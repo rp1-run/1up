@@ -34,9 +34,6 @@ pub const CHUNK_WINDOW_SIZE: usize = 60;
 /// Sliding window overlap (lines) for text chunker.
 pub const CHUNK_OVERLAP: usize = 10;
 
-/// Daemon idle timeout in seconds (default: 30 minutes).
-pub const DAEMON_IDLE_TIMEOUT_SECS: u64 = 1800;
-
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
