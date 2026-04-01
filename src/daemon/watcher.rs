@@ -97,6 +97,7 @@ impl FileWatcher {
         changed
     }
 
+    #[allow(dead_code)]
     pub fn watched_roots(&self) -> &HashSet<PathBuf> {
         &self.watched_roots
     }

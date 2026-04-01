@@ -5,6 +5,7 @@ use crate::shared::errors::{ConfigError, OneupError};
 const APP_NAME: &str = "1up";
 
 /// Returns the XDG config directory for 1up (~/.config/1up/).
+#[allow(dead_code)]
 pub fn config_dir() -> Result<PathBuf, OneupError> {
     let base = dirs::config_dir()
         .ok_or_else(|| ConfigError::XdgDirNotFound("XDG config directory not found".to_string()))?;

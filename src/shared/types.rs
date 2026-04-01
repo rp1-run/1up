@@ -19,6 +19,7 @@ pub struct ParsedSegment {
     pub line_start: usize,
     pub line_end: usize,
     pub language: String,
+    #[allow(dead_code)]
     pub breadcrumb: Option<String>,
     pub complexity: u32,
     pub role: SegmentRole,

@@ -1,5 +1,6 @@
 use crate::shared::types::SearchResult;
 
+#[allow(dead_code)]
 pub fn truncate_content(content: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() <= max_lines {
@@ -11,10 +12,12 @@ pub fn truncate_content(content: &str, max_lines: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_score(score: f64) -> String {
     format!("{:.4}", score)
 }
 
+#[allow(dead_code)]
 pub fn summarize_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
         return "No results found.".to_string();

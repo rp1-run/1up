@@ -73,7 +73,7 @@ pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
     for entry in walker {
         let entry = entry.map_err(|e| IndexingError::Scan(format!("directory walk error: {e}")))?;
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 

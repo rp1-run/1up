@@ -49,6 +49,7 @@ INSERT OR REPLACE INTO segments (
     ?14, datetime('now'), datetime('now')
 )";
 
+#[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, complexity, role,
@@ -69,6 +70,7 @@ LIMIT 1";
 pub const SELECT_ALL_FILE_PATHS: &str = "
 SELECT DISTINCT file_path FROM segments ORDER BY file_path";
 
+#[allow(dead_code)]
 pub const SELECT_SEGMENT_BY_ID: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, complexity, role,
@@ -81,6 +83,7 @@ pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";
 
+#[allow(dead_code)]
 pub const DELETE_META: &str = "DELETE FROM meta WHERE key = ?1";
 
 pub const COUNT_SEGMENTS: &str = "SELECT COUNT(*) FROM segments";

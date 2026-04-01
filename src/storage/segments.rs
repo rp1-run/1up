@@ -6,6 +6,7 @@ use crate::storage::queries;
 
 /// A stored segment row read from the database.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StoredSegment {
     pub id: String,
     pub file_path: String,
@@ -25,6 +26,7 @@ pub struct StoredSegment {
 
 impl StoredSegment {
     /// Parse the role string back into a SegmentRole enum.
+    #[allow(dead_code)]
     pub fn parsed_role(&self) -> SegmentRole {
         match self.role.as_str() {
             "DEFINITION" => SegmentRole::Definition,
@@ -104,6 +106,7 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
 }
 
 /// Query all segments for a given file path, ordered by line_start.
+#[allow(dead_code)]
 pub async fn get_segments_by_file(
     conn: &Connection,
     file_path: &str,
@@ -125,6 +128,7 @@ pub async fn get_segments_by_file(
 }
 
 /// Get a single segment by its ID.
+#[allow(dead_code)]
 pub async fn get_segment_by_id(
     conn: &Connection,
     id: &str,
@@ -228,6 +232,7 @@ pub async fn get_file_paths_by_language(
 }
 
 /// Set a key-value pair in the meta table.
+#[allow(dead_code)]
 pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), OneupError> {
     conn.execute(queries::UPSERT_META, [key, value])
         .await
@@ -236,6 +241,7 @@ pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), O
 }
 
 /// Get a value from the meta table by key.
+#[allow(dead_code)]
 pub async fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, OneupError> {
     let mut rows = conn
         .query(queries::SELECT_META, [key])
@@ -258,6 +264,7 @@ pub async fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, On
 }
 
 /// Delete a key from the meta table.
+#[allow(dead_code)]
 pub async fn delete_meta(conn: &Connection, key: &str) -> Result<(), OneupError> {
     conn.execute(queries::DELETE_META, [key])
         .await

@@ -66,6 +66,7 @@ impl Db {
     }
 
     /// Open an in-memory database (useful for tests).
+    #[allow(dead_code)]
     pub async fn open_memory() -> Result<Self, OneupError> {
         let database = Builder::new_local(":memory:")
             .experimental_index_method(true)

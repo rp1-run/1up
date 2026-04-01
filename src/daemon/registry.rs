@@ -88,6 +88,7 @@ impl Registry {
         self.projects.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn project_roots(&self) -> Vec<PathBuf> {
         self.projects
             .iter()

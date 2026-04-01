@@ -260,7 +260,7 @@ impl SupportedLanguage {
 /// one per nested method/function inside container types.
 pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, ParserError> {
     let lang = SupportedLanguage::from_extension(language)
-        .or_else(|| match language {
+        .or(match language {
             "rust" => Some(SupportedLanguage::Rust),
             "python" => Some(SupportedLanguage::Python),
             "javascript" => Some(SupportedLanguage::JavaScript),

@@ -16,6 +16,7 @@ use crate::shared::errors::OneupError;
 use crate::storage::{db::Db, schema};
 
 struct ProjectState {
+    #[allow(dead_code)]
     project_root: PathBuf,
     db: Db,
 }

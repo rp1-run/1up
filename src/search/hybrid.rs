@@ -29,7 +29,7 @@ impl<'a> HybridSearchEngine<'a> {
         let intent = detect_intent(query);
 
         let vector_results = if let Some(ref mut embedder) = self.embedder {
-            vector_search(self.conn, *embedder, query).await?
+            vector_search(self.conn, embedder, query).await?
         } else {
             Vec::new()
         };

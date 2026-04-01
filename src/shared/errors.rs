@@ -43,6 +43,7 @@ pub enum StorageError {
     Query(String),
 
     #[error("transaction failed: {0}")]
+    #[allow(dead_code)]
     Transaction(String),
 }
 
@@ -52,12 +53,14 @@ pub enum IndexingError {
     Scan(String),
 
     #[error("file read failed: {path}: {source}")]
+    #[allow(dead_code)]
     FileRead {
         path: String,
         source: std::io::Error,
     },
 
     #[error("pipeline failed: {0}")]
+    #[allow(dead_code)]
     Pipeline(String),
 }
 
@@ -97,9 +100,11 @@ pub enum ParserError {
 #[derive(Error, Debug)]
 pub enum DaemonError {
     #[error("daemon already running (pid: {0})")]
+    #[allow(dead_code)]
     AlreadyRunning(u32),
 
     #[error("daemon not running")]
+    #[allow(dead_code)]
     NotRunning,
 
     #[error("pid file error: {0}")]
@@ -118,6 +123,7 @@ pub enum ConfigError {
     XdgDirNotFound(String),
 
     #[error("config read failed: {0}")]
+    #[allow(dead_code)]
     ReadFailed(String),
 }
 
@@ -127,13 +133,16 @@ pub enum ProjectError {
     NotInitialized,
 
     #[error("project already initialized at {0}")]
+    #[allow(dead_code)]
     AlreadyInitialized(String),
 
     #[error("project ID read failed: {0}")]
+    #[allow(dead_code)]
     ReadFailed(String),
 
     #[error("project ID write failed: {0}")]
     WriteFailed(String),
 }
 
+#[allow(dead_code)]
 pub type Result<T> = std::result::Result<T, OneupError>;
