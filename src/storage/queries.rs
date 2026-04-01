@@ -9,10 +9,12 @@ CREATE TABLE IF NOT EXISTS segments (
     line_end INTEGER NOT NULL,
     embedding BLOB,
     embedding_q8 BLOB,
+    breadcrumb TEXT,
     complexity INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'DEFINITION',
     defined_symbols TEXT NOT NULL DEFAULT '[]',
     referenced_symbols TEXT NOT NULL DEFAULT '[]',
+    called_symbols TEXT NOT NULL DEFAULT '[]',
     file_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -40,20 +42,20 @@ pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (
     id, file_path, language, block_type, content,
     line_start, line_end, embedding, embedding_q8,
-    complexity, role, defined_symbols, referenced_symbols,
+    breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
     file_hash, created_at, updated_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5,
     ?6, ?7, CASE WHEN ?8 IS NULL THEN NULL ELSE vector32(?8) END, CASE WHEN ?9 IS NULL THEN NULL ELSE vector8(?9) END,
-    ?10, ?11, ?12, ?13,
-    ?14, datetime('now'), datetime('now')
+    ?10, ?11, ?12, ?13, ?14, ?15,
+    ?16, datetime('now'), datetime('now')
 )";
 
 #[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
 SELECT id, file_path, language, block_type, content,
-       line_start, line_end, complexity, role,
-       defined_symbols, referenced_symbols, file_hash,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
        created_at, updated_at
 FROM segments
 WHERE file_path = ?1
@@ -73,8 +75,8 @@ SELECT DISTINCT file_path FROM segments ORDER BY file_path";
 #[allow(dead_code)]
 pub const SELECT_SEGMENT_BY_ID: &str = "
 SELECT id, file_path, language, block_type, content,
-       line_start, line_end, complexity, role,
-       defined_symbols, referenced_symbols, file_hash,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
        created_at, updated_at
 FROM segments
 WHERE id = ?1";
@@ -97,8 +99,8 @@ ORDER BY file_path";
 
 pub const SELECT_SYMBOLS_BY_DEFINED: &str = "
 SELECT id, file_path, language, block_type, content,
-       line_start, line_end, complexity, role,
-       defined_symbols, referenced_symbols, file_hash,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
        created_at, updated_at
 FROM segments
 WHERE defined_symbols LIKE '%' || ?1 || '%'
@@ -108,8 +110,8 @@ ORDER BY
 
 pub const SELECT_SYMBOLS_BY_REFERENCED: &str = "
 SELECT id, file_path, language, block_type, content,
-       line_start, line_end, complexity, role,
-       defined_symbols, referenced_symbols, file_hash,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
        created_at, updated_at
 FROM segments
 WHERE referenced_symbols LIKE '%' || ?1 || '%'

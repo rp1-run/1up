@@ -25,6 +25,7 @@ pub struct ParsedSegment {
     pub role: SegmentRole,
     pub defined_symbols: Vec<String>,
     pub referenced_symbols: Vec<String>,
+    pub called_symbols: Vec<String>,
 }
 
 /// A search result returned by hybrid or FTS-only search.
@@ -36,12 +37,64 @@ pub struct SearchResult {
     pub content: String,
     pub score: f64,
     pub line_number: usize,
+    pub line_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breadcrumb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<SegmentRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defined_symbols: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub referenced_symbols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub called_symbols: Option<Vec<String>>,
+}
+
+impl SearchResult {
+    pub fn is_definition_like(&self) -> bool {
+        if matches!(self.role, Some(SegmentRole::Definition)) {
+            return true;
+        }
+
+        let has_symbols = self
+            .defined_symbols
+            .as_ref()
+            .map(|symbols| !symbols.is_empty())
+            .unwrap_or(false);
+
+        has_symbols
+            && matches!(
+                self.block_type.as_str(),
+                "function"
+                    | "method"
+                    | "struct"
+                    | "enum"
+                    | "trait"
+                    | "type"
+                    | "class"
+                    | "interface"
+                    | "module"
+                    | "macro"
+                    | "constructor"
+            )
+    }
+
+    pub fn display_kind(&self) -> &'static str {
+        if self.is_definition_like() {
+            "DEFINITION"
+        } else {
+            match self.role {
+                Some(SegmentRole::Docs) => "DOCS",
+                Some(SegmentRole::Import) => "IMPORT",
+                Some(SegmentRole::Orchestration) => "FLOW",
+                Some(SegmentRole::Implementation) => "IMPLEMENTATION",
+                Some(SegmentRole::Definition) => "DEFINITION",
+                None => "RESULT",
+            }
+        }
+    }
 }
 
 /// Distinguishes between a symbol definition and a usage reference.
@@ -67,10 +120,23 @@ pub struct SymbolResult {
     pub name: String,
     pub kind: String,
     pub file_path: String,
+    pub language: String,
     pub line_start: usize,
     pub line_end: usize,
     pub content: String,
     pub reference_kind: ReferenceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breadcrumb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<SegmentRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defined_symbols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_symbols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub called_symbols: Option<Vec<String>>,
 }
 
 /// A structural search result from AST pattern matching.

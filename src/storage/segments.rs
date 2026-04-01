@@ -15,10 +15,12 @@ pub struct StoredSegment {
     pub content: String,
     pub line_start: i64,
     pub line_end: i64,
+    pub breadcrumb: Option<String>,
     pub complexity: i64,
     pub role: String,
     pub defined_symbols: String,
     pub referenced_symbols: String,
+    pub called_symbols: String,
     pub file_hash: String,
     pub created_at: String,
     pub updated_at: String,
@@ -47,6 +49,11 @@ impl StoredSegment {
     pub fn parsed_referenced_symbols(&self) -> Vec<String> {
         serde_json::from_str(&self.referenced_symbols).unwrap_or_default()
     }
+
+    /// Parse called_symbols JSON string into a Vec<String>.
+    pub fn parsed_called_symbols(&self) -> Vec<String> {
+        serde_json::from_str(&self.called_symbols).unwrap_or_default()
+    }
 }
 
 /// Parameters for inserting or upserting a segment.
@@ -60,10 +67,12 @@ pub struct SegmentInsert {
     pub line_end: i64,
     pub embedding: Option<String>,
     pub embedding_q8: Option<String>,
+    pub breadcrumb: Option<String>,
     pub complexity: i64,
     pub role: String,
     pub defined_symbols: String,
     pub referenced_symbols: String,
+    pub called_symbols: String,
     pub file_hash: String,
 }
 
@@ -92,10 +101,12 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
             seg.line_end,
             embedding,
             embedding_q8,
+            seg.breadcrumb.clone(),
             seg.complexity,
             seg.role.clone(),
             seg.defined_symbols.clone(),
             seg.referenced_symbols.clone(),
+            seg.called_symbols.clone(),
             seg.file_hash.clone(),
         ],
     )
@@ -339,26 +350,32 @@ pub fn row_to_stored_segment(row: &turso::Row) -> Result<StoredSegment, OneupErr
         line_end: row
             .get(6)
             .map_err(|e| StorageError::Query(format!("read line_end failed: {e}")))?,
-        complexity: row
+        breadcrumb: row
             .get(7)
+            .map_err(|e| StorageError::Query(format!("read breadcrumb failed: {e}")))?,
+        complexity: row
+            .get(8)
             .map_err(|e| StorageError::Query(format!("read complexity failed: {e}")))?,
         role: row
-            .get(8)
+            .get(9)
             .map_err(|e| StorageError::Query(format!("read role failed: {e}")))?,
         defined_symbols: row
-            .get(9)
+            .get(10)
             .map_err(|e| StorageError::Query(format!("read defined_symbols failed: {e}")))?,
         referenced_symbols: row
-            .get(10)
-            .map_err(|e| StorageError::Query(format!("read referenced_symbols failed: {e}")))?,
-        file_hash: row
             .get(11)
+            .map_err(|e| StorageError::Query(format!("read referenced_symbols failed: {e}")))?,
+        called_symbols: row
+            .get(12)
+            .map_err(|e| StorageError::Query(format!("read called_symbols failed: {e}")))?,
+        file_hash: row
+            .get(13)
             .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
         created_at: row
-            .get(12)
+            .get(14)
             .map_err(|e| StorageError::Query(format!("read created_at failed: {e}")))?,
         updated_at: row
-            .get(13)
+            .get(15)
             .map_err(|e| StorageError::Query(format!("read updated_at failed: {e}")))?,
     })
 }
@@ -386,10 +403,12 @@ mod tests {
             line_end: 3,
             embedding: None,
             embedding_q8: None,
+            breadcrumb: None,
             complexity: 1,
             role: "DEFINITION".to_string(),
             defined_symbols: format!("[\"{id}\"]"),
             referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
             file_hash: file_hash.to_string(),
         }
     }
@@ -568,6 +587,7 @@ mod tests {
         let mut seg = test_segment("s1", "src/main.rs", "h");
         seg.defined_symbols = r#"["foo","bar"]"#.to_string();
         seg.referenced_symbols = r#"["baz"]"#.to_string();
+        seg.called_symbols = r#"["qux"]"#.to_string();
         seg.role = "IMPLEMENTATION".to_string();
         upsert_segment(&conn, &seg).await.unwrap();
 
@@ -577,5 +597,6 @@ mod tests {
         assert_eq!(stored.parsed_role(), SegmentRole::Implementation);
         assert_eq!(stored.parsed_defined_symbols(), vec!["foo", "bar"]);
         assert_eq!(stored.parsed_referenced_symbols(), vec!["baz"]);
+        assert_eq!(stored.parsed_called_symbols(), vec!["qux"]);
     }
 }

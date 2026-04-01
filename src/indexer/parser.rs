@@ -435,6 +435,7 @@ fn extract_segment(
     let complexity = compute_complexity(node, lang);
     let defined_symbols = collect_defined_symbols(node, source, lang);
     let referenced_symbols = collect_referenced_symbols(node, source, lang);
+    let called_symbols = collect_called_symbols(node, source, lang);
 
     ParsedSegment {
         content: full_content,
@@ -447,6 +448,7 @@ fn extract_segment(
         role,
         defined_symbols,
         referenced_symbols,
+        called_symbols,
     }
 }
 
@@ -956,6 +958,12 @@ fn collect_referenced_symbols(node: &Node, source: &[u8], lang: SupportedLanguag
     refs
 }
 
+fn collect_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
+    let mut calls = Vec::new();
+    walk_called_symbols(node, source, lang, &mut calls);
+    calls
+}
+
 fn walk_references(
     node: &Node,
     source: &[u8],
@@ -997,6 +1005,160 @@ fn walk_references(
     for child in node.children(&mut cursor) {
         walk_references(&child, source, lang, defined, refs);
     }
+}
+
+fn walk_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage, calls: &mut Vec<String>) {
+    if let Some(call_target) = extract_call_target(node, source, lang) {
+        if !call_target.is_empty() && !calls.contains(&call_target) {
+            calls.push(call_target);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_called_symbols(&child, source, lang, calls);
+    }
+}
+
+fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> Option<String> {
+    match lang {
+        SupportedLanguage::Rust => match node.kind() {
+            "call_expression" | "method_call_expression" | "macro_invocation" => {
+                extract_rust_call_target(node, source)
+            }
+            _ => None,
+        },
+        SupportedLanguage::Python => match node.kind() {
+            "call" => extract_child_text(node, source, &["function"]),
+            _ => None,
+        },
+        SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => match node.kind() {
+            "call_expression" => extract_child_text(node, source, &["function"]),
+            "new_expression" => extract_child_text(node, source, &["constructor", "function"]),
+            _ => None,
+        },
+        SupportedLanguage::Go => match node.kind() {
+            "call_expression" => extract_child_text(node, source, &["function"]),
+            _ => None,
+        },
+        SupportedLanguage::Java => match node.kind() {
+            "method_invocation" => {
+                let name = extract_child_text(node, source, &["name"])?;
+                if let Some(object) = extract_child_text(node, source, &["object"]) {
+                    Some(format!("{object}.{name}"))
+                } else {
+                    Some(name)
+                }
+            }
+            "object_creation_expression" => extract_child_text(node, source, &["type"]),
+            _ => None,
+        },
+        SupportedLanguage::C | SupportedLanguage::Cpp => match node.kind() {
+            "call_expression" => extract_child_text(node, source, &["function"]),
+            _ => None,
+        },
+    }
+}
+
+fn extract_child_text(node: &Node, source: &[u8], fields: &[&str]) -> Option<String> {
+    for field in fields {
+        if let Some(child) = node.child_by_field_name(field) {
+            if let Ok(text) = child.utf8_text(source) {
+                let trimmed = sanitize_call_target(text);
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_last_named_text(node: &Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let mut last_text = None;
+
+    for child in node.named_children(&mut cursor) {
+        if let Ok(text) = child.utf8_text(source) {
+            let trimmed = sanitize_call_target(text);
+            if !trimmed.is_empty() {
+                last_text = Some(trimmed);
+            }
+        }
+    }
+
+    last_text
+}
+
+fn extract_rust_call_target(node: &Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|function| render_rust_callable(&function, source)),
+        "method_call_expression" => {
+            let receiver = node
+                .child_by_field_name("receiver")
+                .and_then(|receiver| render_rust_callable(&receiver, source))?;
+            let method = extract_child_text(node, source, &["method", "name"])
+                .or_else(|| extract_last_named_text(node, source))?;
+            Some(format!("{receiver}.{method}"))
+        }
+        "macro_invocation" => extract_child_text(node, source, &["macro", "name"]),
+        _ => None,
+    }
+}
+
+fn render_rust_callable(node: &Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "field_identifier" | "scoped_identifier" => {
+            node.utf8_text(source)
+                .ok()
+                .map(sanitize_call_target)
+                .filter(|text| !text.is_empty())
+        }
+        "field_expression" => {
+            let value = node
+                .child_by_field_name("value")
+                .and_then(|value| render_rust_callable(&value, source))
+                .or_else(|| {
+                    let mut cursor = node.walk();
+                    let first_child = node
+                        .named_children(&mut cursor)
+                        .next()
+                        .and_then(|child| render_rust_callable(&child, source));
+                    first_child
+                })?;
+            let field = node
+                .child_by_field_name("field")
+                .and_then(|field| field.utf8_text(source).ok())
+                .map(sanitize_call_target)
+                .filter(|text| !text.is_empty())
+                .or_else(|| extract_last_named_text(node, source))?;
+            Some(format!("{value}.{field}"))
+        }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|function| render_rust_callable(&function, source)),
+        "method_call_expression" => extract_rust_call_target(node, source),
+        _ => node
+            .utf8_text(source)
+            .ok()
+            .map(sanitize_call_target)
+            .filter(|text| !text.is_empty()),
+    }
+}
+
+fn sanitize_call_target(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".")
+        .replace(". ", ".")
+        .replace(" ::", "::")
+        .replace(":: ", "::")
+        .replace("( ", "(")
+        .replace(" )", ")")
 }
 
 fn is_keyword(lang: SupportedLanguage, name: &str) -> bool {

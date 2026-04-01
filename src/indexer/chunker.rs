@@ -78,6 +78,7 @@ pub fn chunk_file(
             role: SegmentRole::Implementation,
             defined_symbols: Vec::new(),
             referenced_symbols: Vec::new(),
+            called_symbols: Vec::new(),
         });
 
         if end >= lines.len() {

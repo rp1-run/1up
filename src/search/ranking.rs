@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 
 use crate::search::intent::QueryIntent;
-use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS, RRF_K, VECTOR_WEIGHT};
+use crate::shared::constants::{
+    MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS, RRF_K, SYMBOL_WEIGHT, VECTOR_WEIGHT,
+};
 use crate::shared::types::SearchResult;
 
 struct ScoredCandidate {
     result: SearchResult,
     vector_rank: Option<usize>,
     fts_rank: Option<usize>,
+    symbol_rank: Option<usize>,
     fused_score: f64,
 }
 
 pub fn fuse_results(
     vector_results: Vec<SearchResult>,
     fts_results: Vec<SearchResult>,
+    symbol_results: Vec<SearchResult>,
     intent: QueryIntent,
     limit: usize,
 ) -> Vec<SearchResult> {
@@ -27,6 +31,7 @@ pub fn fuse_results(
                 result: r,
                 vector_rank: Some(rank),
                 fts_rank: None,
+                symbol_rank: None,
                 fused_score: 0.0,
             },
         );
@@ -45,6 +50,28 @@ pub fn fuse_results(
                         result: r,
                         vector_rank: None,
                         fts_rank: Some(rank),
+                        symbol_rank: None,
+                        fused_score: 0.0,
+                    },
+                );
+            }
+        }
+    }
+
+    for (rank, r) in symbol_results.into_iter().enumerate() {
+        let key = candidate_key(&r);
+        match candidates.get_mut(&key) {
+            Some(existing) => {
+                existing.symbol_rank = Some(rank);
+            }
+            None => {
+                candidates.insert(
+                    key,
+                    ScoredCandidate {
+                        result: r,
+                        vector_rank: None,
+                        fts_rank: None,
+                        symbol_rank: Some(rank),
                         fused_score: 0.0,
                     },
                 );
@@ -93,7 +120,12 @@ fn compute_rrf_score(candidate: &ScoredCandidate, intent: QueryIntent) -> f64 {
         .map(|rank| 1.0 / (RRF_K + rank as f64 + 1.0))
         .unwrap_or(0.0);
 
-    let mut score = vector_score + fts_score;
+    let symbol_score = candidate
+        .symbol_rank
+        .map(|rank| SYMBOL_WEIGHT / (RRF_K + rank as f64 + 1.0))
+        .unwrap_or(0.0);
+
+    let mut score = vector_score + fts_score + symbol_score;
 
     score *= intent_boost(&candidate.result, intent);
     score *= file_path_boost(&candidate.result.file_path);
@@ -112,7 +144,7 @@ fn intent_boost(result: &SearchResult, intent: QueryIntent) -> f64 {
 
     match intent {
         QueryIntent::Definition => {
-            if role_str == "DEFINITION" {
+            if role_str == "DEFINITION" || result.is_definition_like() {
                 1.3
             } else {
                 1.0
@@ -128,7 +160,14 @@ fn intent_boost(result: &SearchResult, intent: QueryIntent) -> f64 {
             }
         }
         QueryIntent::Usage => {
-            if role_str == "IMPLEMENTATION" || role_str == "ORCHESTRATION" {
+            if role_str == "IMPLEMENTATION"
+                || role_str == "ORCHESTRATION"
+                || result
+                    .called_symbols
+                    .as_ref()
+                    .map(|calls| !calls.is_empty())
+                    .unwrap_or(false)
+            {
                 1.2
             } else {
                 1.0
@@ -223,9 +262,13 @@ mod tests {
             content: content.to_string(),
             score: 0.0,
             line_number: line,
+            line_end: line + content.lines().count().saturating_sub(1),
+            breadcrumb: None,
+            complexity: None,
             role: Some(SegmentRole::Definition),
             defined_symbols: None,
             referenced_symbols: None,
+            called_symbols: None,
         }
     }
 
@@ -240,7 +283,7 @@ mod tests {
             make_result("a.rs", 1, "function", "fn foo() {\n  let x = 1;\n  let y = 2;\n  let z = 3;\n  let w = 4;\n  let v = 5;\n}"),
         ];
 
-        let fused = fuse_results(vec_results, fts_results, QueryIntent::General, 10);
+        let fused = fuse_results(vec_results, fts_results, vec![], QueryIntent::General, 10);
         assert_eq!(fused.len(), 2);
         assert!(fused[0].score > 0.0);
         assert!(fused[0].score >= fused[1].score);
@@ -275,7 +318,7 @@ mod tests {
             ),
         ];
 
-        let fused = fuse_results(vec_results, vec![], QueryIntent::General, 20);
+        let fused = fuse_results(vec_results, vec![], vec![], QueryIntent::General, 20);
         assert!(fused.len() <= MAX_RESULTS_PER_FILE);
     }
 
@@ -296,7 +339,7 @@ mod tests {
             ),
         ];
 
-        let fused = fuse_results(vec_results, vec![], QueryIntent::General, 20);
+        let fused = fuse_results(vec_results, vec![], vec![], QueryIntent::General, 20);
         assert_eq!(fused.len(), 1);
     }
 

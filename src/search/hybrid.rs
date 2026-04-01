@@ -2,10 +2,12 @@ use turso::Connection;
 
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
+use crate::search::intent::QueryIntent;
 use crate::search::ranking::fuse_results;
 use crate::shared::constants::VECTOR_PREFILTER_K;
 use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::types::{SearchResult, SegmentRole};
+use crate::shared::types::{ReferenceKind, SearchResult, SegmentRole, SymbolResult};
+use crate::search::symbol::SymbolSearchEngine;
 
 pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
@@ -27,6 +29,7 @@ impl<'a> HybridSearchEngine<'a> {
         }
 
         let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, query, intent).await?;
 
         let vector_results = if let Some(ref mut embedder) = self.embedder {
             vector_search(self.conn, embedder, query).await?
@@ -36,11 +39,17 @@ impl<'a> HybridSearchEngine<'a> {
 
         let fts_results = fts_search(self.conn, query).await?;
 
-        if vector_results.is_empty() && fts_results.is_empty() {
+        if vector_results.is_empty() && fts_results.is_empty() && symbol_results.is_empty() {
             return Ok(Vec::new());
         }
 
-        Ok(fuse_results(vector_results, fts_results, intent, limit))
+        Ok(fuse_results(
+            vector_results,
+            fts_results,
+            symbol_results,
+            intent,
+            limit,
+        ))
     }
 
     pub async fn fts_only_search(
@@ -53,9 +62,16 @@ impl<'a> HybridSearchEngine<'a> {
         }
 
         let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, query, intent).await?;
         let fts_results = fts_search(self.conn, query).await?;
 
-        Ok(fuse_results(Vec::new(), fts_results, intent, limit))
+        Ok(fuse_results(
+            Vec::new(),
+            fts_results,
+            symbol_results,
+            intent,
+            limit,
+        ))
     }
 }
 
@@ -72,8 +88,8 @@ async fn vector_search(
     let mut rows = conn
         .query(
             "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                    s.line_start, s.line_end, s.role, s.defined_symbols,
-                    s.referenced_symbols,
+                    s.line_start, s.line_end, s.breadcrumb, s.complexity,
+                    s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
                     vector_distance_cos(s.embedding_q8, vector8(?1)) as distance
              FROM segments s
              WHERE s.embedding_q8 IS NOT NULL
@@ -94,7 +110,7 @@ async fn vector_search(
             .get(0)
             .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
         let distance: f64 = row
-            .get(10)
+            .get(13)
             .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
         let result = row_to_search_result(&row)?;
         candidates.push((id, result, distance));
@@ -167,8 +183,8 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
     let mut rows = conn
         .query(
             "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                    s.line_start, s.line_end, s.role, s.defined_symbols,
-                    s.referenced_symbols,
+                    s.line_start, s.line_end, s.breadcrumb, s.complexity,
+                    s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
                     fts_score(s.content, ?1) as score
              FROM segments s
              WHERE fts_match(s.content, ?1)
@@ -207,27 +223,33 @@ fn row_to_search_result(row: &turso::Row) -> Result<SearchResult, OneupError> {
     let line_start: i64 = row
         .get(5)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let role_str: String = row
+    let line_end: i64 = row
+        .get(6)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let breadcrumb: Option<String> = row
         .get(7)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let defined_symbols: String = row
+    let complexity: i64 = row
         .get(8)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let referenced_symbols: String = row
+    let role_str: String = row
         .get(9)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let defined_symbols: String = row
+        .get(10)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let referenced_symbols: String = row
+        .get(11)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let called_symbols: String = row
+        .get(12)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
 
-    let role = match role_str.as_str() {
-        "DEFINITION" => Some(SegmentRole::Definition),
-        "IMPLEMENTATION" => Some(SegmentRole::Implementation),
-        "ORCHESTRATION" => Some(SegmentRole::Orchestration),
-        "IMPORT" => Some(SegmentRole::Import),
-        "DOCS" => Some(SegmentRole::Docs),
-        _ => None,
-    };
+    let role = parse_role(&role_str);
 
     let def_syms: Vec<String> = serde_json::from_str(&defined_symbols).unwrap_or_default();
     let ref_syms: Vec<String> = serde_json::from_str(&referenced_symbols).unwrap_or_default();
+    let call_syms: Vec<String> = serde_json::from_str(&called_symbols).unwrap_or_default();
 
     Ok(SearchResult {
         file_path,
@@ -236,18 +258,211 @@ fn row_to_search_result(row: &turso::Row) -> Result<SearchResult, OneupError> {
         content,
         score: 0.0,
         line_number: line_start as usize,
+        line_end: line_end as usize,
+        breadcrumb,
+        complexity: Some(complexity as u32),
         role,
-        defined_symbols: if def_syms.is_empty() {
-            None
-        } else {
-            Some(def_syms)
-        },
-        referenced_symbols: if ref_syms.is_empty() {
-            None
-        } else {
-            Some(ref_syms)
-        },
+        defined_symbols: some_if_not_empty(def_syms),
+        referenced_symbols: some_if_not_empty(ref_syms),
+        called_symbols: some_if_not_empty(call_syms),
     })
+}
+
+async fn symbol_search(
+    conn: &Connection,
+    query: &str,
+    intent: QueryIntent,
+) -> Result<Vec<SearchResult>, OneupError> {
+    let variants = build_symbol_variants(query, intent);
+    if variants.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let engine = SymbolSearchEngine::new(conn);
+    let include_usages = matches!(intent, QueryIntent::Usage);
+    let mut matches = Vec::new();
+
+    for variant in variants {
+        let symbol_matches = if include_usages {
+            engine.find_references(&variant).await?
+        } else {
+            engine.find_definitions(&variant).await?
+        };
+
+        for result in symbol_matches {
+            if symbol_result_matches_query(&result, query) {
+                matches.push(result);
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| symbol_sort_key(a, query).cmp(&symbol_sort_key(b, query)));
+
+    let mut deduped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for symbol in matches {
+        let search_result = search_result_from_symbol(symbol);
+        let key = candidate_key(&search_result);
+        if seen.insert(key) {
+            deduped.push(search_result);
+        }
+    }
+
+    Ok(deduped)
+}
+
+fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
+    let words = query_words(query);
+    if words.is_empty() || words.len() > 4 {
+        return Vec::new();
+    }
+
+    let symbolish = query.contains('_')
+        || query.chars().any(|c| c.is_uppercase())
+        || matches!(intent, QueryIntent::Definition | QueryIntent::Usage)
+        || words.len() <= 2;
+
+    if !symbolish {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+
+    for word in &words {
+        if word.len() >= 2 {
+            variants.push(word.clone());
+        }
+    }
+
+    if !words.is_empty() {
+        let snake = words.join("_");
+        let compact = words.join("");
+        let pascal = words
+            .iter()
+            .map(|word| capitalize(word))
+            .collect::<Vec<_>>()
+            .join("");
+
+        variants.push(snake);
+        variants.push(compact);
+        variants.push(pascal.clone());
+
+        if let Some((first, rest)) = words.split_first() {
+            let camel = format!(
+                "{}{}",
+                first.to_lowercase(),
+                rest.iter().map(|word| capitalize(word)).collect::<String>()
+            );
+            variants.push(camel);
+        }
+    }
+
+    let mut deduped = Vec::new();
+    for variant in variants {
+        if variant.len() >= 2 && !deduped.contains(&variant) {
+            deduped.push(variant);
+        }
+    }
+
+    deduped
+}
+
+fn query_words(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_string())
+        .collect()
+}
+
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()),
+        None => String::new(),
+    }
+}
+
+fn symbol_result_matches_query(result: &SymbolResult, query: &str) -> bool {
+    let normalized_query = normalize_symbolish(query);
+    let normalized_name = normalize_symbolish(&result.name);
+
+    normalized_name == normalized_query
+        || normalized_name.contains(&normalized_query)
+        || normalized_query.contains(&normalized_name)
+}
+
+fn symbol_sort_key(result: &SymbolResult, query: &str) -> (u8, u8, usize, usize, String) {
+    let exactness = if normalize_symbolish(&result.name) == normalize_symbolish(query) {
+        0
+    } else {
+        1
+    };
+    let ref_kind = match result.reference_kind {
+        ReferenceKind::Definition => 0,
+        ReferenceKind::Usage => 1,
+    };
+
+    (
+        ref_kind,
+        exactness,
+        result.line_start,
+        result.name.len(),
+        result.file_path.clone(),
+    )
+}
+
+fn normalize_symbolish(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn search_result_from_symbol(result: SymbolResult) -> SearchResult {
+    SearchResult {
+        file_path: result.file_path,
+        language: result.language,
+        block_type: result.kind,
+        content: result.content,
+        score: 0.0,
+        line_number: result.line_start,
+        line_end: result.line_end,
+        breadcrumb: result.breadcrumb,
+        complexity: result.complexity,
+        role: result.role,
+        defined_symbols: result.defined_symbols,
+        referenced_symbols: result.referenced_symbols,
+        called_symbols: result.called_symbols,
+    }
+}
+
+fn parse_role(role_str: &str) -> Option<SegmentRole> {
+    match role_str {
+        "DEFINITION" => Some(SegmentRole::Definition),
+        "IMPLEMENTATION" => Some(SegmentRole::Implementation),
+        "ORCHESTRATION" => Some(SegmentRole::Orchestration),
+        "IMPORT" => Some(SegmentRole::Import),
+        "DOCS" => Some(SegmentRole::Docs),
+        _ => None,
+    }
+}
+
+fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn candidate_key(result: &SearchResult) -> String {
+    format!(
+        "{}:{}:{}",
+        result.file_path, result.line_number, result.block_type
+    )
 }
 
 fn build_fts_query(query: &str) -> String {
@@ -356,10 +571,12 @@ mod tests {
             line_end: 3,
             embedding: None,
             embedding_q8: None,
+            breadcrumb: None,
             complexity: 1,
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"handle_error\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
             file_hash: "abc123".to_string(),
         };
         crate::storage::segments::upsert_segment(&conn, &insert)
@@ -392,10 +609,12 @@ mod tests {
             line_end: 12,
             embedding: None,
             embedding_q8: None,
+            breadcrumb: None,
             complexity: 1,
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"validate_input\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
             file_hash: "def456".to_string(),
         };
         crate::storage::segments::upsert_segment(&conn, &insert)

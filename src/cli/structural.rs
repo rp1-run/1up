@@ -39,7 +39,7 @@ pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<
     if db_path.exists() {
         let db = Db::open_ro(&db_path).await?;
         let conn = db.connect()?;
-        schema::migrate(&conn).await?;
+        schema::ensure_compatible(&conn).await?;
 
         let engine = StructuralSearchEngine::new(&project_root, Some(&conn));
         let results = engine.search(&args.pattern, lang_filter).await?;

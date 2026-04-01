@@ -46,7 +46,7 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::migrate(&conn).await?;
+    schema::ensure_compatible(&conn).await?;
 
     let mut embedder_opt = if is_model_available() {
         match Embedder::from_dir(&crate::shared::config::model_dir()?) {

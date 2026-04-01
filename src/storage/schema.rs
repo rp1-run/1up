@@ -87,3 +87,25 @@ pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
 
     Ok(())
 }
+
+/// Verify that an existing database is compatible with the current binary
+/// without mutating schema state.
+pub async fn ensure_compatible(conn: &Connection) -> Result<(), OneupError> {
+    let current = get_schema_version(conn).await?;
+
+    match current {
+        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) if v < SCHEMA_VERSION => Err(StorageError::Migration(format!(
+            "index schema is out of date (found v{v}, expected v{SCHEMA_VERSION}); run `1up reindex`"
+        ))
+        .into()),
+        Some(v) => Err(StorageError::Migration(format!(
+            "index schema v{v} is newer than this binary supports (expected v{SCHEMA_VERSION}); rebuild or upgrade `1up`"
+        ))
+        .into()),
+        None => Err(StorageError::Migration(format!(
+            "index schema is missing or unreadable; run `1up reindex`"
+        ))
+        .into()),
+    }
+}

@@ -16,6 +16,9 @@ pub const RRF_K: f64 = 60.0;
 /// Weight multiplier for vector search scores in RRF fusion.
 pub const VECTOR_WEIGHT: f64 = 1.5;
 
+/// Weight multiplier for exact/fuzzy symbol search scores in RRF fusion.
+pub const SYMBOL_WEIGHT: f64 = 4.0;
+
 /// Maximum search results returned per query.
 pub const MAX_SEARCH_RESULTS: usize = 20;
 
@@ -37,8 +40,14 @@ pub const DAEMON_IDLE_TIMEOUT_SECS: u64 = 1800;
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
+/// Number of retries for transient database lock failures.
+pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
+
+/// Delay between transient database lock retries.
+pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
+
 /// Schema version for database migrations.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// ONNX model filename.
 pub const MODEL_FILENAME: &str = "model.onnx";

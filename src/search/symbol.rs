@@ -40,10 +40,17 @@ impl<'a> SymbolSearchEngine<'a> {
                     name: matched_name,
                     kind: seg.block_type.clone(),
                     file_path: seg.file_path.clone(),
+                    language: seg.language.clone(),
                     line_start: seg.line_start as usize,
                     line_end: seg.line_end as usize,
                     content: seg.content.clone(),
                     reference_kind: ReferenceKind::Definition,
+                    breadcrumb: seg.breadcrumb.clone(),
+                    complexity: Some(seg.complexity as u32),
+                    role: Some(seg.parsed_role()),
+                    defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
+                    referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
+                    called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
                 });
             }
         }
@@ -74,14 +81,29 @@ impl<'a> SymbolSearchEngine<'a> {
                     name: matched_name,
                     kind: seg.block_type.clone(),
                     file_path: seg.file_path.clone(),
+                    language: seg.language.clone(),
                     line_start: seg.line_start as usize,
                     line_end: seg.line_end as usize,
                     content: seg.content.clone(),
                     reference_kind: ReferenceKind::Usage,
+                    breadcrumb: seg.breadcrumb.clone(),
+                    complexity: Some(seg.complexity as u32),
+                    role: Some(seg.parsed_role()),
+                    defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
+                    referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
+                    called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
                 });
             }
         }
         Ok(results)
+    }
+}
+
+fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
     }
 }
 
@@ -181,10 +203,12 @@ mod tests {
             line_end: 5,
             embedding: None,
             embedding_q8: None,
+            breadcrumb: None,
             complexity: 1,
             role: "DEFINITION".to_string(),
             defined_symbols: defined.to_string(),
             referenced_symbols: referenced.to_string(),
+            called_symbols: "[]".to_string(),
             file_hash: "abc123".to_string(),
         }
     }

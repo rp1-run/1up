@@ -224,11 +224,14 @@ pub async fn run(
                     line_end: seg.line_end as i64,
                     embedding: Some(embedding_json),
                     embedding_q8: Some(embedding_q8_json),
+                    breadcrumb: seg.breadcrumb.clone(),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
                     defined_symbols: serde_json::to_string(&seg.defined_symbols)
                         .unwrap_or_else(|_| "[]".into()),
                     referenced_symbols: serde_json::to_string(&seg.referenced_symbols)
+                        .unwrap_or_else(|_| "[]".into()),
+                    called_symbols: serde_json::to_string(&seg.called_symbols)
                         .unwrap_or_else(|_| "[]".into()),
                     file_hash: pf.file_hash.clone(),
                 };
@@ -254,11 +257,14 @@ pub async fn run(
                     line_end: seg.line_end as i64,
                     embedding: None,
                     embedding_q8: None,
+                    breadcrumb: seg.breadcrumb.clone(),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
                     defined_symbols: serde_json::to_string(&seg.defined_symbols)
                         .unwrap_or_else(|_| "[]".into()),
                     referenced_symbols: serde_json::to_string(&seg.referenced_symbols)
+                        .unwrap_or_else(|_| "[]".into()),
+                    called_symbols: serde_json::to_string(&seg.called_symbols)
                         .unwrap_or_else(|_| "[]".into()),
                     file_hash: pf.file_hash.clone(),
                 };

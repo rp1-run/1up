@@ -45,7 +45,7 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::migrate(&conn).await?;
+    schema::ensure_compatible(&conn).await?;
 
     let engine = SymbolSearchEngine::new(&conn);
     let results = if args.references {

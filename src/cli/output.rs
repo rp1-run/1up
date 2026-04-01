@@ -69,18 +69,18 @@ impl Formatter for HumanFormatter {
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
             if i > 0 {
-                out.push('\n');
+                out.push_str("\n----------------------------------------\n\n");
             }
             out.push_str(&format!(
-                "{} {} (score: {:.4})\n",
+                "{} {}\n",
+                r.display_kind().bold(),
                 format!("{}:{}", r.file_path, r.line_number).cyan(),
-                format!("[{}]", r.block_type).dimmed(),
-                r.score
             ));
-            for line in r.content.lines().take(5) {
+            out.push_str(&format!("{}\n\n", render_search_metadata(r).dimmed()));
+            for line in r.content.lines().take(12) {
                 out.push_str(&format!("  {line}\n"));
             }
-            if r.content.lines().count() > 5 {
+            if r.content.lines().count() > 12 {
                 out.push_str(&format!("  {}\n", "...".dimmed()));
             }
         }
@@ -94,19 +94,19 @@ impl Formatter for HumanFormatter {
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
             if i > 0 {
-                out.push('\n');
+                out.push_str("\n----------------------------------------\n\n");
             }
-            let kind_label = format!("[{}: {}]", r.reference_kind, r.kind);
             out.push_str(&format!(
                 "{} {} {}\n",
+                r.reference_kind.to_string().to_uppercase().bold(),
                 r.name.bold(),
-                kind_label.dimmed(),
-                format!("{}:{}-{}", r.file_path, r.line_start, r.line_end).cyan(),
+                format!("{}:{}", r.file_path, r.line_start).cyan(),
             ));
-            for line in r.content.lines().take(5) {
+            out.push_str(&format!("{}\n\n", render_symbol_metadata(r).dimmed()));
+            for line in r.content.lines().take(12) {
                 out.push_str(&format!("  {line}\n"));
             }
-            if r.content.lines().count() > 5 {
+            if r.content.lines().count() > 12 {
                 out.push_str(&format!("  {}\n", "...".dimmed()));
             }
         }
@@ -191,9 +191,10 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for r in results {
             out.push_str(&format!(
-                "{}:{}\t{}\t{:.4}\n",
-                r.file_path, r.line_number, r.block_type, r.score
+                "{}:{}-{}\t{}\t{:.4}\n",
+                r.file_path, r.line_number, r.line_end, r.block_type, r.score
             ));
+            out.push_str(&format!("{}\n", render_search_metadata(r)));
             out.push_str(&r.content);
             if !r.content.ends_with('\n') {
                 out.push('\n');
@@ -213,6 +214,7 @@ impl Formatter for PlainFormatter {
                 "{}\t{}\t{}\t{}:{}-{}\n",
                 r.name, r.reference_kind, r.kind, r.file_path, r.line_start, r.line_end
             ));
+            out.push_str(&format!("{}\n", render_symbol_metadata(r)));
         }
         out
     }
@@ -280,4 +282,65 @@ impl Formatter for PlainFormatter {
 
 fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+fn render_search_metadata(result: &SearchResult) -> String {
+    let mut parts = vec![format!("Kind: {}", result.block_type)];
+
+    if let Some(breadcrumb) = &result.breadcrumb {
+        parts.push(format!("Scope: {breadcrumb}"));
+    }
+    if let Some(defined) = &result.defined_symbols {
+        if !defined.is_empty() {
+            parts.push(format!("Defines: {}", truncate_items(defined, 5)));
+        }
+    }
+    if let Some(calls) = &result.called_symbols {
+        if !calls.is_empty() {
+            parts.push(format!("Calls: {}", truncate_items(calls, 5)));
+        }
+    }
+    if let Some(complexity) = result.complexity {
+        if complexity > 0 {
+            parts.push(format!("Complexity: {complexity}"));
+        }
+    }
+
+    parts.push(format!("Score: {:.4}", result.score));
+    parts.join(" | ")
+}
+
+fn render_symbol_metadata(result: &SymbolResult) -> String {
+    let mut parts = vec![format!("Kind: {}", result.kind)];
+
+    if let Some(breadcrumb) = &result.breadcrumb {
+        parts.push(format!("Scope: {breadcrumb}"));
+    }
+    if let Some(defined) = &result.defined_symbols {
+        if !defined.is_empty() {
+            parts.push(format!("Defines: {}", truncate_items(defined, 5)));
+        }
+    }
+    if let Some(calls) = &result.called_symbols {
+        if !calls.is_empty() {
+            parts.push(format!("Calls: {}", truncate_items(calls, 5)));
+        }
+    }
+    if let Some(complexity) = result.complexity {
+        if complexity > 0 {
+            parts.push(format!("Complexity: {complexity}"));
+        }
+    }
+
+    parts.join(" | ")
+}
+
+fn truncate_items(items: &[String], limit: usize) -> String {
+    if items.len() <= limit {
+        return items.join(", ");
+    }
+
+    let mut preview = items.iter().take(limit).cloned().collect::<Vec<_>>();
+    preview.push(format!("+{}", items.len() - limit));
+    preview.join(", ")
 }
