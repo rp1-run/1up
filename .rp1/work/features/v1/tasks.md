@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 69% (11 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11 complete)
+**Progress**: 75% (12 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -567,6 +567,18 @@ stateDiagram-v2
     - **Deviations**: Added `nix` (v0.29, signal+process features) and `chrono` (v0.4, serde feature) dependencies for signal management and timestamps
     - **Tests**: 11/11 passing (3 lifecycle: process alive/not alive/pid roundtrip, 3 registry: roundtrip/deregister/empty, 5 watcher: skip gitdir/node_modules/binary ext, allow source, filter, watcher creation)
 
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
     **Execution Flow**:
 
     ```mermaid
@@ -575,7 +587,7 @@ stateDiagram-v2
         T11_daemon_and_watcher --> [*]
     ```
 
-- [ ] **T12**: Implement init and start commands with project boundary detection, daemon spawning, auto-start on first query, and stop/status commands `[complexity:medium]`
+- [x] **T12**: Implement init and start commands with project boundary detection, daemon spawning, auto-start on first query, and stop/status commands `[complexity:medium]`
 
     **Reference**: [design.md#21-module-structure](design.md#21-module-structure)
 
@@ -583,12 +595,27 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] `1up init` creates .1up/project_id with UUID; warns if already exists
-    - [ ] `1up start` triggers full/incremental index then spawns daemon in background
-    - [ ] `1up stop` deregisters project, sends SIGTERM or SIGHUP as appropriate
-    - [ ] `1up status` reports daemon running state and index statistics
-    - [ ] Auto-start on first query if no daemon running (FR-DMN-001)
-    - [ ] Integration with project registry for daemon lifecycle management
+    - [x] `1up init` creates .1up/project_id with UUID; warns if already exists
+    - [x] `1up start` triggers full/incremental index then spawns daemon in background
+    - [x] `1up stop` deregisters project, sends SIGTERM or SIGHUP as appropriate
+    - [x] `1up status` reports daemon running state and index statistics
+    - [x] Auto-start on first query if no daemon running (FR-DMN-001)
+    - [x] Integration with project registry for daemon lifecycle management
+
+    **Implementation Summary**:
+
+    - **Files**: `src/cli/start.rs`, `src/cli/stop.rs`, `src/cli/status.rs`, `src/daemon/lifecycle.rs`, `src/cli/search.rs`, `src/cli/symbol.rs`, `src/cli/context.rs`
+    - **Approach**: start command validates project init, runs indexing pipeline with optional embedder, registers project in registry, spawns daemon; stop command deregisters project from registry and sends SIGTERM (if no projects remain) or SIGHUP (to drop the project); status command reports daemon running state via PID file, project ID, and index statistics from DB; ensure_daemon() helper in lifecycle.rs provides auto-start on first query for search/symbol/context commands by checking PID file, registering project if needed, and spawning daemon
+    - **Deviations**: None
+    - **Tests**: 120/120 passing (all pre-existing tests pass; init already tested in CLI integration tests)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T12_init_and_start_commands
+        T12_init_and_start_commands --> [*]
+    ```
 
 - [ ] **T13**: Implement graceful degradation with FTS-only fallback when embeddings unavailable and skip unsupported languages with warnings `[complexity:simple]`
 

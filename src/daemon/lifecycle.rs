@@ -117,6 +117,43 @@ pub fn current_binary_path() -> Result<std::path::PathBuf, OneupError> {
         .map_err(|e| DaemonError::PidFileError(format!("failed to determine binary path: {e}")))?)
 }
 
+/// Ensures the daemon is running for a given project. If no daemon is running,
+/// registers the project and spawns a new daemon. If a daemon is already running
+/// but the project is not registered, registers it and sends SIGHUP to reload.
+/// Returns the daemon PID.
+pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, OneupError> {
+    use crate::daemon::registry::Registry;
+
+    if let Some(pid) = is_daemon_running()? {
+        let mut registry = Registry::load()?;
+        let already_registered = registry.projects.iter().any(|p| {
+            p.project_root
+                == project_root
+                    .canonicalize()
+                    .unwrap_or(project_root.to_path_buf())
+        });
+
+        if !already_registered {
+            registry.register(project_id, project_root)?;
+            send_sighup(pid)?;
+            debug!("auto-registered project and sent SIGHUP to daemon (pid={pid})");
+        }
+
+        return Ok(pid);
+    }
+
+    let mut registry = Registry::load()?;
+    registry.register(project_id, project_root)?;
+
+    let binary = current_binary_path()?;
+    let pid = spawn_daemon(&binary)?;
+    debug!(
+        "auto-started daemon (pid={pid}) for project at {}",
+        project_root.display()
+    );
+    Ok(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,9 @@
 use clap::Args;
 
 use crate::cli::output::formatter_for;
+use crate::daemon::lifecycle;
 use crate::search::context::{parse_location, ContextEngine};
+use crate::shared::project;
 use crate::shared::types::OutputFormat;
 
 #[derive(Args)]
@@ -21,6 +23,12 @@ pub struct ContextArgs {
 pub async fn exec(args: ContextArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
+
+    if let Ok(pid) = project::read_project_id(&project_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
+            tracing::debug!("auto-start daemon skipped: {e}");
+        }
+    }
 
     let (file_str, line) = parse_location(&args.location)?;
     let file_path = project_root.join(&file_str);

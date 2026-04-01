@@ -1,8 +1,10 @@
 use clap::Args;
 
 use crate::cli::output::formatter_for;
+use crate::daemon::lifecycle;
 use crate::search::SymbolSearchEngine;
 use crate::shared::config::project_db_path;
+use crate::shared::project;
 use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -25,6 +27,12 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let db_path = project_db_path(&project_root);
     let fmt = formatter_for(format);
+
+    if let Ok(pid) = project::read_project_id(&project_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
+            tracing::debug!("auto-start daemon skipped: {e}");
+        }
+    }
 
     if !db_path.exists() {
         eprintln!(
