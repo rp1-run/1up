@@ -117,10 +117,7 @@ impl Formatter for HumanFormatter {
         ));
         for (i, line) in result.content.lines().enumerate() {
             let line_num = result.line_start + i;
-            out.push_str(&format!(
-                "{} {line}\n",
-                format!("{line_num:>4} |").dimmed()
-            ));
+            out.push_str(&format!("{} {line}\n", format!("{line_num:>4} |").dimmed()));
         }
         out
     }

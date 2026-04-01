@@ -143,7 +143,11 @@ impl SupportedLanguage {
                 "enum_declaration",
             ],
             Self::C => &[],
-            Self::Cpp => &["class_specifier", "struct_specifier", "namespace_definition"],
+            Self::Cpp => &[
+                "class_specifier",
+                "struct_specifier",
+                "namespace_definition",
+            ],
         }
     }
 
@@ -163,11 +167,7 @@ impl SupportedLanguage {
                 "field_declaration",
             ],
             Self::C => &[],
-            Self::Cpp => &[
-                "function_definition",
-                "field_declaration",
-                "declaration",
-            ],
+            Self::Cpp => &["function_definition", "field_declaration", "declaration"],
         }
     }
 
@@ -258,10 +258,7 @@ impl SupportedLanguage {
 ///
 /// Returns `Vec<ParsedSegment>` with one segment per top-level construct and
 /// one per nested method/function inside container types.
-pub fn parse_file(
-    source: &str,
-    language: &str,
-) -> Result<Vec<ParsedSegment>, ParserError> {
+pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, ParserError> {
     let lang = SupportedLanguage::from_extension(language)
         .or_else(|| match language {
             "rust" => Some(SupportedLanguage::Rust),
@@ -310,13 +307,8 @@ pub fn parse_file(
 
         if top_level.contains(&kind) {
             if containers.contains(&kind) {
-                let container_segment = extract_segment(
-                    &node,
-                    source_bytes,
-                    lang,
-                    &leading_comments,
-                    None,
-                );
+                let container_segment =
+                    extract_segment(&node, source_bytes, lang, &leading_comments, None);
                 segments.push(container_segment);
 
                 extract_nested(
@@ -328,13 +320,8 @@ pub fn parse_file(
                 );
             } else if kind == "decorated_definition" {
                 if let Some(inner) = find_decorated_inner(&node) {
-                    let segment = extract_segment(
-                        &node,
-                        source_bytes,
-                        lang,
-                        &leading_comments,
-                        None,
-                    );
+                    let segment =
+                        extract_segment(&node, source_bytes, lang, &leading_comments, None);
                     if containers.contains(&inner.kind()) {
                         segments.push(segment);
                         extract_nested(
@@ -348,24 +335,14 @@ pub fn parse_file(
                         segments.push(segment);
                     }
                 } else {
-                    let segment = extract_segment(
-                        &node,
-                        source_bytes,
-                        lang,
-                        &leading_comments,
-                        None,
-                    );
+                    let segment =
+                        extract_segment(&node, source_bytes, lang, &leading_comments, None);
                     segments.push(segment);
                 }
             } else if kind == "export_statement" {
                 if let Some(decl) = node.child_by_field_name("declaration") {
-                    let segment = extract_segment(
-                        &node,
-                        source_bytes,
-                        lang,
-                        &leading_comments,
-                        None,
-                    );
+                    let segment =
+                        extract_segment(&node, source_bytes, lang, &leading_comments, None);
                     if containers.contains(&decl.kind()) {
                         segments.push(segment);
                         extract_nested(
@@ -379,23 +356,12 @@ pub fn parse_file(
                         segments.push(segment);
                     }
                 } else {
-                    let segment = extract_segment(
-                        &node,
-                        source_bytes,
-                        lang,
-                        &leading_comments,
-                        None,
-                    );
+                    let segment =
+                        extract_segment(&node, source_bytes, lang, &leading_comments, None);
                     segments.push(segment);
                 }
             } else {
-                let segment = extract_segment(
-                    &node,
-                    source_bytes,
-                    lang,
-                    &leading_comments,
-                    None,
-                );
+                let segment = extract_segment(&node, source_bytes, lang, &leading_comments, None);
                 segments.push(segment);
             }
         }
@@ -505,15 +471,9 @@ fn extract_nested(
         if kind == "decorated_definition" {
             if let Some(inner) = find_decorated_inner(&child) {
                 if nested_kinds.contains(&inner.kind()) {
-                    let comments =
-                        collect_leading_comments(search_node, i, comment_kinds, source);
-                    let segment = extract_segment(
-                        &child,
-                        source,
-                        lang,
-                        &comments,
-                        Some(parent_name),
-                    );
+                    let comments = collect_leading_comments(search_node, i, comment_kinds, source);
+                    let segment =
+                        extract_segment(&child, source, lang, &comments, Some(parent_name));
                     segments.push(segment);
                 }
             }
@@ -522,13 +482,7 @@ fn extract_nested(
 
         if nested_kinds.contains(&kind) {
             let comments = collect_leading_comments(search_node, i, comment_kinds, source);
-            let segment = extract_segment(
-                &child,
-                source,
-                lang,
-                &comments,
-                Some(parent_name),
-            );
+            let segment = extract_segment(&child, source, lang, &comments, Some(parent_name));
             segments.push(segment);
         }
     }
@@ -852,7 +806,9 @@ fn collect_defined_symbols_inner(
             _ => {}
         },
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => match kind {
-            "function_declaration" | "class_declaration" | "interface_declaration"
+            "function_declaration"
+            | "class_declaration"
+            | "interface_declaration"
             | "enum_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
@@ -907,8 +863,11 @@ fn collect_defined_symbols_inner(
             _ => {}
         },
         SupportedLanguage::Java => match kind {
-            "class_declaration" | "interface_declaration" | "enum_declaration"
-            | "method_declaration" | "constructor_declaration"
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "method_declaration"
+            | "constructor_declaration"
             | "annotation_type_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
@@ -988,11 +947,7 @@ fn collect_variable_names(node: &Node, source: &[u8], symbols: &mut Vec<String>)
     }
 }
 
-fn collect_referenced_symbols(
-    node: &Node,
-    source: &[u8],
-    lang: SupportedLanguage,
-) -> Vec<String> {
+fn collect_referenced_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
     let mut refs = Vec::new();
     let defined = collect_defined_symbols(node, source, lang);
     walk_references(node, source, lang, &defined, &mut refs);
@@ -1011,10 +966,15 @@ fn walk_references(
     let kind = node.kind();
 
     let is_reference = match lang {
-        SupportedLanguage::Rust => matches!(kind, "identifier" | "type_identifier" | "field_identifier"),
+        SupportedLanguage::Rust => {
+            matches!(kind, "identifier" | "type_identifier" | "field_identifier")
+        }
         SupportedLanguage::Python => kind == "identifier",
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
-            matches!(kind, "identifier" | "type_identifier" | "property_identifier")
+            matches!(
+                kind,
+                "identifier" | "type_identifier" | "property_identifier"
+            )
         }
         SupportedLanguage::Go => kind == "identifier" || kind == "type_identifier",
         SupportedLanguage::Java => kind == "identifier" || kind == "type_identifier",
@@ -1026,7 +986,8 @@ fn walk_references(
     if is_reference {
         if let Ok(text) = node.utf8_text(source) {
             let name = text.to_string();
-            if !defined.contains(&name) && !is_keyword(lang, &name) && !is_builtin_type(lang, &name) {
+            if !defined.contains(&name) && !is_keyword(lang, &name) && !is_builtin_type(lang, &name)
+            {
                 refs.push(name);
             }
         }
@@ -1042,52 +1003,242 @@ fn is_keyword(lang: SupportedLanguage, name: &str) -> bool {
     match lang {
         SupportedLanguage::Rust => matches!(
             name,
-            "self" | "Self" | "super" | "crate" | "pub" | "fn" | "let" | "mut" | "const"
-                | "static" | "if" | "else" | "match" | "for" | "while" | "loop" | "return"
-                | "break" | "continue" | "struct" | "enum" | "trait" | "impl" | "type"
-                | "where" | "use" | "mod" | "as" | "in" | "ref" | "true" | "false"
-                | "async" | "await" | "move" | "dyn" | "unsafe"
+            "self"
+                | "Self"
+                | "super"
+                | "crate"
+                | "pub"
+                | "fn"
+                | "let"
+                | "mut"
+                | "const"
+                | "static"
+                | "if"
+                | "else"
+                | "match"
+                | "for"
+                | "while"
+                | "loop"
+                | "return"
+                | "break"
+                | "continue"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "impl"
+                | "type"
+                | "where"
+                | "use"
+                | "mod"
+                | "as"
+                | "in"
+                | "ref"
+                | "true"
+                | "false"
+                | "async"
+                | "await"
+                | "move"
+                | "dyn"
+                | "unsafe"
         ),
         SupportedLanguage::Python => matches!(
             name,
-            "self" | "cls" | "None" | "True" | "False" | "def" | "class" | "if" | "else"
-                | "elif" | "for" | "while" | "return" | "pass" | "break" | "continue"
-                | "import" | "from" | "as" | "try" | "except" | "finally" | "raise"
-                | "with" | "yield" | "lambda" | "and" | "or" | "not" | "in" | "is"
-                | "global" | "nonlocal" | "assert" | "del"
+            "self"
+                | "cls"
+                | "None"
+                | "True"
+                | "False"
+                | "def"
+                | "class"
+                | "if"
+                | "else"
+                | "elif"
+                | "for"
+                | "while"
+                | "return"
+                | "pass"
+                | "break"
+                | "continue"
+                | "import"
+                | "from"
+                | "as"
+                | "try"
+                | "except"
+                | "finally"
+                | "raise"
+                | "with"
+                | "yield"
+                | "lambda"
+                | "and"
+                | "or"
+                | "not"
+                | "in"
+                | "is"
+                | "global"
+                | "nonlocal"
+                | "assert"
+                | "del"
         ),
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => matches!(
             name,
-            "this" | "super" | "undefined" | "null" | "true" | "false" | "var" | "let"
-                | "const" | "function" | "class" | "if" | "else" | "for" | "while" | "do"
-                | "switch" | "case" | "break" | "continue" | "return" | "throw" | "try"
-                | "catch" | "finally" | "new" | "delete" | "typeof" | "instanceof" | "void"
-                | "in" | "of" | "import" | "export" | "default" | "async" | "await" | "yield"
+            "this"
+                | "super"
+                | "undefined"
+                | "null"
+                | "true"
+                | "false"
+                | "var"
+                | "let"
+                | "const"
+                | "function"
+                | "class"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "break"
+                | "continue"
+                | "return"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "new"
+                | "delete"
+                | "typeof"
+                | "instanceof"
+                | "void"
+                | "in"
+                | "of"
+                | "import"
+                | "export"
+                | "default"
+                | "async"
+                | "await"
+                | "yield"
         ),
         SupportedLanguage::Go => matches!(
             name,
-            "nil" | "true" | "false" | "iota" | "func" | "var" | "const" | "type" | "struct"
-                | "interface" | "map" | "chan" | "if" | "else" | "for" | "range" | "switch"
-                | "case" | "default" | "return" | "break" | "continue" | "goto" | "go"
-                | "defer" | "select" | "package" | "import" | "fallthrough"
+            "nil"
+                | "true"
+                | "false"
+                | "iota"
+                | "func"
+                | "var"
+                | "const"
+                | "type"
+                | "struct"
+                | "interface"
+                | "map"
+                | "chan"
+                | "if"
+                | "else"
+                | "for"
+                | "range"
+                | "switch"
+                | "case"
+                | "default"
+                | "return"
+                | "break"
+                | "continue"
+                | "goto"
+                | "go"
+                | "defer"
+                | "select"
+                | "package"
+                | "import"
+                | "fallthrough"
         ),
         SupportedLanguage::Java => matches!(
             name,
-            "this" | "super" | "null" | "true" | "false" | "void" | "class" | "interface"
-                | "enum" | "extends" | "implements" | "if" | "else" | "for" | "while" | "do"
-                | "switch" | "case" | "break" | "continue" | "return" | "throw" | "try"
-                | "catch" | "finally" | "new" | "instanceof" | "import" | "package"
-                | "public" | "private" | "protected" | "static" | "final" | "abstract"
-                | "synchronized" | "volatile" | "transient" | "native"
+            "this"
+                | "super"
+                | "null"
+                | "true"
+                | "false"
+                | "void"
+                | "class"
+                | "interface"
+                | "enum"
+                | "extends"
+                | "implements"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "break"
+                | "continue"
+                | "return"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "new"
+                | "instanceof"
+                | "import"
+                | "package"
+                | "public"
+                | "private"
+                | "protected"
+                | "static"
+                | "final"
+                | "abstract"
+                | "synchronized"
+                | "volatile"
+                | "transient"
+                | "native"
         ),
         SupportedLanguage::C | SupportedLanguage::Cpp => matches!(
             name,
-            "NULL" | "void" | "if" | "else" | "for" | "while" | "do" | "switch" | "case"
-                | "break" | "continue" | "return" | "sizeof" | "typedef" | "struct" | "enum"
-                | "union" | "static" | "extern" | "const" | "volatile" | "register" | "auto"
-                | "goto" | "default" | "inline" | "this" | "class" | "namespace" | "template"
-                | "virtual" | "override" | "public" | "private" | "protected" | "new"
-                | "delete" | "throw" | "try" | "catch" | "true" | "false" | "nullptr"
+            "NULL"
+                | "void"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "break"
+                | "continue"
+                | "return"
+                | "sizeof"
+                | "typedef"
+                | "struct"
+                | "enum"
+                | "union"
+                | "static"
+                | "extern"
+                | "const"
+                | "volatile"
+                | "register"
+                | "auto"
+                | "goto"
+                | "default"
+                | "inline"
+                | "this"
+                | "class"
+                | "namespace"
+                | "template"
+                | "virtual"
+                | "override"
+                | "public"
+                | "private"
+                | "protected"
+                | "new"
+                | "delete"
+                | "throw"
+                | "try"
+                | "catch"
+                | "true"
+                | "false"
+                | "nullptr"
         ),
     }
 }
@@ -1096,52 +1247,224 @@ fn is_builtin_type(lang: SupportedLanguage, name: &str) -> bool {
     match lang {
         SupportedLanguage::Rust => matches!(
             name,
-            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-                | "u128" | "usize" | "f32" | "f64" | "bool" | "char" | "str" | "String"
-                | "Vec" | "Option" | "Result" | "Box" | "Rc" | "Arc"
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "bool"
+                | "char"
+                | "str"
+                | "String"
+                | "Vec"
+                | "Option"
+                | "Result"
+                | "Box"
+                | "Rc"
+                | "Arc"
         ),
         SupportedLanguage::Python => matches!(
             name,
-            "int" | "float" | "str" | "bool" | "list" | "dict" | "set" | "tuple" | "bytes"
-                | "type" | "object" | "range" | "print" | "len" | "enumerate" | "zip"
-                | "map" | "filter" | "sorted" | "reversed" | "any" | "all" | "sum" | "min"
-                | "max" | "abs" | "round" | "isinstance" | "issubclass" | "hasattr"
-                | "getattr" | "setattr" | "super" | "property" | "staticmethod"
-                | "classmethod" | "Exception"
+            "int"
+                | "float"
+                | "str"
+                | "bool"
+                | "list"
+                | "dict"
+                | "set"
+                | "tuple"
+                | "bytes"
+                | "type"
+                | "object"
+                | "range"
+                | "print"
+                | "len"
+                | "enumerate"
+                | "zip"
+                | "map"
+                | "filter"
+                | "sorted"
+                | "reversed"
+                | "any"
+                | "all"
+                | "sum"
+                | "min"
+                | "max"
+                | "abs"
+                | "round"
+                | "isinstance"
+                | "issubclass"
+                | "hasattr"
+                | "getattr"
+                | "setattr"
+                | "super"
+                | "property"
+                | "staticmethod"
+                | "classmethod"
+                | "Exception"
         ),
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => matches!(
             name,
-            "string" | "number" | "boolean" | "object" | "symbol" | "bigint" | "any" | "void"
-                | "never" | "unknown" | "undefined" | "null" | "Array" | "Object" | "String"
-                | "Number" | "Boolean" | "Map" | "Set" | "Promise" | "Date" | "RegExp"
-                | "Error" | "console" | "Math" | "JSON" | "parseInt" | "parseFloat"
-                | "isNaN" | "isFinite" | "Infinity" | "NaN" | "globalThis" | "window"
-                | "document" | "setTimeout" | "setInterval" | "clearTimeout"
-                | "clearInterval" | "require" | "module" | "exports" | "process"
+            "string"
+                | "number"
+                | "boolean"
+                | "object"
+                | "symbol"
+                | "bigint"
+                | "any"
+                | "void"
+                | "never"
+                | "unknown"
+                | "undefined"
+                | "null"
+                | "Array"
+                | "Object"
+                | "String"
+                | "Number"
+                | "Boolean"
+                | "Map"
+                | "Set"
+                | "Promise"
+                | "Date"
+                | "RegExp"
+                | "Error"
+                | "console"
+                | "Math"
+                | "JSON"
+                | "parseInt"
+                | "parseFloat"
+                | "isNaN"
+                | "isFinite"
+                | "Infinity"
+                | "NaN"
+                | "globalThis"
+                | "window"
+                | "document"
+                | "setTimeout"
+                | "setInterval"
+                | "clearTimeout"
+                | "clearInterval"
+                | "require"
+                | "module"
+                | "exports"
+                | "process"
         ),
         SupportedLanguage::Go => matches!(
             name,
-            "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16"
-                | "uint32" | "uint64" | "uintptr" | "float32" | "float64" | "complex64"
-                | "complex128" | "bool" | "string" | "byte" | "rune" | "error" | "any"
-                | "comparable" | "make" | "len" | "cap" | "append" | "copy" | "close"
-                | "delete" | "new" | "panic" | "recover" | "print" | "println" | "fmt"
+            "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+                | "float32"
+                | "float64"
+                | "complex64"
+                | "complex128"
+                | "bool"
+                | "string"
+                | "byte"
+                | "rune"
+                | "error"
+                | "any"
+                | "comparable"
+                | "make"
+                | "len"
+                | "cap"
+                | "append"
+                | "copy"
+                | "close"
+                | "delete"
+                | "new"
+                | "panic"
+                | "recover"
+                | "print"
+                | "println"
+                | "fmt"
         ),
         SupportedLanguage::Java => matches!(
             name,
-            "int" | "long" | "short" | "byte" | "float" | "double" | "boolean" | "char"
-                | "String" | "Integer" | "Long" | "Short" | "Byte" | "Float" | "Double"
-                | "Boolean" | "Character" | "Object" | "System" | "Math" | "Override"
-                | "Deprecated" | "SuppressWarnings" | "FunctionalInterface"
+            "int"
+                | "long"
+                | "short"
+                | "byte"
+                | "float"
+                | "double"
+                | "boolean"
+                | "char"
+                | "String"
+                | "Integer"
+                | "Long"
+                | "Short"
+                | "Byte"
+                | "Float"
+                | "Double"
+                | "Boolean"
+                | "Character"
+                | "Object"
+                | "System"
+                | "Math"
+                | "Override"
+                | "Deprecated"
+                | "SuppressWarnings"
+                | "FunctionalInterface"
         ),
         SupportedLanguage::C | SupportedLanguage::Cpp => matches!(
             name,
-            "int" | "long" | "short" | "char" | "float" | "double" | "unsigned" | "signed"
-                | "size_t" | "ssize_t" | "ptrdiff_t" | "int8_t" | "int16_t" | "int32_t"
-                | "int64_t" | "uint8_t" | "uint16_t" | "uint32_t" | "uint64_t" | "bool"
-                | "string" | "vector" | "map" | "set" | "list" | "deque" | "queue" | "stack"
-                | "pair" | "tuple" | "shared_ptr" | "unique_ptr" | "weak_ptr" | "optional"
-                | "variant" | "any" | "cout" | "cerr" | "cin" | "endl" | "std"
+            "int"
+                | "long"
+                | "short"
+                | "char"
+                | "float"
+                | "double"
+                | "unsigned"
+                | "signed"
+                | "size_t"
+                | "ssize_t"
+                | "ptrdiff_t"
+                | "int8_t"
+                | "int16_t"
+                | "int32_t"
+                | "int64_t"
+                | "uint8_t"
+                | "uint16_t"
+                | "uint32_t"
+                | "uint64_t"
+                | "bool"
+                | "string"
+                | "vector"
+                | "map"
+                | "set"
+                | "list"
+                | "deque"
+                | "queue"
+                | "stack"
+                | "pair"
+                | "tuple"
+                | "shared_ptr"
+                | "unique_ptr"
+                | "weak_ptr"
+                | "optional"
+                | "variant"
+                | "any"
+                | "cout"
+                | "cerr"
+                | "cin"
+                | "endl"
+                | "std"
         ),
     }
 }
@@ -1192,8 +1515,12 @@ fn main() {
             .filter(|s| s.breadcrumb.is_some() && s.block_type == "function")
             .collect();
         assert_eq!(nested_fns.len(), 2);
-        assert!(nested_fns.iter().any(|s| s.defined_symbols.contains(&"new".to_string())));
-        assert!(nested_fns.iter().any(|s| s.defined_symbols.contains(&"distance".to_string())));
+        assert!(nested_fns
+            .iter()
+            .any(|s| s.defined_symbols.contains(&"new".to_string())));
+        assert!(nested_fns
+            .iter()
+            .any(|s| s.defined_symbols.contains(&"distance".to_string())));
 
         let main_seg = segments
             .iter()
@@ -1221,8 +1548,15 @@ fn complex(x: i32) -> i32 {
 }
 "#;
         let segments = parse_file(source, "rust").unwrap();
-        let func = segments.iter().find(|s| s.block_type == "function").unwrap();
-        assert!(func.complexity >= 3, "expected complexity >= 3, got {}", func.complexity);
+        let func = segments
+            .iter()
+            .find(|s| s.block_type == "function")
+            .unwrap();
+        assert!(
+            func.complexity >= 3,
+            "expected complexity >= 3, got {}",
+            func.complexity
+        );
     }
 
     #[test]
@@ -1249,12 +1583,17 @@ class Calculator:
 "#;
         let segments = parse_file(source, "python").unwrap();
 
-        let imports: Vec<_> = segments.iter().filter(|s| s.block_type == "import").collect();
+        let imports: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "import")
+            .collect();
         assert_eq!(imports.len(), 2);
         assert_eq!(imports[0].role, SegmentRole::Import);
 
         let class_seg = segments.iter().find(|s| s.block_type == "class").unwrap();
-        assert!(class_seg.defined_symbols.contains(&"Calculator".to_string()));
+        assert!(class_seg
+            .defined_symbols
+            .contains(&"Calculator".to_string()));
         assert_eq!(class_seg.role, SegmentRole::Definition);
 
         let methods: Vec<_> = segments
@@ -1299,14 +1638,21 @@ export type Status = 'active' | 'inactive';
 
         let func_seg = segments
             .iter()
-            .find(|s| s.block_type == "function" && s.defined_symbols.contains(&"greet".to_string()) && s.breadcrumb.is_none())
+            .find(|s| {
+                s.block_type == "function"
+                    && s.defined_symbols.contains(&"greet".to_string())
+                    && s.breadcrumb.is_none()
+            })
             .unwrap();
         assert_eq!(func_seg.role, SegmentRole::Implementation);
 
         let class_seg = segments.iter().find(|s| s.block_type == "class").unwrap();
         assert!(class_seg.defined_symbols.contains(&"Greeter".to_string()));
 
-        let iface_seg = segments.iter().find(|s| s.block_type == "interface").unwrap();
+        let iface_seg = segments
+            .iter()
+            .find(|s| s.block_type == "interface")
+            .unwrap();
         assert!(iface_seg.defined_symbols.contains(&"Config".to_string()));
 
         let type_seg = segments.iter().find(|s| s.block_type == "type").unwrap();
@@ -1345,8 +1691,12 @@ func (p Point) Distance(other Point) float64 {
             .filter(|s| s.block_type == "function")
             .collect();
         assert_eq!(funcs.len(), 2);
-        assert!(funcs.iter().any(|f| f.defined_symbols.contains(&"NewPoint".to_string())));
-        assert!(funcs.iter().any(|f| f.defined_symbols.contains(&"Distance".to_string())));
+        assert!(funcs
+            .iter()
+            .any(|f| f.defined_symbols.contains(&"NewPoint".to_string())));
+        assert!(funcs
+            .iter()
+            .any(|f| f.defined_symbols.contains(&"Distance".to_string())));
     }
 
     #[test]
@@ -1373,7 +1723,9 @@ public class Calculator {
         assert_eq!(import_seg.role, SegmentRole::Import);
 
         let class_seg = segments.iter().find(|s| s.block_type == "class").unwrap();
-        assert!(class_seg.defined_symbols.contains(&"Calculator".to_string()));
+        assert!(class_seg
+            .defined_symbols
+            .contains(&"Calculator".to_string()));
 
         let methods: Vec<_> = segments
             .iter()
@@ -1418,8 +1770,12 @@ int main() {
             .filter(|s| s.block_type == "function")
             .collect();
         assert_eq!(funcs.len(), 2);
-        assert!(funcs.iter().any(|f| f.defined_symbols.contains(&"distance".to_string())));
-        assert!(funcs.iter().any(|f| f.defined_symbols.contains(&"main".to_string())));
+        assert!(funcs
+            .iter()
+            .any(|f| f.defined_symbols.contains(&"distance".to_string())));
+        assert!(funcs
+            .iter()
+            .any(|f| f.defined_symbols.contains(&"main".to_string())));
     }
 
     #[test]
@@ -1463,7 +1819,10 @@ fn process(data: Vec<Item>) -> Result<Output, Error> {
 }
 "#;
         let segments = parse_file(source, "rust").unwrap();
-        let func = segments.iter().find(|s| s.block_type == "function").unwrap();
+        let func = segments
+            .iter()
+            .find(|s| s.block_type == "function")
+            .unwrap();
         assert!(func.referenced_symbols.contains(&"Item".to_string()));
         assert!(func.referenced_symbols.contains(&"Output".to_string()));
         assert!(func.referenced_symbols.contains(&"Error".to_string()));
@@ -1482,7 +1841,10 @@ fn add(a: i32, b: i32) -> i32 {
 }
 "#;
         let segments = parse_file(source, "rust").unwrap();
-        let func = segments.iter().find(|s| s.block_type == "function").unwrap();
+        let func = segments
+            .iter()
+            .find(|s| s.block_type == "function")
+            .unwrap();
         assert!(func.content.contains("Adds two numbers together"));
         assert!(func.content.contains("Returns the sum"));
     }

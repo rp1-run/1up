@@ -22,7 +22,10 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
     let fmt = formatter_for(format);
     println!(
         "{}",
-        fmt.format_message(&format!("symbol lookup for '{}': not yet implemented", args.name))
+        fmt.format_message(&format!(
+            "symbol lookup for '{}': not yet implemented",
+            args.name
+        ))
     );
     Ok(())
 }

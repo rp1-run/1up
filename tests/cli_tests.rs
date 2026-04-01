@@ -7,21 +7,17 @@ fn cmd() -> Command {
 
 #[test]
 fn help_shows_all_subcommands() {
-    cmd()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("init")
-                .and(predicate::str::contains("start"))
-                .and(predicate::str::contains("stop"))
-                .and(predicate::str::contains("status"))
-                .and(predicate::str::contains("symbol"))
-                .and(predicate::str::contains("search"))
-                .and(predicate::str::contains("context"))
-                .and(predicate::str::contains("index"))
-                .and(predicate::str::contains("reindex")),
-        );
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("init")
+            .and(predicate::str::contains("start"))
+            .and(predicate::str::contains("stop"))
+            .and(predicate::str::contains("status"))
+            .and(predicate::str::contains("symbol"))
+            .and(predicate::str::contains("search"))
+            .and(predicate::str::contains("context"))
+            .and(predicate::str::contains("index"))
+            .and(predicate::str::contains("reindex")),
+    );
 }
 
 #[test]
@@ -49,10 +45,7 @@ fn subcommand_help_works() {
 #[test]
 fn format_flag_accepts_all_variants() {
     for fmt in &["json", "human", "plain"] {
-        cmd()
-            .args(["--format", fmt, "--help"])
-            .assert()
-            .success();
+        cmd().args(["--format", fmt, "--help"]).assert().success();
     }
 }
 
@@ -109,8 +102,5 @@ fn json_output_is_valid_json() {
 
 #[test]
 fn verbose_flag_accepted() {
-    cmd()
-        .args(["-vv", "--help"])
-        .assert()
-        .success();
+    cmd().args(["-vv", "--help"]).assert().success();
 }
