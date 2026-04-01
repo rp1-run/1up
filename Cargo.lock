@@ -2189,6 +2189,7 @@ dependencies = [
  "futures-util",
  "ignore",
  "indicatif",
+ "libc",
  "libsql",
  "nix",
  "notify",
