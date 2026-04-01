@@ -15,6 +15,7 @@ pub enum SupportedLanguage {
     Java,
     C,
     Cpp,
+    Kotlin,
 }
 
 impl SupportedLanguage {
@@ -28,6 +29,7 @@ impl SupportedLanguage {
             "java" => Some(Self::Java),
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -42,6 +44,7 @@ impl SupportedLanguage {
             Self::Java => "java",
             Self::C => "c",
             Self::Cpp => "cpp",
+            Self::Kotlin => "kotlin",
         }
     }
 
@@ -55,6 +58,7 @@ impl SupportedLanguage {
             Self::Java => tree_sitter_java::LANGUAGE,
             Self::C => tree_sitter_c::LANGUAGE,
             Self::Cpp => tree_sitter_cpp::LANGUAGE,
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
         }
     }
 
@@ -128,6 +132,14 @@ impl SupportedLanguage {
                 "preproc_include",
                 "preproc_def",
             ],
+            Self::Kotlin => &[
+                "function_declaration",
+                "class_declaration",
+                "object_declaration",
+                "property_declaration",
+                "import_header",
+                "type_alias",
+            ],
         }
     }
 
@@ -147,6 +159,11 @@ impl SupportedLanguage {
                 "class_specifier",
                 "struct_specifier",
                 "namespace_definition",
+            ],
+            Self::Kotlin => &[
+                "class_declaration",
+                "object_declaration",
+                "companion_object",
             ],
         }
     }
@@ -168,6 +185,11 @@ impl SupportedLanguage {
             ],
             Self::C => &[],
             Self::Cpp => &["function_definition", "field_declaration", "declaration"],
+            Self::Kotlin => &[
+                "function_declaration",
+                "property_declaration",
+                "companion_object",
+            ],
         }
     }
 
@@ -179,6 +201,7 @@ impl SupportedLanguage {
             Self::Go => &["import_declaration"],
             Self::Java => &["import_declaration"],
             Self::C | Self::Cpp => &["preproc_include"],
+            Self::Kotlin => &["import_header"],
         }
     }
 
@@ -190,6 +213,7 @@ impl SupportedLanguage {
             Self::Go => &["comment"],
             Self::Java => &["line_comment", "block_comment"],
             Self::C | Self::Cpp => &["comment"],
+            Self::Kotlin => &["line_comment", "multiline_comment"],
         }
     }
 
@@ -250,6 +274,15 @@ impl SupportedLanguage {
                 "switch_statement",
                 "conditional_expression",
             ],
+            Self::Kotlin => &[
+                "if_expression",
+                "when_expression",
+                "for_statement",
+                "while_statement",
+                "do_while_statement",
+                "try_expression",
+                "lambda_literal",
+            ],
         }
     }
 }
@@ -269,6 +302,7 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
             "java" => Some(SupportedLanguage::Java),
             "c" => Some(SupportedLanguage::C),
             "cpp" => Some(SupportedLanguage::Cpp),
+            "kotlin" => Some(SupportedLanguage::Kotlin),
             _ => None,
         })
         .ok_or_else(|| ParserError::UnsupportedLanguage(language.to_string()))?;
@@ -378,6 +412,7 @@ pub fn is_language_supported(language: &str) -> bool {
         || matches!(
             language,
             "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
+            | "kotlin"
         )
 }
 
@@ -500,6 +535,7 @@ fn find_body_node<'a>(node: &Node<'a>, lang: SupportedLanguage) -> Option<Node<'
         SupportedLanguage::Java => node.child_by_field_name("body"),
         SupportedLanguage::Go => None,
         SupportedLanguage::C | SupportedLanguage::Cpp => node.child_by_field_name("body"),
+        SupportedLanguage::Kotlin => node.child_by_field_name("body"),
     }
 }
 
@@ -628,6 +664,16 @@ fn classify_block_type(node: &Node, lang: SupportedLanguage) -> String {
             "preproc_def" => "macro",
             _ => kind,
         },
+        SupportedLanguage::Kotlin => match kind {
+            "function_declaration" => "function",
+            "class_declaration" => "class",
+            "object_declaration" => "class",
+            "property_declaration" => "variable",
+            "import_header" => "import",
+            "type_alias" => "type",
+            "companion_object" => "class",
+            _ => kind,
+        },
     }
     .to_string()
 }
@@ -729,6 +775,12 @@ fn classify_role(node: &Node, lang: SupportedLanguage) -> SegmentRole {
                 SegmentRole::Definition
             }
             "namespace_definition" => SegmentRole::Orchestration,
+            _ => SegmentRole::Definition,
+        },
+        SupportedLanguage::Kotlin => match kind {
+            "function_declaration" => SegmentRole::Implementation,
+            "class_declaration" | "object_declaration" | "type_alias" => SegmentRole::Definition,
+            "property_declaration" => SegmentRole::Definition,
             _ => SegmentRole::Definition,
         },
     }
@@ -908,6 +960,32 @@ fn collect_defined_symbols_inner(
             }
             _ => {}
         },
+        SupportedLanguage::Kotlin => match kind {
+            "function_declaration"
+            | "class_declaration"
+            | "object_declaration"
+            | "type_alias" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source) {
+                        symbols.push(text.to_string());
+                    }
+                }
+            }
+            "property_declaration" => {
+                // Kotlin properties use variable_declaration children
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "variable_declaration" {
+                        if let Some(name) = child.child_by_field_name("name") {
+                            if let Ok(text) = name.utf8_text(source) {
+                                symbols.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -989,6 +1067,9 @@ fn walk_references(
         SupportedLanguage::C | SupportedLanguage::Cpp => {
             matches!(kind, "identifier" | "type_identifier" | "field_identifier")
         }
+        SupportedLanguage::Kotlin => {
+            matches!(kind, "simple_identifier" | "type_identifier")
+        }
     };
 
     if is_reference {
@@ -1054,6 +1135,10 @@ fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> O
             _ => None,
         },
         SupportedLanguage::C | SupportedLanguage::Cpp => match node.kind() {
+            "call_expression" => extract_child_text(node, source, &["function"]),
+            _ => None,
+        },
+        SupportedLanguage::Kotlin => match node.kind() {
             "call_expression" => extract_child_text(node, source, &["function"]),
             _ => None,
         },
@@ -1402,6 +1487,57 @@ fn is_keyword(lang: SupportedLanguage, name: &str) -> bool {
                 | "false"
                 | "nullptr"
         ),
+        SupportedLanguage::Kotlin => matches!(
+            name,
+            "this"
+                | "super"
+                | "null"
+                | "true"
+                | "false"
+                | "fun"
+                | "val"
+                | "var"
+                | "class"
+                | "object"
+                | "interface"
+                | "if"
+                | "else"
+                | "when"
+                | "for"
+                | "while"
+                | "do"
+                | "return"
+                | "break"
+                | "continue"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "import"
+                | "package"
+                | "is"
+                | "as"
+                | "in"
+                | "typealias"
+                | "companion"
+                | "data"
+                | "sealed"
+                | "enum"
+                | "abstract"
+                | "open"
+                | "override"
+                | "private"
+                | "protected"
+                | "public"
+                | "internal"
+                | "suspend"
+                | "inline"
+                | "operator"
+                | "infix"
+                | "lateinit"
+                | "by"
+                | "it"
+        ),
     }
 }
 
@@ -1627,6 +1763,40 @@ fn is_builtin_type(lang: SupportedLanguage, name: &str) -> bool {
                 | "cin"
                 | "endl"
                 | "std"
+        ),
+        SupportedLanguage::Kotlin => matches!(
+            name,
+            "Int"
+                | "Long"
+                | "Short"
+                | "Byte"
+                | "Float"
+                | "Double"
+                | "Boolean"
+                | "Char"
+                | "String"
+                | "Unit"
+                | "Nothing"
+                | "Any"
+                | "Array"
+                | "List"
+                | "Map"
+                | "Set"
+                | "MutableList"
+                | "MutableMap"
+                | "MutableSet"
+                | "Pair"
+                | "Triple"
+                | "Sequence"
+                | "Comparable"
+                | "Iterable"
+                | "Collection"
+                | "println"
+                | "print"
+                | "require"
+                | "check"
+                | "error"
+                | "TODO"
         ),
     }
 }

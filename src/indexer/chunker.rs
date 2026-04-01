@@ -17,7 +17,7 @@ fn language_from_extension(ext: &str) -> String {
         "rb" => "ruby".into(),
         "php" => "php".into(),
         "swift" => "swift".into(),
-        "kt" | "kts" => "kotlin".into(),
+        // "kt" | "kts" handled by tree-sitter (SupportedLanguage::Kotlin)
         "r" | "R" => "r".into(),
         "scala" => "scala".into(),
         "ex" | "exs" => "elixir".into(),

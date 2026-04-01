@@ -114,6 +114,13 @@ const SCOPE_NODE_KINDS: &[&[&str]] = &[
         "struct_specifier",
         "namespace_definition",
     ],
+    // Kotlin
+    &[
+        "function_declaration",
+        "class_declaration",
+        "object_declaration",
+        "companion_object",
+    ],
 ];
 
 fn scope_kinds_for(lang: SupportedLanguage) -> &'static [&'static str] {
@@ -125,6 +132,7 @@ fn scope_kinds_for(lang: SupportedLanguage) -> &'static [&'static str] {
         SupportedLanguage::Java => SCOPE_NODE_KINDS[4],
         SupportedLanguage::C => SCOPE_NODE_KINDS[5],
         SupportedLanguage::Cpp => SCOPE_NODE_KINDS[6],
+        SupportedLanguage::Kotlin => SCOPE_NODE_KINDS[7],
     }
 }
 
@@ -250,6 +258,13 @@ fn classify_scope_type(kind: &str, lang: SupportedLanguage) -> String {
             "class_specifier" => "class",
             "struct_specifier" => "struct",
             "namespace_definition" => "namespace",
+            _ => kind,
+        },
+        SupportedLanguage::Kotlin => match kind {
+            "function_declaration" => "function",
+            "class_declaration" => "class",
+            "object_declaration" => "object",
+            "companion_object" => "companion",
             _ => kind,
         },
     }
