@@ -103,9 +103,9 @@ pub async fn ensure_compatible(conn: &Connection) -> Result<(), OneupError> {
             "index schema v{v} is newer than this binary supports (expected v{SCHEMA_VERSION}); rebuild or upgrade `1up`"
         ))
         .into()),
-        None => Err(StorageError::Migration(format!(
-            "index schema is missing or unreadable; run `1up reindex`"
-        ))
+        None => Err(StorageError::Migration(
+            "index schema is missing or unreadable; run `1up reindex`".to_string(),
+        )
         .into()),
     }
 }

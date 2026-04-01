@@ -75,6 +75,7 @@ impl<'a> StructuralSearchEngine<'a> {
             SupportedLanguage::Java,
             SupportedLanguage::C,
             SupportedLanguage::Cpp,
+            SupportedLanguage::Kotlin,
         ];
 
         match filter {

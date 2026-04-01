@@ -296,7 +296,7 @@ async fn symbol_search(
         }
     }
 
-    matches.sort_by(|a, b| symbol_sort_key(a, query).cmp(&symbol_sort_key(b, query)));
+    matches.sort_by_key(|a| symbol_sort_key(a, query));
 
     let mut deduped = Vec::new();
     let mut seen = std::collections::HashSet::new();
