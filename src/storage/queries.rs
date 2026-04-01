@@ -7,8 +7,8 @@ CREATE TABLE IF NOT EXISTS segments (
     content TEXT NOT NULL,
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
-    embedding F32_BLOB(384),
-    embedding_q8 VECTOR8(384),
+    embedding BLOB,
+    embedding_q8 BLOB,
     complexity INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'DEFINITION',
     defined_symbols TEXT NOT NULL DEFAULT '[]',
@@ -44,7 +44,7 @@ INSERT OR REPLACE INTO segments (
     file_hash, created_at, updated_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5,
-    ?6, ?7, ?8, ?9,
+    ?6, ?7, CASE WHEN ?8 IS NULL THEN NULL ELSE vector32(?8) END, CASE WHEN ?9 IS NULL THEN NULL ELSE vector8(?9) END,
     ?10, ?11, ?12, ?13,
     ?14, datetime('now'), datetime('now')
 )";

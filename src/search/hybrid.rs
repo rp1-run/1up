@@ -65,7 +65,7 @@ async fn vector_search(
     query: &str,
 ) -> Result<Vec<SearchResult>, OneupError> {
     let query_embedding = embedder.embed_one(query)?;
-    let query_q8_bytes = f32_to_q8_bytes(&query_embedding);
+    let query_q8_json = f32_to_q8_json(&query_embedding);
 
     let prefilter_k = VECTOR_PREFILTER_K as i64;
 
@@ -74,12 +74,12 @@ async fn vector_search(
             "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
                     s.line_start, s.line_end, s.role, s.defined_symbols,
                     s.referenced_symbols,
-                    vector_distance_cos(s.embedding_q8, ?1) as distance
+                    vector_distance_cos(s.embedding_q8, vector8(?1)) as distance
              FROM segments s
              WHERE s.embedding_q8 IS NOT NULL
              ORDER BY distance ASC
              LIMIT ?2",
-            turso::params![turso::Value::Blob(query_q8_bytes), prefilter_k],
+            turso::params![query_q8_json, prefilter_k],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("int8 prefilter: {e}")))?;
@@ -132,16 +132,16 @@ async fn rerank_f32(
     ids: &[String],
     query_embedding: &[f32],
 ) -> Result<Vec<(String, f64)>, OneupError> {
-    let query_vec_bytes = f32_vec_to_bytes(query_embedding);
+    let query_vec_json = f32_to_json_array(query_embedding);
     let mut results = Vec::new();
 
     for id in ids {
         let mut rows = conn
             .query(
-                "SELECT vector_distance_cos(embedding, ?1) as distance
+                "SELECT vector_distance_cos(embedding, vector32(?1)) as distance
                  FROM segments
                  WHERE id = ?2 AND embedding IS NOT NULL",
-                turso::params![turso::Value::Blob(query_vec_bytes.clone()), id.clone()],
+                turso::params![query_vec_json.clone(), id.clone()],
             )
             .await
             .map_err(|e| SearchError::QueryFailed(format!("f32 rerank: {e}")))?;
@@ -275,15 +275,12 @@ fn build_fts_query(query: &str) -> String {
         .join(" OR ")
 }
 
-fn f32_vec_to_bytes(vec: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vec.len() * 4);
-    for &val in vec {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
+fn f32_to_json_array(vec: &[f32]) -> String {
+    let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
+    format!("[{}]", parts.join(","))
 }
 
-fn f32_to_q8_bytes(vec: &[f32]) -> Vec<u8> {
+fn f32_to_q8_json(vec: &[f32]) -> String {
     let max_abs = vec
         .iter()
         .map(|v| v.abs())
@@ -291,7 +288,8 @@ fn f32_to_q8_bytes(vec: &[f32]) -> Vec<u8> {
         .max(1e-10);
 
     let scale = 127.0 / max_abs;
-    vec.iter().map(|v| (v * scale) as i8 as u8).collect()
+    let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
+    format!("[{}]", parts.join(","))
 }
 
 #[cfg(test)]
@@ -323,33 +321,23 @@ mod tests {
     }
 
     #[test]
-    fn q8_quantization_produces_correct_length() {
+    fn q8_json_produces_correct_format() {
         let vec = vec![0.1f32, -0.5, 0.3, 0.0, 1.0];
-        let q8 = f32_to_q8_bytes(&vec);
-        assert_eq!(q8.len(), vec.len());
+        let json = f32_to_q8_json(&vec);
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        let parsed: Vec<u8> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), vec.len());
     }
 
     #[test]
-    fn q8_quantization_matches_pipeline() {
-        let vec = vec![0.5f32, -1.0, 0.0, 0.25, -0.75];
-        let q8 = f32_to_q8_bytes(&vec);
-        let max_abs = 1.0f32;
-        let scale = 127.0 / max_abs;
-        let expected: Vec<u8> = vec.iter().map(|v| (v * scale) as i8 as u8).collect();
-        assert_eq!(q8, expected);
-    }
-
-    #[test]
-    fn f32_to_bytes_roundtrip() {
+    fn f32_json_array_format() {
         let vec = vec![1.0f32, 2.0, 3.0];
-        let bytes = f32_vec_to_bytes(&vec);
-        assert_eq!(bytes.len(), 12);
-
-        let reconstructed: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        assert_eq!(reconstructed, vec);
+        let json = f32_to_json_array(&vec);
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        let parsed: Vec<f32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, vec);
     }
 
     #[tokio::test]

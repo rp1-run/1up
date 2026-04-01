@@ -58,8 +58,8 @@ pub struct SegmentInsert {
     pub content: String,
     pub line_start: i64,
     pub line_end: i64,
-    pub embedding: Option<Vec<u8>>,
-    pub embedding_q8: Option<Vec<u8>>,
+    pub embedding: Option<String>,
+    pub embedding_q8: Option<String>,
     pub complexity: i64,
     pub role: String,
     pub defined_symbols: String,
@@ -72,12 +72,12 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
     let embedding = seg
         .embedding
         .as_ref()
-        .map(|v| turso::Value::Blob(v.clone()))
+        .map(|v| turso::Value::Text(v.clone()))
         .unwrap_or(turso::Value::Null);
     let embedding_q8 = seg
         .embedding_q8
         .as_ref()
-        .map(|v| turso::Value::Blob(v.clone()))
+        .map(|v| turso::Value::Text(v.clone()))
         .unwrap_or(turso::Value::Null);
 
     conn.execute(

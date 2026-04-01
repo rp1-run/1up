@@ -38,7 +38,7 @@ pub const DAEMON_IDLE_TIMEOUT_SECS: u64 = 1800;
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
 /// Schema version for database migrations.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// ONNX model filename.
 pub const MODEL_FILENAME: &str = "model.onnx";

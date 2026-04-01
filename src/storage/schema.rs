@@ -73,8 +73,14 @@ pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
             initialize(conn).await?;
         }
         Some(v) if v < SCHEMA_VERSION => {
-            // Future migrations go here, applied incrementally.
-            set_schema_version(conn, SCHEMA_VERSION).await?;
+            // Drop and recreate to handle schema changes (e.g. libsql -> turso FTS migration)
+            conn.execute("DROP TABLE IF EXISTS segments", ())
+                .await
+                .map_err(|e| StorageError::Migration(format!("drop segments: {e}")))?;
+            conn.execute("DROP TABLE IF EXISTS meta", ())
+                .await
+                .map_err(|e| StorageError::Migration(format!("drop meta: {e}")))?;
+            initialize(conn).await?;
         }
         Some(_) => {}
     }

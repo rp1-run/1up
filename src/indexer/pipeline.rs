@@ -31,11 +31,12 @@ fn generate_segment_id(file_path: &str, line_start: usize, line_end: usize) -> S
         .to_string()
 }
 
-fn f32_to_bytes(vec: &[f32]) -> Vec<u8> {
-    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+fn f32_to_json_array(vec: &[f32]) -> String {
+    let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
+    format!("[{}]", parts.join(","))
 }
 
-fn f32_to_q8_bytes(vec: &[f32]) -> Vec<u8> {
+fn f32_to_q8_json_array(vec: &[f32]) -> String {
     let max_abs = vec
         .iter()
         .map(|v| v.abs())
@@ -43,7 +44,8 @@ fn f32_to_q8_bytes(vec: &[f32]) -> Vec<u8> {
         .max(1e-10);
 
     let scale = 127.0 / max_abs;
-    vec.iter().map(|v| (v * scale) as i8 as u8).collect()
+    let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
+    format!("[{}]", parts.join(","))
 }
 
 /// Statistics returned after a pipeline run.
@@ -209,8 +211,8 @@ pub async fn run(
 
             for (i, seg) in pf.segments.iter().enumerate() {
                 let embedding = &embeddings[i];
-                let embedding_bytes = f32_to_bytes(embedding);
-                let embedding_q8_bytes = f32_to_q8_bytes(embedding);
+                let embedding_json = f32_to_json_array(embedding);
+                let embedding_q8_json = f32_to_q8_json_array(embedding);
 
                 let insert = SegmentInsert {
                     id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
@@ -220,8 +222,8 @@ pub async fn run(
                     content: seg.content.clone(),
                     line_start: seg.line_start as i64,
                     line_end: seg.line_end as i64,
-                    embedding: Some(embedding_bytes),
-                    embedding_q8: Some(embedding_q8_bytes),
+                    embedding: Some(embedding_json),
+                    embedding_q8: Some(embedding_q8_json),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
                     defined_symbols: serde_json::to_string(&seg.defined_symbols)
