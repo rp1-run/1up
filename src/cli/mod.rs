@@ -78,9 +78,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Context(args) => context::exec(args, cli.format).await,
         Command::Index(args) => index::exec(args, cli.format).await,
         Command::Reindex(args) => reindex::exec(args, cli.format).await,
-        Command::Worker => {
-            tracing::info!("daemon worker starting");
-            Ok(())
-        }
+        Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
 }

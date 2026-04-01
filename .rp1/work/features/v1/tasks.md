@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 62% (10 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 complete)
+**Progress**: 69% (11 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -519,6 +519,18 @@ stateDiagram-v2
     - **Deviations**: Made SupportedLanguage::language_fn() pub to allow context module to create tree-sitter parsers independently of the indexing pipeline
     - **Tests**: 14/14 passing (location parsing, Rust function/impl, Python function/class, Go function, unsupported language fallback, boundary clamping, out-of-range errors, no-enclosing-scope fallback)
 
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
     **Execution Flow**:
 
     ```mermaid
@@ -529,7 +541,7 @@ stateDiagram-v2
 
 ### Daemon, Init/Start & Degradation (Parallel)
 
-- [ ] **T11**: Implement daemon worker process with PID file management, signal handling (SIGHUP/SIGTERM), notify-based file watching, debounced re-indexing, idle timeout, and multi-project support `[complexity:complex]`
+- [x] **T11**: Implement daemon worker process with PID file management, signal handling (SIGHUP/SIGTERM), notify-based file watching, debounced re-indexing, idle timeout, and multi-project support `[complexity:complex]`
 
     **Reference**: [design.md#23-daemon-lifecycle](design.md#23-daemon-lifecycle)
 
@@ -537,16 +549,31 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] Worker process spawned as detached child via `1up __worker` subcommand
-    - [ ] PID file written to ~/.local/share/1up/daemon.pid on start, cleaned on exit
-    - [ ] SIGHUP handler reloads project registry and updates watched directories
-    - [ ] SIGTERM handler triggers graceful shutdown
-    - [ ] notify-based file watcher with debounced batch processing
-    - [ ] Incremental re-indexing of changed files via indexing pipeline
-    - [ ] Global project registry (~/.local/share/1up/projects.json) for multi-project support
-    - [ ] Idle timeout monitoring via timestamp, auto-exit when exceeded
-    - [ ] Crash recovery: stale PID file detection and cleanup
-    - [ ] Integration test for PID file lifecycle
+    - [x] Worker process spawned as detached child via `1up __worker` subcommand
+    - [x] PID file written to ~/.local/share/1up/daemon.pid on start, cleaned on exit
+    - [x] SIGHUP handler reloads project registry and updates watched directories
+    - [x] SIGTERM handler triggers graceful shutdown
+    - [x] notify-based file watcher with debounced batch processing
+    - [x] Incremental re-indexing of changed files via indexing pipeline
+    - [x] Global project registry (~/.local/share/1up/projects.json) for multi-project support
+    - [x] Idle timeout monitoring via timestamp, auto-exit when exceeded
+    - [x] Crash recovery: stale PID file detection and cleanup
+    - [x] Integration test for PID file lifecycle
+
+    **Implementation Summary**:
+
+    - **Files**: `src/daemon/lifecycle.rs`, `src/daemon/registry.rs`, `src/daemon/watcher.rs`, `src/daemon/worker.rs`, `src/cli/mod.rs`, `Cargo.toml`
+    - **Approach**: lifecycle module handles PID file CRUD, process liveness check via nix signal(0), SIGHUP/SIGTERM sending, and detached daemon spawning with setsid; registry module provides JSON-serialized project registry with register/deregister/load/save operations; watcher module wraps notify RecommendedWatcher with mpsc channel, watch/unwatch/drain_events with debounced collection, and path filtering for binary/ignored directories; worker module runs the main daemon loop using tokio::select! over SIGHUP (reload registry), SIGTERM (graceful shutdown), and debounced file events (incremental re-indexing via pipeline::run), with idle timeout auto-exit and multi-project support; CLI Worker command wired to daemon::worker::run()
+    - **Deviations**: Added `nix` (v0.29, signal+process features) and `chrono` (v0.4, serde feature) dependencies for signal management and timestamps
+    - **Tests**: 11/11 passing (3 lifecycle: process alive/not alive/pid roundtrip, 3 registry: roundtrip/deregister/empty, 5 watcher: skip gitdir/node_modules/binary ext, allow source, filter, watcher creation)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T11_daemon_and_watcher
+        T11_daemon_and_watcher --> [*]
+    ```
 
 - [ ] **T12**: Implement init and start commands with project boundary detection, daemon spawning, auto-start on first query, and stop/status commands `[complexity:medium]`
 
