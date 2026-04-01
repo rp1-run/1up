@@ -51,6 +51,15 @@ pub enum ReferenceKind {
     Usage,
 }
 
+impl std::fmt::Display for ReferenceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReferenceKind::Definition => write!(f, "definition"),
+            ReferenceKind::Usage => write!(f, "usage"),
+        }
+    }
+}
+
 /// A symbol lookup result.
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolResult {
