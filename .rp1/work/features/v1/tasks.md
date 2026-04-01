@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 56% (9 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9 complete)
+**Progress**: 62% (10 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -476,6 +476,18 @@ stateDiagram-v2
     - **Deviations**: None
     - **Tests**: 10/10 passing (exact definition, partial match, block_type priority, references with definition/usage distinction, self-reference dedup, unknown symbol, fuzzy Levenshtein, exact-preferred matching, partial-when-no-exact, Levenshtein distance)
 
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
     **Execution Flow**:
 
     ```mermaid
@@ -484,7 +496,7 @@ stateDiagram-v2
         T9_symbol_lookup --> [*]
     ```
 
-- [ ] **T10**: Implement scope-aware context retrieval using tree-sitter AST with line-range fallback `[complexity:medium]`
+- [x] **T10**: Implement scope-aware context retrieval using tree-sitter AST with line-range fallback `[complexity:medium]`
 
     **Reference**: [design.md#35-context-retrieval-design](design.md#35-context-retrieval-design)
 
@@ -492,13 +504,28 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] `1up context <file>:<line>` reads source file from disk
-    - [ ] Tree-sitter parse to build AST, find smallest enclosing named node for target line
-    - [ ] Returns enclosing function/class/impl block content as ContextResult
-    - [ ] Configurable expansion (default: full enclosing function/block)
-    - [ ] Falls back to +/- 50 lines when tree-sitter unavailable for the language
-    - [ ] Returns ContextResult with file_path, language, content, line range, scope_type
-    - [ ] Unit tests for scope detection and fallback behavior
+    - [x] `1up context <file>:<line>` reads source file from disk
+    - [x] Tree-sitter parse to build AST, find smallest enclosing named node for target line
+    - [x] Returns enclosing function/class/impl block content as ContextResult
+    - [x] Configurable expansion (default: full enclosing function/block)
+    - [x] Falls back to +/- 50 lines when tree-sitter unavailable for the language
+    - [x] Returns ContextResult with file_path, language, content, line range, scope_type
+    - [x] Unit tests for scope detection and fallback behavior
+
+    **Implementation Summary**:
+
+    - **Files**: `src/search/context.rs`, `src/search/mod.rs`, `src/cli/context.rs`, `src/indexer/parser.rs`
+    - **Approach**: ContextEngine with retrieve() method that reads source from disk, detects language by extension, parses with tree-sitter to find the smallest enclosing scope node (function/class/impl/trait/struct/enum/etc.) via recursive AST walk, returns ContextResult with scope_type classification; falls back to configurable +/- N line window (default 50) when tree-sitter is unavailable or no enclosing scope found; parse_location() helper handles file:line parsing including Windows-style paths with colons; CLI wired with --expansion flag and project root resolution
+    - **Deviations**: Made SupportedLanguage::language_fn() pub to allow context module to create tree-sitter parsers independently of the indexing pipeline
+    - **Tests**: 14/14 passing (location parsing, Rust function/impl, Python function/class, Go function, unsupported language fallback, boundary clamping, out-of-range errors, no-enclosing-scope fallback)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T10_context_retrieval
+        T10_context_retrieval --> [*]
+    ```
 
 ### Daemon, Init/Start & Degradation (Parallel)
 

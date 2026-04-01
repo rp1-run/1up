@@ -45,7 +45,7 @@ impl SupportedLanguage {
         }
     }
 
-    fn language_fn(&self) -> LanguageFn {
+    pub fn language_fn(&self) -> LanguageFn {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE,
             Self::Python => tree_sitter_python::LANGUAGE,
