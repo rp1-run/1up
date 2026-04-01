@@ -1,7 +1,11 @@
 use clap::Args;
 
 use crate::cli::output::formatter_for;
+use crate::search::SymbolSearchEngine;
+use crate::shared::config::project_db_path;
 use crate::shared::types::OutputFormat;
+use crate::storage::db::Db;
+use crate::storage::schema;
 
 #[derive(Args)]
 pub struct SymbolArgs {
@@ -18,14 +22,30 @@ pub struct SymbolArgs {
 }
 
 pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let _project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let db_path = project_db_path(&project_root);
     let fmt = formatter_for(format);
-    println!(
-        "{}",
-        fmt.format_message(&format!(
-            "symbol lookup for '{}': not yet implemented",
-            args.name
-        ))
-    );
+
+    if !db_path.exists() {
+        eprintln!(
+            "warning: no index found at {}. Run `1up index` first.",
+            db_path.display()
+        );
+        println!("{}", fmt.format_symbol_results(&[]));
+        return Ok(());
+    }
+
+    let db = Db::open_ro(&db_path).await?;
+    let conn = db.connect()?;
+    schema::migrate(&conn).await?;
+
+    let engine = SymbolSearchEngine::new(&conn);
+    let results = if args.references {
+        engine.find_references(&args.name).await?
+    } else {
+        engine.find_definitions(&args.name).await?
+    };
+
+    println!("{}", fmt.format_symbol_results(&results));
     Ok(())
 }

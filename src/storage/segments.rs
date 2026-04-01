@@ -285,7 +285,7 @@ pub async fn count_files(conn: &Connection) -> Result<u64, OneupError> {
     }
 }
 
-fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupError> {
+pub fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupError> {
     Ok(StoredSegment {
         id: row
             .get(0)

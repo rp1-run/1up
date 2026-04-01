@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 50% (8 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8 complete)
+**Progress**: 56% (9 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -441,7 +441,19 @@ stateDiagram-v2
         T8_search_engine --> [*]
     ```
 
-- [ ] **T9**: Implement symbol lookup and reference search with definition/usage distinction and fuzzy/partial matching `[complexity:medium]`
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
+- [x] **T9**: Implement symbol lookup and reference search with definition/usage distinction and fuzzy/partial matching `[complexity:medium]`
 
     **Reference**: [design.md#33-symbol-lookup-design](design.md#33-symbol-lookup-design)
 
@@ -449,13 +461,28 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] `1up symbol <name>` queries defined_symbols JSON column via LIKE pattern
-    - [ ] Results ordered by block_type priority (function/struct/trait/class first)
-    - [ ] `1up symbol --references <name>` returns both definitions and usages
-    - [ ] Results tagged with ReferenceKind::Definition or ReferenceKind::Usage
-    - [ ] Fuzzy/partial matching via LIKE '%name%' with post-query Levenshtein filtering
-    - [ ] Returns Vec<SymbolResult> with name, kind, file_path, line range, content
-    - [ ] Unit tests for symbol query and reference distinction
+    - [x] `1up symbol <name>` queries defined_symbols JSON column via LIKE pattern
+    - [x] Results ordered by block_type priority (function/struct/trait/class first)
+    - [x] `1up symbol --references <name>` returns both definitions and usages
+    - [x] Results tagged with ReferenceKind::Definition or ReferenceKind::Usage
+    - [x] Fuzzy/partial matching via LIKE '%name%' with post-query Levenshtein filtering
+    - [x] Returns Vec<SymbolResult> with name, kind, file_path, line range, content
+    - [x] Unit tests for symbol query and reference distinction
+
+    **Implementation Summary**:
+
+    - **Files**: `src/search/symbol.rs`, `src/search/mod.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/cli/symbol.rs`
+    - **Approach**: SymbolSearchEngine struct with find_definitions() and find_references() methods; SQL LIKE queries on defined_symbols/referenced_symbols JSON columns with block_type priority ordering; post-query Levenshtein filtering for fuzzy matching with exact-match preference; reference search excludes segments already counted as definitions; CLI wired with DB open, schema migration, and formatter output
+    - **Deviations**: None
+    - **Tests**: 10/10 passing (exact definition, partial match, block_type priority, references with definition/usage distinction, self-reference dedup, unknown symbol, fuzzy Levenshtein, exact-preferred matching, partial-when-no-exact, Levenshtein distance)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T9_symbol_lookup
+        T9_symbol_lookup --> [*]
+    ```
 
 - [ ] **T10**: Implement scope-aware context retrieval using tree-sitter AST with line-range fallback `[complexity:medium]`
 

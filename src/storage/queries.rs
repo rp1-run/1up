@@ -109,3 +109,24 @@ pub const DELETE_META: &str = "DELETE FROM meta WHERE key = ?1";
 pub const COUNT_SEGMENTS: &str = "SELECT COUNT(*) FROM segments";
 
 pub const COUNT_FILES: &str = "SELECT COUNT(DISTINCT file_path) FROM segments";
+
+pub const SELECT_SYMBOLS_BY_DEFINED: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, complexity, role,
+       defined_symbols, referenced_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE defined_symbols LIKE '%' || ?1 || '%'
+ORDER BY
+  CASE WHEN block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
+  file_path";
+
+pub const SELECT_SYMBOLS_BY_REFERENCED: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, complexity, role,
+       defined_symbols, referenced_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE referenced_symbols LIKE '%' || ?1 || '%'
+  AND defined_symbols NOT LIKE '%\"' || ?1 || '\"%'
+ORDER BY file_path, line_start";
