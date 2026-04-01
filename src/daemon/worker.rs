@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
-
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn};
 
@@ -11,7 +9,7 @@ use crate::daemon::watcher::{self, FileWatcher};
 use crate::indexer::embedder::{self, Embedder};
 use crate::indexer::pipeline;
 use crate::shared::config;
-use crate::shared::constants::{DAEMON_IDLE_TIMEOUT_SECS, WATCHER_DEBOUNCE_MS};
+use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::OneupError;
 use crate::storage::{db::Db, schema};
 
@@ -54,10 +52,8 @@ async fn run_inner() -> Result<(), OneupError> {
     };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
-    let mut last_activity = Instant::now();
 
     let debounce = std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS);
-    let idle_timeout = std::time::Duration::from_secs(DAEMON_IDLE_TIMEOUT_SECS);
 
     loop {
         tokio::select! {
@@ -66,7 +62,6 @@ async fn run_inner() -> Result<(), OneupError> {
                 if let Err(e) = reload_projects(&mut file_watcher, &mut projects).await {
                     error!("failed to reload projects: {e}");
                 }
-                last_activity = Instant::now();
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -114,15 +109,7 @@ async fn run_inner() -> Result<(), OneupError> {
                                 }
                             }
                         }
-                        last_activity = Instant::now();
                     }
-                }
-
-                if last_activity.elapsed() > idle_timeout {
-                    info!(
-                        "idle timeout ({DAEMON_IDLE_TIMEOUT_SECS}s) exceeded, shutting down"
-                    );
-                    break;
                 }
             }
         }
