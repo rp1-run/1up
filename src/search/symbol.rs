@@ -1,4 +1,4 @@
-use libsql::Connection;
+use turso::Connection;
 
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{ReferenceKind, SymbolResult};

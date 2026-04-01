@@ -1,16 +1,16 @@
 use std::path::Path;
 
-use libsql::{Builder, Connection, Database};
+use turso::{Builder, Connection, Database};
 
 use crate::shared::errors::{OneupError, StorageError};
 
-/// A wrapper around a libSQL database that manages connections.
+/// A wrapper around a turso database that manages connections.
 pub struct Db {
     database: Database,
 }
 
 impl Db {
-    /// Open a local libSQL database at the given path in read-write mode,
+    /// Open a local database at the given path in read-write mode,
     /// creating the file and parent directories if they do not exist.
     pub async fn open_rw(path: &Path) -> Result<Self, OneupError> {
         if let Some(parent) = path.parent() {
@@ -22,7 +22,15 @@ impl Db {
             })?;
         }
 
-        let database = Builder::new_local(path)
+        let path_str = path.to_str().ok_or_else(|| {
+            StorageError::Connection(format!(
+                "database path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+
+        let database = Builder::new_local(path_str)
+            .experimental_index_method(true)
             .build()
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -30,7 +38,7 @@ impl Db {
         Ok(Self { database })
     }
 
-    /// Open a local libSQL database at the given path in read-only mode.
+    /// Open a local database at the given path in read-only mode.
     /// The database file must already exist.
     pub async fn open_ro(path: &Path) -> Result<Self, OneupError> {
         if !path.exists() {
@@ -41,7 +49,15 @@ impl Db {
             .into());
         }
 
-        let database = Builder::new_local(path)
+        let path_str = path.to_str().ok_or_else(|| {
+            StorageError::Connection(format!(
+                "database path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+
+        let database = Builder::new_local(path_str)
+            .experimental_index_method(true)
             .build()
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -49,9 +65,10 @@ impl Db {
         Ok(Self { database })
     }
 
-    /// Open an in-memory libSQL database (useful for tests).
+    /// Open an in-memory database (useful for tests).
     pub async fn open_memory() -> Result<Self, OneupError> {
         let database = Builder::new_local(":memory:")
+            .experimental_index_method(true)
             .build()
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;

@@ -1,4 +1,4 @@
-use libsql::Connection;
+use turso::Connection;
 
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
@@ -79,7 +79,7 @@ async fn vector_search(
              WHERE s.embedding_q8 IS NOT NULL
              ORDER BY distance ASC
              LIMIT ?2",
-            libsql::params![libsql::Value::Blob(query_q8_bytes), prefilter_k],
+            turso::params![turso::Value::Blob(query_q8_bytes), prefilter_k],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("int8 prefilter: {e}")))?;
@@ -141,7 +141,7 @@ async fn rerank_f32(
                 "SELECT vector_distance_cos(embedding, ?1) as distance
                  FROM segments
                  WHERE id = ?2 AND embedding IS NOT NULL",
-                libsql::params![libsql::Value::Blob(query_vec_bytes.clone()), id.clone()],
+                turso::params![turso::Value::Blob(query_vec_bytes.clone()), id.clone()],
             )
             .await
             .map_err(|e| SearchError::QueryFailed(format!("f32 rerank: {e}")))?;
@@ -169,13 +169,12 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
             "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
                     s.line_start, s.line_end, s.role, s.defined_symbols,
                     s.referenced_symbols,
-                    rank
-             FROM segments_fts
-             JOIN segments s ON segments_fts.rowid = s.rowid
-             WHERE segments_fts MATCH ?1
-             ORDER BY rank
+                    fts_score(s.content, ?1) as score
+             FROM segments s
+             WHERE fts_match(s.content, ?1)
+             ORDER BY score DESC
              LIMIT ?2",
-            libsql::params![fts_query, VECTOR_PREFILTER_K as i64],
+            turso::params![fts_query, VECTOR_PREFILTER_K as i64],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
@@ -192,7 +191,7 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
     Ok(results)
 }
 
-fn row_to_search_result(row: &libsql::Row) -> Result<SearchResult, OneupError> {
+fn row_to_search_result(row: &turso::Row) -> Result<SearchResult, OneupError> {
     let file_path: String = row
         .get(1)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;

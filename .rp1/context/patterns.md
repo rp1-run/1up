@@ -24,11 +24,14 @@
 
 ## Database Access
 
-- `Db` wrapper struct with `open_rw()`, `open_ro()`, `open_memory()` constructors
+- `Db` wrapper struct with `open_rw()`, `open_ro()`, `open_memory()` constructors using `turso::Builder`
+- All Builder calls use `.experimental_index_method(true)` to enable turso-native FTS (tantivy-backed)
+- `Builder::new_local()` takes `&str` (paths converted via `.to_str()`)
 - Read-only access for queries; read-write for indexing
 - Schema migration via `schema::migrate(&conn)` called before any DB operation
 - Segments stored with JSON-encoded `defined_symbols` and `referenced_symbols` arrays
 - Embedding vectors stored as both f32 (`F32_BLOB(384)`) and int8 quantized (`VECTOR8(384)`)
+- FTS uses `CREATE INDEX ... USING fts(content)` with `fts_match()` / `fts_score()` queries (not SQLite FTS5)
 
 ## Graceful Degradation
 
@@ -45,7 +48,7 @@
 
 - No IPC -- shared-nothing model
 - CLI and daemon communicate exclusively through:
-  - libSQL database (read/write)
+  - Turso database (read/write)
   - PID file for liveness checking
   - Project registry JSON file
   - Unix signals (SIGHUP = reload, SIGTERM = shutdown)
@@ -73,7 +76,7 @@
 - Integration tests in `tests/` directory using `assert_cmd` and `predicates`
 - Benchmarks in `benches/` using `criterion`
 - Temp directories via `tempfile` crate for test isolation
-- In-memory or temp-file libSQL for storage tests
+- In-memory or temp-file turso DB for storage tests
 
 ## File Organization
 

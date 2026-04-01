@@ -1,4 +1,4 @@
-use libsql::Connection;
+use turso::Connection;
 
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::types::SegmentRole;
@@ -70,17 +70,17 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
     let embedding = seg
         .embedding
         .as_ref()
-        .map(|v| libsql::Value::Blob(v.clone()))
-        .unwrap_or(libsql::Value::Null);
+        .map(|v| turso::Value::Blob(v.clone()))
+        .unwrap_or(turso::Value::Null);
     let embedding_q8 = seg
         .embedding_q8
         .as_ref()
-        .map(|v| libsql::Value::Blob(v.clone()))
-        .unwrap_or(libsql::Value::Null);
+        .map(|v| turso::Value::Blob(v.clone()))
+        .unwrap_or(turso::Value::Null);
 
     conn.execute(
         queries::UPSERT_SEGMENT,
-        libsql::params![
+        turso::params![
             seg.id.clone(),
             seg.file_path.clone(),
             seg.language.clone(),
@@ -309,7 +309,7 @@ pub async fn count_files(conn: &Connection) -> Result<u64, OneupError> {
     }
 }
 
-pub fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupError> {
+pub fn row_to_stored_segment(row: &turso::Row) -> Result<StoredSegment, OneupError> {
     Ok(StoredSegment {
         id: row
             .get(0)

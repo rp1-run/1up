@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use libsql::Connection;
+use turso::Connection;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 

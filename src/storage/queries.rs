@@ -27,31 +27,8 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
 
-pub const CREATE_FTS_TABLE: &str = "
-CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
-    content, file_path, block_type,
-    content='segments', content_rowid='rowid'
-)";
-
-pub const CREATE_FTS_INSERT_TRIGGER: &str = "
-CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN
-    INSERT INTO segments_fts(rowid, content, file_path, block_type)
-    VALUES (new.rowid, new.content, new.file_path, new.block_type);
-END";
-
-pub const CREATE_FTS_DELETE_TRIGGER: &str = "
-CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON segments BEGIN
-    INSERT INTO segments_fts(segments_fts, rowid, content, file_path, block_type)
-    VALUES ('delete', old.rowid, old.content, old.file_path, old.block_type);
-END";
-
-pub const CREATE_FTS_UPDATE_TRIGGER: &str = "
-CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
-    INSERT INTO segments_fts(segments_fts, rowid, content, file_path, block_type)
-    VALUES ('delete', old.rowid, old.content, old.file_path, old.block_type);
-    INSERT INTO segments_fts(rowid, content, file_path, block_type)
-    VALUES (new.rowid, new.content, new.file_path, new.block_type);
-END";
+pub const CREATE_FTS_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS idx_segments_fts ON segments USING fts(content)";
 
 pub const CREATE_META_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS meta (

@@ -18,7 +18,8 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Database
-libsql = "0.6"
+turso = "0.6.0-pre.14"
+turso_core = { version = "0.6.0-pre.14", features = ["fts"] }
 
 # Tree-sitter (core + language grammars)
 tree-sitter = "0.24"

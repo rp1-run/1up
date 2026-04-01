@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 100% (17 of 17 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8, TD1, TD2 complete)
+**Progress**: 100% (19 of 19 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8, TD1, TD2, TX-structural-search, TX-migrate-to-turso complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -747,6 +747,39 @@ stateDiagram-v2
         TX_fix_clippy_and_int8 --> [*]
     ```
 
+### Structural Search
+
+- [x] **TX-structural-search**: Implement structural AST-pattern search using tree-sitter queries (FR-STR-001, FR-STR-002) `[complexity:medium]`
+
+    **Reference**: [design.md#34-structural-search-design](design.md#34-structural-search-design)
+
+    **Effort**: 4 hours
+
+    **Acceptance Criteria**:
+
+    - [x] Structural search engine parses tree-sitter query patterns (S-expression syntax) and matches against source files
+    - [x] Returns matching code locations with file path, line range, language, and content
+    - [x] Works across all 8 tree-sitter-supported languages (Rust, Python, JS, TS, Go, Java, C, C++)
+    - [x] Uses DB index to narrow files by language when available; falls back to filesystem scan
+    - [x] CLI `1up structural` subcommand with --language filter and --path options
+    - [x] All three output formats (JSON, human, plain) supported
+    - [x] Unit tests covering multi-language queries, line numbers, deduplication, and error handling
+
+    **Implementation Summary**:
+
+    - **Files**: `src/search/structural.rs`, `src/cli/structural.rs`, `src/search/mod.rs`, `src/cli/mod.rs`, `src/cli/output.rs`, `src/shared/types.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `Cargo.toml`
+    - **Approach**: StructuralSearchEngine takes a tree-sitter query pattern and optional language filter; resolves target languages, compiles the query per-language (skipping languages where the pattern is invalid), fetches file paths from DB index or filesystem scanner, parses each source file with tree-sitter, runs QueryCursor with StreamingIterator, deduplicates by byte range, and returns StructuralResult with capture names; CLI wired with auto-daemon and DB-backed or direct filesystem modes; added streaming-iterator dependency for tree-sitter 0.24 QueryMatches API
+    - **Deviations**: Added `streaming-iterator` dependency required by tree-sitter 0.24's QueryMatches which implements StreamingIterator instead of Iterator
+    - **Tests**: 8/8 passing (find_rust_functions, find_python_functions, find_if_statements, invalid_query_for_language, unsupported_language_filter, deduplicates_overlapping_matches, multi_language_scan, captures_line_numbers)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TX_structural_search
+        TX_structural_search --> [*]
+    ```
+
 ### User Docs
 
 - [x] **TD1**: Create documentation for README.md - Installation, Usage, CLI Reference `[complexity:simple]`
@@ -807,6 +840,38 @@ stateDiagram-v2
     - **Approach**: Created 4 KB files: index.md (loading guide, quick orientation), architecture.md (process model, data flows, storage schema, tech stack), modules.md (full module hierarchy with per-file responsibilities), patterns.md (error handling, async, CLI structure, DB access, degradation, search ranking, testing, naming conventions)
     - **Deviations**: None
     - **Tests**: N/A (documentation)
+
+### Dependency Migration
+
+- [x] **TX-migrate-to-turso**: Migrate from libsql crate to turso crate throughout the project `[complexity:medium]`
+
+    **Reference**: Crate rename -- libsql rebranded to turso
+
+    **Effort**: 1 hour
+
+    **Acceptance Criteria**:
+
+    - [x] Cargo.toml uses `turso = "0.6.0-pre.14"` instead of `libsql = "0.6"`
+    - [x] All source files use `turso::` imports instead of `libsql::`
+    - [x] FTS5 virtual table replaced with turso-native FTS index (`CREATE INDEX ... USING fts`)
+    - [x] FTS search queries updated to use `fts_match()` / `fts_score()`
+    - [x] `cargo check` passes
+    - [x] All tests pass (157/157)
+
+    **Implementation Summary**:
+
+    - **Files**: `Cargo.toml`, `src/storage/db.rs`, `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/indexer/pipeline.rs`, `src/search/hybrid.rs`, `src/search/symbol.rs`, `src/search/structural.rs`
+    - **Approach**: Replaced `libsql` dependency with `turso` + `turso_core` (with `fts` feature for tantivy-based FTS). Updated all imports from `libsql::` to `turso::`. Converted `Builder::new_local()` calls to pass `&str` instead of `&Path` (API difference). Added `.experimental_index_method(true)` to all Builder calls to enable turso-native FTS indexes. Replaced FTS5 virtual table + sync triggers with `CREATE INDEX ... USING fts(content)`. Updated FTS search queries from `segments_fts MATCH` to `fts_match()`/`fts_score()`.
+    - **Deviations**: FTS5 virtual table + triggers replaced with turso-native FTS index (tantivy-backed). The turso crate's SQLite implementation does not support FTS5; the native FTS index provides equivalent functionality through `fts_match()` and `fts_score()` functions.
+    - **Tests**: 157/157 passing
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TX_migrate_to_turso
+        TX_migrate_to_turso --> [*]
+    ```
 
 ## Acceptance Criteria Checklist
 

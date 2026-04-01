@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use libsql::Connection;
+use turso::Connection;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 

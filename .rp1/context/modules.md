@@ -61,12 +61,12 @@ Search engines: hybrid semantic+FTS, symbol lookup, context retrieval.
 
 ## `src/storage/`
 
-Database access layer using libSQL.
+Database access layer using turso (formerly libSQL).
 
 | File | Responsibility |
 |------|---------------|
 | `mod.rs` | Module exports |
-| `db.rs` | `Db` wrapper with `open_rw`/`open_ro`/`open_memory` constructors using `libsql::Builder` |
+| `db.rs` | `Db` wrapper with `open_rw`/`open_ro`/`open_memory` constructors using `turso::Builder` with `experimental_index_method(true)` for FTS support |
 | `schema.rs` | DDL with segments table (F32_BLOB, VECTOR8), FTS5 virtual table with insert/delete/update triggers, meta KV table; `migrate()` for schema versioning |
 | `queries.rs` | SQL query string constants |
 | `segments.rs` | Segment CRUD (upsert, query by file/id, delete by file, file hash lookup, count), meta CRUD |

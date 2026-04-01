@@ -1,4 +1,4 @@
-use libsql::Connection;
+use turso::Connection;
 
 use crate::shared::constants::SCHEMA_VERSION;
 use crate::shared::errors::{OneupError, StorageError};
@@ -10,15 +10,12 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 /// This is idempotent -- safe to call on an already-initialized database.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{};",
+        "{};{};{};{};{};",
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
-        queries::CREATE_FTS_TABLE,
-        queries::CREATE_FTS_INSERT_TRIGGER,
-        queries::CREATE_FTS_DELETE_TRIGGER,
-        queries::CREATE_FTS_UPDATE_TRIGGER,
+        queries::CREATE_FTS_INDEX,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
