@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 88% (15 of 17 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8 complete)
+**Progress**: 100% (17 of 17 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8, TD1, TD2 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -749,7 +749,7 @@ stateDiagram-v2
 
 ### User Docs
 
-- [ ] **TD1**: Create documentation for README.md - Installation, Usage, CLI Reference `[complexity:simple]`
+- [x] **TD1**: Create documentation for README.md - Installation, Usage, CLI Reference `[complexity:simple]`
 
     **Reference**: [design.md#documentation-impact](design.md#documentation-impact)
 
@@ -765,9 +765,25 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] New README.md created with installation instructions, usage examples, and CLI reference for all subcommands
+    - [x] New README.md created with installation instructions, usage examples, and CLI reference for all subcommands
 
-- [ ] **TD2**: Create documentation for CLAUDE.md KB files - architecture.md, patterns.md, modules.md `[complexity:simple]`
+    **Implementation Summary**:
+
+    - **Files**: `README.md`
+    - **Approach**: Created comprehensive README with installation from source, quick start guide, usage sections for all 9 subcommands, full CLI reference with flags/options tables, output format examples, storage layout, and supported languages list
+    - **Deviations**: None
+    - **Tests**: N/A (documentation)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TD1_create_readme
+        TD1_create_readme --> TD2_update_kb_docs
+        TD2_update_kb_docs --> [*]
+    ```
+
+- [x] **TD2**: Create documentation for CLAUDE.md KB files - architecture.md, patterns.md, modules.md `[complexity:simple]`
 
     **Reference**: [design.md#documentation-impact](design.md#documentation-impact)
 
@@ -783,7 +799,14 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] KB files created reflecting the Rust architecture, coding patterns, and module documentation
+    - [x] KB files created reflecting the Rust architecture, coding patterns, and module documentation
+
+    **Implementation Summary**:
+
+    - **Files**: `.rp1/context/index.md`, `.rp1/context/architecture.md`, `.rp1/context/modules.md`, `.rp1/context/patterns.md`
+    - **Approach**: Created 4 KB files: index.md (loading guide, quick orientation), architecture.md (process model, data flows, storage schema, tech stack), modules.md (full module hierarchy with per-file responsibilities), patterns.md (error handling, async, CLI structure, DB access, degradation, search ranking, testing, naming conventions)
+    - **Deviations**: None
+    - **Tests**: N/A (documentation)
 
 ## Acceptance Criteria Checklist
 
