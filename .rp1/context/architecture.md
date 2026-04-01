@@ -19,7 +19,7 @@ Communication between CLI and daemon is exclusively through:
 1. **Start**: `1up start` or auto-start on first query registers the project, spawns `1up __worker`, writes PID file.
 2. **Reload**: SIGHUP causes the worker to reload the project registry and update watched directories.
 3. **Stop**: `1up stop` deregisters the project. SIGTERM if no projects remain; SIGHUP otherwise.
-4. **Idle timeout**: Auto-exit after 30 minutes of inactivity (configurable via `DAEMON_IDLE_TIMEOUT_SECS`).
+4. **No idle timeout**: Daemon runs indefinitely until explicitly stopped via `1up stop` or SIGTERM.
 5. **Crash recovery**: Stale PID files detected and cleaned on startup.
 
 ## Data Flow: Indexing Pipeline
@@ -82,7 +82,7 @@ Single libSQL database per project at `.1up/index.db`:
 | Async runtime | `tokio` |
 | CLI | `clap` (derive) |
 | Database | `libsql` |
-| Tree-sitter | `tree-sitter` + 8 language grammar crates |
+| Tree-sitter | `tree-sitter` + 9 language grammar crates |
 | ONNX inference | `ort` |
 | Tokenizer | `tokenizers` |
 | File watching | `notify` |

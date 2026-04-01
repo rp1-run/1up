@@ -25,7 +25,7 @@
 
 - Single-binary CLI with clap derive subcommands
 - Turso (formerly libSQL) for persistent storage with tantivy-backed FTS + vector columns
-- Tree-sitter for multi-language AST parsing (8 languages compiled in)
+- Tree-sitter for multi-language AST parsing (9 languages compiled in)
 - ONNX embeddings via `ort` crate (all-MiniLM-L6-v2, 384-dim)
 - Background daemon for file watching and incremental re-indexing
 - CLI and daemon share no runtime state -- communicate through the database and filesystem
