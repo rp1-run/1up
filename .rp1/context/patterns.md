@@ -57,7 +57,7 @@
 ## Indexing Pipeline
 
 - Incremental by default: SHA-256 file content hash comparison
-- Language routing: tree-sitter for supported languages (8), text chunker for others
+- Language routing: tree-sitter for supported languages (9), text chunker for others
 - Batch embedding: configurable batch size (default 32)
 - Deleted file detection: segments for missing files removed
 - Progress reporting via `indicatif`
