@@ -1,0 +1,5 @@
+# Build release binary and copy to ~/.local/bin
+install:
+    cargo build --release
+    mkdir -p ~/.local/bin
+    cp target/release/1up ~/.local/bin/1up
