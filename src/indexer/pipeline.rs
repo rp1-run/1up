@@ -114,6 +114,10 @@ pub async fn run(
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
 
+    if !has_embedder {
+        warn!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+    }
+
     struct PendingFile {
         relative_path: String,
         file_hash: String,
@@ -121,6 +125,7 @@ pub async fn run(
     }
 
     let mut pending: Vec<PendingFile> = Vec::new();
+    let mut unsupported_extensions: HashSet<String> = HashSet::new();
 
     for (relative_path, scanned_file) in &scanned_relative {
         let content = match std::fs::read_to_string(&scanned_file.path) {
@@ -151,13 +156,18 @@ pub async fn run(
                 Ok(segs) => segs,
                 Err(e) => {
                     warn!(
-                        "tree-sitter parse failed for {}, falling back to chunker: {e}",
+                        "tree-sitter parse failed for {}, falling back to text chunker: {e}",
                         relative_path
                     );
                     chunker::chunk_file_default(&content, &scanned_file.extension)
                 }
             }
         } else {
+            unsupported_extensions.insert(scanned_file.extension.clone());
+            debug!(
+                "no tree-sitter grammar for .{} files, using text chunker: {}",
+                scanned_file.extension, relative_path
+            );
             chunker::chunk_file_default(&content, &scanned_file.extension)
         };
 
@@ -174,6 +184,15 @@ pub async fn run(
         });
 
         pb.inc(1);
+    }
+
+    if !unsupported_extensions.is_empty() {
+        let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
+        exts.sort();
+        warn!(
+            "no tree-sitter grammar available for file types: .{}; these files were indexed with text chunking only (symbol and structural search will not cover them)",
+            exts.join(", .")
+        );
     }
 
     if let Some(emb) = embedder {
@@ -423,5 +442,73 @@ mod tests {
         let hash3 = compute_file_hash(b"hello world!");
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
+    }
+
+    #[tokio::test]
+    async fn unsupported_language_falls_back_to_chunker_with_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines: Vec<String> = (1..=30)
+            .map(|i| format!("config_line_{i} = value"))
+            .collect();
+        fs::write(tmp.path().join("config.toml"), lines.join("\n")).unwrap();
+
+        let (_db, conn) = setup().await;
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+
+        assert_eq!(stats.files_indexed, 1);
+        assert!(stats.segments_stored > 0);
+
+        let segs = segments::get_segments_by_file(&conn, "config.toml")
+            .await
+            .unwrap();
+        assert!(
+            segs.iter().all(|s| s.block_type == "chunk"),
+            "unsupported language should produce chunk segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_without_embedder_stores_no_embeddings() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("main.rs"),
+            "fn hello() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+
+        let (_db, conn) = setup().await;
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+
+        assert!(!stats.embeddings_generated);
+        assert!(stats.files_indexed > 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_supported_and_unsupported_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
+        let lines: Vec<String> = (1..=30).map(|i| format!("key{i}: val")).collect();
+        fs::write(tmp.path().join("data.yaml"), lines.join("\n")).unwrap();
+
+        let (_db, conn) = setup().await;
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+
+        assert_eq!(stats.files_indexed, 2);
+
+        let rs_segs = segments::get_segments_by_file(&conn, "lib.rs")
+            .await
+            .unwrap();
+        assert!(
+            rs_segs.iter().any(|s| s.block_type != "chunk"),
+            "rust files should produce non-chunk segments"
+        );
+
+        let yaml_segs = segments::get_segments_by_file(&conn, "data.yaml")
+            .await
+            .unwrap();
+        assert!(
+            yaml_segs.iter().all(|s| s.block_type == "chunk"),
+            "yaml files should produce only chunk segments"
+        );
     }
 }

@@ -79,10 +79,7 @@ async fn vector_search(
              WHERE s.embedding_q8 IS NOT NULL
              ORDER BY distance ASC
              LIMIT ?2",
-            libsql::params![
-                libsql::Value::Blob(query_vec_bytes.clone()),
-                prefilter_k
-            ],
+            libsql::params![libsql::Value::Blob(query_vec_bytes.clone()), prefilter_k],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("int8 prefilter: {e}")))?;
@@ -93,8 +90,12 @@ async fn vector_search(
         .await
         .map_err(|e| SearchError::QueryFailed(format!("row iteration: {e}")))?
     {
-        let id: String = row.get(0).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-        let distance: f64 = row.get(10).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+        let id: String = row
+            .get(0)
+            .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+        let distance: f64 = row
+            .get(10)
+            .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
         let result = row_to_search_result(&row)?;
         candidates.push((id, result, distance));
     }
@@ -140,10 +141,7 @@ async fn rerank_f32(
                 "SELECT vector_distance_cos(embedding, ?1) as distance
                  FROM segments
                  WHERE id = ?2 AND embedding IS NOT NULL",
-                libsql::params![
-                    libsql::Value::Blob(query_vec_bytes.clone()),
-                    id.clone()
-                ],
+                libsql::params![libsql::Value::Blob(query_vec_bytes.clone()), id.clone()],
             )
             .await
             .map_err(|e| SearchError::QueryFailed(format!("f32 rerank: {e}")))?;
@@ -153,7 +151,9 @@ async fn rerank_f32(
             .await
             .map_err(|e| SearchError::QueryFailed(format!("rerank row: {e}")))?
         {
-            let distance: f64 = row.get(0).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+            let distance: f64 = row
+                .get(0)
+                .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
             results.push((id.clone(), distance));
         }
     }
@@ -193,14 +193,30 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
 }
 
 fn row_to_search_result(row: &libsql::Row) -> Result<SearchResult, OneupError> {
-    let file_path: String = row.get(1).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let language: String = row.get(2).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let block_type: String = row.get(3).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let content: String = row.get(4).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let line_start: i64 = row.get(5).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let role_str: String = row.get(7).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let defined_symbols: String = row.get(8).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let referenced_symbols: String = row.get(9).map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let file_path: String = row
+        .get(1)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let language: String = row
+        .get(2)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let block_type: String = row
+        .get(3)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let content: String = row
+        .get(4)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let line_start: i64 = row
+        .get(5)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let role_str: String = row
+        .get(7)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let defined_symbols: String = row
+        .get(8)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let referenced_symbols: String = row
+        .get(9)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
 
     let role = match role_str.as_str() {
         "DEFINITION" => Some(SegmentRole::Definition),
@@ -236,10 +252,7 @@ fn row_to_search_result(row: &libsql::Row) -> Result<SearchResult, OneupError> {
 }
 
 fn build_fts_query(query: &str) -> String {
-    let terms: Vec<&str> = query
-        .split_whitespace()
-        .filter(|t| t.len() >= 2)
-        .collect();
+    let terms: Vec<&str> = query.split_whitespace().filter(|t| t.len() >= 2).collect();
 
     if terms.is_empty() {
         return query.to_string();
@@ -248,7 +261,10 @@ fn build_fts_query(query: &str) -> String {
     terms
         .iter()
         .map(|t| {
-            let cleaned: String = t.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+            let cleaned: String = t
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
             if cleaned.is_empty() {
                 String::new()
             } else {
@@ -307,5 +323,76 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(reconstructed, vec);
+    }
+
+    #[tokio::test]
+    async fn fts_only_search_without_embedder() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let insert = crate::storage::segments::SegmentInsert {
+            id: "test-seg-1".to_string(),
+            file_path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn handle_error() { eprintln!(\"error occurred\"); }".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding: None,
+            embedding_q8: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"handle_error\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            file_hash: "abc123".to_string(),
+        };
+        crate::storage::segments::upsert_segment(&conn, &insert)
+            .await
+            .unwrap();
+
+        let engine = HybridSearchEngine::new(&conn, None);
+        let results = engine.fts_only_search("error", 10).await.unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "FTS-only search should return results without embedder"
+        );
+        assert_eq!(results[0].file_path, "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn search_with_none_embedder_uses_fts_only() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let insert = crate::storage::segments::SegmentInsert {
+            id: "test-seg-2".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn validate_input(data: &str) -> bool { !data.is_empty() }".to_string(),
+            line_start: 10,
+            line_end: 12,
+            embedding: None,
+            embedding_q8: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"validate_input\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            file_hash: "def456".to_string(),
+        };
+        crate::storage::segments::upsert_segment(&conn, &insert)
+            .await
+            .unwrap();
+
+        let mut engine = HybridSearchEngine::new(&conn, None);
+        let results = engine.search("validate input", 10).await.unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "search with None embedder should fall back to FTS"
+        );
     }
 }

@@ -52,12 +52,16 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
         match Embedder::from_dir(&crate::shared::config::model_dir()?) {
             Ok(e) => Some(e),
             Err(err) => {
-                eprintln!("warning: embedding model unavailable ({err}), falling back to FTS-only");
+                eprintln!("warning: embedding model failed to load ({err}); search is degraded to FTS-only mode (results may be less relevant)");
                 None
             }
         }
     } else {
-        eprintln!("warning: embedding model not downloaded, falling back to FTS-only search");
+        if crate::indexer::embedder::is_download_failed() {
+            eprintln!("warning: embedding model download previously failed; search is degraded to FTS-only mode. Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
+        } else {
+            eprintln!("warning: embedding model not found; search is degraded to FTS-only mode. Run `1up index` to download the model and enable semantic search");
+        }
         None
     };
 

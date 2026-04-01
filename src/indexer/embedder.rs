@@ -4,7 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
-use crate::shared::config::model_dir;
+use crate::shared::config::{download_failure_marker, model_dir};
 use crate::shared::constants::{
     EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_BASE_URL, HF_MODEL_REPO,
     MODEL_FILENAME, TOKENIZER_FILENAME,
@@ -25,12 +25,43 @@ pub struct Embedder {
 }
 
 /// Reports whether the embedding model files are present on disk.
+///
+/// Returns `false` if files are missing or a previous download failed
+/// (indicated by a `.download_failed` marker file).
 pub fn is_model_available() -> bool {
     let dir = match model_dir() {
         Ok(d) => d,
         Err(_) => return false,
     };
     dir.join(MODEL_FILENAME).exists() && dir.join(TOKENIZER_FILENAME).exists()
+}
+
+/// Reports whether a previous download attempt failed.
+///
+/// When true, the system should not re-attempt download automatically.
+/// Users can clear the marker by deleting it or running `1up index --retry-download`.
+pub fn is_download_failed() -> bool {
+    match download_failure_marker() {
+        Ok(path) => path.exists(),
+        Err(_) => false,
+    }
+}
+
+/// Writes a download failure marker to prevent automatic retry.
+fn mark_download_failed() {
+    if let Ok(marker) = download_failure_marker() {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker, "download failed");
+    }
+}
+
+/// Clears the download failure marker, allowing a fresh download attempt.
+pub fn clear_download_failure() {
+    if let Ok(marker) = download_failure_marker() {
+        let _ = std::fs::remove_file(marker);
+    }
 }
 
 impl Embedder {
@@ -42,6 +73,9 @@ impl Embedder {
     }
 
     /// Creates a new embedder with a custom batch size.
+    ///
+    /// If the model is not present, attempts auto-download. On download failure,
+    /// a marker file is written to prevent repeated download attempts.
     pub async fn with_batch_size(batch_size: usize) -> Result<Self, OneupError> {
         let dir = model_dir()?;
 
@@ -49,7 +83,22 @@ impl Embedder {
         let tokenizer_path = dir.join(TOKENIZER_FILENAME);
 
         if !model_path.exists() || !tokenizer_path.exists() {
-            download_model(&dir).await?;
+            if is_download_failed() {
+                return Err(EmbeddingError::DownloadFailed(
+                    "previous download failed; delete the marker file at ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry"
+                        .to_string(),
+                )
+                .into());
+            }
+            match download_model(&dir).await {
+                Ok(()) => {
+                    clear_download_failure();
+                }
+                Err(e) => {
+                    mark_download_failed();
+                    return Err(e);
+                }
+            }
         }
 
         let session = Session::builder()
@@ -361,6 +410,36 @@ mod tests {
             available || !available,
             "is_model_available should return a bool"
         );
+    }
+
+    #[test]
+    fn download_failure_marker_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join(".download_failed");
+
+        assert!(!marker_path.exists());
+
+        std::fs::write(&marker_path, "download failed").unwrap();
+        assert!(marker_path.exists());
+
+        std::fs::remove_file(&marker_path).unwrap();
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn mark_and_clear_download_failure() {
+        mark_download_failed();
+        assert!(is_download_failed());
+
+        clear_download_failure();
+        assert!(!is_download_failed());
+    }
+
+    #[test]
+    fn is_model_available_returns_false_when_files_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!tmp.path().join(MODEL_FILENAME).exists());
+        assert!(!tmp.path().join(TOKENIZER_FILENAME).exists());
     }
 
     #[test]

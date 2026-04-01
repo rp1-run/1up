@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::search::intent::QueryIntent;
 use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS, RRF_K, VECTOR_WEIGHT};
 use crate::shared::types::SearchResult;
-use crate::search::intent::QueryIntent;
 
 struct ScoredCandidate {
     result: SearchResult,
@@ -57,7 +57,11 @@ pub fn fuse_results(
     }
 
     let mut sorted: Vec<ScoredCandidate> = candidates.into_values().collect();
-    sorted.sort_by(|a, b| b.fused_score.partial_cmp(&a.fused_score).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let deduped = deduplicate(sorted);
     let capped = apply_per_file_cap(deduped, MAX_RESULTS_PER_FILE);
@@ -174,9 +178,9 @@ fn deduplicate(candidates: Vec<ScoredCandidate>) -> Vec<ScoredCandidate> {
         let start = c.result.line_number;
         let end = start + c.result.content.lines().count();
 
-        let overlaps = seen.iter().any(|(f, s, e)| {
-            f == file && ranges_overlap(start, end, *s, *e)
-        });
+        let overlaps = seen
+            .iter()
+            .any(|(f, s, e)| f == file && ranges_overlap(start, end, *s, *e));
 
         if !overlaps {
             seen.push((file.clone(), start, end));
@@ -245,10 +249,30 @@ mod tests {
     #[test]
     fn per_file_cap_applied() {
         let vec_results = vec![
-            make_result("a.rs", 1, "function", "fn one() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}"),
-            make_result("a.rs", 20, "function", "fn two() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}"),
-            make_result("a.rs", 40, "function", "fn three() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}"),
-            make_result("a.rs", 60, "function", "fn four() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}"),
+            make_result(
+                "a.rs",
+                1,
+                "function",
+                "fn one() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}",
+            ),
+            make_result(
+                "a.rs",
+                20,
+                "function",
+                "fn two() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}",
+            ),
+            make_result(
+                "a.rs",
+                40,
+                "function",
+                "fn three() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}",
+            ),
+            make_result(
+                "a.rs",
+                60,
+                "function",
+                "fn four() {\n  x();\n  y();\n  z();\n  w();\n  v();\n}",
+            ),
         ];
 
         let fused = fuse_results(vec_results, vec![], QueryIntent::General, 20);
@@ -258,8 +282,18 @@ mod tests {
     #[test]
     fn overlap_deduplication() {
         let vec_results = vec![
-            make_result("a.rs", 1, "function", "fn foo() {\n  body\n  body\n  body\n  body\n  body\n}"),
-            make_result("a.rs", 3, "impl", "impl Foo {\n  body\n  body\n  body\n  body\n  body\n}"),
+            make_result(
+                "a.rs",
+                1,
+                "function",
+                "fn foo() {\n  body\n  body\n  body\n  body\n  body\n}",
+            ),
+            make_result(
+                "a.rs",
+                3,
+                "impl",
+                "impl Foo {\n  body\n  body\n  body\n  body\n  body\n}",
+            ),
         ];
 
         let fused = fuse_results(vec_results, vec![], QueryIntent::General, 20);

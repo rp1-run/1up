@@ -23,6 +23,14 @@ pub fn model_dir() -> Result<PathBuf, OneupError> {
     Ok(data_dir()?.join("models").join("all-MiniLM-L6-v2"))
 }
 
+/// Returns the path to the download failure marker file.
+///
+/// When present, indicates a previous model download failed and
+/// the system should not re-attempt until the marker is cleared.
+pub fn download_failure_marker() -> Result<PathBuf, OneupError> {
+    Ok(model_dir()?.join(".download_failed"))
+}
+
 /// Returns the path to the daemon PID file.
 pub fn pid_file_path() -> Result<PathBuf, OneupError> {
     Ok(data_dir()?.join("daemon.pid"))

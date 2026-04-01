@@ -21,11 +21,7 @@ pub fn summarize_results(results: &[SearchResult]) -> String {
     }
     let files: std::collections::HashSet<&str> =
         results.iter().map(|r| r.file_path.as_str()).collect();
-    format!(
-        "{} results across {} files",
-        results.len(),
-        files.len()
-    )
+    format!("{} results across {} files", results.len(), files.len())
 }
 
 #[cfg(test)]

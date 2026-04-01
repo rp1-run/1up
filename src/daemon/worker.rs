@@ -47,7 +47,7 @@ async fn run_inner() -> Result<(), OneupError> {
     let mut embedder = match load_embedder() {
         Ok(emb) => Some(emb),
         Err(e) => {
-            warn!("embedder not available, indexing without embeddings: {e}");
+            warn!("embedding model not available ({e}); daemon will index without embeddings (semantic search degraded to FTS-only)");
             None
         }
     };

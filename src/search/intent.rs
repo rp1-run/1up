@@ -111,29 +111,50 @@ mod tests {
 
     #[test]
     fn detects_definition_intent() {
-        assert_eq!(detect_intent("where is the struct Config defined"), QueryIntent::Definition);
-        assert_eq!(detect_intent("find function definition for parse"), QueryIntent::Definition);
+        assert_eq!(
+            detect_intent("where is the struct Config defined"),
+            QueryIntent::Definition
+        );
+        assert_eq!(
+            detect_intent("find function definition for parse"),
+            QueryIntent::Definition
+        );
     }
 
     #[test]
     fn detects_flow_intent() {
-        assert_eq!(detect_intent("how does the request flow work"), QueryIntent::Flow);
-        assert_eq!(detect_intent("pipeline orchestration sequence"), QueryIntent::Flow);
+        assert_eq!(
+            detect_intent("how does the request flow work"),
+            QueryIntent::Flow
+        );
+        assert_eq!(
+            detect_intent("pipeline orchestration sequence"),
+            QueryIntent::Flow
+        );
     }
 
     #[test]
     fn detects_usage_intent() {
-        assert_eq!(detect_intent("who calls this function and where is it used"), QueryIntent::Usage);
+        assert_eq!(
+            detect_intent("who calls this function and where is it used"),
+            QueryIntent::Usage
+        );
     }
 
     #[test]
     fn detects_docs_intent() {
-        assert_eq!(detect_intent("show me the api documentation and guide"), QueryIntent::Docs);
+        assert_eq!(
+            detect_intent("show me the api documentation and guide"),
+            QueryIntent::Docs
+        );
     }
 
     #[test]
     fn defaults_to_general() {
-        assert_eq!(detect_intent("error handling network"), QueryIntent::General);
+        assert_eq!(
+            detect_intent("error handling network"),
+            QueryIntent::General
+        );
         assert_eq!(detect_intent(""), QueryIntent::General);
     }
 }

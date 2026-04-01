@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 75% (12 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12 complete)
+**Progress**: 81% (13 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -609,6 +609,18 @@ stateDiagram-v2
     - **Deviations**: None
     - **Tests**: 120/120 passing (all pre-existing tests pass; init already tested in CLI integration tests)
 
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ⏭️ N/A |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
     **Execution Flow**:
 
     ```mermaid
@@ -617,7 +629,7 @@ stateDiagram-v2
         T12_init_and_start_commands --> [*]
     ```
 
-- [ ] **T13**: Implement graceful degradation with FTS-only fallback when embeddings unavailable and skip unsupported languages with warnings `[complexity:simple]`
+- [x] **T13**: Implement graceful degradation with FTS-only fallback when embeddings unavailable and skip unsupported languages with warnings `[complexity:simple]`
 
     **Reference**: [design.md#24-data-flow-indexing-pipeline](design.md#24-data-flow-indexing-pipeline)
 
@@ -625,12 +637,27 @@ stateDiagram-v2
 
     **Acceptance Criteria**:
 
-    - [ ] Embedder availability check before search operations
-    - [ ] When model unavailable: visible warning emitted, search falls back to FTS-only ranking
-    - [ ] When model download fails: flag set, FTS-only mode persists until manual retry
-    - [ ] Unsupported tree-sitter languages skipped with warning during indexing
-    - [ ] Warning messages clearly indicate degraded capability (BR-005)
-    - [ ] Unit tests for degradation path activation
+    - [x] Embedder availability check before search operations
+    - [x] When model unavailable: visible warning emitted, search falls back to FTS-only ranking
+    - [x] When model download fails: flag set, FTS-only mode persists until manual retry
+    - [x] Unsupported tree-sitter languages skipped with warning during indexing
+    - [x] Warning messages clearly indicate degraded capability (BR-005)
+    - [x] Unit tests for degradation path activation
+
+    **Implementation Summary**:
+
+    - **Files**: `src/indexer/embedder.rs`, `src/indexer/pipeline.rs`, `src/cli/search.rs`, `src/cli/start.rs`, `src/cli/index.rs`, `src/cli/reindex.rs`, `src/daemon/worker.rs`, `src/shared/config.rs`
+    - **Approach**: Added download failure marker file mechanism (.download_failed) in model dir to persist FTS-only mode after download failure until manual retry; improved all degradation warning messages to clearly state which capability is degraded and how to recover (BR-005); added unsupported language tracking in pipeline with summary warning listing affected file types; wired up `1up index` and `1up reindex` commands with full degradation handling (auto-download attempt, failure marker, FTS-only fallback); HybridSearchEngine FTS-only path verified with new tests
+    - **Deviations**: Wired up `1up index` and `1up reindex` CLI commands (previously stubs) since graceful degradation during indexing requires a functional index command
+    - **Tests**: 128/128 passing (8 new: 3 embedder degradation, 3 pipeline degradation, 2 hybrid FTS-only search)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T13_graceful_degradation
+        T13_graceful_degradation --> [*]
+    ```
 
 ### Integration Testing
 
