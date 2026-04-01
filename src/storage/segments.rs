@@ -203,6 +203,30 @@ pub async fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, OneupE
     Ok(paths)
 }
 
+/// Get all distinct file paths for a given language.
+pub async fn get_file_paths_by_language(
+    conn: &Connection,
+    language: &str,
+) -> Result<Vec<String>, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_FILE_PATHS_BY_LANGUAGE, [language])
+        .await
+        .map_err(|e| StorageError::Query(format!("query file paths by language failed: {e}")))?;
+
+    let mut paths = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 /// Set a key-value pair in the meta table.
 pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), OneupError> {
     conn.execute(queries::UPSERT_META, [key, value])

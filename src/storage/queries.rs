@@ -110,6 +110,11 @@ pub const COUNT_SEGMENTS: &str = "SELECT COUNT(*) FROM segments";
 
 pub const COUNT_FILES: &str = "SELECT COUNT(DISTINCT file_path) FROM segments";
 
+pub const SELECT_FILE_PATHS_BY_LANGUAGE: &str = "
+SELECT DISTINCT file_path FROM segments
+WHERE language = ?1
+ORDER BY file_path";
+
 pub const SELECT_SYMBOLS_BY_DEFINED: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, complexity, role,

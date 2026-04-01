@@ -32,6 +32,9 @@ tree-sitter-c = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-language = "0.1"
 
+# Streaming iterator (for tree-sitter query iteration)
+streaming-iterator = "0.1"
+
 # ONNX inference
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 

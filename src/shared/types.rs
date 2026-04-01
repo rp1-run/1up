@@ -72,6 +72,17 @@ pub struct SymbolResult {
     pub reference_kind: ReferenceKind,
 }
 
+/// A structural search result from AST pattern matching.
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuralResult {
+    pub file_path: String,
+    pub language: String,
+    pub pattern_name: Option<String>,
+    pub content: String,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
 /// A context retrieval result with the enclosing scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextResult {

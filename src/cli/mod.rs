@@ -7,6 +7,7 @@ pub mod search;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod structural;
 pub mod symbol;
 
 use clap::{Parser, Subcommand};
@@ -56,6 +57,9 @@ pub enum Command {
     /// Retrieve code context around a file location
     Context(context::ContextArgs),
 
+    /// Structural AST-pattern search using tree-sitter queries
+    Structural(structural::StructuralArgs),
+
     /// Index a repository
     Index(index::IndexArgs),
 
@@ -76,6 +80,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Symbol(args) => symbol::exec(args, cli.format).await,
         Command::Search(args) => search::exec(args, cli.format).await,
         Command::Context(args) => context::exec(args, cli.format).await,
+        Command::Structural(args) => structural::exec(args, cli.format).await,
         Command::Index(args) => index::exec(args, cli.format).await,
         Command::Reindex(args) => reindex::exec(args, cli.format).await,
         Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),

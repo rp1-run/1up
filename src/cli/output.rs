@@ -1,12 +1,15 @@
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::shared::types::{ContextResult, OutputFormat, SearchResult, SymbolResult};
+use crate::shared::types::{
+    ContextResult, OutputFormat, SearchResult, StructuralResult, SymbolResult,
+};
 
 pub trait Formatter {
     fn format_search_results(&self, results: &[SearchResult]) -> String;
     fn format_symbol_results(&self, results: &[SymbolResult]) -> String;
     fn format_context_result(&self, result: &ContextResult) -> String;
+    fn format_structural_results(&self, results: &[StructuralResult]) -> String;
     fn format_message(&self, message: &str) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
 }
@@ -43,6 +46,10 @@ impl Formatter for JsonFormatter {
 
     fn format_context_result(&self, result: &ContextResult) -> String {
         to_json(result)
+    }
+
+    fn format_structural_results(&self, results: &[StructuralResult]) -> String {
+        to_json(results)
     }
 
     fn format_message(&self, message: &str) -> String {
@@ -122,6 +129,32 @@ impl Formatter for HumanFormatter {
         out
     }
 
+    fn format_structural_results(&self, results: &[StructuralResult]) -> String {
+        if results.is_empty() {
+            return "No structural matches found.".to_string();
+        }
+        let mut out = String::new();
+        for (i, r) in results.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let label = r.pattern_name.as_deref().unwrap_or("match");
+            out.push_str(&format!(
+                "{} {} {}\n",
+                format!("{}:{}-{}", r.file_path, r.line_start, r.line_end).cyan(),
+                format!("[{}]", label).dimmed(),
+                format!("({})", r.language).dimmed(),
+            ));
+            for line in r.content.lines().take(10) {
+                out.push_str(&format!("  {line}\n"));
+            }
+            if r.content.lines().count() > 10 {
+                out.push_str(&format!("  {}\n", "...".dimmed()));
+            }
+        }
+        out
+    }
+
     fn format_message(&self, message: &str) -> String {
         message.to_string()
     }
@@ -192,6 +225,26 @@ impl Formatter for PlainFormatter {
         ));
         out.push_str(&result.content);
         if !result.content.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+
+    fn format_structural_results(&self, results: &[StructuralResult]) -> String {
+        if results.is_empty() {
+            return "No structural matches found.".to_string();
+        }
+        let mut out = String::new();
+        for r in results {
+            let label = r.pattern_name.as_deref().unwrap_or("match");
+            out.push_str(&format!(
+                "{}:{}-{}\t{}\t{}\n",
+                r.file_path, r.line_start, r.line_end, label, r.language
+            ));
+            out.push_str(&r.content);
+            if !r.content.ends_with('\n') {
+                out.push('\n');
+            }
             out.push('\n');
         }
         out
