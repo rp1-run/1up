@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 87% (14 of 16 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14 complete)
+**Progress**: 88% (15 of 17 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8 complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -698,12 +698,53 @@ stateDiagram-v2
     - **Deviations**: Added `src/lib.rs` to expose modules for benchmark access; search tests use FTS-only mode via model hiding to work around a pre-existing vector_distance_cos dimension mismatch bug in the int8 search path (96 vs 384 bytes); added `dirs`, `libc`, `tokio` dev-dependencies
     - **Tests**: 147/147 passing (119 lib + 9 cli_tests + 19 integration_tests), 6 benchmarks passing
 
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
     **Execution Flow**:
 
     ```mermaid
     stateDiagram-v2
         [*] --> T14_integration_testing
         T14_integration_testing --> [*]
+    ```
+
+### Bug Fixes
+
+- [x] **TX-fix-clippy-and-int8**: Fix clippy tautological assertion in embedder test and int8 vector dimension mismatch in hybrid search `[complexity:simple]`
+
+    **Effort**: 30 minutes
+
+    **Acceptance Criteria**:
+
+    - [x] Clippy tautological assertion (`available || !available`) replaced with meaningful smoke test
+    - [x] Int8 prefilter query uses quantized int8 bytes instead of f32 bytes (fixes FN-001 dimension mismatch)
+    - [x] Quantization logic matches pipeline.rs `f32_to_q8_bytes` implementation
+    - [x] All existing tests pass
+    - [x] Clippy passes with no new errors
+
+    **Implementation Summary**:
+
+    - **Files**: `src/indexer/embedder.rs`, `src/search/hybrid.rs`
+    - **Approach**: Replaced tautological `assert!(available || !available)` with smoke test that just calls `is_model_available()` without asserting on a value that depends on environment; added `f32_to_q8_bytes()` function to hybrid.rs (replicating quantization from pipeline.rs) and used it for the int8 prefilter stage instead of `f32_vec_to_bytes()` which was producing 1536 bytes (384 x 4) instead of the expected 384 bytes
+    - **Deviations**: None
+    - **Tests**: 149/149 passing (added 2 new q8 quantization tests)
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TX_fix_clippy_and_int8
+        TX_fix_clippy_and_int8 --> [*]
     ```
 
 ### User Docs

@@ -405,11 +405,9 @@ mod tests {
 
     #[test]
     fn model_availability_check() {
-        let available = is_model_available();
-        assert!(
-            available || !available,
-            "is_model_available should return a bool"
-        );
+        // Smoke test: verify is_model_available() completes without panicking.
+        // The return value depends on whether model files exist on disk.
+        let _available = is_model_available();
     }
 
     #[test]

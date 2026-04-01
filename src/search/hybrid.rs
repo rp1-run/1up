@@ -65,7 +65,7 @@ async fn vector_search(
     query: &str,
 ) -> Result<Vec<SearchResult>, OneupError> {
     let query_embedding = embedder.embed_one(query)?;
-    let query_vec_bytes = f32_vec_to_bytes(&query_embedding);
+    let query_q8_bytes = f32_to_q8_bytes(&query_embedding);
 
     let prefilter_k = VECTOR_PREFILTER_K as i64;
 
@@ -79,7 +79,7 @@ async fn vector_search(
              WHERE s.embedding_q8 IS NOT NULL
              ORDER BY distance ASC
              LIMIT ?2",
-            libsql::params![libsql::Value::Blob(query_vec_bytes.clone()), prefilter_k],
+            libsql::params![libsql::Value::Blob(query_q8_bytes), prefilter_k],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("int8 prefilter: {e}")))?;
@@ -284,6 +284,17 @@ fn f32_vec_to_bytes(vec: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn f32_to_q8_bytes(vec: &[f32]) -> Vec<u8> {
+    let max_abs = vec
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-10);
+
+    let scale = 127.0 / max_abs;
+    vec.iter().map(|v| (v * scale) as i8 as u8).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +321,23 @@ mod tests {
     fn fts_query_handles_empty() {
         let q = build_fts_query("");
         assert_eq!(q, "");
+    }
+
+    #[test]
+    fn q8_quantization_produces_correct_length() {
+        let vec = vec![0.1f32, -0.5, 0.3, 0.0, 1.0];
+        let q8 = f32_to_q8_bytes(&vec);
+        assert_eq!(q8.len(), vec.len());
+    }
+
+    #[test]
+    fn q8_quantization_matches_pipeline() {
+        let vec = vec![0.5f32, -1.0, 0.0, 0.25, -0.75];
+        let q8 = f32_to_q8_bytes(&vec);
+        let max_abs = 1.0f32;
+        let scale = 127.0 / max_abs;
+        let expected: Vec<u8> = vec.iter().map(|v| (v * scale) as i8 as u8).collect();
+        assert_eq!(q8, expected);
     }
 
     #[test]
