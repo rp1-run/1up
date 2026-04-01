@@ -193,7 +193,7 @@ fn find_smallest_enclosing<'a>(
 
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             find_smallest_enclosing(&child, target_row, scope_kinds, best);
         }
     }

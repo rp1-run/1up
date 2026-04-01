@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use turso::Connection;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
+use turso::Connection;
 
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
@@ -17,13 +17,18 @@ use crate::storage::segments::{self, SegmentInsert};
 fn compute_file_hash(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);
-    format!("{:x}", hasher.finalize())
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn generate_segment_id(file_path: &str, line_start: usize, line_end: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{}:{}:{}", file_path, line_start, line_end).as_bytes());
-    format!("{:x}", hasher.finalize())[..16].to_string()
+    let hash = hasher.finalize();
+    hash.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()[..16]
+        .to_string()
 }
 
 fn f32_to_bytes(vec: &[f32]) -> Vec<u8> {

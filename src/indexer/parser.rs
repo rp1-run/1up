@@ -295,7 +295,7 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
     let child_count = root.named_child_count();
 
     while i < child_count {
-        let node = root.named_child(i).unwrap();
+        let node = root.named_child(i as u32).unwrap();
         let kind = node.kind();
 
         if comment_kinds.contains(&kind) {
@@ -391,7 +391,7 @@ fn collect_leading_comments<'a>(
     let mut j = current_index;
     while j > 0 {
         j -= 1;
-        if let Some(prev) = root.named_child(j) {
+        if let Some(prev) = root.named_child(j as u32) {
             if comment_kinds.contains(&prev.kind()) {
                 if let Ok(text) = prev.utf8_text(source) {
                     comments.push(text.to_string());
@@ -465,7 +465,7 @@ fn extract_nested(
 
     let child_count = search_node.named_child_count();
     for i in 0..child_count {
-        let child = search_node.named_child(i).unwrap();
+        let child = search_node.named_child(i as u32).unwrap();
         let kind = child.kind();
 
         if kind == "decorated_definition" {

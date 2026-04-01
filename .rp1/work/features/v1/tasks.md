@@ -6,7 +6,7 @@ rp1_doc_id: 24e70310-556b-42b3-865b-cb8fcd1d65e4
 
 **Feature ID**: v1
 **Status**: Not Started
-**Progress**: 100% (19 of 19 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8, TD1, TD2, TX-structural-search, TX-migrate-to-turso complete)
+**Progress**: 100% (20 of 20 tasks -- T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, TX-fix-clippy-and-int8, TD1, TD2, TX-structural-search, TX-migrate-to-turso, TX-update-deps complete)
 **Estimated Effort**: 11 days
 **Started**: 2026-04-01
 
@@ -871,6 +871,36 @@ stateDiagram-v2
     stateDiagram-v2
         [*] --> TX_migrate_to_turso
         TX_migrate_to_turso --> [*]
+    ```
+
+### Dependency Updates
+
+- [x] **TX-update-deps**: Update all crate dependencies to latest versions `[complexity:low]`
+
+    **Reference**: Keep dependencies current for security and compatibility
+
+    **Effort**: 30 minutes
+
+    **Acceptance Criteria**:
+
+    - [x] All dependencies updated to latest stable versions
+    - [x] Breaking API changes fixed (tree-sitter 0.26, sha2 0.11)
+    - [x] `cargo check` passes
+    - [x] All tests pass (157/157)
+
+    **Implementation Summary**:
+
+    - **Files**: `Cargo.toml`, `Cargo.lock`, `src/indexer/parser.rs`, `src/indexer/pipeline.rs`, `src/search/context.rs`
+    - **Approach**: Updated 13 crate version specifiers to latest stable: tree-sitter 0.24->0.26, tree-sitter-rust 0.23->0.24, tree-sitter-python 0.23->0.25, tree-sitter-javascript 0.23->0.25, tree-sitter-go 0.23->0.25, tree-sitter-c 0.23->0.24, tokenizers 0.21->0.22, reqwest 0.12->0.13, sha2 0.10->0.11, colored 2->3, indicatif 0.17->0.18, nix 0.29->0.31, criterion 0.5->0.8. Fixed two breaking API changes: tree-sitter 0.26 changed child/named_child parameter from usize to u32; sha2 0.11 changed finalize() return type removing LowerHex impl.
+    - **Deviations**: notify kept at 7 (9.0.0-rc.2 is not stable); libc kept at 0.2 (1.0.0-alpha.3 is alpha); turso/ort already at latest pre-release
+    - **Tests**: 157/157 passing
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TX_update_deps
+        TX_update_deps --> [*]
     ```
 
 ## Acceptance Criteria Checklist

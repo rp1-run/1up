@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use turso::Connection;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
+use turso::Connection;
 
 use crate::indexer::parser::SupportedLanguage;
 use crate::shared::errors::{OneupError, SearchError};
