@@ -66,7 +66,7 @@ Hybrid semantic + full-text search with reciprocal rank fusion (RRF) ranking:
 1up search "database connection pool" -n 10
 ```
 
-When the embedding model is available, results combine vector similarity and keyword matching. Falls back to full-text search only if the model is unavailable.
+Search requires a current local schema-v5 index. On rebuilt/current indexes, 1up combines symbol matches, native-vector retrieval over `segments.embedding_vec`, and FTS5 keyword matches. If the embedding model is unavailable, fails to load, or a vector query fails for this invocation, search warns and degrades to `FtsOnly`. Missing, stale, or partial indexes are recovery cases: run `1up reindex`.
 
 ### Symbol Lookup
 
@@ -105,11 +105,15 @@ Explicitly index a repository without starting the daemon:
 1up index [path]
 ```
 
-Force a full re-index (clears existing index first):
+`1up index` is the incremental updater for already-current indexes. On an empty project it creates the current schema-v5 layout; if embeddings are unavailable it still stores searchable content with null vectors.
+
+Force a full re-index when adopting the rewrite or recovering from stale/partial local indexes:
 
 ```sh
 1up reindex [path]
 ```
+
+`1up reindex` treats pre-rewrite local indexes as disposable cache, rebuilds schema v5 from scratch, and repopulates `segments`, `segments_fts`, and `segments.embedding_vec`.
 
 ### Daemon Management
 
@@ -210,7 +214,7 @@ Index a repository. Downloads the embedding model on first use.
 
 #### `1up reindex [PATH]`
 
-Force a full re-index, clearing the existing index first.
+Force a full re-index by rebuilding the local schema-v5 search index from scratch. Use this to adopt the rewrite or recover from stale v4 / partial v5 indexes.
 
 | Argument | Description | Default |
 |----------|-------------|---------|

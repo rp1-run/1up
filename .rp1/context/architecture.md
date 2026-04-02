@@ -42,24 +42,33 @@ Deleted files have their segments removed. The scanner uses the `ignore` crate (
 ```
 Query text
   -> Intent detection (DEFINITION, FLOW, USAGE, DOCS, GENERAL)
-  -> Generate query embedding (384-dim via ONNX)
-  -> Stage 1: int8 prefilter (embedding_q8, top-200 candidates)
-  -> Stage 2: f32 rerank (full-precision embedding)
-  -> FTS5 MATCH query (parallel with vector search)
+  -> Symbol lookup candidates (definitions/usages)
+  -> Generate query embedding when the ONNX model is available
+  -> RetrievalBackend::select(...)
+     -> SqlVectorV2 when query embeddings exist and indexed rows have `embedding_vec`
+        -> serialize embedding -> `vector(?)`
+        -> `vector_top_k('idx_segments_embedding', vector(?), ?)`
+        -> hydrate rows by joining `v.id` back to `segments.rowid`
+     -> FtsOnly otherwise
+        -> `segments_fts MATCH ?`
+  -> If SqlVectorV2 fails, warn and rerun this invocation as FtsOnly
   -> RRF fusion with intent-based boosting
   -> Dedup, per-file caps, penalties (test/doc/short segments)
   -> Return ranked results
 ```
 
-Falls back to FTS-only when the embedding model is unavailable.
+Search requires a current schema-v5 index. Missing, stale, or partial local indexes fail closed with explicit `1up reindex` guidance. Missing models, model load failures, and vector-query failures degrade only the current invocation to `FtsOnly` with warnings.
 
 ## Storage Schema
 
 Single libSQL database per project at `.1up/index.db`:
 
-- **segments**: Main table with file_path, language, block_type, content, line_start/end, embedding (F32_BLOB(384)), embedding_q8 (VECTOR8(384)), complexity, role, defined_symbols (JSON), referenced_symbols (JSON), file_hash
-- **segments_fts**: FTS5 virtual table synced via triggers on content, file_path, block_type
-- **meta**: Key-value store for schema_version and timestamps
+- **segments**: Main table with file_path, language, block_type, content, line_start/end, nullable `embedding_vec FLOAT32(384)`, breadcrumb, complexity, role, symbol JSON columns, and file_hash
+- **idx_segments_embedding**: Native vector index over `segments.embedding_vec`, queried with `vector_top_k(...)`
+- **segments_fts**: FTS5 virtual table over segment content, kept in sync with insert/update/delete triggers and joined back to `segments` by rowid
+- **meta**: Key-value store containing `schema_version`; `schema::ensure_current()` treats that value plus required objects as the read gate
+
+Schema v5 is a clean-break format. Pre-rewrite, stale, missing, or partial indexes are unsupported until `1up reindex` rebuilds `segments`, `segments_fts`, and the vector index from scratch.
 
 ## Storage Layout
 

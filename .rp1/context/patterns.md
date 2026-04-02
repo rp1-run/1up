@@ -24,31 +24,30 @@
 
 ## Database Access
 
-- `Db` wrapper struct with `open_rw()`, `open_ro()`, `open_memory()` constructors using `turso::Builder`
-- All Builder calls use `.experimental_index_method(true)` to enable turso-native FTS (tantivy-backed)
+- `Db` wrapper struct with `open_rw()`, `open_ro()`, `open_memory()` constructors using `libsql::Builder::new_local()`
+- Local opens retry on lock-style errors before surfacing a connection failure
 - `Builder::new_local()` takes `&str` (paths converted via `.to_str()`)
 - Read-only access for queries; read-write for indexing
-- Schema migration via `schema::migrate(&conn)` called before any DB operation
-- Segments stored with JSON-encoded `defined_symbols` and `referenced_symbols` arrays
-- Embedding vectors stored as both f32 (`F32_BLOB(384)`) and int8 quantized (`VECTOR8(384)`)
-- FTS uses `CREATE INDEX ... USING fts(content)` with `fts_match()` / `fts_score()` queries (not SQLite FTS5)
+- `schema::prepare_for_write(&conn)` initializes empty databases or rejects stale indexes; `schema::ensure_current(&conn)` guards read paths; `schema::rebuild(&conn)` is the explicit clean-rebuild entry point
+- Segments store JSON-encoded symbol arrays and a nullable native vector column (`embedding_vec`) written through `vector(?8)`
+- Vector retrieval uses `vector_top_k('idx_segments_embedding', vector(?), ?)` and hydrates candidates from `segments`
+- Keyword retrieval uses SQLite FTS5 `MATCH` against `segments_fts`
 
 ## Graceful Degradation
 
 - `is_model_available()` checks for ONNX model on disk
 - `is_download_failed()` checks for `.download_failed` marker file
-- Three-tier fallback in all embedding-dependent commands:
-  1. Model available -> load and use
-  2. Download previously failed -> warn, skip embeddings
-  3. Model not found -> attempt download, mark failure if it fails
-- Search degrades from hybrid (vector + FTS) to FTS-only with a warning
+- Missing, stale, or partial indexes are recovery-path errors, not graceful fallbacks; read and write paths surface explicit run `1up reindex` guidance
+- `index` and `reindex` continue without embeddings when the model is missing, previously failed to download, or fails to load
+- Search degrades to `FtsOnly` with a warning when the model is unavailable or query embedding generation fails
+- `HybridSearchEngine` also degrades only the current invocation to `FtsOnly` if `SqlVectorV2` retrieval fails at query time
 - Unsupported tree-sitter languages fall back to text chunking
 
 ## Daemon Communication
 
 - No IPC -- shared-nothing model
 - CLI and daemon communicate exclusively through:
-  - Turso database (read/write)
+  - libSQL database (read/write)
   - PID file for liveness checking
   - Project registry JSON file
   - Unix signals (SIGHUP = reload, SIGTERM = shutdown)
@@ -74,9 +73,12 @@
 
 - Unit tests in `#[cfg(test)]` modules within source files
 - Integration tests in `tests/` directory using `assert_cmd` and `predicates`
+- `tests/rewrite_sql_verification.rs` covers stale-v4 guidance, partial-v5 guidance, degraded FTS-only search, freshness after add/edit/delete, and the read-only guarantee for source files
 - Benchmarks in `benches/` using `criterion`
+- `benches/search_bench.rs` exercises retrieval and fusion paths with schema-v5 data shapes
+- `scripts/benchmark_rewrite_sql.sh` is the repeatable baseline-vs-candidate latency and quality harness for the rewrite rollout
 - Temp directories via `tempfile` crate for test isolation
-- In-memory or temp-file turso DB for storage tests
+- In-memory or temp-file libSQL DB for storage tests
 
 ## File Organization
 
