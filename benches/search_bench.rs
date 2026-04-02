@@ -1,4 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use oneup::search::intent::detect_intent;
+use oneup::search::ranking::fuse_results;
+use oneup::search::retrieval::{RetrievalBackend, RetrievalMode};
+use oneup::storage::segments::{self, SegmentInsert};
 
 fn setup_db_and_index() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -135,6 +139,122 @@ module.exports = { handleRequest, handleGet, handlePost, validateInput };
     (tmp, db_path)
 }
 
+fn embedding_with(values: &[(usize, f32)]) -> Vec<f32> {
+    let mut embedding = vec![0.0; 384];
+    for (idx, value) in values {
+        embedding[*idx] = *value;
+    }
+    embedding
+}
+
+fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".1up")).unwrap();
+
+    let db_path = tmp.path().join(".1up").join("index.db");
+    let query = "request auth token validation".to_string();
+    let query_embedding = embedding_with(&[(0, 1.0), (1, 0.8)]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = oneup::storage::db::Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        oneup::storage::schema::initialize(&conn).await.unwrap();
+
+        for idx in 0..40 {
+            let insert = SegmentInsert {
+                id: format!("auth-{idx}"),
+                file_path: format!("src/auth_{idx}.rs"),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "fn validate_token_{idx}(token: &str) -> bool {{\n    let request_context = \"request auth token validation middleware\";\n    let session_state = \"auth token validator\";\n    !token.is_empty() && !request_context.is_empty() && !session_state.is_empty()\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 5,
+                embedding_vec: Some(
+                    serde_json::to_string(&embedding_with(&[
+                        (0, 0.95),
+                        (1, 0.78),
+                        (2, idx as f32 / 100.0),
+                    ]))
+                    .unwrap(),
+                ),
+                breadcrumb: Some("auth".to_string()),
+                complexity: 2,
+                role: "IMPLEMENTATION".to_string(),
+                defined_symbols: format!("[\"validate_token_{idx}\"]"),
+                referenced_symbols: "[\"request\",\"token\"]".to_string(),
+                called_symbols: "[\"validate\"]".to_string(),
+                file_hash: format!("hash-auth-{idx}"),
+            };
+            segments::upsert_segment(&conn, &insert).await.unwrap();
+        }
+
+        for idx in 0..40 {
+            let insert = SegmentInsert {
+                id: format!("config-{idx}"),
+                file_path: format!("src/config_{idx}.rs"),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "fn load_config_{idx}() -> &'static str {{\n    let host = \"config loading host port settings\";\n    let file = \"config path\";\n    if host.is_empty() {{\n        return file;\n    }}\n    host\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 8,
+                embedding_vec: Some(
+                    serde_json::to_string(&embedding_with(&[
+                        (2, 0.92),
+                        (3, 0.81),
+                        (0, idx as f32 / 200.0),
+                    ]))
+                    .unwrap(),
+                ),
+                breadcrumb: Some("config".to_string()),
+                complexity: 2,
+                role: "DEFINITION".to_string(),
+                defined_symbols: format!("[\"load_config_{idx}\"]"),
+                referenced_symbols: "[\"host\",\"port\"]".to_string(),
+                called_symbols: "[]".to_string(),
+                file_hash: format!("hash-config-{idx}"),
+            };
+            segments::upsert_segment(&conn, &insert).await.unwrap();
+        }
+
+        for idx in 0..40 {
+            let insert = SegmentInsert {
+                id: format!("billing-{idx}"),
+                file_path: format!("src/billing_{idx}.rs"),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "fn invoice_total_{idx}() -> i64 {{\n    let ledger = \"billing invoice total payment\";\n    let taxes = 12;\n    let subtotal = 120;\n    let _ = ledger;\n    subtotal + taxes\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 7,
+                embedding_vec: Some(
+                    serde_json::to_string(&embedding_with(&[
+                        (4, 0.93),
+                        (5, 0.79),
+                        (1, idx as f32 / 200.0),
+                    ]))
+                    .unwrap(),
+                ),
+                breadcrumb: Some("billing".to_string()),
+                complexity: 2,
+                role: "IMPLEMENTATION".to_string(),
+                defined_symbols: format!("[\"invoice_total_{idx}\"]"),
+                referenced_symbols: "[\"invoice\"]".to_string(),
+                called_symbols: "[\"total\"]".to_string(),
+                file_hash: format!("hash-billing-{idx}"),
+            };
+            segments::upsert_segment(&conn, &insert).await.unwrap();
+        }
+    });
+
+    (tmp, db_path, query_embedding, query)
+}
+
 fn bench_symbol_lookup(c: &mut Criterion) {
     let (_tmp, db_path) = setup_db_and_index();
 
@@ -219,5 +339,61 @@ fn bench_fts_search(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_symbol_lookup, bench_fts_search);
+fn bench_retrieval_backend(c: &mut Criterion) {
+    let (_tmp, db_path, query_embedding, query) = setup_retrieval_db();
+    let intent = detect_intent(&query);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = rt
+        .block_on(async { oneup::storage::db::Db::open_ro(&db_path).await })
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    c.bench_function("retrieval_sql_vector_v2_candidates", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
+                    .await
+                    .unwrap();
+                let candidates = backend
+                    .search(&query, Some(&query_embedding))
+                    .await
+                    .unwrap();
+                assert_eq!(backend.mode(), RetrievalMode::SqlVectorV2);
+                assert!(!candidates.vector_results.is_empty());
+                assert!(!candidates.fts_results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("hybrid_sql_vector_v2_fusion", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
+                    .await
+                    .unwrap();
+                let candidates = backend
+                    .search(&query, Some(&query_embedding))
+                    .await
+                    .unwrap();
+                let results = fuse_results(
+                    candidates.vector_results,
+                    candidates.fts_results,
+                    Vec::new(),
+                    intent,
+                    10,
+                );
+                assert_eq!(backend.mode(), RetrievalMode::SqlVectorV2);
+                assert!(!results.is_empty());
+                assert!(results[0].file_path.starts_with("src/auth_"));
+            });
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_symbol_lookup,
+    bench_fts_search,
+    bench_retrieval_backend
+);
 criterion_main!(benches);
