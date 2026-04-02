@@ -1,6 +1,6 @@
 # Validation Artifacts: rewrite-sql
 
-**Validated**: 2026-04-02T08:46:48Z
+**Validated**: 2026-04-02T09:09:00Z
 
 ## HYP-001 Result Snapshot
 
@@ -26,30 +26,30 @@
 
 ## T4 Benchmark Snapshot
 
-**Measured**: 2026-04-02T17:38:29+11:00
+**Measured**: 2026-04-02T20:09:00+11:00
 
 - Script: `scripts/benchmark_rewrite_sql.sh`
 - Baseline ref: `45b5117`
-- Candidate ref: `f7da967`
-- Raw summary: `target/rewrite-sql-bench/20260402-173829/summary.md`
+- Candidate ref: `d7e89b4`
+- Raw summary: `target/rewrite-sql-bench/20260402-200900/summary.md`
 - Corpus: generated 33-file mixed-language fixture, 3 clean rebuild runs, 7 query runs with 1 warmup
 
 ### Clean rebuild latency
 
 | Variant | Median ms | p95 ms |
 |---------|-----------|--------|
-| Baseline | 1199.45 | 2129.85 |
-| Candidate | 1270.06 | 2592.02 |
+| Baseline | 1257.92 | 2296.19 |
+| Candidate | 1336.83 | 2267.07 |
 
 ### Search latency
 
 | Query | Expected file | Baseline median ms | Baseline p95 ms | Candidate median ms | Candidate p95 ms |
 |-------|---------------|--------------------|-----------------|---------------------|------------------|
-| `config loading host port` | `src/config.rs` | 134.51 | 139.65 | 128.60 | 132.31 |
-| `request auth token validation middleware` | `src/auth.rs` | 136.39 | 143.24 | 131.80 | 136.77 |
-| `request pipeline json response rendering` | `src/server.rs` | 134.52 | 139.22 | 125.78 | 128.19 |
-| `serialize json response payload` | `tools/output.py` | 136.68 | 146.61 | 129.09 | 131.58 |
-| `billing invoice total tax calculation` | `web/billing.js` | 134.39 | 138.61 | 128.35 | 134.97 |
+| `config loading host port` | `src/config.rs` | 137.71 | 145.09 | 131.54 | 137.30 |
+| `request auth token validation middleware` | `src/auth.rs` | 137.97 | 146.03 | 129.65 | 135.36 |
+| `request pipeline json response rendering` | `src/server.rs` | 136.69 | 140.42 | 134.31 | 138.78 |
+| `serialize json response payload` | `tools/output.py` | 139.62 | 144.16 | 133.59 | 137.92 |
+| `billing invoice total tax calculation` | `web/billing.js` | 139.47 | 144.92 | 133.77 | 136.07 |
 
 ### Quality corpus
 
@@ -63,10 +63,10 @@
 
 ## T4 Operational Stability Follow-up
 
-**Measured**: 2026-04-02T19:46:48+11:00
+**Measured**: 2026-04-02T20:09:00+11:00
 
 - Script: `scripts/benchmark_rewrite_sql.sh`
-- Raw summary: `target/rewrite-sql-bench/20260402-194648/summary.md`
+- Raw summary: `target/rewrite-sql-bench/20260402-200900/summary.md`
 - Method: repeated baseline-versus-candidate add/edit/delete churn on the same 33-file fixture; manual intervention counts cover command failures and explicit `1up reindex` prompts.
 
 ### Operational stability comparison
@@ -78,8 +78,9 @@
 
 ### Evidence Summary
 
-- Candidate search latency improved on all five representative queries versus the baseline commit.
-- Candidate rebuild latency regressed on this fixture, so rebuild cost should stay part of rollout review.
+- The refreshed current-`HEAD` benchmark packet improved candidate median and p95 search latency on all five representative queries versus the baseline commit.
+- The earlier one-query p95 miss for `serialize json response payload` did not reproduce in the refreshed rerun, so the latest raw summary above should be treated as the rollout source of truth.
+- Candidate rebuild latency still regressed on this fixture, so rebuild cost should stay part of rollout review and continue to block broad rollout.
 - The quality corpus stayed flat versus baseline at 4/5 top-3 hits; the missed auth query was already missed before the rewrite, so this evidence shows no material relevance regression from the SQL retrieval change.
 - Routine indexing burden stayed flat on the representative churn fixture: baseline and candidate each completed 12/12 freshness checks with zero command failures and zero explicit `1up reindex` prompts.
 
@@ -115,15 +116,20 @@
 
 | Dimension | Evidence | Status | Notes |
 |-----------|----------|--------|-------|
-| Query latency | `target/rewrite-sql-bench/20260402-173829/summary.md` | Pass | Candidate median and p95 improved on all five representative search queries |
-| Search quality | `target/rewrite-sql-bench/20260402-173829/summary.md` | Pass | Candidate stayed at 4/5 top-3 hits, matching baseline; the missed auth query is pre-existing |
+| Query latency | `target/rewrite-sql-bench/20260402-200900/summary.md` | Pass | Refreshed current-`HEAD` evidence shows candidate median and p95 improved on all five representative search queries |
+| Search quality | `target/rewrite-sql-bench/20260402-200900/summary.md` | Pass | Candidate stayed at 4/5 top-3 hits, matching baseline; the missed auth query is pre-existing |
 | Stale, missing, and partial index handling | `tests/rewrite_sql_verification.rs`, `tests/integration_tests.rs` | Pass | Query commands fail closed with explicit `1up reindex` guidance instead of legacy reads |
 | Freshness after rebuild | `tests/rewrite_sql_verification.rs` | Pass | Rebuilt schema-v5 indexes stayed current across add, edit, and delete flows |
-| Routine operational burden | `target/rewrite-sql-bench/20260402-194648/summary.md` | Pass | Baseline and candidate both completed the repeated add/edit/delete churn check with 12/12 freshness checks, zero command failures, and zero rebuild prompts |
+| Routine operational burden | `target/rewrite-sql-bench/20260402-200900/summary.md` | Pass | Baseline and candidate both completed the repeated add/edit/delete churn check with 12/12 freshness checks, zero command failures, and zero rebuild prompts |
 | Graceful degradation | `tests/rewrite_sql_verification.rs` | Pass | Search warns and still returns FTS-backed results when semantic retrieval is unavailable |
 | Read-only repository guarantee | `tests/rewrite_sql_verification.rs` | Pass | Index and search flows leave source files unchanged |
-| Clean rebuild cost | `target/rewrite-sql-bench/20260402-173829/summary.md` | Block broad rollout | Candidate rebuild median and p95 regressed on the benchmark fixture; broad rollout stays blocked until this required comparison category is resolved or explicitly signed off by maintainers |
+| Clean rebuild cost | `target/rewrite-sql-bench/20260402-200900/summary.md` | Block broad rollout | Candidate rebuild median still regressed on the benchmark fixture; broad rollout stays blocked until this required comparison category is resolved or explicitly signed off by maintainers |
 
 ### Recommendation
 
-The rewrite remains a clean-break feature: stale local indexes should be discarded and rebuilt with `1up reindex`, not migrated. Current evidence supports continued rebuilt-index evaluation on steady-state query behavior, and the new churn comparison shows no added manual-intervention burden versus baseline, but the recorded clean-rebuild regression blocks broad rollout until maintainers explicitly sign off or the rebuild-cost comparison is improved.
+The rewrite remains a clean-break feature: stale local indexes should be discarded and rebuilt with `1up reindex`, not migrated. The refreshed current-`HEAD` benchmark packet clears the earlier `serialize json response payload` p95 concern and keeps steady-state query behavior, quality, degradation, and operational-burden evidence in a reviewable state, but the recorded clean-rebuild regression still blocks broad rollout until maintainers explicitly sign off or the rebuild-cost comparison is improved.
+
+### Open Follow-up
+
+- Use `target/rewrite-sql-bench/20260402-200900/summary.md` as the current rollout-evidence packet for any future verification or maintainer review.
+- Remaining unblocker for broad rollout: either improve clean rebuild cost on the representative fixture or record explicit maintainer sign-off accepting the current rebuild regression against the refreshed benchmark packet.

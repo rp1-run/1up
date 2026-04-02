@@ -1,0 +1,3 @@
+# Field Notes: rewrite-sql
+
+- 2026-04-02: `scripts/benchmark_rewrite_sql.sh` currently measures query latency with `QUERY_RUNS=7`, so the reported p95 is effectively the slowest sample in that run set. A single tail outlier can therefore flip a per-query p95 conclusion even when medians stay stable. When rollout text and verification diverge, rerun the harness and treat the newest `target/rewrite-sql-bench/<timestamp>/summary.md` as the source of truth. The refreshed packet at `target/rewrite-sql-bench/20260402-200900/summary.md` cleared the earlier `serialize json response payload` p95 miss; clean rebuild cost remained the only broad-rollout blocker.
