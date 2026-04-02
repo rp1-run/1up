@@ -104,3 +104,21 @@ fn json_output_is_valid_json() {
 fn verbose_flag_accepted() {
     cmd().args(["-vv", "--help"]).assert().success();
 }
+
+#[test]
+fn search_without_index_requires_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "json",
+            "search",
+            "needle",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1up reindex"));
+}

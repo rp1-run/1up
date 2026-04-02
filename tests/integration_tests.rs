@@ -641,7 +641,7 @@ fn cli_init_then_index_then_search_workflow() {
 }
 
 #[test]
-fn cli_search_without_index_warns() {
+fn cli_search_without_index_requires_reindex() {
     let tmp = TempDir::new().unwrap();
 
     cmd()
@@ -654,12 +654,12 @@ fn cli_search_without_index_warns() {
             tmp.path().to_str().unwrap(),
         ])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("no index found"));
+        .failure()
+        .stderr(predicate::str::contains("1up reindex"));
 }
 
 #[test]
-fn cli_symbol_without_index_warns() {
+fn cli_symbol_without_index_requires_reindex() {
     let tmp = TempDir::new().unwrap();
 
     cmd()
@@ -672,8 +672,8 @@ fn cli_symbol_without_index_warns() {
             tmp.path().to_str().unwrap(),
         ])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("no index found"));
+        .failure()
+        .stderr(predicate::str::contains("1up reindex"));
 }
 
 #[test]

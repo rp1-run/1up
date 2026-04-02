@@ -8,7 +8,6 @@ use crate::shared::config;
 use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
-use crate::storage::segments;
 
 #[derive(Args)]
 pub struct ReindexArgs {
@@ -27,25 +26,12 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
 
-    if !db_path.exists() {
-        anyhow::bail!(
-            "No index found at {}. Run `1up index` first.",
-            db_path.display()
-        );
-    }
-
-    let setup_spinner = spin("Preparing database");
+    let setup_spinner = spin("Rebuilding database");
 
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
-    schema::migrate(&conn).await?;
-
-    let all_paths = segments::get_all_file_paths(&conn).await?;
-    setup_spinner.update(&format!("Clearing {} files from index", all_paths.len()));
-    for path in &all_paths {
-        segments::delete_segments_by_file(&conn, path).await?;
-    }
-    setup_spinner.success_with(&format!("Cleared {} files from index", all_paths.len()));
+    schema::rebuild(&conn).await?;
+    setup_spinner.success_with("Rebuilt schema v5");
 
     let model_spinner = spin("Loading embedding model");
 
@@ -56,7 +42,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
                 Some(e)
             }
             Err(err) => {
-                model_spinner.warn_with(&format!("Embedding model failed to load ({err})"));
+                model_spinner.warn_with(format!("Embedding model failed to load ({err})"));
                 None
             }
         }
@@ -71,7 +57,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
                 Some(e)
             }
             Err(err) => {
-                model_spinner.warn_with(&format!("Model download failed ({err})"));
+                model_spinner.warn_with(format!("Model download failed ({err})"));
                 None
             }
         }
@@ -80,10 +66,9 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let stats = pipeline::run(&conn, &project_root, embedder_opt.as_mut()).await?;
 
     let msg = format!(
-        "Re-indexed {} files ({} segments). {} deleted.{}",
+        "Re-indexed {} files ({} segments). Clean rebuild complete.{}",
         stats.files_indexed,
         stats.segments_stored,
-        all_paths.len(),
         if stats.embeddings_generated {
             ""
         } else {

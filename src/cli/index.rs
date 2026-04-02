@@ -35,7 +35,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
-    schema::migrate(&conn).await?;
+    schema::prepare_for_write(&conn).await?;
 
     setup_spinner.success();
 
@@ -48,7 +48,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
                 Some(e)
             }
             Err(err) => {
-                model_spinner.warn_with(&format!("Embedding model failed to load ({err})"));
+                model_spinner.warn_with(format!("Embedding model failed to load ({err})"));
                 None
             }
         }
@@ -63,7 +63,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
                 Some(e)
             }
             Err(err) => {
-                model_spinner.warn_with(&format!("Model download failed ({err})"));
+                model_spinner.warn_with(format!("Model download failed ({err})"));
                 None
             }
         }

@@ -153,7 +153,13 @@ async fn load_and_watch_projects(
         let db_path = config::project_db_path(&entry.project_root);
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect()?;
-        schema::migrate(&conn).await?;
+        if let Err(e) = schema::prepare_for_write(&conn).await {
+            warn!(
+                "skipping project {} until a clean rebuild succeeds: {e}",
+                entry.project_root.display()
+            );
+            continue;
+        }
 
         watcher.watch(&entry.project_root)?;
 
@@ -207,7 +213,13 @@ async fn reload_projects(
         let db_path = config::project_db_path(&entry.project_root);
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect()?;
-        schema::migrate(&conn).await?;
+        if let Err(e) = schema::prepare_for_write(&conn).await {
+            warn!(
+                "skipping project {} until a clean rebuild succeeds: {e}",
+                entry.project_root.display()
+            );
+            continue;
+        }
 
         watcher.watch(&entry.project_root)?;
 
