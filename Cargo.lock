@@ -4390,8 +4390,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turso"
 version = "0.6.0-pre.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba6fdaa82f9c1a2c29f833863039f3b5999141c48ce012c7a5f958c6b0e5331"
 dependencies = [
  "mimalloc",
  "thiserror 2.0.18",
