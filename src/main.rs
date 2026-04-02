@@ -13,9 +13,9 @@ async fn main() {
     let cli = cli::Cli::parse();
 
     let filter = match cli.verbose {
-        0 => EnvFilter::new("warn"),
-        1 => EnvFilter::new("info"),
-        2 => EnvFilter::new("debug"),
+        0 => EnvFilter::new("error"),
+        1 => EnvFilter::new("warn"),
+        2 => EnvFilter::new("info,1up=debug"),
         _ => EnvFilter::new("trace"),
     };
 
