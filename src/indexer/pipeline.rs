@@ -425,7 +425,7 @@ mod tests {
     async fn routes_unsupported_language_to_chunker() {
         let tmp = tempfile::tempdir().unwrap();
         let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
-        fs::write(tmp.path().join("data.yaml"), lines.join("\n")).unwrap();
+        fs::write(tmp.path().join("data.txt"), lines.join("\n")).unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(stats.files_indexed, 1);
         assert!(stats.segments_stored > 0);
 
-        let segs = segments::get_segments_by_file(&conn, "data.yaml")
+        let segs = segments::get_segments_by_file(&conn, "data.txt")
             .await
             .unwrap();
         assert!(segs.iter().all(|s| s.block_type == "chunk"));
@@ -463,7 +463,7 @@ mod tests {
         let lines: Vec<String> = (1..=30)
             .map(|i| format!("config_line_{i} = value"))
             .collect();
-        fs::write(tmp.path().join("config.toml"), lines.join("\n")).unwrap();
+        fs::write(tmp.path().join("config.ini"), lines.join("\n")).unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(stats.files_indexed, 1);
         assert!(stats.segments_stored > 0);
 
-        let segs = segments::get_segments_by_file(&conn, "config.toml")
+        let segs = segments::get_segments_by_file(&conn, "config.ini")
             .await
             .unwrap();
         assert!(
@@ -500,8 +500,8 @@ mod tests {
     async fn mixed_supported_and_unsupported_languages() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
-        let lines: Vec<String> = (1..=30).map(|i| format!("key{i}: val")).collect();
-        fs::write(tmp.path().join("data.yaml"), lines.join("\n")).unwrap();
+        let lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        fs::write(tmp.path().join("data.txt"), lines.join("\n")).unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
@@ -516,12 +516,12 @@ mod tests {
             "rust files should produce non-chunk segments"
         );
 
-        let yaml_segs = segments::get_segments_by_file(&conn, "data.yaml")
+        let txt_segs = segments::get_segments_by_file(&conn, "data.txt")
             .await
             .unwrap();
         assert!(
-            yaml_segs.iter().all(|s| s.block_type == "chunk"),
-            "yaml files should produce only chunk segments"
+            txt_segs.iter().all(|s| s.block_type == "chunk"),
+            "txt files should produce only chunk segments"
         );
     }
 }

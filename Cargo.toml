@@ -32,6 +32,13 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-kotlin-ng = "1.1"
+tree-sitter-css = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-bash = "0.25"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
 tree-sitter-language = "0.1"
 
 # Streaming iterator (for tree-sitter query iteration)

@@ -16,6 +16,13 @@ pub enum SupportedLanguage {
     C,
     Cpp,
     Kotlin,
+    Css,
+    Html,
+    Json,
+    Bash,
+    Toml,
+    Yaml,
+    Markdown,
 }
 
 impl SupportedLanguage {
@@ -30,6 +37,13 @@ impl SupportedLanguage {
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
             "kt" | "kts" => Some(Self::Kotlin),
+            "css" => Some(Self::Css),
+            "html" | "htm" => Some(Self::Html),
+            "json" => Some(Self::Json),
+            "sh" | "bash" | "zsh" => Some(Self::Bash),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "md" | "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -45,6 +59,13 @@ impl SupportedLanguage {
             Self::C => "c",
             Self::Cpp => "cpp",
             Self::Kotlin => "kotlin",
+            Self::Css => "css",
+            Self::Html => "html",
+            Self::Json => "json",
+            Self::Bash => "bash",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Markdown => "markdown",
         }
     }
 
@@ -59,6 +80,13 @@ impl SupportedLanguage {
             Self::C => tree_sitter_c::LANGUAGE,
             Self::Cpp => tree_sitter_cpp::LANGUAGE,
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
+            Self::Css => tree_sitter_css::LANGUAGE,
+            Self::Html => tree_sitter_html::LANGUAGE,
+            Self::Json => tree_sitter_json::LANGUAGE,
+            Self::Bash => tree_sitter_bash::LANGUAGE,
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE,
+            Self::Yaml => tree_sitter_yaml::LANGUAGE,
+            Self::Markdown => tree_sitter_md::LANGUAGE,
         }
     }
 
@@ -140,6 +168,41 @@ impl SupportedLanguage {
                 "import_header",
                 "type_alias",
             ],
+            Self::Css => &[
+                "rule_set",
+                "media_statement",
+                "import_statement",
+                "keyframes_statement",
+                "supports_statement",
+                "charset_statement",
+                "namespace_statement",
+                "at_rule",
+            ],
+            Self::Html => &[
+                "element",
+                "script_element",
+                "style_element",
+                "doctype",
+            ],
+            Self::Json => &["object", "array"],
+            Self::Bash => &[
+                "function_definition",
+                "command",
+                "if_statement",
+                "for_statement",
+                "while_statement",
+                "case_statement",
+                "pipeline",
+                "variable_assignment",
+            ],
+            Self::Toml => &["table", "pair"],
+            Self::Yaml => &["block_mapping_pair", "block_sequence"],
+            Self::Markdown => &[
+                "section",
+                "fenced_code_block",
+                "html_block",
+                "list",
+            ],
         }
     }
 
@@ -165,6 +228,13 @@ impl SupportedLanguage {
                 "object_declaration",
                 "companion_object",
             ],
+            Self::Css => &["media_statement", "supports_statement"],
+            Self::Html => &["element"],
+            Self::Json => &[],
+            Self::Bash => &[],
+            Self::Toml => &[],
+            Self::Yaml => &[],
+            Self::Markdown => &["section"],
         }
     }
 
@@ -190,6 +260,13 @@ impl SupportedLanguage {
                 "property_declaration",
                 "companion_object",
             ],
+            Self::Css => &["rule_set"],
+            Self::Html => &[],
+            Self::Json => &[],
+            Self::Bash => &["function_definition", "command", "variable_assignment"],
+            Self::Toml => &["pair"],
+            Self::Yaml => &["block_mapping_pair"],
+            Self::Markdown => &[],
         }
     }
 
@@ -202,6 +279,13 @@ impl SupportedLanguage {
             Self::Java => &["import_declaration"],
             Self::C | Self::Cpp => &["preproc_include"],
             Self::Kotlin => &["import_header"],
+            Self::Css => &["import_statement"],
+            Self::Html => &[],
+            Self::Json => &[],
+            Self::Bash => &[],
+            Self::Toml => &[],
+            Self::Yaml => &[],
+            Self::Markdown => &[],
         }
     }
 
@@ -214,6 +298,13 @@ impl SupportedLanguage {
             Self::Java => &["line_comment", "block_comment"],
             Self::C | Self::Cpp => &["comment"],
             Self::Kotlin => &["line_comment", "multiline_comment"],
+            Self::Css => &["comment"],
+            Self::Html => &["comment"],
+            Self::Json => &[],
+            Self::Bash => &["comment"],
+            Self::Toml => &["comment"],
+            Self::Yaml => &["comment"],
+            Self::Markdown => &[],
         }
     }
 
@@ -283,6 +374,13 @@ impl SupportedLanguage {
                 "try_expression",
                 "lambda_literal",
             ],
+            Self::Css | Self::Html | Self::Json | Self::Toml | Self::Yaml | Self::Markdown => &[],
+            Self::Bash => &[
+                "if_statement",
+                "for_statement",
+                "while_statement",
+                "case_statement",
+            ],
         }
     }
 }
@@ -303,6 +401,13 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
             "c" => Some(SupportedLanguage::C),
             "cpp" => Some(SupportedLanguage::Cpp),
             "kotlin" => Some(SupportedLanguage::Kotlin),
+            "css" => Some(SupportedLanguage::Css),
+            "html" => Some(SupportedLanguage::Html),
+            "json" => Some(SupportedLanguage::Json),
+            "bash" | "shell" => Some(SupportedLanguage::Bash),
+            "toml" => Some(SupportedLanguage::Toml),
+            "yaml" => Some(SupportedLanguage::Yaml),
+            "markdown" => Some(SupportedLanguage::Markdown),
             _ => None,
         })
         .ok_or_else(|| ParserError::UnsupportedLanguage(language.to_string()))?;
@@ -536,6 +641,13 @@ fn find_body_node<'a>(node: &Node<'a>, lang: SupportedLanguage) -> Option<Node<'
         SupportedLanguage::Go => None,
         SupportedLanguage::C | SupportedLanguage::Cpp => node.child_by_field_name("body"),
         SupportedLanguage::Kotlin => node.child_by_field_name("body"),
+        SupportedLanguage::Bash => node.child_by_field_name("body"),
+        SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => None,
     }
 }
 
@@ -674,6 +786,55 @@ fn classify_block_type(node: &Node, lang: SupportedLanguage) -> String {
             "companion_object" => "class",
             _ => kind,
         },
+        SupportedLanguage::Css => match kind {
+            "rule_set" => "rule",
+            "media_statement" => "media",
+            "import_statement" => "import",
+            "keyframes_statement" => "keyframes",
+            "supports_statement" => "supports",
+            "charset_statement" => "charset",
+            "namespace_statement" => "namespace",
+            "at_rule" => "at_rule",
+            _ => kind,
+        },
+        SupportedLanguage::Html => match kind {
+            "element" | "script_element" | "style_element" => "element",
+            "doctype" => "doctype",
+            _ => kind,
+        },
+        SupportedLanguage::Json => match kind {
+            "object" => "object",
+            "array" => "array",
+            _ => kind,
+        },
+        SupportedLanguage::Bash => match kind {
+            "function_definition" => "function",
+            "command" => "command",
+            "if_statement" => "if",
+            "for_statement" => "for",
+            "while_statement" => "while",
+            "case_statement" => "case",
+            "pipeline" => "pipeline",
+            "variable_assignment" => "variable",
+            _ => kind,
+        },
+        SupportedLanguage::Toml => match kind {
+            "table" => "table",
+            "pair" => "pair",
+            _ => kind,
+        },
+        SupportedLanguage::Yaml => match kind {
+            "block_mapping_pair" => "mapping",
+            "block_sequence" => "sequence",
+            _ => kind,
+        },
+        SupportedLanguage::Markdown => match kind {
+            "section" => "section",
+            "fenced_code_block" => "code_block",
+            "html_block" => "html_block",
+            "list" => "list",
+            _ => kind,
+        },
     }
     .to_string()
 }
@@ -783,6 +944,21 @@ fn classify_role(node: &Node, lang: SupportedLanguage) -> SegmentRole {
             "property_declaration" => SegmentRole::Definition,
             _ => SegmentRole::Definition,
         },
+        SupportedLanguage::Css => match kind {
+            "rule_set" => SegmentRole::Definition,
+            "import_statement" => SegmentRole::Import,
+            _ => SegmentRole::Definition,
+        },
+        SupportedLanguage::Html => SegmentRole::Definition,
+        SupportedLanguage::Json | SupportedLanguage::Toml | SupportedLanguage::Yaml => {
+            SegmentRole::Definition
+        }
+        SupportedLanguage::Bash => match kind {
+            "function_definition" => SegmentRole::Implementation,
+            "command" | "pipeline" => SegmentRole::Orchestration,
+            _ => SegmentRole::Definition,
+        },
+        SupportedLanguage::Markdown => SegmentRole::Docs,
     }
 }
 
@@ -986,6 +1162,81 @@ fn collect_defined_symbols_inner(
             }
             _ => {}
         },
+        SupportedLanguage::Css => match kind {
+            "rule_set" => {
+                if let Some(sel) = node.child_by_field_name("selectors") {
+                    if let Ok(text) = sel.utf8_text(source) {
+                        symbols.push(text.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
+        },
+        SupportedLanguage::Html => {
+            if kind == "element" || kind == "script_element" || kind == "style_element" {
+                if let Some(tag) = node.child(0) {
+                    if let Some(name) = tag.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(source) {
+                            symbols.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        SupportedLanguage::Json => {}
+        SupportedLanguage::Bash => match kind {
+            "function_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source) {
+                        symbols.push(text.to_string());
+                    }
+                }
+            }
+            "variable_assignment" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source) {
+                        symbols.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        },
+        SupportedLanguage::Toml => match kind {
+            "table" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "bare_key" || child.kind() == "quoted_key" {
+                        if let Ok(text) = child.utf8_text(source) {
+                            symbols.push(text.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            "pair" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "bare_key" || child.kind() == "quoted_key" {
+                        if let Ok(text) = child.utf8_text(source) {
+                            symbols.push(text.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        SupportedLanguage::Yaml => match kind {
+            "block_mapping_pair" => {
+                if let Some(key) = node.child_by_field_name("key") {
+                    if let Ok(text) = key.utf8_text(source) {
+                        symbols.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        },
+        SupportedLanguage::Markdown => {}
     }
 }
 
@@ -1070,6 +1321,13 @@ fn walk_references(
         SupportedLanguage::Kotlin => {
             matches!(kind, "simple_identifier" | "type_identifier")
         }
+        SupportedLanguage::Bash => kind == "variable_name" || kind == "command_name",
+        SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => false,
     };
 
     if is_reference {
@@ -1142,6 +1400,16 @@ fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> O
             "call_expression" => extract_child_text(node, source, &["function"]),
             _ => None,
         },
+        SupportedLanguage::Bash => match node.kind() {
+            "command" => extract_child_text(node, source, &["name"]),
+            _ => None,
+        },
+        SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => None,
     }
 }
 
@@ -1538,6 +1806,37 @@ fn is_keyword(lang: SupportedLanguage, name: &str) -> bool {
                 | "by"
                 | "it"
         ),
+        SupportedLanguage::Bash => matches!(
+            name,
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "for"
+                | "while"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "in"
+                | "function"
+                | "return"
+                | "exit"
+                | "local"
+                | "export"
+                | "readonly"
+                | "declare"
+                | "unset"
+                | "shift"
+                | "true"
+                | "false"
+        ),
+        SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => false,
     }
 }
 
@@ -1798,6 +2097,13 @@ fn is_builtin_type(lang: SupportedLanguage, name: &str) -> bool {
                 | "error"
                 | "TODO"
         ),
+        SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Bash
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => false,
     }
 }
 
