@@ -532,15 +532,27 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
     Ok(segments)
 }
 
-/// Check if a language is supported by extension or name.
+/// Check if a language/extension is supported for indexing.
+/// This covers both tree-sitter parsed languages and text document types
+/// that are indexed via FTS text chunking.
 pub fn is_language_supported(language: &str) -> bool {
     SupportedLanguage::from_extension(language).is_some()
+        || is_text_document(language)
         || matches!(
             language,
             "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
-            | "kotlin" | "css" | "html" | "json" | "bash" | "shell" | "toml" | "yaml"
+            | "kotlin" | "css" | "html" | "bash" | "shell" | "toml" | "yaml"
             | "markdown"
         )
+}
+
+/// Text document types that are indexed via FTS text chunking.
+/// These don't have tree-sitter grammars but contain valuable searchable text.
+fn is_text_document(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org"
+    )
 }
 
 /// Check if a language benefits from tree-sitter structural segmentation.

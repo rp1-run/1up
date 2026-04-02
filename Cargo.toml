@@ -82,8 +82,9 @@ uuid = { version = "1", features = ["v4"] }
 # XDG paths
 dirs = "6"
 
-# Progress bars
+# Terminal UI
 indicatif = "0.18"
+nanospinner = "0.3"
 
 # Logging
 tracing = "0.1"

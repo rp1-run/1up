@@ -1,4 +1,5 @@
 use clap::Args;
+use nanospinner::Spinner;
 
 use crate::cli::output::formatter_for;
 use crate::indexer::embedder::{self, Embedder};
@@ -25,34 +26,39 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         std::fs::create_dir_all(&dot_dir)?;
     }
 
+    let setup_spinner = Spinner::with_writer("Preparing database", std::io::stderr()).start();
+
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
     schema::migrate(&conn).await?;
 
+    setup_spinner.success();
+
+    let model_spinner = Spinner::with_writer("Loading embedding model", std::io::stderr()).start();
+
     let mut embedder_opt = if embedder::is_model_available() {
         match Embedder::from_dir(&config::model_dir()?) {
-            Ok(e) => Some(e),
+            Ok(e) => {
+                model_spinner.success();
+                Some(e)
+            }
             Err(err) => {
-                eprintln!(
-                    "warning: embedding model failed to load ({err}); indexing without embeddings (semantic search will be unavailable)"
-                );
+                model_spinner.warn_with(&format!("Embedding model failed to load ({err})"));
                 None
             }
         }
     } else if embedder::is_download_failed() {
-        eprintln!("warning: embedding model download previously failed; indexing without embeddings (semantic search will be unavailable). Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
+        model_spinner.warn_with("Embedding model unavailable (previous download failed)");
         None
     } else {
-        eprintln!("info: embedding model not found, attempting download...");
+        model_spinner.update("Downloading embedding model");
         match Embedder::new().await {
             Ok(e) => {
-                eprintln!("info: embedding model downloaded successfully");
+                model_spinner.success_with("Embedding model downloaded");
                 Some(e)
             }
             Err(err) => {
-                eprintln!(
-                    "warning: embedding model download failed ({err}); indexing without embeddings (semantic search will be unavailable)"
-                );
+                model_spinner.warn_with(&format!("Model download failed ({err})"));
                 None
             }
         }
@@ -69,7 +75,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         if stats.embeddings_generated {
             ""
         } else {
-            " [no embeddings -- semantic search unavailable]"
+            " [no embeddings]"
         },
     );
     println!("{}", fmt.format_message(&msg));

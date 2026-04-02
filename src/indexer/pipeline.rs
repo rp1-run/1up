@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use nanospinner::{Spinner, SpinnerHandle};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use turso::Connection;
+
+fn spin(msg: impl Into<String>) -> SpinnerHandle {
+    Spinner::with_writer(msg, std::io::stderr()).start()
+}
 
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
@@ -109,21 +113,17 @@ pub async fn run(
         stats.files_deleted += 1;
     }
 
-    let pb = ProgressBar::new(scanned_relative.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{bar:40}] {pos}/{len} files ({eta})")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> "),
-    );
-    pb.set_message("Indexing");
-
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
 
     if !has_embedder {
-        warn!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+        info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
     }
+
+    let scan_spinner = spin(format!(
+        "Scanning {} files",
+        scanned_relative.len()
+    ));
 
     struct PendingFile {
         relative_path: String,
@@ -138,11 +138,10 @@ pub async fn run(
         let content = match std::fs::read_to_string(&scanned_file.path) {
             Ok(c) => c,
             Err(e) => {
-                warn!(
+                info!(
                     "skipping unreadable file {}: {e}",
                     scanned_file.path.display()
                 );
-                pb.inc(1);
                 stats.files_skipped += 1;
                 continue;
             }
@@ -152,7 +151,6 @@ pub async fn run(
 
         if let Some(stored_hash) = segments::get_file_hash(conn, relative_path).await? {
             if stored_hash == file_hash {
-                pb.inc(1);
                 stats.files_skipped += 1;
                 continue;
             }
@@ -162,7 +160,7 @@ pub async fn run(
             match parser::parse_file(&content, &scanned_file.extension) {
                 Ok(segs) => segs,
                 Err(e) => {
-                    warn!(
+                    info!(
                         "tree-sitter parse failed for {}, falling back to text chunker: {e}",
                         relative_path
                     );
@@ -170,19 +168,17 @@ pub async fn run(
                 }
             }
         } else if parser::is_language_supported(&scanned_file.extension) {
-            // Recognized language but better served by text chunking (JSON, YAML, etc.)
+            // Recognized language but better served by text chunking (YAML, TOML, etc.)
             chunker::chunk_file_default(&content, &scanned_file.extension)
         } else {
+            // Unknown file type — skip entirely. A secondary search (grep)
+            // will cover these files without needing them in the FTS index.
             unsupported_extensions.insert(scanned_file.extension.clone());
-            debug!(
-                "no tree-sitter grammar for .{} files, using text chunker: {}",
-                scanned_file.extension, relative_path
-            );
-            chunker::chunk_file_default(&content, &scanned_file.extension)
+            stats.files_skipped += 1;
+            continue;
         };
 
         if parsed_segments.is_empty() {
-            pb.inc(1);
             stats.files_skipped += 1;
             continue;
         }
@@ -192,29 +188,24 @@ pub async fn run(
             file_hash,
             segments: parsed_segments,
         });
-
-        pb.inc(1);
     }
 
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
         exts.sort();
-        warn!(
-            "no tree-sitter grammar available for file types: .{}; these files were indexed with text chunking only (symbol and structural search will not cover them)",
+        debug!(
+            "skipped unsupported file types: .{}",
             exts.join(", .")
         );
     }
 
-    pb.finish_and_clear();
-
-    let store_pb = ProgressBar::new(pending.len() as u64);
-    store_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{bar:40}] {pos}/{len} files ({eta})")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> "),
-    );
-    store_pb.set_message("Storing");
+    let total_segments: usize = pending.iter().map(|pf| pf.segments.len()).sum();
+    scan_spinner.success_with(&format!(
+        "Scanned {} files, {} to index ({} segments)",
+        scanned_relative.len(),
+        pending.len(),
+        total_segments,
+    ));
 
     // Drop FTS index before bulk inserts — FTS maintenance during INSERT is
     // ~160x slower than rebuilding the index once afterwards.
@@ -224,8 +215,15 @@ pub async fn run(
             crate::shared::errors::StorageError::Query(format!("drop FTS index: {e}"))
         })?;
 
+    let store_label = if has_embedder {
+        "Embedding & storing segments"
+    } else {
+        "Storing segments"
+    };
+    let store_spinner = spin(store_label);
+
     if let Some(emb) = embedder {
-        for pf in &pending {
+        for (file_idx, pf) in pending.iter().enumerate() {
             let texts: Vec<&str> = pf.segments.iter().map(|s| s.content.as_str()).collect();
             let embeddings = emb.embed_batch(&texts)?;
 
@@ -263,10 +261,14 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
-            store_pb.inc(1);
+            store_spinner.update(&format!(
+                "Embedding & storing segments ({}/{})",
+                file_idx + 1,
+                pending.len()
+            ));
         }
     } else {
-        for pf in &pending {
+        for (file_idx, pf) in pending.iter().enumerate() {
             segments::delete_segments_by_file(conn, &pf.relative_path).await?;
 
             for seg in &pf.segments {
@@ -297,9 +299,17 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
-            store_pb.inc(1);
+            if file_idx % 50 == 0 {
+                store_spinner.update(&format!(
+                    "Storing segments ({}/{})",
+                    file_idx + 1,
+                    pending.len()
+                ));
+            }
         }
     }
+
+    store_spinner.update("Building search index");
 
     // Rebuild FTS index after bulk inserts.
     conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
@@ -308,7 +318,10 @@ pub async fn run(
             crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
         })?;
 
-    store_pb.finish_and_clear();
+    store_spinner.success_with(&format!(
+        "Stored {} segments across {} files",
+        stats.segments_stored, stats.files_indexed,
+    ));
 
     info!(
         "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments",
@@ -453,10 +466,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_unsupported_language_to_chunker() {
+    async fn indexes_text_documents_via_chunking() {
         let tmp = tempfile::tempdir().unwrap();
         let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
-        fs::write(tmp.path().join("data.txt"), lines.join("\n")).unwrap();
+        fs::write(tmp.path().join("readme.txt"), lines.join("\n")).unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
@@ -464,7 +477,7 @@ mod tests {
         assert_eq!(stats.files_indexed, 1);
         assert!(stats.segments_stored > 0);
 
-        let segs = segments::get_segments_by_file(&conn, "data.txt")
+        let segs = segments::get_segments_by_file(&conn, "readme.txt")
             .await
             .unwrap();
         assert!(segs.iter().all(|s| s.block_type == "chunk"));
@@ -489,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_language_falls_back_to_chunker_with_segments() {
+    async fn skips_unknown_file_types() {
         let tmp = tempfile::tempdir().unwrap();
         let lines: Vec<String> = (1..=30)
             .map(|i| format!("config_line_{i} = value"))
@@ -499,16 +512,8 @@ mod tests {
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
 
-        assert_eq!(stats.files_indexed, 1);
-        assert!(stats.segments_stored > 0);
-
-        let segs = segments::get_segments_by_file(&conn, "config.ini")
-            .await
-            .unwrap();
-        assert!(
-            segs.iter().all(|s| s.block_type == "chunk"),
-            "unsupported language should produce chunk segments"
-        );
+        assert_eq!(stats.files_indexed, 0);
+        assert_eq!(stats.files_skipped, 1);
     }
 
     #[tokio::test]
@@ -528,31 +533,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_supported_and_unsupported_languages() {
+    async fn mixed_code_docs_and_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
-        let lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
-        fs::write(tmp.path().join("data.txt"), lines.join("\n")).unwrap();
+        fs::write(tmp.path().join("notes.txt"), "some notes\n").unwrap();
+        fs::write(tmp.path().join("config.ini"), "key=val\n").unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
 
-        assert_eq!(stats.files_indexed, 2);
+        assert_eq!(stats.files_indexed, 2, "rs + txt should be indexed");
+        assert_eq!(stats.files_skipped, 1, "ini should be skipped");
 
         let rs_segs = segments::get_segments_by_file(&conn, "lib.rs")
             .await
             .unwrap();
         assert!(
             rs_segs.iter().any(|s| s.block_type != "chunk"),
-            "rust files should produce non-chunk segments"
+            "rust files should produce structural segments"
         );
 
-        let txt_segs = segments::get_segments_by_file(&conn, "data.txt")
+        let txt_segs = segments::get_segments_by_file(&conn, "notes.txt")
             .await
             .unwrap();
         assert!(
             txt_segs.iter().all(|s| s.block_type == "chunk"),
-            "txt files should produce only chunk segments"
+            "txt files should produce chunk segments"
         );
     }
 
