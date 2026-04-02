@@ -102,19 +102,41 @@ async fn vector_search(
 ) -> Result<Vec<SearchResult>, OneupError> {
     let query_embedding = embedder.embed_one(query)?;
 
-    // Fetch all segments with embeddings and compute cosine distance in Rust
-    let mut rows = conn
-        .query(
-            "SELECT id, file_path, language, block_type, content,
-                    line_start, line_end, breadcrumb, complexity,
-                    role, defined_symbols, referenced_symbols, called_symbols,
-                    embedding
-             FROM segments
-             WHERE embedding IS NOT NULL",
-            (),
-        )
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
+    // Use FTS to prefilter candidates, then rerank by cosine distance.
+    // This avoids loading all embeddings into memory.
+    let fts_query = build_fts_query(query);
+    let prefilter_limit = (VECTOR_PREFILTER_K * 2) as i64;
+
+    let sql = if fts_query.is_empty() {
+        // No FTS terms — fall back to a random sample
+        "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+                s.line_start, s.line_end, s.breadcrumb, s.complexity,
+                s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
+                s.embedding
+         FROM segments s
+         WHERE s.embedding IS NOT NULL
+         LIMIT ?1".to_string()
+    } else {
+        // Prefilter with FTS, then rerank by vector distance
+        "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+                s.line_start, s.line_end, s.breadcrumb, s.complexity,
+                s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
+                s.embedding
+         FROM segments_fts f
+         JOIN segments s ON s.rowid = f.rowid
+         WHERE segments_fts MATCH ?2 AND s.embedding IS NOT NULL
+         LIMIT ?1".to_string()
+    };
+
+    let mut rows = if fts_query.is_empty() {
+        conn.query(&sql, libsql::params![prefilter_limit])
+            .await
+            .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?
+    } else {
+        conn.query(&sql, libsql::params![prefilter_limit, fts_query])
+            .await
+            .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?
+    };
 
     let mut candidates: Vec<(SearchResult, f64)> = Vec::new();
     while let Some(row) = rows
