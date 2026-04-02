@@ -6,7 +6,7 @@ rp1_doc_id: 6cad3d1f-f662-483b-a4a7-c673015ff710
 
 **Feature ID**: rewrite-sql
 **Status**: In Progress
-**Progress**: 44% (4 of 9 tasks)
+**Progress**: 56% (5 of 9 tasks)
 **Estimated Effort**: 4.25 days
 **Started**: 2026-04-02
 
@@ -228,17 +228,45 @@ stateDiagram-v2
 
 ### Group 4: Rollout Readiness
 
-- [ ] **T5**: Capture adoption guidance and rollout evidence `[complexity:medium]`
+- [x] **T5**: Capture adoption guidance and rollout evidence `[complexity:medium]`
 
     **Reference**: [design.md#deployment-design](design.md#deployment-design)
 
     **Effort**: 4 hours
 
+    **Implementation Summary**:
+
+    - **Files**: `.rp1/work/features/rewrite-sql/{validation-artifacts.md,tasks.md}`
+    - **Approach**: Added feature-local rollout notes covering the explicit `1up reindex` adoption path, recovery expectations for missing/stale/partial indexes, and a maintainer-focused go/no-go review table grounded in the existing benchmark and verification artifacts.
+    - **Deviations**: None
+    - **Tests**: `cargo test --test rewrite_sql_verification` passing; `rp1 agent-tools mmd-validate .rp1/work/features/rewrite-sql/tasks.md` passing
+
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> T5
+        state "Capture adoption guidance and rollout evidence" as T5
+        T5 --> [*]
+    ```
+
     **Acceptance Criteria**:
 
-    - [ ] Rollout notes describe the supported adoption path as explicit `1up reindex` for stale local indexes, with no migration bridge, legacy read mode, or compatibility window.
-    - [ ] Adoption evidence summarizes latency, quality, degradation, freshness, and rebuild behavior in a form maintainers can use for go or no-go decisions.
-    - [ ] User and operator guidance explains expected behavior for stale, missing, or partial local indexes and the recovered state after a clean rebuild.
+    - [x] Rollout notes describe the supported adoption path as explicit `1up reindex` for stale local indexes, with no migration bridge, legacy read mode, or compatibility window.
+    - [x] Adoption evidence summarizes latency, quality, degradation, freshness, and rebuild behavior in a form maintainers can use for go or no-go decisions.
+    - [x] User and operator guidance explains expected behavior for stale, missing, or partial local indexes and the recovered state after a clean rebuild.
 
 ### User Docs
 
