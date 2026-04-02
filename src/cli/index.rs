@@ -26,7 +26,10 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         std::fs::create_dir_all(&dot_dir)?;
     }
 
-    let setup_spinner = Spinner::with_writer("Preparing database", std::io::stderr()).start();
+    use std::io::IsTerminal;
+    let is_tty = std::io::stderr().is_terminal();
+
+    let setup_spinner = Spinner::with_writer_tty("Preparing database", std::io::stderr(), is_tty).start();
 
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
@@ -34,7 +37,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     setup_spinner.success();
 
-    let model_spinner = Spinner::with_writer("Loading embedding model", std::io::stderr()).start();
+    let model_spinner = Spinner::with_writer_tty("Loading embedding model", std::io::stderr(), is_tty).start();
 
     let mut embedder_opt = if embedder::is_model_available() {
         match Embedder::from_dir(&config::model_dir()?) {
