@@ -2,12 +2,12 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use turso::{Builder, Connection, Database};
+use libsql::{Builder, Connection, Database};
 
 use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
 use crate::shared::errors::{OneupError, StorageError};
 
-/// A wrapper around a turso database that manages connections.
+/// A wrapper around a libsql database that manages connections.
 pub struct Db {
     database: Database,
 }
@@ -38,8 +38,7 @@ impl Db {
     }
 
     /// Open a local database at the given path in read-only mode.
-    /// The database file must already exist. Retries longer than write mode
-    /// to handle concurrent indexing.
+    /// The database file must already exist.
     pub async fn open_ro(path: &Path) -> Result<Self, OneupError> {
         if !path.exists() {
             return Err(StorageError::Connection(format!(
@@ -56,46 +55,15 @@ impl Db {
             ))
         })?;
 
-        // Retry more aggressively for reads — indexing can hold the lock for minutes
-        let retry_delay = Duration::from_millis(200);
-        let max_attempts: usize = 25; // 5 seconds total
-        let mut last_error = None;
+        let database = build_local_with_retry(path_str).await?;
 
-        for attempt in 0..max_attempts {
-            match Builder::new_local(path_str)
-                .experimental_index_method(true)
-                .build()
-                .await
-            {
-                Ok(database) => return Ok(Self { database }),
-                Err(err) => {
-                    let err_text = err.to_string();
-                    if !is_lock_error(&err_text) || attempt + 1 == max_attempts {
-                        if is_lock_error(&err_text) {
-                            return Err(StorageError::Connection(
-                                "index is currently being built — try again shortly".to_string(),
-                            )
-                            .into());
-                        }
-                        return Err(StorageError::Connection(err_text).into());
-                    }
-                    last_error = Some(err_text);
-                    thread::sleep(retry_delay);
-                }
-            }
-        }
-
-        Err(StorageError::Connection(
-            last_error.unwrap_or_else(|| "database open failed".to_string()),
-        )
-        .into())
+        Ok(Self { database })
     }
 
     /// Open an in-memory database (useful for tests).
     #[allow(dead_code)]
     pub async fn open_memory() -> Result<Self, OneupError> {
         let database = Builder::new_local(":memory:")
-            .experimental_index_method(true)
             .build()
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
@@ -105,27 +73,9 @@ impl Db {
 
     /// Create a new connection from this database handle.
     pub fn connect(&self) -> Result<Connection, OneupError> {
-        let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
-        let mut last_error = None;
-
-        for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
-            match self.database.connect() {
-                Ok(connection) => return Ok(connection),
-                Err(err) => {
-                    let err_text = err.to_string();
-                    if !is_lock_error(&err_text) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
-                        return Err(StorageError::Connection(err_text).into());
-                    }
-                    last_error = Some(err_text);
-                    thread::sleep(retry_delay);
-                }
-            }
-        }
-
-        Err(StorageError::Connection(
-            last_error.unwrap_or_else(|| "database connection failed".to_string()),
-        )
-        .into())
+        self.database
+            .connect()
+            .map_err(|e| StorageError::Connection(e.to_string()).into())
     }
 }
 
@@ -134,11 +84,7 @@ async fn build_local_with_retry(path_str: &str) -> Result<Database, OneupError> 
     let mut last_error = None;
 
     for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
-        match Builder::new_local(path_str)
-            .experimental_index_method(true)
-            .build()
-            .await
-        {
+        match Builder::new_local(path_str).build().await {
             Ok(database) => return Ok(database),
             Err(err) => {
                 let err_text = err.to_string();
@@ -159,5 +105,8 @@ async fn build_local_with_retry(path_str: &str) -> Result<Database, OneupError> 
 
 fn is_lock_error(error: &str) -> bool {
     let lower = error.to_lowercase();
-    lower.contains("locking error") || lower.contains("failed locking file") || lower.contains("locked by another process")
+    lower.contains("database is locked")
+        || lower.contains("locking error")
+        || lower.contains("failed locking file")
+        || lower.contains("locked by another process")
 }
