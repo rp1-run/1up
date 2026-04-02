@@ -7,7 +7,8 @@ use tracing::{debug, info};
 use turso::Connection;
 
 fn spin(msg: impl Into<String>) -> SpinnerHandle {
-    Spinner::with_writer(msg, std::io::stderr()).start()
+    use std::io::IsTerminal;
+    Spinner::with_writer_tty(msg, std::io::stderr(), std::io::stderr().is_terminal()).start()
 }
 
 use crate::indexer::chunker;
