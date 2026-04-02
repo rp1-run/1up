@@ -73,19 +73,42 @@ pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
             initialize(conn).await?;
         }
         Some(v) if v < SCHEMA_VERSION => {
-            // Drop and recreate to handle schema changes (e.g. libsql -> turso FTS migration)
-            conn.execute("DROP TABLE IF EXISTS segments", ())
-                .await
-                .map_err(|e| StorageError::Migration(format!("drop segments: {e}")))?;
-            conn.execute("DROP TABLE IF EXISTS meta", ())
-                .await
-                .map_err(|e| StorageError::Migration(format!("drop meta: {e}")))?;
-            initialize(conn).await?;
+            reset_schema(conn).await?;
         }
         Some(_) => {}
     }
 
+    // Health check: verify the schema is usable. A killed process can leave
+    // the DB in a corrupt state (e.g. partially dropped FTS indexes).
+    if let Err(e) = conn
+        .query("SELECT COUNT(*) FROM segments", ())
+        .await
+    {
+        tracing::warn!("database schema corrupt ({e}), rebuilding");
+        reset_schema(conn).await?;
+    }
+
     Ok(())
+}
+
+/// Drop all tables and reinitialize from scratch.
+async fn reset_schema(conn: &Connection) -> Result<(), OneupError> {
+    // Drop internal turso FTS tables that may be left behind
+    let _ = conn
+        .execute_batch(
+            "DROP INDEX IF EXISTS idx_segments_fts;\
+             DROP INDEX IF EXISTS idx_segments_file_path;\
+             DROP INDEX IF EXISTS idx_segments_language;\
+             DROP INDEX IF EXISTS idx_segments_file_hash",
+        )
+        .await;
+    conn.execute("DROP TABLE IF EXISTS segments", ())
+        .await
+        .map_err(|e| StorageError::Migration(format!("drop segments: {e}")))?;
+    conn.execute("DROP TABLE IF EXISTS meta", ())
+        .await
+        .map_err(|e| StorageError::Migration(format!("drop meta: {e}")))?;
+    initialize(conn).await
 }
 
 /// Verify that an existing database is compatible with the current binary
