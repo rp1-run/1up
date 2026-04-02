@@ -6,7 +6,7 @@ rp1_doc_id: 6cad3d1f-f662-483b-a4a7-c673015ff710
 
 **Feature ID**: rewrite-sql
 **Status**: In Progress
-**Progress**: 56% (5 of 9 tasks)
+**Progress**: 60% (6 of 10 tasks)
 **Estimated Effort**: 4.25 days
 **Started**: 2026-04-02
 
@@ -279,6 +279,28 @@ stateDiagram-v2
     - [x] Rollout notes describe the supported adoption path as explicit `1up reindex` for stale local indexes, with no migration bridge, legacy read mode, or compatibility window.
     - [x] Adoption evidence summarizes latency, quality, degradation, freshness, and rebuild behavior in a form maintainers can use for go or no-go decisions.
     - [x] User and operator guidance explains expected behavior for stale, missing, or partial local indexes and the recovered state after a clean rebuild.
+
+### Verification Follow-up
+
+- [x] **TX-20260402200524**: Refresh rerun-verify evidence for the remaining rollout blockers `[complexity:simple]`
+
+    **Effort**: 45 minutes
+
+    **Implementation Summary**:
+
+    - **Files**: `.rp1/work/features/rewrite-sql/{validation-artifacts.md,tasks.md,field-notes.md}`
+    - **Approach**: Re-ran `scripts/benchmark_rewrite_sql.sh` on current `HEAD`, refreshed the rollout packet to `target/rewrite-sql-bench/20260402-200900/summary.md`, confirmed the `serialize json response payload` p95 blocker did not reproduce in the latest benchmark packet, and kept the clean-break broad-rollout block focused on clean rebuild cost while recording the remaining maintainer follow-up in feature-local artifacts.
+    - **Deviations**: None
+    - **Tests**: `scripts/benchmark_rewrite_sql.sh` completed and wrote `target/rewrite-sql-bench/20260402-200900/summary.md`; `rp1 agent-tools mmd-validate .rp1/work/features/rewrite-sql/tasks.md` passing
+
+    **Execution Flow**:
+
+    ```mermaid
+    stateDiagram-v2
+        [*] --> TX_20260402200524
+        state "Refresh rerun-verify benchmark and rollout evidence" as TX_20260402200524
+        TX_20260402200524 --> [*]
+    ```
 
 ### User Docs
 
