@@ -121,6 +121,25 @@ const SCOPE_NODE_KINDS: &[&[&str]] = &[
         "object_declaration",
         "companion_object",
     ],
+    // CSS
+    &["rule_set", "media_statement", "keyframes_statement"],
+    // HTML
+    &["element", "script_element", "style_element"],
+    // JSON
+    &["object", "array"],
+    // Bash
+    &[
+        "function_definition",
+        "if_statement",
+        "for_statement",
+        "case_statement",
+    ],
+    // TOML
+    &["table"],
+    // YAML
+    &["block_mapping_pair"],
+    // Markdown
+    &["section"],
 ];
 
 fn scope_kinds_for(lang: SupportedLanguage) -> &'static [&'static str] {
@@ -133,6 +152,13 @@ fn scope_kinds_for(lang: SupportedLanguage) -> &'static [&'static str] {
         SupportedLanguage::C => SCOPE_NODE_KINDS[5],
         SupportedLanguage::Cpp => SCOPE_NODE_KINDS[6],
         SupportedLanguage::Kotlin => SCOPE_NODE_KINDS[7],
+        SupportedLanguage::Css => SCOPE_NODE_KINDS[8],
+        SupportedLanguage::Html => SCOPE_NODE_KINDS[9],
+        SupportedLanguage::Json => SCOPE_NODE_KINDS[10],
+        SupportedLanguage::Bash => SCOPE_NODE_KINDS[11],
+        SupportedLanguage::Toml => SCOPE_NODE_KINDS[12],
+        SupportedLanguage::Yaml => SCOPE_NODE_KINDS[13],
+        SupportedLanguage::Markdown => SCOPE_NODE_KINDS[14],
     }
 }
 
@@ -267,6 +293,31 @@ fn classify_scope_type(kind: &str, lang: SupportedLanguage) -> String {
             "companion_object" => "companion",
             _ => kind,
         },
+        SupportedLanguage::Css => match kind {
+            "rule_set" => "rule",
+            "media_statement" => "media",
+            "keyframes_statement" => "keyframes",
+            _ => kind,
+        },
+        SupportedLanguage::Html => match kind {
+            "element" | "script_element" | "style_element" => "element",
+            _ => kind,
+        },
+        SupportedLanguage::Json => match kind {
+            "object" => "object",
+            "array" => "array",
+            _ => kind,
+        },
+        SupportedLanguage::Bash => match kind {
+            "function_definition" => "function",
+            "if_statement" => "if",
+            "for_statement" => "for",
+            "case_statement" => "case",
+            _ => kind,
+        },
+        SupportedLanguage::Toml => "table",
+        SupportedLanguage::Yaml => "mapping",
+        SupportedLanguage::Markdown => "section",
     }
     .to_string()
 }
