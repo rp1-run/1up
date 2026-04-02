@@ -75,8 +75,19 @@ pub async fn run(
 ) -> Result<PipelineStats, OneupError> {
     let mut stats = PipelineStats::default();
 
+    let has_embedder = embedder.is_some();
+    stats.embeddings_generated = has_embedder;
+
+    if !has_embedder {
+        info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+    }
+
+    let scan_spinner = spin("Scanning files");
+
     let scanned = scanner::scan_directory(project_root)?;
     stats.files_scanned = scanned.len();
+
+    scan_spinner.update(&format!("Scanning {} files", scanned.len()));
 
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
@@ -113,17 +124,7 @@ pub async fn run(
         stats.files_deleted += 1;
     }
 
-    let has_embedder = embedder.is_some();
-    stats.embeddings_generated = has_embedder;
-
-    if !has_embedder {
-        info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
-    }
-
-    let scan_spinner = spin(format!(
-        "Scanning {} files",
-        scanned_relative.len()
-    ));
+    scan_spinner.update(&format!("Parsing {} files", scanned_relative.len()));
 
     struct PendingFile {
         relative_path: String,
