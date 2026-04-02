@@ -1,6 +1,6 @@
 # Validation Artifacts: rewrite-sql
 
-**Validated**: 2026-04-02T04:51:40Z
+**Validated**: 2026-04-02T08:46:48Z
 
 ## HYP-001 Result Snapshot
 
@@ -61,11 +61,27 @@
 | `serialize json response payload` | `tools/output.py` | Yes | Yes | Same top-3 ordering |
 | `billing invoice total tax calculation` | `web/billing.js` | Yes | Yes | Candidate added extra tail results but kept the expected top hit |
 
+## T4 Operational Stability Follow-up
+
+**Measured**: 2026-04-02T19:46:48+11:00
+
+- Script: `scripts/benchmark_rewrite_sql.sh`
+- Raw summary: `target/rewrite-sql-bench/20260402-194648/summary.md`
+- Method: repeated baseline-versus-candidate add/edit/delete churn on the same 33-file fixture; manual intervention counts cover command failures and explicit `1up reindex` prompts.
+
+### Operational stability comparison
+
+| Variant | Churn cycles | Freshness checks passed | Command failures | Reindex prompts | Manual interventions |
+|---------|--------------|-------------------------|------------------|-----------------|----------------------|
+| Baseline | 3 | 12/12 | 0 | 0 | 0 |
+| Candidate | 3 | 12/12 | 0 | 0 | 0 |
+
 ### Evidence Summary
 
 - Candidate search latency improved on all five representative queries versus the baseline commit.
 - Candidate rebuild latency regressed on this fixture, so rebuild cost should stay part of rollout review.
 - The quality corpus stayed flat versus baseline at 4/5 top-3 hits; the missed auth query was already missed before the rewrite, so this evidence shows no material relevance regression from the SQL retrieval change.
+- Routine indexing burden stayed flat on the representative churn fixture: baseline and candidate each completed 12/12 freshness checks with zero command failures and zero explicit `1up reindex` prompts.
 
 ## T5 Rollout Review
 
@@ -103,10 +119,11 @@
 | Search quality | `target/rewrite-sql-bench/20260402-173829/summary.md` | Pass | Candidate stayed at 4/5 top-3 hits, matching baseline; the missed auth query is pre-existing |
 | Stale, missing, and partial index handling | `tests/rewrite_sql_verification.rs`, `tests/integration_tests.rs` | Pass | Query commands fail closed with explicit `1up reindex` guidance instead of legacy reads |
 | Freshness after rebuild | `tests/rewrite_sql_verification.rs` | Pass | Rebuilt schema-v5 indexes stayed current across add, edit, and delete flows |
+| Routine operational burden | `target/rewrite-sql-bench/20260402-194648/summary.md` | Pass | Baseline and candidate both completed the repeated add/edit/delete churn check with 12/12 freshness checks, zero command failures, and zero rebuild prompts |
 | Graceful degradation | `tests/rewrite_sql_verification.rs` | Pass | Search warns and still returns FTS-backed results when semantic retrieval is unavailable |
 | Read-only repository guarantee | `tests/rewrite_sql_verification.rs` | Pass | Index and search flows leave source files unchanged |
-| Clean rebuild cost | `target/rewrite-sql-bench/20260402-173829/summary.md` | Caution | Candidate rebuild median and p95 regressed on the benchmark fixture and still require explicit maintainer sign-off |
+| Clean rebuild cost | `target/rewrite-sql-bench/20260402-173829/summary.md` | Block broad rollout | Candidate rebuild median and p95 regressed on the benchmark fixture; broad rollout stays blocked until this required comparison category is resolved or explicitly signed off by maintainers |
 
 ### Recommendation
 
-The rewrite is ready only through the explicit clean-rebuild path: stale local indexes should be discarded and rebuilt with `1up reindex`, not migrated. Current evidence supports rollout for rebuilt schema-v5 indexes on steady-state query behavior, but the slower clean rebuild numbers should remain a named go/no-go discussion item before broader adoption.
+The rewrite remains a clean-break feature: stale local indexes should be discarded and rebuilt with `1up reindex`, not migrated. Current evidence supports continued rebuilt-index evaluation on steady-state query behavior, and the new churn comparison shows no added manual-intervention burden versus baseline, but the recorded clean-rebuild regression blocks broad rollout until maintainers explicitly sign off or the rebuild-cost comparison is improved.

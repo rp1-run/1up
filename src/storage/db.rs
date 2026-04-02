@@ -97,10 +97,10 @@ async fn build_local_with_retry(path_str: &str) -> Result<Database, OneupError> 
         }
     }
 
-    Err(StorageError::Connection(
-        last_error.unwrap_or_else(|| "database open failed".to_string()),
+    Err(
+        StorageError::Connection(last_error.unwrap_or_else(|| "database open failed".to_string()))
+            .into(),
     )
-    .into())
 }
 
 fn is_lock_error(error: &str) -> bool {

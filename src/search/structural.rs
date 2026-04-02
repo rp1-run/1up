@@ -1,8 +1,8 @@
 use std::path::Path;
 
+use libsql::Connection;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
-use libsql::Connection;
 
 use crate::indexer::parser::SupportedLanguage;
 use crate::shared::errors::{OneupError, SearchError};

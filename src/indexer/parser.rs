@@ -178,12 +178,7 @@ impl SupportedLanguage {
                 "namespace_statement",
                 "at_rule",
             ],
-            Self::Html => &[
-                "element",
-                "script_element",
-                "style_element",
-                "doctype",
-            ],
+            Self::Html => &["element", "script_element", "style_element", "doctype"],
             Self::Json => &["object", "array"],
             Self::Bash => &[
                 "function_definition",
@@ -197,12 +192,7 @@ impl SupportedLanguage {
             ],
             Self::Toml => &["table", "pair"],
             Self::Yaml => &["block_mapping_pair", "block_sequence"],
-            Self::Markdown => &[
-                "section",
-                "fenced_code_block",
-                "html_block",
-                "list",
-            ],
+            Self::Markdown => &["section", "fenced_code_block", "html_block", "list"],
         }
     }
 
@@ -540,19 +530,29 @@ pub fn is_language_supported(language: &str) -> bool {
         || is_text_document(language)
         || matches!(
             language,
-            "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
-            | "kotlin" | "css" | "html" | "bash" | "shell" | "toml" | "yaml"
-            | "markdown"
+            "rust"
+                | "python"
+                | "javascript"
+                | "typescript"
+                | "go"
+                | "java"
+                | "c"
+                | "cpp"
+                | "kotlin"
+                | "css"
+                | "html"
+                | "bash"
+                | "shell"
+                | "toml"
+                | "yaml"
+                | "markdown"
         )
 }
 
 /// Text document types that are indexed via FTS text chunking.
 /// These don't have tree-sitter grammars but contain valuable searchable text.
 fn is_text_document(ext: &str) -> bool {
-    matches!(
-        ext,
-        "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org"
-    )
+    matches!(ext, "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org")
 }
 
 /// Check if a language benefits from tree-sitter structural segmentation.
@@ -563,8 +563,18 @@ pub fn use_structural_parser(language: &str) -> bool {
         Some(lang) => lang.has_structural_segments(),
         None => matches!(
             language,
-            "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
-            | "kotlin" | "css" | "bash" | "shell"
+            "rust"
+                | "python"
+                | "javascript"
+                | "typescript"
+                | "go"
+                | "java"
+                | "c"
+                | "cpp"
+                | "kotlin"
+                | "css"
+                | "bash"
+                | "shell"
         ),
     }
 }
@@ -1185,10 +1195,7 @@ fn collect_defined_symbols_inner(
             _ => {}
         },
         SupportedLanguage::Kotlin => match kind {
-            "function_declaration"
-            | "class_declaration"
-            | "object_declaration"
-            | "type_alias" => {
+            "function_declaration" | "class_declaration" | "object_declaration" | "type_alias" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
                         symbols.push(text.to_string());
@@ -1210,16 +1217,15 @@ fn collect_defined_symbols_inner(
             }
             _ => {}
         },
-        SupportedLanguage::Css => match kind {
-            "rule_set" => {
+        SupportedLanguage::Css => {
+            if kind == "rule_set" {
                 if let Some(sel) = node.child_by_field_name("selectors") {
                     if let Ok(text) = sel.utf8_text(source) {
                         symbols.push(text.trim().to_string());
                     }
                 }
             }
-            _ => {}
-        },
+        }
         SupportedLanguage::Html => {
             if kind == "element" || kind == "script_element" || kind == "style_element" {
                 if let Some(tag) = node.child(0) {
@@ -1274,16 +1280,15 @@ fn collect_defined_symbols_inner(
             }
             _ => {}
         },
-        SupportedLanguage::Yaml => match kind {
-            "block_mapping_pair" => {
+        SupportedLanguage::Yaml => {
+            if kind == "block_mapping_pair" {
                 if let Some(key) = node.child_by_field_name("key") {
                     if let Ok(text) = key.utf8_text(source) {
                         symbols.push(text.to_string());
                     }
                 }
             }
-            _ => {}
-        },
+        }
         SupportedLanguage::Markdown => {}
     }
 }
@@ -1394,7 +1399,12 @@ fn walk_references(
     }
 }
 
-fn walk_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage, calls: &mut Vec<String>) {
+fn walk_called_symbols(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+    calls: &mut Vec<String>,
+) {
     if let Some(call_target) = extract_call_target(node, source, lang) {
         if !call_target.is_empty() && !calls.contains(&call_target) {
             calls.push(call_target);
@@ -1512,12 +1522,11 @@ fn extract_rust_call_target(node: &Node, source: &[u8]) -> Option<String> {
 
 fn render_rust_callable(node: &Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" | "scoped_identifier" => {
-            node.utf8_text(source)
-                .ok()
-                .map(sanitize_call_target)
-                .filter(|text| !text.is_empty())
-        }
+        "identifier" | "type_identifier" | "field_identifier" | "scoped_identifier" => node
+            .utf8_text(source)
+            .ok()
+            .map(sanitize_call_target)
+            .filter(|text| !text.is_empty()),
         "field_expression" => {
             let value = node
                 .child_by_field_name("value")

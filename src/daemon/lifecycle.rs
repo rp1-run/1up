@@ -98,9 +98,7 @@ pub fn spawn_daemon(binary_path: &Path) -> Result<u32, OneupError> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .pre_exec(|| {
-                nix::unistd::setsid().map_err(|e| {
-                    std::io::Error::other(format!("setsid: {e}"))
-                })?;
+                nix::unistd::setsid().map_err(|e| std::io::Error::other(format!("setsid: {e}")))?;
                 Ok(())
             })
             .spawn()

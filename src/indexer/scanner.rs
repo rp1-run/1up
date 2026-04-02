@@ -8,21 +8,16 @@ use crate::shared::errors::{IndexingError, OneupError};
 const BINARY_EXTENSIONS: &[&str] = &[
     // Images
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp", "tiff", "tif", "psd", "pxd", "ai",
-    "sketch", "fig", "xcf", "raw", "cr2", "nef", "heic", "heif", "avif",
-    // Audio/video
+    "sketch", "fig", "xcf", "raw", "cr2", "nef", "heic", "heif", "avif", // Audio/video
     "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg", "mkv", "wmv", "webm", "aac", "m4a",
     // Archives
     "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst", "lz4", "zstd",
     // Compiled/binary
-    "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "wasm",
-    "pyc", "pyo", "class",
+    "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "wasm", "pyc", "pyo", "class",
     // Documents
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    // Fonts
-    "ttf", "otf", "woff", "woff2", "eot",
-    // Databases/lockfiles
-    "db", "sqlite", "sqlite3", "lock",
-    // Data/serialized
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", // Fonts
+    "ttf", "otf", "woff", "woff2", "eot", // Databases/lockfiles
+    "db", "sqlite", "sqlite3", "lock", // Data/serialized
     "parquet", "arrow", "pkl", "pickle", "npy", "npz", "h5", "hdf5",
     // Disk images / packages
     "dmg", "iso", "deb", "rpm", "msi", "apk", "ipa",
@@ -139,8 +134,8 @@ mod tests {
     fn scan_skips_binary_files() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
-        fs::write(tmp.path().join("image.png"), &[0u8; 100]).unwrap();
-        fs::write(tmp.path().join("archive.zip"), &[0u8; 50]).unwrap();
+        fs::write(tmp.path().join("image.png"), [0u8; 100]).unwrap();
+        fs::write(tmp.path().join("archive.zip"), [0u8; 50]).unwrap();
 
         let files = scan_directory(tmp.path()).unwrap();
         assert_eq!(files.len(), 1);

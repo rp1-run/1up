@@ -206,9 +206,21 @@ stateDiagram-v2
     **Implementation Summary**:
 
     - **Files**: `tests/rewrite_sql_verification.rs`, `benches/search_bench.rs`, `scripts/benchmark_rewrite_sql.sh`, `.rp1/work/features/rewrite-sql/validation-artifacts.md`
-    - **Approach**: Added rewrite-specific end-to-end coverage for stale and partial index guidance, degraded FTS-only behavior, freshness, and read-only source-file guarantees; expanded the benchmark surface with native-vector retrieval and hybrid-fusion benches; added a repeatable baseline-vs-candidate benchmark script and recorded the resulting latency and quality evidence in-repo.
+    - **Approach**: Added rewrite-specific end-to-end coverage for stale and partial index guidance, degraded FTS-only behavior, freshness, and read-only source-file guarantees; expanded the benchmark surface with native-vector retrieval and hybrid-fusion benches; added a repeatable baseline-vs-candidate benchmark script and later extended it with a comparative churn check so rollout evidence also covers operational burden.
     - **Deviations**: Used a generated mixed-language fixture for the benchmark corpus so baseline and candidate runs stay hermetic and directly comparable on the same local machine.
-    - **Tests**: `cargo test` 171/171 passing; `cargo bench --bench search_bench --no-run` passing; `scripts/benchmark_rewrite_sql.sh` completed and wrote `target/rewrite-sql-bench/20260402-173829/summary.md`; `cargo clippy --all-targets -- -D warnings` still fails on pre-existing warnings in `src/indexer/{embedder.rs,parser.rs,scanner.rs}`
+    - **Tests**: `cargo test` 171/171 passing; `cargo bench --bench search_bench --no-run` passing; `scripts/benchmark_rewrite_sql.sh` completed and wrote `target/rewrite-sql-bench/20260402-194648/summary.md`; `cargo fmt --check` passing; `cargo clippy --all-targets -- -D warnings` passing
+
+    **Validation Summary**:
+
+    | Dimension | Status |
+    |-----------|--------|
+    | Discipline | ✅ PASS |
+    | Accuracy | ✅ PASS |
+    | Completeness | ✅ PASS |
+    | Quality | ✅ PASS |
+    | Testing | ✅ PASS |
+    | Commit | ✅ PASS |
+    | Comments | ✅ PASS |
 
     **Execution Flow**:
 
@@ -237,9 +249,9 @@ stateDiagram-v2
     **Implementation Summary**:
 
     - **Files**: `.rp1/work/features/rewrite-sql/{validation-artifacts.md,tasks.md}`
-    - **Approach**: Added feature-local rollout notes covering the explicit `1up reindex` adoption path, recovery expectations for missing/stale/partial indexes, and a maintainer-focused go/no-go review table grounded in the existing benchmark and verification artifacts.
+    - **Approach**: Added feature-local rollout notes covering the explicit `1up reindex` adoption path, recovery expectations for missing/stale/partial indexes, and a maintainer-focused go/no-go review table grounded in the existing benchmark and verification artifacts; later tightened the recommendation so a rebuild-cost regression explicitly blocks broad rollout and added comparative operational-burden evidence.
     - **Deviations**: None
-    - **Tests**: `cargo test --test rewrite_sql_verification` passing; `rp1 agent-tools mmd-validate .rp1/work/features/rewrite-sql/tasks.md` passing
+    - **Tests**: `cargo test --test rewrite_sql_verification` passing; `cargo test schema::tests --lib` passing; `rp1 agent-tools mmd-validate .rp1/work/features/rewrite-sql/tasks.md` passing
 
     **Validation Summary**:
 
