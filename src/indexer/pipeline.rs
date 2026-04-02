@@ -135,8 +135,12 @@ pub async fn run(
 
     let mut pending: Vec<PendingFile> = Vec::new();
     let mut unsupported_extensions: HashSet<String> = HashSet::new();
+    let total_files = scanned_relative.len();
 
-    for (relative_path, scanned_file) in &scanned_relative {
+    for (file_idx, (relative_path, scanned_file)) in scanned_relative.iter().enumerate() {
+        if file_idx % 100 == 0 {
+            scan_spinner.update(&format!("Parsing files ({}/{})", file_idx, total_files));
+        }
         let content = match std::fs::read_to_string(&scanned_file.path) {
             Ok(c) => c,
             Err(e) => {
