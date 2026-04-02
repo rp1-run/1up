@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use libsql::Connection;
 use nanospinner::Spinner;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
-use libsql::Connection;
 
 fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
     use std::io::IsTerminal;
@@ -15,7 +15,7 @@ use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
 use crate::indexer::parser;
 use crate::indexer::scanner;
-use crate::shared::errors::OneupError;
+use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::types::ParsedSegment;
 use crate::storage::segments::{self, SegmentInsert};
 
@@ -36,21 +36,9 @@ fn generate_segment_id(file_path: &str, line_start: usize, line_end: usize) -> S
         .to_string()
 }
 
-fn f32_to_json_array(vec: &[f32]) -> String {
-    let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", parts.join(","))
-}
-
-fn f32_to_q8_json_array(vec: &[f32]) -> String {
-    let max_abs = vec
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0f32, f32::max)
-        .max(1e-10);
-
-    let scale = 127.0 / max_abs;
-    let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
-    format!("[{}]", parts.join(","))
+fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
+    serde_json::to_string(vec)
+        .map_err(|e| IndexingError::Pipeline(format!("serialize embedding: {e}")).into())
 }
 
 /// Statistics returned after a pipeline run.
@@ -88,7 +76,7 @@ pub async fn run(
     let scanned = scanner::scan_directory(project_root)?;
     stats.files_scanned = scanned.len();
 
-    scan_spinner.update(&format!("Scanning {} files", scanned.len()));
+    scan_spinner.update(format!("Scanning {} files", scanned.len()));
 
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
@@ -125,7 +113,7 @@ pub async fn run(
         stats.files_deleted += 1;
     }
 
-    scan_spinner.update(&format!("Parsing {} files", scanned_relative.len()));
+    scan_spinner.update(format!("Parsing {} files", scanned_relative.len()));
 
     struct PendingFile {
         relative_path: String,
@@ -139,7 +127,7 @@ pub async fn run(
 
     for (file_idx, (relative_path, scanned_file)) in scanned_relative.iter().enumerate() {
         if file_idx % 100 == 0 {
-            scan_spinner.update(&format!("Parsing files ({}/{})", file_idx + 1, total_files));
+            scan_spinner.update(format!("Parsing files ({}/{})", file_idx + 1, total_files));
         }
         let content = match std::fs::read_to_string(&scanned_file.path) {
             Ok(c) => c,
@@ -199,14 +187,11 @@ pub async fn run(
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
         exts.sort();
-        debug!(
-            "skipped unsupported file types: .{}",
-            exts.join(", .")
-        );
+        debug!("skipped unsupported file types: .{}", exts.join(", ."));
     }
 
     let total_segments: usize = pending.iter().map(|pf| pf.segments.len()).sum();
-    scan_spinner.success_with(&format!(
+    scan_spinner.success_with(format!(
         "Scanned {} files, {} to index ({} segments)",
         scanned_relative.len(),
         pending.len(),
@@ -234,8 +219,7 @@ pub async fn run(
 
             for (i, seg) in pf.segments.iter().enumerate() {
                 let embedding = &embeddings[i];
-                let embedding_json = f32_to_json_array(embedding);
-                let embedding_q8_json = f32_to_q8_json_array(embedding);
+                let embedding_vec = serialize_embedding(embedding)?;
 
                 let insert = SegmentInsert {
                     id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
@@ -245,8 +229,7 @@ pub async fn run(
                     content: seg.content.clone(),
                     line_start: seg.line_start as i64,
                     line_end: seg.line_end as i64,
-                    embedding: Some(embedding_json),
-                    embedding_q8: Some(embedding_q8_json),
+                    embedding_vec: Some(embedding_vec),
                     breadcrumb: seg.breadcrumb.clone(),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
@@ -265,9 +248,13 @@ pub async fn run(
 
             stats.files_indexed += 1;
             if let Some(ref sp) = store_spinner {
-                sp.update(&format!(
+                sp.update(format!(
                     "{} ({}/{})",
-                    if has_embedder { "Embedding & storing" } else { "Storing segments" },
+                    if has_embedder {
+                        "Embedding & storing"
+                    } else {
+                        "Storing segments"
+                    },
                     file_idx + 1,
                     pending_len,
                 ));
@@ -286,8 +273,7 @@ pub async fn run(
                     content: seg.content.clone(),
                     line_start: seg.line_start as i64,
                     line_end: seg.line_end as i64,
-                    embedding: None,
-                    embedding_q8: None,
+                    embedding_vec: None,
                     breadcrumb: seg.breadcrumb.clone(),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
@@ -306,9 +292,13 @@ pub async fn run(
 
             stats.files_indexed += 1;
             if let Some(ref sp) = store_spinner {
-                sp.update(&format!(
+                sp.update(format!(
                     "{} ({}/{})",
-                    if has_embedder { "Embedding & storing" } else { "Storing segments" },
+                    if has_embedder {
+                        "Embedding & storing"
+                    } else {
+                        "Storing segments"
+                    },
                     file_idx + 1,
                     pending_len,
                 ));
@@ -317,7 +307,7 @@ pub async fn run(
     }
 
     if let Some(sp) = store_spinner {
-        sp.success_with(&format!(
+        sp.success_with(format!(
             "Stored {} segments across {} files",
             stats.segments_stored, stats.files_indexed,
         ));
@@ -561,5 +551,4 @@ mod tests {
             "txt files should produce chunk segments"
         );
     }
-
 }

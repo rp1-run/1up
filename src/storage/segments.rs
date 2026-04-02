@@ -65,8 +65,7 @@ pub struct SegmentInsert {
     pub content: String,
     pub line_start: i64,
     pub line_end: i64,
-    pub embedding: Option<String>,
-    pub embedding_q8: Option<String>,
+    pub embedding_vec: Option<String>,
     pub breadcrumb: Option<String>,
     pub complexity: i64,
     pub role: String,
@@ -78,13 +77,8 @@ pub struct SegmentInsert {
 
 /// Insert or replace a segment in the database.
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
-    let embedding = seg
-        .embedding
-        .as_ref()
-        .map(|v| libsql::Value::Text(v.clone()))
-        .unwrap_or(libsql::Value::Null);
-    let embedding_q8 = seg
-        .embedding_q8
+    let embedding_vec = seg
+        .embedding_vec
         .as_ref()
         .map(|v| libsql::Value::Text(v.clone()))
         .unwrap_or(libsql::Value::Null);
@@ -99,8 +93,7 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
             seg.content.clone(),
             seg.line_start,
             seg.line_end,
-            embedding,
-            embedding_q8,
+            embedding_vec,
             seg.breadcrumb.clone(),
             seg.complexity,
             seg.role.clone(),
@@ -401,8 +394,7 @@ mod tests {
             content: format!("fn {id}() {{ }}"),
             line_start: 1,
             line_end: 3,
-            embedding: None,
-            embedding_q8: None,
+            embedding_vec: None,
             breadcrumb: None,
             complexity: 1,
             role: "DEFINITION".to_string(),
@@ -598,5 +590,41 @@ mod tests {
         assert_eq!(stored.parsed_defined_symbols(), vec!["foo", "bar"]);
         assert_eq!(stored.parsed_referenced_symbols(), vec!["baz"]);
         assert_eq!(stored.parsed_called_symbols(), vec!["qux"]);
+    }
+
+    #[tokio::test]
+    async fn upsert_stores_native_vector_embeddings() {
+        let (_db, conn) = setup().await;
+
+        let mut seg = test_segment("seg1", "src/main.rs", "abc123");
+        seg.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        upsert_segment(&conn, &seg).await.unwrap();
+
+        let mut rows = conn
+            .query(
+                "SELECT embedding_vec IS NOT NULL FROM segments WHERE id = ?1",
+                ["seg1"],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let has_embedding: i64 = row.get(0).unwrap();
+        assert_eq!(has_embedding, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_excludes_legacy_embedding_columns() {
+        let (_db, conn) = setup().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name IN ('embedding', 'embedding_q8')",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let legacy_column_count: i64 = row.get(0).unwrap();
+        assert_eq!(legacy_column_count, 0);
     }
 }
