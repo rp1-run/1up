@@ -79,6 +79,27 @@ pub const SELECT_HAS_USER_TABLES: &str =
 pub const SELECT_SEGMENTS_EMBEDDING_VEC_COLUMN: &str =
     "SELECT 1 FROM pragma_table_info('segments') WHERE name = 'embedding_vec' LIMIT 1";
 
+pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str =
+    "SELECT 1 FROM segments WHERE embedding_vec IS NOT NULL LIMIT 1";
+
+pub const SELECT_VECTOR_CANDIDATES: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+FROM vector_top_k('idx_segments_embedding', vector(?1), ?2) AS v
+JOIN segments AS s ON s.rowid = v.id
+WHERE s.embedding_vec IS NOT NULL";
+
+pub const SELECT_FTS_CANDIDATES: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+FROM segments_fts AS f
+JOIN segments AS s ON s.rowid = f.rowid
+WHERE segments_fts MATCH ?1
+ORDER BY f.rank, s.rowid
+LIMIT ?2";
+
 pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (
     id, file_path, language, block_type, content,
