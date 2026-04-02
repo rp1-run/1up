@@ -22,8 +22,8 @@ use crate::shared::types::OutputFormat;
     propagate_version = true
 )]
 pub struct Cli {
-    /// Output format: json (default), human, plain
-    #[arg(long, short, global = true, default_value = "json")]
+    /// Output format: human (default), json, plain
+    #[arg(long, short, global = true, default_value = "human")]
     pub format: OutputFormat,
 
     /// Increase logging verbosity (-v for debug, -vv for trace)
