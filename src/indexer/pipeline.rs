@@ -1,10 +1,15 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use nanospinner::Spinner;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 use turso::Connection;
-use zenity::spinner::{Frames, MultiSpinner};
+
+fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
+    use std::io::IsTerminal;
+    Spinner::with_writer_tty(msg, std::io::stderr(), std::io::stderr().is_terminal()).start()
+}
 
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
@@ -78,16 +83,12 @@ pub async fn run(
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
     }
 
-    let spinner = MultiSpinner::new();
-    spinner.clear(None);
-    let sp = spinner.add(Frames::default());
-    spinner.set_text(&sp, " Scanning files".to_string());
-    spinner.run_all();
+    let scan_spinner = spin("Scanning files");
 
     let scanned = scanner::scan_directory(project_root)?;
     stats.files_scanned = scanned.len();
 
-    spinner.set_text(&sp, format!(" Scanning {} files", scanned.len()));
+    scan_spinner.update(&format!("Scanning {} files", scanned.len()));
 
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
@@ -124,7 +125,7 @@ pub async fn run(
         stats.files_deleted += 1;
     }
 
-    spinner.set_text(&sp, format!(" Parsing {} files", scanned_relative.len()));
+    scan_spinner.update(&format!("Parsing {} files", scanned_relative.len()));
 
     struct PendingFile {
         relative_path: String,
@@ -138,7 +139,7 @@ pub async fn run(
 
     for (file_idx, (relative_path, scanned_file)) in scanned_relative.iter().enumerate() {
         if file_idx % 100 == 0 {
-            spinner.set_text(&sp, format!(" Parsing files ({}/{})", file_idx, total_files));
+            scan_spinner.update(&format!("Parsing files ({}/{})", file_idx + 1, total_files));
         }
         let content = match std::fs::read_to_string(&scanned_file.path) {
             Ok(c) => c,
@@ -205,17 +206,12 @@ pub async fn run(
     }
 
     let total_segments: usize = pending.iter().map(|pf| pf.segments.len()).sum();
-    spinner.set_text(
-        &sp,
-        format!(
-            " Scanned {} files, {} to index ({} segments)",
-            scanned_relative.len(),
-            pending.len(),
-            total_segments,
-        ),
-    );
-    spinner.stop(&sp);
-    drop(spinner);
+    scan_spinner.success_with(&format!(
+        "Scanned {} files, {} to index ({} segments)",
+        scanned_relative.len(),
+        pending.len(),
+        total_segments,
+    ));
 
     // Drop FTS index before bulk inserts — FTS maintenance during INSERT is
     // ~160x slower than rebuilding the index once afterwards.
@@ -225,16 +221,17 @@ pub async fn run(
             crate::shared::errors::StorageError::Query(format!("drop FTS index: {e}"))
         })?;
 
-    let progress = if !pending.is_empty() {
-        let pb = zenity::progress::ProgressBar::new(
-            zenity::progress::Frames::equal().set_goal(pending.len()),
-        );
-        pb.clear(None);
-        pb.run_all();
-        Some(pb)
+    let store_spinner = if !pending.is_empty() {
+        let label = if has_embedder {
+            "Embedding & storing"
+        } else {
+            "Storing segments"
+        };
+        Some(spin(label))
     } else {
         None
     };
+    let pending_len = pending.len();
 
     if let Some(emb) = embedder {
         for (file_idx, pf) in pending.iter().enumerate() {
@@ -275,8 +272,13 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
-            if let Some(ref pb) = progress {
-                pb.set(&pb.get_last(), &(file_idx + 1));
+            if let Some(ref sp) = store_spinner {
+                sp.update(&format!(
+                    "{} ({}/{})",
+                    if has_embedder { "Embedding & storing" } else { "Storing segments" },
+                    file_idx + 1,
+                    pending_len,
+                ));
             }
         }
     } else {
@@ -311,36 +313,39 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
-            if let Some(ref pb) = progress {
-                pb.set(&pb.get_last(), &(file_idx + 1));
+            if let Some(ref sp) = store_spinner {
+                sp.update(&format!(
+                    "{} ({}/{})",
+                    if has_embedder { "Embedding & storing" } else { "Storing segments" },
+                    file_idx + 1,
+                    pending_len,
+                ));
             }
         }
     }
 
-    drop(progress);
+    if let Some(sp) = store_spinner {
+        sp.update("Building search index");
 
-    let fts_spinner = MultiSpinner::new();
-    fts_spinner.clear(None);
-    let fts_sp = fts_spinner.add(Frames::default());
-    fts_spinner.set_text(&fts_sp, " Building search index".to_string());
-    fts_spinner.run_all();
+        // Rebuild FTS index after bulk inserts.
+        conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
+            .await
+            .map_err(|e| {
+                crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
+            })?;
 
-    // Rebuild FTS index after bulk inserts.
-    conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
-        .await
-        .map_err(|e| {
-            crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
-        })?;
-
-    fts_spinner.set_text(
-        &fts_sp,
-        format!(
-            " Indexed {} segments across {} files",
+        sp.success_with(&format!(
+            "Stored {} segments across {} files",
             stats.segments_stored, stats.files_indexed,
-        ),
-    );
-    fts_spinner.stop(&fts_sp);
-    drop(fts_spinner);
+        ));
+    } else {
+        // Rebuild FTS index even if nothing pending (might have been dropped earlier)
+        conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
+            .await
+            .map_err(|e| {
+                crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
+            })?;
+    }
 
     info!(
         "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments",

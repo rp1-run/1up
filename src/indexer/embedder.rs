@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use zenity::progress as zprogress;
+use nanospinner::Spinner;
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -325,13 +325,15 @@ async fn download_file(
         );
     }
 
-    let total = response.content_length().unwrap_or(100) as usize;
+    let total = response.content_length().unwrap_or(0);
 
-    let pb = zprogress::ProgressBar::new(
-        zprogress::Frames::equal().set_goal(total),
-    );
-    pb.clear(None);
-    pb.run_all();
+    use std::io::IsTerminal;
+    let dl_spinner = Spinner::with_writer_tty(
+        format!("Downloading {label}"),
+        std::io::stderr(),
+        std::io::stderr().is_terminal(),
+    )
+    .start();
 
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -341,8 +343,7 @@ async fn download_file(
         .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} file create: {e}")))?;
 
     let mut stream = response.bytes_stream();
-    let mut downloaded = 0usize;
-    let pb_uid = pb.get_last();
+    let mut downloaded = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let chunk =
@@ -350,15 +351,18 @@ async fn download_file(
         file.write_all(&chunk)
             .await
             .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} write: {e}")))?;
-        downloaded += chunk.len();
-        pb.set(&pb_uid, &downloaded);
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let pct = (downloaded * 100) / total;
+            dl_spinner.update(&format!("Downloading {label} ({pct}%)"));
+        }
     }
 
     file.flush()
         .await
         .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} flush: {e}")))?;
 
-    drop(pb);
+    dl_spinner.success_with(&format!("{label} downloaded"));
     Ok(())
 }
 
