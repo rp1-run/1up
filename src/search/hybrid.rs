@@ -4,10 +4,10 @@ use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
 use crate::search::ranking::fuse_results;
-use crate::shared::constants::VECTOR_PREFILTER_K;
-use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::types::{ReferenceKind, SearchResult, SegmentRole, SymbolResult};
+use crate::search::retrieval::{RetrievalBackend, RetrievalMode};
 use crate::search::symbol::SymbolSearchEngine;
+use crate::shared::errors::{OneupError, SearchError};
+use crate::shared::types::{ReferenceKind, SearchResult, SymbolResult};
 
 pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
@@ -24,32 +24,8 @@ impl<'a> HybridSearchEngine<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        if query.trim().is_empty() {
-            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
-        }
-
-        let intent = detect_intent(query);
-        let symbol_results = symbol_search(self.conn, query, intent).await?;
-
-        let vector_results = if let Some(ref mut embedder) = self.embedder {
-            vector_search(self.conn, embedder, query).await?
-        } else {
-            Vec::new()
-        };
-
-        let fts_results = fts_search(self.conn, query).await?;
-
-        if vector_results.is_empty() && fts_results.is_empty() && symbol_results.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        Ok(fuse_results(
-            vector_results,
-            fts_results,
-            symbol_results,
-            intent,
-            limit,
-        ))
+        let query_embedding = self.embed_query(query);
+        execute_search(self.conn, query, limit, query_embedding.as_deref()).await
     }
 
     pub async fn fts_only_search(
@@ -57,200 +33,66 @@ impl<'a> HybridSearchEngine<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        if query.trim().is_empty() {
-            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+        execute_search(self.conn, query, limit, None).await
+    }
+
+    fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
+        let embedder = self.embedder.as_deref_mut()?;
+        match embedder.embed_one(query) {
+            Ok(embedding) => Some(embedding),
+            Err(err) => {
+                eprintln!(
+                    "warning: semantic query embedding failed ({err}); search is degraded to FTS-only mode for this query"
+                );
+                tracing::debug!("semantic query embedding failed: {err}");
+                None
+            }
         }
-
-        let intent = detect_intent(query);
-        let symbol_results = symbol_search(self.conn, query, intent).await?;
-        let fts_results = fts_search(self.conn, query).await?;
-
-        Ok(fuse_results(
-            Vec::new(),
-            fts_results,
-            symbol_results,
-            intent,
-            limit,
-        ))
     }
 }
 
-/// Cosine distance between two f32 vectors (1.0 - cosine_similarity).
-fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let (x, y) = (*x as f64, *y as f64);
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 { 1.0 } else { 1.0 - (dot / denom) }
-}
-
-/// Parse a JSON array string like "[0.1,0.2,0.3]" into Vec<f32>.
-fn parse_embedding_json(json: &str) -> Option<Vec<f32>> {
-    serde_json::from_str(json).ok()
-}
-
-async fn vector_search(
+async fn execute_search(
     conn: &Connection,
-    embedder: &mut Embedder,
     query: &str,
+    limit: usize,
+    query_embedding: Option<&[f32]>,
 ) -> Result<Vec<SearchResult>, OneupError> {
-    let query_embedding = embedder.embed_one(query)?;
+    if query.trim().is_empty() {
+        return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+    }
 
-    // Use FTS to prefilter candidates, then rerank by cosine distance.
-    // This avoids loading all embeddings into memory.
-    let fts_query = build_fts_query(query);
-    let prefilter_limit = (VECTOR_PREFILTER_K * 2) as i64;
-
-    let sql = if fts_query.is_empty() {
-        // No FTS terms — fall back to a random sample
-        "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                s.line_start, s.line_end, s.breadcrumb, s.complexity,
-                s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
-                s.embedding
-         FROM segments s
-         WHERE s.embedding IS NOT NULL
-         LIMIT ?1".to_string()
-    } else {
-        // Prefilter with FTS, then rerank by vector distance
-        "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                s.line_start, s.line_end, s.breadcrumb, s.complexity,
-                s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
-                s.embedding
-         FROM segments_fts f
-         JOIN segments s ON s.rowid = f.rowid
-         WHERE segments_fts MATCH ?2 AND s.embedding IS NOT NULL
-         LIMIT ?1".to_string()
-    };
-
-    let mut rows = if fts_query.is_empty() {
-        conn.query(&sql, libsql::params![prefilter_limit])
-            .await
-            .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?
-    } else {
-        conn.query(&sql, libsql::params![prefilter_limit, fts_query])
-            .await
-            .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?
-    };
-
-    let mut candidates: Vec<(SearchResult, f64)> = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("row iteration: {e}")))?
-    {
-        let embedding_json: String = row
-            .get(13)
-            .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-
-        if let Some(embedding) = parse_embedding_json(&embedding_json) {
-            let distance = cosine_distance(&query_embedding, &embedding);
-            let result = row_to_search_result(&row)?;
-            candidates.push((result, distance));
+    let intent = detect_intent(query);
+    let symbol_results = symbol_search(conn, query, intent).await?;
+    let backend = RetrievalBackend::select(conn, query_embedding).await?;
+    let candidates = match backend.search(query, query_embedding).await {
+        Ok(candidates) => candidates,
+        Err(err) if matches!(backend.mode(), RetrievalMode::SqlVectorV2) => {
+            eprintln!(
+                "warning: vector retrieval failed ({err}); search is degraded to FTS-only mode for this query"
+            );
+            tracing::debug!("vector retrieval failed: {err}");
+            RetrievalBackend::select(conn, None)
+                .await?
+                .search(query, None)
+                .await?
         }
-    }
+        Err(err) => return Err(err),
+    };
 
-    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.truncate(VECTOR_PREFILTER_K);
-
-    Ok(candidates.into_iter().map(|(r, _)| r).collect())
-}
-
-async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, OneupError> {
-    let fts_query = build_fts_query(query);
-
-    let mut rows = conn
-        .query(
-            "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                    s.line_start, s.line_end, s.breadcrumb, s.complexity,
-                    s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
-                    f.rank as score
-             FROM segments_fts f
-             JOIN segments s ON s.rowid = f.rowid
-             WHERE segments_fts MATCH ?1
-             ORDER BY f.rank
-             LIMIT ?2",
-            libsql::params![fts_query, VECTOR_PREFILTER_K as i64],
-        )
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
-
-    let mut results = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("FTS row iteration: {e}")))?
+    if candidates.vector_results.is_empty()
+        && candidates.fts_results.is_empty()
+        && symbol_results.is_empty()
     {
-        results.push(row_to_search_result(&row)?);
+        return Ok(Vec::new());
     }
 
-    Ok(results)
-}
-
-fn row_to_search_result(row: &libsql::Row) -> Result<SearchResult, OneupError> {
-    let file_path: String = row
-        .get(1)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let language: String = row
-        .get(2)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let block_type: String = row
-        .get(3)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let content: String = row
-        .get(4)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let line_start: i64 = row
-        .get(5)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let line_end: i64 = row
-        .get(6)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let breadcrumb: Option<String> = row
-        .get(7)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let complexity: i64 = row
-        .get(8)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let role_str: String = row
-        .get(9)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let defined_symbols: String = row
-        .get(10)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let referenced_symbols: String = row
-        .get(11)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-    let called_symbols: String = row
-        .get(12)
-        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-
-    let role = parse_role(&role_str);
-
-    let def_syms: Vec<String> = serde_json::from_str(&defined_symbols).unwrap_or_default();
-    let ref_syms: Vec<String> = serde_json::from_str(&referenced_symbols).unwrap_or_default();
-    let call_syms: Vec<String> = serde_json::from_str(&called_symbols).unwrap_or_default();
-
-    Ok(SearchResult {
-        file_path,
-        language,
-        block_type,
-        content,
-        score: 0.0,
-        line_number: line_start as usize,
-        line_end: line_end as usize,
-        breadcrumb,
-        complexity: Some(complexity as u32),
-        role,
-        defined_symbols: some_if_not_empty(def_syms),
-        referenced_symbols: some_if_not_empty(ref_syms),
-        called_symbols: some_if_not_empty(call_syms),
-    })
+    Ok(fuse_results(
+        candidates.vector_results,
+        candidates.fts_results,
+        symbol_results,
+        intent,
+        limit,
+    ))
 }
 
 async fn symbol_search(
@@ -424,25 +266,6 @@ fn search_result_from_symbol(result: SymbolResult) -> SearchResult {
     }
 }
 
-fn parse_role(role_str: &str) -> Option<SegmentRole> {
-    match role_str {
-        "DEFINITION" => Some(SegmentRole::Definition),
-        "IMPLEMENTATION" => Some(SegmentRole::Implementation),
-        "ORCHESTRATION" => Some(SegmentRole::Orchestration),
-        "IMPORT" => Some(SegmentRole::Import),
-        "DOCS" => Some(SegmentRole::Docs),
-        _ => None,
-    }
-}
-
-fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
-    }
-}
-
 fn candidate_key(result: &SearchResult) -> String {
     format!(
         "{}:{}:{}",
@@ -450,89 +273,26 @@ fn candidate_key(result: &SearchResult) -> String {
     )
 }
 
-fn build_fts_query(query: &str) -> String {
-    let terms: Vec<&str> = query.split_whitespace().filter(|t| t.len() >= 2).collect();
-
-    if terms.is_empty() {
-        return query.to_string();
-    }
-
-    terms
-        .iter()
-        .map(|t| {
-            let cleaned: String = t
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if cleaned.is_empty() {
-                String::new()
-            } else {
-                format!("\"{}\"", cleaned)
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn f32_to_json_array(vec: &[f32]) -> String {
-        let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-        format!("[{}]", parts.join(","))
-    }
+    #[test]
+    fn symbol_variants_include_common_identifier_forms() {
+        let variants = build_symbol_variants("config loader", QueryIntent::Definition);
 
-    fn f32_to_q8_json(vec: &[f32]) -> String {
-        let max_abs = vec.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-10);
-        let scale = 127.0 / max_abs;
-        let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
-        format!("[{}]", parts.join(","))
+        assert!(variants.contains(&"config".to_string()));
+        assert!(variants.contains(&"loader".to_string()));
+        assert!(variants.contains(&"config_loader".to_string()));
+        assert!(variants.contains(&"configLoader".to_string()));
+        assert!(variants.contains(&"ConfigLoader".to_string()));
     }
 
     #[test]
-    fn fts_query_building() {
-        let q = build_fts_query("error handling network");
-        assert!(q.contains("\"error\""));
-        assert!(q.contains("\"handling\""));
-        assert!(q.contains("\"network\""));
-        assert!(q.contains(" OR "));
-    }
+    fn symbol_variants_skip_non_symbolish_long_queries() {
+        let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
 
-    #[test]
-    fn fts_query_skips_short_terms() {
-        let q = build_fts_query("a is the error");
-        assert!(q.contains("\"is\""));
-        assert!(q.contains("\"the\""));
-        assert!(q.contains("\"error\""));
-        assert!(!q.contains("\"a\""));
-    }
-
-    #[test]
-    fn fts_query_handles_empty() {
-        let q = build_fts_query("");
-        assert_eq!(q, "");
-    }
-
-    #[test]
-    fn q8_json_produces_correct_format() {
-        let vec = vec![0.1f32, -0.5, 0.3, 0.0, 1.0];
-        let json = f32_to_q8_json(&vec);
-        assert!(json.starts_with('['));
-        assert!(json.ends_with(']'));
-        let parsed: Vec<u8> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), vec.len());
-    }
-
-    #[test]
-    fn f32_json_array_format() {
-        let vec = vec![1.0f32, 2.0, 3.0];
-        let json = f32_to_json_array(&vec);
-        assert!(json.starts_with('['));
-        assert!(json.ends_with(']'));
-        let parsed: Vec<f32> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, vec);
+        assert!(variants.is_empty());
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ pub mod formatter;
 pub mod hybrid;
 pub mod intent;
 pub mod ranking;
+pub mod retrieval;
 pub mod structural;
 pub mod symbol;
 
