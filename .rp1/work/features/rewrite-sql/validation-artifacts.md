@@ -66,3 +66,47 @@
 - Candidate search latency improved on all five representative queries versus the baseline commit.
 - Candidate rebuild latency regressed on this fixture, so rebuild cost should stay part of rollout review.
 - The quality corpus stayed flat versus baseline at 4/5 top-3 hits; the missed auth query was already missed before the rewrite, so this evidence shows no material relevance regression from the SQL retrieval change.
+
+## T5 Rollout Review
+
+**Prepared**: 2026-04-02
+
+### Supported Adoption Path
+
+1. Treat any pre-rewrite local index as disposable cache.
+2. After upgrading to the schema-v5 binary, run `1up reindex [path]`.
+3. `1up reindex` recreates the local search schema from scratch and repopulates `segments`, `segments_fts`, and `segments.embedding_vec` for the rebuilt index.
+4. After a successful rebuild, `1up search` and `1up symbol` keep their current CLI and JSON contracts; `1up search` uses `SqlVectorV2` when embeddings are present and warns before degrading to `FtsOnly` when semantic retrieval is unavailable.
+5. Unsupported paths: in-place migration, legacy schema-v4 reads, compatibility windows, and partial-index recovery without an explicit clean rebuild.
+
+### Recovery Matrix
+
+| Local index state | Expected behavior | Supported recovery |
+|-------------------|-------------------|--------------------|
+| Missing `.1up/index.db` | `search` and `symbol` fail closed with explicit `1up reindex` guidance | Run `1up reindex [path]` to create a fresh schema-v5 index |
+| Stale v4 index | schema validation fails with `found v4`, `expected v5`, and `1up reindex` guidance | Run `1up reindex [path]`; no migration bridge is supported |
+| Partial v5 index | schema validation fails closed on missing required objects such as `idx_segments_embedding` | Run `1up reindex [path]`; partial recovery is not supported |
+| Current v5 index without semantic retrieval | `search` warns and degrades to `FtsOnly`, while `symbol` remains available | Indexed search stays usable; rerun `1up index` later if model download/load issues are resolved |
+
+### Recovered State After Clean Rebuild
+
+- `.1up/index.db` is recreated as schema v5 with `segments.embedding_vec` and `idx_segments_embedding`.
+- `1up search` and `1up symbol` stop emitting stale-index rebuild guidance.
+- `1up search` returns the existing machine-readable result shape on rebuilt indexes, using native-vector retrieval when embeddings are available.
+- Incremental `1up index` resumes the add, edit, and delete freshness behavior validated in the rewrite verification suite.
+
+### Maintainer Rollout Review
+
+| Dimension | Evidence | Status | Notes |
+|-----------|----------|--------|-------|
+| Query latency | `target/rewrite-sql-bench/20260402-173829/summary.md` | Pass | Candidate median and p95 improved on all five representative search queries |
+| Search quality | `target/rewrite-sql-bench/20260402-173829/summary.md` | Pass | Candidate stayed at 4/5 top-3 hits, matching baseline; the missed auth query is pre-existing |
+| Stale, missing, and partial index handling | `tests/rewrite_sql_verification.rs`, `tests/integration_tests.rs` | Pass | Query commands fail closed with explicit `1up reindex` guidance instead of legacy reads |
+| Freshness after rebuild | `tests/rewrite_sql_verification.rs` | Pass | Rebuilt schema-v5 indexes stayed current across add, edit, and delete flows |
+| Graceful degradation | `tests/rewrite_sql_verification.rs` | Pass | Search warns and still returns FTS-backed results when semantic retrieval is unavailable |
+| Read-only repository guarantee | `tests/rewrite_sql_verification.rs` | Pass | Index and search flows leave source files unchanged |
+| Clean rebuild cost | `target/rewrite-sql-bench/20260402-173829/summary.md` | Caution | Candidate rebuild median and p95 regressed on the benchmark fixture and still require explicit maintainer sign-off |
+
+### Recommendation
+
+The rewrite is ready only through the explicit clean-rebuild path: stale local indexes should be discarded and rebuilt with `1up reindex`, not migrated. Current evidence supports rollout for rebuilt schema-v5 indexes on steady-state query behavior, but the slower clean rebuild numbers should remain a named go/no-go discussion item before broader adoption.
