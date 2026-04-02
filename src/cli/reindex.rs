@@ -1,5 +1,5 @@
 use clap::Args;
-use nanospinner::Spinner;
+use zenity::spinner::{Frames, MultiSpinner};
 
 use crate::cli::output::formatter_for;
 use crate::indexer::embedder::{self, Embedder};
@@ -29,51 +29,48 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         );
     }
 
-    use std::io::IsTerminal;
-    let is_tty = std::io::stderr().is_terminal();
-
-    let setup_spinner = Spinner::with_writer_tty("Preparing database", std::io::stderr(), is_tty).start();
+    let spinner = MultiSpinner::new();
+    spinner.clear(None);
+    let sp = spinner.add(Frames::default());
+    spinner.set_text(&sp, " Preparing database".to_string());
+    spinner.run_all();
 
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
     schema::migrate(&conn).await?;
 
     let all_paths = segments::get_all_file_paths(&conn).await?;
-    setup_spinner.update("Clearing existing index");
+    spinner.set_text(&sp, format!(" Clearing {} files from index", all_paths.len()));
     for path in &all_paths {
         segments::delete_segments_by_file(&conn, path).await?;
     }
-    setup_spinner.success_with(&format!("Cleared {} files from index", all_paths.len()));
 
-    let model_spinner = Spinner::with_writer_tty("Loading embedding model", std::io::stderr(), is_tty).start();
+    spinner.set_text(&sp, " Loading embedding model".to_string());
 
     let mut embedder_opt = if embedder::is_model_available() {
         match Embedder::from_dir(&config::model_dir()?) {
-            Ok(e) => {
-                model_spinner.success();
-                Some(e)
-            }
+            Ok(e) => Some(e),
             Err(err) => {
-                model_spinner.warn_with(&format!("Embedding model failed to load ({err})"));
+                spinner.set_text(&sp, format!(" Embedding model failed to load ({err})"));
                 None
             }
         }
     } else if embedder::is_download_failed() {
-        model_spinner.warn_with("Embedding model unavailable (previous download failed)");
+        spinner.set_text(&sp, " Embedding model unavailable".to_string());
         None
     } else {
-        model_spinner.update("Downloading embedding model");
+        spinner.set_text(&sp, " Downloading embedding model".to_string());
         match Embedder::new().await {
-            Ok(e) => {
-                model_spinner.success_with("Embedding model downloaded");
-                Some(e)
-            }
+            Ok(e) => Some(e),
             Err(err) => {
-                model_spinner.warn_with(&format!("Model download failed ({err})"));
+                spinner.set_text(&sp, format!(" Model download failed ({err})"));
                 None
             }
         }
     };
+
+    spinner.stop(&sp);
+    drop(spinner);
 
     let stats = pipeline::run(&conn, &project_root, embedder_opt.as_mut()).await?;
 

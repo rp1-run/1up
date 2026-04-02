@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use zenity::progress as zprogress;
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -325,16 +325,13 @@ async fn download_file(
         );
     }
 
-    let total = response.content_length().unwrap_or(0);
+    let total = response.content_length().unwrap_or(100) as usize;
 
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{bar:40}] {bytes}/{total_bytes} ({eta})")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> "),
+    let pb = zprogress::ProgressBar::new(
+        zprogress::Frames::equal().set_goal(total),
     );
-    pb.set_message(label.to_string());
+    pb.clear(None);
+    pb.run_all();
 
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -344,7 +341,8 @@ async fn download_file(
         .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} file create: {e}")))?;
 
     let mut stream = response.bytes_stream();
-    let mut downloaded = 0u64;
+    let mut downloaded = 0usize;
+    let pb_uid = pb.get_last();
 
     while let Some(chunk) = stream.next().await {
         let chunk =
@@ -352,15 +350,15 @@ async fn download_file(
         file.write_all(&chunk)
             .await
             .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} write: {e}")))?;
-        downloaded += chunk.len() as u64;
-        pb.set_position(downloaded);
+        downloaded += chunk.len();
+        pb.set(&pb_uid, &downloaded);
     }
 
     file.flush()
         .await
         .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} flush: {e}")))?;
 
-    pb.finish_with_message(format!("{label} done"));
+    drop(pb);
     Ok(())
 }
 
