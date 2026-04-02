@@ -6,6 +6,7 @@ BASELINE_REF="${BASELINE_REF:-45b5117}"
 INDEX_RUNS="${INDEX_RUNS:-3}"
 QUERY_RUNS="${QUERY_RUNS:-7}"
 QUERY_WARMUP="${QUERY_WARMUP:-1}"
+CHURN_CYCLES="${CHURN_CYCLES:-3}"
 KEEP_BASELINE_WORKTREE="${KEEP_BASELINE_WORKTREE:-0}"
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/rewrite-sql-bench/$TIMESTAMP}"
@@ -151,6 +152,158 @@ top_hits() {
     paste -sd ',' -
 }
 
+search_hits_expected() {
+  local bin_path="$1"
+  local repo_path="$2"
+  local query="$3"
+  local expected="$4"
+  local stderr_path="$5"
+  local output
+
+  if ! output=$("$bin_path" --format json search "$query" --path "$repo_path" -n 5 2>"$stderr_path"); then
+    return 1
+  fi
+
+  jq -e --arg expected "$expected" --arg query "$query" '
+    .[]
+    | select(.file_path == $expected and (.content | contains($query)))
+  ' <<<"$output" >/dev/null
+}
+
+search_misses_expected() {
+  local bin_path="$1"
+  local repo_path="$2"
+  local query="$3"
+  local expected="$4"
+  local stderr_path="$5"
+  local output
+
+  if ! output=$("$bin_path" --format json search "$query" --path "$repo_path" -n 5 2>"$stderr_path"); then
+    return 1
+  fi
+
+  jq -e --arg expected "$expected" --arg query "$query" '
+    map(select(.file_path == $expected and (.content | contains($query)))) | length == 0
+  ' <<<"$output" >/dev/null
+}
+
+stderr_mentions_reindex() {
+  local stderr_path="$1"
+  [[ -f "$stderr_path" ]] && grep -q "1up reindex" "$stderr_path"
+}
+
+run_operational_stability() {
+  local label="$1"
+  local bin_path="$2"
+  local repo_path="$3"
+  local label_key
+  local command_failures=0
+  local reindex_prompts=0
+  local freshness_failures=0
+  local checks_total=$((CHURN_CYCLES * 4))
+
+  prepare_snapshot "$TEMPLATE_DIR" "$repo_path"
+  label_key=$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')
+
+  local stderr_path="$OUT_DIR/${label}_initial_index.stderr"
+  if ! "$bin_path" --format json index "$repo_path" >/dev/null 2>"$stderr_path"; then
+    command_failures=$((command_failures + 1))
+  fi
+  if stderr_mentions_reindex "$stderr_path"; then
+    reindex_prompts=$((reindex_prompts + 1))
+  fi
+
+  for cycle in $(seq 1 "$CHURN_CYCLES"); do
+    local rel_path="src/churn_${cycle}.rs"
+    local file_path="$repo_path/$rel_path"
+    local add_query="${label_key}churnaddcycle${cycle}marker"
+    local edit_query="${label_key}churneditcycle${cycle}marker"
+
+    cat > "$file_path" <<EOF
+pub fn churn_${cycle}_marker() -> &'static str {
+    "${add_query}"
+}
+EOF
+
+    stderr_path="$OUT_DIR/${label}_add_${cycle}.stderr"
+    if ! "$bin_path" --format json index "$repo_path" >/dev/null 2>"$stderr_path"; then
+      command_failures=$((command_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+    stderr_path="$OUT_DIR/${label}_add_search_${cycle}.stderr"
+    if ! search_hits_expected "$bin_path" "$repo_path" "$add_query" "$rel_path" "$stderr_path"; then
+      freshness_failures=$((freshness_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+
+    cat > "$file_path" <<EOF
+pub fn churn_${cycle}_marker_updated() -> &'static str {
+    "${edit_query}"
+}
+EOF
+
+    stderr_path="$OUT_DIR/${label}_edit_${cycle}.stderr"
+    if ! "$bin_path" --format json index "$repo_path" >/dev/null 2>"$stderr_path"; then
+      command_failures=$((command_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+    stderr_path="$OUT_DIR/${label}_edit_search_${cycle}.stderr"
+    if ! search_hits_expected "$bin_path" "$repo_path" "$edit_query" "$rel_path" "$stderr_path"; then
+      freshness_failures=$((freshness_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+    stderr_path="$OUT_DIR/${label}_stale_search_${cycle}.stderr"
+    if ! search_misses_expected "$bin_path" "$repo_path" "$add_query" "$rel_path" "$stderr_path"; then
+      freshness_failures=$((freshness_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+
+    rm -f "$file_path"
+
+    stderr_path="$OUT_DIR/${label}_delete_${cycle}.stderr"
+    if ! "$bin_path" --format json index "$repo_path" >/dev/null 2>"$stderr_path"; then
+      command_failures=$((command_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+    stderr_path="$OUT_DIR/${label}_delete_search_${cycle}.stderr"
+    if ! search_misses_expected "$bin_path" "$repo_path" "$edit_query" "$rel_path" "$stderr_path"; then
+      freshness_failures=$((freshness_failures + 1))
+    fi
+    if stderr_mentions_reindex "$stderr_path"; then
+      reindex_prompts=$((reindex_prompts + 1))
+    fi
+  done
+
+  local checks_passed=$((checks_total - freshness_failures))
+  local manual_interventions=$((command_failures + reindex_prompts))
+  local notes="Routine add/edit/delete cycles completed without extra operator action"
+  if [[ "$manual_interventions" -ne 0 || "$freshness_failures" -ne 0 ]]; then
+    notes="See command, prompt, or freshness failure counts"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$label" \
+    "$CHURN_CYCLES" \
+    "$checks_passed" \
+    "$checks_total" \
+    "$command_failures" \
+    "$reindex_prompts" \
+    "$manual_interventions" \
+    "$notes" >> "$OPERATIONAL_TSV"
+}
+
 require_cmd cargo git hyperfine jq
 
 if [[ ! -f "$MODEL_DIR/model.onnx" || ! -f "$MODEL_DIR/tokenizer.json" ]]; then
@@ -173,6 +326,7 @@ BASELINE_SNAPSHOT="$OUT_DIR/baseline_repo"
 CANDIDATE_SNAPSHOT="$OUT_DIR/candidate_repo"
 INDEX_JSON="$OUT_DIR/index.json"
 QUALITY_TSV="$OUT_DIR/quality.tsv"
+OPERATIONAL_TSV="$OUT_DIR/operational.tsv"
 SUMMARY_MD="$OUT_DIR/summary.md"
 
 create_fixture "$TEMPLATE_DIR"
@@ -198,6 +352,7 @@ queries=(
 )
 
 printf 'query\texpected\tbaseline_top3\tbaseline_hit\tcandidate_top3\tcandidate_hit\n' > "$QUALITY_TSV"
+printf 'variant\tcycles\tchecks_passed\tchecks_total\tcommand_failures\treindex_prompts\tmanual_interventions\tnotes\n' > "$OPERATIONAL_TSV"
 
 for entry in "${queries[@]}"; do
   query=${entry%%|*}
@@ -224,6 +379,10 @@ for entry in "${queries[@]}"; do
     "$candidate_top3" \
     "$candidate_hit" >> "$QUALITY_TSV"
 done
+
+log "running operational stability comparison"
+run_operational_stability "Baseline" "$BASELINE_BIN" "$BASELINE_SNAPSHOT"
+run_operational_stability "Candidate" "$CANDIDATE_BIN" "$CANDIDATE_SNAPSHOT"
 
 {
   printf '# rewrite-sql benchmark evidence\n\n'
@@ -253,7 +412,7 @@ done
     expected=${entry##*|}
     slug=$(printf '%s' "$query" | tr ' ' '_' | tr -cd '[:alnum:]_')
     json_path="$OUT_DIR/${slug}.json"
-    printf '| %s | `%s` | %s | %s | %s | %s |\n' \
+  printf '| %s | `%s` | %s | %s | %s | %s |\n' \
       "$query" \
       "$expected" \
       "$(to_ms "$(metric_value "$json_path" 0 median)")" \
@@ -261,6 +420,22 @@ done
       "$(to_ms "$(metric_value "$json_path" 1 median)")" \
       "$(to_ms "$(metric_value "$json_path" 1 p95)")"
   done
+
+  printf '\n## Operational stability\n\n'
+  printf '| Variant | Churn cycles | Freshness checks passed | Command failures | Reindex prompts | Manual interventions | Notes |\n'
+  printf '|---|---:|---:|---:|---:|---:|---|\n'
+  tail -n +2 "$OPERATIONAL_TSV" |
+    while IFS=$'\t' read -r variant cycles checks_passed checks_total command_failures reindex_prompts manual_interventions notes; do
+      printf '| %s | %s | %s/%s | %s | %s | %s | %s |\n' \
+        "$variant" \
+        "$cycles" \
+        "$checks_passed" \
+        "$checks_total" \
+        "$command_failures" \
+        "$reindex_prompts" \
+        "$manual_interventions" \
+        "$notes"
+    done
 
   printf '\n## Quality corpus\n\n'
   printf '| Query | Expected file | Baseline top-3 | Baseline hit | Candidate top-3 | Candidate hit |\n'

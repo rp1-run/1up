@@ -354,7 +354,7 @@ async fn download_file(
         downloaded += chunk.len() as u64;
         if total > 0 {
             let pct = (downloaded * 100) / total;
-            dl_spinner.update(&format!("Downloading {label} ({pct}%)"));
+            dl_spinner.update(format!("Downloading {label} ({pct}%)"));
         }
     }
 
@@ -362,7 +362,7 @@ async fn download_file(
         .await
         .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} flush: {e}")))?;
 
-    dl_spinner.success_with(&format!("{label} downloaded"));
+    dl_spinner.success_with(format!("{label} downloaded"));
     Ok(())
 }
 
