@@ -6,11 +6,26 @@ use ignore::WalkBuilder;
 use crate::shared::errors::{IndexingError, OneupError};
 
 const BINARY_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp", "tiff", "tif", "psd", "ai", "mp3",
-    "mp4", "avi", "mov", "wav", "flac", "ogg", "mkv", "wmv", "webm", "zip", "tar", "gz", "bz2",
-    "xz", "7z", "rar", "zst", "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "wasm",
-    "pyc", "pyo", "class", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ttf", "otf",
-    "woff", "woff2", "eot", "db", "sqlite", "sqlite3", "lock",
+    // Images
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp", "tiff", "tif", "psd", "pxd", "ai",
+    "sketch", "fig", "xcf", "raw", "cr2", "nef", "heic", "heif", "avif",
+    // Audio/video
+    "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg", "mkv", "wmv", "webm", "aac", "m4a",
+    // Archives
+    "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst", "lz4", "zstd",
+    // Compiled/binary
+    "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "wasm",
+    "pyc", "pyo", "class",
+    // Documents
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    // Fonts
+    "ttf", "otf", "woff", "woff2", "eot",
+    // Databases/lockfiles
+    "db", "sqlite", "sqlite3", "lock",
+    // Data/serialized
+    "parquet", "arrow", "pkl", "pickle", "npy", "npz", "h5", "hdf5",
+    // Disk images / packages
+    "dmg", "iso", "deb", "rpm", "msi", "apk", "ipa",
 ];
 
 const DEFAULT_IGNORE_DIRS: &[&str] = &[

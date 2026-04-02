@@ -108,3 +108,10 @@ tokio = { version = "1", features = ["full"] }
 [[bench]]
 name = "search_bench"
 harness = false
+
+# Patch turso to use async_io=false for local databases.
+# The upstream Rust SDK hardcodes async_io=true (needed only for cloud sync),
+# which adds ~30ms overhead per SQL statement via async poll machinery.
+# Other language bindings (Python, Go) already use async_io=false for local.
+[patch.crates-io]
+turso = { path = "vendor/turso-patched" }

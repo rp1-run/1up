@@ -383,6 +383,27 @@ impl SupportedLanguage {
             ],
         }
     }
+
+    /// Whether this language has meaningful structural segments (functions,
+    /// classes, rules) that benefit from tree-sitter segmentation. Data/config
+    /// formats like JSON, YAML, TOML produce too many fine-grained segments
+    /// and are better served by the text chunker.
+    pub fn has_structural_segments(&self) -> bool {
+        match self {
+            Self::Rust
+            | Self::Python
+            | Self::JavaScript
+            | Self::TypeScript
+            | Self::Go
+            | Self::Java
+            | Self::C
+            | Self::Cpp
+            | Self::Kotlin
+            | Self::Css
+            | Self::Bash => true,
+            Self::Html | Self::Json | Self::Toml | Self::Yaml | Self::Markdown => false,
+        }
+    }
 }
 
 /// Parse a source file and extract segments using tree-sitter.
@@ -517,8 +538,23 @@ pub fn is_language_supported(language: &str) -> bool {
         || matches!(
             language,
             "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
-            | "kotlin"
+            | "kotlin" | "css" | "html" | "json" | "bash" | "shell" | "toml" | "yaml"
+            | "markdown"
         )
+}
+
+/// Check if a language benefits from tree-sitter structural segmentation.
+/// Data/config/markup languages are recognized but better served by the text
+/// chunker to avoid segment explosion and slow indexing.
+pub fn use_structural_parser(language: &str) -> bool {
+    match SupportedLanguage::from_extension(language) {
+        Some(lang) => lang.has_structural_segments(),
+        None => matches!(
+            language,
+            "rust" | "python" | "javascript" | "typescript" | "go" | "java" | "c" | "cpp"
+            | "kotlin" | "css" | "bash" | "shell"
+        ),
+    }
 }
 
 fn collect_leading_comments<'a>(

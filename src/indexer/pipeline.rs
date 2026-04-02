@@ -158,7 +158,7 @@ pub async fn run(
             }
         }
 
-        let parsed_segments = if parser::is_language_supported(&scanned_file.extension) {
+        let parsed_segments = if parser::use_structural_parser(&scanned_file.extension) {
             match parser::parse_file(&content, &scanned_file.extension) {
                 Ok(segs) => segs,
                 Err(e) => {
@@ -169,6 +169,9 @@ pub async fn run(
                     chunker::chunk_file_default(&content, &scanned_file.extension)
                 }
             }
+        } else if parser::is_language_supported(&scanned_file.extension) {
+            // Recognized language but better served by text chunking (JSON, YAML, etc.)
+            chunker::chunk_file_default(&content, &scanned_file.extension)
         } else {
             unsupported_extensions.insert(scanned_file.extension.clone());
             debug!(
@@ -201,6 +204,25 @@ pub async fn run(
             exts.join(", .")
         );
     }
+
+    pb.finish_and_clear();
+
+    let store_pb = ProgressBar::new(pending.len() as u64);
+    store_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:40}] {pos}/{len} files ({eta})")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+    );
+    store_pb.set_message("Storing");
+
+    // Drop FTS index before bulk inserts — FTS maintenance during INSERT is
+    // ~160x slower than rebuilding the index once afterwards.
+    conn.execute_batch("DROP INDEX IF EXISTS idx_segments_fts")
+        .await
+        .map_err(|e| {
+            crate::shared::errors::StorageError::Query(format!("drop FTS index: {e}"))
+        })?;
 
     if let Some(emb) = embedder {
         for pf in &pending {
@@ -241,6 +263,7 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
+            store_pb.inc(1);
         }
     } else {
         for pf in &pending {
@@ -274,10 +297,18 @@ pub async fn run(
             }
 
             stats.files_indexed += 1;
+            store_pb.inc(1);
         }
     }
 
-    pb.finish_with_message("Indexing complete");
+    // Rebuild FTS index after bulk inserts.
+    conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
+        .await
+        .map_err(|e| {
+            crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
+        })?;
+
+    store_pb.finish_and_clear();
 
     info!(
         "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments",
@@ -524,4 +555,5 @@ mod tests {
             "txt files should produce only chunk segments"
         );
     }
+
 }
