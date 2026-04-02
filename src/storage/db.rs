@@ -38,7 +38,8 @@ impl Db {
     }
 
     /// Open a local database at the given path in read-only mode.
-    /// The database file must already exist.
+    /// The database file must already exist. Retries longer than write mode
+    /// to handle concurrent indexing.
     pub async fn open_ro(path: &Path) -> Result<Self, OneupError> {
         if !path.exists() {
             return Err(StorageError::Connection(format!(
@@ -55,9 +56,39 @@ impl Db {
             ))
         })?;
 
-        let database = build_local_with_retry(path_str).await?;
+        // Retry more aggressively for reads — indexing can hold the lock for minutes
+        let retry_delay = Duration::from_millis(200);
+        let max_attempts: usize = 25; // 5 seconds total
+        let mut last_error = None;
 
-        Ok(Self { database })
+        for attempt in 0..max_attempts {
+            match Builder::new_local(path_str)
+                .experimental_index_method(true)
+                .build()
+                .await
+            {
+                Ok(database) => return Ok(Self { database }),
+                Err(err) => {
+                    let err_text = err.to_string();
+                    if !is_lock_error(&err_text) || attempt + 1 == max_attempts {
+                        if is_lock_error(&err_text) {
+                            return Err(StorageError::Connection(
+                                "index is currently being built — try again shortly".to_string(),
+                            )
+                            .into());
+                        }
+                        return Err(StorageError::Connection(err_text).into());
+                    }
+                    last_error = Some(err_text);
+                    thread::sleep(retry_delay);
+                }
+            }
+        }
+
+        Err(StorageError::Connection(
+            last_error.unwrap_or_else(|| "database open failed".to_string()),
+        )
+        .into())
     }
 
     /// Open an in-memory database (useful for tests).
