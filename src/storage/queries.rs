@@ -7,8 +7,8 @@ CREATE TABLE IF NOT EXISTS segments (
     content TEXT NOT NULL,
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
-    embedding BLOB,
-    embedding_q8 BLOB,
+    embedding TEXT,
+    embedding_q8 TEXT,
     breadcrumb TEXT,
     complexity INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'DEFINITION',
@@ -29,8 +29,24 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
 
-pub const CREATE_FTS_INDEX: &str = "
-CREATE INDEX IF NOT EXISTS idx_segments_fts ON segments USING fts(content)";
+pub const CREATE_FTS_TABLE: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
+    content,
+    content='segments',
+    content_rowid='rowid'
+)";
+
+pub const CREATE_FTS_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN
+    INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
+END";
 
 pub const CREATE_META_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -46,7 +62,7 @@ INSERT OR REPLACE INTO segments (
     file_hash, created_at, updated_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5,
-    ?6, ?7, CASE WHEN ?8 IS NULL THEN NULL ELSE vector32(?8) END, CASE WHEN ?9 IS NULL THEN NULL ELSE vector8(?9) END,
+    ?6, ?7, ?8, ?9,
     ?10, ?11, ?12, ?13, ?14, ?15,
     ?16, datetime('now'), datetime('now')
 )";

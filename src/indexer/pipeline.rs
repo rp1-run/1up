@@ -4,7 +4,7 @@ use std::path::Path;
 use nanospinner::Spinner;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
-use turso::Connection;
+use libsql::Connection;
 
 fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
     use std::io::IsTerminal;
@@ -213,14 +213,6 @@ pub async fn run(
         total_segments,
     ));
 
-    // Drop FTS index before bulk inserts — FTS maintenance during INSERT is
-    // ~160x slower than rebuilding the index once afterwards.
-    conn.execute_batch("DROP INDEX IF EXISTS idx_segments_fts")
-        .await
-        .map_err(|e| {
-            crate::shared::errors::StorageError::Query(format!("drop FTS index: {e}"))
-        })?;
-
     let store_spinner = if !pending.is_empty() {
         let label = if has_embedder {
             "Embedding & storing"
@@ -325,26 +317,10 @@ pub async fn run(
     }
 
     if let Some(sp) = store_spinner {
-        sp.update("Building search index");
-
-        // Rebuild FTS index after bulk inserts.
-        conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
-            .await
-            .map_err(|e| {
-                crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
-            })?;
-
         sp.success_with(&format!(
             "Stored {} segments across {} files",
             stats.segments_stored, stats.files_indexed,
         ));
-    } else {
-        // Rebuild FTS index even if nothing pending (might have been dropped earlier)
-        conn.execute_batch(crate::storage::queries::CREATE_FTS_INDEX)
-            .await
-            .map_err(|e| {
-                crate::shared::errors::StorageError::Query(format!("rebuild FTS index: {e}"))
-            })?;
     }
 
     info!(

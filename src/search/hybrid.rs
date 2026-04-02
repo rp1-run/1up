@@ -1,4 +1,4 @@
-use turso::Connection;
+use libsql::Connection;
 
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
@@ -75,106 +75,68 @@ impl<'a> HybridSearchEngine<'a> {
     }
 }
 
+/// Cosine distance between two f32 vectors (1.0 - cosine_similarity).
+fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 { 1.0 } else { 1.0 - (dot / denom) }
+}
+
+/// Parse a JSON array string like "[0.1,0.2,0.3]" into Vec<f32>.
+fn parse_embedding_json(json: &str) -> Option<Vec<f32>> {
+    serde_json::from_str(json).ok()
+}
+
 async fn vector_search(
     conn: &Connection,
     embedder: &mut Embedder,
     query: &str,
 ) -> Result<Vec<SearchResult>, OneupError> {
     let query_embedding = embedder.embed_one(query)?;
-    let query_q8_json = f32_to_q8_json(&query_embedding);
 
-    let prefilter_k = VECTOR_PREFILTER_K as i64;
-
+    // Fetch all segments with embeddings and compute cosine distance in Rust
     let mut rows = conn
         .query(
-            "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
-                    s.line_start, s.line_end, s.breadcrumb, s.complexity,
-                    s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
-                    vector_distance_cos(s.embedding_q8, vector8(?1)) as distance
-             FROM segments s
-             WHERE s.embedding_q8 IS NOT NULL
-             ORDER BY distance ASC
-             LIMIT ?2",
-            turso::params![query_q8_json, prefilter_k],
+            "SELECT id, file_path, language, block_type, content,
+                    line_start, line_end, breadcrumb, complexity,
+                    role, defined_symbols, referenced_symbols, called_symbols,
+                    embedding
+             FROM segments
+             WHERE embedding IS NOT NULL",
+            (),
         )
         .await
-        .map_err(|e| SearchError::QueryFailed(format!("int8 prefilter: {e}")))?;
+        .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
 
-    let mut candidates: Vec<(String, SearchResult, f64)> = Vec::new();
+    let mut candidates: Vec<(SearchResult, f64)> = Vec::new();
     while let Some(row) = rows
         .next()
         .await
         .map_err(|e| SearchError::QueryFailed(format!("row iteration: {e}")))?
     {
-        let id: String = row
-            .get(0)
-            .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-        let distance: f64 = row
+        let embedding_json: String = row
             .get(13)
             .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-        let result = row_to_search_result(&row)?;
-        candidates.push((id, result, distance));
-    }
 
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ids: Vec<String> = candidates.iter().map(|(id, _, _)| id.clone()).collect();
-    let mut reranked = rerank_f32(conn, &ids, &query_embedding).await?;
-
-    for (id, result, _) in &candidates {
-        if !reranked.iter().any(|(rid, _)| rid == id) {
-            reranked.push((id.clone(), f64::MAX));
-        }
-        let _ = result;
-    }
-
-    reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let id_to_result: std::collections::HashMap<String, SearchResult> = candidates
-        .into_iter()
-        .map(|(id, result, _)| (id, result))
-        .collect();
-
-    Ok(reranked
-        .into_iter()
-        .filter_map(|(id, _)| id_to_result.get(&id).cloned())
-        .collect())
-}
-
-async fn rerank_f32(
-    conn: &Connection,
-    ids: &[String],
-    query_embedding: &[f32],
-) -> Result<Vec<(String, f64)>, OneupError> {
-    let query_vec_json = f32_to_json_array(query_embedding);
-    let mut results = Vec::new();
-
-    for id in ids {
-        let mut rows = conn
-            .query(
-                "SELECT vector_distance_cos(embedding, vector32(?1)) as distance
-                 FROM segments
-                 WHERE id = ?2 AND embedding IS NOT NULL",
-                turso::params![query_vec_json.clone(), id.clone()],
-            )
-            .await
-            .map_err(|e| SearchError::QueryFailed(format!("f32 rerank: {e}")))?;
-
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| SearchError::QueryFailed(format!("rerank row: {e}")))?
-        {
-            let distance: f64 = row
-                .get(0)
-                .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
-            results.push((id.clone(), distance));
+        if let Some(embedding) = parse_embedding_json(&embedding_json) {
+            let distance = cosine_distance(&query_embedding, &embedding);
+            let result = row_to_search_result(&row)?;
+            candidates.push((result, distance));
         }
     }
 
-    Ok(results)
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(VECTOR_PREFILTER_K);
+
+    Ok(candidates.into_iter().map(|(r, _)| r).collect())
 }
 
 async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, OneupError> {
@@ -185,12 +147,13 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
             "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
                     s.line_start, s.line_end, s.breadcrumb, s.complexity,
                     s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols,
-                    fts_score(s.content, ?1) as score
-             FROM segments s
-             WHERE fts_match(s.content, ?1)
-             ORDER BY score DESC
+                    f.rank as score
+             FROM segments_fts f
+             JOIN segments s ON s.rowid = f.rowid
+             WHERE segments_fts MATCH ?1
+             ORDER BY f.rank
              LIMIT ?2",
-            turso::params![fts_query, VECTOR_PREFILTER_K as i64],
+            libsql::params![fts_query, VECTOR_PREFILTER_K as i64],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
@@ -207,7 +170,7 @@ async fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>,
     Ok(results)
 }
 
-fn row_to_search_result(row: &turso::Row) -> Result<SearchResult, OneupError> {
+fn row_to_search_result(row: &libsql::Row) -> Result<SearchResult, OneupError> {
     let file_path: String = row
         .get(1)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
@@ -490,26 +453,21 @@ fn build_fts_query(query: &str) -> String {
         .join(" OR ")
 }
 
-fn f32_to_json_array(vec: &[f32]) -> String {
-    let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", parts.join(","))
-}
-
-fn f32_to_q8_json(vec: &[f32]) -> String {
-    let max_abs = vec
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0f32, f32::max)
-        .max(1e-10);
-
-    let scale = 127.0 / max_abs;
-    let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
-    format!("[{}]", parts.join(","))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_to_json_array(vec: &[f32]) -> String {
+        let parts: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
+        format!("[{}]", parts.join(","))
+    }
+
+    fn f32_to_q8_json(vec: &[f32]) -> String {
+        let max_abs = vec.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-10);
+        let scale = 127.0 / max_abs;
+        let parts: Vec<String> = vec.iter().map(|v| format!("{}", (v * scale) as i8 as u8)).collect();
+        format!("[{}]", parts.join(","))
+    }
 
     #[test]
     fn fts_query_building() {

@@ -1,4 +1,4 @@
-use turso::Connection;
+use libsql::Connection;
 
 use crate::shared::constants::SCHEMA_VERSION;
 use crate::shared::errors::{OneupError, StorageError};
@@ -10,15 +10,23 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 /// This is idempotent -- safe to call on an already-initialized database.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};",
+        "{};{};{};{}",
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
-        queries::CREATE_FTS_INDEX,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
+
+    // FTS5 virtual table and sync triggers
+    conn.execute_batch(queries::CREATE_FTS_TABLE)
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to create FTS table: {e}")))?;
+
+    conn.execute_batch(queries::CREATE_FTS_TRIGGERS)
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to create FTS triggers: {e}")))?;
 
     conn.execute(queries::CREATE_META_TABLE, ())
         .await
@@ -64,7 +72,6 @@ async fn set_schema_version(conn: &Connection, version: u32) -> Result<(), Oneup
 }
 
 /// Run any pending migrations to bring the database up to the current schema version.
-/// Currently only supports creating the initial schema (version 1).
 pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
     let current = get_schema_version(conn).await.unwrap_or(None);
 
@@ -79,11 +86,8 @@ pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
     }
 
     // Health check: verify the schema is usable. A killed process can leave
-    // the DB in a corrupt state (e.g. partially dropped FTS indexes).
-    if let Err(e) = conn
-        .query("SELECT COUNT(*) FROM segments", ())
-        .await
-    {
+    // the DB in a corrupt state.
+    if let Err(e) = conn.query("SELECT COUNT(*) FROM segments", ()).await {
         tracing::warn!("database schema corrupt ({e}), rebuilding");
         reset_schema(conn).await?;
     }
@@ -93,10 +97,12 @@ pub async fn migrate(conn: &Connection) -> Result<(), OneupError> {
 
 /// Drop all tables and reinitialize from scratch.
 async fn reset_schema(conn: &Connection) -> Result<(), OneupError> {
-    // Drop internal turso FTS tables that may be left behind
     let _ = conn
         .execute_batch(
-            "DROP INDEX IF EXISTS idx_segments_fts;\
+            "DROP TABLE IF EXISTS segments_fts;\
+             DROP TRIGGER IF EXISTS segments_ai;\
+             DROP TRIGGER IF EXISTS segments_ad;\
+             DROP TRIGGER IF EXISTS segments_au;\
              DROP INDEX IF EXISTS idx_segments_file_path;\
              DROP INDEX IF EXISTS idx_segments_language;\
              DROP INDEX IF EXISTS idx_segments_file_hash",
