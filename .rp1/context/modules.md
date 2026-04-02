@@ -43,7 +43,7 @@ Indexing pipeline: scan, parse, chunk, embed, store.
 | `parser.rs` | `SupportedLanguage` enum mapping 9 languages to tree-sitter grammars; `parse_file()` walks AST root, extracts segments with role classification, symbol collection, complexity scoring, container recursion for nested methods |
 | `chunker.rs` | Sliding-window text chunking with configurable window size and overlap for unsupported languages |
 | `embedder.rs` | `Embedder` struct wrapping `ort::Session` and `tokenizers::Tokenizer`; async auto-download from HuggingFace; batch inference with mean pooling + L2 normalization; `is_model_available()` and `is_download_failed()` for graceful degradation |
-| `pipeline.rs` | Orchestrates scan -> hash check -> parse/chunk -> embed -> store; SHA-256 incremental detection; deleted file cleanup; f32 and int8 quantized embedding storage; progress bar |
+| `pipeline.rs` | Orchestrates scan -> hash check -> parse/chunk -> embed -> store; SHA-256 incremental detection; delete-and-rewrite per changed file; writes `SegmentInsert` rows through `segments::upsert_segment`; stores nullable `embedding_vec` values when embeddings are present and null vectors when they are not; progress bar |
 
 ## `src/search/`
 
@@ -51,25 +51,26 @@ Search engines: hybrid semantic+FTS, symbol lookup, context retrieval.
 
 | File | Responsibility |
 |------|---------------|
-| `mod.rs` | Re-exports `HybridSearchEngine`, `SymbolSearchEngine`, `ContextEngine` |
-| `hybrid.rs` | `HybridSearchEngine` -- two-stage vector search (int8 prefilter, f32 rerank), FTS5 MATCH, result fusion, FTS-only fallback |
+| `mod.rs` | Declares search submodules and re-exports `HybridSearchEngine`, `StructuralSearchEngine`, and `SymbolSearchEngine` |
+| `hybrid.rs` | `HybridSearchEngine` -- query embedding, intent detection, symbol lookup, retrieval backend dispatch, RRF fusion, and vector-failure fallback to `FtsOnly` |
 | `ranking.rs` | RRF fusion, intent-based role boosting, file path penalties (test/doc/vendor), short segment penalties, overlap deduplication, per-file caps |
 | `intent.rs` | Query intent detection via keyword signal scoring: DEFINITION, FLOW, USAGE, DOCS, GENERAL |
+| `retrieval.rs` | `RetrievalBackend`, `SqlVectorV2`, and `FtsOnly`; selects the backend, runs `vector_top_k(...)` or FTS queries, and hydrates `SearchResult` rows from shared SQL result shapes |
 | `symbol.rs` | `SymbolSearchEngine` -- SQL LIKE queries on defined_symbols/referenced_symbols JSON columns, Levenshtein fuzzy matching, block_type priority ordering |
 | `context.rs` | `ContextEngine` -- reads source from disk, tree-sitter parse to find smallest enclosing scope node, line-range fallback; `parse_location()` for `file:line` format |
 | `formatter.rs` | Search result formatting utilities |
 
 ## `src/storage/`
 
-Database access layer using turso (formerly libSQL).
+Database access layer using libSQL.
 
 | File | Responsibility |
 |------|---------------|
 | `mod.rs` | Module exports |
-| `db.rs` | `Db` wrapper with `open_rw`/`open_ro`/`open_memory` constructors using `turso::Builder` with `experimental_index_method(true)` for FTS support |
-| `schema.rs` | DDL with segments table (F32_BLOB, VECTOR8), FTS5 virtual table with insert/delete/update triggers, meta KV table; `migrate()` for schema versioning |
-| `queries.rs` | SQL query string constants |
-| `segments.rs` | Segment CRUD (upsert, query by file/id, delete by file, file hash lookup, count), meta CRUD |
+| `db.rs` | `Db` wrapper with `open_rw`/`open_ro`/`open_memory` constructors using `libsql::Builder`; retries local-open lock failures before surfacing an error |
+| `schema.rs` | Schema-v5 initialization and validation: `prepare_for_write()`, `ensure_current()`, and `rebuild()`; owns required-object checks and explicit `1up reindex` recovery errors |
+| `queries.rs` | SQL DDL and query constants for `segments`, `segments_fts`, `meta`, `idx_segments_embedding`, FTS5 `MATCH`, and `vector_top_k(...)` retrieval |
+| `segments.rs` | Segment CRUD and meta helpers; upserts serialize embeddings into `embedding_vec`, supports file-hash lookups, and exposes segment/meta helpers for storage tests and maintenance paths |
 
 ## `src/shared/`
 
