@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS segments (
     line_end INTEGER NOT NULL,
     embedding TEXT,
     embedding_q8 TEXT,
+    embedding_vec FLOAT32(384),
     breadcrumb TEXT,
     complexity INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'DEFINITION',
@@ -28,6 +29,9 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
+
+pub const CREATE_INDEX_EMBEDDING_VEC: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segments_embedding ON segments (libsql_vector_idx(embedding_vec))";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -53,6 +57,27 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 )";
+
+pub const DROP_SEARCH_SCHEMA: &str = "
+DROP TRIGGER IF EXISTS segments_ai;
+DROP TRIGGER IF EXISTS segments_ad;
+DROP TRIGGER IF EXISTS segments_au;
+DROP TABLE IF EXISTS segments_fts;
+DROP INDEX IF EXISTS idx_segments_embedding;
+DROP INDEX IF EXISTS idx_segments_file_path;
+DROP INDEX IF EXISTS idx_segments_language;
+DROP INDEX IF EXISTS idx_segments_file_hash;
+DROP TABLE IF EXISTS segments;
+DROP TABLE IF EXISTS meta";
+
+pub const SELECT_SCHEMA_OBJECT: &str =
+    "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1";
+
+pub const SELECT_HAS_USER_TABLES: &str =
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1";
+
+pub const SELECT_SEGMENTS_EMBEDDING_VEC_COLUMN: &str =
+    "SELECT 1 FROM pragma_table_info('segments') WHERE name = 'embedding_vec' LIMIT 1";
 
 pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (

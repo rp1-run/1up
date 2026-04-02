@@ -33,7 +33,7 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
-                        if schema::ensure_compatible(&conn).await.is_ok() {
+                        if schema::ensure_current(&conn).await.is_ok() {
                             let files = segments::count_files(&conn).await.ok();
                             let segs = segments::count_segments(&conn).await.ok();
                             (files, segs)

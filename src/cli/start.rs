@@ -57,7 +57,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = config::project_db_path(&project_root);
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
-    schema::migrate(&conn).await?;
+    schema::prepare_for_write(&conn).await?;
 
     let mut embedder_opt = if embedder::is_model_available() {
         match Embedder::from_dir(&config::model_dir()?) {

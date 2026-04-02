@@ -570,11 +570,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_idempotent() {
+    async fn prepare_for_write_is_idempotent() {
         let (_db, conn) = setup().await;
 
-        schema::migrate(&conn).await.unwrap();
-        schema::migrate(&conn).await.unwrap();
+        schema::prepare_for_write(&conn).await.unwrap();
+        schema::prepare_for_write(&conn).await.unwrap();
 
         let version = schema::get_schema_version(&conn).await.unwrap();
         assert_eq!(version, Some(crate::shared::constants::SCHEMA_VERSION));

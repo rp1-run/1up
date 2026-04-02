@@ -43,8 +43,8 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 
-/// Schema version for database migrations.
-pub const SCHEMA_VERSION: u32 = 4;
+/// Schema version for database layout.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// ONNX model filename.
 pub const MODEL_FILENAME: &str = "model.onnx";

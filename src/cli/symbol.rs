@@ -35,17 +35,15 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
     }
 
     if !db_path.exists() {
-        eprintln!(
-            "warning: no index found at {}. Run `1up index` first.",
+        anyhow::bail!(
+            "no current index found at {}. Run `1up reindex` to create a fresh schema-v5 index.",
             db_path.display()
         );
-        println!("{}", fmt.format_symbol_results(&[]));
-        return Ok(());
     }
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::ensure_compatible(&conn).await?;
+    schema::ensure_current(&conn).await?;
 
     let engine = SymbolSearchEngine::new(&conn);
     let results = if args.references {
