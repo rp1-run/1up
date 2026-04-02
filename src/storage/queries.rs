@@ -7,8 +7,6 @@ CREATE TABLE IF NOT EXISTS segments (
     content TEXT NOT NULL,
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
-    embedding TEXT,
-    embedding_q8 TEXT,
     embedding_vec FLOAT32(384),
     breadcrumb TEXT,
     complexity INTEGER NOT NULL DEFAULT 0,
@@ -103,14 +101,14 @@ LIMIT ?2";
 pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (
     id, file_path, language, block_type, content,
-    line_start, line_end, embedding, embedding_q8,
+    line_start, line_end, embedding_vec,
     breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
     file_hash, created_at, updated_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5,
-    ?6, ?7, ?8, ?9,
-    ?10, ?11, ?12, ?13, ?14, ?15,
-    ?16, datetime('now'), datetime('now')
+    ?6, ?7, CASE WHEN ?8 IS NULL THEN NULL ELSE vector(?8) END,
+    ?9, ?10, ?11, ?12, ?13, ?14,
+    ?15, datetime('now'), datetime('now')
 )";
 
 #[allow(dead_code)]
