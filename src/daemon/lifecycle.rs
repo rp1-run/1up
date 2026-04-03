@@ -132,7 +132,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
         });
 
         if !already_registered {
-            registry.register(project_id, project_root)?;
+            registry.register(project_id, project_root, None)?;
             send_sighup(pid)?;
             debug!("auto-registered project and sent SIGHUP to daemon (pid={pid})");
         }
@@ -141,7 +141,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
     }
 
     let mut registry = Registry::load()?;
-    registry.register(project_id, project_root)?;
+    registry.register(project_id, project_root, None)?;
 
     let binary = current_binary_path()?;
     let pid = spawn_daemon(&binary)?;

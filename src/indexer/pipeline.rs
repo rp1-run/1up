@@ -48,6 +48,7 @@ fn refresh_progress(
     state: IndexState,
     phase: IndexPhase,
     files_total: usize,
+    parallelism: Option<IndexParallelism>,
 ) {
     stats.progress = IndexProgress {
         state,
@@ -59,6 +60,8 @@ fn refresh_progress(
         files_deleted: stats.files_deleted,
         segments_stored: stats.segments_stored,
         embeddings_enabled: stats.embeddings_generated,
+        parallelism,
+        timings: None,
         updated_at: chrono::Utc::now(),
     };
     persist_progress(project_root, &stats.progress);
@@ -70,7 +73,9 @@ use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::errors::{IndexingError, OneupError};
-use crate::shared::types::{IndexPhase, IndexProgress, IndexState, ParsedSegment};
+use crate::shared::types::{
+    IndexParallelism, IndexPhase, IndexProgress, IndexState, IndexingConfig, ParsedSegment,
+};
 use crate::storage::segments::{self, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -152,7 +157,17 @@ pub async fn run(
     project_root: &Path,
     embedder: Option<&mut Embedder>,
 ) -> Result<PipelineStats, OneupError> {
+    run_with_config(conn, project_root, embedder, &IndexingConfig::auto()).await
+}
+
+pub async fn run_with_config(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    config: &IndexingConfig,
+) -> Result<PipelineStats, OneupError> {
     let mut stats = PipelineStats::default();
+    let parallelism = Some(config.parallelism());
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
@@ -167,6 +182,7 @@ pub async fn run(
         IndexState::Running,
         IndexPhase::Scanning,
         0,
+        parallelism.clone(),
     );
 
     let scan_spinner = spin("Scanning files");
@@ -217,6 +233,7 @@ pub async fn run(
         IndexState::Running,
         IndexPhase::Parsing,
         scanned_relative.len(),
+        parallelism.clone(),
     );
 
     scan_spinner.update(format!("Parsing {} files", scanned_relative.len()));
@@ -249,6 +266,7 @@ pub async fn run(
                     IndexState::Running,
                     IndexPhase::Parsing,
                     total_files,
+                    parallelism.clone(),
                 );
                 continue;
             }
@@ -265,6 +283,7 @@ pub async fn run(
                     IndexState::Running,
                     IndexPhase::Parsing,
                     total_files,
+                    parallelism.clone(),
                 );
                 continue;
             }
@@ -295,6 +314,7 @@ pub async fn run(
                 IndexState::Running,
                 IndexPhase::Parsing,
                 total_files,
+                parallelism.clone(),
             );
             continue;
         };
@@ -307,6 +327,7 @@ pub async fn run(
                 IndexState::Running,
                 IndexPhase::Parsing,
                 total_files,
+                parallelism.clone(),
             );
             continue;
         }
@@ -323,6 +344,7 @@ pub async fn run(
             IndexState::Running,
             IndexPhase::Parsing,
             total_files,
+            parallelism.clone(),
         );
     }
 
@@ -359,6 +381,7 @@ pub async fn run(
             IndexState::Running,
             IndexPhase::Storing,
             scanned_relative.len(),
+            parallelism.clone(),
         );
     }
 
@@ -434,6 +457,7 @@ pub async fn run(
                 IndexState::Running,
                 IndexPhase::Storing,
                 scanned_relative.len(),
+                parallelism.clone(),
             );
         }
 
@@ -490,6 +514,7 @@ pub async fn run(
                 IndexState::Running,
                 IndexPhase::Storing,
                 scanned_relative.len(),
+                parallelism.clone(),
             );
         }
     }
@@ -516,6 +541,7 @@ pub async fn run(
         IndexState::Complete,
         IndexPhase::Complete,
         scanned_relative.len(),
+        parallelism,
     );
 
     Ok(stats)

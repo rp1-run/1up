@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
+
+use crate::shared::constants::{DEFAULT_INDEX_WRITE_BATCH_FILES, MAX_AUTO_EMBED_THREADS};
 
 /// Role classification for a parsed code segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +164,110 @@ pub struct ContextResult {
     pub scope_type: String,
 }
 
+/// Shared resolved indexing settings for a single run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexingConfig {
+    pub jobs: usize,
+    pub embed_threads: usize,
+    pub write_batch_files: usize,
+}
+
+impl IndexingConfig {
+    pub fn new(
+        jobs: usize,
+        embed_threads: usize,
+        write_batch_files: usize,
+    ) -> Result<Self, String> {
+        if jobs == 0 {
+            return Err("jobs must be at least 1".to_string());
+        }
+        if embed_threads == 0 {
+            return Err("embed_threads must be at least 1".to_string());
+        }
+        if write_batch_files == 0 {
+            return Err("write_batch_files must be at least 1".to_string());
+        }
+
+        Ok(Self {
+            jobs,
+            embed_threads,
+            write_batch_files,
+        })
+    }
+
+    pub fn auto() -> Self {
+        Self::from_sources(None, None, None).expect("automatic indexing defaults are valid")
+    }
+
+    pub fn from_sources(
+        jobs: Option<usize>,
+        embed_threads: Option<usize>,
+        write_batch_files: Option<usize>,
+    ) -> Result<Self, String> {
+        let jobs = jobs.unwrap_or_else(Self::default_jobs);
+        let embed_threads = embed_threads.unwrap_or_else(|| Self::default_embed_threads_for(jobs));
+        let write_batch_files = write_batch_files.unwrap_or(DEFAULT_INDEX_WRITE_BATCH_FILES);
+
+        Self::new(jobs, embed_threads, write_batch_files)
+    }
+
+    pub fn parallelism(&self) -> IndexParallelism {
+        IndexParallelism {
+            jobs_configured: self.jobs,
+            jobs_effective: self.jobs,
+            embed_threads: self.embed_threads,
+        }
+    }
+
+    pub fn default_jobs() -> usize {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    pub fn default_embed_threads_for(jobs: usize) -> usize {
+        jobs.clamp(1, MAX_AUTO_EMBED_THREADS)
+    }
+}
+
+impl<'de> Deserialize<'de> for IndexingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawIndexingConfig {
+            jobs: Option<usize>,
+            embed_threads: Option<usize>,
+            write_batch_files: Option<usize>,
+        }
+
+        let raw = RawIndexingConfig::deserialize(deserializer)?;
+        IndexingConfig::from_sources(raw.jobs, raw.embed_threads, raw.write_batch_files)
+            .map_err(de::Error::custom)
+    }
+}
+
+/// Persisted or reported indexing parallelism values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexParallelism {
+    pub jobs_configured: usize,
+    pub jobs_effective: usize,
+    pub embed_threads: usize,
+}
+
+/// Stage-level timing data for an indexing run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexStageTimings {
+    pub scan_ms: u128,
+    pub parse_ms: u128,
+    pub embed_ms: u128,
+    pub store_ms: u128,
+    pub total_ms: u128,
+}
+
 /// High-level state for the latest indexing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +300,10 @@ pub struct IndexProgress {
     pub files_deleted: usize,
     pub segments_stored: usize,
     pub embeddings_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<IndexParallelism>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<IndexStageTimings>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -209,6 +319,8 @@ impl IndexProgress {
             files_deleted: 0,
             segments_stored: 0,
             embeddings_enabled: false,
+            parallelism: None,
+            timings: None,
             updated_at: Utc::now(),
         }
     }

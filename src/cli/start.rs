@@ -16,11 +16,25 @@ pub struct StartArgs {
     /// Project root directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Maximum concurrent parse workers; overrides ONEUP_INDEX_JOBS
+    #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
+    pub jobs: Option<usize>,
+
+    /// ONNX intra-op threads; overrides ONEUP_EMBED_THREADS
+    #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
+    pub embed_threads: Option<usize>,
 }
 
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
+    let mut registry = Registry::load()?;
+    let indexing_config = config::resolve_indexing_config(
+        args.jobs,
+        args.embed_threads,
+        registry.indexing_config_for(&project_root),
+    )?;
 
     let (project_id, initialized_now) = if project::is_initialized(&project_root) {
         (project::read_project_id(&project_root)?, false)
@@ -40,27 +54,26 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     };
 
     if let Some(pid) = lifecycle::is_daemon_running()? {
-        let mut registry = Registry::load()?;
         let already_registered = registry
             .projects
             .iter()
             .any(|p| p.project_root == project_root);
 
-        if already_registered {
-            let msg = format!(
-                "{init_prefix}Daemon already running (pid={pid}) and project already registered."
-            );
-            eprintln!("{}", fmt.format_message(&msg));
-            return Ok(());
-        }
-
-        registry.register(&project_id, &project_root)?;
+        registry.register(&project_id, &project_root, Some(indexing_config.clone()))?;
         lifecycle::send_sighup(pid)?;
-        let msg = format!(
-            "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
-            project_root.display()
-        );
-        println!("{}", fmt.format_message(&msg));
+        let msg = if already_registered {
+            format!("{init_prefix}Daemon already running (pid={pid}); project settings refreshed.")
+        } else {
+            format!(
+                "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
+                project_root.display()
+            )
+        };
+        if already_registered {
+            eprintln!("{}", fmt.format_message(&msg));
+        } else {
+            println!("{}", fmt.format_message(&msg));
+        }
         return Ok(());
     }
 
@@ -70,7 +83,8 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     schema::prepare_for_write(&conn).await?;
 
     let mut embedder_opt = if embedder::is_model_available() {
-        match Embedder::from_dir(&config::model_dir()?) {
+        match Embedder::from_dir_with_threads(&config::model_dir()?, indexing_config.embed_threads)
+        {
             Ok(e) => Some(e),
             Err(err) => {
                 eprintln!(
@@ -84,7 +98,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         None
     } else {
         eprintln!("info: embedding model not found, attempting download...");
-        match Embedder::new().await {
+        match Embedder::new_with_threads(indexing_config.embed_threads).await {
             Ok(e) => {
                 eprintln!("info: embedding model downloaded successfully");
                 Some(e)
@@ -98,10 +112,15 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         }
     };
 
-    let stats = pipeline::run(&conn, &project_root, embedder_opt.as_mut()).await?;
+    let stats = pipeline::run_with_config(
+        &conn,
+        &project_root,
+        embedder_opt.as_mut(),
+        &indexing_config,
+    )
+    .await?;
 
-    let mut registry = Registry::load()?;
-    registry.register(&project_id, &project_root)?;
+    registry.register(&project_id, &project_root, Some(indexing_config))?;
 
     let binary = lifecycle::current_binary_path()?;
     let pid = lifecycle::spawn_daemon(&binary)?;

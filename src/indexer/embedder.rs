@@ -68,15 +68,26 @@ impl Embedder {
     /// Creates a new embedder, auto-downloading the model if it is not already present.
     ///
     /// The ONNX session is initialized once; reuse this instance across calls.
+    #[allow(dead_code)]
     pub async fn new() -> Result<Self, OneupError> {
-        Self::with_batch_size(EMBEDDING_BATCH_SIZE).await
+        Self::with_options(EMBEDDING_BATCH_SIZE, 1).await
+    }
+
+    /// Creates a new embedder with a custom ONNX intra-op thread count.
+    pub async fn new_with_threads(intra_threads: usize) -> Result<Self, OneupError> {
+        Self::with_options(EMBEDDING_BATCH_SIZE, intra_threads).await
     }
 
     /// Creates a new embedder with a custom batch size.
     ///
     /// If the model is not present, attempts auto-download. On download failure,
     /// a marker file is written to prevent repeated download attempts.
+    #[allow(dead_code)]
     pub async fn with_batch_size(batch_size: usize) -> Result<Self, OneupError> {
+        Self::with_options(batch_size, 1).await
+    }
+
+    async fn with_options(batch_size: usize, intra_threads: usize) -> Result<Self, OneupError> {
         let dir = model_dir()?;
 
         let model_path = dir.join(MODEL_FILENAME);
@@ -103,7 +114,7 @@ impl Embedder {
 
         let session = Session::builder()
             .map_err(|e| EmbeddingError::InferenceFailed(format!("session builder: {e}")))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
             .map_err(|e| EmbeddingError::InferenceFailed(format!("set threads: {e}")))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
@@ -121,6 +132,11 @@ impl Embedder {
 
     /// Creates an embedder from pre-existing model files at a custom path.
     pub fn from_dir(dir: &Path) -> Result<Self, OneupError> {
+        Self::from_dir_with_threads(dir, 1)
+    }
+
+    /// Creates an embedder from pre-existing model files at a custom path and thread count.
+    pub fn from_dir_with_threads(dir: &Path, intra_threads: usize) -> Result<Self, OneupError> {
         let model_path = dir.join(MODEL_FILENAME);
         let tokenizer_path = dir.join(TOKENIZER_FILENAME);
 
@@ -141,7 +157,7 @@ impl Embedder {
 
         let session = Session::builder()
             .map_err(|e| EmbeddingError::InferenceFailed(format!("session builder: {e}")))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
             .map_err(|e| EmbeddingError::InferenceFailed(format!("set threads: {e}")))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;

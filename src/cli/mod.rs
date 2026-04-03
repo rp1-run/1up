@@ -86,3 +86,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
 }
+
+pub(crate) fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer: {raw}"))?;
+
+    if parsed == 0 {
+        return Err(format!("value must be at least 1, got {raw}"));
+    }
+
+    Ok(parsed)
+}

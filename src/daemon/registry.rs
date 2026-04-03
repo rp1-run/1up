@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::shared::config;
 use crate::shared::errors::{DaemonError, OneupError};
+use crate::shared::types::IndexingConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub project_id: String,
     pub project_root: PathBuf,
     pub registered_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexing: Option<IndexingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -50,12 +53,26 @@ impl Registry {
         Ok(())
     }
 
-    pub fn register(&mut self, project_id: &str, project_root: &Path) -> Result<(), OneupError> {
+    pub fn register(
+        &mut self,
+        project_id: &str,
+        project_root: &Path,
+        indexing: Option<IndexingConfig>,
+    ) -> Result<(), OneupError> {
         let canonical = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.to_path_buf());
 
-        if self.projects.iter().any(|p| p.project_root == canonical) {
+        if let Some(existing) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.project_root == canonical)
+        {
+            existing.project_id = project_id.to_string();
+            if let Some(indexing) = indexing {
+                existing.indexing = Some(indexing);
+            }
+            self.save()?;
             return Ok(());
         }
 
@@ -63,6 +80,7 @@ impl Registry {
             project_id: project_id.to_string(),
             project_root: canonical,
             registered_at: chrono::Utc::now().to_rfc3339(),
+            indexing,
         });
 
         self.save()
@@ -86,6 +104,17 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.projects.is_empty()
+    }
+
+    pub fn indexing_config_for(&self, project_root: &Path) -> Option<&IndexingConfig> {
+        let canonical = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+
+        self.projects
+            .iter()
+            .find(|project| project.project_root == canonical)
+            .and_then(|project| project.indexing.as_ref())
     }
 
     #[allow(dead_code)]
@@ -115,6 +144,7 @@ mod tests {
             project_id: "abc-123".to_string(),
             project_root: project_dir.clone(),
             registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: Some(IndexingConfig::new(4, 2, 1).unwrap()),
         });
 
         let content = serde_json::to_string_pretty(&reg).unwrap();
@@ -124,6 +154,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].project_id, "abc-123");
+        assert_eq!(
+            loaded.projects[0].indexing,
+            Some(IndexingConfig::new(4, 2, 1).unwrap())
+        );
     }
 
     #[test]
@@ -139,11 +173,13 @@ mod tests {
             project_id: "id-a".to_string(),
             project_root: dir_a.canonicalize().unwrap(),
             registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: None,
         });
         reg.projects.push(ProjectEntry {
             project_id: "id-b".to_string(),
             project_root: dir_b.canonicalize().unwrap(),
             registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: None,
         });
 
         let before = reg.projects.len();
@@ -158,5 +194,48 @@ mod tests {
         let reg = Registry::default();
         assert!(reg.is_empty());
         assert!(reg.project_roots().is_empty());
+    }
+
+    #[test]
+    fn registry_deserializes_older_entries_without_indexing() {
+        let raw = r#"
+        {
+          "projects": [
+            {
+              "project_id": "abc-123",
+              "project_root": "/tmp/project",
+              "registered_at": "2026-01-01T00:00:00Z"
+            }
+          ]
+        }
+        "#;
+
+        let loaded: Registry = serde_json::from_str(raw).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert!(loaded.projects[0].indexing.is_none());
+    }
+
+    #[test]
+    fn registry_defaults_missing_indexing_fields() {
+        let raw = r#"
+        {
+          "projects": [
+            {
+              "project_id": "abc-123",
+              "project_root": "/tmp/project",
+              "registered_at": "2026-01-01T00:00:00Z",
+              "indexing": {
+                "jobs": 2
+              }
+            }
+          ]
+        }
+        "#;
+
+        let loaded: Registry = serde_json::from_str(raw).unwrap();
+        let indexing = loaded.projects[0].indexing.as_ref().unwrap();
+        assert_eq!(indexing.jobs, 2);
+        assert_eq!(indexing.embed_threads, 2);
+        assert_eq!(indexing.write_batch_files, 1);
     }
 }
