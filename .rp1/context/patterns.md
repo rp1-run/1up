@@ -41,21 +41,21 @@ Evidence: `src/cli/search.rs:38-43`, `src/storage/schema.rs:110-132`
 
 ## Observability
 
-**Logging**: tracing crate with `debug!`/`info!` macros; `-v`/`-vv` CLI flag for verbosity; debug-level for skipped files, fallback decisions; info-level for pipeline summaries
+**Logging**: tracing crate with `debug!`/`info!` macros; `-v`/`-vv` CLI flag for verbosity; debug-level for skipped files, queued follow-up runs, and fallback decisions; info-level for pipeline summaries with configured/effective workers and per-stage timings
 **Metrics**: None detected
 **Tracing**: None detected
-**Progress**: nanospinner for CLI progress indicators; stderr-only output with TTY detection
+**Progress**: `IndexProgress` snapshots persisted to `.1up/index_status.json`; human, plain, and JSON formatters render work summaries, effective parallelism, and scan/parse/embed/store/total timings; nanospinner remains the interactive CLI progress indicator
 
-Evidence: `src/indexer/pipeline.rs:9-12`, `src/cli/index.rs:19-22`
+Evidence: `src/indexer/pipeline.rs`, `src/cli/output.rs`, `src/daemon/worker.rs`
 
 ## Testing Idioms
 
-**Organization**: Unit tests in `#[cfg(test)]` within source files; integration tests in `tests/`; benchmarks in `benches/` (criterion)
-**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `make_result`/`test_segment`/`make_segment` helpers; `tempfile::tempdir()` for filesystem tests
-**Levels**: Unit-dominant with edge case coverage; integration via assert_cmd; model-dependent tests guarded by `is_model_available()` early-return
-**Patterns**: `#[tokio::test]` for async; descriptive test names (e.g., `incremental_indexing_skips_unchanged`)
+**Organization**: Unit tests in `#[cfg(test)]` within source files; integration tests in `tests/`; manual performance workflow in `scripts/benchmark_parallel_indexing.sh` exposed as `just bench-parallel`
+**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem and repo-copy tests; helper builders such as `make_result`, `test_segment`, and `make_segment`
+**Levels**: Unit-dominant with edge case coverage; integration via assert_cmd; parity tests compare `jobs=1` and parallel incremental runs; model-dependent tests still guard on `is_model_available()` when embeddings are required
+**Patterns**: `#[tokio::test]` for async; descriptive regression names; storage helper tests validate transactional rollback; CLI coverage validates new concurrency flags and help text
 
-Evidence: `src/search/ranking.rs:252-370`, `src/storage/segments.rs:376-630`
+Evidence: `src/indexer/pipeline.rs`, `src/storage/segments.rs`, `tests/cli_tests.rs`, `scripts/benchmark_parallel_indexing.sh`
 
 ## I/O & Integration
 
@@ -67,7 +67,7 @@ Evidence: `src/storage/queries.rs`, `src/indexer/scanner.rs:62-110`, `src/indexe
 
 ## Concurrency & Async
 
-**Async Usage**: Tokio full runtime; all CLI handlers and DB operations async; Embedder inference synchronous (CPU-bound ONNX); pipeline processes files sequentially
-**Patterns**: Sequential async iteration; no `join!` parallelism in core paths; daemon uses `tokio::select!` for multiplexing signals and events
+**Async Usage**: Tokio full runtime; all CLI handlers and DB operations async; file-local parse work runs through a bounded `JoinSet::spawn_blocking` pool; embedder inference stays synchronous inside one ONNX session; storage writes remain serialized
+**Patterns**: Sequence IDs plus a `BTreeMap` reorder buffer restore deterministic file order before flush; `write_batch_files` controls transactional replacement batch size; daemon `ProjectRunState` enforces one active run per project and collapses bursts into at most one queued follow-up pass
 
-Evidence: `src/cli/mod.rs:74-88`, `src/indexer/pipeline.rs:60-326`, `src/search/hybrid.rs:22-29`
+Evidence: `src/indexer/pipeline.rs`, `src/daemon/worker.rs`, `src/shared/types.rs`

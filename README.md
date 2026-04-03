@@ -66,7 +66,7 @@ Hybrid semantic + full-text search with reciprocal rank fusion (RRF) ranking:
 1up search "database connection pool" -n 10
 ```
 
-Search requires a current local schema-v5 index. On rebuilt/current indexes, 1up combines symbol matches, native-vector retrieval over `segments.embedding_vec`, and FTS5 keyword matches. If the embedding model is unavailable, fails to load, or a vector query fails for this invocation, search warns and degrades to `FtsOnly`. Missing, stale, or partial indexes are recovery cases: run `1up reindex`.
+Search requires a current local index schema. On rebuilt/current indexes, 1up combines symbol matches, native-vector retrieval, and FTS5 keyword matches. If the embedding model is unavailable, fails to load, or a vector query fails for this invocation, search warns and degrades to `FtsOnly`. Missing, stale, or partial indexes are recovery cases: run `1up reindex`.
 
 ### Symbol Lookup
 
@@ -103,21 +103,34 @@ Explicitly index a repository without starting the daemon:
 
 ```sh
 1up index [path]
+1up index --jobs 4 --embed-threads 2 [path]
 ```
 
-`1up index` is the incremental updater for already-current indexes. On an empty project it creates the current schema-v5 layout; if embeddings are unavailable it still stores searchable content with null vectors.
+All indexing entry points (`index`, `reindex`, and `start`) resolve the same concurrency settings: CLI flags first, then `ONEUP_INDEX_JOBS` and `ONEUP_EMBED_THREADS`, then any settings persisted for the project in the daemon registry, then automatic defaults.
 
-The command also records a final progress snapshot in `.1up/index_status.json`. JSON output keeps the existing `message` field and adds a `progress` object with the last phase, counters, embedding availability, and timestamp.
+`1up index` is the incremental updater for already-current indexes. The pipeline scans and hashes files, fans out file-local parse work through a bounded worker pool, batches embeddings through a single ONNX session, and keeps database replacement work serialized through transactional writes. If embeddings are unavailable it still stores searchable content with null vectors.
+
+Each run records `.1up/index_status.json` with the latest state, phase, work counters, embedding availability, effective parallelism, per-stage timings, and update timestamp. `1up status` renders the same snapshot in human, JSON, and plain output formats.
 
 Force a full re-index when adopting the rewrite or recovering from stale/partial local indexes:
 
 ```sh
 1up reindex [path]
+1up reindex --jobs 1 --embed-threads 1 [path]
 ```
 
-`1up reindex` treats pre-rewrite local indexes as disposable cache, rebuilds schema v5 from scratch, and repopulates `segments`, `segments_fts`, and `segments.embedding_vec`.
+`1up reindex` treats pre-rewrite local indexes as disposable cache, rebuilds the local schema from scratch, and repopulates the segment, FTS, and vector data.
 
 ### Daemon Management
+
+Start or refresh daemon-managed indexing for a project:
+
+```sh
+1up start [path]
+1up start --jobs 6 --embed-threads 2 [path]
+```
+
+`1up start` persists the resolved indexing settings for that project. If the worker is already running, the command refreshes the registry entry and signals the daemon to reload settings instead of starting a second worker.
 
 Check daemon and index status:
 
@@ -125,7 +138,7 @@ Check daemon and index status:
 1up status
 ```
 
-`1up status` reports the latest recorded indexing progress in addition to daemon state and index counts.
+`1up status` reports daemon state, index counts, and the latest recorded indexing progress, including completed versus skipped work, effective worker count, embed threads, and scan/parse/embed/store/total timings.
 
 Stop the daemon for the current project:
 
@@ -133,7 +146,7 @@ Stop the daemon for the current project:
 1up stop
 ```
 
-If other projects are still registered, the daemon keeps running. It shuts down when no projects remain or after an idle timeout (default: 30 minutes).
+If other projects are still registered, the daemon keeps running and reloads its registry via `SIGHUP`. If no projects remain, `1up stop` sends `SIGTERM` and shuts the worker down. While the daemon is running, each project allows only one active indexing pass at a time; file-change bursts collapse into at most one queued follow-up run.
 
 ## CLI Reference
 
@@ -141,7 +154,7 @@ If other projects are still registered, the daemon keeps running. It shuts down 
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--format <FORMAT>` | `-f` | Output format: `json`, `human`, `plain` | `json` |
+| `--format <FORMAT>` | `-f` | Output format: `human`, `json`, `plain` | `human` |
 | `--verbose` | `-v` | Increase logging verbosity (`-v` debug, `-vv` trace) | off |
 
 ### Subcommands
@@ -156,11 +169,13 @@ Initialize a project for 1up indexing. Creates `.1up/project_id` in the project 
 
 #### `1up start [PATH]`
 
-Initialize the project if needed, index the repository, and start the background daemon with file watching.
+Initialize the project if needed, index the repository, persist indexing settings, and start or refresh the background daemon.
 
-| Argument | Description | Default |
-|----------|-------------|---------|
+| Argument/Flag | Description | Default |
+|---------------|-------------|---------|
 | `PATH` | Project root directory | `.` |
+| `--jobs <N>` | Maximum concurrent parse workers | auto |
+| `--embed-threads <N>` | ONNX intra-op threads | auto |
 
 #### `1up stop [PATH]`
 
@@ -172,7 +187,7 @@ Stop the background daemon for the current project. Sends SIGTERM if no projects
 
 #### `1up status [PATH]`
 
-Show daemon running state, project ID, indexed file count, segment count, and the latest recorded indexing progress.
+Show daemon running state, project ID, indexed file count, segment count, and the latest recorded indexing progress summary.
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -208,32 +223,46 @@ Retrieve code context around a file location.
 | `--path <PATH>` | Project root directory | `.` |
 | `--expansion <N>` | Context window in lines (fallback mode) | `50` |
 
+#### `1up structural <PATTERN>`
+
+Search indexed code with tree-sitter S-expression queries. Falls back to direct filesystem scanning if no index exists.
+
+| Argument/Flag | Description | Default |
+|---------------|-------------|---------|
+| `PATTERN` | Tree-sitter query pattern | required |
+| `--language <LANG>`, `-l <LANG>` | Restrict matches to one language | unset |
+| `--path <PATH>` | Project root directory | `.` |
+
 #### `1up index [PATH]`
 
-Index a repository. Downloads the embedding model on first use and emits a final progress snapshot.
+Index a repository incrementally. Downloads the embedding model on first use and emits a final progress snapshot with work, parallelism, and timings.
 
-| Argument | Description | Default |
-|----------|-------------|---------|
+| Argument/Flag | Description | Default |
+|---------------|-------------|---------|
 | `PATH` | Directory to index | `.` |
+| `--jobs <N>` | Maximum concurrent parse workers | auto |
+| `--embed-threads <N>` | ONNX intra-op threads | auto |
 
 #### `1up reindex [PATH]`
 
-Force a full re-index by rebuilding the local schema-v5 search index from scratch. Use this to adopt the rewrite or recover from stale v4 / partial v5 indexes.
+Force a full re-index by rebuilding the local search index from scratch. Use this to adopt the rewrite or recover from stale or partial indexes.
 
-| Argument | Description | Default |
-|----------|-------------|---------|
+| Argument/Flag | Description | Default |
+|---------------|-------------|---------|
 | `PATH` | Directory to re-index | `.` |
+| `--jobs <N>` | Maximum concurrent parse workers | auto |
+| `--embed-threads <N>` | ONNX intra-op threads | auto |
 
 ## Output Formats
 
-JSON is the default format, designed for machine consumption:
+Human-readable output is the CLI default. Use JSON when scripting:
 
 ```sh
-# JSON (default)
+# Human-readable (default)
 1up symbol parse_config
 
-# Human-readable with colors
-1up symbol parse_config -f human
+# JSON for scripts
+1up symbol parse_config -f json
 
 # Plain text (no colors, no JSON)
 1up symbol parse_config -f plain

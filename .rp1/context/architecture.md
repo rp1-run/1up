@@ -9,20 +9,28 @@
 ```mermaid
 graph TB
     User[User] -->|invokes| CLI[CLI Layer<br/>clap subcommands]
+    CLI -->|resolve config| Config[Indexing Config<br/>flags -> env -> registry -> auto]
     CLI -->|start/stop| Daemon[Daemon Worker<br/>background process]
-    CLI -->|index/reindex| Pipeline[Indexing Pipeline]
+    CLI -->|index/reindex| Pipeline[Staged Indexing Orchestrator<br/>pipeline::run_with_config]
     CLI -->|search/query| Search[Search Engine]
 
     Daemon -->|file events| Watcher[File Watcher<br/>notify crate]
     Daemon -->|re-index| Pipeline
     Daemon -->|SIGHUP/SIGTERM| Lifecycle[Lifecycle Manager<br/>PID file + signals]
-    Daemon -->|load/reload| Registry[Project Registry<br/>projects.json]
+    Daemon -->|load/reload| Registry[Project Registry<br/>projects.json + indexing config]
+    Daemon -->|schedule runs| RunState[Per-Project Run State<br/>one active run + queued follow-up]
 
-    Pipeline -->|scan| Scanner[Scanner<br/>ignore crate]
-    Pipeline -->|parse| Parser[Tree-sitter<br/>16 languages]
-    Pipeline -->|chunk| Chunker[Text Chunker]
-    Pipeline -->|embed| Embedder[ONNX Runtime<br/>all-MiniLM-L6-v2]
-    Pipeline -->|store| DB[(libSQL<br/>.1up/index.db)]
+    Config --> Pipeline
+    Registry --> Config
+    RunState --> Pipeline
+
+    Pipeline -->|scan + hash preload| Scanner[Scanner<br/>ignore crate]
+    Pipeline -->|bounded parse| Parser[Parse Worker Pool<br/>spawn_blocking x jobs]
+    Parser -->|ordered flush| Reorder[Deterministic Reorder Buffer]
+    Reorder -->|fallback chunking| Chunker[Text Chunker]
+    Reorder -->|embed batches| Embedder[Single Embed Session<br/>ONNX Runtime]
+    Embedder -->|single writer| Writer[Transactional Writer<br/>batch replace]
+    Writer --> DB[(libSQL<br/>.1up/index.db)]
 
     Search -->|vector search| DB
     Search -->|FTS5 match| DB
@@ -37,6 +45,8 @@ graph TB
     style Embedder fill:#FFB347,color:#fff
 ```
 
+CLI and daemon runs converge on the same `IndexingConfig` resolution path before entering `pipeline::run_with_config`. Only file-local parse work fans out; embeddings stay in one ONNX session and all database mutation flows through a single transactional writer so replacement semantics remain deterministic.
+
 ## Architectural Patterns
 
 ### Two-Process Model
@@ -44,6 +54,9 @@ CLI process (per-invocation) and detached daemon worker (background) share no ru
 
 ### Layered Architecture
 Clear separation: CLI (presentation) -> Indexer/Search (processing) -> Storage (persistence), with daemon as a parallel entry point into the same pipeline.
+
+### Staged Single-Writer Pipeline
+Indexing is split into scan, delete cleanup, bounded parse, embed, and write phases. Parse workers run concurrently, but completed files are reordered by sequence ID before any storage mutation so one writer owns all segment replacement work.
 
 ### Incremental Processing
 SHA-256 file hashing in pipeline; skip if hash unchanged; deleted file detection via set difference.
@@ -53,6 +66,9 @@ Embedder is `Optional<&mut Embedder>`; missing model degrades to FTS-only; `SqlV
 
 ### Schema-Gated Access
 `schema::ensure_current()` validates version + required objects before any read/write; stale schemas require explicit `1up reindex`.
+
+### Shared Config Resolution
+Indexing settings resolve in one chain: CLI flags -> environment variables -> persisted registry config -> automatic defaults. Manual and daemon-triggered runs therefore share the same concurrency model.
 
 ## Layer Details
 
@@ -69,11 +85,14 @@ Embedder is `Optional<&mut Embedder>`; missing model degrades to FTS-only; `SqlV
 
 ### Indexing Pipeline
 ```
-Scanner walks directory (ignore crate, .gitignore-aware)
-  -> For each file: read content, compute SHA-256 hash, skip if unchanged
-  -> Route to tree-sitter parser (structural) or text chunker by extension
-  -> Optionally generate 384-dim embeddings via ONNX
-  -> Store segments in libSQL via INSERT OR REPLACE in transaction
+Resolve indexing config and initialize progress snapshot
+  -> Scan directory (ignore crate, .gitignore-aware) and preload stored file hashes
+  -> Delete segments for removed files before new work begins
+  -> Dispatch changed files to a bounded `spawn_blocking` parse pool with sequence IDs
+  -> Reorder completed parse results before flush to preserve deterministic file ordering
+  -> Generate embeddings in batches through one ONNX session when available
+  -> Replace file segments through single-writer transactional batch helpers
+  -> Persist final progress with work counters, parallelism, and stage timings
 ```
 
 ### Search Query
@@ -87,17 +106,21 @@ Parse query text -> detect intent (DEFINITION, FLOW, USAGE, DOCS, GENERAL)
 
 ### Daemon File Watch Loop
 ```
-Worker loads project registry, watches directories via notify crate
+Worker loads project registry and persisted indexing settings, then watches directories
   -> tokio::select! multiplexes: SIGHUP (reload), SIGTERM (shutdown), timer (drain events)
-  -> On file change: filter paths, identify owning project, run indexing pipeline
-  -> On SIGHUP: reload registry, add/remove watched directories
+  -> Drain + filter changed paths and mark each owning project dirty
+  -> If project idle: start one indexing run with resolved config
+  -> If changes arrive during a run: accumulate them and queue one follow-up pass
+  -> After each run: rerun once if still dirty, otherwise return to idle
+  -> On SIGHUP: reload registry, add/remove watchers, refresh indexing settings
   -> On SIGTERM: unwatch all, clean up PID file, exit
 ```
 
 ### Daemon Lifecycle
 ```
-CLI `start` or auto-start registers project in projects.json
-  -> Spawns detached `1up __worker` child process (setsid for session leader)
+CLI `start` or auto-start registers project in projects.json with optional indexing settings
+  -> If worker already runs: send SIGHUP so it reloads project list and settings
+  -> Else spawn detached `1up __worker` child process (setsid for session leader)
   -> Worker writes PID file, enters event loop
   -> CLI `stop` deregisters project; sends SIGTERM if no projects remain, SIGHUP otherwise
   -> Stale PID files detected and cleaned on next startup
