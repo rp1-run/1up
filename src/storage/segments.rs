@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use libsql::Connection;
 
 use crate::shared::errors::{OneupError, StorageError};
@@ -73,6 +75,14 @@ pub struct SegmentInsert {
     pub referenced_symbols: String,
     pub called_symbols: String,
     pub file_hash: String,
+}
+
+/// Parameters for replacing one file's indexed contents inside a batch transaction.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct FileSegmentBatch<'a> {
+    pub file_path: &'a str,
+    pub segments: &'a [SegmentInsert],
 }
 
 /// Insert or replace a segment in the database.
@@ -158,6 +168,32 @@ pub async fn get_segment_by_id(
     }
 }
 
+/// Get the stored file hash for every indexed file path.
+#[allow(dead_code)]
+pub async fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_ALL_FILE_HASHES, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("query all file hashes failed: {e}")))?;
+
+    let mut hashes = HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let file_path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        let file_hash: String = row
+            .get(1)
+            .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?;
+        hashes.insert(file_path, file_hash);
+    }
+
+    Ok(hashes)
+}
+
 /// Delete all segments for a given file path.
 pub async fn delete_segments_by_file(
     conn: &Connection,
@@ -194,6 +230,51 @@ pub async fn get_file_hash(
         }
         None => Ok(None),
     }
+}
+
+/// Replace all stored segments for a single file in one transaction.
+#[allow(dead_code)]
+pub async fn replace_file_segments_tx(
+    conn: &Connection,
+    file_path: &str,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    validate_replace_segments(file_path, segments)?;
+
+    let tx = conn.transaction().await.map_err(|e| {
+        StorageError::Transaction(format!("begin file replace transaction failed: {e}"))
+    })?;
+
+    replace_file_segments_in_transaction(&tx, file_path, segments).await?;
+
+    tx.commit().await.map_err(|e| {
+        StorageError::Transaction(format!("commit file replace transaction failed: {e}"))
+    })?;
+
+    Ok(())
+}
+
+/// Replace stored segments for multiple files in one transaction.
+#[allow(dead_code)]
+pub async fn replace_file_batch_tx(
+    conn: &Connection,
+    batches: &[FileSegmentBatch<'_>],
+) -> Result<(), OneupError> {
+    validate_replace_batches(batches)?;
+
+    let tx = conn.transaction().await.map_err(|e| {
+        StorageError::Transaction(format!("begin file batch replace transaction failed: {e}"))
+    })?;
+
+    for batch in batches {
+        replace_file_segments_in_transaction(&tx, batch.file_path, batch.segments).await?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        StorageError::Transaction(format!("commit file batch replace transaction failed: {e}"))
+    })?;
+
+    Ok(())
 }
 
 /// Get all distinct file paths stored in the segments table.
@@ -324,6 +405,58 @@ pub async fn count_files(conn: &Connection) -> Result<u64, OneupError> {
         }
         None => Ok(0),
     }
+}
+
+#[allow(dead_code)]
+fn validate_replace_segments(
+    file_path: &str,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    for segment in segments {
+        if segment.file_path != file_path {
+            return Err(StorageError::Transaction(format!(
+                "replace transaction for '{file_path}' received segment '{}' for '{}'",
+                segment.id, segment.file_path
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_replace_batches(batches: &[FileSegmentBatch<'_>]) -> Result<(), OneupError> {
+    let mut seen_paths = HashSet::new();
+
+    for batch in batches {
+        if !seen_paths.insert(batch.file_path) {
+            return Err(StorageError::Transaction(format!(
+                "batch replace received duplicate file path '{}'",
+                batch.file_path
+            ))
+            .into());
+        }
+
+        validate_replace_segments(batch.file_path, batch.segments)?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn replace_file_segments_in_transaction(
+    conn: &Connection,
+    file_path: &str,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    delete_segments_by_file(conn, file_path).await?;
+
+    for segment in segments {
+        upsert_segment(conn, segment).await?;
+    }
+
+    Ok(())
 }
 
 pub fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupError> {
@@ -517,6 +650,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_file_hashes_are_preloaded_once_per_file() {
+        let (_db, conn) = setup().await;
+
+        upsert_segment(&conn, &test_segment("s1", "src/a.rs", "hash-a"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("s2", "src/a.rs", "hash-a"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("s3", "src/b.rs", "hash-b"))
+            .await
+            .unwrap();
+
+        let hashes = get_all_file_hashes(&conn).await.unwrap();
+
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes.get("src/a.rs"), Some(&"hash-a".to_string()));
+        assert_eq!(hashes.get("src/b.rs"), Some(&"hash-b".to_string()));
+    }
+
+    #[tokio::test]
     async fn meta_crud() {
         let (_db, conn) = setup().await;
 
@@ -655,5 +809,83 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let vector_count: i64 = row.get(0).unwrap();
         assert_eq!(vector_count, 0);
+    }
+
+    #[tokio::test]
+    async fn replace_file_segments_tx_replaces_one_file_without_touching_others() {
+        let (_db, conn) = setup().await;
+
+        upsert_segment(&conn, &test_segment("old_a_1", "src/a.rs", "old-a"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("old_a_2", "src/a.rs", "old-a"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("old_b_1", "src/b.rs", "old-b"))
+            .await
+            .unwrap();
+
+        let replacement = [
+            test_segment("new_a_1", "src/a.rs", "new-a"),
+            test_segment("new_a_2", "src/a.rs", "new-a"),
+        ];
+
+        replace_file_segments_tx(&conn, "src/a.rs", &replacement)
+            .await
+            .unwrap();
+
+        let file_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
+        let file_b = get_segments_by_file(&conn, "src/b.rs").await.unwrap();
+
+        let file_a_ids: Vec<&str> = file_a.iter().map(|segment| segment.id.as_str()).collect();
+        assert_eq!(file_a_ids, vec!["new_a_1", "new_a_2"]);
+        assert!(file_a.iter().all(|segment| segment.file_hash == "new-a"));
+        assert_eq!(file_b.len(), 1);
+        assert_eq!(file_b[0].id, "old_b_1");
+        assert_eq!(file_b[0].file_hash, "old-b");
+    }
+
+    #[tokio::test]
+    async fn replace_file_batch_tx_rolls_back_all_files_on_failure() {
+        let (_db, conn) = setup().await;
+
+        upsert_segment(&conn, &test_segment("old_a_1", "src/a.rs", "old-a"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("old_b_1", "src/b.rs", "old-b"))
+            .await
+            .unwrap();
+
+        let replacement_a = [test_segment("new_a_1", "src/a.rs", "new-a")];
+        let mut replacement_b = test_segment("new_b_1", "src/b.rs", "new-b");
+        replacement_b.embedding_vec = Some("not-a-vector".to_string());
+        let replacement_b = [replacement_b];
+
+        let result = replace_file_batch_tx(
+            &conn,
+            &[
+                FileSegmentBatch {
+                    file_path: "src/a.rs",
+                    segments: &replacement_a,
+                },
+                FileSegmentBatch {
+                    file_path: "src/b.rs",
+                    segments: &replacement_b,
+                },
+            ],
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let file_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
+        let file_b = get_segments_by_file(&conn, "src/b.rs").await.unwrap();
+
+        assert_eq!(file_a.len(), 1);
+        assert_eq!(file_a[0].id, "old_a_1");
+        assert_eq!(file_a[0].file_hash, "old-a");
+        assert_eq!(file_b.len(), 1);
+        assert_eq!(file_b[0].id, "old_b_1");
+        assert_eq!(file_b[0].file_hash, "old-b");
     }
 }
