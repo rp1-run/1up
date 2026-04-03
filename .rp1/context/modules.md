@@ -39,50 +39,50 @@
 **Dependencies**: storage, indexer (parser, scanner), shared
 
 ### Indexer (`src/indexer/`)
-**Purpose**: File scanning, parsing (tree-sitter), text chunking, embedding generation, and pipeline orchestration
+**Purpose**: Bounded staged indexing: scan, parse, embed, and single-writer persistence
 **Files**: 6 | **Lines**: ~4,143
 
 **Components**:
-- **Pipeline** (`pipeline.rs`): Orchestrates scan -> hash-check -> parse/chunk -> embed -> store; SHA-256 incremental change detection; progress reporting
+- **Pipeline** (`pipeline.rs`): Config-aware orchestrator with hash preload, deleted-file cleanup, bounded `spawn_blocking` parse workers, deterministic reorder buffer, batched embedding, transactional file replacement, and persisted progress/timing snapshots
 - **Parser** (`parser.rs`): Multi-language AST parsing via tree-sitter; 16 language grammars; role classification and symbol collection
-- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with auto-download, batch inference, mean pooling, L2 normalization
+- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with auto-download, configurable intra-op threads, batch inference, mean pooling, L2 normalization
 - **Scanner** (`scanner.rs`): Directory walking via ignore crate with .gitignore respect and binary filtering
-- **Chunker** (`chunker.rs`): Sliding-window text chunking (60-line window, 10-line overlap) for unsupported languages
+- **Chunker** (`chunker.rs`): Sliding-window text chunking (60-line window, 10-line overlap) for unsupported languages flushed through the same staged pipeline
 
 **Dependencies**: storage, shared
 
 ### Storage (`src/storage/`)
-**Purpose**: Database access layer using libSQL with FTS5 and vector indexing
+**Purpose**: Database access layer using libSQL with FTS5, vector indexing, and transactional file replacement helpers
 **Files**: 5 | **Lines**: ~1,233
 
 **Components**:
 - **Db** (`db.rs`): Database connection wrapper with `open_rw`/`open_ro`/`open_memory` constructors, lock retry
-- **Schema** (`schema.rs`): Schema-v5 initialization, validation, and rebuild with recovery guidance
-- **Segments** (`segments.rs`): Segment CRUD, file-hash lookups, meta helpers
-- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, meta, and vector retrieval
+- **Schema** (`schema.rs`): Schema initialization, validation, and rebuild with recovery guidance
+- **Segments** (`segments.rs`): Segment CRUD, bulk file-hash preload, deleted-file cleanup, and single-file or multi-file transactional replacement helpers
+- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, meta, bulk hash preload, and vector retrieval
 
 **Dependencies**: shared
 
 ### Daemon (`src/daemon/`)
-**Purpose**: Background daemon for file watching and incremental re-indexing
+**Purpose**: Background daemon for file watching, non-overlapping incremental re-indexing, and persisted per-project indexing settings
 **Files**: 5 | **Lines**: ~783
 
 **Components**:
-- **Worker** (`worker.rs`): Main event loop with `tokio::select!` multiplexing signals and events
+- **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project run state, burst-collapsing follow-up scheduling, and shared config resolution before dispatch into `run_with_config`
 - **Lifecycle** (`lifecycle.rs`): Start/stop/ensure daemon with PID management and stale detection
-- **Watcher** (`watcher.rs`): Filesystem event monitoring via notify crate with debounce
-- **Registry** (`registry.rs`): Project registration and JSON-based project list management
+- **Watcher** (`watcher.rs`): Filesystem event monitoring via notify crate with debounce and non-blocking drain support
+- **Registry** (`registry.rs`): Project registration plus optional persisted `IndexingConfig` in the JSON-based project list
 
 **Dependencies**: indexer, storage, shared
 
 ### Shared (`src/shared/`)
-**Purpose**: Cross-cutting types, configuration, constants, error types, and project utilities
+**Purpose**: Cross-cutting types, config resolution, constants, error types, and project utilities
 **Files**: 6 | **Lines**: ~498
 
 **Components**:
-- **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, OutputFormat, SegmentRole
-- **Config** (`config.rs`): XDG-compliant paths for config, data, models, PID file
-- **Constants** (`constants.rs`): Tuning constants (embedding dims, batch sizes, search limits)
+- **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, `IndexingConfig`, `IndexProgress`, `IndexParallelism`, `IndexStageTimings`, OutputFormat, SegmentRole
+- **Config** (`config.rs`): XDG-compliant paths plus indexing config resolution across CLI flags, env vars, registry values, and defaults
+- **Constants** (`constants.rs`): Tuning constants, watcher debounce, env var names, and embedding/search limits
 - **Errors** (`errors.rs`): OneupError hierarchy with thiserror derives
 - **Project** (`project.rs`): Project identity (UUID) and database path resolution
 
@@ -139,7 +139,7 @@ graph TD
 - **Graceful Degradation**: Missing embedder degrades hybrid search to FTS-only with user warnings
 - **Schema Versioning**: Storage validates schema on read/write; mismatches direct to `1up reindex`
 - **Auto-Start Daemon**: Search commands auto-start daemon via `lifecycle::ensure_daemon()` if project initialized
-- **Dual Parse Strategy**: Tree-sitter structural parsing (16 langs) or sliding-window chunking by language support
+- **Staged Pipeline**: Bounded parse concurrency, deterministic reorder, single embed session, and transactional single-writer storage
 
 ## External Dependencies
 
