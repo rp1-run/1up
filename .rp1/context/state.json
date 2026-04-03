@@ -1,0 +1,14 @@
+{
+  "strategy": "parallel-map-reduce",
+  "repo_type": "single-project",
+  "monorepo_projects": [],
+  "generated_at": "2026-04-03T00:00:00Z",
+  "git_commit": "6bc4d4d37c28076ff750bd51aac1ee9379aa3858",
+  "files_analyzed": 62,
+  "languages": ["Rust", "Shell", "Markdown"],
+  "metrics": {
+    "modules": 8,
+    "components": 32,
+    "concepts": 14
+  }
+}

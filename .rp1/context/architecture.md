@@ -1,109 +1,126 @@
-# Architecture
+# System Architecture
 
-## Process Model
+**Project**: 1up
+**Architecture Pattern**: Layered + Two-Process Model
+**Last Updated**: 2026-04-03
 
-Two process types share no runtime state:
+## High-Level Architecture
 
-1. **CLI process** (per invocation): Parses args via clap, opens libSQL database, runs query/command, outputs results, exits. Read-only DB access for queries; read-write for indexing commands.
+```mermaid
+graph TB
+    User[User] -->|invokes| CLI[CLI Layer<br/>clap subcommands]
+    CLI -->|start/stop| Daemon[Daemon Worker<br/>background process]
+    CLI -->|index/reindex| Pipeline[Indexing Pipeline]
+    CLI -->|search/query| Search[Search Engine]
 
-2. **Daemon process** (background): Spawned as a detached child via `1up __worker`. Watches registered projects for file changes using the `notify` crate, runs incremental re-indexing through the same pipeline code. Manages lifecycle via PID file and Unix signals.
+    Daemon -->|file events| Watcher[File Watcher<br/>notify crate]
+    Daemon -->|re-index| Pipeline
+    Daemon -->|SIGHUP/SIGTERM| Lifecycle[Lifecycle Manager<br/>PID file + signals]
+    Daemon -->|load/reload| Registry[Project Registry<br/>projects.json]
 
-Communication between CLI and daemon is exclusively through:
-- The libSQL database (shared storage)
-- The PID file (`~/.local/share/1up/daemon.pid`)
-- The project registry (`~/.local/share/1up/projects.json`)
-- Unix signals (SIGHUP for reload, SIGTERM for shutdown)
+    Pipeline -->|scan| Scanner[Scanner<br/>ignore crate]
+    Pipeline -->|parse| Parser[Tree-sitter<br/>16 languages]
+    Pipeline -->|chunk| Chunker[Text Chunker]
+    Pipeline -->|embed| Embedder[ONNX Runtime<br/>all-MiniLM-L6-v2]
+    Pipeline -->|store| DB[(libSQL<br/>.1up/index.db)]
 
-## Daemon Lifecycle
+    Search -->|vector search| DB
+    Search -->|FTS5 match| DB
+    Search -->|embed query| Embedder
 
-1. **Start**: `1up start` or auto-start on first query registers the project, spawns `1up __worker`, writes PID file.
-2. **Reload**: SIGHUP causes the worker to reload the project registry and update watched directories.
-3. **Stop**: `1up stop` deregisters the project. SIGTERM if no projects remain; SIGHUP otherwise.
-4. **No idle timeout**: Daemon runs indefinitely until explicitly stopped via `1up stop` or SIGTERM.
-5. **Crash recovery**: Stale PID files detected and cleaned on startup.
+    Scanner -->|walks| FS[Project Files]
+    Watcher -->|monitors| FS
 
-## Data Flow: Indexing Pipeline
-
-```
-Scanner (ignore crate, .gitignore-aware)
-  -> Read file, compute SHA-256 hash
-  -> Skip if hash unchanged (incremental)
-  -> Language supported? 
-     Yes -> Tree-sitter parse -> extract segments, symbols, complexity
-     No  -> Text chunker (sliding window with overlap)
-  -> Embedder (ONNX batch inference, 384-dim vectors)
-  -> Store in libSQL (INSERT OR REPLACE in transaction)
-```
-
-Deleted files have their segments removed. The scanner uses the `ignore` crate (same library powering ripgrep) for .gitignore respect.
-
-## Data Flow: Search
-
-```
-Query text
-  -> Intent detection (DEFINITION, FLOW, USAGE, DOCS, GENERAL)
-  -> Symbol lookup candidates (definitions/usages)
-  -> Generate query embedding when the ONNX model is available
-  -> RetrievalBackend::select(...)
-     -> SqlVectorV2 when query embeddings exist and indexed rows have `embedding_vec`
-        -> serialize embedding -> `vector(?)`
-        -> `vector_top_k('idx_segments_embedding', vector(?), ?)`
-        -> hydrate rows by joining `v.id` back to `segments.rowid`
-     -> FtsOnly otherwise
-        -> `segments_fts MATCH ?`
-  -> If SqlVectorV2 fails, warn and rerun this invocation as FtsOnly
-  -> RRF fusion with intent-based boosting
-  -> Dedup, per-file caps, penalties (test/doc/short segments)
-  -> Return ranked results
+    style CLI fill:#4A90D9,color:#fff
+    style Daemon fill:#D94A4A,color:#fff
+    style DB fill:#50C878,color:#fff
+    style Embedder fill:#FFB347,color:#fff
 ```
 
-Search requires a current schema-v5 index. Missing, stale, or partial local indexes fail closed with explicit `1up reindex` guidance. Missing models, model load failures, and vector-query failures degrade only the current invocation to `FtsOnly` with warnings.
+## Architectural Patterns
 
-## Storage Schema
+### Two-Process Model
+CLI process (per-invocation) and detached daemon worker (background) share no runtime state. Communication is exclusively through the libSQL database, PID file, project registry (JSON), and Unix signals (SIGHUP/SIGTERM).
 
-Single libSQL database per project at `.1up/index.db`:
+### Layered Architecture
+Clear separation: CLI (presentation) -> Indexer/Search (processing) -> Storage (persistence), with daemon as a parallel entry point into the same pipeline.
 
-- **segments**: Main table with file_path, language, block_type, content, line_start/end, nullable `embedding_vec FLOAT32(384)`, breadcrumb, complexity, role, symbol JSON columns, and file_hash
-- **idx_segments_embedding**: Native vector index over `segments.embedding_vec`, queried with `vector_top_k(...)`
-- **segments_fts**: FTS5 virtual table over segment content, kept in sync with insert/update/delete triggers and joined back to `segments` by rowid
-- **meta**: Key-value store containing `schema_version`; `schema::ensure_current()` treats that value plus required objects as the read gate
+### Incremental Processing
+SHA-256 file hashing in pipeline; skip if hash unchanged; deleted file detection via set difference.
 
-Schema v5 is a clean-break format. Pre-rewrite, stale, missing, or partial indexes are unsupported until `1up reindex` rebuilds `segments`, `segments_fts`, and the vector index from scratch.
+### Graceful Degradation
+Embedder is `Optional<&mut Embedder>`; missing model degrades to FTS-only; `SqlVectorV2` falls back to `FtsOnly` on failure.
 
-## Storage Layout
+### Schema-Gated Access
+`schema::ensure_current()` validates version + required objects before any read/write; stale schemas require explicit `1up reindex`.
 
+## Layer Details
+
+| Layer | Purpose | Key Files |
+|-------|---------|-----------|
+| CLI | User-facing command parsing and output formatting | `src/main.rs`, `src/cli/` |
+| Daemon | Background file watching, registry management, auto re-indexing | `src/daemon/` |
+| Indexer | File scanning, parsing, chunking, embedding, pipeline orchestration | `src/indexer/` |
+| Search | Query execution, intent detection, RRF fusion, result ranking | `src/search/` |
+| Storage | Database lifecycle, schema management, segment CRUD, queries | `src/storage/` |
+| Shared | Cross-cutting: config paths, constants, error types, data types | `src/shared/` |
+
+## Data Flows
+
+### Indexing Pipeline
 ```
-~/.config/1up/                  # XDG config (reserved)
-~/.local/share/1up/             # XDG data
-  daemon.pid
-  projects.json
-  models/all-MiniLM-L6-v2/     # ONNX model + tokenizer (auto-downloaded)
-
-<project>/.1up/
-  project_id                    # UUID
-  index.db                     # libSQL database
+Scanner walks directory (ignore crate, .gitignore-aware)
+  -> For each file: read content, compute SHA-256 hash, skip if unchanged
+  -> Route to tree-sitter parser (structural) or text chunker by extension
+  -> Optionally generate 384-dim embeddings via ONNX
+  -> Store segments in libSQL via INSERT OR REPLACE in transaction
 ```
 
-## Technology Stack
+### Search Query
+```
+Parse query text -> detect intent (DEFINITION, FLOW, USAGE, DOCS, GENERAL)
+  -> Lookup symbol candidates (definitions/usages)
+  -> Generate query embedding if ONNX model available
+  -> Select retrieval backend: SqlVectorV2 (vector) or FtsOnly (full-text)
+  -> RRF fusion with intent-based boosting, dedup, per-file caps, penalties
+```
 
-| Component | Crate |
-|-----------|-------|
-| Async runtime | `tokio` |
-| CLI | `clap` (derive) |
-| Database | `libsql` |
-| Tree-sitter | `tree-sitter` + 9 language grammar crates |
-| ONNX inference | `ort` |
-| Tokenizer | `tokenizers` |
-| File watching | `notify` |
-| File scanning | `ignore` |
-| Serialization | `serde`, `serde_json` |
-| Error handling | `thiserror`, `anyhow` |
-| HTTP | `reqwest` (model download) |
-| Hashing | `sha2` |
-| Terminal output | `colored` |
-| UUID | `uuid` |
-| XDG paths | `dirs` |
-| Progress bars | `indicatif` |
-| Logging | `tracing`, `tracing-subscriber` |
-| Process/signal | `nix` |
-| Timestamps | `chrono` |
+### Daemon File Watch Loop
+```
+Worker loads project registry, watches directories via notify crate
+  -> tokio::select! multiplexes: SIGHUP (reload), SIGTERM (shutdown), timer (drain events)
+  -> On file change: filter paths, identify owning project, run indexing pipeline
+  -> On SIGHUP: reload registry, add/remove watched directories
+  -> On SIGTERM: unwatch all, clean up PID file, exit
+```
+
+### Daemon Lifecycle
+```
+CLI `start` or auto-start registers project in projects.json
+  -> Spawns detached `1up __worker` child process (setsid for session leader)
+  -> Worker writes PID file, enters event loop
+  -> CLI `stop` deregisters project; sends SIGTERM if no projects remain, SIGHUP otherwise
+  -> Stale PID files detected and cleaned on next startup
+```
+
+## Integration Points
+
+| Integration | Purpose | Type |
+|-------------|---------|------|
+| libSQL (Turso) | Segment storage, FTS5 search, native vector search | Embedded database |
+| ONNX Runtime (ort) | Local ML inference for 384-dim sentence embeddings | Embedded inference |
+| Tree-sitter | Multi-language AST parsing (16 language grammars compiled in) | Compiled-in library |
+
+## State Management
+
+- **PID file**: `~/.local/share/1up/daemon.pid`
+- **Project registry**: `~/.local/share/1up/projects.json`
+- **Per-project DB**: `<project>/.1up/index.db`
+- **Model cache**: `~/.local/share/1up/models/`
+
+## Deployment
+
+- **Type**: Single binary CLI
+- **Environment**: Local developer machine (macOS/Linux)
+- **Distribution**: `cargo build --release`, installed to `~/.local/bin/1up` with codesign on macOS
+- **Installation**: `just install` (builds release, copies to `~/.local/bin`, codesigns)
