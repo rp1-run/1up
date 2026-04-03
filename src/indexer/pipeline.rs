@@ -1041,6 +1041,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_progress_reports_embed_threads_when_embeddings_enabled() {
+        if !crate::indexer::embedder::is_model_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 2, 1).unwrap();
+        let model_dir = crate::shared::config::model_dir().unwrap();
+        let mut embedder =
+            Embedder::from_dir_with_threads(&model_dir, config.embed_threads).unwrap();
+
+        let stats = run_with_config(&conn, tmp.path(), Some(&mut embedder), &config)
+            .await
+            .unwrap();
+
+        assert!(stats.embeddings_generated);
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().jobs_configured,
+            config.jobs
+        );
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().jobs_effective,
+            1
+        );
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().embed_threads,
+            config.embed_threads
+        );
+
+        let progress_path = index_progress_path(tmp.path());
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
+        assert_eq!(persisted["parallelism"]["embed_threads"], 2);
+    }
+
+    #[tokio::test]
     async fn empty_directory_produces_no_segments() {
         let tmp = tempfile::tempdir().unwrap();
 

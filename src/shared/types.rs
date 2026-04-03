@@ -366,3 +366,32 @@ impl std::str::FromStr for OutputFormat {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::constants::MAX_AUTO_EMBED_THREADS;
+
+    #[test]
+    fn default_embed_threads_cap_auto_parallelism() {
+        assert_eq!(IndexingConfig::default_embed_threads_for(1), 1);
+        assert_eq!(
+            IndexingConfig::default_embed_threads_for(MAX_AUTO_EMBED_THREADS + 8),
+            MAX_AUTO_EMBED_THREADS
+        );
+    }
+
+    #[test]
+    fn reporting_parallelism_caps_effective_jobs_and_hides_disabled_embeddings() {
+        let config = IndexingConfig::new(6, 4, 1).unwrap();
+
+        let without_embeddings = config.reporting_parallelism(2, false);
+        assert_eq!(without_embeddings.jobs_configured, 6);
+        assert_eq!(without_embeddings.jobs_effective, 2);
+        assert_eq!(without_embeddings.embed_threads, 0);
+
+        let with_embeddings = config.reporting_parallelism(2, true);
+        assert_eq!(with_embeddings.jobs_effective, 2);
+        assert_eq!(with_embeddings.embed_threads, 4);
+    }
+}

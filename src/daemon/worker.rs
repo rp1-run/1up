@@ -420,6 +420,64 @@ mod tests {
     }
 
     #[test]
+    fn mark_changed_projects_only_queues_matching_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha_root = tmp.path().join("alpha");
+        let beta_root = tmp.path().join("beta");
+        std::fs::create_dir_all(alpha_root.join("src")).unwrap();
+        std::fs::create_dir_all(beta_root.join("src")).unwrap();
+
+        let alpha_db = Db::open_memory();
+        let beta_db = Db::open_memory();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let alpha_db = runtime.block_on(alpha_db).unwrap();
+        let beta_db = runtime.block_on(beta_db).unwrap();
+
+        let mut projects = HashMap::new();
+        projects.insert(
+            alpha_root.clone(),
+            ProjectState {
+                project_root: alpha_root.clone(),
+                db: alpha_db,
+                indexing: None,
+                run_state: ProjectRunState {
+                    running: true,
+                    dirty: false,
+                    pending_change_count: 0,
+                },
+            },
+        );
+        projects.insert(
+            beta_root.clone(),
+            ProjectState {
+                project_root: beta_root.clone(),
+                db: beta_db,
+                indexing: None,
+                run_state: ProjectRunState::default(),
+            },
+        );
+
+        let changed_paths = vec![
+            alpha_root.join("src").join("lib.rs"),
+            alpha_root.join("README.md"),
+            beta_root.join("src").join("mod.rs"),
+            tmp.path().join("outside.txt"),
+        ];
+
+        mark_changed_projects(&mut projects, &changed_paths);
+
+        let alpha = &projects.get(&alpha_root).unwrap().run_state;
+        assert!(alpha.running);
+        assert!(alpha.dirty);
+        assert_eq!(alpha.pending_change_count, 2);
+
+        let beta = &projects.get(&beta_root).unwrap().run_state;
+        assert!(!beta.running);
+        assert!(beta.dirty);
+        assert_eq!(beta.pending_change_count, 1);
+    }
+
+    #[test]
     fn next_dirty_project_prefers_follow_up_root() {
         let tmp = tempfile::tempdir().unwrap();
         let alpha_root = tmp.path().join("alpha");

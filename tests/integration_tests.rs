@@ -185,6 +185,77 @@ fn init_and_index_fts_only(dir: &TempDir) -> HideModelGuard {
     guard
 }
 
+fn init_project(dir: &std::path::Path) {
+    cmd()
+        .args(["--format", "json", "init", dir.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+fn run_index_json(dir: &std::path::Path, extra_args: &[&str]) -> serde_json::Value {
+    let mut command = cmd();
+    command.arg("--format").arg("json").arg("index");
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    command.arg(dir);
+
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+
+    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
+fn lookup_symbol_json(dir: &std::path::Path, symbol: &str) -> Vec<serde_json::Value> {
+    let output = cmd()
+        .args([
+            "--format",
+            "json",
+            "symbol",
+            symbol,
+            "--path",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
+fn write_parallel_regression_fixture(dir: &std::path::Path) {
+    fs::write(
+        dir.join("changed.rs"),
+        "pub fn alpha_symbol() -> &'static str {\n    \"alpha\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("stable.rs"),
+        "pub fn stable_symbol() -> &'static str {\n    \"stable\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("removed.rs"),
+        "pub fn removed_symbol() -> &'static str {\n    \"removed\"\n}\n",
+    )
+    .unwrap();
+}
+
+fn mutate_parallel_regression_fixture(dir: &std::path::Path) {
+    fs::write(
+        dir.join("changed.rs"),
+        "pub fn beta_symbol() -> &'static str {\n    \"beta\"\n}\n",
+    )
+    .unwrap();
+    fs::remove_file(dir.join("removed.rs")).unwrap();
+    fs::write(
+        dir.join("fresh.rs"),
+        "pub fn fresh_symbol() -> &'static str {\n    \"fresh\"\n}\n",
+    )
+    .unwrap();
+}
+
 // ---------- Test fixture: index a small multi-language repository ----------
 
 #[test]
@@ -555,6 +626,70 @@ fn main() {
         serde_json::from_str(String::from_utf8(output3.stdout).unwrap().trim()).unwrap();
     assert!(!results3.is_empty(), "welcome should exist after re-index");
     assert_eq!(results3[0]["name"], "welcome");
+}
+
+#[test]
+fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
+    let _guard = HideModelGuard::new();
+    let default_repo = TempDir::new().unwrap();
+    let serial_repo = TempDir::new().unwrap();
+
+    write_parallel_regression_fixture(default_repo.path());
+    write_parallel_regression_fixture(serial_repo.path());
+
+    init_project(default_repo.path());
+    init_project(serial_repo.path());
+
+    let initial_default = run_index_json(default_repo.path(), &[]);
+    let initial_serial = run_index_json(serial_repo.path(), &["--jobs", "1"]);
+    assert_eq!(
+        initial_default["progress"]["files_indexed"],
+        initial_serial["progress"]["files_indexed"]
+    );
+
+    mutate_parallel_regression_fixture(default_repo.path());
+    mutate_parallel_regression_fixture(serial_repo.path());
+
+    let rerun_default = run_index_json(default_repo.path(), &[]);
+    let rerun_serial = run_index_json(serial_repo.path(), &["--jobs", "1"]);
+
+    for field in ["files_indexed", "files_skipped", "files_deleted"] {
+        assert_eq!(
+            rerun_default["progress"][field], rerun_serial["progress"][field],
+            "mismatched {field} after incremental re-index"
+        );
+    }
+
+    assert_eq!(rerun_default["progress"]["files_indexed"], 2);
+    assert_eq!(rerun_default["progress"]["files_skipped"], 1);
+    assert_eq!(rerun_default["progress"]["files_deleted"], 1);
+
+    assert!(lookup_symbol_json(default_repo.path(), "removed_symbol").is_empty());
+    assert!(lookup_symbol_json(serial_repo.path(), "removed_symbol").is_empty());
+    assert_eq!(
+        lookup_symbol_json(default_repo.path(), "beta_symbol").len(),
+        1
+    );
+    assert_eq!(
+        lookup_symbol_json(serial_repo.path(), "beta_symbol").len(),
+        1
+    );
+    assert_eq!(
+        lookup_symbol_json(default_repo.path(), "fresh_symbol").len(),
+        1
+    );
+    assert_eq!(
+        lookup_symbol_json(serial_repo.path(), "fresh_symbol").len(),
+        1
+    );
+    assert_eq!(
+        lookup_symbol_json(default_repo.path(), "stable_symbol").len(),
+        1
+    );
+    assert_eq!(
+        lookup_symbol_json(serial_repo.path(), "stable_symbol").len(),
+        1
+    );
 }
 
 // ---------- Daemon lifecycle test ----------
