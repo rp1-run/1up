@@ -379,6 +379,7 @@ fn bench_retrieval_backend(c: &mut Criterion) {
                     candidates.vector_results,
                     candidates.fts_results,
                     Vec::new(),
+                    &query,
                     intent,
                     10,
                 );

@@ -90,6 +90,7 @@ async fn execute_search(
         candidates.vector_results,
         candidates.fts_results,
         symbol_results,
+        query,
         intent,
         limit,
     ))

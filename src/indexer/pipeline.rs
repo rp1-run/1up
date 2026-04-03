@@ -211,15 +211,23 @@ pub async fn run(
     let pending_len = pending.len();
 
     if let Some(emb) = embedder {
-        for (file_idx, pf) in pending.iter().enumerate() {
-            let texts: Vec<&str> = pf.segments.iter().map(|s| s.content.as_str()).collect();
-            let embeddings = emb.embed_batch(&texts)?;
+        let texts: Vec<&str> = pending
+            .iter()
+            .flat_map(|pf| pf.segments.iter().map(|s| s.content.as_str()))
+            .collect();
+        let mut embeddings = emb.embed_batch(&texts)?.into_iter();
 
+        for (file_idx, pf) in pending.iter().enumerate() {
             segments::delete_segments_by_file(conn, &pf.relative_path).await?;
 
-            for (i, seg) in pf.segments.iter().enumerate() {
-                let embedding = &embeddings[i];
-                let embedding_vec = serialize_embedding(embedding)?;
+            for seg in &pf.segments {
+                let embedding = embeddings.next().ok_or_else(|| {
+                    IndexingError::Pipeline(format!(
+                        "missing embedding for {}:{}-{}",
+                        pf.relative_path, seg.line_start, seg.line_end
+                    ))
+                })?;
+                let embedding_vec = serialize_embedding(&embedding)?;
 
                 let insert = SegmentInsert {
                     id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
@@ -260,6 +268,11 @@ pub async fn run(
                 ));
             }
         }
+
+        debug_assert!(
+            embeddings.next().is_none(),
+            "unexpected trailing embeddings after pipeline run"
+        );
     } else {
         for (file_idx, pf) in pending.iter().enumerate() {
             segments::delete_segments_by_file(conn, &pf.relative_path).await?;
@@ -498,12 +511,21 @@ mod tests {
             .map(|i| format!("config_line_{i} = value"))
             .collect();
         fs::write(tmp.path().join("config.ini"), lines.join("\n")).unwrap();
+        fs::write(tmp.path().join("archive.xyz"), "opaque").unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
 
-        assert_eq!(stats.files_indexed, 0);
+        assert_eq!(stats.files_indexed, 1);
         assert_eq!(stats.files_skipped, 1);
+
+        let ini_segs = segments::get_segments_by_file(&conn, "config.ini")
+            .await
+            .unwrap();
+        assert!(
+            !ini_segs.is_empty(),
+            "ini files should now be chunk-indexed"
+        );
     }
 
     #[tokio::test]
@@ -528,12 +550,16 @@ mod tests {
         fs::write(tmp.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
         fs::write(tmp.path().join("notes.txt"), "some notes\n").unwrap();
         fs::write(tmp.path().join("config.ini"), "key=val\n").unwrap();
+        fs::write(tmp.path().join("opaque.xyz"), "blob\n").unwrap();
 
         let (_db, conn) = setup().await;
         let stats = run(&conn, tmp.path(), None).await.unwrap();
 
-        assert_eq!(stats.files_indexed, 2, "rs + txt should be indexed");
-        assert_eq!(stats.files_skipped, 1, "ini should be skipped");
+        assert_eq!(stats.files_indexed, 3, "rs + txt + ini should be indexed");
+        assert_eq!(
+            stats.files_skipped, 1,
+            "unknown extension should be skipped"
+        );
 
         let rs_segs = segments::get_segments_by_file(&conn, "lib.rs")
             .await
@@ -549,6 +575,14 @@ mod tests {
         assert!(
             txt_segs.iter().all(|s| s.block_type == "chunk"),
             "txt files should produce chunk segments"
+        );
+
+        let ini_segs = segments::get_segments_by_file(&conn, "config.ini")
+            .await
+            .unwrap();
+        assert!(
+            ini_segs.iter().all(|s| s.block_type == "chunk"),
+            "ini files should produce chunk segments"
         );
     }
 }
