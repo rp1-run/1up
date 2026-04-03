@@ -642,6 +642,30 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
 
     let initial_default = run_index_json(default_repo.path(), &[]);
     let initial_serial = run_index_json(serial_repo.path(), &["--jobs", "1"]);
+    assert!(
+        initial_default["progress"]["files_indexed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        initial_default["progress"]["segments_stored"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        initial_serial["progress"]["files_indexed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        initial_serial["progress"]["segments_stored"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert_eq!(
         initial_default["progress"]["files_indexed"],
         initial_serial["progress"]["files_indexed"]
@@ -652,6 +676,20 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
 
     let rerun_default = run_index_json(default_repo.path(), &[]);
     let rerun_serial = run_index_json(serial_repo.path(), &["--jobs", "1"]);
+    assert!(rerun_default["progress"]["files_indexed"].as_u64().unwrap() > 0);
+    assert!(
+        rerun_default["progress"]["segments_stored"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(rerun_serial["progress"]["files_indexed"].as_u64().unwrap() > 0);
+    assert!(
+        rerun_serial["progress"]["segments_stored"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 
     for field in ["files_indexed", "files_skipped", "files_deleted"] {
         assert_eq!(
