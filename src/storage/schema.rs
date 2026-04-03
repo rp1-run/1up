@@ -7,15 +7,17 @@ use crate::storage::queries;
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segments"),
+    ("table", "segment_vectors"),
     ("table", "segments_fts"),
     ("table", "meta"),
     ("index", "idx_segments_file_path"),
     ("index", "idx_segments_language"),
     ("index", "idx_segments_file_hash"),
-    ("index", "idx_segments_embedding"),
+    ("index", "idx_segment_vectors_embedding"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
+    ("trigger", "segments_vector_ad"),
 ];
 
 /// Run all DDL statements to initialize the database schema.
@@ -27,10 +29,14 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
-        queries::CREATE_INDEX_EMBEDDING_VEC,
+        queries::CREATE_SEGMENT_VECTORS_TABLE,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
+
+    conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
 
     // FTS5 virtual table and sync triggers
     conn.execute_batch(queries::CREATE_FTS_TABLE)
@@ -168,18 +174,21 @@ async fn schema_object_exists(
     }
 }
 
-async fn segments_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
+async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
     let mut rows = conn
-        .query(queries::SELECT_SEGMENTS_EMBEDDING_VEC_COLUMN, ())
+        .query(queries::SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN, ())
         .await
-        .map_err(|e| StorageError::Query(format!("failed to inspect segments columns: {e}")))?;
+        .map_err(|e| {
+            StorageError::Query(format!("failed to inspect segment_vectors columns: {e}"))
+        })?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(e) => {
-            Err(StorageError::Query(format!("segments column inspection failed: {e}")).into())
-        }
+        Err(e) => Err(StorageError::Query(format!(
+            "segment_vectors column inspection failed: {e}"
+        ))
+        .into()),
     }
 }
 
@@ -192,9 +201,9 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
         }
     }
 
-    if !segments_has_embedding_vec(conn).await? {
+    if !segment_vectors_has_embedding_vec(conn).await? {
         return Err(reindex_required(format!(
-            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segments.embedding_vec`)"
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.embedding_vec`)"
         )));
     }
 
@@ -227,11 +236,11 @@ mod tests {
             Some(SCHEMA_VERSION)
         );
         assert!(
-            schema_object_exists(&conn, "index", "idx_segments_embedding")
+            schema_object_exists(&conn, "index", "idx_segment_vectors_embedding")
                 .await
                 .unwrap()
         );
-        assert!(segments_has_embedding_vec(&conn).await.unwrap());
+        assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
         ensure_current(&conn).await.unwrap();
     }
 
@@ -251,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v5_schema() {
+    async fn ensure_current_rejects_partial_v6_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(
@@ -278,9 +287,12 @@ mod tests {
         .await
         .unwrap();
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "5"])
-            .await
-            .unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            [META_KEY_SCHEMA_VERSION, &SCHEMA_VERSION.to_string()],
+        )
+        .await
+        .unwrap();
 
         let err = ensure_current(&conn).await.unwrap_err();
         let msg = err.to_string();

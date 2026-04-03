@@ -77,12 +77,6 @@ pub struct SegmentInsert {
 
 /// Insert or replace a segment in the database.
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
-    let embedding_vec = seg
-        .embedding_vec
-        .as_ref()
-        .map(|v| libsql::Value::Text(v.clone()))
-        .unwrap_or(libsql::Value::Null);
-
     conn.execute(
         queries::UPSERT_SEGMENT,
         libsql::params![
@@ -93,7 +87,6 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
             seg.content.clone(),
             seg.line_start,
             seg.line_end,
-            embedding_vec,
             seg.breadcrumb.clone(),
             seg.complexity,
             seg.role.clone(),
@@ -105,6 +98,19 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
     )
     .await
     .map_err(|e| StorageError::Query(format!("upsert segment failed: {e}")))?;
+
+    if let Some(embedding_vec) = &seg.embedding_vec {
+        conn.execute(
+            queries::UPSERT_SEGMENT_VECTOR,
+            libsql::params![seg.id.clone(), embedding_vec.clone()],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("upsert segment vector failed: {e}")))?;
+    } else {
+        conn.execute(queries::DELETE_SEGMENT_VECTOR, [seg.id.clone()])
+            .await
+            .map_err(|e| StorageError::Query(format!("delete segment vector failed: {e}")))?;
+    }
 
     Ok(())
 }
@@ -602,7 +608,7 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT embedding_vec IS NOT NULL FROM segments WHERE id = ?1",
+                "SELECT COUNT(*) FROM segment_vectors WHERE segment_id = ?1",
                 ["seg1"],
             )
             .await
@@ -626,5 +632,28 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let legacy_column_count: i64 = row.get(0).unwrap();
         assert_eq!(legacy_column_count, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_without_embedding_removes_existing_vector() {
+        let (_db, conn) = setup().await;
+
+        let mut seg = test_segment("seg1", "src/main.rs", "abc123");
+        seg.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        upsert_segment(&conn, &seg).await.unwrap();
+
+        seg.embedding_vec = None;
+        upsert_segment(&conn, &seg).await.unwrap();
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM segment_vectors WHERE segment_id = ?1",
+                ["seg1"],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let vector_count: i64 = row.get(0).unwrap();
+        assert_eq!(vector_count, 0);
     }
 }

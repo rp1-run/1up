@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS segments (
     content TEXT NOT NULL,
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
-    embedding_vec FLOAT32(384),
     breadcrumb TEXT,
     complexity INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'DEFINITION',
@@ -28,8 +27,16 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
 
-pub const CREATE_INDEX_EMBEDDING_VEC: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segments_embedding ON segments (libsql_vector_idx(embedding_vec))";
+pub const CREATE_SEGMENT_VECTORS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS segment_vectors (
+    segment_id TEXT PRIMARY KEY,
+    embedding_vec FLOAT32(384) NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
+pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec))";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -48,6 +55,9 @@ END;
 CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_fts(segments_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS segments_vector_ad AFTER DELETE ON segments BEGIN
+    DELETE FROM segment_vectors WHERE segment_id = old.id;
 END";
 
 pub const CREATE_META_TABLE: &str = "
@@ -60,8 +70,10 @@ pub const DROP_SEARCH_SCHEMA: &str = "
 DROP TRIGGER IF EXISTS segments_ai;
 DROP TRIGGER IF EXISTS segments_ad;
 DROP TRIGGER IF EXISTS segments_au;
+DROP TRIGGER IF EXISTS segments_vector_ad;
 DROP TABLE IF EXISTS segments_fts;
-DROP INDEX IF EXISTS idx_segments_embedding;
+DROP INDEX IF EXISTS idx_segment_vectors_embedding;
+DROP TABLE IF EXISTS segment_vectors;
 DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
@@ -74,19 +86,18 @@ pub const SELECT_SCHEMA_OBJECT: &str =
 pub const SELECT_HAS_USER_TABLES: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1";
 
-pub const SELECT_SEGMENTS_EMBEDDING_VEC_COLUMN: &str =
-    "SELECT 1 FROM pragma_table_info('segments') WHERE name = 'embedding_vec' LIMIT 1";
+pub const SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN: &str =
+    "SELECT 1 FROM pragma_table_info('segment_vectors') WHERE name = 'embedding_vec' LIMIT 1";
 
-pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str =
-    "SELECT 1 FROM segments WHERE embedding_vec IS NOT NULL LIMIT 1";
+pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str = "SELECT 1 FROM segment_vectors LIMIT 1";
 
 pub const SELECT_VECTOR_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
-FROM vector_top_k('idx_segments_embedding', vector(?1), ?2) AS v
-JOIN segments AS s ON s.rowid = v.id
-WHERE s.embedding_vec IS NOT NULL";
+FROM vector_top_k('idx_segment_vectors_embedding', vector(?1), ?2) AS v
+JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN segments AS s ON s.id = sv.segment_id";
 
 pub const SELECT_FTS_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
@@ -101,15 +112,22 @@ LIMIT ?2";
 pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (
     id, file_path, language, block_type, content,
-    line_start, line_end, embedding_vec,
-    breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
+    line_start, line_end, breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
     file_hash, created_at, updated_at
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5,
-    ?6, ?7, CASE WHEN ?8 IS NULL THEN NULL ELSE vector(?8) END,
-    ?9, ?10, ?11, ?12, ?13, ?14,
-    ?15, datetime('now'), datetime('now')
+    ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+    ?14, datetime('now'), datetime('now')
 )";
+
+pub const UPSERT_SEGMENT_VECTOR: &str = "
+INSERT OR REPLACE INTO segment_vectors (
+    segment_id, embedding_vec, created_at, updated_at
+) VALUES (
+    ?1, vector(?2), datetime('now'), datetime('now')
+)";
+
+pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
 
 #[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "

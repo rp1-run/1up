@@ -139,12 +139,12 @@ fn create_stale_v4_index(dir: &Path) {
     });
 }
 
-fn create_partial_v5_index(dir: &Path) {
+fn create_partial_v6_index(dir: &Path) {
     block_on(async {
         let db = Db::open_rw(&db_path(dir)).await.unwrap();
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
-        conn.execute("DROP INDEX idx_segments_embedding", ())
+        conn.execute("DROP INDEX idx_segment_vectors_embedding", ())
             .await
             .unwrap();
     });
@@ -168,15 +168,15 @@ fn stale_schema_search_requires_explicit_reindex_guidance() {
         .failure()
         .stderr(
             predicate::str::contains("found v4")
-                .and(predicate::str::contains("expected v5"))
+                .and(predicate::str::contains("expected v6"))
                 .and(predicate::str::contains("1up reindex")),
         );
 }
 
 #[test]
-fn partial_v5_index_search_requires_explicit_reindex_guidance() {
+fn partial_v6_index_search_requires_explicit_reindex_guidance() {
     let tmp = TempDir::new().unwrap();
-    create_partial_v5_index(tmp.path());
+    create_partial_v6_index(tmp.path());
 
     cmd()
         .args([
@@ -191,7 +191,7 @@ fn partial_v5_index_search_requires_explicit_reindex_guidance() {
         .failure()
         .stderr(
             predicate::str::contains("incomplete")
-                .and(predicate::str::contains("idx_segments_embedding"))
+                .and(predicate::str::contains("idx_segment_vectors_embedding"))
                 .and(predicate::str::contains("1up reindex")),
         );
 }
@@ -208,7 +208,7 @@ fn degraded_search_warns_and_returns_results() {
 }
 
 #[test]
-fn rebuilt_v5_index_keeps_add_edit_delete_search_freshness() {
+fn rebuilt_v6_index_keeps_add_edit_delete_search_freshness() {
     let tmp = create_search_fixture();
     let _guard = index_fts_only(tmp.path());
 
