@@ -39,7 +39,7 @@ pub enum Command {
     /// Initialize a project for 1up indexing
     Init(init::InitArgs),
 
-    /// Index and start the background daemon
+    /// Initialize if needed, index, and start the background daemon
     Start(start::StartArgs),
 
     /// Stop the background daemon

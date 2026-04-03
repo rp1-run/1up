@@ -49,13 +49,13 @@ Initialize a project to create a `.1up/` directory with a project identifier:
 1up init [path]
 ```
 
-Index the repository and start the background daemon for file watching:
+Index the repository and start the background daemon for file watching. If the project has not been initialized yet, `1up start` will create `.1up/project_id` first:
 
 ```sh
 1up start [path]
 ```
 
-The daemon watches for file changes and incrementally re-indexes. If you skip `1up start`, the daemon auto-starts on the first query.
+The daemon watches for file changes and incrementally re-indexes. If you skip `1up start`, the daemon auto-starts on the first query for initialized projects.
 
 ### Search
 
@@ -156,7 +156,7 @@ Initialize a project for 1up indexing. Creates `.1up/project_id` in the project 
 
 #### `1up start [PATH]`
 
-Index the repository and start the background daemon with file watching.
+Initialize the project if needed, index the repository, and start the background daemon with file watching.
 
 | Argument | Description | Default |
 |----------|-------------|---------|

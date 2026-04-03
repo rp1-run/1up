@@ -22,14 +22,22 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
 
-    if !project::is_initialized(&project_root) {
-        anyhow::bail!(
-            "Project not initialized at {}. Run `1up init` first.",
+    let (project_id, initialized_now) = if project::is_initialized(&project_root) {
+        (project::read_project_id(&project_root)?, false)
+    } else {
+        let id = project::write_project_id(&project_root)?;
+        tracing::info!(
+            "initialized project {} at {} during start",
+            id,
             project_root.display()
         );
-    }
-
-    let project_id = project::read_project_id(&project_root)?;
+        (id, true)
+    };
+    let init_prefix = if initialized_now {
+        format!("Initialized project {project_id}. ")
+    } else {
+        String::new()
+    };
 
     if let Some(pid) = lifecycle::is_daemon_running()? {
         let mut registry = Registry::load()?;
@@ -39,7 +47,9 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             .any(|p| p.project_root == project_root);
 
         if already_registered {
-            let msg = format!("Daemon already running (pid={pid}) and project already registered.");
+            let msg = format!(
+                "{init_prefix}Daemon already running (pid={pid}) and project already registered."
+            );
             eprintln!("{}", fmt.format_message(&msg));
             return Ok(());
         }
@@ -47,7 +57,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         registry.register(&project_id, &project_root)?;
         lifecycle::send_sighup(pid)?;
         let msg = format!(
-            "Project registered. Daemon (pid={pid}) notified to watch {}.",
+            "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
             project_root.display()
         );
         println!("{}", fmt.format_message(&msg));
@@ -97,7 +107,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let pid = lifecycle::spawn_daemon(&binary)?;
 
     let msg = format!(
-        "Indexed {} files ({} segments). Daemon started (pid={pid}).",
+        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
         stats.files_indexed, stats.segments_stored,
     );
     println!("{}", fmt.format_message(&msg));
