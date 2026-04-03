@@ -109,6 +109,32 @@ fn subcommand_help_works() {
 }
 
 #[test]
+fn indexing_subcommands_expose_parallel_controls() {
+    for sub in &["index", "reindex", "start"] {
+        cmd().args([sub, "--help"]).assert().success().stdout(
+            predicate::str::contains("--jobs").and(predicate::str::contains("--embed-threads")),
+        );
+    }
+}
+
+#[test]
+fn indexing_subcommands_reject_zero_parallel_values() {
+    for sub in &["index", "reindex", "start"] {
+        cmd()
+            .args([sub, "--jobs", "0"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid value"));
+
+        cmd()
+            .args([sub, "--embed-threads", "0"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid value"));
+    }
+}
+
+#[test]
 fn format_flag_accepts_all_variants() {
     for fmt in &["json", "human", "plain"] {
         cmd().args(["--format", fmt, "--help"]).assert().success();

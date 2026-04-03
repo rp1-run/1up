@@ -2,6 +2,7 @@ use clap::Args;
 use nanospinner::Spinner;
 
 use crate::cli::output::formatter_for;
+use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{self, Embedder};
 use crate::indexer::pipeline;
 use crate::shared::config;
@@ -14,6 +15,14 @@ pub struct ReindexArgs {
     /// Directory to re-index (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Maximum concurrent parse workers; overrides ONEUP_INDEX_JOBS
+    #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
+    pub jobs: Option<usize>,
+
+    /// ONNX intra-op threads; overrides ONEUP_EMBED_THREADS
+    #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
+    pub embed_threads: Option<usize>,
 }
 
 fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
@@ -25,6 +34,12 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
+    let registry = Registry::load()?;
+    let indexing_config = config::resolve_indexing_config(
+        args.jobs,
+        args.embed_threads,
+        registry.indexing_config_for(&project_root),
+    )?;
 
     let setup_spinner = spin("Rebuilding database");
 
@@ -36,7 +51,8 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let model_spinner = spin("Loading embedding model");
 
     let mut embedder_opt = if embedder::is_model_available() {
-        match Embedder::from_dir(&config::model_dir()?) {
+        match Embedder::from_dir_with_threads(&config::model_dir()?, indexing_config.embed_threads)
+        {
             Ok(e) => {
                 model_spinner.success();
                 Some(e)
@@ -51,7 +67,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         None
     } else {
         model_spinner.update("Downloading embedding model");
-        match Embedder::new().await {
+        match Embedder::new_with_threads(indexing_config.embed_threads).await {
             Ok(e) => {
                 model_spinner.success_with("Embedding model downloaded");
                 Some(e)
@@ -63,7 +79,13 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         }
     };
 
-    let stats = pipeline::run(&conn, &project_root, embedder_opt.as_mut()).await?;
+    let stats = pipeline::run_with_config(
+        &conn,
+        &project_root,
+        embedder_opt.as_mut(),
+        &indexing_config,
+    )
+    .await?;
 
     let msg = format!(
         "Re-indexed {} files ({} segments). Clean rebuild complete.{}",
