@@ -635,7 +635,11 @@ mod tests {
 
         let mut rows = conn
             .query(
-                "SELECT file_path, embedding_vec IS NOT NULL FROM segments ORDER BY file_path, line_start",
+                "SELECT s.file_path, COUNT(v.segment_id) > 0
+                 FROM segments AS s
+                 LEFT JOIN segment_vectors AS v ON v.segment_id = s.id
+                 GROUP BY s.id, s.file_path, s.line_start
+                 ORDER BY s.file_path, s.line_start",
                 (),
             )
             .await

@@ -305,16 +305,23 @@ mod tests {
                 conn.execute(
                     "INSERT INTO segments (
                         id, file_path, language, block_type, content,
-                        line_start, line_end, embedding_vec, breadcrumb, complexity,
+                        line_start, line_end, breadcrumb, complexity,
                         role, defined_symbols, referenced_symbols, called_symbols,
                         file_hash, created_at, updated_at
                     ) VALUES (
                         ?1, ?2, 'rust', 'function', ?3,
-                        1, 3, vector(?4), NULL, 1,
+                        1, 3, NULL, 1,
                         'DEFINITION', '[]', '[]', '[]',
-                        ?5, datetime('now'), datetime('now')
+                        ?4, datetime('now'), datetime('now')
                     )",
-                    libsql::params![id, file_path, content, embedding, format!("hash-{id}")],
+                    libsql::params![id, file_path, content, format!("hash-{id}")],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO segment_vectors (segment_id, embedding_vec, created_at, updated_at)
+                     VALUES (?1, vector(?2), datetime('now'), datetime('now'))",
+                    libsql::params![id, embedding],
                 )
                 .await
                 .unwrap();
@@ -454,5 +461,44 @@ mod tests {
         assert_eq!(backend.mode(), RetrievalMode::FtsOnly);
         assert!(candidates.vector_results.is_empty());
         assert_eq!(candidates.fts_results[0].file_path, "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn vector_backend_ignores_fts_only_segments() {
+        let conn = setup().await;
+        let query_embedding = embedding_with(&[(0, 1.0)]);
+
+        insert_segment(
+            &conn,
+            "seg-vector",
+            "src/semantic.rs",
+            "fn semantic_match() -> &'static str { \"config\" }",
+            Some(&query_embedding),
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-fts-only",
+            "config/settings.ini",
+            "config = enabled\nmode = strict",
+            None,
+        )
+        .await;
+
+        let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
+            .await
+            .unwrap();
+        let candidates = backend
+            .search("config", Some(&query_embedding))
+            .await
+            .unwrap();
+
+        assert_eq!(backend.mode(), RetrievalMode::SqlVectorV2);
+        assert_eq!(candidates.vector_results.len(), 1);
+        assert_eq!(candidates.vector_results[0].file_path, "src/semantic.rs");
+        assert!(candidates
+            .fts_results
+            .iter()
+            .any(|result| result.file_path == "config/settings.ini"));
     }
 }

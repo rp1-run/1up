@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::search::intent::QueryIntent;
 use crate::shared::constants::{
@@ -131,6 +131,8 @@ fn compute_rrf_score(candidate: &ScoredCandidate, query: &str, intent: QueryInte
     score *= intent_boost(&candidate.result, query, intent);
     score *= file_path_boost(&candidate.result.file_path);
     score *= query_path_boost(query, &candidate.result.file_path);
+    score *= query_match_boost(query, &candidate.result);
+    score *= content_kind_boost(&candidate.result, intent);
     score *= short_segment_penalty(&candidate.result.content);
 
     score
@@ -222,6 +224,57 @@ fn short_segment_penalty(content: &str) -> f64 {
     }
 }
 
+fn query_match_boost(query: &str, result: &SearchResult) -> f64 {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return 1.0;
+    }
+
+    let term_set = result_term_set(result);
+    let matched_count = terms
+        .iter()
+        .filter(|term| term_set.contains(term.as_str()))
+        .count();
+
+    let mut score = 1.0 + 0.06 * matched_count.min(4) as f64;
+
+    if matched_count == terms.len() {
+        score += if terms.len() >= 3 { 0.35 } else { 0.18 };
+    } else if terms.len() >= 3 && matched_count + 1 == terms.len() {
+        score += 0.12;
+    }
+
+    if phrase_match_score(&terms, result) {
+        score += 0.22;
+    }
+
+    if is_natural_language_query(query) && terms.len() >= 3 {
+        match matched_count {
+            0 => score *= 0.75,
+            1 => score *= 0.82,
+            _ => {}
+        }
+    }
+
+    score
+}
+
+fn content_kind_boost(result: &SearchResult, intent: QueryIntent) -> f64 {
+    let lower_path = result.file_path.to_lowercase();
+    let is_markdown = result.language.eq_ignore_ascii_case("markdown")
+        || lower_path.ends_with(".md")
+        || lower_path.ends_with(".markdown");
+
+    if is_markdown {
+        match intent {
+            QueryIntent::Docs => 1.15,
+            _ => 0.72,
+        }
+    } else {
+        1.0
+    }
+}
+
 fn query_path_boost(query: &str, path: &str) -> f64 {
     let terms = query_terms(query);
     if terms.is_empty() {
@@ -244,6 +297,79 @@ fn query_path_boost(query: &str, path: &str) -> f64 {
     }
 
     score
+}
+
+fn result_term_set(result: &SearchResult) -> HashSet<String> {
+    let mut terms = HashSet::new();
+
+    for value in normalized_haystacks(result) {
+        terms.extend(tokenize_text(&value));
+    }
+
+    terms
+}
+
+fn phrase_match_score(query_terms: &[String], result: &SearchResult) -> bool {
+    if query_terms.len() < 2 {
+        return false;
+    }
+
+    let phrase = query_terms.join(" ");
+    normalized_haystacks(result)
+        .into_iter()
+        .any(|value| normalize_text(&value).contains(&phrase))
+}
+
+fn normalized_haystacks(result: &SearchResult) -> Vec<String> {
+    let mut haystacks = vec![result.file_path.clone(), result.content.clone()];
+
+    if let Some(breadcrumb) = &result.breadcrumb {
+        haystacks.push(breadcrumb.clone());
+    }
+    if let Some(symbols) = &result.defined_symbols {
+        haystacks.push(symbols.join(" "));
+    }
+    if let Some(symbols) = &result.referenced_symbols {
+        haystacks.push(symbols.join(" "));
+    }
+    if let Some(symbols) = &result.called_symbols {
+        haystacks.push(symbols.join(" "));
+    }
+
+    haystacks
+}
+
+fn normalize_text(value: &str) -> String {
+    tokenize_text(value).join(" ")
+}
+
+fn tokenize_text(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut prev: Option<char> = None;
+
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            let is_camel_boundary =
+                prev.is_some_and(|p| (p.is_lowercase() || p.is_ascii_digit()) && ch.is_uppercase());
+
+            if is_camel_boundary && !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+
+        prev = Some(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 fn is_natural_language_query(query: &str) -> bool {
@@ -460,5 +586,49 @@ mod tests {
         let impl_boost = intent_boost(&result, "jira test tickets", QueryIntent::General);
         let symbolish_boost = intent_boost(&result, "PolicyRuleValidator", QueryIntent::General);
         assert!(impl_boost > symbolish_boost);
+    }
+
+    #[test]
+    fn term_coverage_beats_generic_partial_match() {
+        let generic = make_result(
+            "service/src/main/kotlin/TaskMappers.kt",
+            10,
+            "function",
+            "fun toTaskEdge() { val sourceKey = key; val targetKey = key }",
+        );
+        let specific = make_result(
+            "protos/policy_rules.proto",
+            20,
+            "chunk",
+            "optional IdempotencyKeyPreview idempotency_key_preview = 4;",
+        );
+
+        let generic_boost = query_match_boost("idempotency key preview", &generic);
+        let specific_boost = query_match_boost("idempotency key preview", &specific);
+        assert!(specific_boost > generic_boost);
+    }
+
+    #[test]
+    fn markdown_docs_penalized_for_non_docs_query() {
+        let markdown = make_result(
+            "routing_guide.md",
+            1,
+            "chunk",
+            "Webhook signing secret configuration guide",
+        );
+        let config = make_result(
+            "service/src/main/resources/app-common.yaml",
+            1,
+            "chunk",
+            "request_signing_secret: filesystem:/etc/secrets/service/jira_request_signing_secret",
+        );
+
+        let docs_penalty = content_kind_boost(&markdown, QueryIntent::General);
+        let config_penalty = content_kind_boost(&config, QueryIntent::General);
+        let docs_boost = query_match_boost("request signing secret", &markdown);
+        let config_boost = query_match_boost("request signing secret", &config);
+
+        assert!(docs_penalty < config_penalty);
+        assert!(docs_boost <= config_boost);
     }
 }
