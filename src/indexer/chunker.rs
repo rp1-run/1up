@@ -13,6 +13,7 @@ fn language_from_extension(ext: &str) -> String {
         "html" | "htm" => "html".into(),
         "css" => "css".into(),
         "sql" => "sql".into(),
+        "sq" | "sqm" => "sql".into(),
         "sh" | "bash" | "zsh" => "shell".into(),
         "rb" => "ruby".into(),
         "php" => "php".into(),
@@ -29,8 +30,10 @@ fn language_from_extension(ext: &str) -> String {
         "proto" => "protobuf".into(),
         "dockerfile" | "Dockerfile" => "dockerfile".into(),
         "makefile" | "Makefile" | "mk" => "makefile".into(),
+        "justfile" => "makefile".into(),
         "cmake" => "cmake".into(),
         "tf" | "hcl" => "terraform".into(),
+        "properties" | "conf" | "ini" => "config".into(),
         _ => ext.to_lowercase(),
     }
 }
@@ -93,7 +96,16 @@ pub fn chunk_file(
 
 /// Chunks file content using the default constants from `shared::constants`.
 pub fn chunk_file_default(content: &str, file_extension: &str) -> Vec<ParsedSegment> {
-    chunk_file(content, file_extension, CHUNK_WINDOW_SIZE, CHUNK_OVERLAP)
+    let overlap = match file_extension.to_ascii_lowercase().as_str() {
+        // Schema and config files benefit more from fewer, larger chunks than
+        // from overlapping context windows. This keeps recall while cutting
+        // redundant segments and indexing work.
+        "json" | "toml" | "yaml" | "yml" | "proto" | "properties" | "conf" | "ini" | "tf"
+        | "hcl" | "sql" | "sq" | "sqm" => 0,
+        _ => CHUNK_OVERLAP,
+    };
+
+    chunk_file(content, file_extension, CHUNK_WINDOW_SIZE, overlap)
 }
 
 #[cfg(test)]
@@ -199,10 +211,26 @@ mod tests {
     }
 
     #[test]
+    fn config_chunking_uses_no_overlap() {
+        let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        let content = lines.join("\n");
+
+        let result = chunk_file_default(&content, "proto");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].line_start, 1);
+        assert_eq!(result[0].line_end, CHUNK_WINDOW_SIZE);
+        assert_eq!(result[1].line_start, CHUNK_WINDOW_SIZE + 1);
+    }
+
+    #[test]
     fn language_detection_from_extension() {
         assert_eq!(chunk_file("x", "sh", 10, 0)[0].language, "shell");
         assert_eq!(chunk_file("x", "yml", 10, 0)[0].language, "yaml");
         assert_eq!(chunk_file("x", "htm", 10, 0)[0].language, "html");
+        assert_eq!(chunk_file("x", "proto", 10, 0)[0].language, "protobuf");
+        assert_eq!(chunk_file("x", "hcl", 10, 0)[0].language, "terraform");
+        assert_eq!(chunk_file("x", "sq", 10, 0)[0].language, "sql");
+        assert_eq!(chunk_file("x", "justfile", 10, 0)[0].language, "makefile");
         assert_eq!(
             chunk_file("x", "unknown_ext", 10, 0)[0].language,
             "unknown_ext"

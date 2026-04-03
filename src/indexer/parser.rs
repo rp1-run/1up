@@ -552,7 +552,27 @@ pub fn is_language_supported(language: &str) -> bool {
 /// Text document types that are indexed via FTS text chunking.
 /// These don't have tree-sitter grammars but contain valuable searchable text.
 fn is_text_document(ext: &str) -> bool {
-    matches!(ext, "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org")
+    matches!(
+        ext,
+        "txt"
+            | "rst"
+            | "adoc"
+            | "asciidoc"
+            | "tex"
+            | "org"
+            | "proto"
+            | "properties"
+            | "conf"
+            | "ini"
+            | "tf"
+            | "hcl"
+            | "sql"
+            | "sq"
+            | "sqm"
+            | "dockerfile"
+            | "makefile"
+            | "justfile"
+    )
 }
 
 /// Check if a language benefits from tree-sitter structural segmentation.
@@ -2492,6 +2512,30 @@ int main() {
             Some(SupportedLanguage::TypeScript)
         );
         assert_eq!(SupportedLanguage::from_extension("xyz"), None);
+    }
+
+    #[test]
+    fn test_text_document_extensions_use_chunking() {
+        for ext in [
+            "proto",
+            "properties",
+            "conf",
+            "ini",
+            "tf",
+            "hcl",
+            "sql",
+            "sq",
+            "sqm",
+            "dockerfile",
+            "makefile",
+            "justfile",
+        ] {
+            assert!(is_language_supported(ext), "{ext} should be supported");
+            assert!(
+                !use_structural_parser(ext),
+                "{ext} should use text chunking"
+            );
+        }
     }
 
     #[test]

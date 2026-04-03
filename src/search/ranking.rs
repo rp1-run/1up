@@ -18,6 +18,7 @@ pub fn fuse_results(
     vector_results: Vec<SearchResult>,
     fts_results: Vec<SearchResult>,
     symbol_results: Vec<SearchResult>,
+    query: &str,
     intent: QueryIntent,
     limit: usize,
 ) -> Vec<SearchResult> {
@@ -80,7 +81,7 @@ pub fn fuse_results(
     }
 
     for candidate in candidates.values_mut() {
-        candidate.fused_score = compute_rrf_score(candidate, intent);
+        candidate.fused_score = compute_rrf_score(candidate, query, intent);
     }
 
     let mut sorted: Vec<ScoredCandidate> = candidates.into_values().collect();
@@ -109,7 +110,7 @@ fn candidate_key(r: &SearchResult) -> String {
     format!("{}:{}:{}", r.file_path, r.line_number, r.block_type)
 }
 
-fn compute_rrf_score(candidate: &ScoredCandidate, intent: QueryIntent) -> f64 {
+fn compute_rrf_score(candidate: &ScoredCandidate, query: &str, intent: QueryIntent) -> f64 {
     let vector_score = candidate
         .vector_rank
         .map(|rank| VECTOR_WEIGHT / (RRF_K + rank as f64 + 1.0))
@@ -127,14 +128,15 @@ fn compute_rrf_score(candidate: &ScoredCandidate, intent: QueryIntent) -> f64 {
 
     let mut score = vector_score + fts_score + symbol_score;
 
-    score *= intent_boost(&candidate.result, intent);
+    score *= intent_boost(&candidate.result, query, intent);
     score *= file_path_boost(&candidate.result.file_path);
+    score *= query_path_boost(query, &candidate.result.file_path);
     score *= short_segment_penalty(&candidate.result.content);
 
     score
 }
 
-fn intent_boost(result: &SearchResult, intent: QueryIntent) -> f64 {
+fn intent_boost(result: &SearchResult, query: &str, intent: QueryIntent) -> f64 {
     let role_str = result
         .role
         .as_ref()
@@ -180,7 +182,19 @@ fn intent_boost(result: &SearchResult, intent: QueryIntent) -> f64 {
                 1.0
             }
         }
-        QueryIntent::General => 1.0,
+        QueryIntent::General => {
+            if is_natural_language_query(query) {
+                if role_str == "ORCHESTRATION" || role_str == "IMPLEMENTATION" {
+                    1.15
+                } else if role_str == "DOCS" {
+                    1.05
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            }
+        }
     }
 }
 
@@ -206,6 +220,57 @@ fn short_segment_penalty(content: &str) -> f64 {
     } else {
         1.0
     }
+}
+
+fn query_path_boost(query: &str, path: &str) -> f64 {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return 1.0;
+    }
+
+    let lower_path = path.to_lowercase();
+    let mut score = 1.0;
+
+    let overlap_count = terms
+        .iter()
+        .filter(|term| lower_path.contains(term.as_str()))
+        .count();
+    score += 0.06 * overlap_count.min(3) as f64;
+
+    let normalized_path = lower_path.replace(['/', '_', '-'], " ");
+    let phrase = terms.join(" ");
+    if terms.len() >= 2 && normalized_path.contains(&phrase) {
+        score += 0.12;
+    }
+
+    score
+}
+
+fn is_natural_language_query(query: &str) -> bool {
+    let terms = query_terms(query);
+    terms.len() >= 2
+        && !query.contains('_')
+        && !query.chars().any(|c| c.is_uppercase())
+        && !query.chars().any(|c| c.is_numeric())
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "does", "for", "how", "in", "is", "of", "on", "per", "the", "to", "what",
+        "where",
+    ];
+
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter_map(|term| {
+            let term = term.to_lowercase();
+            if term.len() < 3 || STOP_WORDS.contains(&term.as_str()) {
+                None
+            } else {
+                Some(term)
+            }
+        })
+        .collect()
 }
 
 fn deduplicate(candidates: Vec<ScoredCandidate>) -> Vec<ScoredCandidate> {
@@ -283,7 +348,14 @@ mod tests {
             make_result("a.rs", 1, "function", "fn foo() {\n  let x = 1;\n  let y = 2;\n  let z = 3;\n  let w = 4;\n  let v = 5;\n}"),
         ];
 
-        let fused = fuse_results(vec_results, fts_results, vec![], QueryIntent::General, 10);
+        let fused = fuse_results(
+            vec_results,
+            fts_results,
+            vec![],
+            "foo bar",
+            QueryIntent::General,
+            10,
+        );
         assert_eq!(fused.len(), 2);
         assert!(fused[0].score > 0.0);
         assert!(fused[0].score >= fused[1].score);
@@ -318,7 +390,7 @@ mod tests {
             ),
         ];
 
-        let fused = fuse_results(vec_results, vec![], vec![], QueryIntent::General, 20);
+        let fused = fuse_results(vec_results, vec![], vec![], "foo", QueryIntent::General, 20);
         assert!(fused.len() <= MAX_RESULTS_PER_FILE);
     }
 
@@ -339,7 +411,7 @@ mod tests {
             ),
         ];
 
-        let fused = fuse_results(vec_results, vec![], vec![], QueryIntent::General, 20);
+        let fused = fuse_results(vec_results, vec![], vec![], "foo", QueryIntent::General, 20);
         assert_eq!(fused.len(), 1);
     }
 
@@ -356,8 +428,8 @@ mod tests {
     #[test]
     fn intent_boosts_definitions() {
         let r = make_result("a.rs", 1, "function", "fn foo() {}");
-        let general_boost = intent_boost(&r, QueryIntent::General);
-        let def_boost = intent_boost(&r, QueryIntent::Definition);
+        let general_boost = intent_boost(&r, "foo", QueryIntent::General);
+        let def_boost = intent_boost(&r, "foo", QueryIntent::Definition);
         assert!(def_boost > general_boost);
     }
 
@@ -366,5 +438,27 @@ mod tests {
         let short_penalty = short_segment_penalty("x");
         let long_penalty = short_segment_penalty("a\nb\nc\nd\ne\nf\ng");
         assert!(short_penalty < long_penalty);
+    }
+
+    #[test]
+    fn query_path_overlap_boosts_matching_paths() {
+        let path_score = query_path_boost("jira test tickets", "scripts/jira_test_tickets.py");
+        let plain_score = query_path_boost("jira test tickets", "src/main.rs");
+        assert!(path_score > plain_score);
+    }
+
+    #[test]
+    fn natural_language_general_queries_prefer_implementation() {
+        let mut result = make_result(
+            "scripts/jira_test_tickets.py",
+            1,
+            "function",
+            "def main():\n    run()\n    publish()",
+        );
+        result.role = Some(SegmentRole::Implementation);
+
+        let impl_boost = intent_boost(&result, "jira test tickets", QueryIntent::General);
+        let symbolish_boost = intent_boost(&result, "PolicyRuleValidator", QueryIntent::General);
+        assert!(impl_boost > symbolish_boost);
     }
 }

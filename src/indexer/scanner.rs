@@ -55,6 +55,21 @@ pub struct ScannedFile {
     pub extension: String,
 }
 
+fn detect_file_type(path: &Path) -> Option<String> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_lowercase();
+        if !ext.is_empty() {
+            return Some(ext);
+        }
+    }
+
+    let name = path.file_name()?.to_str()?.to_lowercase();
+    match name.as_str() {
+        "dockerfile" | "makefile" | "justfile" => Some(name),
+        _ => None,
+    }
+}
+
 /// Scan a directory for source files, respecting .gitignore and default ignores.
 ///
 /// Returns a list of files with their extensions, skipping binary files,
@@ -89,15 +104,9 @@ pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
 
         let path = entry.path().to_path_buf();
 
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        if extension.is_empty() {
+        let Some(extension) = detect_file_type(&path) else {
             continue;
-        }
+        };
 
         if BINARY_EXTENSIONS.contains(&extension.as_str()) {
             continue;
@@ -160,10 +169,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("Makefile"), "all:").unwrap();
         fs::write(tmp.path().join("main.go"), "package main").unwrap();
+        fs::write(tmp.path().join("notes"), "plain text").unwrap();
 
         let files = scan_directory(tmp.path()).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].extension, "go");
+        assert_eq!(files.len(), 2);
+
+        let extensions: Vec<&str> = files.iter().map(|f| f.extension.as_str()).collect();
+        assert!(extensions.contains(&"go"));
+        assert!(extensions.contains(&"makefile"));
+        assert!(!extensions.contains(&"notes"));
     }
 
     #[test]
@@ -202,5 +216,17 @@ mod tests {
         let files = scan_directory(tmp.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].extension, "rs");
+    }
+
+    #[test]
+    fn scan_recognizes_special_filenames_without_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Dockerfile"), "FROM rust:1.0").unwrap();
+        fs::write(tmp.path().join("justfile"), "fmt:\n  cargo fmt").unwrap();
+
+        let files = scan_directory(tmp.path()).unwrap();
+        let extensions: Vec<&str> = files.iter().map(|f| f.extension.as_str()).collect();
+        assert!(extensions.contains(&"dockerfile"));
+        assert!(extensions.contains(&"justfile"));
     }
 }
