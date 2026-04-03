@@ -212,11 +212,19 @@ impl IndexingConfig {
         Self::new(jobs, embed_threads, write_batch_files)
     }
 
-    pub fn parallelism(&self) -> IndexParallelism {
+    pub fn reporting_parallelism(
+        &self,
+        files_total: usize,
+        embeddings_enabled: bool,
+    ) -> IndexParallelism {
         IndexParallelism {
             jobs_configured: self.jobs,
-            jobs_effective: self.jobs,
-            embed_threads: self.embed_threads,
+            jobs_effective: files_total.min(self.jobs),
+            embed_threads: if embeddings_enabled {
+                self.embed_threads
+            } else {
+                0
+            },
         }
     }
 

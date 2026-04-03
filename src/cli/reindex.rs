@@ -97,6 +97,6 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
             " [no embeddings]"
         },
     );
-    println!("{}", fmt.format_message(&msg));
+    println!("{}", fmt.format_index_summary(&msg, &stats.progress));
     Ok(())
 }

@@ -26,6 +26,25 @@ pub struct StatusInfo {
     pub index_progress: Option<IndexProgress>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WorkSummary {
+    files_completed: usize,
+    files_indexed: usize,
+    files_skipped: usize,
+    files_deleted: usize,
+}
+
+impl From<&IndexProgress> for WorkSummary {
+    fn from(progress: &IndexProgress) -> Self {
+        Self {
+            files_completed: progress.files_indexed + progress.files_deleted,
+            files_indexed: progress.files_indexed,
+            files_skipped: progress.files_skipped,
+            files_deleted: progress.files_deleted,
+        }
+    }
+}
+
 pub fn formatter_for(format: OutputFormat) -> Box<dyn Formatter> {
     match format {
         OutputFormat::Json => Box::new(JsonFormatter),
@@ -60,14 +79,25 @@ impl Formatter for JsonFormatter {
     }
 
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
+        let work = WorkSummary::from(progress);
         to_json(&serde_json::json!({
             "message": message,
             "progress": progress,
+            "work": work,
         }))
     }
 
     fn format_status(&self, status: &StatusInfo) -> String {
-        to_json(status)
+        let index_work = status.index_progress.as_ref().map(WorkSummary::from);
+        to_json(&serde_json::json!({
+            "daemon_running": status.daemon_running,
+            "pid": status.pid,
+            "indexed_files": status.indexed_files,
+            "total_segments": status.total_segments,
+            "project_id": &status.project_id,
+            "index_progress": &status.index_progress,
+            "index_work": index_work,
+        }))
     }
 }
 
@@ -173,6 +203,7 @@ impl Formatter for HumanFormatter {
         let mut out = String::new();
         out.push_str(message);
         out.push('\n');
+        let work = WorkSummary::from(progress);
         out.push_str(&format!(
             "Progress: {} ({}) | scanned {} of {} | indexed {} | skipped {} | deleted {} | segments {}\n",
             render_index_state_human(progress.state),
@@ -184,6 +215,26 @@ impl Formatter for HumanFormatter {
             progress.files_deleted,
             progress.segments_stored,
         ));
+        out.push_str(&format!(
+            "Work: completed {} ({} indexed, {} deleted) | skipped {}\n",
+            work.files_completed, work.files_indexed, work.files_deleted, work.files_skipped,
+        ));
+        if let Some(parallelism) = &progress.parallelism {
+            out.push_str(&format!(
+                "Parallelism: workers {} effective / {} configured | embed threads {}\n",
+                parallelism.jobs_effective, parallelism.jobs_configured, parallelism.embed_threads,
+            ));
+        }
+        if let Some(timings) = &progress.timings {
+            out.push_str(&format!(
+                "Timings: scan {} | parse {} | embed {} | store {} | total {}\n",
+                render_duration_ms(timings.scan_ms),
+                render_duration_ms(timings.parse_ms),
+                render_duration_ms(timings.embed_ms),
+                render_duration_ms(timings.store_ms),
+                render_duration_ms(timings.total_ms),
+            ));
+        }
         out.push_str(&format!(
             "Embeddings: {}\n",
             render_embeddings_human(progress.embeddings_enabled)
@@ -213,6 +264,7 @@ impl Formatter for HumanFormatter {
             out.push_str(&format!("Total segments: {segs}\n"));
         }
         if let Some(progress) = &status.index_progress {
+            let work = WorkSummary::from(progress);
             out.push_str(&format!(
                 "Index status: {}\n",
                 render_index_state_human(progress.state)
@@ -230,6 +282,28 @@ impl Formatter for HumanFormatter {
                 progress.files_deleted,
                 progress.segments_stored,
             ));
+            out.push_str(&format!(
+                "Work: completed {} ({} indexed, {} deleted) | skipped {}\n",
+                work.files_completed, work.files_indexed, work.files_deleted, work.files_skipped,
+            ));
+            if let Some(parallelism) = &progress.parallelism {
+                out.push_str(&format!(
+                    "Parallelism: workers {} effective / {} configured | embed threads {}\n",
+                    parallelism.jobs_effective,
+                    parallelism.jobs_configured,
+                    parallelism.embed_threads,
+                ));
+            }
+            if let Some(timings) = &progress.timings {
+                out.push_str(&format!(
+                    "Timings: scan {} | parse {} | embed {} | store {} | total {}\n",
+                    render_duration_ms(timings.scan_ms),
+                    render_duration_ms(timings.parse_ms),
+                    render_duration_ms(timings.embed_ms),
+                    render_duration_ms(timings.store_ms),
+                    render_duration_ms(timings.total_ms),
+                ));
+            }
             out.push_str(&format!(
                 "Embeddings: {}\n",
                 render_embeddings_human(progress.embeddings_enabled)
@@ -315,21 +389,39 @@ impl Formatter for PlainFormatter {
 
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
         let mut out = String::new();
+        let work = WorkSummary::from(progress);
         out.push_str(message);
         out.push('\n');
         out.push_str(&format!(
-            "index_state:{}\tindex_phase:{}\tfiles_scanned:{}\tfiles_total:{}\tfiles_indexed:{}\tfiles_skipped:{}\tfiles_deleted:{}\tsegments_stored:{}\tembeddings:{}\tupdated:{}\n",
+            "index_state:{}\tindex_phase:{}\tfiles_scanned:{}\tfiles_total:{}\tfiles_completed:{}\tfiles_indexed:{}\tfiles_skipped:{}\tfiles_deleted:{}\tsegments_stored:{}\tembeddings:{}",
             render_index_state_plain(progress.state),
             render_index_phase_plain(progress),
             progress.files_scanned,
             progress.files_total,
+            work.files_completed,
             progress.files_indexed,
             progress.files_skipped,
             progress.files_deleted,
             progress.segments_stored,
             render_embeddings_plain(progress.embeddings_enabled),
-            progress.updated_at.to_rfc3339(),
         ));
+        if let Some(parallelism) = &progress.parallelism {
+            out.push_str(&format!(
+                "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
+                parallelism.jobs_configured, parallelism.jobs_effective, parallelism.embed_threads,
+            ));
+        }
+        if let Some(timings) = &progress.timings {
+            out.push_str(&format!(
+                "\tscan_ms:{}\tparse_ms:{}\tembed_ms:{}\tstore_ms:{}\ttotal_ms:{}",
+                timings.scan_ms,
+                timings.parse_ms,
+                timings.embed_ms,
+                timings.store_ms,
+                timings.total_ms,
+            ));
+        }
+        out.push_str(&format!("\tupdated:{}\n", progress.updated_at.to_rfc3339()));
         out
     }
 
@@ -353,19 +445,39 @@ impl Formatter for PlainFormatter {
             out.push_str(&format!("\tsegments:{segs}"));
         }
         if let Some(progress) = &status.index_progress {
+            let work = WorkSummary::from(progress);
             out.push_str(&format!(
-                "\tindex_state:{}\tindex_phase:{}\tlast_scanned:{}\tlast_total:{}\tlast_indexed:{}\tlast_skipped:{}\tlast_deleted:{}\tlast_segments:{}\tembeddings:{}\tupdated:{}",
+                "\tindex_state:{}\tindex_phase:{}\tlast_scanned:{}\tlast_total:{}\tlast_completed:{}\tlast_indexed:{}\tlast_skipped:{}\tlast_deleted:{}\tlast_segments:{}\tembeddings:{}",
                 render_index_state_plain(progress.state),
                 render_index_phase_plain(progress),
                 progress.files_scanned,
                 progress.files_total,
+                work.files_completed,
                 progress.files_indexed,
                 progress.files_skipped,
                 progress.files_deleted,
                 progress.segments_stored,
                 render_embeddings_plain(progress.embeddings_enabled),
-                progress.updated_at.to_rfc3339(),
             ));
+            if let Some(parallelism) = &progress.parallelism {
+                out.push_str(&format!(
+                    "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
+                    parallelism.jobs_configured,
+                    parallelism.jobs_effective,
+                    parallelism.embed_threads,
+                ));
+            }
+            if let Some(timings) = &progress.timings {
+                out.push_str(&format!(
+                    "\tscan_ms:{}\tparse_ms:{}\tembed_ms:{}\tstore_ms:{}\ttotal_ms:{}",
+                    timings.scan_ms,
+                    timings.parse_ms,
+                    timings.embed_ms,
+                    timings.store_ms,
+                    timings.total_ms,
+                ));
+            }
+            out.push_str(&format!("\tupdated:{}", progress.updated_at.to_rfc3339()));
         }
         out.push('\n');
         out
@@ -402,6 +514,10 @@ fn render_embeddings_human(enabled: bool) -> String {
     } else {
         "disabled".yellow().to_string()
     }
+}
+
+fn render_duration_ms(duration_ms: u128) -> String {
+    format!("{duration_ms}ms")
 }
 
 fn render_index_state_plain(state: IndexState) -> &'static str {
@@ -494,4 +610,82 @@ fn truncate_items(items: &[String], limit: usize) -> String {
     let mut preview = items.iter().take(limit).cloned().collect::<Vec<_>>();
     preview.push(format!("+{}", items.len() - limit));
     preview.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::types::{IndexParallelism, IndexStageTimings};
+
+    fn sample_progress() -> IndexProgress {
+        IndexProgress {
+            state: IndexState::Complete,
+            phase: IndexPhase::Complete,
+            files_total: 6,
+            files_scanned: 6,
+            files_indexed: 3,
+            files_skipped: 2,
+            files_deleted: 1,
+            segments_stored: 14,
+            embeddings_enabled: true,
+            parallelism: Some(IndexParallelism {
+                jobs_configured: 4,
+                jobs_effective: 3,
+                embed_threads: 2,
+            }),
+            timings: Some(IndexStageTimings {
+                scan_ms: 11,
+                parse_ms: 17,
+                embed_ms: 23,
+                store_ms: 5,
+                total_ms: 41,
+            }),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:08Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn json_index_summary_includes_work_parallelism_and_timings() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_index_summary("indexed", &sample_progress());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["message"], "indexed");
+        assert_eq!(value["work"]["files_completed"], 4);
+        assert_eq!(value["work"]["files_skipped"], 2);
+        assert_eq!(value["progress"]["parallelism"]["jobs_effective"], 3);
+        assert_eq!(value["progress"]["timings"]["total_ms"], 41);
+    }
+
+    #[test]
+    fn human_index_summary_renders_work_parallelism_and_timings() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_index_summary("indexed", &sample_progress());
+
+        assert!(rendered.contains("Work: completed 4 (3 indexed, 1 deleted) | skipped 2"));
+        assert!(
+            rendered.contains("Parallelism: workers 3 effective / 4 configured | embed threads 2")
+        );
+        assert!(rendered
+            .contains("Timings: scan 11ms | parse 17ms | embed 23ms | store 5ms | total 41ms"));
+    }
+
+    #[test]
+    fn plain_status_renders_last_work_and_total_duration() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_status(&StatusInfo {
+            daemon_running: true,
+            pid: Some(42),
+            indexed_files: Some(3),
+            total_segments: Some(14),
+            project_id: Some("project-123".to_string()),
+            index_progress: Some(sample_progress()),
+        });
+
+        assert!(rendered.contains("last_completed:4"));
+        assert!(rendered.contains("jobs_effective:3"));
+        assert!(rendered.contains("total_ms:41"));
+    }
 }
