@@ -107,6 +107,8 @@ Explicitly index a repository without starting the daemon:
 
 `1up index` is the incremental updater for already-current indexes. On an empty project it creates the current schema-v5 layout; if embeddings are unavailable it still stores searchable content with null vectors.
 
+The command also records a final progress snapshot in `.1up/index_status.json`. JSON output keeps the existing `message` field and adds a `progress` object with the last phase, counters, embedding availability, and timestamp.
+
 Force a full re-index when adopting the rewrite or recovering from stale/partial local indexes:
 
 ```sh
@@ -122,6 +124,8 @@ Check daemon and index status:
 ```sh
 1up status
 ```
+
+`1up status` reports the latest recorded indexing progress in addition to daemon state and index counts.
 
 Stop the daemon for the current project:
 
@@ -168,7 +172,7 @@ Stop the background daemon for the current project. Sends SIGTERM if no projects
 
 #### `1up status [PATH]`
 
-Show daemon running state, project ID, indexed file count, and segment count.
+Show daemon running state, project ID, indexed file count, segment count, and the latest recorded indexing progress.
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -206,7 +210,7 @@ Retrieve code context around a file location.
 
 #### `1up index [PATH]`
 
-Index a repository. Downloads the embedding model on first use.
+Index a repository. Downloads the embedding model on first use and emits a final progress snapshot.
 
 | Argument | Description | Default |
 |----------|-------------|---------|

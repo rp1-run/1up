@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Role classification for a parsed code segment.
@@ -159,6 +160,58 @@ pub struct ContextResult {
     pub line_start: usize,
     pub line_end: usize,
     pub scope_type: String,
+}
+
+/// High-level state for the latest indexing run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexState {
+    Idle,
+    Running,
+    Complete,
+}
+
+/// Current milestone within an indexing run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPhase {
+    Pending,
+    Scanning,
+    Parsing,
+    Storing,
+    Complete,
+}
+
+/// Latest persisted indexing progress for a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexProgress {
+    pub state: IndexState,
+    pub phase: IndexPhase,
+    pub files_total: usize,
+    pub files_scanned: usize,
+    pub files_indexed: usize,
+    pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub segments_stored: usize,
+    pub embeddings_enabled: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl IndexProgress {
+    pub fn pending() -> Self {
+        Self {
+            state: IndexState::Idle,
+            phase: IndexPhase::Pending,
+            files_total: 0,
+            files_scanned: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            updated_at: Utc::now(),
+        }
+    }
 }
 
 /// Output format for CLI results.
