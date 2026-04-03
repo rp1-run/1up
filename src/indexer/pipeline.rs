@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use libsql::Connection;
 use nanospinner::Spinner;
@@ -50,6 +51,7 @@ fn refresh_progress(
     phase: IndexPhase,
     files_total: usize,
     parallelism: Option<IndexParallelism>,
+    timings: Option<IndexStageTimings>,
 ) {
     stats.progress = IndexProgress {
         state,
@@ -62,7 +64,7 @@ fn refresh_progress(
         segments_stored: stats.segments_stored,
         embeddings_enabled: stats.embeddings_generated,
         parallelism,
-        timings: None,
+        timings,
         updated_at: chrono::Utc::now(),
     };
     persist_progress(project_root, &stats.progress);
@@ -75,11 +77,32 @@ use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::types::{
-    IndexParallelism, IndexPhase, IndexProgress, IndexState, IndexingConfig, ParsedSegment,
+    IndexParallelism, IndexPhase, IndexProgress, IndexStageTimings, IndexState, IndexingConfig,
+    ParsedSegment,
 };
 use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
+
+#[derive(Debug, Default)]
+struct TimingAccumulator {
+    scan_ms: u128,
+    parse_ms: u128,
+    embed_ms: u128,
+    store_ms: u128,
+}
+
+impl TimingAccumulator {
+    fn snapshot(&self, run_started_at: Instant) -> IndexStageTimings {
+        IndexStageTimings {
+            scan_ms: self.scan_ms,
+            parse_ms: self.parse_ms,
+            embed_ms: self.embed_ms,
+            store_ms: self.store_ms,
+            total_ms: run_started_at.elapsed().as_millis(),
+        }
+    }
+}
 
 fn compute_file_hash(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -210,6 +233,7 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
 
     let file_hash = compute_file_hash(content.as_bytes());
     if scanned_file.stored_hash.as_deref() == Some(file_hash.as_str()) {
+        debug!("skipping unchanged file: {}", scanned_file.relative_path);
         return ParseResult {
             sequence_id: scanned_file.sequence_id,
             outcome: ParseResultKind::Skipped(ParseSkipReason::Unchanged),
@@ -230,6 +254,10 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
     } else if parser::is_language_supported(&scanned_file.extension) {
         chunker::chunk_file_default(&content, &scanned_file.extension)
     } else {
+        debug!(
+            "skipping unsupported extension .{}: {}",
+            scanned_file.extension, scanned_file.relative_path
+        );
         return ParseResult {
             sequence_id: scanned_file.sequence_id,
             outcome: ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
@@ -239,6 +267,10 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
     };
 
     if segments.is_empty() {
+        debug!(
+            "skipping file with no parsed segments: {}",
+            scanned_file.relative_path
+        );
         return ParseResult {
             sequence_id: scanned_file.sequence_id,
             outcome: ParseResultKind::Skipped(ParseSkipReason::EmptySegments),
@@ -286,6 +318,7 @@ fn build_segment_insert(
 fn build_segment_batches(
     parsed_files: &[ParsedWorkItem],
     embedder: Option<&mut Embedder>,
+    timings: &mut TimingAccumulator,
 ) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
     let mut embeddings = if let Some(embedder) = embedder {
         let texts: Vec<&str> = parsed_files
@@ -297,7 +330,10 @@ fn build_segment_batches(
                     .map(|segment| segment.content.as_str())
             })
             .collect();
-        Some(embedder.embed_batch(&texts)?.into_iter())
+        let embed_started_at = Instant::now();
+        let embeddings = embedder.embed_batch(&texts)?;
+        timings.embed_ms += embed_started_at.elapsed().as_millis();
+        Some(embeddings.into_iter())
     } else {
         None
     };
@@ -374,16 +410,19 @@ async fn store_ready_files(
     ready_files: &mut Vec<ParsedWorkItem>,
     embedder: Option<&mut Embedder>,
     stats: &mut PipelineStats,
+    timings: &mut TimingAccumulator,
 ) -> Result<(), OneupError> {
     if ready_files.is_empty() {
         return Ok(());
     }
 
     let parsed_files = std::mem::take(ready_files);
-    let segment_batches = build_segment_batches(&parsed_files, embedder)?;
+    let segment_batches = build_segment_batches(&parsed_files, embedder, timings)?;
     let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
 
+    let store_started_at = Instant::now();
     replace_file_batches(conn, &parsed_files, &segment_batches).await?;
+    timings.store_ms += store_started_at.elapsed().as_millis();
 
     stats.files_indexed += parsed_files.len();
     stats.segments_stored += segment_count;
@@ -394,7 +433,10 @@ async fn delete_removed_files(
     conn: &Connection,
     deleted_paths: &[String],
     batch_size: usize,
+    timings: &mut TimingAccumulator,
 ) -> Result<(), OneupError> {
+    let store_started_at = Instant::now();
+
     for chunk in deleted_paths.chunks(batch_size.max(1)) {
         if chunk.len() == 1 {
             segments::replace_file_segments_tx(conn, &chunk[0], &[]).await?;
@@ -411,6 +453,7 @@ async fn delete_removed_files(
         segments::replace_file_batch_tx(conn, &file_batches).await?;
     }
 
+    timings.store_ms += store_started_at.elapsed().as_millis();
     Ok(())
 }
 
@@ -427,6 +470,8 @@ struct FlushState<'a> {
     project_root: &'a Path,
     files_total: usize,
     parallelism: Option<IndexParallelism>,
+    timings: &'a mut TimingAccumulator,
+    run_started_at: Instant,
     unsupported_extensions: &'a mut HashSet<String>,
 }
 
@@ -439,6 +484,7 @@ impl FlushState<'_> {
             phase,
             self.files_total,
             self.parallelism.clone(),
+            Some(self.timings.snapshot(self.run_started_at)),
         );
     }
 }
@@ -462,7 +508,14 @@ async fn flush_reorder_buffer(
                 if ready_files.len() >= config.write_batch_files {
                     {
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
-                        store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+                        store_ready_files(
+                            conn,
+                            &mut ready_files,
+                            embedder,
+                            state.stats,
+                            state.timings,
+                        )
+                        .await?;
                     }
                     state.refresh(IndexPhase::Storing);
                 }
@@ -471,7 +524,14 @@ async fn flush_reorder_buffer(
                 if !ready_files.is_empty() {
                     {
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
-                        store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+                        store_ready_files(
+                            conn,
+                            &mut ready_files,
+                            embedder,
+                            state.stats,
+                            state.timings,
+                        )
+                        .await?;
                     }
                     state.refresh(IndexPhase::Storing);
                 }
@@ -490,7 +550,7 @@ async fn flush_reorder_buffer(
     if !ready_files.is_empty() {
         {
             let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
-            store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+            store_ready_files(conn, &mut ready_files, embedder, state.stats, state.timings).await?;
         }
         state.refresh(IndexPhase::Storing);
     }
@@ -544,12 +604,14 @@ pub async fn run_with_config(
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
 ) -> Result<PipelineStats, OneupError> {
+    let run_started_at = Instant::now();
     let mut stats = PipelineStats::default();
-    let parallelism = Some(config.parallelism());
+    let mut timings = TimingAccumulator::default();
     let mut embedder = embedder;
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
+    let mut parallelism = Some(config.reporting_parallelism(0, has_embedder));
 
     if !has_embedder {
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
@@ -562,9 +624,11 @@ pub async fn run_with_config(
         IndexPhase::Scanning,
         0,
         parallelism.clone(),
+        Some(timings.snapshot(run_started_at)),
     );
 
     let progress_spinner = spin("Scanning files");
+    let scan_started_at = Instant::now();
 
     let scanned = scanner::scan_directory(project_root)?;
     stats.files_scanned = scanned.len();
@@ -584,13 +648,32 @@ pub async fn run_with_config(
         .into_iter()
         .collect();
     let deleted_paths: Vec<String> = indexed_paths.difference(&scanned_paths).cloned().collect();
+    timings.scan_ms = scan_started_at.elapsed().as_millis();
+    parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
+
+    if let Some(parallelism) = &parallelism {
+        info!(
+            "scan stage complete: {} files discovered in {}ms (jobs configured {}, effective {}, embed threads {})",
+            total_files,
+            timings.scan_ms,
+            parallelism.jobs_configured,
+            parallelism.jobs_effective,
+            parallelism.embed_threads,
+        );
+    }
 
     if !deleted_paths.is_empty() {
-        delete_removed_files(conn, &deleted_paths, config.write_batch_files).await?;
+        let store_before_delete = timings.store_ms;
+        delete_removed_files(conn, &deleted_paths, config.write_batch_files, &mut timings).await?;
         for path in &deleted_paths {
             debug!("removed segments for deleted file: {path}");
         }
         stats.files_deleted = deleted_paths.len();
+        info!(
+            "delete cleanup complete: {} files removed in {}ms",
+            deleted_paths.len(),
+            timings.store_ms.saturating_sub(store_before_delete),
+        );
     }
 
     refresh_progress(
@@ -600,9 +683,11 @@ pub async fn run_with_config(
         IndexPhase::Parsing,
         total_files,
         parallelism.clone(),
+        Some(timings.snapshot(run_started_at)),
     );
 
     progress_spinner.update(format!("Processing files (0/{total_files})"));
+    let parse_started_at = Instant::now();
 
     let mut reorder_buffer = BTreeMap::new();
     let mut parse_workers = JoinSet::new();
@@ -615,6 +700,8 @@ pub async fn run_with_config(
             project_root,
             files_total: total_files,
             parallelism: parallelism.clone(),
+            timings: &mut timings,
+            run_started_at,
             unsupported_extensions: &mut unsupported_extensions,
         };
 
@@ -662,12 +749,18 @@ pub async fn run_with_config(
         )
         .await?;
     }
+    timings.parse_ms = parse_started_at.elapsed().as_millis();
 
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
         exts.sort();
         debug!("skipped unsupported file types: .{}", exts.join(", ."));
     }
+
+    info!(
+        "parse stage complete: {} files processed in {}ms",
+        total_files, timings.parse_ms
+    );
 
     progress_spinner.success_with(format!(
         "Processed {} files: {} indexed, {} skipped, {} deleted, {} segments",
@@ -678,14 +771,26 @@ pub async fn run_with_config(
         stats.segments_stored,
     ));
 
-    info!(
-        "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments",
-        stats.files_scanned,
-        stats.files_indexed,
-        stats.files_skipped,
-        stats.files_deleted,
-        stats.segments_stored,
-    );
+    let final_timings = timings.snapshot(run_started_at);
+
+    if let Some(parallelism) = &parallelism {
+        info!(
+            "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments | jobs configured {}, effective {}, embed threads {} | timings scan={}ms parse={}ms embed={}ms store={}ms total={}ms",
+            stats.files_scanned,
+            stats.files_indexed,
+            stats.files_skipped,
+            stats.files_deleted,
+            stats.segments_stored,
+            parallelism.jobs_configured,
+            parallelism.jobs_effective,
+            parallelism.embed_threads,
+            final_timings.scan_ms,
+            final_timings.parse_ms,
+            final_timings.embed_ms,
+            final_timings.store_ms,
+            final_timings.total_ms,
+        );
+    }
 
     refresh_progress(
         &mut stats,
@@ -694,6 +799,7 @@ pub async fn run_with_config(
         IndexPhase::Complete,
         total_files,
         parallelism,
+        Some(final_timings),
     );
 
     Ok(stats)
@@ -898,6 +1004,45 @@ mod tests {
         assert_eq!(
             snapshot_segments(&parallel_conn).await,
             snapshot_segments(&serial_conn).await
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_progress_snapshot_includes_parallelism_and_timings() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(3, 2, 1).unwrap();
+        let stats = run_with_config(&conn, tmp.path(), None, &config)
+            .await
+            .unwrap();
+        let timings = stats.progress.timings.as_ref().unwrap();
+
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().jobs_configured,
+            3
+        );
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().jobs_effective,
+            1
+        );
+        assert_eq!(
+            stats.progress.parallelism.as_ref().unwrap().embed_threads,
+            0
+        );
+        assert!(timings.total_ms >= timings.scan_ms);
+
+        let progress_path = index_progress_path(tmp.path());
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
+
+        assert_eq!(persisted["parallelism"]["jobs_configured"], 3);
+        assert_eq!(persisted["parallelism"]["jobs_effective"], 1);
+        assert_eq!(persisted["parallelism"]["embed_threads"], 0);
+        assert!(
+            persisted["timings"]["total_ms"].as_u64().unwrap()
+                >= persisted["timings"]["scan_ms"].as_u64().unwrap()
         );
     }
 
