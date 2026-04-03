@@ -41,6 +41,25 @@ fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
         .map_err(|e| IndexingError::Pipeline(format!("serialize embedding: {e}")).into())
 }
 
+fn should_embed_segment(seg: &ParsedSegment) -> bool {
+    if seg.block_type != "chunk" {
+        return true;
+    }
+
+    !matches!(
+        seg.language.as_str(),
+        "json"
+            | "yaml"
+            | "toml"
+            | "protobuf"
+            | "terraform"
+            | "sql"
+            | "config"
+            | "makefile"
+            | "dockerfile"
+    )
+}
+
 /// Statistics returned after a pipeline run.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineStats {
@@ -213,7 +232,12 @@ pub async fn run(
     if let Some(emb) = embedder {
         let texts: Vec<&str> = pending
             .iter()
-            .flat_map(|pf| pf.segments.iter().map(|s| s.content.as_str()))
+            .flat_map(|pf| {
+                pf.segments
+                    .iter()
+                    .filter(|seg| should_embed_segment(seg))
+                    .map(|s| s.content.as_str())
+            })
             .collect();
         let mut embeddings = emb.embed_batch(&texts)?.into_iter();
 
@@ -221,13 +245,17 @@ pub async fn run(
             segments::delete_segments_by_file(conn, &pf.relative_path).await?;
 
             for seg in &pf.segments {
-                let embedding = embeddings.next().ok_or_else(|| {
-                    IndexingError::Pipeline(format!(
-                        "missing embedding for {}:{}-{}",
-                        pf.relative_path, seg.line_start, seg.line_end
-                    ))
-                })?;
-                let embedding_vec = serialize_embedding(&embedding)?;
+                let embedding_vec = if should_embed_segment(seg) {
+                    let embedding = embeddings.next().ok_or_else(|| {
+                        IndexingError::Pipeline(format!(
+                            "missing embedding for {}:{}-{}",
+                            pf.relative_path, seg.line_start, seg.line_end
+                        ))
+                    })?;
+                    Some(serialize_embedding(&embedding)?)
+                } else {
+                    None
+                };
 
                 let insert = SegmentInsert {
                     id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
@@ -237,7 +265,7 @@ pub async fn run(
                     content: seg.content.clone(),
                     line_start: seg.line_start as i64,
                     line_end: seg.line_end as i64,
-                    embedding_vec: Some(embedding_vec),
+                    embedding_vec,
                     breadcrumb: seg.breadcrumb.clone(),
                     complexity: seg.complexity as i64,
                     role: format!("{:?}", seg.role).to_uppercase(),
@@ -504,6 +532,45 @@ mod tests {
         assert_ne!(hash1, hash3);
     }
 
+    #[test]
+    fn selective_embedding_skips_low_semantic_chunk_formats() {
+        let code_chunk = ParsedSegment {
+            content: "fn hello() {}".into(),
+            block_type: "function".into(),
+            line_start: 1,
+            line_end: 1,
+            language: "rust".into(),
+            breadcrumb: None,
+            complexity: 0,
+            role: crate::shared::types::SegmentRole::Definition,
+            defined_symbols: vec!["hello".into()],
+            referenced_symbols: Vec::new(),
+            called_symbols: Vec::new(),
+        };
+        assert!(should_embed_segment(&code_chunk));
+
+        let markdown_chunk = ParsedSegment {
+            block_type: "chunk".into(),
+            language: "markdown".into(),
+            ..code_chunk.clone()
+        };
+        assert!(should_embed_segment(&markdown_chunk));
+
+        let proto_chunk = ParsedSegment {
+            block_type: "chunk".into(),
+            language: "protobuf".into(),
+            ..code_chunk.clone()
+        };
+        assert!(!should_embed_segment(&proto_chunk));
+
+        let yaml_chunk = ParsedSegment {
+            block_type: "chunk".into(),
+            language: "yaml".into(),
+            ..code_chunk
+        };
+        assert!(!should_embed_segment(&yaml_chunk));
+    }
+
     #[tokio::test]
     async fn skips_unknown_file_types() {
         let tmp = tempfile::tempdir().unwrap();
@@ -542,6 +609,53 @@ mod tests {
 
         assert!(!stats.embeddings_generated);
         assert!(stats.files_indexed > 0);
+    }
+
+    #[tokio::test]
+    async fn low_semantic_chunked_files_are_indexed_without_embeddings() {
+        if !crate::indexer::embedder::is_model_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lines: Vec<String> = (1..=80).map(|i| format!("field_{i} = value_{i}")).collect();
+        fs::write(tmp.path().join("config.ini"), lines.join("\n")).unwrap();
+        fs::write(
+            tmp.path().join("notes.md"),
+            "# Heading\n\nThis explains the system.\n",
+        )
+        .unwrap();
+
+        let (_db, conn) = setup().await;
+        let mut embedder = Embedder::new().await.unwrap();
+        let stats = run(&conn, tmp.path(), Some(&mut embedder)).await.unwrap();
+
+        assert!(stats.embeddings_generated);
+        assert_eq!(stats.files_indexed, 2);
+
+        let mut rows = conn
+            .query(
+                "SELECT file_path, embedding_vec IS NOT NULL FROM segments ORDER BY file_path, line_start",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_ini_without_embedding = false;
+        let mut saw_markdown_with_embedding = false;
+        while let Some(row) = rows.next().await.unwrap() {
+            let file_path: String = row.get(0).unwrap();
+            let has_embedding: i64 = row.get(1).unwrap();
+            if file_path == "config.ini" && has_embedding == 0 {
+                saw_ini_without_embedding = true;
+            }
+            if file_path == "notes.md" && has_embedding == 1 {
+                saw_markdown_with_embedding = true;
+            }
+        }
+
+        assert!(saw_ini_without_embedding);
+        assert!(saw_markdown_with_embedding);
     }
 
     #[tokio::test]
