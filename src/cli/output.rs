@@ -2,7 +2,8 @@ use colored::Colorize;
 use serde::Serialize;
 
 use crate::shared::types::{
-    ContextResult, OutputFormat, SearchResult, StructuralResult, SymbolResult,
+    ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
+    StructuralResult, SymbolResult,
 };
 
 pub trait Formatter {
@@ -11,6 +12,7 @@ pub trait Formatter {
     fn format_context_result(&self, result: &ContextResult) -> String;
     fn format_structural_results(&self, results: &[StructuralResult]) -> String;
     fn format_message(&self, message: &str) -> String;
+    fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
 }
 
@@ -21,6 +23,7 @@ pub struct StatusInfo {
     pub indexed_files: Option<u64>,
     pub total_segments: Option<u64>,
     pub project_id: Option<String>,
+    pub index_progress: Option<IndexProgress>,
 }
 
 pub fn formatter_for(format: OutputFormat) -> Box<dyn Formatter> {
@@ -54,6 +57,13 @@ impl Formatter for JsonFormatter {
 
     fn format_message(&self, message: &str) -> String {
         to_json(&serde_json::json!({ "message": message }))
+    }
+
+    fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
+        to_json(&serde_json::json!({
+            "message": message,
+            "progress": progress,
+        }))
     }
 
     fn format_status(&self, status: &StatusInfo) -> String {
@@ -159,6 +169,29 @@ impl Formatter for HumanFormatter {
         message.to_string()
     }
 
+    fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
+        let mut out = String::new();
+        out.push_str(message);
+        out.push('\n');
+        out.push_str(&format!(
+            "Progress: {} ({}) | scanned {} of {} | indexed {} | skipped {} | deleted {} | segments {}\n",
+            render_index_state_human(progress.state),
+            render_index_phase_human(progress),
+            progress.files_scanned,
+            progress.files_total,
+            progress.files_indexed,
+            progress.files_skipped,
+            progress.files_deleted,
+            progress.segments_stored,
+        ));
+        out.push_str(&format!(
+            "Embeddings: {}\n",
+            render_embeddings_human(progress.embeddings_enabled)
+        ));
+        out.push_str(&format!("Updated: {}\n", progress.updated_at.to_rfc3339()));
+        out
+    }
+
     fn format_status(&self, status: &StatusInfo) -> String {
         let mut out = String::new();
         let state = if status.daemon_running {
@@ -178,6 +211,30 @@ impl Formatter for HumanFormatter {
         }
         if let Some(segs) = status.total_segments {
             out.push_str(&format!("Total segments: {segs}\n"));
+        }
+        if let Some(progress) = &status.index_progress {
+            out.push_str(&format!(
+                "Index status: {}\n",
+                render_index_state_human(progress.state)
+            ));
+            out.push_str(&format!(
+                "Index phase: {}\n",
+                render_index_phase_human(progress)
+            ));
+            out.push_str(&format!(
+                "Last index: scanned {} of {} files, indexed {}, skipped {}, deleted {}, segments {}\n",
+                progress.files_scanned,
+                progress.files_total,
+                progress.files_indexed,
+                progress.files_skipped,
+                progress.files_deleted,
+                progress.segments_stored,
+            ));
+            out.push_str(&format!(
+                "Embeddings: {}\n",
+                render_embeddings_human(progress.embeddings_enabled)
+            ));
+            out.push_str(&format!("Updated: {}\n", progress.updated_at.to_rfc3339()));
         }
         out
     }
@@ -256,6 +313,26 @@ impl Formatter for PlainFormatter {
         message.to_string()
     }
 
+    fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
+        let mut out = String::new();
+        out.push_str(message);
+        out.push('\n');
+        out.push_str(&format!(
+            "index_state:{}\tindex_phase:{}\tfiles_scanned:{}\tfiles_total:{}\tfiles_indexed:{}\tfiles_skipped:{}\tfiles_deleted:{}\tsegments_stored:{}\tembeddings:{}\tupdated:{}\n",
+            render_index_state_plain(progress.state),
+            render_index_phase_plain(progress),
+            progress.files_scanned,
+            progress.files_total,
+            progress.files_indexed,
+            progress.files_skipped,
+            progress.files_deleted,
+            progress.segments_stored,
+            render_embeddings_plain(progress.embeddings_enabled),
+            progress.updated_at.to_rfc3339(),
+        ));
+        out
+    }
+
     fn format_status(&self, status: &StatusInfo) -> String {
         let state = if status.daemon_running {
             "running"
@@ -275,6 +352,21 @@ impl Formatter for PlainFormatter {
         if let Some(segs) = status.total_segments {
             out.push_str(&format!("\tsegments:{segs}"));
         }
+        if let Some(progress) = &status.index_progress {
+            out.push_str(&format!(
+                "\tindex_state:{}\tindex_phase:{}\tlast_scanned:{}\tlast_total:{}\tlast_indexed:{}\tlast_skipped:{}\tlast_deleted:{}\tlast_segments:{}\tembeddings:{}\tupdated:{}",
+                render_index_state_plain(progress.state),
+                render_index_phase_plain(progress),
+                progress.files_scanned,
+                progress.files_total,
+                progress.files_indexed,
+                progress.files_skipped,
+                progress.files_deleted,
+                progress.segments_stored,
+                render_embeddings_plain(progress.embeddings_enabled),
+                progress.updated_at.to_rfc3339(),
+            ));
+        }
         out.push('\n');
         out
     }
@@ -282,6 +374,65 @@ impl Formatter for PlainFormatter {
 
 fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+fn render_index_state_human(state: IndexState) -> String {
+    match state {
+        IndexState::Idle => "idle".dimmed().to_string(),
+        IndexState::Running => "running".yellow().to_string(),
+        IndexState::Complete => "complete".green().to_string(),
+    }
+}
+
+fn render_index_phase_human(progress: &IndexProgress) -> String {
+    let label = match progress.phase {
+        IndexPhase::Pending => "pending",
+        IndexPhase::Scanning => "scanning",
+        IndexPhase::Parsing => "parsing",
+        IndexPhase::Storing if progress.embeddings_enabled => "embedding & storing",
+        IndexPhase::Storing => "storing",
+        IndexPhase::Complete => "complete",
+    };
+    label.cyan().to_string()
+}
+
+fn render_embeddings_human(enabled: bool) -> String {
+    if enabled {
+        "enabled".green().to_string()
+    } else {
+        "disabled".yellow().to_string()
+    }
+}
+
+fn render_index_state_plain(state: IndexState) -> &'static str {
+    match state {
+        IndexState::Idle => "idle",
+        IndexState::Running => "running",
+        IndexState::Complete => "complete",
+    }
+}
+
+fn render_index_phase_plain(progress: &IndexProgress) -> &'static str {
+    render_index_phase(progress)
+}
+
+fn render_embeddings_plain(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn render_index_phase(progress: &IndexProgress) -> &'static str {
+    match progress.phase {
+        IndexPhase::Pending => "pending",
+        IndexPhase::Scanning => "scanning",
+        IndexPhase::Parsing => "parsing",
+        IndexPhase::Storing if progress.embeddings_enabled => "embedding_and_storing",
+        IndexPhase::Storing => "storing",
+        IndexPhase::Complete => "complete",
+    }
 }
 
 fn render_search_metadata(result: &SearchResult) -> String {

@@ -641,6 +641,68 @@ fn cli_init_then_index_then_search_workflow() {
 }
 
 #[test]
+fn index_json_output_includes_progress_summary() {
+    let tmp = create_multi_lang_fixture();
+    let _guard = HideModelGuard::new();
+
+    cmd()
+        .args(["--format", "json", "init", tmp.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd()
+        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let progress = &payload["progress"];
+
+    assert!(payload["message"].as_str().unwrap().contains("Indexed"));
+    assert_eq!(progress["state"], "complete");
+    assert_eq!(progress["phase"], "complete");
+    assert!(progress["files_scanned"].as_u64().unwrap() > 0);
+    assert!(progress["segments_stored"].as_u64().unwrap() > 0);
+    assert_eq!(progress["embeddings_enabled"], false);
+    assert!(progress["updated_at"].as_str().is_some());
+}
+
+#[test]
+fn status_json_reports_noop_index_progress() {
+    let tmp = create_multi_lang_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let second_index = cmd()
+        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(second_index.status.success());
+
+    let output = cmd()
+        .args(["--format", "json", "status", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let progress = &payload["index_progress"];
+
+    assert_eq!(progress["state"], "complete");
+    assert_eq!(progress["phase"], "complete");
+    assert_eq!(progress["files_indexed"], 0);
+    assert_eq!(progress["segments_stored"], 0);
+    assert!(progress["files_skipped"].as_u64().unwrap() > 0);
+    assert_eq!(progress["files_total"], progress["files_scanned"]);
+    assert_eq!(progress["embeddings_enabled"], false);
+    assert!(payload["indexed_files"].as_u64().unwrap() > 0);
+}
+
+#[test]
 fn cli_search_without_index_requires_reindex() {
     let tmp = TempDir::new().unwrap();
 

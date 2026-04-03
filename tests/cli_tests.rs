@@ -1,8 +1,60 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
 fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
+}
+
+struct HideModelGuard {
+    model_path: PathBuf,
+    hidden_path: PathBuf,
+    marker_path: PathBuf,
+    active: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HideModelGuard {
+    fn new() -> Self {
+        let lock = MODEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let model_dir = dirs::data_dir()
+            .unwrap()
+            .join("1up")
+            .join("models")
+            .join("all-MiniLM-L6-v2");
+        let _ = fs::create_dir_all(&model_dir);
+        let model_path = model_dir.join("model.onnx");
+        let hidden_path = model_dir.join("model.onnx.hidden_by_test");
+        let marker_path = model_dir.join(".download_failed");
+
+        let active = model_path.exists();
+        if active {
+            fs::rename(&model_path, &hidden_path).unwrap();
+        }
+        let _ = fs::write(&marker_path, "hidden_by_test");
+
+        Self {
+            model_path,
+            hidden_path,
+            marker_path,
+            active,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for HideModelGuard {
+    fn drop(&mut self) {
+        if self.active && self.hidden_path.exists() {
+            let _ = fs::rename(&self.hidden_path, &self.model_path);
+        }
+        let _ = fs::remove_file(&self.marker_path);
+    }
 }
 
 #[test]
@@ -121,4 +173,35 @@ fn search_without_index_requires_reindex() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("1up reindex"));
+}
+
+#[test]
+fn status_human_output_includes_last_index_progress() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    cmd()
+        .args(["--format", "json", "index", dir.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    cmd()
+        .args(["--format", "human", "status", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Index status:")
+                .and(predicate::str::contains("Index phase:"))
+                .and(predicate::str::contains("Last index:")),
+        );
 }

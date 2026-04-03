@@ -11,13 +11,69 @@ fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
     Spinner::with_writer_tty(msg, std::io::stderr(), std::io::stderr().is_terminal()).start()
 }
 
+fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
+    config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME)
+}
+
+fn persist_progress(project_root: &Path, progress: &IndexProgress) {
+    let dot_dir = config::project_dot_dir(project_root);
+    let payload = match serde_json::to_vec_pretty(progress) {
+        Ok(payload) => payload,
+        Err(err) => {
+            debug!("failed to serialize index progress: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&dot_dir) {
+        debug!(
+            "failed to create progress directory {}: {err}",
+            dot_dir.display()
+        );
+        return;
+    }
+
+    let progress_path = index_progress_path(project_root);
+    if let Err(err) = std::fs::write(&progress_path, payload) {
+        debug!(
+            "failed to persist index progress to {}: {err}",
+            progress_path.display()
+        );
+    }
+}
+
+fn refresh_progress(
+    stats: &mut PipelineStats,
+    project_root: &Path,
+    state: IndexState,
+    phase: IndexPhase,
+    files_total: usize,
+) {
+    stats.progress = IndexProgress {
+        state,
+        phase,
+        files_total,
+        files_scanned: stats.files_scanned,
+        files_indexed: stats.files_indexed,
+        files_skipped: stats.files_skipped,
+        files_deleted: stats.files_deleted,
+        segments_stored: stats.segments_stored,
+        embeddings_enabled: stats.embeddings_generated,
+        updated_at: chrono::Utc::now(),
+    };
+    persist_progress(project_root, &stats.progress);
+}
+
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
 use crate::indexer::parser;
 use crate::indexer::scanner;
+use crate::shared::config;
 use crate::shared::errors::{IndexingError, OneupError};
-use crate::shared::types::ParsedSegment;
+use crate::shared::types::{IndexPhase, IndexProgress, IndexState, ParsedSegment};
 use crate::storage::segments::{self, SegmentInsert};
+
+const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
 fn compute_file_hash(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -61,7 +117,7 @@ fn should_embed_segment(seg: &ParsedSegment) -> bool {
 }
 
 /// Statistics returned after a pipeline run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PipelineStats {
     pub files_scanned: usize,
     pub files_indexed: usize,
@@ -69,6 +125,21 @@ pub struct PipelineStats {
     pub files_deleted: usize,
     pub segments_stored: usize,
     pub embeddings_generated: bool,
+    pub progress: IndexProgress,
+}
+
+impl Default for PipelineStats {
+    fn default() -> Self {
+        Self {
+            files_scanned: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_generated: false,
+            progress: IndexProgress::pending(),
+        }
+    }
 }
 
 /// Run the indexing pipeline on a project root directory.
@@ -89,6 +160,14 @@ pub async fn run(
     if !has_embedder {
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
     }
+
+    refresh_progress(
+        &mut stats,
+        project_root,
+        IndexState::Running,
+        IndexPhase::Scanning,
+        0,
+    );
 
     let scan_spinner = spin("Scanning files");
 
@@ -132,6 +211,14 @@ pub async fn run(
         stats.files_deleted += 1;
     }
 
+    refresh_progress(
+        &mut stats,
+        project_root,
+        IndexState::Running,
+        IndexPhase::Parsing,
+        scanned_relative.len(),
+    );
+
     scan_spinner.update(format!("Parsing {} files", scanned_relative.len()));
 
     struct PendingFile {
@@ -156,6 +243,13 @@ pub async fn run(
                     scanned_file.path.display()
                 );
                 stats.files_skipped += 1;
+                refresh_progress(
+                    &mut stats,
+                    project_root,
+                    IndexState::Running,
+                    IndexPhase::Parsing,
+                    total_files,
+                );
                 continue;
             }
         };
@@ -165,6 +259,13 @@ pub async fn run(
         if let Some(stored_hash) = segments::get_file_hash(conn, relative_path).await? {
             if stored_hash == file_hash {
                 stats.files_skipped += 1;
+                refresh_progress(
+                    &mut stats,
+                    project_root,
+                    IndexState::Running,
+                    IndexPhase::Parsing,
+                    total_files,
+                );
                 continue;
             }
         }
@@ -188,11 +289,25 @@ pub async fn run(
             // will cover these files without needing them in the FTS index.
             unsupported_extensions.insert(scanned_file.extension.clone());
             stats.files_skipped += 1;
+            refresh_progress(
+                &mut stats,
+                project_root,
+                IndexState::Running,
+                IndexPhase::Parsing,
+                total_files,
+            );
             continue;
         };
 
         if parsed_segments.is_empty() {
             stats.files_skipped += 1;
+            refresh_progress(
+                &mut stats,
+                project_root,
+                IndexState::Running,
+                IndexPhase::Parsing,
+                total_files,
+            );
             continue;
         }
 
@@ -201,6 +316,14 @@ pub async fn run(
             file_hash,
             segments: parsed_segments,
         });
+
+        refresh_progress(
+            &mut stats,
+            project_root,
+            IndexState::Running,
+            IndexPhase::Parsing,
+            total_files,
+        );
     }
 
     if !unsupported_extensions.is_empty() {
@@ -228,6 +351,16 @@ pub async fn run(
         None
     };
     let pending_len = pending.len();
+
+    if pending_len > 0 {
+        refresh_progress(
+            &mut stats,
+            project_root,
+            IndexState::Running,
+            IndexPhase::Storing,
+            scanned_relative.len(),
+        );
+    }
 
     if let Some(emb) = embedder {
         let texts: Vec<&str> = pending
@@ -295,6 +428,13 @@ pub async fn run(
                     pending_len,
                 ));
             }
+            refresh_progress(
+                &mut stats,
+                project_root,
+                IndexState::Running,
+                IndexPhase::Storing,
+                scanned_relative.len(),
+            );
         }
 
         debug_assert!(
@@ -344,6 +484,13 @@ pub async fn run(
                     pending_len,
                 ));
             }
+            refresh_progress(
+                &mut stats,
+                project_root,
+                IndexState::Running,
+                IndexPhase::Storing,
+                scanned_relative.len(),
+            );
         }
     }
 
@@ -361,6 +508,14 @@ pub async fn run(
         stats.files_skipped,
         stats.files_deleted,
         stats.segments_stored,
+    );
+
+    refresh_progress(
+        &mut stats,
+        project_root,
+        IndexState::Complete,
+        IndexPhase::Complete,
+        scanned_relative.len(),
     );
 
     Ok(stats)
