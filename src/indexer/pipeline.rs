@@ -713,10 +713,9 @@ pub async fn run_with_config(
                 .timings
                 .parse_ms
                 .max(parse_result.completed_at_ms);
+            let previous = reorder_buffer.insert(parse_result.sequence_id, parse_result.outcome);
             debug_assert!(
-                reorder_buffer
-                    .insert(parse_result.sequence_id, parse_result.outcome)
-                    .is_none(),
+                previous.is_none(),
                 "duplicate parse result sequence {}",
                 parse_result.sequence_id
             );
@@ -965,6 +964,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(serial_first.files_indexed > 0);
+        assert!(parallel_first.files_indexed > 0);
+        assert!(serial_first.segments_stored > 0);
+        assert!(parallel_first.segments_stored > 0);
         assert_eq!(parallel_first.files_indexed, serial_first.files_indexed);
         assert_eq!(parallel_first.files_skipped, serial_first.files_skipped);
         assert_eq!(parallel_first.files_deleted, serial_first.files_deleted);
@@ -992,6 +995,10 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(serial_second.files_indexed > 0);
+        assert!(parallel_second.files_indexed > 0);
+        assert!(serial_second.segments_stored > 0);
+        assert!(parallel_second.segments_stored > 0);
         assert_eq!(parallel_second.files_indexed, serial_second.files_indexed);
         assert_eq!(parallel_second.files_skipped, serial_second.files_skipped);
         assert_eq!(parallel_second.files_deleted, serial_second.files_deleted);

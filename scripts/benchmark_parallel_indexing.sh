@@ -24,6 +24,23 @@ metric_value() {
   jq -r --argjson idx "$result_index" '.results[$idx].median' "$json_path"
 }
 
+require_index_work() {
+  local label="$1"
+  local output_json="$2"
+
+  if jq -e '.progress.files_indexed > 0 and .progress.segments_stored > 0' >/dev/null <<<"$output_json"; then
+    return 0
+  fi
+
+  local files_indexed
+  local segments_stored
+  files_indexed=$(jq -r '.progress.files_indexed // 0' <<<"$output_json")
+  segments_stored=$(jq -r '.progress.segments_stored // 0' <<<"$output_json")
+  printf 'benchmark run %s produced no indexed work (files_indexed=%s, segments_stored=%s)\n' \
+    "$label" "$files_indexed" "$segments_stored" >&2
+  return 1
+}
+
 sync_repo() {
   local source_dir="$1"
   local target_dir="$2"
@@ -46,7 +63,7 @@ run_full_case() {
   local jobs="$3"
   local embed_threads="$4"
 
-  local args=("$oneup_bin" reindex "$run_dir")
+  local args=("$oneup_bin" "--format" "json" reindex "$run_dir")
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -54,7 +71,9 @@ run_full_case() {
     args+=(--embed-threads "$embed_threads")
   fi
 
-  "${args[@]}" >/dev/null 2>&1
+  local output
+  output=$("${args[@]}")
+  require_index_work "full:$run_dir" "$output"
 }
 
 prepare_incremental_case() {
@@ -72,7 +91,7 @@ pub fn bench_marker() -> &'static str {
 }
 EOF
 
-  local args=("$oneup_bin" index "$run_dir")
+  local args=("$oneup_bin" "--format" "json" index "$run_dir")
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -80,7 +99,9 @@ EOF
     args+=(--embed-threads "$embed_threads")
   fi
 
-  "${args[@]}" >/dev/null 2>&1
+  local output
+  output=$("${args[@]}")
+  require_index_work "prepare-incremental:$run_dir" "$output"
 
   cat > "$run_dir/_1up_parallel_bench.rs" <<'EOF'
 pub fn bench_marker() -> &'static str {
@@ -99,7 +120,7 @@ run_incremental_case() {
   local jobs="$3"
   local embed_threads="$4"
 
-  local args=("$oneup_bin" index "$run_dir")
+  local args=("$oneup_bin" "--format" "json" index "$run_dir")
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -107,7 +128,9 @@ run_incremental_case() {
     args+=(--embed-threads "$embed_threads")
   fi
 
-  "${args[@]}" >/dev/null 2>&1
+  local output
+  output=$("${args[@]}")
+  require_index_work "incremental:$run_dir" "$output"
 }
 
 if [[ "${1:-}" == "__prepare_full_case" ]]; then
