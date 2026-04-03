@@ -179,6 +179,7 @@ enum ParseResultKind {
 struct ParseResult {
     sequence_id: usize,
     outcome: ParseResultKind,
+    completed_at_ms: u128,
 }
 
 fn relative_path_for(project_root: &Path, path: &Path) -> String {
@@ -216,7 +217,7 @@ fn build_scanned_work_items(
         .collect()
 }
 
-fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
+fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
     let content = match std::fs::read_to_string(&scanned_file.path) {
         Ok(content) => content,
         Err(err) => {
@@ -224,20 +225,14 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
                 "skipping unreadable file {}: {err}",
                 scanned_file.path.display()
             );
-            return ParseResult {
-                sequence_id: scanned_file.sequence_id,
-                outcome: ParseResultKind::Skipped(ParseSkipReason::Unreadable),
-            };
+            return ParseResultKind::Skipped(ParseSkipReason::Unreadable);
         }
     };
 
     let file_hash = compute_file_hash(content.as_bytes());
     if scanned_file.stored_hash.as_deref() == Some(file_hash.as_str()) {
         debug!("skipping unchanged file: {}", scanned_file.relative_path);
-        return ParseResult {
-            sequence_id: scanned_file.sequence_id,
-            outcome: ParseResultKind::Skipped(ParseSkipReason::Unchanged),
-        };
+        return ParseResultKind::Skipped(ParseSkipReason::Unchanged);
     }
 
     let segments = if parser::use_structural_parser(&scanned_file.extension) {
@@ -258,12 +253,9 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
             "skipping unsupported extension .{}: {}",
             scanned_file.extension, scanned_file.relative_path
         );
-        return ParseResult {
-            sequence_id: scanned_file.sequence_id,
-            outcome: ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
-                scanned_file.extension,
-            )),
-        };
+        return ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
+            scanned_file.extension,
+        ));
     };
 
     if segments.is_empty() {
@@ -271,20 +263,14 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
             "skipping file with no parsed segments: {}",
             scanned_file.relative_path
         );
-        return ParseResult {
-            sequence_id: scanned_file.sequence_id,
-            outcome: ParseResultKind::Skipped(ParseSkipReason::EmptySegments),
-        };
+        return ParseResultKind::Skipped(ParseSkipReason::EmptySegments);
     }
 
-    ParseResult {
-        sequence_id: scanned_file.sequence_id,
-        outcome: ParseResultKind::Ready(ParsedWorkItem {
-            relative_path: scanned_file.relative_path,
-            file_hash,
-            segments,
-        }),
-    }
+    ParseResultKind::Ready(ParsedWorkItem {
+        relative_path: scanned_file.relative_path,
+        file_hash,
+        segments,
+    })
 }
 
 fn build_segment_insert(
@@ -708,7 +694,12 @@ pub async fn run_with_config(
         while next_to_dispatch < total_files || !parse_workers.is_empty() {
             while next_to_dispatch < total_files && parse_workers.len() < config.jobs {
                 let scanned_file = scanned_files[next_to_dispatch].clone();
-                parse_workers.spawn_blocking(move || parse_scanned_file(scanned_file));
+                let sequence_id = scanned_file.sequence_id;
+                parse_workers.spawn_blocking(move || ParseResult {
+                    sequence_id,
+                    outcome: parse_scanned_file(scanned_file),
+                    completed_at_ms: parse_started_at.elapsed().as_millis(),
+                });
                 next_to_dispatch += 1;
             }
 
@@ -718,6 +709,10 @@ pub async fn run_with_config(
 
             let parse_result = parse_result
                 .map_err(|err| IndexingError::Pipeline(format!("parse worker failed: {err}")))?;
+            flush_state.timings.parse_ms = flush_state
+                .timings
+                .parse_ms
+                .max(parse_result.completed_at_ms);
             debug_assert!(
                 reorder_buffer
                     .insert(parse_result.sequence_id, parse_result.outcome)
@@ -749,7 +744,6 @@ pub async fn run_with_config(
         )
         .await?;
     }
-    timings.parse_ms = parse_started_at.elapsed().as_millis();
 
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
