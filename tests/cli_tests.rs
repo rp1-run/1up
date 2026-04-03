@@ -3,11 +3,25 @@ use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
 fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
+}
+
+fn test_data_dir(home: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library").join("Application Support").join("1up")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local").join("share").join("1up")
+    }
 }
 
 struct HideModelGuard {
@@ -137,6 +151,52 @@ fn init_warns_if_already_initialized() {
         .assert()
         .success()
         .stderr(predicate::str::contains("already initialized"));
+}
+
+#[test]
+fn start_auto_initializes_project_if_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = test_data_dir(home.path());
+    let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .args(["--format", "json", "start", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Initialized project")
+                .and(predicate::str::contains("Daemon started")),
+        );
+
+    let id_path = dir.path().join(".1up").join("project_id");
+    assert!(id_path.exists(), "start should create .1up/project_id");
+
+    let pid_file = data_dir.join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pid_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if pid_file.exists() {
+        cmd()
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .args(["--format", "json", "stop", dir.path().to_str().unwrap()])
+            .assert()
+            .success();
+    }
 }
 
 #[test]
