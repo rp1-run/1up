@@ -208,6 +208,7 @@ pub async fn delete_segments_by_file(
 
 /// Get the stored file hash for a given file path (from the first segment found).
 /// Returns None if no segments exist for this file.
+#[allow(dead_code)]
 pub async fn get_file_hash(
     conn: &Connection,
     file_path: &str,

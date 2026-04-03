@@ -141,6 +141,7 @@ ORDER BY line_start";
 
 pub const DELETE_SEGMENTS_BY_FILE: &str = "DELETE FROM segments WHERE file_path = ?1";
 
+#[allow(dead_code)]
 pub const SELECT_FILE_HASH: &str = "
 SELECT DISTINCT file_hash
 FROM segments

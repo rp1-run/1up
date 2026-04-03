@@ -1,9 +1,10 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use libsql::Connection;
 use nanospinner::Spinner;
 use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
@@ -76,7 +77,7 @@ use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::types::{
     IndexParallelism, IndexPhase, IndexProgress, IndexState, IndexingConfig, ParsedSegment,
 };
-use crate::storage::segments::{self, SegmentInsert};
+use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
@@ -119,6 +120,382 @@ fn should_embed_segment(seg: &ParsedSegment) -> bool {
             | "makefile"
             | "dockerfile"
     )
+}
+
+#[derive(Debug, Clone)]
+struct ScannedWorkItem {
+    sequence_id: usize,
+    relative_path: String,
+    path: PathBuf,
+    extension: String,
+    stored_hash: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedWorkItem {
+    relative_path: String,
+    file_hash: String,
+    segments: Vec<ParsedSegment>,
+}
+
+#[derive(Debug)]
+enum ParseSkipReason {
+    EmptySegments,
+    Unchanged,
+    Unreadable,
+    UnsupportedExtension(String),
+}
+
+#[derive(Debug)]
+enum ParseResultKind {
+    Ready(ParsedWorkItem),
+    Skipped(ParseSkipReason),
+}
+
+#[derive(Debug)]
+struct ParseResult {
+    sequence_id: usize,
+    outcome: ParseResultKind,
+}
+
+fn relative_path_for(project_root: &Path, path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical
+        .strip_prefix(project_root)
+        .unwrap_or(&canonical)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn build_scanned_work_items(
+    project_root: &Path,
+    scanned: Vec<scanner::ScannedFile>,
+    stored_hashes: &HashMap<String, String>,
+) -> Vec<ScannedWorkItem> {
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    scanned
+        .into_iter()
+        .enumerate()
+        .map(|(sequence_id, scanned_file)| {
+            let relative_path = relative_path_for(&project_root, &scanned_file.path);
+            let stored_hash = stored_hashes.get(&relative_path).cloned();
+            ScannedWorkItem {
+                sequence_id,
+                relative_path,
+                path: scanned_file.path,
+                extension: scanned_file.extension,
+                stored_hash,
+            }
+        })
+        .collect()
+}
+
+fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResult {
+    let content = match std::fs::read_to_string(&scanned_file.path) {
+        Ok(content) => content,
+        Err(err) => {
+            info!(
+                "skipping unreadable file {}: {err}",
+                scanned_file.path.display()
+            );
+            return ParseResult {
+                sequence_id: scanned_file.sequence_id,
+                outcome: ParseResultKind::Skipped(ParseSkipReason::Unreadable),
+            };
+        }
+    };
+
+    let file_hash = compute_file_hash(content.as_bytes());
+    if scanned_file.stored_hash.as_deref() == Some(file_hash.as_str()) {
+        return ParseResult {
+            sequence_id: scanned_file.sequence_id,
+            outcome: ParseResultKind::Skipped(ParseSkipReason::Unchanged),
+        };
+    }
+
+    let segments = if parser::use_structural_parser(&scanned_file.extension) {
+        match parser::parse_file(&content, &scanned_file.extension) {
+            Ok(segments) => segments,
+            Err(err) => {
+                info!(
+                    "tree-sitter parse failed for {}, falling back to text chunker: {err}",
+                    scanned_file.relative_path
+                );
+                chunker::chunk_file_default(&content, &scanned_file.extension)
+            }
+        }
+    } else if parser::is_language_supported(&scanned_file.extension) {
+        chunker::chunk_file_default(&content, &scanned_file.extension)
+    } else {
+        return ParseResult {
+            sequence_id: scanned_file.sequence_id,
+            outcome: ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
+                scanned_file.extension,
+            )),
+        };
+    };
+
+    if segments.is_empty() {
+        return ParseResult {
+            sequence_id: scanned_file.sequence_id,
+            outcome: ParseResultKind::Skipped(ParseSkipReason::EmptySegments),
+        };
+    }
+
+    ParseResult {
+        sequence_id: scanned_file.sequence_id,
+        outcome: ParseResultKind::Ready(ParsedWorkItem {
+            relative_path: scanned_file.relative_path,
+            file_hash,
+            segments,
+        }),
+    }
+}
+
+fn build_segment_insert(
+    relative_path: &str,
+    file_hash: &str,
+    segment: &ParsedSegment,
+    embedding_vec: Option<String>,
+) -> SegmentInsert {
+    SegmentInsert {
+        id: generate_segment_id(relative_path, segment.line_start, segment.line_end),
+        file_path: relative_path.to_string(),
+        language: segment.language.clone(),
+        block_type: segment.block_type.clone(),
+        content: segment.content.clone(),
+        line_start: segment.line_start as i64,
+        line_end: segment.line_end as i64,
+        embedding_vec,
+        breadcrumb: segment.breadcrumb.clone(),
+        complexity: segment.complexity as i64,
+        role: format!("{:?}", segment.role).to_uppercase(),
+        defined_symbols: serde_json::to_string(&segment.defined_symbols)
+            .unwrap_or_else(|_| "[]".into()),
+        referenced_symbols: serde_json::to_string(&segment.referenced_symbols)
+            .unwrap_or_else(|_| "[]".into()),
+        called_symbols: serde_json::to_string(&segment.called_symbols)
+            .unwrap_or_else(|_| "[]".into()),
+        file_hash: file_hash.to_string(),
+    }
+}
+
+fn build_segment_batches(
+    parsed_files: &[ParsedWorkItem],
+    embedder: Option<&mut Embedder>,
+) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
+    let mut embeddings = if let Some(embedder) = embedder {
+        let texts: Vec<&str> = parsed_files
+            .iter()
+            .flat_map(|file| {
+                file.segments
+                    .iter()
+                    .filter(|segment| should_embed_segment(segment))
+                    .map(|segment| segment.content.as_str())
+            })
+            .collect();
+        Some(embedder.embed_batch(&texts)?.into_iter())
+    } else {
+        None
+    };
+
+    let mut batches = Vec::with_capacity(parsed_files.len());
+    for file in parsed_files {
+        let mut inserts = Vec::with_capacity(file.segments.len());
+        for segment in &file.segments {
+            let embedding_vec = if should_embed_segment(segment) {
+                match embeddings.as_mut() {
+                    Some(embeddings) => {
+                        let embedding = embeddings.next().ok_or_else(|| {
+                            IndexingError::Pipeline(format!(
+                                "missing embedding for {}:{}-{}",
+                                file.relative_path, segment.line_start, segment.line_end
+                            ))
+                        })?;
+                        Some(serialize_embedding(&embedding)?)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            inserts.push(build_segment_insert(
+                &file.relative_path,
+                &file.file_hash,
+                segment,
+                embedding_vec,
+            ));
+        }
+        batches.push(inserts);
+    }
+
+    if let Some(embeddings) = embeddings.as_mut() {
+        debug_assert!(
+            embeddings.next().is_none(),
+            "unexpected trailing embeddings after pipeline run"
+        );
+    }
+
+    Ok(batches)
+}
+
+async fn replace_file_batches(
+    conn: &Connection,
+    parsed_files: &[ParsedWorkItem],
+    segment_batches: &[Vec<SegmentInsert>],
+) -> Result<(), OneupError> {
+    if parsed_files.len() == 1 {
+        return segments::replace_file_segments_tx(
+            conn,
+            &parsed_files[0].relative_path,
+            &segment_batches[0],
+        )
+        .await;
+    }
+
+    let file_batches: Vec<FileSegmentBatch<'_>> = parsed_files
+        .iter()
+        .zip(segment_batches.iter())
+        .map(|(file, segments)| FileSegmentBatch {
+            file_path: file.relative_path.as_str(),
+            segments,
+        })
+        .collect();
+
+    segments::replace_file_batch_tx(conn, &file_batches).await
+}
+
+async fn store_ready_files(
+    conn: &Connection,
+    ready_files: &mut Vec<ParsedWorkItem>,
+    embedder: Option<&mut Embedder>,
+    stats: &mut PipelineStats,
+) -> Result<(), OneupError> {
+    if ready_files.is_empty() {
+        return Ok(());
+    }
+
+    let parsed_files = std::mem::take(ready_files);
+    let segment_batches = build_segment_batches(&parsed_files, embedder)?;
+    let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
+
+    replace_file_batches(conn, &parsed_files, &segment_batches).await?;
+
+    stats.files_indexed += parsed_files.len();
+    stats.segments_stored += segment_count;
+    Ok(())
+}
+
+async fn delete_removed_files(
+    conn: &Connection,
+    deleted_paths: &[String],
+    batch_size: usize,
+) -> Result<(), OneupError> {
+    for chunk in deleted_paths.chunks(batch_size.max(1)) {
+        if chunk.len() == 1 {
+            segments::replace_file_segments_tx(conn, &chunk[0], &[]).await?;
+            continue;
+        }
+
+        let file_batches: Vec<FileSegmentBatch<'_>> = chunk
+            .iter()
+            .map(|path| FileSegmentBatch {
+                file_path: path.as_str(),
+                segments: &[],
+            })
+            .collect();
+        segments::replace_file_batch_tx(conn, &file_batches).await?;
+    }
+
+    Ok(())
+}
+
+fn current_progress_phase(stats: &PipelineStats) -> IndexPhase {
+    if stats.files_indexed > 0 {
+        IndexPhase::Storing
+    } else {
+        IndexPhase::Parsing
+    }
+}
+
+struct FlushState<'a> {
+    stats: &'a mut PipelineStats,
+    project_root: &'a Path,
+    files_total: usize,
+    parallelism: Option<IndexParallelism>,
+    unsupported_extensions: &'a mut HashSet<String>,
+}
+
+impl FlushState<'_> {
+    fn refresh(&mut self, phase: IndexPhase) {
+        refresh_progress(
+            self.stats,
+            self.project_root,
+            IndexState::Running,
+            phase,
+            self.files_total,
+            self.parallelism.clone(),
+        );
+    }
+}
+
+async fn flush_reorder_buffer(
+    conn: &Connection,
+    reorder_buffer: &mut BTreeMap<usize, ParseResultKind>,
+    next_sequence: &mut usize,
+    config: &IndexingConfig,
+    embedder: &mut Option<&mut Embedder>,
+    state: &mut FlushState<'_>,
+) -> Result<(), OneupError> {
+    let mut ready_files = Vec::new();
+
+    while let Some(result) = reorder_buffer.remove(next_sequence) {
+        match result {
+            ParseResultKind::Ready(file) => {
+                ready_files.push(file);
+                *next_sequence += 1;
+
+                if ready_files.len() >= config.write_batch_files {
+                    {
+                        let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
+                        store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+                    }
+                    state.refresh(IndexPhase::Storing);
+                }
+            }
+            ParseResultKind::Skipped(reason) => {
+                if !ready_files.is_empty() {
+                    {
+                        let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
+                        store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+                    }
+                    state.refresh(IndexPhase::Storing);
+                }
+
+                if let ParseSkipReason::UnsupportedExtension(extension) = reason {
+                    state.unsupported_extensions.insert(extension);
+                }
+
+                state.stats.files_skipped += 1;
+                *next_sequence += 1;
+                state.refresh(current_progress_phase(state.stats));
+            }
+        }
+    }
+
+    if !ready_files.is_empty() {
+        {
+            let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
+            store_ready_files(conn, &mut ready_files, embedder, state.stats).await?;
+        }
+        state.refresh(IndexPhase::Storing);
+    }
+
+    Ok(())
 }
 
 /// Statistics returned after a pipeline run.
@@ -168,6 +545,7 @@ pub async fn run_with_config(
 ) -> Result<PipelineStats, OneupError> {
     let mut stats = PipelineStats::default();
     let parallelism = Some(config.parallelism());
+    let mut embedder = embedder;
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
@@ -185,46 +563,33 @@ pub async fn run_with_config(
         parallelism.clone(),
     );
 
-    let scan_spinner = spin("Scanning files");
+    let progress_spinner = spin("Scanning files");
 
     let scanned = scanner::scan_directory(project_root)?;
     stats.files_scanned = scanned.len();
 
-    scan_spinner.update(format!("Scanning {} files", scanned.len()));
+    progress_spinner.update(format!("Scanning {} files", scanned.len()));
 
+    let stored_hashes = segments::get_all_file_hashes(conn).await?;
+    let scanned_files = build_scanned_work_items(project_root, scanned, &stored_hashes);
+    let total_files = scanned_files.len();
+
+    let scanned_paths: HashSet<String> = scanned_files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect();
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
         .into_iter()
         .collect();
-
-    let project_root_str = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-
-    let scanned_relative: Vec<(String, &scanner::ScannedFile)> = scanned
-        .iter()
-        .map(|f| {
-            let canonical = f.path.canonicalize().unwrap_or_else(|_| f.path.clone());
-            let relative = canonical
-                .strip_prefix(&project_root_str)
-                .unwrap_or(&canonical)
-                .to_string_lossy()
-                .to_string();
-            (relative, f)
-        })
-        .collect();
-
-    let scanned_paths: HashSet<String> = scanned_relative
-        .iter()
-        .map(|(rel, _)| rel.clone())
-        .collect();
-
     let deleted_paths: Vec<String> = indexed_paths.difference(&scanned_paths).cloned().collect();
 
-    for path in &deleted_paths {
-        segments::delete_segments_by_file(conn, path).await?;
-        debug!("removed segments for deleted file: {path}");
-        stats.files_deleted += 1;
+    if !deleted_paths.is_empty() {
+        delete_removed_files(conn, &deleted_paths, config.write_batch_files).await?;
+        for path in &deleted_paths {
+            debug!("removed segments for deleted file: {path}");
+        }
+        stats.files_deleted = deleted_paths.len();
     }
 
     refresh_progress(
@@ -232,120 +597,69 @@ pub async fn run_with_config(
         project_root,
         IndexState::Running,
         IndexPhase::Parsing,
-        scanned_relative.len(),
+        total_files,
         parallelism.clone(),
     );
 
-    scan_spinner.update(format!("Parsing {} files", scanned_relative.len()));
+    progress_spinner.update(format!("Processing files (0/{total_files})"));
 
-    struct PendingFile {
-        relative_path: String,
-        file_hash: String,
-        segments: Vec<ParsedSegment>,
-    }
-
-    let mut pending: Vec<PendingFile> = Vec::new();
+    let mut reorder_buffer = BTreeMap::new();
+    let mut parse_workers = JoinSet::new();
+    let mut next_to_dispatch = 0usize;
+    let mut next_to_flush = 0usize;
     let mut unsupported_extensions: HashSet<String> = HashSet::new();
-    let total_files = scanned_relative.len();
-
-    for (file_idx, (relative_path, scanned_file)) in scanned_relative.iter().enumerate() {
-        if file_idx % 100 == 0 {
-            scan_spinner.update(format!("Parsing files ({}/{})", file_idx + 1, total_files));
-        }
-        let content = match std::fs::read_to_string(&scanned_file.path) {
-            Ok(c) => c,
-            Err(e) => {
-                info!(
-                    "skipping unreadable file {}: {e}",
-                    scanned_file.path.display()
-                );
-                stats.files_skipped += 1;
-                refresh_progress(
-                    &mut stats,
-                    project_root,
-                    IndexState::Running,
-                    IndexPhase::Parsing,
-                    total_files,
-                    parallelism.clone(),
-                );
-                continue;
-            }
-        };
-
-        let file_hash = compute_file_hash(content.as_bytes());
-
-        if let Some(stored_hash) = segments::get_file_hash(conn, relative_path).await? {
-            if stored_hash == file_hash {
-                stats.files_skipped += 1;
-                refresh_progress(
-                    &mut stats,
-                    project_root,
-                    IndexState::Running,
-                    IndexPhase::Parsing,
-                    total_files,
-                    parallelism.clone(),
-                );
-                continue;
-            }
-        }
-
-        let parsed_segments = if parser::use_structural_parser(&scanned_file.extension) {
-            match parser::parse_file(&content, &scanned_file.extension) {
-                Ok(segs) => segs,
-                Err(e) => {
-                    info!(
-                        "tree-sitter parse failed for {}, falling back to text chunker: {e}",
-                        relative_path
-                    );
-                    chunker::chunk_file_default(&content, &scanned_file.extension)
-                }
-            }
-        } else if parser::is_language_supported(&scanned_file.extension) {
-            // Recognized language but better served by text chunking (YAML, TOML, etc.)
-            chunker::chunk_file_default(&content, &scanned_file.extension)
-        } else {
-            // Unknown file type — skip entirely. A secondary search (grep)
-            // will cover these files without needing them in the FTS index.
-            unsupported_extensions.insert(scanned_file.extension.clone());
-            stats.files_skipped += 1;
-            refresh_progress(
-                &mut stats,
-                project_root,
-                IndexState::Running,
-                IndexPhase::Parsing,
-                total_files,
-                parallelism.clone(),
-            );
-            continue;
-        };
-
-        if parsed_segments.is_empty() {
-            stats.files_skipped += 1;
-            refresh_progress(
-                &mut stats,
-                project_root,
-                IndexState::Running,
-                IndexPhase::Parsing,
-                total_files,
-                parallelism.clone(),
-            );
-            continue;
-        }
-
-        pending.push(PendingFile {
-            relative_path: relative_path.clone(),
-            file_hash,
-            segments: parsed_segments,
-        });
-
-        refresh_progress(
-            &mut stats,
+    {
+        let mut flush_state = FlushState {
+            stats: &mut stats,
             project_root,
-            IndexState::Running,
-            IndexPhase::Parsing,
-            total_files,
-            parallelism.clone(),
-        );
+            files_total: total_files,
+            parallelism: parallelism.clone(),
+            unsupported_extensions: &mut unsupported_extensions,
+        };
+
+        while next_to_dispatch < total_files || !parse_workers.is_empty() {
+            while next_to_dispatch < total_files && parse_workers.len() < config.jobs {
+                let scanned_file = scanned_files[next_to_dispatch].clone();
+                parse_workers.spawn_blocking(move || parse_scanned_file(scanned_file));
+                next_to_dispatch += 1;
+            }
+
+            let Some(parse_result) = parse_workers.join_next().await else {
+                break;
+            };
+
+            let parse_result = parse_result
+                .map_err(|err| IndexingError::Pipeline(format!("parse worker failed: {err}")))?;
+            debug_assert!(
+                reorder_buffer
+                    .insert(parse_result.sequence_id, parse_result.outcome)
+                    .is_none(),
+                "duplicate parse result sequence {}",
+                parse_result.sequence_id
+            );
+
+            flush_reorder_buffer(
+                conn,
+                &mut reorder_buffer,
+                &mut next_to_flush,
+                config,
+                &mut embedder,
+                &mut flush_state,
+            )
+            .await?;
+
+            progress_spinner.update(format!("Processing files ({next_to_flush}/{total_files})"));
+        }
+
+        flush_reorder_buffer(
+            conn,
+            &mut reorder_buffer,
+            &mut next_to_flush,
+            config,
+            &mut embedder,
+            &mut flush_state,
+        )
+        .await?;
     }
 
     if !unsupported_extensions.is_empty() {
@@ -354,177 +668,14 @@ pub async fn run_with_config(
         debug!("skipped unsupported file types: .{}", exts.join(", ."));
     }
 
-    let total_segments: usize = pending.iter().map(|pf| pf.segments.len()).sum();
-    scan_spinner.success_with(format!(
-        "Scanned {} files, {} to index ({} segments)",
-        scanned_relative.len(),
-        pending.len(),
-        total_segments,
+    progress_spinner.success_with(format!(
+        "Processed {} files: {} indexed, {} skipped, {} deleted, {} segments",
+        total_files,
+        stats.files_indexed,
+        stats.files_skipped,
+        stats.files_deleted,
+        stats.segments_stored,
     ));
-
-    let store_spinner = if !pending.is_empty() {
-        let label = if has_embedder {
-            "Embedding & storing"
-        } else {
-            "Storing segments"
-        };
-        Some(spin(label))
-    } else {
-        None
-    };
-    let pending_len = pending.len();
-
-    if pending_len > 0 {
-        refresh_progress(
-            &mut stats,
-            project_root,
-            IndexState::Running,
-            IndexPhase::Storing,
-            scanned_relative.len(),
-            parallelism.clone(),
-        );
-    }
-
-    if let Some(emb) = embedder {
-        let texts: Vec<&str> = pending
-            .iter()
-            .flat_map(|pf| {
-                pf.segments
-                    .iter()
-                    .filter(|seg| should_embed_segment(seg))
-                    .map(|s| s.content.as_str())
-            })
-            .collect();
-        let mut embeddings = emb.embed_batch(&texts)?.into_iter();
-
-        for (file_idx, pf) in pending.iter().enumerate() {
-            segments::delete_segments_by_file(conn, &pf.relative_path).await?;
-
-            for seg in &pf.segments {
-                let embedding_vec = if should_embed_segment(seg) {
-                    let embedding = embeddings.next().ok_or_else(|| {
-                        IndexingError::Pipeline(format!(
-                            "missing embedding for {}:{}-{}",
-                            pf.relative_path, seg.line_start, seg.line_end
-                        ))
-                    })?;
-                    Some(serialize_embedding(&embedding)?)
-                } else {
-                    None
-                };
-
-                let insert = SegmentInsert {
-                    id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
-                    file_path: pf.relative_path.clone(),
-                    language: seg.language.clone(),
-                    block_type: seg.block_type.clone(),
-                    content: seg.content.clone(),
-                    line_start: seg.line_start as i64,
-                    line_end: seg.line_end as i64,
-                    embedding_vec,
-                    breadcrumb: seg.breadcrumb.clone(),
-                    complexity: seg.complexity as i64,
-                    role: format!("{:?}", seg.role).to_uppercase(),
-                    defined_symbols: serde_json::to_string(&seg.defined_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    referenced_symbols: serde_json::to_string(&seg.referenced_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    called_symbols: serde_json::to_string(&seg.called_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    file_hash: pf.file_hash.clone(),
-                };
-
-                segments::upsert_segment(conn, &insert).await?;
-                stats.segments_stored += 1;
-            }
-
-            stats.files_indexed += 1;
-            if let Some(ref sp) = store_spinner {
-                sp.update(format!(
-                    "{} ({}/{})",
-                    if has_embedder {
-                        "Embedding & storing"
-                    } else {
-                        "Storing segments"
-                    },
-                    file_idx + 1,
-                    pending_len,
-                ));
-            }
-            refresh_progress(
-                &mut stats,
-                project_root,
-                IndexState::Running,
-                IndexPhase::Storing,
-                scanned_relative.len(),
-                parallelism.clone(),
-            );
-        }
-
-        debug_assert!(
-            embeddings.next().is_none(),
-            "unexpected trailing embeddings after pipeline run"
-        );
-    } else {
-        for (file_idx, pf) in pending.iter().enumerate() {
-            segments::delete_segments_by_file(conn, &pf.relative_path).await?;
-
-            for seg in &pf.segments {
-                let insert = SegmentInsert {
-                    id: generate_segment_id(&pf.relative_path, seg.line_start, seg.line_end),
-                    file_path: pf.relative_path.clone(),
-                    language: seg.language.clone(),
-                    block_type: seg.block_type.clone(),
-                    content: seg.content.clone(),
-                    line_start: seg.line_start as i64,
-                    line_end: seg.line_end as i64,
-                    embedding_vec: None,
-                    breadcrumb: seg.breadcrumb.clone(),
-                    complexity: seg.complexity as i64,
-                    role: format!("{:?}", seg.role).to_uppercase(),
-                    defined_symbols: serde_json::to_string(&seg.defined_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    referenced_symbols: serde_json::to_string(&seg.referenced_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    called_symbols: serde_json::to_string(&seg.called_symbols)
-                        .unwrap_or_else(|_| "[]".into()),
-                    file_hash: pf.file_hash.clone(),
-                };
-
-                segments::upsert_segment(conn, &insert).await?;
-                stats.segments_stored += 1;
-            }
-
-            stats.files_indexed += 1;
-            if let Some(ref sp) = store_spinner {
-                sp.update(format!(
-                    "{} ({}/{})",
-                    if has_embedder {
-                        "Embedding & storing"
-                    } else {
-                        "Storing segments"
-                    },
-                    file_idx + 1,
-                    pending_len,
-                ));
-            }
-            refresh_progress(
-                &mut stats,
-                project_root,
-                IndexState::Running,
-                IndexPhase::Storing,
-                scanned_relative.len(),
-                parallelism.clone(),
-            );
-        }
-    }
-
-    if let Some(sp) = store_spinner {
-        sp.success_with(format!(
-            "Stored {} segments across {} files",
-            stats.segments_stored, stats.files_indexed,
-        ));
-    }
 
     info!(
         "pipeline complete: {} scanned, {} indexed, {} skipped, {} deleted, {} segments",
@@ -540,7 +691,7 @@ pub async fn run_with_config(
         project_root,
         IndexState::Complete,
         IndexPhase::Complete,
-        scanned_relative.len(),
+        total_files,
         parallelism,
     );
 
@@ -558,6 +709,52 @@ mod tests {
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
         (db, conn)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SegmentSnapshot {
+        id: String,
+        file_path: String,
+        language: String,
+        block_type: String,
+        content: String,
+        line_start: i64,
+        line_end: i64,
+        breadcrumb: Option<String>,
+        complexity: i64,
+        role: String,
+        defined_symbols: String,
+        referenced_symbols: String,
+        called_symbols: String,
+        file_hash: String,
+    }
+
+    async fn snapshot_segments(conn: &Connection) -> Vec<SegmentSnapshot> {
+        let mut snapshots = Vec::new();
+        for file_path in segments::get_all_file_paths(conn).await.unwrap() {
+            for segment in segments::get_segments_by_file(conn, &file_path)
+                .await
+                .unwrap()
+            {
+                snapshots.push(SegmentSnapshot {
+                    id: segment.id,
+                    file_path: segment.file_path,
+                    language: segment.language,
+                    block_type: segment.block_type,
+                    content: segment.content,
+                    line_start: segment.line_start,
+                    line_end: segment.line_end,
+                    breadcrumb: segment.breadcrumb,
+                    complexity: segment.complexity,
+                    role: segment.role,
+                    defined_symbols: segment.defined_symbols,
+                    referenced_symbols: segment.referenced_symbols,
+                    called_symbols: segment.called_symbols,
+                    file_hash: segment.file_hash,
+                });
+            }
+        }
+        snapshots
     }
 
     #[tokio::test]
@@ -641,6 +838,66 @@ mod tests {
 
         let paths2 = segments::get_all_file_paths(&conn).await.unwrap();
         assert_eq!(paths2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_pipeline_matches_single_job_for_incremental_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(
+            tmp.path().join("notes.md"),
+            "# Notes\n\nparallel indexing keeps results fresh.\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("config.ini"), "host=localhost\nport=5432\n").unwrap();
+        fs::write(tmp.path().join("opaque.xyz"), "opaque\n").unwrap();
+
+        let (_serial_db, serial_conn) = setup().await;
+        let (_parallel_db, parallel_conn) = setup().await;
+        let serial_config = IndexingConfig::new(1, 1, 1).unwrap();
+        let parallel_config = IndexingConfig::new(4, 1, 2).unwrap();
+
+        let serial_first = run_with_config(&serial_conn, tmp.path(), None, &serial_config)
+            .await
+            .unwrap();
+        let parallel_first = run_with_config(&parallel_conn, tmp.path(), None, &parallel_config)
+            .await
+            .unwrap();
+
+        assert_eq!(parallel_first.files_indexed, serial_first.files_indexed);
+        assert_eq!(parallel_first.files_skipped, serial_first.files_skipped);
+        assert_eq!(parallel_first.files_deleted, serial_first.files_deleted);
+        assert_eq!(
+            snapshot_segments(&parallel_conn).await,
+            snapshot_segments(&serial_conn).await
+        );
+
+        fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join("notes.md")).unwrap();
+        fs::write(
+            tmp.path().join("readme.txt"),
+            "parallel indexing keeps writes ordered\nwhile skipping unchanged files\n",
+        )
+        .unwrap();
+
+        let serial_second = run_with_config(&serial_conn, tmp.path(), None, &serial_config)
+            .await
+            .unwrap();
+        let parallel_second = run_with_config(&parallel_conn, tmp.path(), None, &parallel_config)
+            .await
+            .unwrap();
+
+        assert_eq!(parallel_second.files_indexed, serial_second.files_indexed);
+        assert_eq!(parallel_second.files_skipped, serial_second.files_skipped);
+        assert_eq!(parallel_second.files_deleted, serial_second.files_deleted);
+        assert_eq!(
+            snapshot_segments(&parallel_conn).await,
+            snapshot_segments(&serial_conn).await
+        );
     }
 
     #[tokio::test]
