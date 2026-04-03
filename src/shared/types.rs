@@ -195,6 +195,7 @@ impl IndexingConfig {
         })
     }
 
+    #[allow(dead_code)]
     pub fn auto() -> Self {
         Self::from_sources(None, None, None).expect("automatic indexing defaults are valid")
     }

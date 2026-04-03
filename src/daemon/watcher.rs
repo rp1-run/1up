@@ -80,18 +80,17 @@ impl FileWatcher {
         let mut changed = HashSet::new();
 
         while let Ok(result) = self.rx.recv_timeout(timeout) {
-            match result {
-                Ok(event) => {
-                    for path in event.paths {
-                        if path.is_file() || !path.exists() {
-                            changed.insert(path);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("watcher event error: {e}");
-                }
-            }
+            collect_event_paths(result, &mut changed);
+        }
+
+        changed
+    }
+
+    pub fn drain_events_nowait(&self) -> HashSet<PathBuf> {
+        let mut changed = HashSet::new();
+
+        while let Ok(result) = self.rx.try_recv() {
+            collect_event_paths(result, &mut changed);
         }
 
         changed
@@ -100,6 +99,21 @@ impl FileWatcher {
     #[allow(dead_code)]
     pub fn watched_roots(&self) -> &HashSet<PathBuf> {
         &self.watched_roots
+    }
+}
+
+fn collect_event_paths(result: notify::Result<Event>, changed: &mut HashSet<PathBuf>) {
+    match result {
+        Ok(event) => {
+            for path in event.paths {
+                if path.is_file() || !path.exists() {
+                    changed.insert(path);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("watcher event error: {e}");
+        }
     }
 }
 

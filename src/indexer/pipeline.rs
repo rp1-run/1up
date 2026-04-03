@@ -529,6 +529,7 @@ impl Default for PipelineStats {
 /// Scans for source files, computes SHA-256 hashes for incremental detection,
 /// parses/chunks files, generates embeddings, and stores segments in the database.
 /// Deleted files have their segments removed.
+#[allow(dead_code)]
 pub async fn run(
     conn: &Connection,
     project_root: &Path,
