@@ -1,32 +1,64 @@
-# 1up Knowledge Base Index
+# 1up - Knowledge Base
 
-**Project**: 1up -- Unified search substrate for source repositories
-**Language**: Rust (2021 edition)
-**Binary**: `1up` (single crate, package name `oneup`)
+**Type**: Single Project
+**Languages**: Rust
+**Updated**: 2026-04-03
 
-## KB Files
+## Project Summary
 
-| File | Contents |
-|------|----------|
-| `architecture.md` | System architecture, process model, data flow, storage layout |
-| `modules.md` | Module hierarchy with descriptions and responsibilities |
-| `patterns.md` | Key patterns, conventions, and coding standards |
+1up is a local code search and indexing CLI tool that combines semantic vector search, full-text search (FTS5), and symbol lookup via Reciprocal Rank Fusion (RRF) to provide high-quality code search results. It uses tree-sitter for multi-language AST parsing, ONNX Runtime for embedding generation, and libSQL for storage, with a background daemon for automatic incremental re-indexing on file changes.
 
-## Loading Guide
+## Quick Reference
 
-| Task | Load |
-|------|------|
+| Aspect | Value |
+|--------|-------|
+| Entry Point | `src/main.rs` -> `src/cli/mod.rs` |
+| Key Pattern | Layered Architecture + Two-Process Model (CLI + Daemon) |
+| Tech Stack | Rust, tokio, clap, tree-sitter (16 langs), libSQL, ONNX Runtime (all-MiniLM-L6-v2) |
+
+## KB File Manifest
+
+**Progressive Loading**: Load files on-demand based on your task.
+
+| File | Lines | Load For |
+|------|-------|----------|
+| architecture.md | ~126 | System design, layers, data flows, integration points |
+| modules.md | ~158 | Component breakdown, module responsibilities, dependencies |
+| patterns.md | ~73 | Code conventions, error handling, testing idioms |
+| concept_map.md | ~94 | Domain terminology (Segment, RRF, QueryIntent, etc.) |
+
+## Task-Based Loading
+
+| Task | Files to Load |
+|------|---------------|
 | Code review | `patterns.md` |
 | Bug investigation | `architecture.md`, `modules.md` |
-| Feature work | `modules.md`, `patterns.md` |
-| System-wide analysis | all files |
+| Feature implementation | `modules.md`, `patterns.md` |
+| Strategic analysis | ALL files |
 
-## Quick Orientation
+## How to Load
 
-- Single-binary CLI with clap derive subcommands
-- Turso (formerly libSQL) for persistent storage with tantivy-backed FTS + vector columns
-- Tree-sitter for multi-language AST parsing (9 languages compiled in)
-- ONNX embeddings via `ort` crate (all-MiniLM-L6-v2, 384-dim)
-- Background daemon for file watching and incremental re-indexing
-- CLI and daemon share no runtime state -- communicate through the database and filesystem
-- XDG-compliant paths for config and data storage
+```
+Read: .rp1/context/{filename}
+```
+
+## Project Structure
+
+```
+src/
+├── cli/        # CLI subcommands (search, symbol, context, structural, index, etc.)
+├── daemon/     # Background file watcher and incremental re-indexing
+├── indexer/    # Scanning, parsing (tree-sitter), chunking, embedding (ONNX)
+├── search/     # Hybrid search, symbol lookup, structural queries, ranking
+├── shared/     # Types, config, constants, errors, project identity
+└── storage/    # libSQL database, schema, segment CRUD, queries
+tests/          # Integration and CLI tests
+benches/        # Criterion search benchmarks
+```
+
+## Navigation
+
+- **[architecture.md](architecture.md)**: System design, data flows, integration points
+- **[modules.md](modules.md)**: Component breakdown with metrics and dependencies
+- **[patterns.md](patterns.md)**: Code conventions and implementation patterns
+- **[concept_map.md](concept_map.md)**: Domain terminology and concept boundaries

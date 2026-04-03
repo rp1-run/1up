@@ -1,94 +1,158 @@
-# Modules
+# Module & Component Breakdown
 
-Single crate (`oneup`, binary name `1up`) with the following module hierarchy:
+**Project**: 1up
+**Analysis Date**: 2026-04-03
+**Modules Analyzed**: 8
 
-## `src/cli/`
+## Core Modules
 
-CLI layer. Clap derive-based argument structs and `exec()` async handlers for each subcommand.
+### CLI (`src/cli/`)
+**Purpose**: User-facing command parsing and output formatting via clap derive
+**Files**: 12 | **Lines**: ~695
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | `Cli` struct (global flags), `Command` enum (all subcommands), `run()` dispatch |
-| `init.rs` | `InitArgs` -- create `.1up/project_id` |
-| `start.rs` | `StartArgs` -- index + spawn daemon |
-| `stop.rs` | `StopArgs` -- deregister project, signal daemon |
-| `status.rs` | `StatusArgs` -- report daemon state + index stats |
-| `symbol.rs` | `SymbolArgs` -- symbol lookup with optional `--references` |
-| `search.rs` | `SearchArgs` -- hybrid search with `--limit` |
-| `context.rs` | `ContextArgs` -- context retrieval with `--expansion` |
-| `index.rs` | `IndexArgs` -- explicit indexing with embedder auto-download |
-| `reindex.rs` | `ReindexArgs` -- clear + full re-index |
-| `output.rs` | `Formatter` trait with `JsonFormatter`, `HumanFormatter`, `PlainFormatter` implementations |
+**Components**:
+- **Cli** (`mod.rs`): Top-level CLI struct with `Command` enum dispatch, global `--format` and `--verbose` flags
+- **SearchArgs** (`search.rs`): Hybrid search with `--limit` and auto-daemon-start
+- **SymbolArgs** (`symbol.rs`): Symbol lookup with optional `--references` flag
+- **ContextArgs** (`context.rs`): Context retrieval for `file:line` locations
+- **StructuralArgs** (`structural.rs`): AST pattern search using tree-sitter S-expression queries
+- **IndexArgs** (`index.rs`): Explicit indexing with embedder auto-download and progress spinners
+- **ReindexArgs** (`reindex.rs`): Force clear + full re-index with schema rebuild
+- **Formatter** (`output.rs`): Output formatting trait with JSON, Human, and Plain implementations
 
-## `src/daemon/`
+**Dependencies**: search, indexer, storage, daemon, shared
 
-Background daemon for file watching and incremental re-indexing.
+### Search (`src/search/`)
+**Purpose**: Search engines: hybrid semantic+FTS, symbol lookup, structural AST queries, and context retrieval
+**Files**: 9 | **Lines**: ~2,211
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Module exports |
-| `lifecycle.rs` | PID file CRUD, process liveness check (via `nix` signal(0)), SIGHUP/SIGTERM sending, detached daemon spawning with `setsid`, `ensure_daemon()` for auto-start |
-| `registry.rs` | JSON-serialized project registry (`projects.json`) with register/deregister/load/save |
-| `watcher.rs` | `notify::RecommendedWatcher` wrapper with mpsc channel, watch/unwatch/drain_events, debounced collection, path filtering (binary files, .git, node_modules) |
-| `worker.rs` | Main daemon loop using `tokio::select!` over SIGHUP (reload), SIGTERM (shutdown), and file events (incremental re-index via pipeline); runs until explicitly stopped |
+**Components**:
+- **HybridSearchEngine** (`hybrid.rs`): Orchestrates multi-signal search with RRF fusion; builds symbol name variants; degrades to FTS-only when embedder unavailable
+- **RetrievalBackend** (`retrieval.rs`): Backend selection (SqlVectorV2 or FtsOnly) based on index state; auto-detects embedded embeddings
+- **SymbolSearchEngine** (`symbol.rs`): Definition and reference lookup via SQL LIKE with Levenshtein fuzzy matching
+- **ContextEngine** (`context.rs`): Source context retrieval using tree-sitter scope detection with line-range fallback
+- **StructuralSearchEngine** (`structural.rs`): Tree-sitter S-expression queries across indexed files; fallback to directory scan
+- **IntentDetector** (`intent.rs`): Signal-based query classification into Definition, Flow, Usage, Docs, General
+- **Ranking** (`ranking.rs`): RRF fusion, intent boosting, path penalties, per-file caps
+- **Formatter** (`formatter.rs`): Search result formatting utilities
 
-## `src/indexer/`
+**Dependencies**: storage, indexer (parser, scanner), shared
 
-Indexing pipeline: scan, parse, chunk, embed, store.
+### Indexer (`src/indexer/`)
+**Purpose**: File scanning, parsing (tree-sitter), text chunking, embedding generation, and pipeline orchestration
+**Files**: 6 | **Lines**: ~4,143
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Module exports |
-| `scanner.rs` | Directory walking via `ignore` crate `WalkBuilder`, .gitignore respect, default directory exclusions, binary extension filtering, language detection from file extension |
-| `parser.rs` | `SupportedLanguage` enum mapping 9 languages to tree-sitter grammars; `parse_file()` walks AST root, extracts segments with role classification, symbol collection, complexity scoring, container recursion for nested methods |
-| `chunker.rs` | Sliding-window text chunking with configurable window size and overlap for unsupported languages |
-| `embedder.rs` | `Embedder` struct wrapping `ort::Session` and `tokenizers::Tokenizer`; async auto-download from HuggingFace; batch inference with mean pooling + L2 normalization; `is_model_available()` and `is_download_failed()` for graceful degradation |
-| `pipeline.rs` | Orchestrates scan -> hash check -> parse/chunk -> embed -> store; SHA-256 incremental detection; delete-and-rewrite per changed file; writes `SegmentInsert` rows through `segments::upsert_segment`; stores nullable `embedding_vec` values when embeddings are present and null vectors when they are not; progress bar |
+**Components**:
+- **Pipeline** (`pipeline.rs`): Orchestrates scan -> hash-check -> parse/chunk -> embed -> store; SHA-256 incremental change detection; progress reporting
+- **Parser** (`parser.rs`): Multi-language AST parsing via tree-sitter; 16 language grammars; role classification and symbol collection
+- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with auto-download, batch inference, mean pooling, L2 normalization
+- **Scanner** (`scanner.rs`): Directory walking via ignore crate with .gitignore respect and binary filtering
+- **Chunker** (`chunker.rs`): Sliding-window text chunking (60-line window, 10-line overlap) for unsupported languages
 
-## `src/search/`
+**Dependencies**: storage, shared
 
-Search engines: hybrid semantic+FTS, symbol lookup, context retrieval.
+### Storage (`src/storage/`)
+**Purpose**: Database access layer using libSQL with FTS5 and vector indexing
+**Files**: 5 | **Lines**: ~1,233
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Declares search submodules and re-exports `HybridSearchEngine`, `StructuralSearchEngine`, and `SymbolSearchEngine` |
-| `hybrid.rs` | `HybridSearchEngine` -- query embedding, intent detection, symbol lookup, retrieval backend dispatch, RRF fusion, and vector-failure fallback to `FtsOnly` |
-| `ranking.rs` | RRF fusion, intent-based role boosting, file path penalties (test/doc/vendor), short segment penalties, overlap deduplication, per-file caps |
-| `intent.rs` | Query intent detection via keyword signal scoring: DEFINITION, FLOW, USAGE, DOCS, GENERAL |
-| `retrieval.rs` | `RetrievalBackend`, `SqlVectorV2`, and `FtsOnly`; selects the backend, runs `vector_top_k(...)` or FTS queries, and hydrates `SearchResult` rows from shared SQL result shapes |
-| `symbol.rs` | `SymbolSearchEngine` -- SQL LIKE queries on defined_symbols/referenced_symbols JSON columns, Levenshtein fuzzy matching, block_type priority ordering |
-| `context.rs` | `ContextEngine` -- reads source from disk, tree-sitter parse to find smallest enclosing scope node, line-range fallback; `parse_location()` for `file:line` format |
-| `formatter.rs` | Search result formatting utilities |
+**Components**:
+- **Db** (`db.rs`): Database connection wrapper with `open_rw`/`open_ro`/`open_memory` constructors, lock retry
+- **Schema** (`schema.rs`): Schema-v5 initialization, validation, and rebuild with recovery guidance
+- **Segments** (`segments.rs`): Segment CRUD, file-hash lookups, meta helpers
+- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, meta, and vector retrieval
 
-## `src/storage/`
+**Dependencies**: shared
 
-Database access layer using libSQL.
+### Daemon (`src/daemon/`)
+**Purpose**: Background daemon for file watching and incremental re-indexing
+**Files**: 5 | **Lines**: ~783
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Module exports |
-| `db.rs` | `Db` wrapper with `open_rw`/`open_ro`/`open_memory` constructors using `libsql::Builder`; retries local-open lock failures before surfacing an error |
-| `schema.rs` | Schema-v5 initialization and validation: `prepare_for_write()`, `ensure_current()`, and `rebuild()`; owns required-object checks and explicit `1up reindex` recovery errors |
-| `queries.rs` | SQL DDL and query constants for `segments`, `segments_fts`, `meta`, `idx_segments_embedding`, FTS5 `MATCH`, and `vector_top_k(...)` retrieval |
-| `segments.rs` | Segment CRUD and meta helpers; upserts serialize embeddings into `embedding_vec`, supports file-hash lookups, and exposes segment/meta helpers for storage tests and maintenance paths |
+**Components**:
+- **Worker** (`worker.rs`): Main event loop with `tokio::select!` multiplexing signals and events
+- **Lifecycle** (`lifecycle.rs`): Start/stop/ensure daemon with PID management and stale detection
+- **Watcher** (`watcher.rs`): Filesystem event monitoring via notify crate with debounce
+- **Registry** (`registry.rs`): Project registration and JSON-based project list management
 
-## `src/shared/`
+**Dependencies**: indexer, storage, shared
 
-Shared types, configuration, and utilities.
+### Shared (`src/shared/`)
+**Purpose**: Cross-cutting types, configuration, constants, error types, and project utilities
+**Files**: 6 | **Lines**: ~498
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Module exports |
-| `config.rs` | XDG path resolution (`config_dir`, `data_dir`, `model_dir`, `pid_file_path`, `projects_registry_path`, `project_db_path`, `project_dot_dir`) |
-| `constants.rs` | Tunables: embedding dimensions (384), batch size (32), RRF_K (60), vector weight (1.5), result limits, chunk sizes, watcher debounce, schema version |
-| `errors.rs` | Error types via `thiserror` (`OneupError`, `ConfigError`, etc.) |
-| `types.rs` | Core domain types: `ParsedSegment`, `SearchResult`, `SymbolResult`, `ContextResult`, `OutputFormat`, `SegmentRole`, `ReferenceKind` |
-| `project.rs` | Project ID read/write utilities, `is_initialized()` check |
+**Components**:
+- **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, OutputFormat, SegmentRole
+- **Config** (`config.rs`): XDG-compliant paths for config, data, models, PID file
+- **Constants** (`constants.rs`): Tuning constants (embedding dims, batch sizes, search limits)
+- **Errors** (`errors.rs`): OneupError hierarchy with thiserror derives
+- **Project** (`project.rs`): Project identity (UUID) and database path resolution
 
-## `src/main.rs`
+**Dependencies**: None (foundation module)
 
-Entry point. Initializes `tracing-subscriber`, parses `Cli` via clap, dispatches to `cli::run()`.
+## Support Modules
 
-## `src/lib.rs`
+### Tests (`tests/`)
+**Files**: 3 | **Lines**: ~1,176
+- `integration_tests.rs`: End-to-end pipeline and search tests
+- `cli_tests.rs`: CLI subcommand tests via assert_cmd
+- `rewrite_sql_verification.rs`: SQL schema verification
 
-Re-exports modules for benchmark and integration test access.
+### Benchmarks (`benches/`)
+**Files**: 1 | **Lines**: ~399
+- `search_bench.rs`: Criterion benchmarks for symbol lookup, FTS, retrieval backends
+
+## Module Dependencies
+
+```mermaid
+graph TD
+    CLI[cli] --> Search[search]
+    CLI --> Indexer[indexer]
+    CLI --> Storage[storage]
+    CLI --> Daemon[daemon]
+    CLI --> Shared[shared]
+    Search --> Storage
+    Search --> Indexer
+    Search --> Shared
+    Indexer --> Storage
+    Indexer --> Shared
+    Daemon --> Indexer
+    Daemon --> Storage
+    Daemon --> Shared
+    Storage --> Shared
+```
+
+## Module Metrics
+
+| Module | Files | Lines | Components | Avg File Size |
+|--------|-------|-------|------------|---------------|
+| cli | 12 | 695 | 8 | 58 |
+| search | 9 | 2,211 | 6 | 246 |
+| indexer | 6 | 4,143 | 5 | 691 |
+| storage | 5 | 1,233 | 4 | 247 |
+| daemon | 5 | 783 | 4 | 157 |
+| shared | 6 | 498 | 5 | 83 |
+| tests | 3 | 1,176 | 3 | 392 |
+| benches | 1 | 399 | 1 | 399 |
+
+## Cross-Module Patterns
+
+- **Layered Architecture**: CLI -> Search/Indexer -> Storage -> Shared; strict dependency hierarchy
+- **Graceful Degradation**: Missing embedder degrades hybrid search to FTS-only with user warnings
+- **Schema Versioning**: Storage validates schema on read/write; mismatches direct to `1up reindex`
+- **Auto-Start Daemon**: Search commands auto-start daemon via `lifecycle::ensure_daemon()` if project initialized
+- **Dual Parse Strategy**: Tree-sitter structural parsing (16 langs) or sliding-window chunking by language support
+
+## External Dependencies
+
+| Crate | Version | Purpose | Used By |
+|-------|---------|---------|---------|
+| clap | 4 | CLI argument parsing (derive) | cli |
+| libsql | 0.9 | SQLite with vector + FTS5 | storage, search |
+| tree-sitter | 0.26 | Multi-language AST parsing | indexer, search |
+| ort | 2.0.0-rc.12 | ONNX runtime for embeddings | indexer |
+| tokenizers | 0.22 | HuggingFace tokenizer | indexer |
+| notify | 7 | Filesystem event watching | daemon |
+| ignore | 0.4 | .gitignore-aware directory walking | indexer |
+| reqwest | 0.13 | HTTP client for model download | indexer |
+| sha2 | 0.11 | SHA-256 for incremental detection | indexer |
+| nix | 0.31 | Unix signal/process management | daemon |
+| thiserror | 2 | Derive-based error types | shared |
