@@ -33,14 +33,18 @@ sync_repo() {
   rsync -a --delete --exclude .git --exclude .1up --exclude target "$source_dir"/ "$target_dir"/
 }
 
-run_full_case() {
+prepare_full_case() {
   local source_dir="$1"
   local run_dir="$2"
-  local oneup_bin="$3"
-  local jobs="$4"
-  local embed_threads="$5"
 
   sync_repo "$source_dir" "$run_dir"
+}
+
+run_full_case() {
+  local run_dir="$1"
+  local oneup_bin="$2"
+  local jobs="$3"
+  local embed_threads="$4"
 
   local args=("$oneup_bin" reindex "$run_dir")
   if [[ -n "$jobs" ]]; then
@@ -53,7 +57,7 @@ run_full_case() {
   "${args[@]}" >/dev/null 2>&1
 }
 
-run_incremental_case() {
+prepare_incremental_case() {
   local source_dir="$1"
   local run_dir="$2"
   local oneup_bin="$3"
@@ -87,13 +91,40 @@ pub fn bench_extra() -> usize {
     42
 }
 EOF
+}
+
+run_incremental_case() {
+  local run_dir="$1"
+  local oneup_bin="$2"
+  local jobs="$3"
+  local embed_threads="$4"
+
+  local args=("$oneup_bin" index "$run_dir")
+  if [[ -n "$jobs" ]]; then
+    args+=(--jobs "$jobs")
+  fi
+  if [[ -n "$embed_threads" ]]; then
+    args+=(--embed-threads "$embed_threads")
+  fi
 
   "${args[@]}" >/dev/null 2>&1
 }
 
+if [[ "${1:-}" == "__prepare_full_case" ]]; then
+  shift
+  prepare_full_case "$@"
+  exit 0
+fi
+
 if [[ "${1:-}" == "__run_full_case" ]]; then
   shift
   run_full_case "$@"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__prepare_incremental_case" ]]; then
+  shift
+  prepare_incremental_case "$@"
   exit 0
 fi
 
@@ -150,18 +181,24 @@ hyperfine \
   --export-json "$FULL_JSON" \
   --runs "$RUNS" \
   --warmup "$WARMUP" \
-  "bash \"$0\" __run_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
-  "bash \"$0\" __run_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
-  "bash \"$0\" __run_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
+  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-serial\"" \
+  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-auto\"" \
+  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-constrained\"" \
+  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
 
 log "benchmarking incremental reindex runs"
 hyperfine \
   --export-json "$INCREMENTAL_JSON" \
   --runs "$RUNS" \
   --warmup "$WARMUP" \
-  "bash \"$0\" __run_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
-  "bash \"$0\" __run_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
-  "bash \"$0\" __run_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
+  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
+  "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
 
 SERIAL_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 0)")
 AUTO_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 1)")
