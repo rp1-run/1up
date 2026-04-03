@@ -151,6 +151,13 @@ pub const SELECT_ALL_FILE_PATHS: &str = "
 SELECT DISTINCT file_path FROM segments ORDER BY file_path";
 
 #[allow(dead_code)]
+pub const SELECT_ALL_FILE_HASHES: &str = "
+SELECT file_path, MAX(file_hash) AS file_hash
+FROM segments
+GROUP BY file_path
+ORDER BY file_path";
+
+#[allow(dead_code)]
 pub const SELECT_SEGMENT_BY_ID: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, breadcrumb, complexity, role,
