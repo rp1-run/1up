@@ -5,6 +5,8 @@ use crate::shared::errors::{OneupError, StorageError};
 use crate::storage::queries;
 
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
+const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
+const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segments"),
     ("table", "segment_vectors"),
@@ -214,6 +216,75 @@ fn reindex_required(message: String) -> OneupError {
     StorageError::Migration(format!("{message}; run `1up reindex`")).into()
 }
 
+/// Reads the embedding model name recorded in the meta table.
+///
+/// Returns `None` if no model metadata has been stored yet (i.e. the index
+/// was created before model tracking was introduced, or is brand new).
+pub async fn get_embedding_model(conn: &Connection) -> Result<Option<String>, OneupError> {
+    if !schema_object_exists(conn, "table", "meta").await? {
+        return Ok(None);
+    }
+
+    let mut rows = conn
+        .query(queries::SELECT_META, [META_KEY_EMBEDDING_MODEL])
+        .await
+        .map_err(|e| StorageError::Query(format!("failed to read embedding model: {e}")))?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let val: String = row.get(0).map_err(|e| {
+                StorageError::Query(format!("failed to read embedding model value: {e}"))
+            })?;
+            Ok(Some(val))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            Err(StorageError::Query(format!("embedding model query failed: {e}")).into())
+        }
+    }
+}
+
+/// Persists embedding model metadata (name and output dimension) to the meta table.
+async fn set_embedding_model_meta(
+    conn: &Connection,
+    model_name: &str,
+    dim: usize,
+) -> Result<(), OneupError> {
+    conn.execute(queries::UPSERT_META, [META_KEY_EMBEDDING_MODEL, model_name])
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to write embedding model: {e}")))?;
+    conn.execute(
+        queries::UPSERT_META,
+        [META_KEY_EMBEDDING_DIM, &dim.to_string()],
+    )
+    .await
+    .map_err(|e| StorageError::Migration(format!("failed to write embedding dim: {e}")))?;
+    Ok(())
+}
+
+/// Verifies that the index was built with the current embedding model.
+///
+/// If no model metadata is recorded yet, writes it so future runs can
+/// detect incompatibility.  If a different model name is recorded, returns
+/// an error directing the user to run `1up reindex` — embeddings produced
+/// by different models are not comparable and continuing would silently
+/// corrupt semantic search results.
+pub async fn check_embedding_model_compatible(
+    conn: &Connection,
+    model_name: &str,
+    dim: usize,
+) -> Result<(), OneupError> {
+    match get_embedding_model(conn).await? {
+        None => set_embedding_model_meta(conn, model_name, dim).await,
+        Some(ref stored) if stored == model_name => Ok(()),
+        Some(stored) => Err(StorageError::Migration(format!(
+            "index was built with embedding model '{stored}' but the current model is \
+             '{model_name}'; run `1up reindex` to rebuild the index with the new model"
+        ))
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +294,62 @@ mod tests {
         let db = Db::open_memory().await.unwrap();
         let conn = db.connect().unwrap();
         (db, conn)
+    }
+
+    #[tokio::test]
+    async fn check_embedding_model_compatible_records_on_first_run() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        // No model recorded yet — should write and succeed.
+        check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_embedding_model(&conn).await.unwrap(),
+            Some("org/model-v1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn check_embedding_model_compatible_passes_for_same_model() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap();
+        // Second call with same model should also succeed.
+        check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_embedding_model_compatible_fails_for_different_model() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap();
+
+        let err = check_embedding_model_compatible(&conn, "org/model-v2", 768)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("org/model-v1"), "should mention stored model");
+        assert!(msg.contains("org/model-v2"), "should mention new model");
+        assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn get_embedding_model_returns_none_before_any_indexing() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        assert_eq!(get_embedding_model(&conn).await.unwrap(), None);
     }
 
     #[tokio::test]
