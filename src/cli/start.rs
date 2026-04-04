@@ -126,7 +126,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let pid = lifecycle::spawn_daemon(&binary)?;
 
     let msg = format!(
-        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
+        "🍄  {init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
         stats.files_indexed, stats.segments_stored,
     );
     println!("{}", fmt.format_index_summary(&msg, &stats.progress));
