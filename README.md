@@ -8,6 +8,16 @@ Unified search substrate for source repositories. A single CLI binary providing 
 
 Built in Rust with tree-sitter for multi-language parsing, ONNX embeddings (all-MiniLM-L6-v2) for semantic search, and libSQL for persistent storage. A background daemon handles file watching and incremental re-indexing.
 
+## Agent Skill
+
+1up ships a portable [Agent Skill](https://agentskills.io/specification) that teaches AI coding agents to prefer `1up` over grep/rg for code search. Install it so your agent uses semantic search, symbol lookup, and context retrieval instead of raw text matching.
+
+```sh
+npx skills add rp1-run/1up
+```
+
+This auto-detects your installed agents (Claude Code, Cursor, Copilot, Cline, Windsurf, etc.) and configures the skill for each one.
+
 ## Installation
 
 Build from source (requires Rust toolchain):
