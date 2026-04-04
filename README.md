@@ -66,7 +66,7 @@ Hybrid semantic + full-text search with reciprocal rank fusion (RRF) ranking:
 1up search "database connection pool" -n 10
 ```
 
-Search requires a current local index schema. On rebuilt/current indexes, 1up combines symbol matches, native-vector retrieval, and FTS5 keyword matches. If the embedding model is unavailable, fails to load, or a vector query fails for this invocation, search warns and degrades to `FtsOnly`. Missing, stale, or partial indexes are recovery cases: run `1up reindex`.
+If the embedding model is unavailable, search degrades gracefully to full-text only. Missing or stale indexes are recovery cases: run `1up reindex`.
 
 ### Symbol Lookup
 
@@ -97,6 +97,17 @@ Retrieve the enclosing scope (function, class, impl block) around a file locatio
 
 Uses tree-sitter to snap to structural boundaries. Falls back to a line window (+/- 50 lines) for unsupported languages.
 
+### Structural Search
+
+Search code using tree-sitter S-expression queries:
+
+```sh
+1up structural "(function_item name: (identifier) @name)"
+1up structural "(call_expression function: (identifier) @fn)" -l rust
+```
+
+Falls back to direct filesystem scanning if no index exists.
+
 ### Indexing
 
 Explicitly index a repository without starting the daemon:
@@ -106,31 +117,21 @@ Explicitly index a repository without starting the daemon:
 1up index --jobs 4 --embed-threads 2 [path]
 ```
 
-All indexing entry points (`index`, `reindex`, and `start`) resolve the same concurrency settings: CLI flags first, then `ONEUP_INDEX_JOBS` and `ONEUP_EMBED_THREADS`, then any settings persisted for the project in the daemon registry, then automatic defaults.
-
-`1up index` is the incremental updater for already-current indexes. The pipeline scans and hashes files, fans out file-local parse work through a bounded worker pool, batches embeddings through a single ONNX session, and keeps database replacement work serialized through transactional writes. If embeddings are unavailable it still stores searchable content with null vectors.
-
-Each run records `.1up/index_status.json` with the latest state, phase, work counters, embedding availability, effective parallelism, per-stage timings, and update timestamp. `1up status` renders the same snapshot in human, JSON, and plain output formats.
-
-Force a full re-index when adopting the rewrite or recovering from stale/partial local indexes:
+Force a full re-index when recovering from stale or partial indexes:
 
 ```sh
 1up reindex [path]
 1up reindex --jobs 1 --embed-threads 1 [path]
 ```
 
-`1up reindex` treats pre-rewrite local indexes as disposable cache, rebuilds the local schema from scratch, and repopulates the segment, FTS, and vector data.
-
 ### Daemon Management
 
-Start or refresh daemon-managed indexing for a project:
+Start or refresh daemon-managed indexing:
 
 ```sh
 1up start [path]
 1up start --jobs 6 --embed-threads 2 [path]
 ```
-
-`1up start` persists the resolved indexing settings for that project. If the worker is already running, the command refreshes the registry entry and signals the daemon to reload settings instead of starting a second worker.
 
 Check daemon and index status:
 
@@ -138,15 +139,11 @@ Check daemon and index status:
 1up status
 ```
 
-`1up status` reports daemon state, index counts, and the latest recorded indexing progress, including completed versus skipped work, effective worker count, embed threads, and scan/parse/embed/store/total timings.
-
 Stop the daemon for the current project:
 
 ```sh
 1up stop
 ```
-
-If other projects are still registered, the daemon keeps running and reloads its registry via `SIGHUP`. If no projects remain, `1up stop` sends `SIGTERM` and shuts the worker down. While the daemon is running, each project allows only one active indexing pass at a time; file-change bursts collapse into at most one queued follow-up run.
 
 ## CLI Reference
 
@@ -159,99 +156,20 @@ If other projects are still registered, the daemon keeps running and reloads its
 
 ### Subcommands
 
-#### `1up init [PATH]`
+| Command | Description |
+|---------|-------------|
+| `init [PATH]` | Initialize a project for indexing |
+| `start [PATH]` | Init if needed, index, and start/refresh daemon |
+| `stop [PATH]` | Stop the daemon for this project |
+| `status [PATH]` | Show daemon state, index counts, and indexing progress |
+| `search <QUERY>` | Hybrid semantic + full-text search |
+| `symbol <NAME>` | Look up symbol definitions and references |
+| `context <LOCATION>` | Retrieve enclosing scope around `file:line` |
+| `structural <PATTERN>` | Tree-sitter S-expression query search |
+| `index [PATH]` | Incremental index without starting daemon |
+| `reindex [PATH]` | Full re-index from scratch |
 
-Initialize a project for 1up indexing. Creates `.1up/project_id` in the project root.
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `PATH` | Project root directory | `.` |
-
-#### `1up start [PATH]`
-
-Initialize the project if needed, index the repository, persist indexing settings, and start or refresh the background daemon.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `PATH` | Project root directory | `.` |
-| `--jobs <N>` | Maximum concurrent parse workers | auto |
-| `--embed-threads <N>` | ONNX intra-op threads | auto |
-
-#### `1up stop [PATH]`
-
-Stop the background daemon for the current project. Sends SIGTERM if no projects remain registered, SIGHUP otherwise.
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `PATH` | Project root directory | `.` |
-
-#### `1up status [PATH]`
-
-Show daemon running state, project ID, indexed file count, segment count, and the latest recorded indexing progress summary.
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `PATH` | Project root directory | `.` |
-
-#### `1up symbol <NAME>`
-
-Look up symbol definitions and optionally references.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `NAME` | Symbol name to look up | required |
-| `--references`, `-r` | Include usages in addition to definitions | `false` |
-| `--path <PATH>` | Project root directory | `.` |
-
-#### `1up search <QUERY>`
-
-Hybrid semantic + full-text search.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `QUERY` | Search query | required |
-| `--limit`, `-n` | Maximum number of results | `20` |
-| `--path <PATH>` | Project root directory | `.` |
-
-#### `1up context <LOCATION>`
-
-Retrieve code context around a file location.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `LOCATION` | File location in `file:line` format | required |
-| `--path <PATH>` | Project root directory | `.` |
-| `--expansion <N>` | Context window in lines (fallback mode) | `50` |
-
-#### `1up structural <PATTERN>`
-
-Search indexed code with tree-sitter S-expression queries. Falls back to direct filesystem scanning if no index exists.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `PATTERN` | Tree-sitter query pattern | required |
-| `--language <LANG>`, `-l <LANG>` | Restrict matches to one language | unset |
-| `--path <PATH>` | Project root directory | `.` |
-
-#### `1up index [PATH]`
-
-Index a repository incrementally. Downloads the embedding model on first use and emits a final progress snapshot with work, parallelism, and timings.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `PATH` | Directory to index | `.` |
-| `--jobs <N>` | Maximum concurrent parse workers | auto |
-| `--embed-threads <N>` | ONNX intra-op threads | auto |
-
-#### `1up reindex [PATH]`
-
-Force a full re-index by rebuilding the local search index from scratch. Use this to adopt the rewrite or recover from stale or partial indexes.
-
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `PATH` | Directory to re-index | `.` |
-| `--jobs <N>` | Maximum concurrent parse workers | auto |
-| `--embed-threads <N>` | ONNX intra-op threads | auto |
+Indexing commands (`index`, `reindex`, `start`) accept `--jobs <N>` and `--embed-threads <N>` to control parallelism.
 
 ## Output Formats
 
@@ -268,24 +186,6 @@ Human-readable output is the CLI default. Use JSON when scripting:
 1up symbol parse_config -f plain
 ```
 
-## Storage Layout
-
-```
-~/.config/1up/                  # XDG config (reserved for future use)
-~/.local/share/1up/             # XDG data
-  daemon.pid                    # Daemon PID file
-  projects.json                 # Global project registry
-  models/
-    all-MiniLM-L6-v2/
-      model.onnx                # ONNX embedding model (auto-downloaded)
-      tokenizer.json            # WordPiece tokenizer (auto-downloaded)
-
-<project-root>/
-  .1up/
-    project_id                  # UUID identifying this project
-    index.db                    # libSQL database (segments, FTS, vectors)
-```
-
 ## Supported Languages
 
 Tree-sitter grammars compiled into the binary:
@@ -293,6 +193,10 @@ Tree-sitter grammars compiled into the binary:
 Rust, Python, JavaScript, TypeScript, Go, Java, C, C++
 
 Files in unsupported languages are indexed via text chunking (sliding window) and remain searchable through full-text and semantic search.
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture, storage layout, internals, and contributing.
 
 ## License
 
