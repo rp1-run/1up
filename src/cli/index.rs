@@ -94,7 +94,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
     .await?;
 
     let msg = format!(
-        "Indexed {} files ({} segments). {} skipped, {} deleted.{}",
+        "🍄  Indexed {} files ({} segments). {} skipped, {} deleted.{}",
         stats.files_indexed,
         stats.segments_stored,
         stats.files_skipped,

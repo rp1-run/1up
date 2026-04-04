@@ -88,7 +88,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     .await?;
 
     let msg = format!(
-        "Re-indexed {} files ({} segments). Clean rebuild complete.{}",
+        "🍄  Re-indexed {} files ({} segments). Clean rebuild complete.{}",
         stats.files_indexed,
         stats.segments_stored,
         if stats.embeddings_generated {
