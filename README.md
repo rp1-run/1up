@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="1up" width="128" height="128" />
+</p>
+
 # 1up
 
 Unified search substrate for source repositories. A single CLI binary providing symbol lookup, reference search, context retrieval, and hybrid semantic + full-text search with machine-readable JSON output.
