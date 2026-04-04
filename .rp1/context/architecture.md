@@ -2,7 +2,7 @@
 
 **Project**: 1up
 **Architecture Pattern**: Layered + Two-Process Model
-**Last Updated**: 2026-04-03
+**Last Updated**: 2026-04-04
 
 ## High-Level Architecture
 
@@ -56,7 +56,7 @@ CLI process (per-invocation) and detached daemon worker (background) share no ru
 Clear separation: CLI (presentation) -> Indexer/Search (processing) -> Storage (persistence), with daemon as a parallel entry point into the same pipeline.
 
 ### Staged Single-Writer Pipeline
-Indexing is split into scan, delete cleanup, bounded parse, embed, and write phases. Parse workers run concurrently, but completed files are reordered by sequence ID before any storage mutation so one writer owns all segment replacement work.
+Indexing is split into scan, delete cleanup, bounded parse, embed, and write phases. Parse workers run concurrently, but completed files are reordered by sequence ID before any storage mutation so one writer owns all segment replacement work. Write batch size is configurable via `write_batch_files` to tune transaction granularity.
 
 ### Incremental Processing
 SHA-256 file hashing in pipeline; skip if hash unchanged; deleted file detection via set difference.
@@ -68,7 +68,10 @@ Embedder is `Optional<&mut Embedder>`; missing model degrades to FTS-only; `SqlV
 `schema::ensure_current()` validates version + required objects before any read/write; stale schemas require explicit `1up reindex`.
 
 ### Shared Config Resolution
-Indexing settings resolve in one chain: CLI flags -> environment variables -> persisted registry config -> automatic defaults. Manual and daemon-triggered runs therefore share the same concurrency model.
+Indexing settings (jobs, embed_threads, write_batch_files) resolve in one chain: CLI flags -> environment variables (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`, `ONEUP_INDEX_WRITE_BATCH_FILES`) -> persisted registry config -> automatic defaults. Manual and daemon-triggered runs share the same concurrency model.
+
+### Transient Failure Retry
+Database lock contention is handled with bounded retries (10 attempts, 50ms delay) rather than failing immediately, supporting concurrent CLI and daemon access to the same database.
 
 ## Layer Details
 
@@ -85,14 +88,15 @@ Indexing settings resolve in one chain: CLI flags -> environment variables -> pe
 
 ### Indexing Pipeline
 ```
-Resolve indexing config and initialize progress snapshot
+Resolve indexing config (CLI flags -> env vars -> registry -> auto defaults)
+  -> Initialize progress snapshot
   -> Scan directory (ignore crate, .gitignore-aware) and preload stored file hashes
   -> Delete segments for removed files before new work begins
-  -> Dispatch changed files to a bounded `spawn_blocking` parse pool with sequence IDs
-  -> Reorder completed parse results before flush to preserve deterministic file ordering
+  -> Dispatch changed files to bounded spawn_blocking parse pool with sequence IDs
+  -> Reorder completed parse results to preserve deterministic file ordering
   -> Generate embeddings in batches through one ONNX session when available
-  -> Replace file segments through single-writer transactional batch helpers
-  -> Persist final progress with work counters, parallelism, and stage timings
+  -> Replace file segments through single-writer transactional batch helpers (write_batch_files controls batch size)
+  -> Persist final progress with work counters, parallelism, and stage timings to .1up/index_status.json
 ```
 
 ### Search Query
@@ -130,20 +134,23 @@ CLI `start` or auto-start registers project in projects.json with optional index
 
 | Integration | Purpose | Type |
 |-------------|---------|------|
-| libSQL (Turso) | Segment storage, FTS5 search, native vector search | Embedded database |
-| ONNX Runtime (ort) | Local ML inference for 384-dim sentence embeddings | Embedded inference |
+| libSQL (Turso) | Segment storage, FTS5 search, native vector search with 384-dim embeddings | Embedded database |
+| ONNX Runtime (ort) | Local ML inference for 384-dim sentence embeddings (all-MiniLM-L6-v2) | Embedded inference |
 | Tree-sitter | Multi-language AST parsing (16 language grammars compiled in) | Compiled-in library |
+| hyperfine | Parallel indexing performance benchmarking (serial vs auto vs constrained) | Dev tooling |
 
 ## State Management
 
 - **PID file**: `~/.local/share/1up/daemon.pid`
-- **Project registry**: `~/.local/share/1up/projects.json`
+- **Project registry**: `~/.local/share/1up/projects.json` (includes per-project IndexingConfig)
 - **Per-project DB**: `<project>/.1up/index.db`
+- **Index progress**: `<project>/.1up/index_status.json` (IndexProgress with parallelism + stage timings)
 - **Model cache**: `~/.local/share/1up/models/`
 
 ## Deployment
 
-- **Type**: Single binary CLI
+- **Type**: Single binary CLI with background daemon
 - **Environment**: Local developer machine (macOS/Linux)
 - **Distribution**: `cargo build --release`, installed to `~/.local/bin/1up` with codesign on macOS
 - **Installation**: `just install` (builds release, copies to `~/.local/bin`, codesigns)
+- **Dev tooling**: `just bench-parallel` for performance benchmarking via hyperfine

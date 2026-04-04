@@ -1,64 +1,62 @@
-# 1up - Knowledge Base
+# 1up — Knowledge Base Index
 
-**Type**: Single Project
-**Languages**: Rust
-**Updated**: 2026-04-03
-
-## Project Summary
-
-1up is a local code search and indexing CLI tool that combines semantic vector search, full-text search (FTS5), and symbol lookup via Reciprocal Rank Fusion (RRF) to provide high-quality code search results. It uses tree-sitter for multi-language AST parsing, ONNX Runtime for embedding generation, and libSQL for storage, with a background daemon for automatic incremental re-indexing on file changes.
+**1up** is a local code search and indexing CLI that combines semantic vector search (ONNX embeddings), FTS5 full-text search, symbol lookup, and structural AST queries over a libSQL database. A background daemon watches for file changes and incrementally re-indexes with configurable bounded parallelism.
 
 ## Quick Reference
 
 | Aspect | Value |
 |--------|-------|
-| Entry Point | `src/main.rs` -> `src/cli/mod.rs` |
-| Key Pattern | Layered Architecture + Two-Process Model (CLI + Daemon) |
-| Tech Stack | Rust, tokio, clap, tree-sitter (16 langs), libSQL, ONNX Runtime (all-MiniLM-L6-v2) |
+| Entry point | `src/main.rs` -> `src/cli/mod.rs` |
+| Key pattern | Staged single-writer pipeline with bounded parallel parse workers |
+| Tech stack | Rust, libSQL, ONNX Runtime, tree-sitter (16 languages), tokio |
+| Architecture | Layered + two-process model (CLI + daemon) |
 
 ## KB File Manifest
 
-**Progressive Loading**: Load files on-demand based on your task.
-
 | File | Lines | Load For |
 |------|-------|----------|
-| architecture.md | ~126 | System design, layers, data flows, integration points |
-| modules.md | ~158 | Component breakdown, module responsibilities, dependencies |
-| patterns.md | ~73 | Code conventions, error handling, testing idioms |
-| concept_map.md | ~94 | Domain terminology (Segment, RRF, QueryIntent, etc.) |
+| [concept_map.md](concept_map.md) | ~120 | Domain terminology, concept relationships |
+| [architecture.md](architecture.md) | ~156 | System layers, data flows, integration points |
+| [interaction-model.md](interaction-model.md) | ~98 | CLI surfaces, feedback loops, output modes |
+| [modules.md](modules.md) | ~166 | Component breakdown, dependencies, metrics |
+| [patterns.md](patterns.md) | ~74 | Coding conventions, error handling, concurrency |
 
 ## Task-Based Loading
 
-| Task | Files to Load |
-|------|---------------|
+| Task | Load These Files |
+|------|-----------------|
 | Code review | `patterns.md` |
 | Bug investigation | `architecture.md`, `modules.md` |
-| Feature implementation | `modules.md`, `patterns.md` |
-| Strategic analysis | ALL files |
+| Feature work | `modules.md`, `patterns.md` |
+| CLI/UX changes | `interaction-model.md`, `modules.md` |
+| Strategic / system-wide | All files |
 
 ## How to Load
 
-```
-Read: .rp1/context/{filename}
-```
+1. Always read `index.md` first (this file)
+2. Load additional files based on task type above
+3. Only load all files for holistic analysis
 
 ## Project Structure
 
 ```
 src/
-├── cli/        # CLI subcommands (search, symbol, context, structural, index, etc.)
-├── daemon/     # Background file watcher and incremental re-indexing
-├── indexer/    # Scanning, parsing (tree-sitter), chunking, embedding (ONNX)
-├── search/     # Hybrid search, symbol lookup, structural queries, ranking
-├── shared/     # Types, config, constants, errors, project identity
-└── storage/    # libSQL database, schema, segment CRUD, queries
-tests/          # Integration and CLI tests
-benches/        # Criterion search benchmarks
+├── main.rs              # Entry point
+├── cli/                 # CLI commands and output formatting (12 files)
+├── daemon/              # Background file watcher and registry (5 files)
+├── indexer/             # Scan, parse, embed, pipeline (6 files)
+├── search/              # Hybrid, symbol, structural, context search (9 files)
+├── shared/              # Types, config, constants, errors (6 files)
+└── storage/             # libSQL DB, schema, segments, queries (5 files)
+tests/                   # Integration, CLI, SQL verification (3 files)
+benches/                 # Search benchmarks (1 file)
+scripts/                 # Benchmark tooling
 ```
 
 ## Navigation
 
-- **[architecture.md](architecture.md)**: System design, data flows, integration points
-- **[modules.md](modules.md)**: Component breakdown with metrics and dependencies
-- **[patterns.md](patterns.md)**: Code conventions and implementation patterns
-- **[concept_map.md](concept_map.md)**: Domain terminology and concept boundaries
+- **Concepts & terminology** -> [concept_map.md](concept_map.md)
+- **System architecture & data flows** -> [architecture.md](architecture.md)
+- **CLI interaction model** -> [interaction-model.md](interaction-model.md)
+- **Module & component details** -> [modules.md](modules.md)
+- **Implementation patterns** -> [patterns.md](patterns.md)
