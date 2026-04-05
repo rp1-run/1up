@@ -262,21 +262,53 @@ async fn set_embedding_model_meta(
     Ok(())
 }
 
+/// Returns true if `segment_vectors` contains at least one row.
+async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_HAS_INDEXED_EMBEDDINGS, ())
+        .await
+        .map_err(|e| {
+            StorageError::Query(format!("failed to check for indexed embeddings: {e}"))
+        })?;
+
+    match rows.next().await {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(e) => {
+            Err(StorageError::Query(format!("indexed embeddings check failed: {e}")).into())
+        }
+    }
+}
+
 /// Verifies that the index was built with the current embedding model.
 ///
-/// If no model metadata is recorded yet, writes it so future runs can
-/// detect incompatibility.  If a different model name is recorded, returns
-/// an error directing the user to run `1up reindex` — embeddings produced
-/// by different models are not comparable and continuing would silently
-/// corrupt semantic search results.
+/// When no model metadata is recorded:
+/// - If embeddings already exist (legacy index), requires a reindex so
+///   vectors of unknown provenance are not mixed with new ones.
+/// - If no embeddings exist yet, stamps the current model metadata.
+///
+/// When metadata exists but no embeddings have been written, the model
+/// metadata is treated as unbound and can be updated freely — this avoids
+/// forcing unnecessary reindexes when the model changes before any vectors
+/// are stored.
+///
+/// If a different model is recorded *and* embeddings exist, returns an error
+/// directing the user to run `1up reindex`.
 pub async fn check_embedding_model_compatible(
     conn: &Connection,
     model_name: &str,
     dim: usize,
 ) -> Result<(), OneupError> {
-    match get_embedding_model(conn).await? {
+    let stored = get_embedding_model(conn).await?;
+    let has_vectors = has_indexed_embeddings(conn).await?;
+
+    match stored {
+        None if has_vectors => Err(reindex_required(
+            "index contains embeddings from an unknown model".to_string(),
+        )),
         None => set_embedding_model_meta(conn, model_name, dim).await,
-        Some(ref stored) if stored == model_name => Ok(()),
+        Some(ref s) if s == model_name => Ok(()),
+        Some(_) if !has_vectors => set_embedding_model_meta(conn, model_name, dim).await,
         Some(stored) => Err(StorageError::Migration(format!(
             "index was built with embedding model '{stored}' but the current model is \
              '{model_name}'; run `1up reindex` to rebuild the index with the new model"
@@ -327,7 +359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_embedding_model_compatible_fails_for_different_model() {
+    async fn check_embedding_model_compatible_allows_model_change_without_vectors() {
         let (_db, conn) = setup().await;
         prepare_for_write(&conn).await.unwrap();
 
@@ -335,12 +367,76 @@ mod tests {
             .await
             .unwrap();
 
+        // No vectors stored yet — switching model should succeed and update metadata.
+        check_embedding_model_compatible(&conn, "org/model-v2", 768)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_embedding_model(&conn).await.unwrap(),
+            Some("org/model-v2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn check_embedding_model_compatible_fails_for_different_model_with_vectors() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap();
+
+        // Simulate stored embeddings.
+        conn.execute(
+            "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector32(zeroblob(1536)))",
+            (),
+        )
+        .await
+        .unwrap();
+
         let err = check_embedding_model_compatible(&conn, "org/model-v2", 768)
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("org/model-v1"), "should mention stored model");
         assert!(msg.contains("org/model-v2"), "should mention new model");
+        assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn check_embedding_model_compatible_rejects_legacy_index_with_vectors() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        // Simulate a legacy index: has vectors but no model metadata.
+        conn.execute(
+            "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector32(zeroblob(1536)))",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let err = check_embedding_model_compatible(&conn, "org/model-v1", 384)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown model"),
+            "should mention unknown model"
+        );
         assert!(msg.contains("run `1up reindex`"));
     }
 
