@@ -82,7 +82,8 @@ fn help_shows_all_subcommands() {
             .and(predicate::str::contains("search"))
             .and(predicate::str::contains("context"))
             .and(predicate::str::contains("index"))
-            .and(predicate::str::contains("reindex")),
+            .and(predicate::str::contains("reindex"))
+            .and(predicate::str::contains("hello-agent")),
     );
 }
 
@@ -98,7 +99,16 @@ fn worker_subcommand_hidden_from_help() {
 #[test]
 fn subcommand_help_works() {
     for sub in &[
-        "init", "start", "stop", "status", "symbol", "search", "context", "index", "reindex",
+        "init",
+        "start",
+        "stop",
+        "status",
+        "symbol",
+        "search",
+        "context",
+        "index",
+        "reindex",
+        "hello-agent",
     ] {
         cmd()
             .args([sub, "--help"])
@@ -328,5 +338,43 @@ fn status_human_output_includes_last_index_progress() {
             predicate::str::contains("Index status:")
                 .and(predicate::str::contains("Index phase:"))
                 .and(predicate::str::contains("Last index:")),
+        );
+}
+
+#[test]
+fn hello_agent_plain_output_contains_key_commands() {
+    cmd().args(["hello-agent"]).assert().success().stdout(
+        predicate::str::contains("1up search")
+            .and(predicate::str::contains("1up symbol"))
+            .and(predicate::str::contains("1up context"))
+            .and(predicate::str::contains("1up structural")),
+    );
+}
+
+#[test]
+fn hello_agent_json_output_is_valid_json() {
+    let output = cmd()
+        .args(["--format", "json", "hello-agent"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["instruction"]
+        .as_str()
+        .unwrap()
+        .contains("1up search"));
+}
+
+#[test]
+fn hello_agent_human_output_has_header() {
+    cmd()
+        .args(["--format", "human", "hello-agent"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("1up Agent Instructions")
+                .and(predicate::str::contains("1up search")),
         );
 }

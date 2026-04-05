@@ -1,4 +1,5 @@
 pub mod context;
+pub mod hello_agent;
 pub mod index;
 pub mod init;
 pub mod output;
@@ -66,6 +67,9 @@ pub enum Command {
     /// Force re-index of all files
     Reindex(reindex::ReindexArgs),
 
+    /// Output a concise agent instruction for AI assistants
+    HelloAgent(hello_agent::HelloAgentArgs),
+
     /// Internal: daemon worker process (not for direct use)
     #[command(name = "__worker", hide = true)]
     Worker,
@@ -83,6 +87,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Structural(args) => structural::exec(args, cli.format).await,
         Command::Index(args) => index::exec(args, cli.format).await,
         Command::Reindex(args) => reindex::exec(args, cli.format).await,
+        Command::HelloAgent(args) => hello_agent::exec(args, cli.format).await,
         Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
 }
