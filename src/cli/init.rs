@@ -21,11 +21,7 @@ pub async fn exec(args: InitArgs, format: OutputFormat) -> anyhow::Result<()> {
     }
 
     let id = crate::shared::project::write_project_id(&project_root)?;
-    let msg = format!(
-        "Initialized project {} at {}",
-        id,
-        project_root.display()
-    );
+    let msg = format!("Initialized project {} at {}", id, project_root.display());
     println!("{}", fmt.format_message(&msg));
     Ok(())
 }
