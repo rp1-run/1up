@@ -238,9 +238,7 @@ pub async fn get_embedding_model(conn: &Connection) -> Result<Option<String>, On
             Ok(Some(val))
         }
         Ok(None) => Ok(None),
-        Err(e) => {
-            Err(StorageError::Query(format!("embedding model query failed: {e}")).into())
-        }
+        Err(e) => Err(StorageError::Query(format!("embedding model query failed: {e}")).into()),
     }
 }
 
@@ -267,16 +265,12 @@ async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
     let mut rows = conn
         .query(queries::SELECT_HAS_INDEXED_EMBEDDINGS, ())
         .await
-        .map_err(|e| {
-            StorageError::Query(format!("failed to check for indexed embeddings: {e}"))
-        })?;
+        .map_err(|e| StorageError::Query(format!("failed to check for indexed embeddings: {e}")))?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(e) => {
-            Err(StorageError::Query(format!("indexed embeddings check failed: {e}")).into())
-        }
+        Err(e) => Err(StorageError::Query(format!("indexed embeddings check failed: {e}")).into()),
     }
 }
 
