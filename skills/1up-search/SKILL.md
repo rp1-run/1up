@@ -13,7 +13,6 @@ description: >
   Do NOT use for: searching non-code files (logs, data), exact byte-level pattern matching,
   or projects without 1up installed.
 license: MIT
-compatibility: Requires 1up CLI on PATH. Works with any agent that can execute shell commands.
 metadata:
   author: rp1-run/1up
   version: "1.0"
@@ -61,20 +60,23 @@ After this, the index stays current automatically via the background daemon.
 
 Find code by meaning. Combines vector similarity, full-text matching, and symbol analysis with ranked fusion.
 
+Always pass `-n 5` to return the top 5 results:
+
 ```sh
-1up search "error handling"              # natural language query
-1up search "database connection pool"    # conceptual search
-1up search "retry logic with backoff"    # finds implementations even without exact wording
-1up search "parse configuration" -n 5    # limit results
+1up search "error handling" -n 5              # natural language query
+1up search "database connection pool" -n 5    # conceptual search
+1up search "retry logic with backoff" -n 5    # finds implementations even without exact wording
 ```
 
 Use `-f json` for structured output when parsing results programmatically:
 
 ```sh
-1up search "auth middleware" -f json
+1up search "auth middleware" -n 5 -f json
 ```
 
 **When to use**: Exploring unfamiliar code, investigating how something works, finding implementations by concept rather than by name.
+
+**Critical limitation**: Semantic search ranks by relevance and may omit lower-scored matches. Never conclude "only one place" or "only N callers" from semantic search alone — always verify completeness with `1up symbol -r` (see Search-then-Verify below).
 
 ### Symbol Lookup — `1up symbol`
 
@@ -142,28 +144,42 @@ All commands support `--format` / `-f`:
 
 Use `json` when you need to parse results programmatically. Use `human` or `plain` for reading.
 
+## Search-then-Verify Rule
+
+Use semantic search for **discovery** (finding symbol names), then switch to symbol lookup for **completeness** (finding all locations).
+
+After a semantic search, always follow up with `1up symbol -r <name>` on key symbols found in the results to check for duplicate definitions or additional call sites. Semantic search ranks by relevance and may omit lower-scored duplicates — symbol lookup is exhaustive.
+
+```sh
+# 1. Discover via semantic search
+1up search "token validation" -n 5
+
+# 2. Found `validate_token` in results — now verify all locations
+1up symbol -r validate_token
+```
+
 ## Common Agent Workflows
 
 **Bug investigation** — start broad, narrow down:
 
 ```sh
-1up search "connection timeout handling"    # find relevant code
-1up symbol -r ConnectionPool                # trace usage
-1up context src/pool.rs:87                  # understand the specific code
+1up search "connection timeout handling" -n 5    # find relevant code
+1up symbol -r ConnectionPool                     # verify all locations
+1up context src/pool.rs:87                       # understand the specific code
 ```
 
 **Understanding a module** — combine search and symbols:
 
 ```sh
-1up search "what does the indexer do"       # conceptual overview
-1up symbol Pipeline                         # find the core type
-1up symbol -r run_with_config               # trace how it's called
+1up search "what does the indexer do" -n 5       # conceptual overview
+1up symbol Pipeline                              # find the core type
+1up symbol -r run_with_config                    # trace how it's called
 ```
 
 **Finding where to make a change**:
 
 ```sh
-1up search "user validation logic"          # find the area
-1up symbol validate_user                    # find the exact function
-1up context src/auth/validate.rs:55         # see full implementation
+1up search "user validation logic" -n 5          # find the area
+1up symbol -r validate_user                      # verify all definitions and callers
+1up context src/auth/validate.rs:55              # see full implementation
 ```
