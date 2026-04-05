@@ -142,6 +142,27 @@ fn format_flag_accepts_all_variants() {
 }
 
 #[test]
+fn help_shows_plain_as_default_output_format() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("Output format: plain (default), json, human")
+            .and(predicate::str::contains("[default: plain]")),
+    );
+}
+
+#[test]
+fn status_defaults_to_plain_output() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args(["status", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::starts_with("daemon:").and(predicate::str::contains("Daemon:").not()),
+        );
+}
+
+#[test]
 fn invalid_format_flag_rejected() {
     cmd()
         .args(["--format", "xml", "search", "test"])
