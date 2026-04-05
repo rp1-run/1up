@@ -165,7 +165,7 @@ Stop the daemon for the current project:
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--format <FORMAT>` | `-f` | Output format: `human`, `json`, `plain` | `human` |
+| `--format <FORMAT>` | `-f` | Output format: `plain`, `json`, `human` | `plain` |
 | `--verbose` | `-v` | Increase logging verbosity (`-v` debug, `-vv` trace) | off |
 
 ### Subcommands
@@ -187,17 +187,17 @@ Indexing commands (`index`, `reindex`, `start`) accept `--jobs <N>` and `--embed
 
 ## Output Formats
 
-Human-readable output is the CLI default. Use JSON when scripting:
+Plain text output is the CLI default. Use human for interactive use and JSON when scripting:
 
 ```sh
-# Human-readable (default)
+# Plain text (default)
 1up symbol parse_config
+
+# Human-readable interactive output
+1up symbol parse_config -f human
 
 # JSON for scripts
 1up symbol parse_config -f json
-
-# Plain text (no colors, no JSON)
-1up symbol parse_config -f plain
 ```
 
 ## Supported Languages
