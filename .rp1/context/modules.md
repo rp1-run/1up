@@ -11,7 +11,7 @@
 **Files**: 12 | **Lines**: ~1,535
 
 **Components**:
-- **Cli** (`mod.rs`): Top-level CLI struct with `Command` enum dispatch, global `--format` (default human) and `--verbose` flags, `parse_positive_usize` validator for concurrency flags
+- **Cli** (`mod.rs`): Top-level CLI struct with `Command` enum dispatch, global `--format` (default plain) and `--verbose` flags, `parse_positive_usize` validator for concurrency flags
 - **SearchArgs** (`search.rs`): Hybrid search with `--limit` and auto-daemon-start
 - **SymbolArgs** (`symbol.rs`): Symbol lookup with optional `--references` flag
 - **ContextArgs** (`context.rs`): Context retrieval for `file:line` locations
