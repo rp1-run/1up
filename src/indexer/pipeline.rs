@@ -75,11 +75,13 @@ use crate::indexer::embedder::Embedder;
 use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
+use crate::shared::constants::{EMBEDDING_DIM, HF_MODEL_REPO};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::types::{
     IndexParallelism, IndexPhase, IndexProgress, IndexStageTimings, IndexState, IndexingConfig,
     ParsedSegment,
 };
+use crate::storage::schema;
 use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -601,6 +603,8 @@ pub async fn run_with_config(
 
     if !has_embedder {
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+    } else {
+        schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
     }
 
     refresh_progress(
