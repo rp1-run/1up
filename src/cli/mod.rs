@@ -16,8 +16,8 @@ use crate::shared::types::OutputFormat;
 
 #[derive(Parser)]
 #[command(
-    name = "1up",
-    about = "🍄  Unified search substrate for source repositories",
+    name = "🍄 1up",
+    about = "🍄 1up — Unified search substrate for source repositories",
     version,
     propagate_version = true
 )]
