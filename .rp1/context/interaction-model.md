@@ -5,7 +5,7 @@
 
 ## Experience Principles
 
-- **Human-first defaults, machine-readable on demand**: CLI defaults to colored human-readable output. Users opt into `json` or `plain` via `--format/-f` for scripting. Human format uses spinners on stderr; json provides structured data; plain emits tab-separated key-value pairs without ANSI.
+- **Agent-first defaults, human-readable on demand**: CLI defaults to `plain` output (tab-separated key-value pairs, no ANSI) for agent and scripting friendliness. Users opt into `human` via `--format/-f` for interactive use. Human format uses spinners on stderr; json provides structured data; plain emits tab-separated key-value pairs without ANSI.
 - **Graceful degradation over hard failure**: When the embedding model is unavailable, the system warns and continues without embeddings. Search degrades to FtsOnly; indexing stores null vectors but retains full-text and symbol data.
 - **Progressive automation with explicit escape hatches**: `1up start` auto-initializes, indexes, persists settings, and starts the daemon in one command. Individual steps (`init`, `index`, `reindex`, `stop`) remain available for granular control.
 - **Configuration cascade**: Concurrency settings resolve through CLI flags > env vars (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`) > registry persisted values > automatic defaults.
@@ -34,7 +34,7 @@
 | `1up index [PATH]` | Incremental index | `--jobs`, `--embed-threads` |
 | `1up reindex [PATH]` | Full rebuild from scratch | `--jobs`, `--embed-threads` |
 
-Global flags: `--format (human|json|plain)` (default: human), `--verbose (-v/-vv)`
+Global flags: `--format (plain|json|human)` (default: plain), `--verbose (-v/-vv)`
 
 ## User-Visible States
 
