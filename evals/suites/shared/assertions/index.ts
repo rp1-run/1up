@@ -113,8 +113,6 @@ export function reportEfficiency(
 
   const turns = meta?.numTurns ?? 0;
   const durationMs = meta?.durationMs ?? 0;
-  const durationSec = (durationMs / 1000).toFixed(1);
-  const costStr = cost != null ? `$${cost.toFixed(4)}` : "unknown";
 
   // Parse the raw SDK response to get full token counts including cache.
   // promptfoo's tokenUsage only captures input_tokens + output_tokens,
@@ -144,19 +142,23 @@ export function reportEfficiency(
   }
 
 
-  // Score: lower cost = better. Normalize against a $0.50 baseline.
-  const COST_BASELINE = 0.5;
-  const score = cost != null ? Math.max(0, Math.min(1, 1 - cost / COST_BASELINE)) : 0;
+  const durationS = Math.round(durationMs / 1000);
+  const costVal = cost ?? 0;
+
+  // Efficiency scores: higher = better, 0-100 scale for readability.
+  // Speed: 200s baseline → 0, 0s → 100. e.g. 50s → 75, 100s → 50
+  const speedScore = Math.max(0, Math.min(100, Math.round((1 - durationS / 200) * 100)));
+  // Cost: $0.50 baseline → 0, $0 → 100. e.g. $0.25 → 50, $0.10 → 80
+  const costScore = Math.max(0, Math.min(100, Math.round((1 - costVal / 0.5) * 100)));
 
   return {
     pass: true,
-    score,
+    score: costScore / 100,
     namedScores: {
-      "Duration (s)": Math.round(durationMs / 1000),
-      "Cost ($)": cost ?? 0,
-      "Turns": turns,
+      "Speed": speedScore,
+      "Cost Efficiency": costScore,
     },
-    reason: `Duration: ${durationSec}s | Cost: ${costStr} | Turns: ${turns} | Tokens (in:${inputTokens.toLocaleString()} out:${outputTokens.toLocaleString()} cache_create:${cacheCreation.toLocaleString()})${debugInfo}`,
+    reason: `${durationS}s | $${costVal.toFixed(2)} | ${turns} turns | tokens in:${inputTokens.toLocaleString()} out:${outputTokens.toLocaleString()} cache_create:${cacheCreation.toLocaleString()}${debugInfo}`,
   };
 }
 

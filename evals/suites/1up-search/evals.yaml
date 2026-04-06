@@ -57,8 +57,9 @@ tests:
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Referenced all expected files: ${expected.join(', ')}` : `Missing: ${missing.join(', ')}` };
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -91,8 +92,9 @@ tests:
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Referenced all expected files: ${expected.join(', ')}` : `Missing: ${missing.join(', ')}` };
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -124,8 +126,9 @@ tests:
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Referenced all expected files: ${expected.join(', ')}` : `Missing: ${missing.join(', ')}` };
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -156,8 +159,9 @@ tests:
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Referenced all expected files: ${expected.join(', ')}` : `Missing: ${missing.join(', ')}` };
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
