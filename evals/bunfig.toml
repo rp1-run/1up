@@ -1,0 +1,3 @@
+[install]
+peer = false
+registry = "https://artifactory.global.square/artifactory/api/npm/square-npm/"
