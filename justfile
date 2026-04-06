@@ -7,3 +7,6 @@ install:
 
 bench-parallel repo='.':
     ./scripts/benchmark_parallel_indexing.sh {{repo}}
+
+eval:
+    cd evals && bun run eval
