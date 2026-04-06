@@ -1,10 +1,12 @@
 import { execSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const EMDASH_REPO = "https://github.com/sanity-io/sanity.git";
-const EMDASH_COMMIT = "a32de23b1c4f4f8e1a9d3c5b7e2f0a6d8c4e1b3a";
-const CACHE_DIR = join(import.meta.dir, "../../.cache/emdash");
+const EMDASH_REPO = "https://github.com/emdash-cms/emdash.git";
+const EMDASH_COMMIT = "5beb0dd";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CACHE_DIR = join(__dirname, "../../.cache/emdash");
 const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
 const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
 const TEMP_BASE = "/tmp/1up-evals";
