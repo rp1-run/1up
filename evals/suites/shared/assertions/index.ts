@@ -1,141 +1,82 @@
-import type { GradingResult } from "promptfoo";
-import { toCanonical } from "../tool-names.ts";
+/**
+ * Tool-call based assertions for 1up eval tests.
+ * Uses provider metadata to inspect tool calls made by the agent.
+ */
 
-interface AssertionContext {
+interface GradingResult {
+  pass: boolean;
+  score: number;
+  reason: string;
+}
+
+interface ToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly input: unknown;
+  readonly output?: unknown;
+  readonly is_error?: boolean;
+  readonly parentToolUseId?: string | null;
+}
+
+interface ProviderMetadata {
+  readonly toolCalls?: readonly ToolCall[];
+  readonly skillCalls?: readonly { name: string }[];
+}
+
+interface EvalContext {
   vars?: Record<string, string | number | boolean | object>;
-  test?: Record<string, unknown>;
-  logProbs?: number[];
-  config?: Record<string, unknown>;
-  provider?: unknown;
   providerResponse?: {
-    raw?: unknown;
-    output?: unknown;
-    metadata?: Record<string, unknown>;
+    metadata?: ProviderMetadata;
   };
 }
 
-const ONEUP_COMMANDS = ["1up search", "1up symbol", "1up context"];
+function getToolCalls(context: EvalContext): readonly ToolCall[] {
+  return context.providerResponse?.metadata?.toolCalls ?? [];
+}
+
+function getBashCommands(context: EvalContext): string[] {
+  return getToolCalls(context)
+    .filter((tc) => tc.name === "Bash")
+    .map((tc) => (tc.input as { command?: string })?.command ?? "")
+    .filter((cmd) => cmd.length > 0);
+}
+
+const ONEUP_PATTERN = /\b1up\s+(?:search|symbol|context)\b/;
 
 const FALLBACK_PATTERNS = [
-  /(?:^|\s|&&|\|\||;)rg\s/m,
-  /(?:^|\s|&&|\|\||;)grep\s/m,
-  /(?:^|\s|&&|\|\||;)find\s/m,
+  /(?:^|\s|&&|\|\||;)rg\s/,
+  /(?:^|\s|&&|\|\||;)grep\s/,
+  /(?:^|\s|&&|\|\||;)find\s/,
 ];
 
-function isShellTool(toolName: string): boolean {
-  return toCanonical(toolName) === "shell";
-}
-
-function extractToolLog(output: string, context: AssertionContext): string {
-  const parts: string[] = [output];
-
-  if (context.providerResponse?.raw) {
-    parts.push(
-      typeof context.providerResponse.raw === "string"
-        ? context.providerResponse.raw
-        : JSON.stringify(context.providerResponse.raw),
-    );
-  }
-
-  if (
-    context.providerResponse?.output &&
-    context.providerResponse.output !== output
-  ) {
-    parts.push(
-      typeof context.providerResponse.output === "string"
-        ? context.providerResponse.output
-        : JSON.stringify(context.providerResponse.output),
-    );
-  }
-
-  return parts.join("\n");
-}
-
-function extractShellCommands(toolLog: string): string[] {
-  const commands: string[] = [];
-
-  const shellToolNames = ["Bash", "bash"].filter(isShellTool);
-  const namePattern = shellToolNames.join("|");
-
-  const toolUsePattern = new RegExp(
-    `"(?:tool_name|name)"\\s*:\\s*"(?:${namePattern})"\\s*[\\s\\S]*?"(?:command|input)"\\s*:\\s*"([^"]*)"`,
-    "g",
-  );
-  let match: RegExpExecArray | null;
-  match = toolUsePattern.exec(toolLog);
-  while (match !== null) {
-    commands.push(match[1]);
-    match = toolUsePattern.exec(toolLog);
-  }
-
-  const inlinePattern = /(?:1up\s+(?:search|symbol|context))\b[^\n]*/g;
-  match = inlinePattern.exec(toolLog);
-  while (match !== null) {
-    commands.push(match[0]);
-    match = inlinePattern.exec(toolLog);
-  }
-
-  return commands;
-}
-
 export function assert1upUsed(
-  output: string,
-  context: AssertionContext,
+  _output: string,
+  context: EvalContext,
 ): GradingResult {
-  const toolLog = extractToolLog(output, context);
-  const shellCommands = extractShellCommands(toolLog);
-
-  const found = shellCommands.some((cmd) =>
-    ONEUP_COMMANDS.some((oneup) => cmd.includes(oneup)),
-  );
-
-  if (!found) {
-    const directMatch = ONEUP_COMMANDS.some((cmd) => toolLog.includes(cmd));
-    if (directMatch) {
-      return {
-        pass: true,
-        score: 1,
-        reason: "Agent invoked at least one 1up command",
-      };
-    }
-  }
+  const bashCommands = getBashCommands(context);
+  const found = bashCommands.some((cmd) => ONEUP_PATTERN.test(cmd));
 
   return {
     pass: found,
     score: found ? 1 : 0,
     reason: found
-      ? "Agent invoked at least one 1up command"
-      : "Agent did not invoke any 1up commands (search, symbol, or context)",
+      ? "Agent invoked at least one 1up command (search, symbol, or context)"
+      : `Agent did not invoke any 1up commands. Bash commands seen: ${bashCommands.length === 0 ? "(none)" : bashCommands.map((c) => c.slice(0, 60)).join("; ")}`,
   };
 }
 
 export function assertNoFallbackTools(
-  output: string,
-  context: AssertionContext,
+  _output: string,
+  context: EvalContext,
 ): GradingResult {
-  const toolLog = extractToolLog(output, context);
-  const shellCommands = extractShellCommands(toolLog);
-
+  const bashCommands = getBashCommands(context);
   const violations: string[] = [];
 
-  for (const cmd of shellCommands) {
+  for (const cmd of bashCommands) {
     for (const pattern of FALLBACK_PATTERNS) {
       if (pattern.test(cmd)) {
         const tool = cmd.match(pattern)?.[0]?.trim();
-        if (tool) {
-          violations.push(tool);
-        }
-      }
-    }
-  }
-
-  if (violations.length === 0) {
-    for (const pattern of FALLBACK_PATTERNS) {
-      if (pattern.test(toolLog)) {
-        const tool = toolLog.match(pattern)?.[0]?.trim();
-        if (tool) {
-          violations.push(tool);
-        }
+        if (tool) violations.push(tool);
       }
     }
   }
@@ -152,8 +93,8 @@ export function assertNoFallbackTools(
 
 export function assertExpectedFiles(
   expectedFiles: string[],
-): (output: string, context: AssertionContext) => GradingResult {
-  return (output: string, _context: AssertionContext): GradingResult => {
+): (output: string, context: EvalContext) => GradingResult {
+  return (output: string, _context: EvalContext): GradingResult => {
     const missing: string[] = [];
 
     for (const file of expectedFiles) {
