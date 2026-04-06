@@ -12,3 +12,8 @@
 .rp1/settings.toml
 # rp1:end
 .osgrep
+
+# evals
+evals/.cache/
+evals/output/
+evals/node_modules/
