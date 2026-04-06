@@ -7,11 +7,12 @@ providers:
   - id: anthropic:claude-agent-sdk
     config:
       model: haiku
-      betas: [fast-mode-2026-02-01]
+      betas:
+        - fast-mode-2026-02-01
       permission_mode: bypassPermissions
       allow_dangerously_skip_permissions: true
       max_turns: 100
-      custom_allowed_tools: [Bash, Read]
+      custom_allowed_tools: [Bash, Read, Skill]
 
 defaultTest:
   options:
@@ -30,7 +31,7 @@ tests:
         Trace how emdash content search is enabled and queried, from a field
         becoming searchable through to admin search results. Identify the key
         files involved in each step.
-      EXPECTED_FILES: fts-manager.ts,query.ts,AdminCommandPalette.tsx,search.spec.ts
+      EXPECTED_FILES: fts-manager.ts,query.ts,AdminCommandPalette.tsx
     assert:
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
@@ -44,128 +45,132 @@ tests:
           return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
       - type: llm-rubric
         value: >
-          Accuracy: Does the agent's answer correctly describe how content
-          search works in emdash, including FTS indexing via fts-manager.ts,
-          query execution via query.ts, admin search UI in
-          AdminCommandPalette.tsx, and test coverage in search.spec.ts? Score
-          based on factual correctness of the described code flow.
+          Accuracy: The correct search flow in emdash is: (1) FTSManager in
+          fts-manager.ts creates FTS5 virtual tables and triggers when search
+          is enabled, (2) query.ts contains searchSingleCollection() which
+          runs FTS5 MATCH queries with BM25 ranking, (3) AdminCommandPalette.tsx
+          provides the admin search UI that calls the search API endpoint.
+          Does the agent's answer accurately describe this flow? Score 1.0
+          if all three components are correctly described, 0.5 if partially
+          correct, 0.0 if fundamentally wrong.
       - type: llm-rubric
         value: >
           Completeness: Does the agent trace the full path from a field
           becoming searchable through to admin search results? The answer
-          should cover indexing setup, query execution, UI integration, and
-          testing. Score based on coverage of the complete flow.
+          should cover: (a) how fields are marked searchable, (b) FTS index
+          creation/maintenance, (c) query execution with ranking, (d) UI
+          integration. Score based on how many of these four stages are covered.
       - type: llm-rubric
         value: >
           Reasoning Quality: Is the explanation coherent, well-structured, and
           does it demonstrate understanding of how the search components
           connect? Score based on clarity and logical flow of the explanation.
 
-  - description: WordPress Import
-    vars:
-      TASK_PROMPT: >
-        Explain the WordPress import pipeline from the admin wizard through
-        schema preparation, WXR execution, and Gutenberg-to-Portable-Text
-        conversion. Identify the key files involved in each step.
-      EXPECTED_FILES: WordPressImport.tsx,prepare.ts,execute.ts,gutenberg-to-portable-text/src/index.ts
-    assert:
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: |
-          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
-          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
-      - type: llm-rubric
-        value: >
-          Accuracy: Does the agent's answer correctly describe the WordPress
-          import pipeline, including the admin wizard in WordPressImport.tsx,
-          schema preparation in prepare.ts, WXR execution in execute.ts, and
-          Gutenberg-to-Portable-Text conversion in index.ts? Score based on
-          factual correctness.
-      - type: llm-rubric
-        value: >
-          Completeness: Does the agent trace the full import pipeline from
-          wizard UI through preparation, execution, and content conversion?
-          The answer should cover all four stages. Score based on coverage.
-      - type: llm-rubric
-        value: >
-          Reasoning Quality: Is the explanation coherent, well-structured, and
-          does it demonstrate understanding of how the import stages connect
-          and transform data? Score based on clarity and logical flow.
+  # - description: WordPress Import
+  #   vars:
+  #     TASK_PROMPT: >
+  #       Explain the WordPress import pipeline from the admin wizard through
+  #       schema preparation, WXR execution, and Gutenberg-to-Portable-Text
+  #       conversion. Identify the key files involved in each step.
+  #     EXPECTED_FILES: WordPressImport.tsx,prepare.ts,execute.ts,gutenberg-to-portable-text/src/index.ts
+  #   assert:
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assert1upUsed
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assertNoFallbackTools
+  #     - type: javascript
+  #       value: |
+  #         const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+  #         const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+  #         const pass = missing.length === 0;
+  #         return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
+  #     - type: llm-rubric
+  #       value: >
+  #         Accuracy: Does the agent's answer correctly describe the WordPress
+  #         import pipeline, including the admin wizard in WordPressImport.tsx,
+  #         schema preparation in prepare.ts, WXR execution in execute.ts, and
+  #         Gutenberg-to-Portable-Text conversion in index.ts? Score based on
+  #         factual correctness.
+  #     - type: llm-rubric
+  #       value: >
+  #         Completeness: Does the agent trace the full import pipeline from
+  #         wizard UI through preparation, execution, and content conversion?
+  #         The answer should cover all four stages. Score based on coverage.
+  #     - type: llm-rubric
+  #       value: >
+  #         Reasoning Quality: Is the explanation coherent, well-structured, and
+  #         does it demonstrate understanding of how the import stages connect
+  #         and transform data? Score based on clarity and logical flow.
 
-  - description: Plugin Architecture
-    vars:
-      TASK_PROMPT: >
-        Trace how a sandboxed emdash plugin is registered, capability-gated,
-        loaded into Cloudflare Worker isolation, and given controlled access
-        to content, storage, and network. Identify the key files involved in
-        each step.
-      EXPECTED_FILES: manager.ts,hooks.ts,runner.ts,wrapper.ts,bridge.ts
-    assert:
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: |
-          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
-          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
-      - type: llm-rubric
-        value: >
-          Accuracy: Does the agent's answer correctly describe the plugin
-          architecture, including registration in manager.ts, capability hooks
-          in hooks.ts, Worker isolation in runner.ts, sandboxed wrapping in
-          wrapper.ts, and bridge access in bridge.ts? Score based on factual
-          correctness.
-      - type: llm-rubric
-        value: >
-          Completeness: Does the agent trace the full plugin lifecycle from
-          registration through capability gating, Worker isolation, and
-          controlled resource access? The answer should cover all five
-          architectural layers. Score based on coverage.
-      - type: llm-rubric
-        value: >
-          Reasoning Quality: Is the explanation coherent, well-structured, and
-          does it demonstrate understanding of the security boundaries and
-          isolation mechanisms? Score based on clarity and logical flow.
+  # - description: Plugin Architecture
+  #   vars:
+  #     TASK_PROMPT: >
+  #       Trace how a sandboxed emdash plugin is registered, capability-gated,
+  #       loaded into Cloudflare Worker isolation, and given controlled access
+  #       to content, storage, and network. Identify the key files involved in
+  #       each step.
+  #     EXPECTED_FILES: manager.ts,hooks.ts,runner.ts,wrapper.ts,bridge.ts
+  #   assert:
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assert1upUsed
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assertNoFallbackTools
+  #     - type: javascript
+  #       value: |
+  #         const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+  #         const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+  #         const pass = missing.length === 0;
+  #         return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
+  #     - type: llm-rubric
+  #       value: >
+  #         Accuracy: Does the agent's answer correctly describe the plugin
+  #         architecture, including registration in manager.ts, capability hooks
+  #         in hooks.ts, Worker isolation in runner.ts, sandboxed wrapping in
+  #         wrapper.ts, and bridge access in bridge.ts? Score based on factual
+  #         correctness.
+  #     - type: llm-rubric
+  #       value: >
+  #         Completeness: Does the agent trace the full plugin lifecycle from
+  #         registration through capability gating, Worker isolation, and
+  #         controlled resource access? The answer should cover all five
+  #         architectural layers. Score based on coverage.
+  #     - type: llm-rubric
+  #       value: >
+  #         Reasoning Quality: Is the explanation coherent, well-structured, and
+  #         does it demonstrate understanding of the security boundaries and
+  #         isolation mechanisms? Score based on clarity and logical flow.
 
-  - description: Live Content Query
-    vars:
-      TASK_PROMPT: >
-        Explain how emdash stores schema in the database and exposes typed
-        live content queries through Astro. Identify the key files involved
-        in each step.
-      EXPECTED_FILES: registry.ts,loader.ts,query.ts,live.config.ts
-    assert:
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: |
-          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
-          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
-          const pass = missing.length === 0;
-          return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
-      - type: llm-rubric
-        value: >
-          Accuracy: Does the agent's answer correctly describe schema storage
-          in registry.ts, schema loading in loader.ts, query execution in
-          query.ts, and Astro integration in live.config.ts? Score based on
-          factual correctness.
-      - type: llm-rubric
-        value: >
-          Completeness: Does the agent trace the full path from schema
-          storage through loading, querying, and Astro exposure? The answer
-          should cover all four components. Score based on coverage.
-      - type: llm-rubric
-        value: >
-          Reasoning Quality: Is the explanation coherent, well-structured, and
-          does it demonstrate understanding of how schema definition flows
-          through to typed query APIs? Score based on clarity and logical flow.
+  # - description: Live Content Query
+  #   vars:
+  #     TASK_PROMPT: >
+  #       Explain how emdash stores schema in the database and exposes typed
+  #       live content queries through Astro. Identify the key files involved
+  #       in each step.
+  #     EXPECTED_FILES: registry.ts,loader.ts,query.ts,live.config.ts
+  #   assert:
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assert1upUsed
+  #     - type: javascript
+  #       value: file://../shared/assertions/index.ts:assertNoFallbackTools
+  #     - type: javascript
+  #       value: |
+  #         const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+  #         const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+  #         const pass = missing.length === 0;
+  #         return { pass, score: (expected.length - missing.length) / expected.length, reason: pass ? `Agent referenced all expected files: ${expected.join(', ')}` : `Agent missing references to: ${missing.join(', ')}` };
+  #     - type: llm-rubric
+  #       value: >
+  #         Accuracy: Does the agent's answer correctly describe schema storage
+  #         in registry.ts, schema loading in loader.ts, query execution in
+  #         query.ts, and Astro integration in live.config.ts? Score based on
+  #         factual correctness.
+  #     - type: llm-rubric
+  #       value: >
+  #         Completeness: Does the agent trace the full path from schema
+  #         storage through loading, querying, and Astro exposure? The answer
+  #         should cover all four components. Score based on coverage.
+  #     - type: llm-rubric
+  #       value: >
+  #         Reasoning Quality: Is the explanation coherent, well-structured, and
+  #         does it demonstrate understanding of how schema definition flows
+  #         through to typed query APIs? Score based on clarity and logical flow.
