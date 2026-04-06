@@ -1,5 +1,5 @@
 import type { GradingResult } from "promptfoo";
-import { toCanonical } from "../tool-names";
+import { toCanonical } from "../tool-names.ts";
 
 interface AssertionContext {
   vars?: Record<string, string | number | boolean | object>;
