@@ -90,18 +90,6 @@ export default async function (
     }
     context.test.options.working_dir = emdashDir;
 
-    const provider = context.test.options.provider as
-      | Record<string, Record<string, unknown>>
-      | undefined;
-    if (provider?.config) {
-      provider.config.env = {
-        ...(provider.config.env as Record<string, string> | undefined),
-        HOME: homeDir,
-        XDG_DATA_HOME: join(homeDir, ".local/share"),
-        XDG_CONFIG_HOME: join(homeDir, ".config"),
-      };
-    }
-
     context.test.vars._WORKSPACE_DIR = workspaceDir;
     context.test.vars._HOME = homeDir;
 
