@@ -1,0 +1,5 @@
+Load 1up-search skill. Your working directory is {{WORKSPACE_DIR}}.
+
+{{TASK_PROMPT}}
+
+Keep all the answers in this session to exactly one sentence. Use only 1up commands (search, symbol, context) for code exploration. Do not use grep, rg, or find.
