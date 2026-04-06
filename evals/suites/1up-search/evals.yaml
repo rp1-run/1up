@@ -21,7 +21,7 @@ defaultTest:
         temperature: 0
 
 extensions:
-  - file://../shared/extension.ts
+  - file://../shared/extension.ts:default
 
 tests:
   - description: Search Stack
