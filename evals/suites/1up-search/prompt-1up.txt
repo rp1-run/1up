@@ -1,0 +1,10 @@
+Your working directory is {{WORKSPACE_DIR}}.
+
+{{TASK_PROMPT}}
+
+Be concise. Use `1up search` for code exploration. Examples:
+- `1up search "how does authentication work"`
+- `1up search "database connection setup"`
+- `1up search "error handling patterns"`
+
+Do not use grep, rg, or find.
