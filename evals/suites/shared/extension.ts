@@ -29,12 +29,10 @@ function ensureFixtureCache(): void {
   mkdirSync(CACHE_DIR, { recursive: true });
 
   if (!existsSync(join(CACHE_DIR, ".git"))) {
-    execSync(`git clone --depth 1 ${EMDASH_REPO} "${CACHE_DIR}"`, {
-      stdio: "pipe",
-    });
-    execSync(`git -C "${CACHE_DIR}" fetch --depth 1 origin ${EMDASH_COMMIT}`, {
-      stdio: "pipe",
-    });
+    execSync(
+      `git clone --single-branch --branch main ${EMDASH_REPO} "${CACHE_DIR}"`,
+      { stdio: "pipe" },
+    );
     execSync(`git -C "${CACHE_DIR}" checkout ${EMDASH_COMMIT}`, {
       stdio: "pipe",
     });
