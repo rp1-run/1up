@@ -1,0 +1,130 @@
+import { execSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
+const EMDASH_REPO = "https://github.com/sanity-io/sanity.git";
+const EMDASH_COMMIT = "a32de23b1c4f4f8e1a9d3c5b7e2f0a6d8c4e1b3a";
+const CACHE_DIR = join(import.meta.dir, "../../.cache/emdash");
+const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
+const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
+const TEMP_BASE = "/tmp/1up-evals";
+
+interface HookContext {
+  test: {
+    vars?: Record<string, string | number | boolean | object>;
+    options?: Record<string, unknown>;
+  };
+  result?: {
+    success: boolean;
+  };
+}
+
+function ensureFixtureCache(): void {
+  if (existsSync(INDEX_DB_PATH)) {
+    return;
+  }
+
+  mkdirSync(CACHE_DIR, { recursive: true });
+
+  if (!existsSync(join(CACHE_DIR, ".git"))) {
+    execSync(`git clone --depth 1 ${EMDASH_REPO} "${CACHE_DIR}"`, {
+      stdio: "pipe",
+    });
+    execSync(`git -C "${CACHE_DIR}" fetch --depth 1 origin ${EMDASH_COMMIT}`, {
+      stdio: "pipe",
+    });
+    execSync(`git -C "${CACHE_DIR}" checkout ${EMDASH_COMMIT}`, {
+      stdio: "pipe",
+    });
+  }
+
+  execSync("1up index", { cwd: CACHE_DIR, stdio: "pipe" });
+
+  if (existsSync(PROJECT_ID_PATH)) {
+    rmSync(PROJECT_ID_PATH);
+  }
+}
+
+function createWorkspace(): string {
+  const uuid = crypto.randomUUID();
+  const workspaceDir = join(TEMP_BASE, uuid);
+  const homeDir = join(workspaceDir, "home");
+
+  mkdirSync(homeDir, { recursive: true });
+  mkdirSync(join(homeDir, ".local/share"), { recursive: true });
+  mkdirSync(join(homeDir, ".config"), { recursive: true });
+
+  cpSync(CACHE_DIR, join(workspaceDir, "emdash"), { recursive: true });
+
+  return workspaceDir;
+}
+
+function cleanupWorkspace(workspaceDir: string): void {
+  if (existsSync(workspaceDir)) {
+    rmSync(workspaceDir, { recursive: true, force: true });
+  }
+}
+
+export default async function (
+  hookName: string,
+  context: HookContext,
+): Promise<void> {
+  if (hookName === "beforeAll") {
+    ensureFixtureCache();
+    return;
+  }
+
+  if (hookName === "beforeEach") {
+    const workspaceDir = createWorkspace();
+    const emdashDir = join(workspaceDir, "emdash");
+    const homeDir = join(workspaceDir, "home");
+
+    if (!context.test.vars) {
+      context.test.vars = {};
+    }
+    context.test.vars.WORKSPACE_DIR = emdashDir;
+    context.test.vars.EVAL_BASE_DIR = workspaceDir;
+
+    if (!context.test.options) {
+      context.test.options = {};
+    }
+    context.test.options.working_dir = emdashDir;
+
+    const provider = context.test.options.provider as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+    if (provider?.config) {
+      provider.config.env = {
+        ...(provider.config.env as Record<string, string> | undefined),
+        HOME: homeDir,
+        XDG_DATA_HOME: join(homeDir, ".local/share"),
+        XDG_CONFIG_HOME: join(homeDir, ".config"),
+      };
+    }
+
+    context.test.vars._WORKSPACE_DIR = workspaceDir;
+    context.test.vars._HOME = homeDir;
+
+    return;
+  }
+
+  if (hookName === "afterEach") {
+    const workspaceDir = context.test.vars?._WORKSPACE_DIR as
+      | string
+      | undefined;
+    if (!workspaceDir) {
+      return;
+    }
+
+    const preserve =
+      process.env.PRESERVE_EVAL_WORKSPACES === "true" &&
+      context.result?.success === false;
+
+    if (preserve) {
+      console.log(`Preserving workspace for failed test: ${workspaceDir}`);
+      return;
+    }
+
+    cleanupWorkspace(workspaceDir);
+  }
+}
