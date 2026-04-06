@@ -7,6 +7,7 @@ interface GradingResult {
   pass: boolean;
   score: number;
   reason: string;
+  namedScores?: Record<string, number>;
 }
 
 interface ToolCall {
@@ -21,12 +22,24 @@ interface ToolCall {
 interface ProviderMetadata {
   readonly toolCalls?: readonly ToolCall[];
   readonly skillCalls?: readonly { name: string }[];
+  readonly numTurns?: number;
+  readonly durationMs?: number;
+}
+
+interface TokenUsage {
+  readonly total?: number;
+  readonly prompt?: number;
+  readonly completion?: number;
+  readonly numRequests?: number;
 }
 
 interface EvalContext {
   vars?: Record<string, string | number | boolean | object>;
   providerResponse?: {
     metadata?: ProviderMetadata;
+    tokenUsage?: TokenUsage;
+    cost?: number;
+    raw?: string;
   };
 }
 
@@ -88,6 +101,62 @@ export function assertNoFallbackTools(
     reason: pass
       ? "Agent did not use fallback search tools"
       : `Agent used fallback tools: ${[...new Set(violations)].join(", ")}`,
+  };
+}
+
+export function reportEfficiency(
+  _output: string,
+  context: EvalContext,
+): GradingResult {
+  const meta = context.providerResponse?.metadata;
+  const cost = context.providerResponse?.cost;
+
+  const turns = meta?.numTurns ?? 0;
+  const durationMs = meta?.durationMs ?? 0;
+  const durationSec = (durationMs / 1000).toFixed(1);
+  const costStr = cost != null ? `$${cost.toFixed(4)}` : "unknown";
+
+  // Parse the raw SDK response to get full token counts including cache.
+  // promptfoo's tokenUsage only captures input_tokens + output_tokens,
+  // missing cache_read and cache_creation which are the bulk of usage.
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheCreation = 0;
+  let debugInfo = "";
+
+  const rawStr = context.providerResponse?.raw;
+  if (rawStr) {
+    try {
+      const raw = typeof rawStr === "string" ? JSON.parse(rawStr) : rawStr;
+      const usage = raw.usage ?? {};
+      inputTokens = usage.input_tokens ?? 0;
+      outputTokens = usage.output_tokens ?? 0;
+      cacheCreation = usage.cache_creation_input_tokens ?? 0;
+    } catch {
+      debugInfo = " [raw parse failed]";
+    }
+  } else {
+    // No raw — try tokenUsage as fallback
+    const tu = context.providerResponse?.tokenUsage;
+    inputTokens = tu?.prompt ?? 0;
+    outputTokens = tu?.completion ?? 0;
+    debugInfo = ` [no raw, keys: ${Object.keys(context.providerResponse ?? {}).join(",")}]`;
+  }
+
+
+  // Score: lower cost = better. Normalize against a $0.50 baseline.
+  const COST_BASELINE = 0.5;
+  const score = cost != null ? Math.max(0, Math.min(1, 1 - cost / COST_BASELINE)) : 0;
+
+  return {
+    pass: true,
+    score,
+    namedScores: {
+      "Duration (s)": Math.round(durationMs / 1000),
+      "Cost ($)": cost ?? 0,
+      "Turns": turns,
+    },
+    reason: `Duration: ${durationSec}s | Cost: ${costStr} | Turns: ${turns} | Tokens (in:${inputTokens.toLocaleString()} out:${outputTokens.toLocaleString()} cache_create:${cacheCreation.toLocaleString()})${debugInfo}`,
   };
 }
 
