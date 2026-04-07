@@ -79,7 +79,7 @@ use crate::shared::constants::{EMBEDDING_DIM, HF_MODEL_REPO};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::types::{
     IndexParallelism, IndexPhase, IndexProgress, IndexStageTimings, IndexState, IndexingConfig,
-    ParsedSegment,
+    ParsedSegment, RunScope,
 };
 use crate::storage::schema;
 use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
@@ -185,9 +185,12 @@ struct ParseResult {
 }
 
 fn relative_path_for(project_root: &Path, path: &Path) -> String {
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     canonical
-        .strip_prefix(project_root)
+        .strip_prefix(&project_root)
         .unwrap_or(&canonical)
         .to_string_lossy()
         .to_string()
@@ -217,6 +220,151 @@ fn build_scanned_work_items(
             }
         })
         .collect()
+}
+
+struct RunInputs {
+    scanned_files: Vec<ScannedWorkItem>,
+    deleted_paths: Vec<String>,
+}
+
+enum ScopePreparation {
+    Ready(RunInputs),
+    FallbackToFull(String),
+}
+
+fn requires_full_scope_fallback(relative_path: &Path) -> bool {
+    relative_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".gitignore" | ".ignore"))
+        || relative_path == Path::new(".git").join("info").join("exclude")
+}
+
+fn is_known_extensionless_file(relative_path: &Path) -> bool {
+    relative_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "dockerfile" | "makefile" | "justfile"
+            )
+        })
+}
+
+async fn prepare_full_run_inputs(
+    conn: &Connection,
+    project_root: &Path,
+) -> Result<RunInputs, OneupError> {
+    let scanned = scanner::scan_directory(project_root)?;
+    let stored_hashes = segments::get_all_file_hashes(conn).await?;
+    let scanned_files = build_scanned_work_items(project_root, scanned, &stored_hashes);
+
+    let scanned_paths: HashSet<String> = scanned_files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect();
+    let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
+        .await?
+        .into_iter()
+        .collect();
+    let deleted_paths = indexed_paths.difference(&scanned_paths).cloned().collect();
+
+    Ok(RunInputs {
+        scanned_files,
+        deleted_paths,
+    })
+}
+
+async fn prepare_scoped_run_inputs(
+    conn: &Connection,
+    project_root: &Path,
+    changed_paths: &std::collections::BTreeSet<PathBuf>,
+) -> Result<ScopePreparation, OneupError> {
+    if changed_paths.is_empty() {
+        return Ok(ScopePreparation::Ready(RunInputs {
+            scanned_files: Vec::new(),
+            deleted_paths: Vec::new(),
+        }));
+    }
+
+    let mut scoped_scan_results: HashMap<String, scanner::ScannedFile> =
+        scanner::scan_paths(project_root, changed_paths)?
+            .into_iter()
+            .map(|file| (relative_path_for(project_root, &file.path), file))
+            .collect();
+
+    let mut scanned_files = Vec::new();
+    let mut deleted_paths = Vec::new();
+
+    for relative_path in changed_paths {
+        if requires_full_scope_fallback(relative_path) {
+            return Ok(ScopePreparation::FallbackToFull(format!(
+                "path {} changes ignore semantics",
+                relative_path.display()
+            )));
+        }
+
+        let relative_string = relative_path.to_string_lossy().to_string();
+        let absolute_path = project_root.join(relative_path);
+
+        if absolute_path.exists() {
+            if !absolute_path.is_file() {
+                return Ok(ScopePreparation::FallbackToFull(format!(
+                    "path {} resolved to a directory",
+                    relative_path.display()
+                )));
+            }
+
+            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
+            if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
+                scanned_files.push(ScannedWorkItem {
+                    sequence_id: scanned_files.len(),
+                    relative_path: relative_string,
+                    path: scanned_file.path,
+                    extension: scanned_file.extension,
+                    stored_hash,
+                });
+                continue;
+            }
+
+            if scanner::is_scannable_file(&absolute_path) {
+                return Ok(ScopePreparation::FallbackToFull(format!(
+                    "path {} is excluded by full-scan ignore semantics",
+                    relative_path.display()
+                )));
+            }
+
+            if stored_hash.is_some() {
+                return Ok(ScopePreparation::FallbackToFull(format!(
+                    "path {} no longer matches scanner filters",
+                    relative_path.display()
+                )));
+            }
+
+            continue;
+        }
+
+        if segments::get_file_hash(conn, &relative_string)
+            .await?
+            .is_some()
+        {
+            deleted_paths.push(relative_string);
+            continue;
+        }
+
+        if relative_path.extension().is_none() && !is_known_extensionless_file(relative_path) {
+            return Ok(ScopePreparation::FallbackToFull(format!(
+                "path {} disappeared without indexed content",
+                relative_path.display()
+            )));
+        }
+    }
+
+    Ok(ScopePreparation::Ready(RunInputs {
+        scanned_files,
+        deleted_paths,
+    }))
 }
 
 fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
@@ -486,6 +634,7 @@ async fn flush_reorder_buffer(
     state: &mut FlushState<'_>,
 ) -> Result<(), OneupError> {
     let mut ready_files = Vec::new();
+    let write_batch_files = config.effective_write_batch_files(state.files_total);
 
     while let Some(result) = reorder_buffer.remove(next_sequence) {
         match result {
@@ -493,7 +642,7 @@ async fn flush_reorder_buffer(
                 ready_files.push(file);
                 *next_sequence += 1;
 
-                if ready_files.len() >= config.write_batch_files {
+                if ready_files.len() >= write_batch_files {
                     {
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
@@ -592,10 +741,51 @@ pub async fn run_with_config(
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
 ) -> Result<PipelineStats, OneupError> {
+    run_with_scope(conn, project_root, embedder, &RunScope::Full, config).await
+}
+
+pub async fn run_with_scope(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+) -> Result<PipelineStats, OneupError> {
+    let run_inputs = match scope {
+        RunScope::Full => prepare_full_run_inputs(conn, project_root).await?,
+        RunScope::Paths(changed_paths) => {
+            match prepare_scoped_run_inputs(conn, project_root, changed_paths).await? {
+                ScopePreparation::Ready(run_inputs) => run_inputs,
+                ScopePreparation::FallbackToFull(reason) => {
+                    info!(
+                        "scoped run for {} fell back to a full scan: {}",
+                        project_root.display(),
+                        reason
+                    );
+                    prepare_full_run_inputs(conn, project_root).await?
+                }
+            }
+        }
+    };
+
+    execute_run_with_inputs(conn, project_root, embedder, config, run_inputs).await
+}
+
+async fn execute_run_with_inputs(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    config: &IndexingConfig,
+    run_inputs: RunInputs,
+) -> Result<PipelineStats, OneupError> {
     let run_started_at = Instant::now();
     let mut stats = PipelineStats::default();
     let mut timings = TimingAccumulator::default();
     let mut embedder = embedder;
+    let RunInputs {
+        scanned_files,
+        deleted_paths,
+    } = run_inputs;
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
@@ -620,24 +810,9 @@ pub async fn run_with_config(
     let progress_spinner = spin("Scanning files");
     let scan_started_at = Instant::now();
 
-    let scanned = scanner::scan_directory(project_root)?;
-    stats.files_scanned = scanned.len();
-
-    progress_spinner.update(format!("Scanning {} files", scanned.len()));
-
-    let stored_hashes = segments::get_all_file_hashes(conn).await?;
-    let scanned_files = build_scanned_work_items(project_root, scanned, &stored_hashes);
+    stats.files_scanned = scanned_files.len();
+    progress_spinner.update(format!("Scanning {} files", scanned_files.len()));
     let total_files = scanned_files.len();
-
-    let scanned_paths: HashSet<String> = scanned_files
-        .iter()
-        .map(|file| file.relative_path.clone())
-        .collect();
-    let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
-        .await?
-        .into_iter()
-        .collect();
-    let deleted_paths: Vec<String> = indexed_paths.difference(&scanned_paths).cloned().collect();
     timings.scan_ms = scan_started_at.elapsed().as_millis();
     parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
 
@@ -654,7 +829,13 @@ pub async fn run_with_config(
 
     if !deleted_paths.is_empty() {
         let store_before_delete = timings.store_ms;
-        delete_removed_files(conn, &deleted_paths, config.write_batch_files, &mut timings).await?;
+        delete_removed_files(
+            conn,
+            &deleted_paths,
+            config.effective_write_batch_files(deleted_paths.len()),
+            &mut timings,
+        )
+        .await?;
         for path in &deleted_paths {
             debug!("removed segments for deleted file: {path}");
         }
@@ -942,6 +1123,164 @@ mod tests {
 
         let paths2 = segments::get_all_file_paths(&conn).await.unwrap();
         assert_eq!(paths2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_updates_only_changed_paths_and_deletions() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn b() {}\n").unwrap();
+        fs::write(tmp.path().join("keep.rs"), "fn keep() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\nfn a2() {}\n").unwrap();
+        fs::remove_file(tmp.path().join("b.rs")).unwrap();
+        fs::write(tmp.path().join("c.rs"), "fn c() {}\n").unwrap();
+        let config = IndexingConfig::from_sources(Some(2), Some(1), None).unwrap();
+        assert!(config.write_batch_files > 1);
+        assert_eq!(config.effective_write_batch_files(2), 2);
+        assert_eq!(config.effective_write_batch_files(1), 1);
+
+        let scope = RunScope::from_paths(["a.rs", "b.rs", "c.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(&conn, tmp.path(), None, &scope, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(stats.files_indexed, 2);
+
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["a.rs", "c.rs", "keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_directory_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src").join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(tmp.path().join("top.rs"), "pub fn top() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(
+            tmp.path().join("top.rs"),
+            "pub fn top() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+
+        let scope = RunScope::from_paths(["src", "top.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_hidden_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(tmp.path().join(".hidden.rs"), "pub fn hidden() {}\n").unwrap();
+
+        let scope = RunScope::from_paths([".hidden.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 0);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_git_excluded_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "ignored.rs\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("ignored.rs"), "pub fn ignored() {}\n").unwrap();
+
+        let scope = RunScope::from_paths(["ignored.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 0);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_git_exclude_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+        fs::write(tmp.path().join("ignored.rs"), "pub fn ignored() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "ignored.rs\n",
+        )
+        .unwrap();
+
+        let scope = RunScope::from_paths([PathBuf::from(".git/info/exclude")]).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 1);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
     }
 
     #[tokio::test]

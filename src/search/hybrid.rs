@@ -3,11 +3,12 @@ use libsql::Connection;
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
-use crate::search::ranking::fuse_results;
-use crate::search::retrieval::{RetrievalBackend, RetrievalMode};
+use crate::search::ranking::{rank_candidates, RankedCandidate};
+use crate::search::retrieval::{CandidateRow, RetrievalBackend, RetrievalMode};
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::types::{ReferenceKind, SearchResult, SymbolResult};
+use crate::shared::types::SearchResult;
+use crate::storage::segments::{get_segment_by_id, StoredSegment};
 
 pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
@@ -86,21 +87,23 @@ async fn execute_search(
         return Ok(Vec::new());
     }
 
-    Ok(fuse_results(
+    let ranked = rank_candidates(
         candidates.vector_results,
         candidates.fts_results,
         symbol_results,
         query,
         intent,
         limit,
-    ))
+    );
+
+    hydrate_ranked_candidates(conn, ranked).await
 }
 
 async fn symbol_search(
     conn: &Connection,
     query: &str,
     intent: QueryIntent,
-) -> Result<Vec<SearchResult>, OneupError> {
+) -> Result<Vec<CandidateRow>, OneupError> {
     let variants = build_symbol_variants(query, intent);
     if variants.is_empty() {
         return Ok(Vec::new());
@@ -111,29 +114,21 @@ async fn symbol_search(
     let mut matches = Vec::new();
 
     for variant in variants {
-        let symbol_matches = if include_usages {
-            engine.find_references(&variant).await?
+        let symbol_matches: Vec<CandidateRow> = if include_usages {
+            engine.find_reference_candidates(&variant).await?
         } else {
-            engine.find_definitions(&variant).await?
+            engine.find_definition_candidates(&variant).await?
         };
-
-        for result in symbol_matches {
-            if symbol_result_matches_query(&result, query) {
-                matches.push(result);
-            }
-        }
+        matches.extend(symbol_matches);
     }
-
-    matches.sort_by_key(|a| symbol_sort_key(a, query));
 
     let mut deduped = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for symbol in matches {
-        let search_result = search_result_from_symbol(symbol);
-        let key = candidate_key(&search_result);
+    for candidate in matches {
+        let key = candidate_key(&candidate);
         if seen.insert(key) {
-            deduped.push(search_result);
+            deduped.push(candidate);
         }
     }
 
@@ -142,7 +137,7 @@ async fn symbol_search(
 
 fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     let words = query_words(query);
-    if words.is_empty() || words.len() > 4 {
+    if words.is_empty() || words.len() > 4 || words.iter().all(|word| word.len() < 2) {
         return Vec::new();
     }
 
@@ -155,45 +150,7 @@ fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut variants = Vec::new();
-
-    for word in &words {
-        if word.len() >= 2 {
-            variants.push(word.clone());
-        }
-    }
-
-    if !words.is_empty() {
-        let snake = words.join("_");
-        let compact = words.join("");
-        let pascal = words
-            .iter()
-            .map(|word| capitalize(word))
-            .collect::<Vec<_>>()
-            .join("");
-
-        variants.push(snake);
-        variants.push(compact);
-        variants.push(pascal.clone());
-
-        if let Some((first, rest)) = words.split_first() {
-            let camel = format!(
-                "{}{}",
-                first.to_lowercase(),
-                rest.iter().map(|word| capitalize(word)).collect::<String>()
-            );
-            variants.push(camel);
-        }
-    }
-
-    let mut deduped = Vec::new();
-    for variant in variants {
-        if variant.len() >= 2 && !deduped.contains(&variant) {
-            deduped.push(variant);
-        }
-    }
-
-    deduped
+    vec![words.join(" ")]
 }
 
 fn query_words(query: &str) -> Vec<String> {
@@ -204,74 +161,62 @@ fn query_words(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn capitalize(word: &str) -> String {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()),
-        None => String::new(),
+async fn hydrate_ranked_candidates(
+    conn: &Connection,
+    ranked: Vec<RankedCandidate>,
+) -> Result<Vec<SearchResult>, OneupError> {
+    let mut results = Vec::with_capacity(ranked.len());
+
+    for ranked_candidate in ranked {
+        let segment = get_segment_by_id(conn, &ranked_candidate.candidate.segment_id)
+            .await?
+            .ok_or_else(|| {
+                SearchError::QueryFailed(format!(
+                    "ranked segment '{}' disappeared before hydration",
+                    ranked_candidate.candidate.segment_id
+                ))
+            })?;
+        let mut result = search_result_from_segment(segment);
+        result.score = ranked_candidate.score;
+        results.push(result);
     }
+
+    Ok(results)
 }
 
-fn symbol_result_matches_query(result: &SymbolResult, query: &str) -> bool {
-    let normalized_query = normalize_symbolish(query);
-    let normalized_name = normalize_symbolish(&result.name);
+fn search_result_from_segment(segment: StoredSegment) -> SearchResult {
+    let role = Some(segment.parsed_role());
+    let defined_symbols = some_if_not_empty(segment.parsed_defined_symbols());
+    let referenced_symbols = some_if_not_empty(segment.parsed_referenced_symbols());
+    let called_symbols = some_if_not_empty(segment.parsed_called_symbols());
 
-    normalized_name == normalized_query
-        || normalized_name.contains(&normalized_query)
-        || normalized_query.contains(&normalized_name)
-}
-
-fn symbol_sort_key(result: &SymbolResult, query: &str) -> (u8, u8, usize, usize, String) {
-    let exactness = if normalize_symbolish(&result.name) == normalize_symbolish(query) {
-        0
-    } else {
-        1
-    };
-    let ref_kind = match result.reference_kind {
-        ReferenceKind::Definition => 0,
-        ReferenceKind::Usage => 1,
-    };
-
-    (
-        ref_kind,
-        exactness,
-        result.line_start,
-        result.name.len(),
-        result.file_path.clone(),
-    )
-}
-
-fn normalize_symbolish(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn search_result_from_symbol(result: SymbolResult) -> SearchResult {
     SearchResult {
-        file_path: result.file_path,
-        language: result.language,
-        block_type: result.kind,
-        content: result.content,
+        file_path: segment.file_path,
+        language: segment.language,
+        block_type: segment.block_type,
+        content: segment.content,
         score: 0.0,
-        line_number: result.line_start,
-        line_end: result.line_end,
-        breadcrumb: result.breadcrumb,
-        complexity: result.complexity,
-        role: result.role,
-        defined_symbols: result.defined_symbols,
-        referenced_symbols: result.referenced_symbols,
-        called_symbols: result.called_symbols,
+        line_number: segment.line_start as usize,
+        line_end: segment.line_end as usize,
+        breadcrumb: segment.breadcrumb,
+        complexity: Some(segment.complexity as u32),
+        role,
+        defined_symbols,
+        referenced_symbols,
+        called_symbols,
     }
 }
 
-fn candidate_key(result: &SearchResult) -> String {
-    format!(
-        "{}:{}:{}",
-        result.file_path, result.line_number, result.block_type
-    )
+fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn candidate_key(candidate: &CandidateRow) -> String {
+    candidate.segment_id.clone()
 }
 
 #[cfg(test)]
@@ -279,14 +224,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn symbol_variants_include_common_identifier_forms() {
+    fn symbol_variants_keep_one_canonical_query() {
         let variants = build_symbol_variants("config loader", QueryIntent::Definition);
 
-        assert!(variants.contains(&"config".to_string()));
-        assert!(variants.contains(&"loader".to_string()));
-        assert!(variants.contains(&"config_loader".to_string()));
-        assert!(variants.contains(&"configLoader".to_string()));
-        assert!(variants.contains(&"ConfigLoader".to_string()));
+        assert_eq!(variants, vec!["config loader".to_string()]);
     }
 
     #[test]
@@ -294,6 +235,42 @@ mod tests {
         let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
 
         assert!(variants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn symbol_search_matches_canonical_symbol_queries() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let insert = crate::storage::segments::SegmentInsert {
+            id: "test-seg-symbol".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "struct".to_string(),
+            content: "struct ConfigLoader;".to_string(),
+            line_start: 1,
+            line_end: 1,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"ConfigLoader\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "symbol123".to_string(),
+        };
+        crate::storage::segments::upsert_segment(&conn, &insert)
+            .await
+            .unwrap();
+
+        let results = symbol_search(&conn, "config loader", QueryIntent::Definition)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "src/lib.rs");
+        assert_eq!(results[0].block_type, "struct");
     }
 
     #[tokio::test]

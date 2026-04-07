@@ -236,6 +236,9 @@ mod tests {
         let indexing = loaded.projects[0].indexing.as_ref().unwrap();
         assert_eq!(indexing.jobs, 2);
         assert_eq!(indexing.embed_threads, 2);
-        assert_eq!(indexing.write_batch_files, 1);
+        assert_eq!(
+            indexing.write_batch_files,
+            crate::shared::types::IndexingConfig::default_write_batch_files_for(indexing.jobs)
+        );
     }
 }

@@ -113,6 +113,9 @@ pub enum DaemonError {
     #[error("signal error: {0}")]
     SignalError(String),
 
+    #[error("request error: {0}")]
+    RequestError(String),
+
     #[error("watcher error: {0}")]
     WatcherError(String),
 }

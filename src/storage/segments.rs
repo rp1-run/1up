@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use libsql::Connection;
 
 use crate::shared::errors::{OneupError, StorageError};
-use crate::shared::types::SegmentRole;
+use crate::shared::symbols::normalize_symbolish;
+use crate::shared::types::{ReferenceKind, SegmentRole};
 use crate::storage::queries;
 
 /// A stored segment row read from the database.
@@ -85,6 +86,12 @@ pub struct FileSegmentBatch<'a> {
     pub segments: &'a [SegmentInsert],
 }
 
+struct SegmentSymbolInsert {
+    symbol: String,
+    canonical_symbol: String,
+    reference_kind: ReferenceKind,
+}
+
 /// Insert or replace a segment in the database.
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
     conn.execute(
@@ -121,6 +128,8 @@ pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<()
             .await
             .map_err(|e| StorageError::Query(format!("delete segment vector failed: {e}")))?;
     }
+
+    replace_segment_symbols(conn, seg).await?;
 
     Ok(())
 }
@@ -426,6 +435,76 @@ fn validate_replace_segments(
     Ok(())
 }
 
+fn parse_symbols(value: &str) -> Vec<String> {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+fn reference_kind_label(reference_kind: ReferenceKind) -> &'static str {
+    match reference_kind {
+        ReferenceKind::Definition => "definition",
+        ReferenceKind::Usage => "usage",
+    }
+}
+
+fn build_segment_symbol_rows(seg: &SegmentInsert) -> Vec<SegmentSymbolInsert> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (symbols, reference_kind) in [
+        (
+            parse_symbols(&seg.defined_symbols),
+            ReferenceKind::Definition,
+        ),
+        (parse_symbols(&seg.referenced_symbols), ReferenceKind::Usage),
+    ] {
+        for symbol in symbols {
+            let canonical_symbol = normalize_symbolish(&symbol);
+            if canonical_symbol.is_empty() {
+                continue;
+            }
+
+            let dedupe_key = (
+                reference_kind_label(reference_kind).to_string(),
+                canonical_symbol.clone(),
+            );
+            if seen.insert(dedupe_key) {
+                rows.push(SegmentSymbolInsert {
+                    symbol,
+                    canonical_symbol,
+                    reference_kind,
+                });
+            }
+        }
+    }
+
+    rows
+}
+
+async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
+    conn.execute(
+        queries::DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID,
+        [seg.id.clone()],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("delete segment symbols failed: {e}")))?;
+
+    for symbol in build_segment_symbol_rows(seg) {
+        conn.execute(
+            queries::INSERT_SEGMENT_SYMBOL,
+            libsql::params![
+                seg.id.clone(),
+                symbol.symbol,
+                symbol.canonical_symbol,
+                reference_kind_label(symbol.reference_kind),
+            ],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("insert segment symbol failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn validate_replace_batches(batches: &[FileSegmentBatch<'_>]) -> Result<(), OneupError> {
     let mut seen_paths = HashSet::new();
@@ -543,6 +622,30 @@ mod tests {
             called_symbols: "[]".to_string(),
             file_hash: file_hash.to_string(),
         }
+    }
+
+    async fn symbol_rows(conn: &Connection, segment_id: &str) -> Vec<(String, String, String)> {
+        let mut rows = conn
+            .query(
+                "SELECT symbol, canonical_symbol, reference_kind
+                 FROM segment_symbols
+                 WHERE segment_id = ?1
+                 ORDER BY reference_kind, canonical_symbol",
+                [segment_id],
+            )
+            .await
+            .unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            results.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            ));
+        }
+
+        results
     }
 
     #[tokio::test]
@@ -774,6 +877,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_stores_normalized_symbol_rows() {
+        let (_db, conn) = setup().await;
+
+        let mut seg = test_segment("seg1", "src/main.rs", "abc123");
+        seg.defined_symbols = r#"["ConfigLoader","config_loader"]"#.to_string();
+        seg.referenced_symbols = r#"["load_config"]"#.to_string();
+        upsert_segment(&conn, &seg).await.unwrap();
+
+        let rows = symbol_rows(&conn, "seg1").await;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "ConfigLoader".to_string(),
+                    "configloader".to_string(),
+                    "definition".to_string(),
+                ),
+                (
+                    "load_config".to_string(),
+                    "loadconfig".to_string(),
+                    "usage".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn schema_excludes_legacy_embedding_columns() {
         let (_db, conn) = setup().await;
 
@@ -844,6 +974,27 @@ mod tests {
         assert_eq!(file_b.len(), 1);
         assert_eq!(file_b[0].id, "old_b_1");
         assert_eq!(file_b[0].file_hash, "old-b");
+
+        let new_symbol_rows = symbol_rows(&conn, "new_a_1").await;
+        assert_eq!(
+            new_symbol_rows,
+            vec![(
+                "new_a_1".to_string(),
+                "newa1".to_string(),
+                "definition".to_string(),
+            )]
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM segment_symbols WHERE segment_id = 'old_a_1'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let stale_symbol_count: i64 = row.get(0).unwrap();
+        assert_eq!(stale_symbol_count, 0);
     }
 
     #[tokio::test]
@@ -888,5 +1039,21 @@ mod tests {
         assert_eq!(file_b.len(), 1);
         assert_eq!(file_b[0].id, "old_b_1");
         assert_eq!(file_b[0].file_hash, "old-b");
+        assert_eq!(
+            symbol_rows(&conn, "old_a_1").await,
+            vec![(
+                "old_a_1".to_string(),
+                "olda1".to_string(),
+                "definition".to_string(),
+            )]
+        );
+        assert_eq!(
+            symbol_rows(&conn, "old_b_1").await,
+            vec![(
+                "old_b_1".to_string(),
+                "oldb1".to_string(),
+                "definition".to_string(),
+            )]
+        );
     }
 }

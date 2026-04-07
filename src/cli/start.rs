@@ -3,7 +3,7 @@ use clap::Args;
 use crate::cli::output::formatter_for;
 use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
-use crate::indexer::embedder::{self, Embedder};
+use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::project;
@@ -82,40 +82,40 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let conn = db.connect()?;
     schema::prepare_for_write(&conn).await?;
 
-    let mut embedder_opt = if embedder::is_model_available() {
-        match Embedder::from_dir_with_threads(&config::model_dir()?, indexing_config.embed_threads)
-        {
-            Ok(e) => Some(e),
-            Err(err) => {
-                eprintln!(
-                    "warning: embedding model failed to load ({err}); indexing without embeddings (semantic search will be unavailable)"
-                );
-                None
-            }
+    let mut runtime = EmbeddingRuntime::default();
+    let status = runtime
+        .prepare_for_indexing(indexing_config.embed_threads)
+        .await;
+    match &status {
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
+        EmbeddingLoadStatus::Downloaded => {
+            eprintln!("info: embedding model downloaded successfully");
         }
-    } else if embedder::is_download_failed() {
-        eprintln!("warning: embedding model download previously failed; indexing without embeddings (semantic search will be unavailable). Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
-        None
-    } else {
-        eprintln!("info: embedding model not found, attempting download...");
-        match Embedder::new_with_threads(indexing_config.embed_threads).await {
-            Ok(e) => {
-                eprintln!("info: embedding model downloaded successfully");
-                Some(e)
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: embedding model download failed ({err}); indexing without embeddings (semantic search will be unavailable)"
-                );
-                None
-            }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            eprintln!("warning: embedding model download previously failed; indexing without embeddings (semantic search will be unavailable). Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
         }
-    };
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            eprintln!(
+                "warning: embedding model download failed ({err}); indexing without embeddings (semantic search will be unavailable)"
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
+            eprintln!(
+                "warning: embedding model failed to load ({err}); indexing without embeddings (semantic search will be unavailable)"
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            eprintln!(
+                "warning: embedding model unavailable; indexing without embeddings (semantic search will be unavailable)"
+            );
+        }
+    }
 
     let stats = pipeline::run_with_config(
         &conn,
         &project_root,
-        embedder_opt.as_mut(),
+        runtime.current_embedder(),
         &indexing_config,
     )
     .await?;
