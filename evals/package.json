@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "bench": "bun run suites/1up-search/search-bench.ts",
     "coverage": "npm run typecheck && bun test suites/shared/assertions/index.test.ts --coverage",
     "eval": "promptfoo eval -c suites/1up-search/evals.yaml",
     "eval:view": "promptfoo view",
