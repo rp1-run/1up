@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -162,6 +165,43 @@ pub struct ContextResult {
     pub line_start: usize,
     pub line_end: usize,
     pub scope_type: String,
+}
+
+/// Scope for an indexing run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunScope {
+    Full,
+    Paths(BTreeSet<PathBuf>),
+}
+
+impl RunScope {
+    pub fn from_paths<I>(paths: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let paths: BTreeSet<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+
+        if paths.is_empty() {
+            None
+        } else {
+            Some(Self::Paths(paths))
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        match other {
+            Self::Full => *self = Self::Full,
+            Self::Paths(other_paths) => match self {
+                Self::Full => {}
+                Self::Paths(paths) => {
+                    paths.extend(other_paths);
+                }
+            },
+        }
+    }
 }
 
 /// Shared resolved indexing settings for a single run.
