@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future;
 use std::path::{Path, PathBuf};
 
 use tokio::signal::unix::{signal, SignalKind};
@@ -6,9 +7,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
+use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
 use crate::daemon::watcher::{self, FileWatcher};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
+use crate::search::HybridSearchEngine;
 use crate::shared::config;
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::OneupError;
@@ -78,6 +81,13 @@ async fn run_inner() -> Result<(), OneupError> {
 
     let mut file_watcher = FileWatcher::new()?;
     let mut projects: HashMap<PathBuf, ProjectState> = HashMap::new();
+    let search_listener = match search_service::bind_listener().await {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            warn!("failed to start daemon search socket; search will fall back locally: {err}");
+            None
+        }
+    };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
 
@@ -85,6 +95,26 @@ async fn run_inner() -> Result<(), OneupError> {
 
     loop {
         tokio::select! {
+            request = async {
+                match search_listener.as_ref() {
+                    Some(listener) => Some(search_service::accept_request(listener).await),
+                    None => future::pending::<Option<Result<_, OneupError>>>().await,
+                }
+            } => {
+                if let Some(request) = request {
+                    match request {
+                        Ok((mut stream, request)) => {
+                            let response = handle_search_request(&mut projects, request).await;
+                            if let Err(err) = search_service::send_response(&mut stream, &response).await {
+                                warn!("failed to respond to daemon search request: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            warn!("failed to accept daemon search request: {err}");
+                        }
+                    }
+                }
+            }
             _ = sighup.recv() => {
                 info!("received SIGHUP, reloading project registry");
                 if let Err(e) = reload_projects(&mut file_watcher, &mut projects).await {
@@ -115,12 +145,21 @@ async fn run_inner() -> Result<(), OneupError> {
     if let Err(e) = file_watcher.unwatch_all() {
         warn!("failed to unwatch on shutdown: {e}");
     }
+    if search_listener.is_some() {
+        if let Err(err) = search_service::cleanup_socket_file() {
+            warn!("failed to remove daemon search socket: {err}");
+        }
+    }
 
     info!("daemon worker exiting");
     Ok(())
 }
 
-fn log_embedding_status(project_root: &Path, embed_threads: usize, status: &EmbeddingLoadStatus) {
+fn log_indexing_embedding_status(
+    project_root: &Path,
+    embed_threads: usize,
+    status: &EmbeddingLoadStatus,
+) {
     match status {
         EmbeddingLoadStatus::Warm => {
             debug!(
@@ -157,6 +196,47 @@ fn log_embedding_status(project_root: &Path, embed_threads: usize, status: &Embe
         | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
             warn!(
                 "failed to prepare embedding runtime for {} with embed_threads={embed_threads}: {err}; daemon will index without embeddings",
+                project_root.display()
+            );
+        }
+    }
+}
+
+fn log_search_embedding_status(
+    project_root: &Path,
+    embed_threads: usize,
+    status: &EmbeddingLoadStatus,
+) {
+    match status {
+        EmbeddingLoadStatus::Warm => {
+            debug!(
+                "reused warm daemon search runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Downloaded => {
+            debug!(
+                "loaded daemon search runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            debug!(
+                "embedding model download previously failed; daemon search for {} will use FTS-only mode",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            debug!(
+                "embedding model not available; daemon search for {} will use FTS-only mode",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            debug!(
+                "failed to prepare daemon search runtime for {} with embed_threads={embed_threads}: {err}; using FTS-only mode",
                 project_root.display()
             );
         }
@@ -458,7 +538,7 @@ async fn run_project(
             .embedding_runtime
             .prepare_for_indexing(indexing_config.embed_threads)
             .await;
-        log_embedding_status(&project_root, indexing_config.embed_threads, &status);
+        log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
         pipeline::run_with_scope(
             &conn,
             &project_root,
@@ -476,6 +556,65 @@ async fn run_project(
         .finish_run();
 
     result
+}
+
+async fn handle_search_request(
+    projects: &mut HashMap<PathBuf, ProjectState>,
+    request: SearchRequest,
+) -> SearchResponse {
+    let Some(state) = projects.get_mut(&request.project_root) else {
+        return SearchResponse::Unavailable {
+            reason: format!(
+                "project {} is not registered with the daemon",
+                request.project_root.display()
+            ),
+        };
+    };
+
+    let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
+    {
+        Ok(indexing_config) => indexing_config,
+        Err(err) => {
+            return SearchResponse::Unavailable {
+                reason: format!("failed to resolve search configuration: {err}"),
+            };
+        }
+    };
+
+    let conn = match state.db.connect() {
+        Ok(conn) => conn,
+        Err(err) => {
+            return SearchResponse::Unavailable {
+                reason: format!("failed to open search connection: {err}"),
+            };
+        }
+    };
+
+    if let Err(err) = schema::ensure_current(&conn).await {
+        return SearchResponse::Unavailable {
+            reason: format!("search index is unavailable: {err}"),
+        };
+    }
+
+    let status = state
+        .embedding_runtime
+        .prepare_for_search(indexing_config.embed_threads);
+    log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
+
+    let results = if status.is_available() {
+        let mut engine = HybridSearchEngine::new(&conn, state.embedding_runtime.current_embedder());
+        engine.search(&request.query, request.limit).await
+    } else {
+        let engine = HybridSearchEngine::new(&conn, None);
+        engine.fts_only_search(&request.query, request.limit).await
+    };
+
+    match results {
+        Ok(results) => SearchResponse::Results { results },
+        Err(err) => SearchResponse::Unavailable {
+            reason: format!("daemon search failed: {err}"),
+        },
+    }
 }
 
 #[cfg(test)]

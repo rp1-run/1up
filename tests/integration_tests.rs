@@ -11,6 +11,18 @@ fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
 }
 
+fn test_data_dir(home: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library").join("Application Support").join("1up")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local").join("share").join("1up")
+    }
+}
+
 /// RAII guard that temporarily hides the embedding model to force FTS-only mode.
 /// On drop, the model is restored. This works around a pre-existing vector
 /// dimension mismatch bug in the int8 search path. Holds a mutex to prevent
@@ -873,6 +885,76 @@ fn status_json_reports_noop_index_progress() {
     assert_eq!(progress["files_total"], progress["files_scanned"]);
     assert_eq!(progress["embeddings_enabled"], false);
     assert!(payload["indexed_files"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn cli_search_uses_daemon_results_before_local_fallback() {
+    let home = tempfile::Builder::new()
+        .prefix("1up-home-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let project = TempDir::new().unwrap();
+    let socket_path = test_data_dir(home.path()).join("daemon.sock");
+    let expected_root = project.path().canonicalize().unwrap();
+
+    let server_socket_path = socket_path.clone();
+    let server_expected_root = expected_root.clone();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        if let Some(parent) = server_socket_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let _ = fs::remove_file(&server_socket_path);
+
+        let listener = UnixListener::bind(&server_socket_path).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(
+            payload["project_root"].as_str().unwrap(),
+            server_expected_root.to_str().unwrap()
+        );
+        assert_eq!(payload["query"], "test");
+        assert_eq!(payload["limit"], 20);
+
+        let response = serde_json::json!({
+            "status": "results",
+            "results": [
+                {
+                    "file_path": "src/daemon.rs",
+                    "language": "rust",
+                    "block_type": "function",
+                    "content": "fn daemon_search() {}",
+                    "score": 1.0,
+                    "line_number": 3,
+                    "line_end": 3
+                }
+            ]
+        });
+        stream.write_all(response.to_string().as_bytes()).unwrap();
+    });
+
+    cmd()
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args([
+            "--format",
+            "json",
+            "search",
+            "test",
+            "--path",
+            project.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/daemon.rs"));
+
+    server.join().unwrap();
 }
 
 #[test]
