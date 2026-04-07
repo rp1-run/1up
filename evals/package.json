@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "coverage": "npm run typecheck && bun test suites/shared/assertions/index.test.ts --coverage",
     "eval": "promptfoo eval -c suites/1up-search/evals.yaml",
-    "eval:view": "promptfoo view"
+    "eval:view": "promptfoo view",
+    "format": "npx @biomejs/biome format --write biome.json package.json tsconfig.json suites",
+    "lint": "npx @biomejs/biome lint biome.json package.json tsconfig.json suites",
+    "test": "npm run typecheck && bun test suites/shared/assertions/index.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "promptfoo": "^0.121.0",
