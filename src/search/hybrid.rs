@@ -7,6 +7,7 @@ use crate::search::ranking::fuse_results;
 use crate::search::retrieval::{RetrievalBackend, RetrievalMode};
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
+use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::{ReferenceKind, SearchResult, SymbolResult};
 
 pub struct HybridSearchEngine<'a> {
@@ -142,7 +143,7 @@ async fn symbol_search(
 
 fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     let words = query_words(query);
-    if words.is_empty() || words.len() > 4 {
+    if words.is_empty() || words.len() > 4 || words.iter().all(|word| word.len() < 2) {
         return Vec::new();
     }
 
@@ -155,45 +156,7 @@ fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut variants = Vec::new();
-
-    for word in &words {
-        if word.len() >= 2 {
-            variants.push(word.clone());
-        }
-    }
-
-    if !words.is_empty() {
-        let snake = words.join("_");
-        let compact = words.join("");
-        let pascal = words
-            .iter()
-            .map(|word| capitalize(word))
-            .collect::<Vec<_>>()
-            .join("");
-
-        variants.push(snake);
-        variants.push(compact);
-        variants.push(pascal.clone());
-
-        if let Some((first, rest)) = words.split_first() {
-            let camel = format!(
-                "{}{}",
-                first.to_lowercase(),
-                rest.iter().map(|word| capitalize(word)).collect::<String>()
-            );
-            variants.push(camel);
-        }
-    }
-
-    let mut deduped = Vec::new();
-    for variant in variants {
-        if variant.len() >= 2 && !deduped.contains(&variant) {
-            deduped.push(variant);
-        }
-    }
-
-    deduped
+    vec![words.join(" ")]
 }
 
 fn query_words(query: &str) -> Vec<String> {
@@ -202,14 +165,6 @@ fn query_words(query: &str) -> Vec<String> {
         .filter(|word| !word.is_empty())
         .map(|word| word.to_string())
         .collect()
-}
-
-fn capitalize(word: &str) -> String {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()),
-        None => String::new(),
-    }
 }
 
 fn symbol_result_matches_query(result: &SymbolResult, query: &str) -> bool {
@@ -239,14 +194,6 @@ fn symbol_sort_key(result: &SymbolResult, query: &str) -> (u8, u8, usize, usize,
         result.name.len(),
         result.file_path.clone(),
     )
-}
-
-fn normalize_symbolish(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
 }
 
 fn search_result_from_symbol(result: SymbolResult) -> SearchResult {
@@ -279,14 +226,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn symbol_variants_include_common_identifier_forms() {
+    fn symbol_variants_keep_one_canonical_query() {
         let variants = build_symbol_variants("config loader", QueryIntent::Definition);
 
-        assert!(variants.contains(&"config".to_string()));
-        assert!(variants.contains(&"loader".to_string()));
-        assert!(variants.contains(&"config_loader".to_string()));
-        assert!(variants.contains(&"configLoader".to_string()));
-        assert!(variants.contains(&"ConfigLoader".to_string()));
+        assert_eq!(variants, vec!["config loader".to_string()]);
     }
 
     #[test]
@@ -294,6 +237,42 @@ mod tests {
         let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
 
         assert!(variants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn symbol_search_matches_canonical_symbol_queries() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let insert = crate::storage::segments::SegmentInsert {
+            id: "test-seg-symbol".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "struct".to_string(),
+            content: "struct ConfigLoader;".to_string(),
+            line_start: 1,
+            line_end: 1,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"ConfigLoader\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "symbol123".to_string(),
+        };
+        crate::storage::segments::upsert_segment(&conn, &insert)
+            .await
+            .unwrap();
+
+        let results = symbol_search(&conn, "config loader", QueryIntent::Definition)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "src/lib.rs");
+        assert_eq!(results[0].block_type, "struct");
     }
 
     #[tokio::test]
