@@ -236,6 +236,28 @@ fn lookup_symbol_json(dir: &std::path::Path, symbol: &str) -> Vec<serde_json::Va
     serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
 }
 
+fn search_json(dir: &std::path::Path, query: &str) -> Vec<serde_json::Value> {
+    let output = cmd()
+        .args([
+            "--format",
+            "json",
+            "search",
+            query,
+            "--path",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
 fn write_parallel_regression_fixture(dir: &std::path::Path) {
     fs::write(
         dir.join("changed.rs"),
@@ -266,6 +288,90 @@ fn mutate_parallel_regression_fixture(dir: &std::path::Path) {
         "pub fn fresh_symbol() -> &'static str {\n    \"fresh\"\n}\n",
     )
     .unwrap();
+}
+
+fn create_search_acceptance_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::create_dir_all(tmp.path().join("config")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    fs::create_dir_all(tmp.path().join("proto")).unwrap();
+    fs::create_dir_all(tmp.path().join("sql")).unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("routing.rs"),
+        r#"pub struct PolicyRuleValidator;
+
+impl PolicyRuleValidator {
+    pub fn validate(&self, route: &str) -> bool {
+        !route.is_empty()
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("runner.rs"),
+        r#"use crate::routing::PolicyRuleValidator;
+
+pub fn run_validation(validator: &PolicyRuleValidator) -> bool {
+    validator.validate("orders")
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("webhooks.rs"),
+        r#"// validate incoming webhook signatures
+pub fn validate_incoming_request_signatures(secret: &str, header: &str) -> bool {
+    !secret.is_empty() && header.contains(secret)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("config").join("webhooks.yaml"),
+        r#"request_signing_secret: sq-test-secret
+description: request signing secret used for request validation
+policy_rule_preview_enabled: true
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("webhooks.md"),
+        r#"# Webhooks API documentation guide
+
+Use config/signatures.yaml to set the request signing secret for local development.
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("proto").join("policy_rules.proto"),
+        r#"syntax = "proto3";
+
+message PolicyRulePreview {
+  string id = 1;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("sql").join("policy_rules.sql"),
+        r#"CREATE TABLE policy_rules_preview (
+    id TEXT PRIMARY KEY,
+    validator_name TEXT NOT NULL
+);
+"#,
+    )
+    .unwrap();
+
+    tmp
 }
 
 // ---------- Test fixture: index a small multi-language repository ----------
@@ -354,6 +460,45 @@ fn symbol_lookup_references_include_definitions_and_usages() {
     );
 }
 
+#[test]
+fn symbol_lookup_acceptance_queries_cover_exact_canonical_and_references() {
+    let tmp = create_search_acceptance_fixture();
+    init_and_index(&tmp);
+
+    let exact = lookup_symbol_json(tmp.path(), "PolicyRuleValidator");
+    assert_eq!(exact[0]["name"], "PolicyRuleValidator");
+    assert_eq!(exact[0]["file_path"], "src/policy.rs");
+
+    let canonical = lookup_symbol_json(tmp.path(), "routing rule validator");
+    assert_eq!(canonical[0]["name"], "PolicyRuleValidator");
+    assert_eq!(canonical[0]["file_path"], "src/policy.rs");
+
+    let references = cmd()
+        .args([
+            "--format",
+            "json",
+            "symbol",
+            "--references",
+            "PolicyRuleValidator",
+            "--path",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(references.status.success());
+
+    let results: Vec<serde_json::Value> =
+        serde_json::from_str(String::from_utf8(references.stdout).unwrap().trim()).unwrap();
+
+    assert!(results.iter().any(|result| {
+        result["reference_kind"] == "definition" && result["file_path"] == "src/policy.rs"
+    }));
+    assert!(results.iter().any(|result| {
+        result["reference_kind"] == "usage" && result["file_path"] == "src/runner.rs"
+    }));
+}
+
 // ---------- Verify hybrid search returns ranked results ----------
 
 #[test]
@@ -393,6 +538,56 @@ fn fts_search_returns_ranked_results_json() {
 
     let score = first["score"].as_f64().unwrap();
     assert!(score > 0.0, "search results should have positive scores");
+}
+
+#[test]
+fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let cases = [
+        (
+            "request_signing_secret policy_rule_preview_enabled",
+            "config/signatures.yaml",
+        ),
+        (
+            "api documentation guide local development",
+            "docs/signatures.md",
+        ),
+        ("validate incoming webhook signatures", "src/signatures.rs"),
+        ("PolicyRulePreview", "proto/policy_rules.proto"),
+        ("policy_rules_preview table", "sql/policy_rules.sql"),
+    ];
+
+    for (query, expected_top_path) in cases {
+        let first = search_json(tmp.path(), query);
+        let second = search_json(tmp.path(), query);
+
+        assert!(
+            !first.is_empty(),
+            "query {query:?} should produce at least one result"
+        );
+        assert_eq!(
+            first[0]["file_path"], expected_top_path,
+            "query {query:?} returned an unexpected top hit"
+        );
+
+        let first_paths: Vec<_> = first
+            .iter()
+            .take(3)
+            .map(|result| result["file_path"].clone())
+            .collect();
+        let second_paths: Vec<_> = second
+            .iter()
+            .take(3)
+            .map(|result| result["file_path"].clone())
+            .collect();
+
+        assert_eq!(
+            first_paths, second_paths,
+            "query {query:?} should keep a stable top-3 result set"
+        );
+    }
 }
 
 // ---------- Verify context retrieval returns enclosing scope ----------
