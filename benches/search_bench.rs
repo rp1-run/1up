@@ -114,9 +114,40 @@ function validateInput(data) {
 module.exports = { handleRequest, handleGet, handlePost, validateInput };
 "#;
 
+    let yaml_source = r#"
+webhook_signing_secret: sq-test-secret
+description: webhook signing secret used for request validation
+routing_rule_preview_enabled: true
+"#;
+
+    let proto_source = r#"
+syntax = "proto3";
+
+message RoutingRulePreview {
+    string id = 1;
+}
+"#;
+
+    let sql_source = r#"
+CREATE TABLE routing_rules_preview (
+    id TEXT PRIMARY KEY,
+    validator_name TEXT NOT NULL
+);
+"#;
+
     std::fs::write(tmp.path().join("main.rs"), rust_source).unwrap();
     std::fs::write(tmp.path().join("processor.py"), python_source).unwrap();
     std::fs::write(tmp.path().join("handler.js"), js_source).unwrap();
+    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("proto")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("sql")).unwrap();
+    std::fs::write(tmp.path().join("config").join("webhooks.yaml"), yaml_source).unwrap();
+    std::fs::write(
+        tmp.path().join("proto").join("routing_rules.proto"),
+        proto_source,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("sql").join("routing_rules.sql"), sql_source).unwrap();
     std::fs::create_dir_all(tmp.path().join(".1up")).unwrap();
     std::fs::write(
         tmp.path().join(".1up").join("project_id"),
@@ -339,6 +370,56 @@ fn bench_fts_search(c: &mut Criterion) {
     });
 }
 
+fn bench_chunked_content_search(c: &mut Criterion) {
+    let (_tmp, db_path) = setup_db_and_index();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("fts_search_chunked_config_query", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
+                let conn = db.connect().unwrap();
+                let engine = oneup::search::HybridSearchEngine::new(&conn, None);
+                let results = engine
+                    .fts_only_search("webhook_signing_secret routing_rule_preview_enabled", 20)
+                    .await
+                    .unwrap();
+                assert!(!results.is_empty());
+                assert_eq!(results[0].file_path, "config/webhooks.yaml");
+            });
+        });
+    });
+
+    c.bench_function("fts_search_chunked_proto_query", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
+                let conn = db.connect().unwrap();
+                let mut engine = oneup::search::HybridSearchEngine::new(&conn, None);
+                let results = engine.search("RoutingRulePreview", 20).await.unwrap();
+                assert!(!results.is_empty());
+                assert_eq!(results[0].file_path, "proto/routing_rules.proto");
+            });
+        });
+    });
+
+    c.bench_function("fts_search_chunked_sql_query", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
+                let conn = db.connect().unwrap();
+                let engine = oneup::search::HybridSearchEngine::new(&conn, None);
+                let results = engine
+                    .fts_only_search("routing_rules_preview table", 20)
+                    .await
+                    .unwrap();
+                assert!(!results.is_empty());
+                assert_eq!(results[0].file_path, "sql/routing_rules.sql");
+            });
+        });
+    });
+}
+
 fn bench_retrieval_backend(c: &mut Criterion) {
     let (_tmp, db_path, query_embedding, query) = setup_retrieval_db();
     let intent = detect_intent(&query);
@@ -395,6 +476,7 @@ criterion_group!(
     benches,
     bench_symbol_lookup,
     bench_fts_search,
+    bench_chunked_content_search,
     bench_retrieval_backend
 );
 criterion_main!(benches);

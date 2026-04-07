@@ -736,6 +736,50 @@ mod tests {
     }
 
     #[test]
+    fn prepare_for_search_reuses_warm_runtime_when_model_is_unchanged() {
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let mut runtime = EmbeddingRuntime::default();
+        let first = runtime.prepare_for_search(1);
+        assert!(
+            matches!(
+                first,
+                EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Downloaded
+            ),
+            "expected an initial load, got {first:?}"
+        );
+        assert!(runtime.current_embedder().is_some());
+
+        let second = runtime.prepare_for_search(1);
+        assert_eq!(second, EmbeddingLoadStatus::Warm);
+    }
+
+    #[tokio::test]
+    async fn prepare_for_indexing_reuses_warm_runtime_when_model_is_unchanged() {
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let mut runtime = EmbeddingRuntime::default();
+        let first = runtime.prepare_for_indexing(1).await;
+        assert!(
+            matches!(
+                first,
+                EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Downloaded
+            ),
+            "expected an initial load, got {first:?}"
+        );
+        assert!(runtime.current_embedder().is_some());
+
+        let second = runtime.prepare_for_indexing(1).await;
+        assert_eq!(second, EmbeddingLoadStatus::Warm);
+    }
+
+    #[test]
     fn embed_batch_empty_input() {
         if !is_model_available() {
             eprintln!("skipping: model not available");
