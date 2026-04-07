@@ -35,7 +35,7 @@ pub struct ParsedSegment {
 }
 
 /// A search result returned by hybrid or FTS-only search.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file_path: String,
     pub language: String,

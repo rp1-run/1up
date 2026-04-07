@@ -1,7 +1,9 @@
 use clap::Args;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::cli::output::formatter_for;
-use crate::daemon::lifecycle;
+use crate::daemon::{lifecycle, search_service};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::search::HybridSearchEngine;
 use crate::shared::config::project_db_path;
@@ -24,6 +26,8 @@ pub struct SearchArgs {
     pub path: String,
 }
 
+const DAEMON_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let db_path = project_db_path(&project_root);
@@ -33,6 +37,11 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
         if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
             tracing::debug!("auto-start daemon skipped: {e}");
         }
+    }
+
+    if let Some(results) = try_daemon_search(&project_root, &args.query, args.limit).await {
+        println!("{}", fmt.format_search_results(&results));
+        return Ok(());
     }
 
     if !db_path.exists() {
@@ -78,4 +87,32 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
 
     println!("{}", fmt.format_search_results(&results));
     Ok(())
+}
+
+async fn try_daemon_search(
+    project_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Option<Vec<crate::shared::types::SearchResult>> {
+    let result = tokio::time::timeout(
+        DAEMON_SEARCH_TIMEOUT,
+        search_service::request_search(project_root, query, limit),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Some(results))) => Some(results),
+        Ok(Ok(None)) => {
+            tracing::debug!("daemon search unavailable; falling back to local runtime");
+            None
+        }
+        Ok(Err(err)) => {
+            tracing::debug!("daemon search request failed; falling back to local runtime: {err}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("daemon search timed out; falling back to local runtime");
+            None
+        }
+    }
 }

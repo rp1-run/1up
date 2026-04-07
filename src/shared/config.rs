@@ -41,6 +41,11 @@ pub fn pid_file_path() -> Result<PathBuf, OneupError> {
     Ok(data_dir()?.join("daemon.pid"))
 }
 
+/// Returns the path to the daemon search socket.
+pub fn daemon_socket_path() -> Result<PathBuf, OneupError> {
+    Ok(data_dir()?.join("daemon.sock"))
+}
+
 /// Returns the path to the global project registry.
 pub fn projects_registry_path() -> Result<PathBuf, OneupError> {
     Ok(data_dir()?.join("projects.json"))
