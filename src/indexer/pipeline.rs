@@ -634,6 +634,7 @@ async fn flush_reorder_buffer(
     state: &mut FlushState<'_>,
 ) -> Result<(), OneupError> {
     let mut ready_files = Vec::new();
+    let write_batch_files = config.effective_write_batch_files(state.files_total);
 
     while let Some(result) = reorder_buffer.remove(next_sequence) {
         match result {
@@ -641,7 +642,7 @@ async fn flush_reorder_buffer(
                 ready_files.push(file);
                 *next_sequence += 1;
 
-                if ready_files.len() >= config.write_batch_files {
+                if ready_files.len() >= write_batch_files {
                     {
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
@@ -828,7 +829,13 @@ async fn execute_run_with_inputs(
 
     if !deleted_paths.is_empty() {
         let store_before_delete = timings.store_ms;
-        delete_removed_files(conn, &deleted_paths, config.write_batch_files, &mut timings).await?;
+        delete_removed_files(
+            conn,
+            &deleted_paths,
+            config.effective_write_batch_files(deleted_paths.len()),
+            &mut timings,
+        )
+        .await?;
         for path in &deleted_paths {
             debug!("removed segments for deleted file: {path}");
         }
@@ -1131,17 +1138,15 @@ mod tests {
         fs::write(tmp.path().join("a.rs"), "fn a() {}\nfn a2() {}\n").unwrap();
         fs::remove_file(tmp.path().join("b.rs")).unwrap();
         fs::write(tmp.path().join("c.rs"), "fn c() {}\n").unwrap();
+        let config = IndexingConfig::from_sources(Some(2), Some(1), None).unwrap();
+        assert!(config.write_batch_files > 1);
+        assert_eq!(config.effective_write_batch_files(2), 2);
+        assert_eq!(config.effective_write_batch_files(1), 1);
 
         let scope = RunScope::from_paths(["a.rs", "b.rs", "c.rs"].map(PathBuf::from)).unwrap();
-        let stats = run_with_scope(
-            &conn,
-            tmp.path(),
-            None,
-            &scope,
-            &IndexingConfig::new(2, 1, 1).unwrap(),
-        )
-        .await
-        .unwrap();
+        let stats = run_with_scope(&conn, tmp.path(), None, &scope, &config)
+            .await
+            .unwrap();
 
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.files_deleted, 1);

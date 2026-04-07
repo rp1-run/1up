@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-use crate::shared::constants::{DEFAULT_INDEX_WRITE_BATCH_FILES, MAX_AUTO_EMBED_THREADS};
+use crate::shared::constants::{
+    DEFAULT_INDEX_WRITE_BATCH_FILES, MAX_AUTO_EMBED_THREADS, MAX_AUTO_INDEX_WRITE_BATCH_FILES,
+};
 
 /// Role classification for a parsed code segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +249,8 @@ impl IndexingConfig {
     ) -> Result<Self, String> {
         let jobs = jobs.unwrap_or_else(Self::default_jobs);
         let embed_threads = embed_threads.unwrap_or_else(|| Self::default_embed_threads_for(jobs));
-        let write_batch_files = write_batch_files.unwrap_or(DEFAULT_INDEX_WRITE_BATCH_FILES);
+        let write_batch_files =
+            write_batch_files.unwrap_or_else(|| Self::default_write_batch_files_for(jobs));
 
         Self::new(jobs, embed_threads, write_batch_files)
     }
@@ -278,6 +281,17 @@ impl IndexingConfig {
 
     pub fn default_embed_threads_for(jobs: usize) -> usize {
         jobs.clamp(1, MAX_AUTO_EMBED_THREADS)
+    }
+
+    pub fn default_write_batch_files_for(jobs: usize) -> usize {
+        jobs.clamp(
+            DEFAULT_INDEX_WRITE_BATCH_FILES,
+            MAX_AUTO_INDEX_WRITE_BATCH_FILES,
+        )
+    }
+
+    pub fn effective_write_batch_files(&self, files_total: usize) -> usize {
+        self.write_batch_files.min(files_total.max(1))
     }
 }
 
@@ -410,7 +424,7 @@ impl std::str::FromStr for OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::constants::MAX_AUTO_EMBED_THREADS;
+    use crate::shared::constants::{MAX_AUTO_EMBED_THREADS, MAX_AUTO_INDEX_WRITE_BATCH_FILES};
 
     #[test]
     fn default_embed_threads_cap_auto_parallelism() {
@@ -419,6 +433,28 @@ mod tests {
             IndexingConfig::default_embed_threads_for(MAX_AUTO_EMBED_THREADS + 8),
             MAX_AUTO_EMBED_THREADS
         );
+    }
+
+    #[test]
+    fn default_write_batch_files_cap_auto_parallelism() {
+        assert_eq!(
+            IndexingConfig::default_write_batch_files_for(1),
+            DEFAULT_INDEX_WRITE_BATCH_FILES
+        );
+        assert_eq!(
+            IndexingConfig::default_write_batch_files_for(MAX_AUTO_INDEX_WRITE_BATCH_FILES + 8),
+            MAX_AUTO_INDEX_WRITE_BATCH_FILES
+        );
+    }
+
+    #[test]
+    fn effective_write_batch_files_caps_to_run_size() {
+        let config = IndexingConfig::new(6, 4, 8).unwrap();
+
+        assert_eq!(config.effective_write_batch_files(0), 1);
+        assert_eq!(config.effective_write_batch_files(1), 1);
+        assert_eq!(config.effective_write_batch_files(3), 3);
+        assert_eq!(config.effective_write_batch_files(12), 8);
     }
 
     #[test]
