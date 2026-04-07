@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -8,6 +8,19 @@ use tracing::{debug, warn};
 
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::{DaemonError, OneupError};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatcherChanges {
+    pub file_paths: BTreeSet<PathBuf>,
+    pub ambiguous_paths: BTreeSet<PathBuf>,
+    pub has_unscoped_error: bool,
+}
+
+impl WatcherChanges {
+    pub fn is_empty(&self) -> bool {
+        self.file_paths.is_empty() && self.ambiguous_paths.is_empty() && !self.has_unscoped_error
+    }
+}
 
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
@@ -75,9 +88,9 @@ impl FileWatcher {
         Ok(())
     }
 
-    pub fn drain_events(&self) -> HashSet<PathBuf> {
+    pub fn drain_events(&self) -> WatcherChanges {
         let timeout = Duration::from_millis(WATCHER_DEBOUNCE_MS);
-        let mut changed = HashSet::new();
+        let mut changed = WatcherChanges::default();
 
         while let Ok(result) = self.rx.recv_timeout(timeout) {
             collect_event_paths(result, &mut changed);
@@ -86,8 +99,8 @@ impl FileWatcher {
         changed
     }
 
-    pub fn drain_events_nowait(&self) -> HashSet<PathBuf> {
-        let mut changed = HashSet::new();
+    pub fn drain_events_nowait(&self) -> WatcherChanges {
+        let mut changed = WatcherChanges::default();
 
         while let Ok(result) = self.rx.try_recv() {
             collect_event_paths(result, &mut changed);
@@ -102,17 +115,25 @@ impl FileWatcher {
     }
 }
 
-fn collect_event_paths(result: notify::Result<Event>, changed: &mut HashSet<PathBuf>) {
+fn collect_event_paths(result: notify::Result<Event>, changed: &mut WatcherChanges) {
     match result {
         Ok(event) => {
+            if event.paths.is_empty() {
+                changed.has_unscoped_error = true;
+                return;
+            }
+
             for path in event.paths {
                 if path.is_file() || !path.exists() {
-                    changed.insert(path);
+                    changed.file_paths.insert(path);
+                } else if path.is_dir() {
+                    changed.ambiguous_paths.insert(path);
                 }
             }
         }
         Err(e) => {
             warn!("watcher event error: {e}");
+            changed.has_unscoped_error = true;
         }
     }
 }
@@ -153,8 +174,23 @@ fn should_skip_path(path: &Path) -> bool {
     false
 }
 
-pub fn filter_changed_paths(paths: HashSet<PathBuf>) -> Vec<PathBuf> {
-    paths.into_iter().filter(|p| !should_skip_path(p)).collect()
+pub fn filter_changed_paths(changes: WatcherChanges) -> WatcherChanges {
+    let file_paths = changes
+        .file_paths
+        .into_iter()
+        .filter(|path| !should_skip_path(path))
+        .collect();
+    let ambiguous_paths = changes
+        .ambiguous_paths
+        .into_iter()
+        .filter(|path| !should_skip_path(path))
+        .collect();
+
+    WatcherChanges {
+        file_paths,
+        ambiguous_paths,
+        has_unscoped_error: changes.has_unscoped_error,
+    }
 }
 
 #[cfg(test)]
@@ -186,21 +222,36 @@ mod tests {
 
     #[test]
     fn filter_removes_skipped() {
-        let paths: HashSet<PathBuf> = [
-            PathBuf::from("/p/src/main.rs"),
-            PathBuf::from("/p/.git/HEAD"),
-            PathBuf::from("/p/lib.py"),
-            PathBuf::from("/p/image.png"),
-        ]
-        .into_iter()
-        .collect();
-
-        let filtered = filter_changed_paths(paths);
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|p| {
+        let filtered = filter_changed_paths(WatcherChanges {
+            file_paths: BTreeSet::from([
+                PathBuf::from("/p/src/main.rs"),
+                PathBuf::from("/p/.git/HEAD"),
+                PathBuf::from("/p/lib.py"),
+                PathBuf::from("/p/image.png"),
+            ]),
+            ambiguous_paths: BTreeSet::new(),
+            has_unscoped_error: false,
+        });
+        assert_eq!(filtered.file_paths.len(), 2);
+        assert!(filtered.file_paths.iter().all(|p| {
             let name = p.file_name().unwrap().to_str().unwrap();
             name == "main.rs" || name == "lib.py"
         }));
+    }
+
+    #[test]
+    fn filter_preserves_ambiguous_paths_and_errors() {
+        let filtered = filter_changed_paths(WatcherChanges {
+            file_paths: BTreeSet::new(),
+            ambiguous_paths: BTreeSet::from([PathBuf::from("/p/src"), PathBuf::from("/p/.git")]),
+            has_unscoped_error: true,
+        });
+
+        assert_eq!(
+            filtered.ambiguous_paths,
+            BTreeSet::from([PathBuf::from("/p/src")])
+        );
+        assert!(filtered.has_unscoped_error);
     }
 
     #[test]

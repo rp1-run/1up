@@ -12,33 +12,33 @@ use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::OneupError;
-use crate::shared::types::IndexingConfig;
+use crate::shared::types::{IndexingConfig, RunScope};
 use crate::storage::{db::Db, schema};
 
 #[derive(Debug, Default)]
 struct ProjectRunState {
     running: bool,
     dirty: bool,
-    pending_change_count: usize,
+    pending_scope: Option<RunScope>,
 }
 
 impl ProjectRunState {
-    fn mark_dirty(&mut self, change_count: usize) {
-        if change_count == 0 {
-            return;
+    fn mark_dirty(&mut self, scope: RunScope) {
+        match self.pending_scope.as_mut() {
+            Some(existing) => existing.merge(scope),
+            None => self.pending_scope = Some(scope),
         }
 
         self.dirty = true;
-        self.pending_change_count = self.pending_change_count.saturating_add(change_count);
     }
 
-    fn start_run(&mut self) -> usize {
+    fn start_run(&mut self) -> RunScope {
         debug_assert!(self.dirty, "only dirty projects should start a run");
         self.running = true;
         self.dirty = false;
-        let pending_change_count = self.pending_change_count;
-        self.pending_change_count = 0;
-        pending_change_count
+        self.pending_scope
+            .take()
+            .expect("dirty project must have a pending scope")
     }
 
     fn finish_run(&mut self) {
@@ -100,7 +100,11 @@ async fn run_inner() -> Result<(), OneupError> {
                     continue;
                 }
 
-                debug!("detected {} changed files", filtered.len());
+                debug!(
+                    "detected {} changed files and {} ambiguous paths",
+                    filtered.file_paths.len(),
+                    filtered.ambiguous_paths.len()
+                );
                 mark_changed_projects(&mut projects, &filtered);
                 run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
             }
@@ -239,32 +243,73 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
     }))
 }
 
-fn mark_changed_projects(projects: &mut HashMap<PathBuf, ProjectState>, changed_paths: &[PathBuf]) {
+fn normalize_relative_path(project_root: &Path, changed_path: &Path) -> Option<PathBuf> {
+    let relative = changed_path.strip_prefix(project_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative.to_path_buf())
+    }
+}
+
+fn mark_changed_projects(
+    projects: &mut HashMap<PathBuf, ProjectState>,
+    changes: &watcher::WatcherChanges,
+) {
     for (root, state) in projects.iter_mut() {
-        let relevant_count = changed_paths
+        let scope = if changes.has_unscoped_error
+            || changes
+                .ambiguous_paths
+                .iter()
+                .any(|path| path.starts_with(root))
+        {
+            Some(RunScope::Full)
+        } else {
+            RunScope::from_paths(
+                changes
+                    .file_paths
+                    .iter()
+                    .filter(|path| path.starts_with(root))
+                    .filter_map(|path| normalize_relative_path(root, path)),
+            )
+        };
+
+        let Some(scope) = scope else {
+            continue;
+        };
+
+        let relevant_count = changes
+            .file_paths
             .iter()
             .filter(|path| path.starts_with(root))
             .count();
 
-        if relevant_count == 0 {
-            continue;
-        }
-
         let was_dirty = state.run_state.dirty;
         let was_running = state.run_state.running;
-        state.run_state.mark_dirty(relevant_count);
+        state.run_state.mark_dirty(scope.clone());
 
         if was_running && !was_dirty {
             debug!(
-                "project {} changed during an active run; queued one follow-up pass",
-                root.display()
+                "project {} changed during an active run; queued one follow-up {}",
+                root.display(),
+                match scope {
+                    RunScope::Full => "full re-index".to_string(),
+                    RunScope::Paths(paths) => format!("run for {} changed paths", paths.len()),
+                }
             );
         } else if !was_dirty {
-            debug!(
-                "queued re-index for {} after {} changed paths",
-                root.display(),
-                relevant_count
-            );
+            match scope {
+                RunScope::Full => {
+                    debug!("queued full re-index for {}", root.display());
+                }
+                RunScope::Paths(paths) => {
+                    debug!(
+                        "queued re-index for {} after {} changed paths",
+                        root.display(),
+                        paths.len().max(relevant_count)
+                    );
+                }
+            }
         }
     }
 }
@@ -305,8 +350,9 @@ async fn run_dirty_projects_until_clean(
         let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
         if !filtered.is_empty() {
             debug!(
-                "detected {} changed files while re-indexing",
-                filtered.len()
+                "detected {} changed files and {} ambiguous paths while re-indexing",
+                filtered.file_paths.len(),
+                filtered.ambiguous_paths.len()
             );
             mark_changed_projects(projects, &filtered);
         }
@@ -342,11 +388,11 @@ async fn run_project(
     root: &Path,
     projects: &mut HashMap<PathBuf, ProjectState>,
 ) -> Result<pipeline::PipelineStats, OneupError> {
-    let (project_root, pending_change_count, setup) = {
+    let (project_root, scope, setup) = {
         let state = projects
             .get_mut(root)
             .expect("dirty project must exist while running");
-        let pending_change_count = state.run_state.start_run();
+        let scope = state.run_state.start_run();
         let project_root = state.project_root.clone();
         let setup = (|| {
             let conn = state.db.connect()?;
@@ -355,7 +401,7 @@ async fn run_project(
             Ok((conn, indexing_config))
         })();
 
-        (project_root, pending_change_count, setup)
+        (project_root, scope, setup)
     };
 
     let (conn, indexing_config) = match setup {
@@ -370,17 +416,35 @@ async fn run_project(
         }
     };
 
-    info!(
-        "re-indexing {} changed files in {} (jobs={}, embed_threads={})",
-        pending_change_count,
-        project_root.display(),
-        indexing_config.jobs,
-        indexing_config.embed_threads
-    );
+    match &scope {
+        RunScope::Full => {
+            info!(
+                "re-indexing full project {} (jobs={}, embed_threads={})",
+                project_root.display(),
+                indexing_config.jobs,
+                indexing_config.embed_threads
+            );
+        }
+        RunScope::Paths(paths) => {
+            info!(
+                "re-indexing {} changed files in {} (jobs={}, embed_threads={})",
+                paths.len(),
+                project_root.display(),
+                indexing_config.jobs,
+                indexing_config.embed_threads
+            );
+        }
+    }
 
     let mut embedder = load_embedder(indexing_config.embed_threads);
-    let result =
-        pipeline::run_with_config(&conn, &project_root, embedder.as_mut(), &indexing_config).await;
+    let result = pipeline::run_with_scope(
+        &conn,
+        &project_root,
+        embedder.as_mut(),
+        &scope,
+        &indexing_config,
+    )
+    .await;
 
     projects
         .get_mut(root)
@@ -398,21 +462,28 @@ mod tests {
     #[test]
     fn run_state_collapses_bursts_into_follow_up() {
         let mut state = ProjectRunState::default();
-        state.mark_dirty(2);
-        state.mark_dirty(3);
+        state.mark_dirty(RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap());
+        state.mark_dirty(RunScope::from_paths([PathBuf::from("README.md")]).unwrap());
 
         assert!(state.dirty);
-        assert_eq!(state.pending_change_count, 5);
+        assert_eq!(
+            state.pending_scope,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+        );
 
         let pending = state.start_run();
-        assert_eq!(pending, 5);
+        assert_eq!(
+            pending,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+                .unwrap()
+        );
         assert!(state.running);
         assert!(!state.dirty);
-        assert_eq!(state.pending_change_count, 0);
+        assert!(state.pending_scope.is_none());
 
-        state.mark_dirty(4);
+        state.mark_dirty(RunScope::Full);
         assert!(state.dirty);
-        assert_eq!(state.pending_change_count, 4);
+        assert_eq!(state.pending_scope, Some(RunScope::Full));
 
         state.finish_run();
         assert!(!state.running);
@@ -443,7 +514,7 @@ mod tests {
                 run_state: ProjectRunState {
                     running: true,
                     dirty: false,
-                    pending_change_count: 0,
+                    pending_scope: None,
                 },
             },
         );
@@ -457,24 +528,105 @@ mod tests {
             },
         );
 
-        let changed_paths = vec![
-            alpha_root.join("src").join("lib.rs"),
-            alpha_root.join("README.md"),
-            beta_root.join("src").join("mod.rs"),
-            tmp.path().join("outside.txt"),
-        ];
+        let changes = watcher::WatcherChanges {
+            file_paths: std::collections::BTreeSet::from([
+                alpha_root.join("src").join("lib.rs"),
+                alpha_root.join("README.md"),
+                beta_root.join("src").join("mod.rs"),
+                tmp.path().join("outside.txt"),
+            ]),
+            ambiguous_paths: std::collections::BTreeSet::new(),
+            has_unscoped_error: false,
+        };
 
-        mark_changed_projects(&mut projects, &changed_paths);
+        mark_changed_projects(&mut projects, &changes);
 
         let alpha = &projects.get(&alpha_root).unwrap().run_state;
         assert!(alpha.running);
         assert!(alpha.dirty);
-        assert_eq!(alpha.pending_change_count, 2);
+        assert_eq!(
+            alpha.pending_scope,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+        );
 
         let beta = &projects.get(&beta_root).unwrap().run_state;
         assert!(!beta.running);
         assert!(beta.dirty);
-        assert_eq!(beta.pending_change_count, 1);
+        assert_eq!(
+            beta.pending_scope,
+            RunScope::from_paths([PathBuf::from("src/mod.rs")])
+        );
+    }
+
+    #[test]
+    fn mark_changed_projects_escalates_ambiguous_and_unscoped_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha_root = tmp.path().join("alpha");
+        let beta_root = tmp.path().join("beta");
+        std::fs::create_dir_all(alpha_root.join("src")).unwrap();
+        std::fs::create_dir_all(beta_root.join("src")).unwrap();
+
+        let alpha_db = Db::open_memory();
+        let beta_db = Db::open_memory();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let alpha_db = runtime.block_on(alpha_db).unwrap();
+        let beta_db = runtime.block_on(beta_db).unwrap();
+
+        let mut projects = HashMap::new();
+        projects.insert(
+            alpha_root.clone(),
+            ProjectState {
+                project_root: alpha_root.clone(),
+                db: alpha_db,
+                indexing: None,
+                run_state: ProjectRunState::default(),
+            },
+        );
+        projects.insert(
+            beta_root.clone(),
+            ProjectState {
+                project_root: beta_root.clone(),
+                db: beta_db,
+                indexing: None,
+                run_state: ProjectRunState::default(),
+            },
+        );
+
+        mark_changed_projects(
+            &mut projects,
+            &watcher::WatcherChanges {
+                file_paths: std::collections::BTreeSet::new(),
+                ambiguous_paths: std::collections::BTreeSet::from([alpha_root.join("src")]),
+                has_unscoped_error: false,
+            },
+        );
+        assert_eq!(
+            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
+        assert!(projects
+            .get(&beta_root)
+            .unwrap()
+            .run_state
+            .pending_scope
+            .is_none());
+
+        mark_changed_projects(
+            &mut projects,
+            &watcher::WatcherChanges {
+                file_paths: std::collections::BTreeSet::new(),
+                ambiguous_paths: std::collections::BTreeSet::new(),
+                has_unscoped_error: true,
+            },
+        );
+        assert_eq!(
+            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
+        assert_eq!(
+            projects.get(&beta_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
     }
 
     #[test]
@@ -501,7 +653,9 @@ mod tests {
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
-                    pending_change_count: 1,
+                    pending_scope: Some(
+                        RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap(),
+                    ),
                 },
             },
         );
@@ -514,7 +668,9 @@ mod tests {
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
-                    pending_change_count: 1,
+                    pending_scope: Some(
+                        RunScope::from_paths([PathBuf::from("src/mod.rs")]).unwrap(),
+                    ),
                 },
             },
         );

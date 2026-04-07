@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use ignore::gitignore::Gitignore;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 
@@ -70,11 +72,7 @@ fn detect_file_type(path: &Path) -> Option<String> {
     }
 }
 
-/// Scan a directory for source files, respecting .gitignore and default ignores.
-///
-/// Returns a list of files with their extensions, skipping binary files,
-/// hidden directories, and common build artifact directories.
-pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
+fn build_walker(root: &Path, path: &Path) -> Result<ignore::Walk, OneupError> {
     let mut overrides = OverrideBuilder::new(root);
     for pattern in DEFAULT_IGNORE_DIRS {
         overrides.add(pattern).map_err(|e| {
@@ -85,13 +83,105 @@ pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
         .build()
         .map_err(|e| IndexingError::Scan(format!("failed to build overrides: {e}")))?;
 
-    let walker = WalkBuilder::new(root)
+    Ok(WalkBuilder::new(path)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .overrides(overrides)
-        .build();
+        .build())
+}
+
+fn is_default_ignored_path(path: &Path) -> bool {
+    for component in path.components() {
+        let Some(component) = component.as_os_str().to_str() else {
+            continue;
+        };
+
+        if matches!(
+            component,
+            "node_modules"
+                | ".git"
+                | "vendor"
+                | "target"
+                | "build"
+                | "dist"
+                | "out"
+                | ".next"
+                | ".nuxt"
+                | "__pycache__"
+                | ".venv"
+                | "venv"
+                | ".tox"
+                | ".mypy_cache"
+                | ".pytest_cache"
+                | ".cargo"
+                | ".gradle"
+                | ".idea"
+                | ".vscode"
+                | ".1up"
+                | ".rp1"
+                | "coverage"
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_gitignored(root: &Path, path: &Path) -> Result<bool, OneupError> {
+    let mut ignored = false;
+    let mut current = path.parent();
+    let mut directories = Vec::new();
+
+    while let Some(dir) = current {
+        if !dir.starts_with(root) {
+            break;
+        }
+
+        directories.push(dir.to_path_buf());
+        if dir == root {
+            break;
+        }
+
+        current = dir.parent();
+    }
+
+    directories.reverse();
+
+    for dir in directories {
+        let gitignore_path = dir.join(".gitignore");
+        if !gitignore_path.is_file() {
+            continue;
+        }
+
+        let (matcher, error) = Gitignore::new(&gitignore_path);
+        if let Some(error) = error {
+            return Err(IndexingError::Scan(format!(
+                "failed to load {}: {error}",
+                gitignore_path.display()
+            ))
+            .into());
+        }
+
+        let matched = matcher.matched_path_or_any_parents(path, false);
+        if matched.is_ignore() {
+            ignored = true;
+        } else if matched.is_whitelist() {
+            ignored = false;
+        }
+    }
+
+    Ok(ignored)
+}
+
+/// Scan a directory for source files, respecting .gitignore and default ignores.
+///
+/// Returns a list of files with their extensions, skipping binary files,
+/// hidden directories, and common build artifact directories.
+pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
+    let walker = build_walker(root, root)?;
 
     let mut files = Vec::new();
 
@@ -103,6 +193,40 @@ pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
         }
 
         let path = entry.path().to_path_buf();
+
+        let Some(extension) = detect_file_type(&path) else {
+            continue;
+        };
+
+        if BINARY_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+
+        files.push(ScannedFile { path, extension });
+    }
+
+    Ok(files)
+}
+
+pub fn scan_paths(
+    root: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+) -> Result<Vec<ScannedFile>, OneupError> {
+    let mut files = Vec::new();
+
+    for relative_path in relative_paths {
+        if is_default_ignored_path(relative_path) {
+            continue;
+        }
+
+        let path = root.join(relative_path);
+        if !path.is_file() {
+            continue;
+        }
+
+        if is_gitignored(root, &path)? {
+            continue;
+        }
 
         let Some(extension) = detect_file_type(&path) else {
             continue;
@@ -190,6 +314,25 @@ mod tests {
         fs::write(tmp.path().join("ignored.rs"), "fn ignored() {}").unwrap();
 
         let files = scan_directory(tmp.path()).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(names.contains(&"main.rs"));
+        assert!(!names.contains(&"ignored.rs"));
+    }
+
+    #[test]
+    fn scan_paths_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join("ignored.rs"), "fn ignored() {}").unwrap();
+
+        let paths = BTreeSet::from([PathBuf::from("main.rs"), PathBuf::from("ignored.rs")]);
+
+        let files = scan_paths(tmp.path(), &paths).unwrap();
         let names: Vec<&str> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
