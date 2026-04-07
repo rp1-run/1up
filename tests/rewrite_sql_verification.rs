@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use oneup::shared::constants::SCHEMA_VERSION;
 use oneup::storage::{db::Db, queries, schema};
 use predicates::prelude::*;
 use std::fs;
@@ -139,7 +140,7 @@ fn create_stale_v4_index(dir: &Path) {
     });
 }
 
-fn create_partial_v6_index(dir: &Path) {
+fn create_partial_current_index(dir: &Path) {
     block_on(async {
         let db = Db::open_rw(&db_path(dir)).await.unwrap();
         let conn = db.connect().unwrap();
@@ -168,15 +169,17 @@ fn stale_schema_search_requires_explicit_reindex_guidance() {
         .failure()
         .stderr(
             predicate::str::contains("found v4")
-                .and(predicate::str::contains("expected v6"))
+                .and(predicate::str::contains(format!(
+                    "expected v{SCHEMA_VERSION}"
+                )))
                 .and(predicate::str::contains("1up reindex")),
         );
 }
 
 #[test]
-fn partial_v6_index_search_requires_explicit_reindex_guidance() {
+fn partial_current_index_search_requires_explicit_reindex_guidance() {
     let tmp = TempDir::new().unwrap();
-    create_partial_v6_index(tmp.path());
+    create_partial_current_index(tmp.path());
 
     cmd()
         .args([
@@ -208,7 +211,7 @@ fn degraded_search_warns_and_returns_results() {
 }
 
 #[test]
-fn rebuilt_v6_index_keeps_add_edit_delete_search_freshness() {
+fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     let tmp = create_search_fixture();
     let _guard = index_fts_only(tmp.path());
 
