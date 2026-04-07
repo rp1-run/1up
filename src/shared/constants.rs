@@ -46,8 +46,11 @@ pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 /// Conservative upper bound for auto-selected embedding threads.
 pub const MAX_AUTO_EMBED_THREADS: usize = 4;
 
-/// Default number of files written per storage transaction.
-pub const DEFAULT_INDEX_WRITE_BATCH_FILES: usize = 1;
+/// Minimum number of files written per auto-selected storage transaction.
+pub const DEFAULT_INDEX_WRITE_BATCH_FILES: usize = 4;
+
+/// Conservative upper bound for auto-selected storage transaction batches.
+pub const MAX_AUTO_INDEX_WRITE_BATCH_FILES: usize = 16;
 
 /// Environment variable for parse worker count.
 pub const INDEX_JOBS_ENV_VAR: &str = "ONEUP_INDEX_JOBS";

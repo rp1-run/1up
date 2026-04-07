@@ -201,6 +201,25 @@ mod tests {
             resolved.embed_threads,
             IndexingConfig::default_embed_threads_for(resolved.jobs)
         );
+        assert_eq!(
+            resolved.write_batch_files,
+            IndexingConfig::default_write_batch_files_for(resolved.jobs)
+        );
+    }
+
+    #[test]
+    fn resolve_indexing_config_keeps_single_file_registry_override() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new(&[
+            INDEX_JOBS_ENV_VAR,
+            EMBED_THREADS_ENV_VAR,
+            INDEX_WRITE_BATCH_FILES_ENV_VAR,
+        ]);
+        clear_indexing_env();
+
+        let persisted = IndexingConfig::new(3, 2, 1).unwrap();
+        let resolved = resolve_indexing_config(None, None, Some(&persisted)).unwrap();
+
         assert_eq!(resolved.write_batch_files, 1);
     }
 
