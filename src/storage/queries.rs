@@ -117,7 +117,7 @@ pub const SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN: &str =
 pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str = "SELECT 1 FROM segment_vectors LIMIT 1";
 
 pub const SELECT_VECTOR_CANDIDATES: &str = "
-SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
 FROM vector_top_k('idx_segment_vectors_embedding', vector(?1), ?2) AS v
@@ -125,7 +125,7 @@ JOIN segment_vectors AS sv ON sv.rowid = v.id
 JOIN segments AS s ON s.id = sv.segment_id";
 
 pub const SELECT_FTS_CANDIDATES: &str = "
-SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
 FROM segments_fts AS f

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use libsql::Connection;
 
+use crate::search::retrieval::CandidateRow;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::{ReferenceKind, SymbolResult};
@@ -35,25 +36,36 @@ impl<'a> SymbolSearchEngine<'a> {
     }
 
     pub async fn find_references(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
-        let definitions = self.find_matches(name, ReferenceKind::Definition).await?;
-        let definition_ids: HashSet<String> = definitions
-            .iter()
-            .map(|symbol_match| symbol_match.segment_id.clone())
-            .collect();
-
-        let mut results: Vec<SymbolResult> = definitions
+        Ok(self
+            .find_reference_matches(name)
+            .await?
             .into_iter()
             .map(|symbol_match| symbol_match.result)
-            .collect();
+            .collect())
+    }
 
-        let usages = self.find_matches(name, ReferenceKind::Usage).await?;
-        for usage in usages {
-            if !definition_ids.contains(&usage.segment_id) {
-                results.push(usage.result);
-            }
-        }
+    pub(crate) async fn find_definition_candidates(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        Ok(self
+            .find_matches(name, ReferenceKind::Definition)
+            .await?
+            .into_iter()
+            .map(candidate_from_symbol_match)
+            .collect())
+    }
 
-        Ok(results)
+    pub(crate) async fn find_reference_candidates(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        Ok(self
+            .find_reference_matches(name)
+            .await?
+            .into_iter()
+            .map(candidate_from_symbol_match)
+            .collect())
     }
 
     async fn find_matches(
@@ -210,6 +222,24 @@ impl<'a> SymbolSearchEngine<'a> {
 
         Ok(results)
     }
+
+    async fn find_reference_matches(&self, name: &str) -> Result<Vec<SymbolMatch>, OneupError> {
+        let definitions = self.find_matches(name, ReferenceKind::Definition).await?;
+        let definition_ids: HashSet<String> = definitions
+            .iter()
+            .map(|symbol_match| symbol_match.segment_id.clone())
+            .collect();
+
+        let mut results = definitions;
+        let usages = self.find_matches(name, ReferenceKind::Usage).await?;
+        for usage in usages {
+            if !definition_ids.contains(&usage.segment_id) {
+                results.push(usage);
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
@@ -256,6 +286,23 @@ fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
         exact
     } else {
         partial
+    }
+}
+
+fn candidate_from_symbol_match(symbol_match: SymbolMatch) -> CandidateRow {
+    CandidateRow {
+        segment_id: symbol_match.segment_id,
+        file_path: symbol_match.result.file_path,
+        language: symbol_match.result.language,
+        block_type: symbol_match.result.kind,
+        line_number: symbol_match.result.line_start,
+        line_end: symbol_match.result.line_end,
+        breadcrumb: symbol_match.result.breadcrumb,
+        complexity: symbol_match.result.complexity,
+        role: symbol_match.result.role,
+        defined_symbols: symbol_match.result.defined_symbols,
+        referenced_symbols: symbol_match.result.referenced_symbols,
+        called_symbols: symbol_match.result.called_symbols,
     }
 }
 
