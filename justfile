@@ -9,6 +9,10 @@ install:
     cp target/release/1up ~/.local/bin/1up
     codesign -f -s - ~/.local/bin/1up
 
+bench:
+    cargo build --release
+    @cd evals && ONEUP_BENCH_BIN=../target/release/1up bun run bench
+
 bench-parallel repo='.':
     ./scripts/benchmark_parallel_indexing.sh {{repo}}
 

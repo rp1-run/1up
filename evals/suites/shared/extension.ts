@@ -11,6 +11,17 @@ const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
 const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
 const TEMP_BASE = "/tmp/1up-evals";
 
+interface CacheStatus {
+  indexed_files?: number | null;
+  total_segments?: number | null;
+}
+
+export interface FixtureWorkspace {
+  workspaceDir: string;
+  repoDir: string;
+  homeDir: string;
+}
+
 interface HookContext {
   test: {
     vars?: Record<string, string | number | boolean | object>;
@@ -21,11 +32,30 @@ interface HookContext {
   };
 }
 
-function ensureFixtureCache(): void {
-  if (existsSync(INDEX_DB_PATH)) {
-    return;
+function cacheNeedsRefresh(): boolean {
+  if (!existsSync(INDEX_DB_PATH)) {
+    return true;
   }
 
+  try {
+    const rawStatus = execSync("1up status -f json .", {
+      cwd: CACHE_DIR,
+      stdio: "pipe",
+    }).toString();
+    const status = JSON.parse(rawStatus) as CacheStatus;
+
+    return !(
+      typeof status.indexed_files === "number" &&
+      status.indexed_files > 0 &&
+      typeof status.total_segments === "number" &&
+      status.total_segments > 0
+    );
+  } catch {
+    return true;
+  }
+}
+
+export function ensureFixtureCache(): void {
   mkdirSync(CACHE_DIR, { recursive: true });
 
   if (!existsSync(join(CACHE_DIR, ".git"))) {
@@ -38,28 +68,32 @@ function ensureFixtureCache(): void {
     });
   }
 
-  execSync("1up index", { cwd: CACHE_DIR, stdio: "pipe" });
+  if (cacheNeedsRefresh()) {
+    const command = existsSync(INDEX_DB_PATH) ? "1up reindex" : "1up index";
+    execSync(command, { cwd: CACHE_DIR, stdio: "pipe" });
+  }
 
   if (existsSync(PROJECT_ID_PATH)) {
     rmSync(PROJECT_ID_PATH);
   }
 }
 
-function createWorkspace(): string {
+export function createWorkspace(): FixtureWorkspace {
   const uuid = crypto.randomUUID();
   const workspaceDir = join(TEMP_BASE, uuid);
   const homeDir = join(workspaceDir, "home");
+  const repoDir = join(workspaceDir, "emdash");
 
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(join(homeDir, ".local/share"), { recursive: true });
   mkdirSync(join(homeDir, ".config"), { recursive: true });
 
-  cpSync(CACHE_DIR, join(workspaceDir, "emdash"), { recursive: true });
+  cpSync(CACHE_DIR, repoDir, { recursive: true });
 
-  return workspaceDir;
+  return { workspaceDir, repoDir, homeDir };
 }
 
-function cleanupWorkspace(workspaceDir: string): void {
+export function cleanupWorkspace(workspaceDir: string): void {
   if (existsSync(workspaceDir)) {
     rmSync(workspaceDir, { recursive: true, force: true });
   }
@@ -75,20 +109,18 @@ export default async function (
   }
 
   if (hookName === "beforeEach") {
-    const workspaceDir = createWorkspace();
-    const emdashDir = join(workspaceDir, "emdash");
-    const homeDir = join(workspaceDir, "home");
+    const { workspaceDir, repoDir, homeDir } = createWorkspace();
 
     if (!context.test.vars) {
       context.test.vars = {};
     }
-    context.test.vars.WORKSPACE_DIR = emdashDir;
+    context.test.vars.WORKSPACE_DIR = repoDir;
     context.test.vars.EVAL_BASE_DIR = workspaceDir;
 
     if (!context.test.options) {
       context.test.options = {};
     }
-    context.test.options.working_dir = emdashDir;
+    context.test.options.working_dir = repoDir;
 
     context.test.vars._WORKSPACE_DIR = workspaceDir;
     context.test.vars._HOME = homeDir;
