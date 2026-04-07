@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use nanospinner::Spinner;
 use ort::session::Session;
@@ -13,6 +14,223 @@ use crate::shared::errors::{EmbeddingError, OneupError};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    size: u64,
+    modified_ns: u128,
+}
+
+impl FileFingerprint {
+    fn from_path(path: &Path) -> Result<Self, OneupError> {
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            EmbeddingError::ModelNotAvailable(format!("failed to inspect {}: {e}", path.display()))
+        })?;
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+
+        Ok(Self {
+            size: metadata.len(),
+            modified_ns,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingCompatibilityKey {
+    model_dir: PathBuf,
+    model: FileFingerprint,
+    tokenizer: FileFingerprint,
+    embed_threads: usize,
+}
+
+impl EmbeddingCompatibilityKey {
+    fn from_dir_with_threads(dir: &Path, embed_threads: usize) -> Result<Self, OneupError> {
+        let model_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let model_path = model_dir.join(MODEL_FILENAME);
+        let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
+
+        Ok(Self {
+            model_dir,
+            model: FileFingerprint::from_path(&model_path)?,
+            tokenizer: FileFingerprint::from_path(&tokenizer_path)?,
+            embed_threads,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingUnavailableReason {
+    ModelMissing,
+    PreviousDownloadFailed,
+    ModelDirUnavailable(String),
+    LoadFailed(String),
+    DownloadFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingLoadStatus {
+    Warm,
+    Loaded,
+    Downloaded,
+    Unavailable(EmbeddingUnavailableReason),
+}
+
+impl EmbeddingLoadStatus {
+    pub fn is_available(&self) -> bool {
+        !matches!(self, Self::Unavailable(_))
+    }
+}
+
+struct CachedRuntime<T> {
+    key: EmbeddingCompatibilityKey,
+    value: T,
+}
+
+struct WarmRuntime<T> {
+    cached: Option<CachedRuntime<T>>,
+}
+
+impl<T> WarmRuntime<T> {
+    fn is_compatible(&self, key: &EmbeddingCompatibilityKey) -> bool {
+        self.cached
+            .as_ref()
+            .is_some_and(|cached| cached.key == *key)
+    }
+
+    fn store(&mut self, key: EmbeddingCompatibilityKey, value: T) {
+        self.cached = Some(CachedRuntime { key, value });
+    }
+
+    fn clear(&mut self) {
+        self.cached = None;
+    }
+
+    fn current_mut(&mut self) -> Option<&mut T> {
+        self.cached.as_mut().map(|cached| &mut cached.value)
+    }
+}
+
+#[derive(Default)]
+pub struct EmbeddingRuntime {
+    cache: WarmRuntime<Embedder>,
+}
+
+impl<T> Default for WarmRuntime<T> {
+    fn default() -> Self {
+        Self { cached: None }
+    }
+}
+
+impl EmbeddingRuntime {
+    pub async fn prepare_for_indexing(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+        if is_model_available() {
+            return self.prepare_from_model_dir(embed_threads);
+        }
+
+        if is_download_failed() {
+            self.cache.clear();
+            return EmbeddingLoadStatus::Unavailable(
+                EmbeddingUnavailableReason::PreviousDownloadFailed,
+            );
+        }
+
+        self.prepare_with_download(embed_threads).await
+    }
+
+    pub fn prepare_for_search(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+        if !is_model_available() {
+            self.cache.clear();
+            return EmbeddingLoadStatus::Unavailable(if is_download_failed() {
+                EmbeddingUnavailableReason::PreviousDownloadFailed
+            } else {
+                EmbeddingUnavailableReason::ModelMissing
+            });
+        }
+
+        self.prepare_from_model_dir(embed_threads)
+    }
+
+    pub fn current_embedder(&mut self) -> Option<&mut Embedder> {
+        self.cache.current_mut()
+    }
+
+    fn prepare_from_model_dir(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+        let key = match Self::model_dir_key(embed_threads) {
+            Ok(key) => key,
+            Err(reason) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(reason);
+            }
+        };
+
+        if self.cache.is_compatible(&key) {
+            return EmbeddingLoadStatus::Warm;
+        }
+
+        match Embedder::from_dir_with_threads(&key.model_dir, embed_threads) {
+            Ok(embedder) => {
+                self.cache.store(key, embedder);
+                EmbeddingLoadStatus::Loaded
+            }
+            Err(err) => {
+                self.cache.clear();
+                EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
+                    err.to_string(),
+                ))
+            }
+        }
+    }
+
+    async fn prepare_with_download(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+        let model_dir = match model_dir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
+                );
+            }
+        };
+
+        match Embedder::new_with_threads(embed_threads).await {
+            Ok(embedder) => {
+                match EmbeddingCompatibilityKey::from_dir_with_threads(&model_dir, embed_threads) {
+                    Ok(key) => {
+                        self.cache.store(key, embedder);
+                        EmbeddingLoadStatus::Downloaded
+                    }
+                    Err(err) => {
+                        self.cache.clear();
+                        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
+                            err.to_string(),
+                        ))
+                    }
+                }
+            }
+            Err(err) => {
+                self.cache.clear();
+                EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(
+                    err.to_string(),
+                ))
+            }
+        }
+    }
+
+    fn model_dir_key(
+        embed_threads: usize,
+    ) -> Result<EmbeddingCompatibilityKey, EmbeddingUnavailableReason> {
+        let model_dir = model_dir()
+            .map_err(|err| EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()))?;
+
+        EmbeddingCompatibilityKey::from_dir_with_threads(&model_dir, embed_threads)
+            .map_err(|err| EmbeddingUnavailableReason::LoadFailed(err.to_string()))
+    }
+}
 
 /// Embedding engine backed by an ONNX model (all-MiniLM-L6-v2) with WordPiece tokenization.
 ///
@@ -128,11 +346,6 @@ impl Embedder {
             tokenizer,
             batch_size,
         })
-    }
-
-    /// Creates an embedder from pre-existing model files at a custom path.
-    pub fn from_dir(dir: &Path) -> Result<Self, OneupError> {
-        Self::from_dir_with_threads(dir, 1)
     }
 
     /// Creates an embedder from pre-existing model files at a custom path and thread count.
@@ -421,6 +634,11 @@ async fn download_model(dir: &Path) -> Result<(), OneupError> {
 mod tests {
     use super::*;
 
+    fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
+        std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
+        std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
+    }
+
     #[test]
     fn model_availability_check() {
         // Smoke test: verify is_model_available() completes without panicking.
@@ -461,7 +679,7 @@ mod tests {
     #[test]
     fn from_dir_missing_model() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = Embedder::from_dir(tmp.path());
+        let result = Embedder::from_dir_with_threads(tmp.path(), 1);
         assert!(result.is_err());
         let err = format!("{}", result.err().unwrap());
         assert!(err.contains("model not found") || err.contains("not found"));
@@ -471,10 +689,50 @@ mod tests {
     fn from_dir_missing_tokenizer() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(MODEL_FILENAME), b"not a real model").unwrap();
-        let result = Embedder::from_dir(tmp.path());
+        let result = Embedder::from_dir_with_threads(tmp.path(), 1);
         assert!(result.is_err());
         let err = format!("{}", result.err().unwrap());
         assert!(err.contains("tokenizer not found") || err.contains("not found"));
+    }
+
+    #[test]
+    fn compatibility_key_changes_when_embed_threads_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
+
+        let key_a = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 1).unwrap();
+        let key_b = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn compatibility_key_changes_when_model_files_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
+
+        let key_before = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+
+        write_fake_model_files(tmp.path(), b"model-v2-with-different-size", b"tokenizer-v1");
+
+        let key_after = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+        assert_ne!(key_before, key_after);
+    }
+
+    #[test]
+    fn warm_runtime_reports_only_matching_keys_as_compatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
+
+        let key_a = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+        let key_b = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 3).unwrap();
+
+        let mut cache = WarmRuntime::default();
+        cache.store(key_a.clone(), 7usize);
+
+        assert!(cache.is_compatible(&key_a));
+        assert!(!cache.is_compatible(&key_b));
+        assert_eq!(cache.current_mut().map(|value| *value), Some(7));
     }
 
     #[test]
@@ -483,7 +741,7 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir(&model_dir().unwrap()).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
         let result = embedder.embed_batch(&[]).unwrap();
         assert!(result.is_empty());
     }
@@ -494,7 +752,7 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir(&model_dir().unwrap()).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
         let vec = embedder.embed_one("hello world").unwrap();
         assert_eq!(vec.len(), EMBEDDING_DIM);
     }
@@ -505,7 +763,7 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir(&model_dir().unwrap()).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
         let vec = embedder.embed_one("the quick brown fox").unwrap();
         let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
@@ -520,7 +778,7 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir(&model_dir().unwrap()).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
         let texts = vec![
             "error handling in rust",
             "machine learning algorithms",
@@ -544,7 +802,7 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir(&model_dir().unwrap()).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
         let vecs = embedder
             .embed_batch(&[
                 "how to handle errors in rust",

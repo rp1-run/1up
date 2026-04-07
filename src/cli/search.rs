@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::cli::output::formatter_for;
 use crate::daemon::lifecycle;
-use crate::indexer::embedder::{is_model_available, Embedder};
+use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::search::HybridSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
@@ -46,32 +46,34 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
     let conn = db.connect()?;
     schema::ensure_current(&conn).await?;
 
-    let mut embedder_opt = if is_model_available() {
-        match Embedder::from_dir(&crate::shared::config::model_dir()?) {
-            Ok(e) => Some(e),
-            Err(err) => {
-                eprintln!("warning: embedding model failed to load ({err}); search is degraded to FTS-only mode (results may be less relevant)");
-                None
-            }
+    let mut runtime = EmbeddingRuntime::default();
+    let status = runtime.prepare_for_search(1);
+    match &status {
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
+        EmbeddingLoadStatus::Downloaded => {
+            tracing::debug!("search runtime loaded a fresh embedder via download path");
         }
-    } else {
-        if crate::indexer::embedder::is_download_failed() {
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
             eprintln!("warning: embedding model download previously failed; search is degraded to FTS-only mode. Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
-        } else {
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
             eprintln!("warning: embedding model not found; search is degraded to FTS-only mode. Run `1up index` to download the model and enable semantic search");
         }
-        None
-    };
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            eprintln!(
+                "warning: embedding model failed to load ({err}); search is degraded to FTS-only mode (results may be less relevant)"
+            );
+        }
+    }
 
-    let results = match &mut embedder_opt {
-        Some(embedder) => {
-            let mut engine = HybridSearchEngine::new(&conn, Some(embedder));
-            engine.search(&args.query, args.limit).await?
-        }
-        None => {
-            let engine = HybridSearchEngine::new(&conn, None);
-            engine.fts_only_search(&args.query, args.limit).await?
-        }
+    let results = if status.is_available() {
+        let mut engine = HybridSearchEngine::new(&conn, runtime.current_embedder());
+        engine.search(&args.query, args.limit).await?
+    } else {
+        let engine = HybridSearchEngine::new(&conn, None);
+        engine.fts_only_search(&args.query, args.limit).await?
     };
 
     println!("{}", fmt.format_search_results(&results));
