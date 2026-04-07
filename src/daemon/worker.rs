@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future;
 use std::path::{Path, PathBuf};
 
 use tokio::signal::unix::{signal, SignalKind};
@@ -6,39 +7,41 @@ use tracing::{debug, error, info, warn};
 
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
+use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
 use crate::daemon::watcher::{self, FileWatcher};
-use crate::indexer::embedder::{self, Embedder};
+use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
+use crate::search::HybridSearchEngine;
 use crate::shared::config;
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::OneupError;
-use crate::shared::types::IndexingConfig;
+use crate::shared::types::{IndexingConfig, RunScope};
 use crate::storage::{db::Db, schema};
 
 #[derive(Debug, Default)]
 struct ProjectRunState {
     running: bool,
     dirty: bool,
-    pending_change_count: usize,
+    pending_scope: Option<RunScope>,
 }
 
 impl ProjectRunState {
-    fn mark_dirty(&mut self, change_count: usize) {
-        if change_count == 0 {
-            return;
+    fn mark_dirty(&mut self, scope: RunScope) {
+        match self.pending_scope.as_mut() {
+            Some(existing) => existing.merge(scope),
+            None => self.pending_scope = Some(scope),
         }
 
         self.dirty = true;
-        self.pending_change_count = self.pending_change_count.saturating_add(change_count);
     }
 
-    fn start_run(&mut self) -> usize {
+    fn start_run(&mut self) -> RunScope {
         debug_assert!(self.dirty, "only dirty projects should start a run");
         self.running = true;
         self.dirty = false;
-        let pending_change_count = self.pending_change_count;
-        self.pending_change_count = 0;
-        pending_change_count
+        self.pending_scope
+            .take()
+            .expect("dirty project must have a pending scope")
     }
 
     fn finish_run(&mut self) {
@@ -50,6 +53,7 @@ struct ProjectState {
     project_root: PathBuf,
     db: Db,
     indexing: Option<IndexingConfig>,
+    embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
 }
 
@@ -77,6 +81,13 @@ async fn run_inner() -> Result<(), OneupError> {
 
     let mut file_watcher = FileWatcher::new()?;
     let mut projects: HashMap<PathBuf, ProjectState> = HashMap::new();
+    let search_listener = match search_service::bind_listener().await {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            warn!("failed to start daemon search socket; search will fall back locally: {err}");
+            None
+        }
+    };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
 
@@ -84,6 +95,26 @@ async fn run_inner() -> Result<(), OneupError> {
 
     loop {
         tokio::select! {
+            request = async {
+                match search_listener.as_ref() {
+                    Some(listener) => Some(search_service::accept_request(listener).await),
+                    None => future::pending::<Option<Result<_, OneupError>>>().await,
+                }
+            } => {
+                if let Some(request) = request {
+                    match request {
+                        Ok((mut stream, request)) => {
+                            let response = handle_search_request(&mut projects, request).await;
+                            if let Err(err) = search_service::send_response(&mut stream, &response).await {
+                                warn!("failed to respond to daemon search request: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            warn!("failed to accept daemon search request: {err}");
+                        }
+                    }
+                }
+            }
             _ = sighup.recv() => {
                 info!("received SIGHUP, reloading project registry");
                 if let Err(e) = reload_projects(&mut file_watcher, &mut projects).await {
@@ -100,7 +131,11 @@ async fn run_inner() -> Result<(), OneupError> {
                     continue;
                 }
 
-                debug!("detected {} changed files", filtered.len());
+                debug!(
+                    "detected {} changed files and {} ambiguous paths",
+                    filtered.file_paths.len(),
+                    filtered.ambiguous_paths.len()
+                );
                 mark_changed_projects(&mut projects, &filtered);
                 run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
             }
@@ -110,38 +145,100 @@ async fn run_inner() -> Result<(), OneupError> {
     if let Err(e) = file_watcher.unwatch_all() {
         warn!("failed to unwatch on shutdown: {e}");
     }
+    if search_listener.is_some() {
+        if let Err(err) = search_service::cleanup_socket_file() {
+            warn!("failed to remove daemon search socket: {err}");
+        }
+    }
 
     info!("daemon worker exiting");
     Ok(())
 }
 
-fn load_embedder(embed_threads: usize) -> Option<Embedder> {
-    if !embedder::is_model_available() {
-        if embedder::is_download_failed() {
-            warn!(
-                "embedding model download previously failed; daemon will index without embeddings"
+fn log_indexing_embedding_status(
+    project_root: &Path,
+    embed_threads: usize,
+    status: &EmbeddingLoadStatus,
+) {
+    match status {
+        EmbeddingLoadStatus::Warm => {
+            debug!(
+                "reused warm embedding runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
             );
-        } else {
-            debug!("embedding model not available; daemon will index without embeddings");
         }
-        return None;
+        EmbeddingLoadStatus::Loaded => {
+            debug!(
+                "loaded embedding model for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Downloaded => {
+            info!(
+                "downloaded embedding model for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            warn!(
+                "embedding model download previously failed; daemon will index {} without embeddings",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            debug!(
+                "embedding model not available; daemon will index {} without embeddings",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            warn!(
+                "failed to prepare embedding runtime for {} with embed_threads={embed_threads}: {err}; daemon will index without embeddings",
+                project_root.display()
+            );
+        }
     }
+}
 
-    let dir = match config::model_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            warn!("failed to resolve embedding model dir: {e}");
-            return None;
-        }
-    };
-
-    match Embedder::from_dir_with_threads(&dir, embed_threads) {
-        Ok(embedder) => Some(embedder),
-        Err(e) => {
-            warn!(
-                "failed to load embedding model with embed_threads={embed_threads}: {e}; daemon will index without embeddings"
+fn log_search_embedding_status(
+    project_root: &Path,
+    embed_threads: usize,
+    status: &EmbeddingLoadStatus,
+) {
+    match status {
+        EmbeddingLoadStatus::Warm => {
+            debug!(
+                "reused warm daemon search runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
             );
-            None
+        }
+        EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Downloaded => {
+            debug!(
+                "loaded daemon search runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            debug!(
+                "embedding model download previously failed; daemon search for {} will use FTS-only mode",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            debug!(
+                "embedding model not available; daemon search for {} will use FTS-only mode",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            debug!(
+                "failed to prepare daemon search runtime for {} with embed_threads={embed_threads}: {err}; using FTS-only mode",
+                project_root.display()
+            );
         }
     }
 }
@@ -235,36 +332,78 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         project_root: entry.project_root.clone(),
         db,
         indexing: entry.indexing.clone(),
+        embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
     }))
 }
 
-fn mark_changed_projects(projects: &mut HashMap<PathBuf, ProjectState>, changed_paths: &[PathBuf]) {
+fn normalize_relative_path(project_root: &Path, changed_path: &Path) -> Option<PathBuf> {
+    let relative = changed_path.strip_prefix(project_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative.to_path_buf())
+    }
+}
+
+fn mark_changed_projects(
+    projects: &mut HashMap<PathBuf, ProjectState>,
+    changes: &watcher::WatcherChanges,
+) {
     for (root, state) in projects.iter_mut() {
-        let relevant_count = changed_paths
+        let scope = if changes.has_unscoped_error
+            || changes
+                .ambiguous_paths
+                .iter()
+                .any(|path| path.starts_with(root))
+        {
+            Some(RunScope::Full)
+        } else {
+            RunScope::from_paths(
+                changes
+                    .file_paths
+                    .iter()
+                    .filter(|path| path.starts_with(root))
+                    .filter_map(|path| normalize_relative_path(root, path)),
+            )
+        };
+
+        let Some(scope) = scope else {
+            continue;
+        };
+
+        let relevant_count = changes
+            .file_paths
             .iter()
             .filter(|path| path.starts_with(root))
             .count();
 
-        if relevant_count == 0 {
-            continue;
-        }
-
         let was_dirty = state.run_state.dirty;
         let was_running = state.run_state.running;
-        state.run_state.mark_dirty(relevant_count);
+        state.run_state.mark_dirty(scope.clone());
 
         if was_running && !was_dirty {
             debug!(
-                "project {} changed during an active run; queued one follow-up pass",
-                root.display()
+                "project {} changed during an active run; queued one follow-up {}",
+                root.display(),
+                match scope {
+                    RunScope::Full => "full re-index".to_string(),
+                    RunScope::Paths(paths) => format!("run for {} changed paths", paths.len()),
+                }
             );
         } else if !was_dirty {
-            debug!(
-                "queued re-index for {} after {} changed paths",
-                root.display(),
-                relevant_count
-            );
+            match scope {
+                RunScope::Full => {
+                    debug!("queued full re-index for {}", root.display());
+                }
+                RunScope::Paths(paths) => {
+                    debug!(
+                        "queued re-index for {} after {} changed paths",
+                        root.display(),
+                        paths.len().max(relevant_count)
+                    );
+                }
+            }
         }
     }
 }
@@ -305,8 +444,9 @@ async fn run_dirty_projects_until_clean(
         let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
         if !filtered.is_empty() {
             debug!(
-                "detected {} changed files while re-indexing",
-                filtered.len()
+                "detected {} changed files and {} ambiguous paths while re-indexing",
+                filtered.file_paths.len(),
+                filtered.ambiguous_paths.len()
             );
             mark_changed_projects(projects, &filtered);
         }
@@ -342,11 +482,11 @@ async fn run_project(
     root: &Path,
     projects: &mut HashMap<PathBuf, ProjectState>,
 ) -> Result<pipeline::PipelineStats, OneupError> {
-    let (project_root, pending_change_count, setup) = {
+    let (project_root, scope, setup) = {
         let state = projects
             .get_mut(root)
             .expect("dirty project must exist while running");
-        let pending_change_count = state.run_state.start_run();
+        let scope = state.run_state.start_run();
         let project_root = state.project_root.clone();
         let setup = (|| {
             let conn = state.db.connect()?;
@@ -355,7 +495,7 @@ async fn run_project(
             Ok((conn, indexing_config))
         })();
 
-        (project_root, pending_change_count, setup)
+        (project_root, scope, setup)
     };
 
     let (conn, indexing_config) = match setup {
@@ -370,17 +510,44 @@ async fn run_project(
         }
     };
 
-    info!(
-        "re-indexing {} changed files in {} (jobs={}, embed_threads={})",
-        pending_change_count,
-        project_root.display(),
-        indexing_config.jobs,
-        indexing_config.embed_threads
-    );
+    match &scope {
+        RunScope::Full => {
+            info!(
+                "re-indexing full project {} (jobs={}, embed_threads={})",
+                project_root.display(),
+                indexing_config.jobs,
+                indexing_config.embed_threads
+            );
+        }
+        RunScope::Paths(paths) => {
+            info!(
+                "re-indexing {} changed files in {} (jobs={}, embed_threads={})",
+                paths.len(),
+                project_root.display(),
+                indexing_config.jobs,
+                indexing_config.embed_threads
+            );
+        }
+    }
 
-    let mut embedder = load_embedder(indexing_config.embed_threads);
-    let result =
-        pipeline::run_with_config(&conn, &project_root, embedder.as_mut(), &indexing_config).await;
+    let result = {
+        let state = projects
+            .get_mut(root)
+            .expect("dirty project must exist while preparing embeddings");
+        let status = state
+            .embedding_runtime
+            .prepare_for_indexing(indexing_config.embed_threads)
+            .await;
+        log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
+        pipeline::run_with_scope(
+            &conn,
+            &project_root,
+            state.embedding_runtime.current_embedder(),
+            &scope,
+            &indexing_config,
+        )
+        .await
+    };
 
     projects
         .get_mut(root)
@@ -391,6 +558,65 @@ async fn run_project(
     result
 }
 
+async fn handle_search_request(
+    projects: &mut HashMap<PathBuf, ProjectState>,
+    request: SearchRequest,
+) -> SearchResponse {
+    let Some(state) = projects.get_mut(&request.project_root) else {
+        return SearchResponse::Unavailable {
+            reason: format!(
+                "project {} is not registered with the daemon",
+                request.project_root.display()
+            ),
+        };
+    };
+
+    let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
+    {
+        Ok(indexing_config) => indexing_config,
+        Err(err) => {
+            return SearchResponse::Unavailable {
+                reason: format!("failed to resolve search configuration: {err}"),
+            };
+        }
+    };
+
+    let conn = match state.db.connect() {
+        Ok(conn) => conn,
+        Err(err) => {
+            return SearchResponse::Unavailable {
+                reason: format!("failed to open search connection: {err}"),
+            };
+        }
+    };
+
+    if let Err(err) = schema::ensure_current(&conn).await {
+        return SearchResponse::Unavailable {
+            reason: format!("search index is unavailable: {err}"),
+        };
+    }
+
+    let status = state
+        .embedding_runtime
+        .prepare_for_search(indexing_config.embed_threads);
+    log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
+
+    let results = if status.is_available() {
+        let mut engine = HybridSearchEngine::new(&conn, state.embedding_runtime.current_embedder());
+        engine.search(&request.query, request.limit).await
+    } else {
+        let engine = HybridSearchEngine::new(&conn, None);
+        engine.fts_only_search(&request.query, request.limit).await
+    };
+
+    match results {
+        Ok(results) => SearchResponse::Results { results },
+        Err(err) => SearchResponse::Unavailable {
+            reason: format!("daemon search failed: {err}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,21 +624,28 @@ mod tests {
     #[test]
     fn run_state_collapses_bursts_into_follow_up() {
         let mut state = ProjectRunState::default();
-        state.mark_dirty(2);
-        state.mark_dirty(3);
+        state.mark_dirty(RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap());
+        state.mark_dirty(RunScope::from_paths([PathBuf::from("README.md")]).unwrap());
 
         assert!(state.dirty);
-        assert_eq!(state.pending_change_count, 5);
+        assert_eq!(
+            state.pending_scope,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+        );
 
         let pending = state.start_run();
-        assert_eq!(pending, 5);
+        assert_eq!(
+            pending,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+                .unwrap()
+        );
         assert!(state.running);
         assert!(!state.dirty);
-        assert_eq!(state.pending_change_count, 0);
+        assert!(state.pending_scope.is_none());
 
-        state.mark_dirty(4);
+        state.mark_dirty(RunScope::Full);
         assert!(state.dirty);
-        assert_eq!(state.pending_change_count, 4);
+        assert_eq!(state.pending_scope, Some(RunScope::Full));
 
         state.finish_run();
         assert!(!state.running);
@@ -440,10 +673,11 @@ mod tests {
                 project_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: true,
                     dirty: false,
-                    pending_change_count: 0,
+                    pending_scope: None,
                 },
             },
         );
@@ -453,28 +687,112 @@ mod tests {
                 project_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
             },
         );
 
-        let changed_paths = vec![
-            alpha_root.join("src").join("lib.rs"),
-            alpha_root.join("README.md"),
-            beta_root.join("src").join("mod.rs"),
-            tmp.path().join("outside.txt"),
-        ];
+        let changes = watcher::WatcherChanges {
+            file_paths: std::collections::BTreeSet::from([
+                alpha_root.join("src").join("lib.rs"),
+                alpha_root.join("README.md"),
+                beta_root.join("src").join("mod.rs"),
+                tmp.path().join("outside.txt"),
+            ]),
+            ambiguous_paths: std::collections::BTreeSet::new(),
+            has_unscoped_error: false,
+        };
 
-        mark_changed_projects(&mut projects, &changed_paths);
+        mark_changed_projects(&mut projects, &changes);
 
         let alpha = &projects.get(&alpha_root).unwrap().run_state;
         assert!(alpha.running);
         assert!(alpha.dirty);
-        assert_eq!(alpha.pending_change_count, 2);
+        assert_eq!(
+            alpha.pending_scope,
+            RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
+        );
 
         let beta = &projects.get(&beta_root).unwrap().run_state;
         assert!(!beta.running);
         assert!(beta.dirty);
-        assert_eq!(beta.pending_change_count, 1);
+        assert_eq!(
+            beta.pending_scope,
+            RunScope::from_paths([PathBuf::from("src/mod.rs")])
+        );
+    }
+
+    #[test]
+    fn mark_changed_projects_escalates_ambiguous_and_unscoped_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha_root = tmp.path().join("alpha");
+        let beta_root = tmp.path().join("beta");
+        std::fs::create_dir_all(alpha_root.join("src")).unwrap();
+        std::fs::create_dir_all(beta_root.join("src")).unwrap();
+
+        let alpha_db = Db::open_memory();
+        let beta_db = Db::open_memory();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let alpha_db = runtime.block_on(alpha_db).unwrap();
+        let beta_db = runtime.block_on(beta_db).unwrap();
+
+        let mut projects = HashMap::new();
+        projects.insert(
+            alpha_root.clone(),
+            ProjectState {
+                project_root: alpha_root.clone(),
+                db: alpha_db,
+                indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
+                run_state: ProjectRunState::default(),
+            },
+        );
+        projects.insert(
+            beta_root.clone(),
+            ProjectState {
+                project_root: beta_root.clone(),
+                db: beta_db,
+                indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
+                run_state: ProjectRunState::default(),
+            },
+        );
+
+        mark_changed_projects(
+            &mut projects,
+            &watcher::WatcherChanges {
+                file_paths: std::collections::BTreeSet::new(),
+                ambiguous_paths: std::collections::BTreeSet::from([alpha_root.join("src")]),
+                has_unscoped_error: false,
+            },
+        );
+        assert_eq!(
+            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
+        assert!(projects
+            .get(&beta_root)
+            .unwrap()
+            .run_state
+            .pending_scope
+            .is_none());
+
+        mark_changed_projects(
+            &mut projects,
+            &watcher::WatcherChanges {
+                file_paths: std::collections::BTreeSet::new(),
+                ambiguous_paths: std::collections::BTreeSet::new(),
+                has_unscoped_error: true,
+            },
+        );
+        assert_eq!(
+            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
+        assert_eq!(
+            projects.get(&beta_root).unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
     }
 
     #[test]
@@ -498,10 +816,13 @@ mod tests {
                 project_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
-                    pending_change_count: 1,
+                    pending_scope: Some(
+                        RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap(),
+                    ),
                 },
             },
         );
@@ -511,10 +832,13 @@ mod tests {
                 project_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
-                    pending_change_count: 1,
+                    pending_scope: Some(
+                        RunScope::from_paths([PathBuf::from("src/mod.rs")]).unwrap(),
+                    ),
                 },
             },
         );

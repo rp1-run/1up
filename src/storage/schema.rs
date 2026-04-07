@@ -10,28 +10,33 @@ const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segments"),
     ("table", "segment_vectors"),
+    ("table", "segment_symbols"),
     ("table", "segments_fts"),
     ("table", "meta"),
     ("index", "idx_segments_file_path"),
     ("index", "idx_segments_language"),
     ("index", "idx_segments_file_hash"),
     ("index", "idx_segment_vectors_embedding"),
+    ("index", "idx_segment_symbols_exact"),
+    ("index", "idx_segment_symbols_prefix"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
     ("trigger", "segments_vector_ad"),
+    ("trigger", "segments_symbol_ad"),
 ];
 
 /// Run all DDL statements to initialize the database schema.
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{}",
+        "{};{};{};{};{};{}",
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
         queries::CREATE_SEGMENT_VECTORS_TABLE,
+        queries::CREATE_SEGMENT_SYMBOLS_TABLE,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
@@ -39,6 +44,14 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
+
+    conn.execute_batch(&format!(
+        "{};{}",
+        queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
+        queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
+    ))
+    .await
+    .map_err(|e| StorageError::Migration(format!("failed to create symbol indexes: {e}")))?;
 
     // FTS5 virtual table and sync triggers
     conn.execute_batch(queries::CREATE_FTS_TABLE)
@@ -48,6 +61,10 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(queries::CREATE_FTS_TRIGGERS)
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create FTS triggers: {e}")))?;
+
+    conn.execute_batch(queries::CREATE_SEGMENT_SYMBOLS_TRIGGER)
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to create symbol triggers: {e}")))?;
 
     conn.execute(queries::CREATE_META_TABLE, ())
         .await
@@ -457,6 +474,22 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(schema_object_exists(&conn, "table", "segment_symbols")
+            .await
+            .unwrap());
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_symbols_exact")
+                .await
+                .unwrap()
+        );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_symbols_prefix")
+                .await
+                .unwrap()
+        );
+        assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
+            .await
+            .unwrap());
         assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
         ensure_current(&conn).await.unwrap();
     }
@@ -477,7 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v6_schema() {
+    async fn ensure_current_rejects_partial_v7_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(

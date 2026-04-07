@@ -3,7 +3,7 @@ use nanospinner::Spinner;
 
 use crate::cli::output::formatter_for;
 use crate::daemon::registry::Registry;
-use crate::indexer::embedder::{self, Embedder};
+use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::types::OutputFormat;
@@ -56,39 +56,36 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let model_spinner = spin("Loading embedding model");
 
-    let mut embedder_opt = if embedder::is_model_available() {
-        match Embedder::from_dir_with_threads(&config::model_dir()?, indexing_config.embed_threads)
-        {
-            Ok(e) => {
-                model_spinner.success();
-                Some(e)
-            }
-            Err(err) => {
-                model_spinner.warn_with(format!("Embedding model failed to load ({err})"));
-                None
-            }
+    let mut runtime = EmbeddingRuntime::default();
+    let status = runtime
+        .prepare_for_indexing(indexing_config.embed_threads)
+        .await;
+    match &status {
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {
+            model_spinner.success();
         }
-    } else if embedder::is_download_failed() {
-        model_spinner.warn_with("Embedding model unavailable (previous download failed)");
-        None
-    } else {
-        model_spinner.update("Downloading embedding model");
-        match Embedder::new_with_threads(indexing_config.embed_threads).await {
-            Ok(e) => {
-                model_spinner.success_with("Embedding model downloaded");
-                Some(e)
-            }
-            Err(err) => {
-                model_spinner.warn_with(format!("Model download failed ({err})"));
-                None
-            }
+        EmbeddingLoadStatus::Downloaded => {
+            model_spinner.success_with("Embedding model downloaded");
         }
-    };
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            model_spinner.warn_with("Embedding model unavailable (previous download failed)");
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            model_spinner.warn_with(format!("Model download failed ({err})"));
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
+            model_spinner.warn_with(format!("Embedding model failed to load ({err})"));
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            model_spinner.warn_with("Embedding model unavailable");
+        }
+    }
 
     let stats = pipeline::run_with_config(
         &conn,
         &project_root,
-        embedder_opt.as_mut(),
+        runtime.current_embedder(),
         &indexing_config,
     )
     .await?;

@@ -133,6 +133,69 @@ run_incremental_case() {
   require_index_work "incremental:$run_dir" "$output"
 }
 
+prepare_write_heavy_case() {
+  local source_dir="$1"
+  local run_dir="$2"
+  local oneup_bin="$3"
+  local jobs="$4"
+  local embed_threads="$5"
+
+  sync_repo "$source_dir" "$run_dir"
+  mkdir -p "$run_dir/write_heavy"
+
+  local idx
+  for idx in $(seq 1 24); do
+    cat > "$run_dir/write_heavy/file_${idx}.rs" <<EOF
+pub fn write_heavy_marker_${idx}() -> &'static str {
+    "write-heavy-initial-${idx}"
+}
+EOF
+  done
+
+  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  if [[ -n "$jobs" ]]; then
+    args+=(--jobs "$jobs")
+  fi
+  if [[ -n "$embed_threads" ]]; then
+    args+=(--embed-threads "$embed_threads")
+  fi
+
+  local output
+  output=$("${args[@]}")
+  require_index_work "prepare-write-heavy:$run_dir" "$output"
+
+  for idx in $(seq 1 24); do
+    cat > "$run_dir/write_heavy/file_${idx}.rs" <<EOF
+pub fn write_heavy_marker_${idx}() -> &'static str {
+    "write-heavy-updated-${idx}"
+}
+
+pub fn write_heavy_counter_${idx}() -> usize {
+    ${idx}
+}
+EOF
+  done
+}
+
+run_write_heavy_case() {
+  local run_dir="$1"
+  local oneup_bin="$2"
+  local jobs="$3"
+  local embed_threads="$4"
+
+  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  if [[ -n "$jobs" ]]; then
+    args+=(--jobs "$jobs")
+  fi
+  if [[ -n "$embed_threads" ]]; then
+    args+=(--embed-threads "$embed_threads")
+  fi
+
+  local output
+  output=$("${args[@]}")
+  require_index_work "write-heavy:$run_dir" "$output"
+}
+
 if [[ "${1:-}" == "__prepare_full_case" ]]; then
   shift
   prepare_full_case "$@"
@@ -154,6 +217,18 @@ fi
 if [[ "${1:-}" == "__run_incremental_case" ]]; then
   shift
   run_incremental_case "$@"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__prepare_write_heavy_case" ]]; then
+  shift
+  prepare_write_heavy_case "$@"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__run_write_heavy_case" ]]; then
+  shift
+  run_write_heavy_case "$@"
   exit 0
 fi
 
@@ -185,6 +260,7 @@ PRISTINE_DIR="$OUT_DIR/pristine"
 RUN_DIR_ROOT="$OUT_DIR/runs"
 FULL_JSON="$OUT_DIR/full-index.json"
 INCREMENTAL_JSON="$OUT_DIR/incremental-index.json"
+WRITE_HEAVY_JSON="$OUT_DIR/write-heavy-index.json"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 
 mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT"
@@ -223,12 +299,27 @@ hyperfine \
   --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
   "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
 
+log "benchmarking write-heavy incremental runs"
+hyperfine \
+  --export-json "$WRITE_HEAVY_JSON" \
+  --runs "$RUNS" \
+  --warmup "$WARMUP" \
+  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
+  "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
+
 SERIAL_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 0)")
 AUTO_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 1)")
 CONSTRAINED_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 2)")
 SERIAL_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 0)")
 AUTO_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 1)")
 CONSTRAINED_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 2)")
+SERIAL_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 0)")
+AUTO_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 1)")
+CONSTRAINED_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 2)")
 
 jq -n \
   --arg repo "$REPO" \
@@ -239,6 +330,9 @@ jq -n \
   --arg serial_incremental_ms "$SERIAL_INCREMENTAL_MS" \
   --arg auto_incremental_ms "$AUTO_INCREMENTAL_MS" \
   --arg constrained_incremental_ms "$CONSTRAINED_INCREMENTAL_MS" \
+  --arg serial_write_heavy_ms "$SERIAL_WRITE_HEAVY_MS" \
+  --arg auto_write_heavy_ms "$AUTO_WRITE_HEAVY_MS" \
+  --arg constrained_write_heavy_ms "$CONSTRAINED_WRITE_HEAVY_MS" \
   --argjson runs "$RUNS" \
   --argjson warmup "$WARMUP" \
   --argjson serial_jobs "$SERIAL_JOBS" \
@@ -259,6 +353,16 @@ jq -n \
       serial: ($serial_incremental_ms | tonumber),
       auto: ($auto_incremental_ms | tonumber),
       constrained: ($constrained_incremental_ms | tonumber)
+    },
+    scoped_follow_up_median_ms: {
+      serial: ($serial_incremental_ms | tonumber),
+      auto: ($auto_incremental_ms | tonumber),
+      constrained: ($constrained_incremental_ms | tonumber)
+    },
+    write_heavy_index_median_ms: {
+      serial: ($serial_write_heavy_ms | tonumber),
+      auto: ($auto_write_heavy_ms | tonumber),
+      constrained: ($constrained_write_heavy_ms | tonumber)
     },
     configs: {
       serial: {
@@ -281,5 +385,7 @@ printf 'Repository: %s\n' "$REPO"
 printf 'Output: %s\n' "$OUT_DIR"
 printf 'Full reindex median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_FULL_MS" "$AUTO_FULL_MS" "$CONSTRAINED_FULL_MS"
-printf 'Incremental index median ms: serial=%s auto=%s constrained=%s\n' \
+printf 'Scoped follow-up median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_INCREMENTAL_MS" "$AUTO_INCREMENTAL_MS" "$CONSTRAINED_INCREMENTAL_MS"
+printf 'Write-heavy median ms: serial=%s auto=%s constrained=%s\n' \
+  "$SERIAL_WRITE_HEAVY_MS" "$AUTO_WRITE_HEAVY_MS" "$CONSTRAINED_WRITE_HEAVY_MS"

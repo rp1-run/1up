@@ -35,8 +35,24 @@ CREATE TABLE IF NOT EXISTS segment_vectors (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 )";
 
+pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS segment_symbols (
+    segment_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    canonical_symbol TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (segment_id, canonical_symbol, reference_kind)
+)";
+
 pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec))";
+
+pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(canonical_symbol, reference_kind)";
+
+pub const CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_prefix ON segment_symbols(canonical_symbol)";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -60,6 +76,11 @@ CREATE TRIGGER IF NOT EXISTS segments_vector_ad AFTER DELETE ON segments BEGIN
     DELETE FROM segment_vectors WHERE segment_id = old.id;
 END";
 
+pub const CREATE_SEGMENT_SYMBOLS_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS segments_symbol_ad AFTER DELETE ON segments BEGIN
+    DELETE FROM segment_symbols WHERE segment_id = old.id;
+END";
+
 pub const CREATE_META_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -71,9 +92,13 @@ DROP TRIGGER IF EXISTS segments_ai;
 DROP TRIGGER IF EXISTS segments_ad;
 DROP TRIGGER IF EXISTS segments_au;
 DROP TRIGGER IF EXISTS segments_vector_ad;
+DROP TRIGGER IF EXISTS segments_symbol_ad;
 DROP TABLE IF EXISTS segments_fts;
 DROP INDEX IF EXISTS idx_segment_vectors_embedding;
+DROP INDEX IF EXISTS idx_segment_symbols_exact;
+DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP TABLE IF EXISTS segment_vectors;
+DROP TABLE IF EXISTS segment_symbols;
 DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
@@ -92,7 +117,7 @@ pub const SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN: &str =
 pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str = "SELECT 1 FROM segment_vectors LIMIT 1";
 
 pub const SELECT_VECTOR_CANDIDATES: &str = "
-SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
 FROM vector_top_k('idx_segment_vectors_embedding', vector(?1), ?2) AS v
@@ -100,7 +125,7 @@ JOIN segment_vectors AS sv ON sv.rowid = v.id
 JOIN segments AS s ON s.id = sv.segment_id";
 
 pub const SELECT_FTS_CANDIDATES: &str = "
-SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
 FROM segments_fts AS f
@@ -128,6 +153,16 @@ INSERT OR REPLACE INTO segment_vectors (
 )";
 
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
+
+pub const INSERT_SEGMENT_SYMBOL: &str = "
+INSERT OR REPLACE INTO segment_symbols (
+    segment_id, symbol, canonical_symbol, reference_kind, created_at
+) VALUES (
+    ?1, ?2, ?3, ?4, datetime('now')
+)";
+
+pub const DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID: &str =
+    "DELETE FROM segment_symbols WHERE segment_id = ?1";
 
 #[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
@@ -183,23 +218,37 @@ SELECT DISTINCT file_path FROM segments
 WHERE language = ?1
 ORDER BY file_path";
 
-pub const SELECT_SYMBOLS_BY_DEFINED: &str = "
-SELECT id, file_path, language, block_type, content,
-       line_start, line_end, breadcrumb, complexity, role,
-       defined_symbols, referenced_symbols, called_symbols, file_hash,
-       created_at, updated_at
-FROM segments
-WHERE defined_symbols LIKE '%' || ?1 || '%'
+pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
+       s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
+       s.created_at, s.updated_at, ss.symbol
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.reference_kind = ?1
+  AND ss.canonical_symbol = ?2
 ORDER BY
-  CASE WHEN block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
-  file_path";
+  CASE WHEN s.block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
+  s.file_path,
+  s.line_start,
+  ss.symbol";
 
-pub const SELECT_SYMBOLS_BY_REFERENCED: &str = "
-SELECT id, file_path, language, block_type, content,
-       line_start, line_end, breadcrumb, complexity, role,
-       defined_symbols, referenced_symbols, called_symbols, file_hash,
-       created_at, updated_at
-FROM segments
-WHERE referenced_symbols LIKE '%' || ?1 || '%'
-  AND defined_symbols NOT LIKE '%\"' || ?1 || '\"%'
-ORDER BY file_path, line_start";
+pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX: &str = "
+SELECT DISTINCT canonical_symbol
+FROM segment_symbols
+WHERE reference_kind = ?1
+  AND canonical_symbol LIKE ?2 || '%'
+ORDER BY LENGTH(canonical_symbol), canonical_symbol
+LIMIT ?3";
+
+pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS: &str = "
+SELECT DISTINCT canonical_symbol
+FROM segment_symbols
+WHERE reference_kind = ?1
+  AND canonical_symbol LIKE '%' || ?2 || '%'
+ORDER BY
+  CASE WHEN canonical_symbol LIKE ?2 || '%' THEN 0 ELSE 1 END,
+  ABS(LENGTH(canonical_symbol) - LENGTH(?2)),
+  LENGTH(canonical_symbol),
+  canonical_symbol
+LIMIT ?3";

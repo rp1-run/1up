@@ -1,12 +1,24 @@
+use std::collections::HashSet;
+
 use libsql::Connection;
 
+use crate::search::retrieval::CandidateRow;
 use crate::shared::errors::{OneupError, SearchError};
+use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::{ReferenceKind, SymbolResult};
 use crate::storage::queries;
 use crate::storage::segments::row_to_stored_segment;
 
+const SYMBOL_FALLBACK_CANONICAL_LIMIT: i64 = 32;
+const SYMBOL_PREFIX_SEED_LEN: usize = 3;
+
 pub struct SymbolSearchEngine<'a> {
     conn: &'a Connection,
+}
+
+struct SymbolMatch {
+    segment_id: String,
+    result: SymbolResult,
 }
 
 impl<'a> SymbolSearchEngine<'a> {
@@ -14,17 +26,97 @@ impl<'a> SymbolSearchEngine<'a> {
         Self { conn }
     }
 
-    /// Find symbol definitions matching the given name.
-    /// Uses LIKE pattern matching on the defined_symbols JSON column,
-    /// with post-query filtering for exact or fuzzy matches.
     pub async fn find_definitions(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
+        Ok(self
+            .find_matches(name, ReferenceKind::Definition)
+            .await?
+            .into_iter()
+            .map(|symbol_match| symbol_match.result)
+            .collect())
+    }
+
+    pub async fn find_references(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
+        Ok(self
+            .find_reference_matches(name)
+            .await?
+            .into_iter()
+            .map(|symbol_match| symbol_match.result)
+            .collect())
+    }
+
+    pub(crate) async fn find_definition_candidates(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        Ok(self
+            .find_matches(name, ReferenceKind::Definition)
+            .await?
+            .into_iter()
+            .map(candidate_from_symbol_match)
+            .collect())
+    }
+
+    pub(crate) async fn find_reference_candidates(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        Ok(self
+            .find_reference_matches(name)
+            .await?
+            .into_iter()
+            .map(candidate_from_symbol_match)
+            .collect())
+    }
+
+    async fn find_matches(
+        &self,
+        query: &str,
+        reference_kind: ReferenceKind,
+    ) -> Result<Vec<SymbolMatch>, OneupError> {
+        let canonical_query = normalize_symbolish(query);
+        if canonical_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let exact = self.load_matches(reference_kind, &canonical_query).await?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+
+        let fallback_canonicals = self
+            .load_fallback_canonicals(reference_kind, &canonical_query)
+            .await?;
+        let matching_canonicals = find_matching_symbols(&fallback_canonicals, &canonical_query);
+
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+
+        for canonical_symbol in matching_canonicals {
+            for symbol_match in self.load_matches(reference_kind, &canonical_symbol).await? {
+                let dedupe_key =
+                    format!("{}:{}", symbol_match.segment_id, symbol_match.result.name);
+                if seen.insert(dedupe_key) {
+                    results.push(symbol_match);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn load_matches(
+        &self,
+        reference_kind: ReferenceKind,
+        canonical_symbol: &str,
+    ) -> Result<Vec<SymbolMatch>, OneupError> {
         let mut rows = self
             .conn
-            .query(queries::SELECT_SYMBOLS_BY_DEFINED, [name])
+            .query(
+                queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL,
+                libsql::params![reference_kind_label(reference_kind), canonical_symbol],
+            )
             .await
-            .map_err(|e| {
-                SearchError::QueryFailed(format!("symbol definition query failed: {e}"))
-            })?;
+            .map_err(|e| SearchError::QueryFailed(format!("symbol lookup failed: {e}")))?;
 
         let mut results = Vec::new();
         while let Some(row) = rows
@@ -33,10 +125,12 @@ impl<'a> SymbolSearchEngine<'a> {
             .map_err(|e| SearchError::QueryFailed(format!("row iteration failed: {e}")))?
         {
             let seg = row_to_stored_segment(&row)?;
-            let defined = seg.parsed_defined_symbols();
-            let matching = find_matching_symbols(&defined, name);
-            for matched_name in matching {
-                results.push(SymbolResult {
+            let matched_name: String = row
+                .get(16)
+                .map_err(|e| SearchError::QueryFailed(format!("read symbol row failed: {e}")))?;
+            results.push(SymbolMatch {
+                segment_id: seg.id.clone(),
+                result: SymbolResult {
                     name: matched_name,
                     kind: seg.block_type.clone(),
                     file_path: seg.file_path.clone(),
@@ -44,57 +138,106 @@ impl<'a> SymbolSearchEngine<'a> {
                     line_start: seg.line_start as usize,
                     line_end: seg.line_end as usize,
                     content: seg.content.clone(),
-                    reference_kind: ReferenceKind::Definition,
+                    reference_kind,
                     breadcrumb: seg.breadcrumb.clone(),
                     complexity: Some(seg.complexity as u32),
                     role: Some(seg.parsed_role()),
                     defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
                     referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
                     called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
-                });
-            }
+                },
+            });
         }
+
         Ok(results)
     }
 
-    /// Find both definitions and usages of a symbol.
-    /// Definitions come from defined_symbols, usages from referenced_symbols.
-    pub async fn find_references(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
-        let mut results = self.find_definitions(name).await?;
+    async fn load_fallback_canonicals(
+        &self,
+        reference_kind: ReferenceKind,
+        canonical_query: &str,
+    ) -> Result<Vec<String>, OneupError> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        let prefix_seed = prefix_seed(canonical_query);
 
+        for value in self
+            .load_canonical_rows(
+                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX,
+                reference_kind,
+                &prefix_seed,
+            )
+            .await?
+        {
+            if seen.insert(value.clone()) {
+                candidates.push(value);
+            }
+        }
+
+        for value in self
+            .load_canonical_rows(
+                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS,
+                reference_kind,
+                canonical_query,
+            )
+            .await?
+        {
+            if seen.insert(value.clone()) {
+                candidates.push(value);
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    async fn load_canonical_rows(
+        &self,
+        query: &str,
+        reference_kind: ReferenceKind,
+        value: &str,
+    ) -> Result<Vec<String>, OneupError> {
         let mut rows = self
             .conn
-            .query(queries::SELECT_SYMBOLS_BY_REFERENCED, [name])
+            .query(
+                query,
+                libsql::params![
+                    reference_kind_label(reference_kind),
+                    value,
+                    SYMBOL_FALLBACK_CANONICAL_LIMIT,
+                ],
+            )
             .await
-            .map_err(|e| SearchError::QueryFailed(format!("symbol reference query failed: {e}")))?;
+            .map_err(|e| SearchError::QueryFailed(format!("symbol fallback query failed: {e}")))?;
 
+        let mut results = Vec::new();
         while let Some(row) = rows
             .next()
             .await
             .map_err(|e| SearchError::QueryFailed(format!("row iteration failed: {e}")))?
         {
-            let seg = row_to_stored_segment(&row)?;
-            let referenced = seg.parsed_referenced_symbols();
-            let matching = find_matching_symbols(&referenced, name);
-            for matched_name in matching {
-                results.push(SymbolResult {
-                    name: matched_name,
-                    kind: seg.block_type.clone(),
-                    file_path: seg.file_path.clone(),
-                    language: seg.language.clone(),
-                    line_start: seg.line_start as usize,
-                    line_end: seg.line_end as usize,
-                    content: seg.content.clone(),
-                    reference_kind: ReferenceKind::Usage,
-                    breadcrumb: seg.breadcrumb.clone(),
-                    complexity: Some(seg.complexity as u32),
-                    role: Some(seg.parsed_role()),
-                    defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
-                    referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
-                    called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
-                });
+            results.push(row.get(0).map_err(|e| {
+                SearchError::QueryFailed(format!("read canonical symbol failed: {e}"))
+            })?);
+        }
+
+        Ok(results)
+    }
+
+    async fn find_reference_matches(&self, name: &str) -> Result<Vec<SymbolMatch>, OneupError> {
+        let definitions = self.find_matches(name, ReferenceKind::Definition).await?;
+        let definition_ids: HashSet<String> = definitions
+            .iter()
+            .map(|symbol_match| symbol_match.segment_id.clone())
+            .collect();
+
+        let mut results = definitions;
+        let usages = self.find_matches(name, ReferenceKind::Usage).await?;
+        for usage in usages {
+            if !definition_ids.contains(&usage.segment_id) {
+                results.push(usage);
             }
         }
+
         Ok(results)
     }
 }
@@ -107,21 +250,35 @@ fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-/// Find symbols in the list that match the query name.
-/// Supports exact match and fuzzy/partial matching via Levenshtein distance.
+fn reference_kind_label(reference_kind: ReferenceKind) -> &'static str {
+    match reference_kind {
+        ReferenceKind::Definition => "definition",
+        ReferenceKind::Usage => "usage",
+    }
+}
+
+fn prefix_seed(canonical_query: &str) -> String {
+    canonical_query
+        .chars()
+        .take(SYMBOL_PREFIX_SEED_LEN)
+        .collect()
+}
+
 fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
-    let query_lower = query.to_lowercase();
+    let canonical_query = normalize_symbolish(query);
     let mut exact = Vec::new();
     let mut partial = Vec::new();
 
-    for sym in symbols {
-        let sym_lower = sym.to_lowercase();
-        if sym_lower == query_lower {
-            exact.push(sym.clone());
-        } else if sym_lower.contains(&query_lower)
-            || levenshtein(&sym_lower, &query_lower) <= max_edit_distance(query)
+    for symbol in symbols {
+        let canonical_symbol = normalize_symbolish(symbol);
+        if canonical_symbol == canonical_query {
+            exact.push(symbol.clone());
+        } else if canonical_symbol.contains(&canonical_query)
+            || canonical_query.contains(&canonical_symbol)
+            || levenshtein(&canonical_symbol, &canonical_query)
+                <= max_edit_distance(&canonical_query)
         {
-            partial.push(sym.clone());
+            partial.push(symbol.clone());
         }
     }
 
@@ -132,8 +289,23 @@ fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
     }
 }
 
-/// Compute the maximum allowed edit distance for fuzzy matching.
-/// Short names allow 1 edit; longer names allow 2.
+fn candidate_from_symbol_match(symbol_match: SymbolMatch) -> CandidateRow {
+    CandidateRow {
+        segment_id: symbol_match.segment_id,
+        file_path: symbol_match.result.file_path,
+        language: symbol_match.result.language,
+        block_type: symbol_match.result.kind,
+        line_number: symbol_match.result.line_start,
+        line_end: symbol_match.result.line_end,
+        breadcrumb: symbol_match.result.breadcrumb,
+        complexity: symbol_match.result.complexity,
+        role: symbol_match.result.role,
+        defined_symbols: symbol_match.result.defined_symbols,
+        referenced_symbols: symbol_match.result.referenced_symbols,
+        called_symbols: symbol_match.result.called_symbols,
+    }
+}
+
 fn max_edit_distance(query: &str) -> usize {
     if query.len() <= 4 {
         1
@@ -142,7 +314,6 @@ fn max_edit_distance(query: &str) -> usize {
     }
 }
 
-/// Compute Levenshtein edit distance between two strings.
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -228,6 +399,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_canonical_definition() {
+        let (_db, conn) = setup().await;
+
+        let seg = make_segment("s1", "src/lib.rs", "struct", r#"["ConfigLoader"]"#, "[]");
+        segments::upsert_segment(&conn, &seg).await.unwrap();
+
+        let engine = SymbolSearchEngine::new(&conn);
+        let results = engine.find_definitions("config_loader").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "ConfigLoader");
+    }
+
+    #[tokio::test]
     async fn find_partial_definition() {
         let (_db, conn) = setup().await;
 
@@ -258,7 +442,6 @@ mod tests {
         let engine = SymbolSearchEngine::new(&conn);
         let results = engine.find_definitions("Config").await.unwrap();
         assert_eq!(results.len(), 2);
-        // struct is in the priority group (CASE 0), module is not (CASE 1)
         assert_eq!(results[0].kind, "struct");
         assert_eq!(results[1].kind, "module");
     }

@@ -1,14 +1,14 @@
 # Module & Component Breakdown
 
 **Project**: 1up
-**Analysis Date**: 2026-04-04
-**Modules Analyzed**: 8
+**Analysis Date**: 2026-04-07
+**Modules Analyzed**: 9
 
 ## Core Modules
 
 ### CLI (`src/cli/`)
 **Purpose**: User-facing command parsing and output formatting via clap derive
-**Files**: 12 | **Lines**: ~1,535
+**Files**: 13 | **Lines**: ~1,658
 
 **Components**:
 - **Cli** (`mod.rs`): Top-level CLI struct with `Command` enum dispatch, global `--format` (default plain) and `--verbose` flags, `parse_positive_usize` validator for concurrency flags
@@ -25,28 +25,28 @@
 
 ### Search (`src/search/`)
 **Purpose**: Search engines: hybrid semantic+FTS, symbol lookup, structural AST queries, and context retrieval
-**Files**: 9 | **Lines**: ~2,993
+**Files**: 9 | **Lines**: ~3,191
 
 **Components**:
-- **HybridSearchEngine** (`hybrid.rs`): Orchestrates multi-signal search with RRF fusion; builds symbol name variants; degrades to FTS-only when embedder unavailable
-- **RetrievalBackend** (`retrieval.rs`): Backend selection (SqlVectorV2 or FtsOnly) based on index state; auto-detects embedded embeddings
-- **SymbolSearchEngine** (`symbol.rs`): Definition and reference lookup via SQL LIKE with Levenshtein fuzzy matching
+- **HybridSearchEngine** (`hybrid.rs`): Shared execution path for local CLI and daemon-backed search; builds symbol variants, embeds queries when available, executes candidate-first fusion, and degrades per query to FTS-only when embedding/vector work fails
+- **RetrievalBackend** (`retrieval.rs`): Backend selection (SqlVectorV2 or FtsOnly) based on index state; fetches vector and FTS `CandidateRow` sets first, then leaves segment hydration until after ranking
+- **SymbolSearchEngine** (`symbol.rs`): Exact-first definition and reference lookup over canonicalized symbols stored in `segment_symbols`; prefix/contains fallback seeds fuzzy matching only when exact lookup misses
 - **ContextEngine** (`context.rs`): Source context retrieval using tree-sitter scope detection with line-range fallback
 - **StructuralSearchEngine** (`structural.rs`): Tree-sitter S-expression queries across indexed files; fallback to directory scan
 - **IntentDetector** (`intent.rs`): Signal-based query classification into Definition, Flow, Usage, Docs, General
-- **Ranking** (`ranking.rs`): RRF fusion, intent-aware boosting using query string, path penalties, per-file caps
+- **Ranking** (`ranking.rs`): RRF fusion plus intent/query/path/content boosts, short-segment penalties, overlap dedup, and per-file caps before final hydration
 - **Formatter** (`formatter.rs`): Search result formatting utilities
 
 **Dependencies**: storage, indexer (parser, scanner), shared
 
 ### Indexer (`src/indexer/`)
 **Purpose**: Bounded staged indexing: scan, parse, embed, and single-writer persistence
-**Files**: 6 | **Lines**: ~5,033
+**Files**: 6 | **Lines**: ~5,784
 
 **Components**:
-- **Pipeline** (`pipeline.rs`): Config-aware orchestrator accepting `IndexingConfig` for jobs/embed_threads/write_batch_files; hash preload, deleted-file cleanup, bounded `spawn_blocking` parse workers with sequence IDs, `BTreeMap` reorder buffer, batched embedding through single ONNX session, transactional file replacement, `TimingAccumulator` for per-stage metrics, persisted `IndexProgress`/`IndexParallelism`/`IndexStageTimings` to `.1up/index_status.json`
+- **Pipeline** (`pipeline.rs`): Config-aware orchestrator accepting `IndexingConfig` for jobs/embed_threads/write_batch_files plus `RunScope`; prepares scoped or full run inputs, falls back safely when watcher paths affect ignore semantics, uses bounded `spawn_blocking` parse workers with sequence IDs, flushes through a `BTreeMap` reorder buffer, batches embeddings through one ONNX session, and persists `IndexProgress`/`IndexParallelism`/`IndexStageTimings` to `.1up/index_status.json`
 - **Parser** (`parser.rs`): Multi-language AST parsing via tree-sitter; 16 language grammars; role classification and symbol collection
-- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with configurable intra-op `embed_threads`, auto-download, batch inference, mean pooling, L2 normalization
+- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with configurable intra-op `embed_threads`, auto-download, batch inference, mean pooling, L2 normalization, and warm runtime reuse keyed by model fingerprints plus thread count
 - **Scanner** (`scanner.rs`): Directory walking via ignore crate with .gitignore respect and binary filtering
 - **Chunker** (`chunker.rs`): Sliding-window text chunking (60-line window, 10-line overlap) for unsupported languages flushed through the same staged pipeline
 
@@ -54,31 +54,32 @@
 
 ### Storage (`src/storage/`)
 **Purpose**: Database access layer using libSQL with FTS5, vector indexing, and transactional file replacement helpers
-**Files**: 5 | **Lines**: ~1,425
+**Files**: 5 | **Lines**: ~1,999
 
 **Components**:
 - **Db** (`db.rs`): Database connection wrapper with `open_rw`/`open_ro`/`open_memory` constructors, lock retry
-- **Schema** (`schema.rs`): Schema initialization, validation, and rebuild with recovery guidance
-- **Segments** (`segments.rs`): Segment CRUD, bulk file-hash preload, deleted-file cleanup, and single-file or multi-file transactional replacement helpers with configurable batch size
-- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, meta, bulk hash preload, and vector retrieval
+- **Schema** (`schema.rs`): Schema initialization, validation, vector-model compatibility checks, and rebuild with recovery guidance for schema v7
+- **Segments** (`segments.rs`): Segment CRUD, bulk file-hash preload, deleted-file cleanup, transactional replacement helpers with configurable batch size, and maintenance of canonical symbol rows in `segment_symbols`
+- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, `segment_symbols`, meta, bulk hash preload, and candidate-first vector/FTS retrieval
 
 **Dependencies**: shared
 
 ### Daemon (`src/daemon/`)
-**Purpose**: Background daemon for file watching, non-overlapping incremental re-indexing, and persisted per-project indexing settings
-**Files**: 5 | **Lines**: ~1,167
+**Purpose**: Background daemon for file watching, scoped incremental re-indexing, daemon-backed search, and persisted per-project indexing settings
+**Files**: 6 | **Lines**: ~1,775
 
 **Components**:
-- **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project `ProjectRunState` (one active + one queued via dirty flag), burst-collapsing follow-up scheduling, SIGHUP reload of registry and settings, shared config resolution before dispatch into `run_with_config`
+- **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project `ProjectRunState` (one active + one queued via dirty flag), scoped `RunScope::Paths` scheduling, burst-collapsing follow-up scheduling, shared config resolution, daemon search handling, and a warm `EmbeddingRuntime` cache per project
 - **Lifecycle** (`lifecycle.rs`): Start/stop/ensure daemon with PID management, stale detection, and SIGHUP signaling
 - **Watcher** (`watcher.rs`): Filesystem event monitoring via notify crate with debounce and non-blocking drain support
 - **Registry** (`registry.rs`): Project registration with optional persisted `IndexingConfig` in JSON-based project list
+- **Search Service** (`search_service.rs`): Unix domain socket transport for `SearchRequest`/`SearchResponse`; bind/accept/connect helpers plus graceful unavailable responses so CLI search can fall back locally
 
-**Dependencies**: indexer, storage, shared
+**Dependencies**: indexer, search, storage, shared
 
 ### Shared (`src/shared/`)
 **Purpose**: Cross-cutting types, config resolution, constants, error types, and project utilities
-**Files**: 6 | **Lines**: ~875
+**Files**: 7 | **Lines**: ~1,001
 
 **Components**:
 - **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, `IndexingConfig` (with `from_sources` resolution and validation), `IndexProgress`, `IndexParallelism`, `IndexStageTimings`, `IndexState`, `IndexPhase`, OutputFormat, SegmentRole, ReferenceKind
@@ -92,17 +93,19 @@
 ## Support Modules
 
 ### Tests (`tests/`)
-**Files**: 3 | **Lines**: ~1,598
-- `integration_tests.rs`: End-to-end pipeline and search tests with parallel parity tests (jobs=1 vs auto)
-- `cli_tests.rs`: CLI subcommand tests via assert_cmd including concurrency flag validation
-- `rewrite_sql_verification.rs`: SQL schema verification
+**Files**: 3 | **Lines**: ~1,947
+- `integration_tests.rs`: End-to-end pipeline and search tests, including exact/canonical/reference symbol acceptance and incremental freshness checks
+- `cli_tests.rs`: CLI subcommand tests via assert_cmd including concurrency flag validation, daemon lifecycle behaviors, and degraded search coverage
+- `rewrite_sql_verification.rs`: Schema rebuild guidance plus add/edit/delete search freshness under degraded FTS-only indexing
 
 ### Benchmarks (`benches/`)
-**Files**: 1 | **Lines**: ~400
-- `search_bench.rs`: Criterion benchmarks for symbol lookup, FTS, retrieval backends
+**Files**: 1 | **Lines**: ~482
+- `search_bench.rs`: Criterion benchmarks for exact/partial symbol lookup, chunked-content retrieval, candidate-first backend selection, and hybrid fusion
 
 ### Scripts (`scripts/`)
-- `benchmark_parallel_indexing.sh`: Parallel indexing performance benchmarks via hyperfine (serial/auto/constrained), exposed as `just bench-parallel`
+- `benchmark_parallel_indexing.sh`: Hyperfine benchmarks for full reindex, scoped follow-up, and write-heavy follow-up indexing; emits JSON summaries and median rollups
+- `benchmark_builderbot.sh`: Snapshot-based `1up` vs `osgrep` comparison for clean indexing, warm search queries, and symbol lookup when structural-language coverage is high enough
+- `benchmark_rewrite_sql.sh`: Baseline-vs-candidate benchmark evidence generator for SQL rewrite work
 
 ## Module Dependencies
 
@@ -113,6 +116,7 @@ graph TD
     CLI --> Storage[storage]
     CLI --> Daemon[daemon]
     CLI --> Shared[shared]
+    Daemon --> Search
     Search --> Storage
     Search --> Indexer
     Search --> Shared
@@ -128,21 +132,27 @@ graph TD
 
 | Module | Files | Lines | Components | Avg File Size |
 |--------|-------|-------|------------|---------------|
-| cli | 12 | 1,535 | 9 | 128 |
-| search | 9 | 2,993 | 8 | 333 |
-| indexer | 6 | 5,033 | 5 | 839 |
-| storage | 5 | 1,425 | 4 | 285 |
-| daemon | 5 | 1,167 | 4 | 233 |
-| shared | 6 | 875 | 5 | 146 |
-| tests | 3 | 1,598 | 3 | 533 |
-| benches | 1 | 400 | 1 | 400 |
+| cli | 13 | 1,658 | 9 | 128 |
+| search | 9 | 3,191 | 8 | 355 |
+| indexer | 6 | 5,784 | 5 | 964 |
+| storage | 5 | 1,999 | 4 | 400 |
+| daemon | 6 | 1,775 | 5 | 296 |
+| shared | 7 | 1,001 | 5 | 143 |
+| tests | 3 | 1,947 | 3 | 649 |
+| benches | 1 | 482 | 1 | 482 |
+| scripts | 3 | 1,244 | 3 | 415 |
 
 ## Cross-Module Patterns
 
 - **Layered Architecture**: CLI -> Search/Indexer -> Storage -> Shared; strict dependency hierarchy
-- **Staged Pipeline with Bounded Parallelism**: Pipeline uses bounded spawn_blocking parse workers, sequence-ID reorder buffer, single embed session, transactional writer
+- **Scoped Follow-Up Indexing**: Daemon watcher events become `RunScope::Paths`; the indexer scans only changed files/deletions unless safety rules force a full scan
+- **Staged Pipeline with Bounded Parallelism**: Pipeline uses bounded spawn_blocking parse workers, sequence-ID reorder buffer, single embed session, and transactional writer
+- **Adaptive Writer Batching**: `write_batch_files` scales with configured jobs but is capped to the amount of work ready for each run
 - **Layered Config Resolution**: IndexingConfig resolved via priority chain: CLI flags > env vars > registry > computed defaults
 - **Progress Persistence**: Pipeline persists IndexProgress to `.1up/index_status.json` at phase transitions; status reads them back
+- **Daemon-Backed Warm Search Reuse**: CLI search prefers daemon socket requests so repeated searches can reuse the daemon's warm embedding runtime
+- **Exact-First Symbol Retrieval**: Storage persists canonical symbol rows and search only widens into prefix/contains/fuzzy matching after exact misses
+- **Candidate-First Hybrid Retrieval**: Search ranks vector/FTS/symbol candidates before hydrating final segment bodies by ID
 - **Graceful Degradation**: Missing embedder degrades hybrid search to FTS-only with user warnings
 - **Auto-Start Daemon**: Search commands auto-start daemon via `lifecycle::ensure_daemon()`; start auto-inits project if needed
 - **SIGHUP Reload**: Daemon handles SIGHUP to reload registry and per-project settings without restart

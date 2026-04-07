@@ -1,7 +1,7 @@
 # Implementation Patterns
 
 **Project**: 1up
-**Last Updated**: 2026-04-04
+**Last Updated**: 2026-04-07
 
 ## Naming & Organization
 
@@ -50,20 +50,22 @@ Evidence: `src/indexer/pipeline.rs:20-45`, `src/cli/output.rs`, `src/daemon/work
 
 ## Testing Idioms
 
-**Organization**: Unit tests in `#[cfg(test)]` within source files; integration tests in `tests/`; manual performance workflow in `scripts/benchmark_parallel_indexing.sh` exposed as `just bench-parallel`
-**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem and repo-copy tests; helper builders (`make_result`, `test_segment`, `make_segment`); RAII guards for env vars (`EnvGuard` with Drop restore) and model hiding (`HideModelGuard` with rename/restore)
-**Levels**: Unit-dominant with edge case coverage; integration via assert_cmd; parity tests compare `jobs=1` and parallel incremental runs; model-dependent tests guard on `is_model_available()`
-**Patterns**: `#[tokio::test]` for async; descriptive regression names; storage helper tests validate transactional rollback; CLI coverage validates concurrency flags and help text; static Mutex for shared resources (env vars, model files) in tests
+**Organization**: Unit tests live in `#[cfg(test)]` blocks inside modules; integration tests live in `tests/`; Criterion performance coverage lives in `benches/search_bench.rs`; repo-scale benchmark scripts live in `scripts/`
+**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem, snapshot, and daemon-socket tests; helper builders (`make_result`, `test_segment`, `make_segment`); acceptance fixtures that create multi-language corpora; RAII guards for env vars (`EnvGuard`) and model visibility (`HideModelGuard`)
+**Levels**: Unit coverage for config resolution, warm embedding reuse, daemon search socket transport, ranking, and storage symbol rows; integration coverage for exact/canonical/reference symbol lookup, scoped-run planning/fallback, schema rebuild guidance, and add/edit/delete freshness; benchmark coverage for candidate-first retrieval and real-repo warm-query workloads
+**Patterns**: `#[tokio::test]` for async; descriptive regression names; parity tests compare `jobs=1` and parallel incremental runs; scoped-index tests assert safe fallback to full scans; daemon request tests treat unavailability as a fallback path instead of a fatal error; benchmark scripts verify that indexing actually performed work before accepting timings
 
-Evidence: `src/shared/config.rs:104-217`, `tests/cli_tests.rs`, `src/indexer/pipeline.rs`, `scripts/benchmark_parallel_indexing.sh`
+Evidence: `src/shared/config.rs`, `src/indexer/embedder.rs`, `src/indexer/pipeline.rs`, `src/daemon/search_service.rs`, `tests/integration_tests.rs`, `tests/cli_tests.rs`, `benches/search_bench.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_builderbot.sh`
 
 ## I/O & Integration
 
-**Database**: libsql via `Db` wrapper with `open_rw`/`open_ro`/`open_memory`; SQL as `pub const &str` in `storage/queries.rs`; async row iteration with column extraction by index; schema versioning via meta table; transactional batch writes via `replace_file_batch_tx` with configurable batch size
+**Database**: libsql via `Db` wrapper with `open_rw`/`open_ro`/`open_memory`; SQL as `pub const &str` in `storage/queries.rs`; async row iteration with column extraction by index; schema versioning via meta table; transactional batch writes via `replace_file_batch_tx`; `segment_symbols` stores raw + canonical symbols so search can do exact-first lookup before broader fallback queries
+**IPC**: Daemon-backed search uses JSON `SearchRequest`/`SearchResponse` messages over a Unix domain socket at `~/.local/share/1up/daemon.sock`; CLI search times out quickly and falls back to local execution instead of blocking on daemon availability
 **HTTP Clients**: reqwest for model downloads with streaming byte transfer; no retry for HTTP (only DB lock contention)
-**File I/O**: ignore crate (WalkBuilder) for gitignore-aware scanning; SHA-256 hashing for incremental detection; `std::fs` for synchronous reads in parser/context
+**File I/O**: ignore crate (WalkBuilder) for gitignore-aware scanning; `scan_directory` for full runs and `scan_paths` for scoped follow-ups; SHA-256 hashing for incremental detection; full-scan fallback when ignore-control files or excluded paths change; `std::fs` for synchronous reads in parser/context and search fallback
+**Benchmark Tooling**: hyperfine + jq + rsync/git snapshots in `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_builderbot.sh`, and `scripts/benchmark_rewrite_sql.sh`
 
-Evidence: `src/storage/queries.rs`, `src/indexer/scanner.rs:62-110`, `src/indexer/pipeline.rs:368-392`
+Evidence: `src/storage/queries.rs`, `src/storage/segments.rs`, `src/daemon/search_service.rs`, `src/indexer/scanner.rs`, `src/indexer/pipeline.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_builderbot.sh`
 
 ## Concurrency & Async
 
