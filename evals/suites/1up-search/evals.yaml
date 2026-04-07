@@ -1,0 +1,181 @@
+description: "1up search evaluation: 1up vs baseline comparison"
+
+evaluateOptions:
+  maxConcurrency: 1
+
+prompts:
+  - id: file://prompt-1up.txt
+    label: 1up
+  - id: file://prompt-baseline.txt
+    label: baseline
+
+providers:
+  - id: anthropic:claude-agent-sdk
+    label: 1up-agent
+    prompts: [1up]
+    config:
+      model: haiku
+      betas:
+        - fast-mode-2026-02-01
+      permission_mode: bypassPermissions
+      allow_dangerously_skip_permissions: true
+      max_turns: 100
+      custom_allowed_tools: [Bash, Read]
+
+  - id: anthropic:claude-agent-sdk
+    label: baseline-agent
+    prompts: [baseline]
+    config:
+      model: haiku
+      betas:
+        - fast-mode-2026-02-01
+      permission_mode: bypassPermissions
+      allow_dangerously_skip_permissions: true
+      max_turns: 100
+      custom_allowed_tools: [Bash, Read, Glob, Grep]
+
+defaultTest:
+  options:
+    provider:
+      id: anthropic:claude-haiku-4-5-20251001
+      config:
+        temperature: 0
+
+extensions:
+  - file://../shared/extension.ts:default
+
+tests:
+  - description: Search Stack
+    vars:
+      TASK_PROMPT: >
+        Trace how emdash content search is enabled and queried, from a field
+        becoming searchable through to admin search results. Identify the key
+        files involved in each step.
+      EXPECTED_FILES: fts-manager.ts,query.ts,AdminCommandPalette.tsx
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: The correct search flow in emdash is: (1) FTSManager in
+          fts-manager.ts creates FTS5 virtual tables and triggers, (2) query.ts
+          runs FTS5 MATCH queries via searchSingleCollection(), (3)
+          AdminCommandPalette.tsx is the admin search UI. Score 1.0 if the
+          answer correctly names these key files and their roles. Score 0.5
+          if some are correct but others wrong or missing. Score 0.0 if
+          fundamentally wrong. Judge only factual correctness, not format
+          or length.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should cover these stages: (a) fields
+          marked searchable, (b) FTS indexing, (c) query execution, (d)
+          admin UI. Score 1.0 if all four stages are mentioned, 0.75 if
+          three, 0.5 if two, 0.25 if one. Judge only coverage, not format
+          or length.
+
+  - description: WordPress Import
+    vars:
+      TASK_PROMPT: >
+        Explain the WordPress import pipeline from the admin wizard through
+        schema preparation, WXR execution, and Gutenberg-to-Portable-Text
+        conversion. Identify the key files involved in each step.
+      EXPECTED_FILES: WordPressImport.tsx,prepare.ts,execute.ts,gutenberg-to-portable-text/src/index.ts
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: The correct WordPress import flow is: (1) WordPressImport.tsx
+          is the admin wizard UI, (2) prepare.ts handles schema preparation
+          creating collections and fields, (3) execute.ts parses WXR and
+          imports content, (4) gutenberg-to-portable-text/src/index.ts converts
+          Gutenberg blocks to Portable Text. Score 1.0 if all four are correctly
+          described, 0.5 if partially correct, 0.0 if fundamentally wrong.
+          Judge only factual correctness, not format or length.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should cover: (a) admin wizard UI,
+          (b) schema preparation, (c) WXR parsing/execution, (d) content
+          format conversion. Score 1.0 if all four, 0.75 if three, 0.5 if
+          two, 0.25 if one. Judge only coverage, not format or length.
+
+  - description: Plugin Architecture
+    vars:
+      TASK_PROMPT: >
+        Trace how a sandboxed emdash plugin is registered, capability-gated,
+        loaded into Cloudflare Worker isolation, and given controlled access
+        to content, storage, and network. Identify the key files involved in
+        each step.
+      EXPECTED_FILES: manager.ts,hooks.ts,runner.ts,wrapper.ts,bridge.ts
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: The correct plugin architecture is: (1) manager.ts handles
+          plugin registration, (2) hooks.ts provides capability hooks, (3)
+          runner.ts loads plugins into Cloudflare Worker isolation, (4) wrapper.ts
+          provides sandboxed wrapping, (5) bridge.ts controls access to content,
+          storage, and network. Score 1.0 if the key files and their roles are
+          correct, 0.5 if partially correct, 0.0 if fundamentally wrong. Judge
+          only factual correctness, not format or length.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should cover: (a) plugin registration,
+          (b) capability gating, (c) Worker isolation, (d) controlled resource
+          access. Score 1.0 if all four, 0.75 if three, 0.5 if two, 0.25 if
+          one. Judge only coverage, not format or length.
+
+  - description: Live Content Query
+    vars:
+      TASK_PROMPT: >
+        Explain how emdash stores schema in the database and exposes typed
+        live content queries through Astro. Identify the key files involved
+        in each step.
+      EXPECTED_FILES: registry.ts,loader.ts,query.ts,live.config.ts
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: The correct live content query flow is: (1) registry.ts
+          stores schema definitions in the database, (2) loader.ts loads schema
+          at runtime, (3) query.ts executes typed content queries, (4)
+          live.config.ts integrates with Astro for live queries. Score 1.0 if
+          all four are correctly described, 0.5 if partially correct, 0.0 if
+          fundamentally wrong. Judge only factual correctness, not format or
+          length.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should cover: (a) schema storage,
+          (b) schema loading, (c) query execution, (d) Astro integration.
+          Score 1.0 if all four, 0.75 if three, 0.5 if two, 0.25 if one.
+          Judge only coverage, not format or length.

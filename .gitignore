@@ -12,3 +12,9 @@
 .rp1/settings.toml
 # rp1:end
 .rg
+
+# evals
+evals/.cache/
+evals/output/
+evals/node_modules/
+evals/**/promptfoo-errors.log
