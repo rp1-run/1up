@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::daemon::watcher::{self, FileWatcher};
-use crate::indexer::embedder::{self, Embedder};
+use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
@@ -50,6 +50,7 @@ struct ProjectState {
     project_root: PathBuf,
     db: Db,
     indexing: Option<IndexingConfig>,
+    embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
 }
 
@@ -119,33 +120,45 @@ async fn run_inner() -> Result<(), OneupError> {
     Ok(())
 }
 
-fn load_embedder(embed_threads: usize) -> Option<Embedder> {
-    if !embedder::is_model_available() {
-        if embedder::is_download_failed() {
-            warn!(
-                "embedding model download previously failed; daemon will index without embeddings"
+fn log_embedding_status(project_root: &Path, embed_threads: usize, status: &EmbeddingLoadStatus) {
+    match status {
+        EmbeddingLoadStatus::Warm => {
+            debug!(
+                "reused warm embedding runtime for {} (embed_threads={embed_threads})",
+                project_root.display()
             );
-        } else {
-            debug!("embedding model not available; daemon will index without embeddings");
         }
-        return None;
-    }
-
-    let dir = match config::model_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            warn!("failed to resolve embedding model dir: {e}");
-            return None;
-        }
-    };
-
-    match Embedder::from_dir_with_threads(&dir, embed_threads) {
-        Ok(embedder) => Some(embedder),
-        Err(e) => {
-            warn!(
-                "failed to load embedding model with embed_threads={embed_threads}: {e}; daemon will index without embeddings"
+        EmbeddingLoadStatus::Loaded => {
+            debug!(
+                "loaded embedding model for {} (embed_threads={embed_threads})",
+                project_root.display()
             );
-            None
+        }
+        EmbeddingLoadStatus::Downloaded => {
+            info!(
+                "downloaded embedding model for {} (embed_threads={embed_threads})",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            warn!(
+                "embedding model download previously failed; daemon will index {} without embeddings",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            debug!(
+                "embedding model not available; daemon will index {} without embeddings",
+                project_root.display()
+            );
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            warn!(
+                "failed to prepare embedding runtime for {} with embed_threads={embed_threads}: {err}; daemon will index without embeddings",
+                project_root.display()
+            );
         }
     }
 }
@@ -239,6 +252,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         project_root: entry.project_root.clone(),
         db,
         indexing: entry.indexing.clone(),
+        embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
     }))
 }
@@ -436,15 +450,24 @@ async fn run_project(
         }
     }
 
-    let mut embedder = load_embedder(indexing_config.embed_threads);
-    let result = pipeline::run_with_scope(
-        &conn,
-        &project_root,
-        embedder.as_mut(),
-        &scope,
-        &indexing_config,
-    )
-    .await;
+    let result = {
+        let state = projects
+            .get_mut(root)
+            .expect("dirty project must exist while preparing embeddings");
+        let status = state
+            .embedding_runtime
+            .prepare_for_indexing(indexing_config.embed_threads)
+            .await;
+        log_embedding_status(&project_root, indexing_config.embed_threads, &status);
+        pipeline::run_with_scope(
+            &conn,
+            &project_root,
+            state.embedding_runtime.current_embedder(),
+            &scope,
+            &indexing_config,
+        )
+        .await
+    };
 
     projects
         .get_mut(root)
@@ -511,6 +534,7 @@ mod tests {
                 project_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: true,
                     dirty: false,
@@ -524,6 +548,7 @@ mod tests {
                 project_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
             },
         );
@@ -579,6 +604,7 @@ mod tests {
                 project_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
             },
         );
@@ -588,6 +614,7 @@ mod tests {
                 project_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
             },
         );
@@ -650,6 +677,7 @@ mod tests {
                 project_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
@@ -665,6 +693,7 @@ mod tests {
                 project_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState {
                     running: false,
                     dirty: true,
