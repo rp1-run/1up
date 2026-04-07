@@ -237,6 +237,7 @@ fn requires_full_scope_fallback(relative_path: &Path) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, ".gitignore" | ".ignore"))
+        || relative_path == Path::new(".git").join("info").join("exclude")
 }
 
 fn is_known_extensionless_file(relative_path: &Path) -> bool {
@@ -315,8 +316,8 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
+            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
             if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
-                let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
                 scanned_files.push(ScannedWorkItem {
                     sequence_id: scanned_files.len(),
                     relative_path: relative_string,
@@ -327,10 +328,14 @@ async fn prepare_scoped_run_inputs(
                 continue;
             }
 
-            if segments::get_file_hash(conn, &relative_string)
-                .await?
-                .is_some()
-            {
+            if scanner::is_scannable_file(&absolute_path) {
+                return Ok(ScopePreparation::FallbackToFull(format!(
+                    "path {} is excluded by full-scan ignore semantics",
+                    relative_path.display()
+                )));
+            }
+
+            if stored_hash.is_some() {
                 return Ok(ScopePreparation::FallbackToFull(format!(
                     "path {} no longer matches scanner filters",
                     relative_path.display()
@@ -1175,6 +1180,102 @@ mod tests {
 
         assert_eq!(stats.files_scanned, 2);
         assert_eq!(stats.files_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_hidden_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(tmp.path().join(".hidden.rs"), "pub fn hidden() {}\n").unwrap();
+
+        let scope = RunScope::from_paths([".hidden.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 0);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_git_excluded_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "ignored.rs\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("ignored.rs"), "pub fn ignored() {}\n").unwrap();
+
+        let scope = RunScope::from_paths(["ignored.rs"].map(PathBuf::from)).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 0);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_run_falls_back_to_full_scan_for_git_exclude_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(tmp.path().join("visible.rs"), "pub fn visible() {}\n").unwrap();
+        fs::write(tmp.path().join("ignored.rs"), "pub fn ignored() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        run(&conn, tmp.path(), None).await.unwrap();
+
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "ignored.rs\n",
+        )
+        .unwrap();
+
+        let scope = RunScope::from_paths([PathBuf::from(".git/info/exclude")]).unwrap();
+        let stats = run_with_scope(
+            &conn,
+            tmp.path(),
+            None,
+            &scope,
+            &IndexingConfig::new(2, 1, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(stats.files_deleted, 1);
+        let paths = segments::get_all_file_paths(&conn).await.unwrap();
+        assert_eq!(paths, vec!["visible.rs"]);
     }
 
     #[tokio::test]
