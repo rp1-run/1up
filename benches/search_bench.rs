@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use oneup::search::intent::detect_intent;
-use oneup::search::ranking::fuse_results;
+use oneup::search::ranking::rank_candidates;
 use oneup::search::retrieval::{RetrievalBackend, RetrievalMode};
 use oneup::storage::segments::{self, SegmentInsert};
 
@@ -375,7 +375,7 @@ fn bench_retrieval_backend(c: &mut Criterion) {
                     .search(&query, Some(&query_embedding))
                     .await
                     .unwrap();
-                let results = fuse_results(
+                let ranked = rank_candidates(
                     candidates.vector_results,
                     candidates.fts_results,
                     Vec::new(),
@@ -384,8 +384,8 @@ fn bench_retrieval_backend(c: &mut Criterion) {
                     10,
                 );
                 assert_eq!(backend.mode(), RetrievalMode::SqlVectorV2);
-                assert!(!results.is_empty());
-                assert!(results[0].file_path.starts_with("src/auth_"));
+                assert!(!ranked.is_empty());
+                assert!(ranked[0].candidate.file_path.starts_with("src/auth_"));
             });
         });
     });
