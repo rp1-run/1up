@@ -24,6 +24,9 @@ pub enum OneupError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
+    #[error("filesystem error: {0}")]
+    Filesystem(#[from] FilesystemError),
+
     #[error("project error: {0}")]
     Project(#[from] ProjectError),
 
@@ -128,6 +131,32 @@ pub enum ConfigError {
     #[error("config read failed: {0}")]
     #[allow(dead_code)]
     ReadFailed(String),
+}
+
+#[allow(dead_code)]
+#[derive(Error, Debug)]
+pub enum FilesystemError {
+    #[error("invalid filesystem path: {0}")]
+    InvalidPath(String),
+
+    #[error("path contains a symlinked component: {0}")]
+    SymlinkComponent(String),
+
+    #[error("path is outside approved root {root}: {path}")]
+    OutsideApprovedRoot { path: String, root: String },
+
+    #[error("unexpected filesystem object at {path}: expected {expected}, found {found}")]
+    UnexpectedType {
+        path: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error("filesystem operation failed for {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Error, Debug)]
