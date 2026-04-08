@@ -104,6 +104,35 @@ pub const MODEL_FILENAME: &str = "model.onnx";
 /// Tokenizer filename.
 pub const TOKENIZER_FILENAME: &str = "tokenizer.json";
 
+/// Verified model artifact store directory name.
+pub const MODEL_VERIFIED_DIRNAME: &str = "verified";
+
+/// Model artifact staging directory name.
+pub const MODEL_STAGING_DIRNAME: &str = ".staging";
+
+/// Active model artifact pointer filename.
+pub const MODEL_CURRENT_MANIFEST_FILENAME: &str = "current.json";
+
+/// Verified model artifact manifest filename.
+pub const MODEL_ARTIFACT_MANIFEST_FILENAME: &str = "manifest.json";
+
+/// Schema version for verified model artifact metadata.
+pub const MODEL_ARTIFACT_MANIFEST_VERSION: u32 = 1;
+
+/// Connect timeout for model downloads.
+pub const MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Total request timeout for model downloads.
+pub const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
+/// Pinned SHA-256 digest for the ONNX embedding model.
+pub const MODEL_ONNX_SHA256: &str =
+    "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
+
+/// Pinned SHA-256 digest for the tokenizer artifact.
+pub const TOKENIZER_SHA256: &str =
+    "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
+
 /// Hugging Face model repository for auto-download.
 pub const HF_MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 

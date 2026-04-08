@@ -1,19 +1,133 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, IsTerminal, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use nanospinner::Spinner;
 use ort::session::Session;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
+use tokio::io::AsyncWriteExt;
 
-use crate::shared::config::{download_failure_marker, model_dir};
+use crate::shared::config::{
+    download_failure_marker, model_current_manifest_path, model_dir, model_staging_dir,
+    model_verified_dir, verified_model_artifact_dir, verified_model_manifest_path,
+};
 use crate::shared::constants::{
     EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_BASE_URL, HF_MODEL_REPO,
-    MODEL_FILENAME, TOKENIZER_FILENAME,
+    MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
+    MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
+    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME,
+    MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
+    XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::{EmbeddingError, OneupError};
+use crate::shared::fs::{
+    atomic_replace, ensure_secure_dir_within_root, ensure_secure_xdg_root, remove_regular_file,
+    validate_regular_file_path,
+};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
+
+struct ExpectedArtifactFile {
+    filename: &'static str,
+    relative_url: &'static str,
+    sha256: &'static str,
+    label: &'static str,
+}
+
+impl ExpectedArtifactFile {
+    fn source_url(&self) -> String {
+        format!(
+            "{}/{}/resolve/main/{}",
+            HF_BASE_URL, HF_MODEL_REPO, self.relative_url
+        )
+    }
+}
+
+const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 2] = [
+    ExpectedArtifactFile {
+        filename: MODEL_FILENAME,
+        relative_url: MODEL_DOWNLOAD_URL,
+        sha256: MODEL_ONNX_SHA256,
+        label: "model",
+    },
+    ExpectedArtifactFile {
+        filename: TOKENIZER_FILENAME,
+        relative_url: TOKENIZER_DOWNLOAD_URL,
+        sha256: TOKENIZER_SHA256,
+        label: "tokenizer",
+    },
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct VerifiedArtifactFile {
+    filename: String,
+    sha256: String,
+    source_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct VerifiedArtifactManifest {
+    version: u32,
+    artifact_id: String,
+    files: Vec<VerifiedArtifactFile>,
+}
+
+impl VerifiedArtifactManifest {
+    fn for_artifact(artifact_id: String) -> Self {
+        Self {
+            version: MODEL_ARTIFACT_MANIFEST_VERSION,
+            artifact_id,
+            files: EXPECTED_ARTIFACT_FILES
+                .iter()
+                .map(|artifact| VerifiedArtifactFile {
+                    filename: artifact.filename.to_string(),
+                    sha256: artifact.sha256.to_string(),
+                    source_url: artifact.source_url(),
+                })
+                .collect(),
+        }
+    }
+
+    fn matches_expected(&self) -> bool {
+        if self.version != MODEL_ARTIFACT_MANIFEST_VERSION
+            || self.files.len() != EXPECTED_ARTIFACT_FILES.len()
+        {
+            return false;
+        }
+
+        EXPECTED_ARTIFACT_FILES.iter().all(|expected| {
+            self.files.iter().any(|file| {
+                file.filename == expected.filename
+                    && file.sha256 == expected.sha256
+                    && file.source_url == expected.source_url()
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ActiveArtifactPointer {
+    version: u32,
+    artifact_id: String,
+}
+
+impl ActiveArtifactPointer {
+    fn new(artifact_id: String) -> Self {
+        Self {
+            version: MODEL_ARTIFACT_MANIFEST_VERSION,
+            artifact_id,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.version == MODEL_ARTIFACT_MANIFEST_VERSION && !self.artifact_id.trim().is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
@@ -128,8 +242,25 @@ impl<T> Default for WarmRuntime<T> {
 
 impl EmbeddingRuntime {
     pub async fn prepare_for_indexing(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
-        if is_model_available() {
-            return self.prepare_from_model_dir(embed_threads);
+        let model_root = match ensure_secure_model_root() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
+                );
+            }
+        };
+
+        match resolve_model_dir_without_download(&model_root) {
+            Ok(Some(dir)) => return self.prepare_from_model_dir(&dir, embed_threads),
+            Ok(None) => {}
+            Err(err) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
+                    err.to_string(),
+                ));
+            }
         }
 
         if is_download_failed() {
@@ -139,32 +270,57 @@ impl EmbeddingRuntime {
             );
         }
 
-        self.prepare_with_download(embed_threads).await
+        self.prepare_with_download(&model_root, embed_threads).await
     }
 
     pub fn prepare_for_search(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
-        if !is_model_available() {
-            self.cache.clear();
-            return EmbeddingLoadStatus::Unavailable(if is_download_failed() {
-                EmbeddingUnavailableReason::PreviousDownloadFailed
-            } else {
-                EmbeddingUnavailableReason::ModelMissing
-            });
-        }
+        let model_root = match ensure_secure_model_root() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
+                );
+            }
+        };
 
-        self.prepare_from_model_dir(embed_threads)
+        let model_dir = match resolve_model_dir_without_download(&model_root) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(if is_download_failed() {
+                    EmbeddingUnavailableReason::PreviousDownloadFailed
+                } else {
+                    EmbeddingUnavailableReason::ModelMissing
+                });
+            }
+            Err(err) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
+                    err.to_string(),
+                ));
+            }
+        };
+
+        self.prepare_from_model_dir(&model_dir, embed_threads)
     }
 
     pub fn current_embedder(&mut self) -> Option<&mut Embedder> {
         self.cache.current_mut()
     }
 
-    fn prepare_from_model_dir(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
-        let key = match Self::model_dir_key(embed_threads) {
+    fn prepare_from_model_dir(
+        &mut self,
+        model_dir: &Path,
+        embed_threads: usize,
+    ) -> EmbeddingLoadStatus {
+        let key = match EmbeddingCompatibilityKey::from_dir_with_threads(model_dir, embed_threads) {
             Ok(key) => key,
-            Err(reason) => {
+            Err(err) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(reason);
+                return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
+                    err.to_string(),
+                ));
             }
         };
 
@@ -186,49 +342,29 @@ impl EmbeddingRuntime {
         }
     }
 
-    async fn prepare_with_download(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
-        let model_dir = match model_dir() {
-            Ok(dir) => dir,
-            Err(err) => {
-                self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(
-                    EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
-                );
-            }
-        };
-
-        match Embedder::new_with_threads(embed_threads).await {
-            Ok(embedder) => {
-                match EmbeddingCompatibilityKey::from_dir_with_threads(&model_dir, embed_threads) {
-                    Ok(key) => {
-                        self.cache.store(key, embedder);
+    async fn prepare_with_download(
+        &mut self,
+        model_root: &Path,
+        embed_threads: usize,
+    ) -> EmbeddingLoadStatus {
+        match download_and_activate_verified_artifacts(model_root).await {
+            Ok(model_dir) => {
+                clear_download_failure();
+                match self.prepare_from_model_dir(&model_dir, embed_threads) {
+                    EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Warm => {
                         EmbeddingLoadStatus::Downloaded
                     }
-                    Err(err) => {
-                        self.cache.clear();
-                        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
-                            err.to_string(),
-                        ))
-                    }
+                    status => status,
                 }
             }
             Err(err) => {
+                mark_download_failed();
                 self.cache.clear();
                 EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(
                     err.to_string(),
                 ))
             }
         }
-    }
-
-    fn model_dir_key(
-        embed_threads: usize,
-    ) -> Result<EmbeddingCompatibilityKey, EmbeddingUnavailableReason> {
-        let model_dir = model_dir()
-            .map_err(|err| EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()))?;
-
-        EmbeddingCompatibilityKey::from_dir_with_threads(&model_dir, embed_threads)
-            .map_err(|err| EmbeddingUnavailableReason::LoadFailed(err.to_string()))
     }
 }
 
@@ -244,14 +380,16 @@ pub struct Embedder {
 
 /// Reports whether the embedding model files are present on disk.
 ///
-/// Returns `false` if files are missing or a previous download failed
-/// (indicated by a `.download_failed` marker file).
+/// Returns `false` if neither an active verified artifact nor a hash-validated
+/// legacy flat-file cache is available.
+#[allow(dead_code)]
 pub fn is_model_available() -> bool {
-    let dir = match model_dir() {
+    let model_root = match model_dir() {
         Ok(d) => d,
         Err(_) => return false,
     };
-    dir.join(MODEL_FILENAME).exists() && dir.join(TOKENIZER_FILENAME).exists()
+
+    has_active_verified_artifact(&model_root) || legacy_artifacts_match_expected(&model_root)
 }
 
 /// Reports whether a previous download attempt failed.
@@ -267,18 +405,25 @@ pub fn is_download_failed() -> bool {
 
 /// Writes a download failure marker to prevent automatic retry.
 fn mark_download_failed() {
-    if let Ok(marker) = download_failure_marker() {
-        if let Some(parent) = marker.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    if let Ok(model_root) = ensure_secure_model_root() {
+        if let Ok(marker) = download_failure_marker() {
+            let _ = atomic_replace(
+                &marker,
+                b"download failed",
+                &model_root,
+                XDG_STATE_DIR_MODE,
+                SECURE_STATE_FILE_MODE,
+            );
         }
-        let _ = std::fs::write(&marker, "download failed");
     }
 }
 
 /// Clears the download failure marker, allowing a fresh download attempt.
 pub fn clear_download_failure() {
-    if let Ok(marker) = download_failure_marker() {
-        let _ = std::fs::remove_file(marker);
+    if let Ok(model_root) = model_dir() {
+        if let Ok(marker) = download_failure_marker() {
+            let _ = remove_regular_file(&marker, &model_root);
+        }
     }
 }
 
@@ -292,6 +437,7 @@ impl Embedder {
     }
 
     /// Creates a new embedder with a custom ONNX intra-op thread count.
+    #[allow(dead_code)]
     pub async fn new_with_threads(intra_threads: usize) -> Result<Self, OneupError> {
         Self::with_options(EMBEDDING_BATCH_SIZE, intra_threads).await
     }
@@ -306,50 +452,45 @@ impl Embedder {
     }
 
     async fn with_options(batch_size: usize, intra_threads: usize) -> Result<Self, OneupError> {
-        let dir = model_dir()?;
+        let model_root = ensure_secure_model_root()?;
 
-        let model_path = dir.join(MODEL_FILENAME);
-        let tokenizer_path = dir.join(TOKENIZER_FILENAME);
-
-        if !model_path.exists() || !tokenizer_path.exists() {
-            if is_download_failed() {
-                return Err(EmbeddingError::DownloadFailed(
-                    "previous download failed; delete the marker file at ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry"
-                        .to_string(),
-                )
-                .into());
-            }
-            match download_model(&dir).await {
-                Ok(()) => {
-                    clear_download_failure();
+        let model_dir = match resolve_model_dir_without_download(&model_root)? {
+            Some(dir) => dir,
+            None => {
+                if is_download_failed() {
+                    return Err(EmbeddingError::DownloadFailed(
+                        "previous download failed; delete the marker file at ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry"
+                            .to_string(),
+                    )
+                    .into());
                 }
-                Err(e) => {
-                    mark_download_failed();
-                    return Err(e);
+
+                match download_and_activate_verified_artifacts(&model_root).await {
+                    Ok(dir) => {
+                        clear_download_failure();
+                        dir
+                    }
+                    Err(err) => {
+                        mark_download_failed();
+                        return Err(err);
+                    }
                 }
             }
-        }
+        };
 
-        let session = Session::builder()
-            .map_err(|e| EmbeddingError::InferenceFailed(format!("session builder: {e}")))?
-            .with_intra_threads(intra_threads)
-            .map_err(|e| EmbeddingError::InferenceFailed(format!("set threads: {e}")))?
-            .commit_from_file(&model_path)
-            .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
-
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
-        })?;
-
-        Ok(Self {
-            session,
-            tokenizer,
-            batch_size,
-        })
+        Self::from_dir_with_batch_size(&model_dir, intra_threads, batch_size)
     }
 
     /// Creates an embedder from pre-existing model files at a custom path and thread count.
     pub fn from_dir_with_threads(dir: &Path, intra_threads: usize) -> Result<Self, OneupError> {
+        Self::from_dir_with_batch_size(dir, intra_threads, EMBEDDING_BATCH_SIZE)
+    }
+
+    fn from_dir_with_batch_size(
+        dir: &Path,
+        intra_threads: usize,
+        batch_size: usize,
+    ) -> Result<Self, OneupError> {
         let model_path = dir.join(MODEL_FILENAME);
         let tokenizer_path = dir.join(TOKENIZER_FILENAME);
 
@@ -382,7 +523,7 @@ impl Embedder {
         Ok(Self {
             session,
             tokenizer,
-            batch_size: EMBEDDING_BATCH_SIZE,
+            batch_size,
         })
     }
 
@@ -536,7 +677,209 @@ impl Embedder {
     }
 }
 
-async fn download_file(
+fn ensure_secure_model_root() -> Result<PathBuf, OneupError> {
+    let xdg_root = ensure_secure_xdg_root()?;
+    let model_root = model_dir()?;
+    ensure_secure_dir_within_root(&model_root, &xdg_root, XDG_STATE_DIR_MODE)
+}
+
+fn verified_dir_path(model_root: &Path) -> PathBuf {
+    match model_dir() {
+        Ok(configured_root) if configured_root == model_root => {
+            model_verified_dir().unwrap_or_else(|_| model_root.join(MODEL_VERIFIED_DIRNAME))
+        }
+        _ => model_root.join(MODEL_VERIFIED_DIRNAME),
+    }
+}
+
+fn staging_dir_path(model_root: &Path) -> PathBuf {
+    match model_dir() {
+        Ok(configured_root) if configured_root == model_root => {
+            model_staging_dir().unwrap_or_else(|_| model_root.join(MODEL_STAGING_DIRNAME))
+        }
+        _ => model_root.join(MODEL_STAGING_DIRNAME),
+    }
+}
+
+fn current_manifest_path(model_root: &Path) -> PathBuf {
+    match model_dir() {
+        Ok(configured_root) if configured_root == model_root => model_current_manifest_path()
+            .unwrap_or_else(|_| model_root.join(MODEL_CURRENT_MANIFEST_FILENAME)),
+        _ => model_root.join(MODEL_CURRENT_MANIFEST_FILENAME),
+    }
+}
+
+fn artifact_dir_path(model_root: &Path, artifact_id: &str) -> PathBuf {
+    match model_dir() {
+        Ok(configured_root) if configured_root == model_root => {
+            verified_model_artifact_dir(artifact_id)
+                .unwrap_or_else(|_| verified_dir_path(model_root).join(artifact_id))
+        }
+        _ => verified_dir_path(model_root).join(artifact_id),
+    }
+}
+
+fn manifest_path(model_root: &Path, artifact_id: &str) -> PathBuf {
+    match model_dir() {
+        Ok(configured_root) if configured_root == model_root => {
+            verified_model_manifest_path(artifact_id).unwrap_or_else(|_| {
+                artifact_dir_path(model_root, artifact_id).join(MODEL_ARTIFACT_MANIFEST_FILENAME)
+            })
+        }
+        _ => artifact_dir_path(model_root, artifact_id).join(MODEL_ARTIFACT_MANIFEST_FILENAME),
+    }
+}
+
+fn has_active_verified_artifact(model_root: &Path) -> bool {
+    try_load_active_artifact_dir(model_root)
+        .map(|dir| dir.is_some())
+        .unwrap_or(false)
+}
+
+fn legacy_artifacts_match_expected(model_root: &Path) -> bool {
+    EXPECTED_ARTIFACT_FILES.iter().all(|artifact| {
+        let path = model_root.join(artifact.filename);
+        path.exists() && sha256_digest_file(&path).is_ok_and(|digest| digest == artifact.sha256)
+    })
+}
+
+fn resolve_model_dir_without_download(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
+    if let Some(active_dir) = try_load_active_artifact_dir(model_root)? {
+        return Ok(Some(active_dir));
+    }
+
+    try_activate_legacy_artifacts(model_root)
+}
+
+fn try_load_active_artifact_dir(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
+    let current_path = current_manifest_path(model_root);
+    let current_bytes = match read_validated_file(&current_path, model_root) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let current: ActiveArtifactPointer =
+        match serde_json::from_slice::<ActiveArtifactPointer>(&current_bytes) {
+            Ok(pointer) if pointer.is_valid() => pointer,
+            _ => return Ok(None),
+        };
+
+    let manifest_bytes =
+        match read_validated_file(&manifest_path(model_root, &current.artifact_id), model_root) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+    let manifest: VerifiedArtifactManifest =
+        match serde_json::from_slice::<VerifiedArtifactManifest>(&manifest_bytes) {
+            Ok(manifest)
+                if manifest.artifact_id == current.artifact_id && manifest.matches_expected() =>
+            {
+                manifest
+            }
+            _ => return Ok(None),
+        };
+
+    let artifact_dir = artifact_dir_path(model_root, &manifest.artifact_id);
+    for artifact in EXPECTED_ARTIFACT_FILES {
+        let path = artifact_dir.join(artifact.filename);
+        if validate_regular_file_path(&path, model_root)
+            .and_then(|validated| {
+                fs::metadata(&validated).map(|_| ()).map_err(|err| {
+                    EmbeddingError::ModelNotAvailable(format!(
+                        "failed to inspect {}: {err}",
+                        validated.display()
+                    ))
+                    .into()
+                })
+            })
+            .is_err()
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(artifact_dir))
+}
+
+fn try_activate_legacy_artifacts(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
+    let legacy_paths: Vec<PathBuf> = EXPECTED_ARTIFACT_FILES
+        .iter()
+        .map(|artifact| model_root.join(artifact.filename))
+        .collect();
+    if legacy_paths.iter().any(|path| !path.exists()) {
+        return Ok(None);
+    }
+
+    for (artifact, path) in EXPECTED_ARTIFACT_FILES.iter().zip(legacy_paths.iter()) {
+        let digest = sha256_digest_file(path)?;
+        if digest != artifact.sha256 {
+            return Ok(None);
+        }
+    }
+
+    let artifact_id = format!(
+        "v{}-{}",
+        MODEL_ARTIFACT_MANIFEST_VERSION,
+        uuid::Uuid::new_v4().simple()
+    );
+    let stage_dir = create_stage_dir(model_root, &artifact_id)?;
+    let cleanup_path = stage_dir.clone();
+
+    let copy_result = (|| -> Result<PathBuf, OneupError> {
+        for (artifact, path) in EXPECTED_ARTIFACT_FILES.iter().zip(legacy_paths.iter()) {
+            copy_file_to_stage(path, &stage_dir.join(artifact.filename), artifact.label)?;
+        }
+        activate_staged_artifact(model_root, &artifact_id, &stage_dir)
+    })();
+
+    if copy_result.is_err() {
+        let _ = fs::remove_dir_all(cleanup_path);
+    }
+
+    copy_result.map(Some)
+}
+
+async fn download_and_activate_verified_artifacts(
+    model_root: &Path,
+) -> Result<PathBuf, OneupError> {
+    let artifact_id = format!(
+        "v{}-{}",
+        MODEL_ARTIFACT_MANIFEST_VERSION,
+        uuid::Uuid::new_v4().simple()
+    );
+    let stage_dir = create_stage_dir(model_root, &artifact_id)?;
+    let cleanup_path = stage_dir.clone();
+
+    let download_result = async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(MODEL_DOWNLOAD_TIMEOUT_SECS))
+            .build()
+            .map_err(|err| {
+                EmbeddingError::DownloadFailed(format!("build download client: {err}"))
+            })?;
+
+        for artifact in EXPECTED_ARTIFACT_FILES {
+            download_file_to_stage(
+                &client,
+                &artifact.source_url(),
+                &stage_dir.join(artifact.filename),
+                artifact.label,
+            )
+            .await?;
+        }
+
+        activate_staged_artifact(model_root, &artifact_id, &stage_dir)
+    }
+    .await;
+
+    if download_result.is_err() {
+        let _ = fs::remove_dir_all(cleanup_path);
+    }
+
+    download_result
+}
+
+async fn download_file_to_stage(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
@@ -546,7 +889,7 @@ async fn download_file(
         .get(url)
         .send()
         .await
-        .map_err(|e| EmbeddingError::DownloadFailed(format!("{label}: {e}")))?;
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label}: {err}")))?;
 
     if !response.status().is_success() {
         return Err(
@@ -555,8 +898,6 @@ async fn download_file(
     }
 
     let total = response.content_length().unwrap_or(0);
-
-    use std::io::IsTerminal;
     let dl_spinner = Spinner::with_writer_tty(
         format!("Downloading {label}"),
         std::io::stderr(),
@@ -564,22 +905,21 @@ async fn download_file(
     )
     .start();
 
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = tokio::fs::File::create(dest)
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(dest)
         .await
-        .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} file create: {e}")))?;
-
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} file create: {err}")))?;
     let mut stream = response.bytes_stream();
     let mut downloaded = 0u64;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| EmbeddingError::DownloadFailed(format!("{label} stream: {e}")))?;
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk
+            .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} stream: {err}")))?;
         file.write_all(&chunk)
             .await
-            .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} write: {e}")))?;
+            .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} write: {err}")))?;
         downloaded += chunk.len() as u64;
         if total > 0 {
             let pct = (downloaded * 100) / total;
@@ -587,56 +927,181 @@ async fn download_file(
         }
     }
 
+    if total > 0 && downloaded != total {
+        return Err(EmbeddingError::DownloadFailed(format!(
+            "{label}: incomplete download ({downloaded}/{total} bytes)"
+        ))
+        .into());
+    }
+
     file.flush()
         .await
-        .map_err(|e| EmbeddingError::DownloadFailed(format!("{label} flush: {e}")))?;
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} flush: {err}")))?;
+    file.sync_all()
+        .await
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} sync: {err}")))?;
+    fs::set_permissions(dest, fs::Permissions::from_mode(SECURE_STATE_FILE_MODE)).map_err(
+        |err| EmbeddingError::DownloadFailed(format!("{label} chmod {}: {err}", dest.display())),
+    )?;
 
     dl_spinner.success_with(format!("{label} downloaded"));
     Ok(())
 }
 
-async fn download_model(dir: &Path) -> Result<(), OneupError> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| EmbeddingError::DownloadFailed(format!("create model dir: {e}")))?;
-
-    let client = reqwest::Client::new();
-
-    let model_url = format!(
-        "{}/{}/resolve/main/{}",
-        HF_BASE_URL, HF_MODEL_REPO, MODEL_DOWNLOAD_URL
-    );
-    let tokenizer_url = format!(
-        "{}/{}/resolve/main/{}",
-        HF_BASE_URL, HF_MODEL_REPO, TOKENIZER_DOWNLOAD_URL
-    );
-
-    download_file(
-        &client,
-        &model_url,
-        &dir.join(MODEL_FILENAME),
-        "Downloading model",
+fn create_stage_dir(model_root: &Path, artifact_id: &str) -> Result<PathBuf, OneupError> {
+    let staging_root = ensure_secure_dir_within_root(
+        &staging_dir_path(model_root),
+        model_root,
+        XDG_STATE_DIR_MODE,
+    )?;
+    ensure_secure_dir_within_root(
+        &staging_root.join(artifact_id),
+        model_root,
+        XDG_STATE_DIR_MODE,
     )
-    .await?;
+}
 
-    download_file(
-        &client,
-        &tokenizer_url,
-        &dir.join(TOKENIZER_FILENAME),
-        "Downloading tokenizer",
-    )
-    .await?;
-
+fn copy_file_to_stage(source: &Path, dest: &Path, label: &str) -> Result<(), OneupError> {
+    let mut src = File::open(source)
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy open: {err}")))?;
+    let mut dest_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(SECURE_STATE_FILE_MODE)
+        .open(dest)
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy create: {err}")))?;
+    std::io::copy(&mut src, &mut dest_file)
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy write: {err}")))?;
+    dest_file
+        .sync_all()
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy sync: {err}")))?;
     Ok(())
+}
+
+fn activate_staged_artifact(
+    model_root: &Path,
+    artifact_id: &str,
+    stage_dir: &Path,
+) -> Result<PathBuf, OneupError> {
+    for artifact in EXPECTED_ARTIFACT_FILES {
+        let staged_path = stage_dir.join(artifact.filename);
+        let digest = sha256_digest_file(&staged_path)?;
+        if digest != artifact.sha256 {
+            return Err(EmbeddingError::DownloadFailed(format!(
+                "{} SHA-256 mismatch: expected {}, got {}",
+                artifact.label, artifact.sha256, digest
+            ))
+            .into());
+        }
+    }
+
+    let manifest = VerifiedArtifactManifest::for_artifact(artifact_id.to_string());
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|err| EmbeddingError::DownloadFailed(format!("serialize manifest: {err}")))?;
+    write_stage_file(&stage_dir.join("manifest.json"), &manifest_bytes)?;
+    sync_directory(stage_dir)?;
+
+    let verified_root = ensure_secure_dir_within_root(
+        &verified_dir_path(model_root),
+        model_root,
+        XDG_STATE_DIR_MODE,
+    )?;
+    let final_dir = verified_root.join(artifact_id);
+    fs::rename(stage_dir, &final_dir).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!(
+            "activate verified artifact {}: {err}",
+            final_dir.display()
+        ))
+    })?;
+    sync_directory(&verified_root)?;
+
+    let current = ActiveArtifactPointer::new(artifact_id.to_string());
+    let current_bytes = serde_json::to_vec_pretty(&current).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("serialize current manifest: {err}"))
+    })?;
+    atomic_replace(
+        &current_manifest_path(model_root),
+        &current_bytes,
+        model_root,
+        XDG_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    )?;
+
+    Ok(final_dir)
+}
+
+fn write_stage_file(path: &Path, contents: &[u8]) -> Result<(), OneupError> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(SECURE_STATE_FILE_MODE)
+        .open(path)
+        .map_err(|err| {
+            EmbeddingError::DownloadFailed(format!("write stage file {}: {err}", path.display()))
+        })?;
+    file.write_all(contents).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("write stage file {}: {err}", path.display()))
+    })?;
+    file.sync_all().map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("sync stage file {}: {err}", path.display()))
+    })?;
+    Ok(())
+}
+
+fn read_validated_file(path: &Path, approved_root: &Path) -> Result<Vec<u8>, OneupError> {
+    let validated = validate_regular_file_path(path, approved_root)?;
+    fs::read(&validated).map_err(|err| {
+        EmbeddingError::ModelNotAvailable(format!("failed to read {}: {err}", validated.display()))
+            .into()
+    })
+}
+
+fn sha256_digest_file(path: &Path) -> Result<String, OneupError> {
+    let file = File::open(path).map_err(|err| {
+        EmbeddingError::ModelNotAvailable(format!("failed to read {}: {err}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buf).map_err(|err| {
+            EmbeddingError::ModelNotAvailable(format!("failed to hash {}: {err}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sync_directory(path: &Path) -> Result<(), OneupError> {
+    let file = File::open(path).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("open directory {}: {err}", path.display()))
+    })?;
+    file.sync_all().map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("sync directory {}: {err}", path.display())).into()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
         std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
+    }
+
+    fn runtime_model_dir() -> PathBuf {
+        let root = model_dir().unwrap();
+        resolve_model_dir_without_download(&root)
+            .unwrap()
+            .expect("model available")
     }
 
     #[test]
@@ -662,6 +1127,7 @@ mod tests {
 
     #[test]
     fn mark_and_clear_download_failure() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         mark_download_failed();
         assert!(is_download_failed());
 
@@ -736,7 +1202,76 @@ mod tests {
     }
 
     #[test]
+    fn legacy_artifacts_import_into_verified_store_only_after_digest_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let live_model = std::fs::read(model_dir().unwrap().join(MODEL_FILENAME)).unwrap();
+        let live_tokenizer = std::fs::read(model_dir().unwrap().join(TOKENIZER_FILENAME)).unwrap();
+        std::fs::write(model_root.join(MODEL_FILENAME), &live_model).unwrap();
+        std::fs::write(model_root.join(TOKENIZER_FILENAME), &live_tokenizer).unwrap();
+
+        let activated = try_activate_legacy_artifacts(&model_root)
+            .unwrap()
+            .expect("legacy artifacts should import");
+        let current: ActiveArtifactPointer =
+            serde_json::from_slice(&std::fs::read(current_manifest_path(&model_root)).unwrap())
+                .unwrap();
+        let manifest: VerifiedArtifactManifest = serde_json::from_slice(
+            &std::fs::read(manifest_path(&model_root, &current.artifact_id)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            activated,
+            artifact_dir_path(&model_root, &current.artifact_id)
+        );
+        assert!(manifest.matches_expected());
+        assert!(activated.join(MODEL_FILENAME).exists());
+        assert!(activated.join(TOKENIZER_FILENAME).exists());
+    }
+
+    #[test]
+    fn invalid_legacy_artifacts_do_not_replace_active_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let active_id = "active-good";
+        let active_dir = artifact_dir_path(&model_root, active_id);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::write(active_dir.join(MODEL_FILENAME), b"active-model").unwrap();
+        std::fs::write(active_dir.join(TOKENIZER_FILENAME), b"active-tokenizer").unwrap();
+        std::fs::write(
+            active_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&VerifiedArtifactManifest::for_artifact(
+                active_id.to_string(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            current_manifest_path(&model_root),
+            serde_json::to_vec_pretty(&ActiveArtifactPointer::new(active_id.to_string())).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(model_root.join(MODEL_FILENAME), b"tampered-model").unwrap();
+        std::fs::write(model_root.join(TOKENIZER_FILENAME), b"tampered-tokenizer").unwrap();
+
+        let result = try_activate_legacy_artifacts(&model_root).unwrap();
+        let current: ActiveArtifactPointer =
+            serde_json::from_slice(&std::fs::read(current_manifest_path(&model_root)).unwrap())
+                .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(current.artifact_id, active_id);
+    }
+
+    #[test]
     fn prepare_for_search_reuses_warm_runtime_when_model_is_unchanged() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
@@ -758,7 +1293,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn prepare_for_indexing_reuses_warm_runtime_when_model_is_unchanged() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
@@ -781,33 +1318,36 @@ mod tests {
 
     #[test]
     fn embed_batch_empty_input() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
         let result = embedder.embed_batch(&[]).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn embed_one_produces_correct_dim() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
         let vec = embedder.embed_one("hello world").unwrap();
         assert_eq!(vec.len(), EMBEDDING_DIM);
     }
 
     #[test]
     fn embed_one_l2_normalized() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
         let vec = embedder.embed_one("the quick brown fox").unwrap();
         let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
@@ -818,11 +1358,12 @@ mod tests {
 
     #[test]
     fn embed_batch_multiple_texts() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
         let texts = vec![
             "error handling in rust",
             "machine learning algorithms",
@@ -842,11 +1383,12 @@ mod tests {
 
     #[test]
     fn embed_similar_texts_closer_than_dissimilar() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&model_dir().unwrap(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
         let vecs = embedder
             .embed_batch(&[
                 "how to handle errors in rust",
@@ -868,11 +1410,12 @@ mod tests {
 
     #[test]
     fn embed_batch_exceeding_batch_size() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let dir = model_dir().unwrap();
+        let dir = runtime_model_dir();
         let mut embedder = Embedder {
             session: Session::builder()
                 .unwrap()
