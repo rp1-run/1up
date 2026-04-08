@@ -155,10 +155,15 @@ impl Formatter for HumanFormatter {
 
     fn format_context_result(&self, result: &ContextResult) -> String {
         let mut out = String::new();
+        let access_scope = result
+            .access_scope
+            .map(|scope| format!(" {}", format!("[{}]", scope.as_str()).dimmed()))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{} {} (lines {}-{})\n\n",
+            "{} {}{} (lines {}-{})\n\n",
             result.file_path.cyan(),
             format!("[{}]", result.scope_type).dimmed(),
+            access_scope,
             result.line_start,
             result.line_end,
         ));
@@ -352,10 +357,20 @@ impl Formatter for PlainFormatter {
 
     fn format_context_result(&self, result: &ContextResult) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "{}:{}-{}\t{}\n",
-            result.file_path, result.line_start, result.line_end, result.scope_type
-        ));
+        match result.access_scope {
+            Some(scope) => out.push_str(&format!(
+                "{}:{}-{}\t{}\t{}\n",
+                result.file_path,
+                result.line_start,
+                result.line_end,
+                result.scope_type,
+                scope.as_str()
+            )),
+            None => out.push_str(&format!(
+                "{}:{}-{}\t{}\n",
+                result.file_path, result.line_start, result.line_end, result.scope_type
+            )),
+        }
         out.push_str(&result.content);
         if !result.content.ends_with('\n') {
             out.push('\n');
