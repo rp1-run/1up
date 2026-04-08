@@ -226,6 +226,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_json_frame_rejects_malformed_json_payloads() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(&(8u32).to_be_bytes()).await.unwrap();
+        writer.write_all(b"{oops!!}").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let err = read_json_frame::<TestPayload>(&mut reader, 1024, Duration::from_millis(250))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to decode"));
+    }
+
+    #[tokio::test]
     async fn write_json_frame_rejects_payloads_over_the_cap() {
         let (mut writer, _reader) = UnixStream::pair().unwrap();
 
@@ -241,5 +255,22 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("exceeds 16 bytes"));
+    }
+
+    #[tokio::test]
+    async fn write_all_with_timeout_rejects_stalled_writers() {
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+
+        let err = write_all_with_timeout(
+            &mut writer,
+            &payload,
+            Duration::from_millis(20),
+            "write saturated frame",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
     }
 }

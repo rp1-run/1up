@@ -1088,7 +1088,10 @@ fn sync_directory(path: &Path) -> Result<(), OneupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::thread;
 
     static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1274,6 +1277,87 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(current.artifact_id, active_id);
+    }
+
+    #[test]
+    fn activate_staged_artifact_keeps_current_manifest_on_digest_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let active_id = "active-good";
+        let active_dir = artifact_dir_path(&model_root, active_id);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::write(active_dir.join(MODEL_FILENAME), b"active-model").unwrap();
+        std::fs::write(active_dir.join(TOKENIZER_FILENAME), b"active-tokenizer").unwrap();
+        std::fs::write(
+            active_dir.join(MODEL_ARTIFACT_MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&VerifiedArtifactManifest::for_artifact(
+                active_id.to_string(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            current_manifest_path(&model_root),
+            serde_json::to_vec_pretty(&ActiveArtifactPointer::new(active_id.to_string())).unwrap(),
+        )
+        .unwrap();
+
+        let candidate_id = "candidate-bad";
+        let stage_dir = create_stage_dir(&model_root, candidate_id).unwrap();
+        std::fs::write(stage_dir.join(MODEL_FILENAME), b"tampered-model").unwrap();
+        std::fs::write(stage_dir.join(TOKENIZER_FILENAME), b"tampered-tokenizer").unwrap();
+
+        let err = activate_staged_artifact(&model_root, candidate_id, &stage_dir).unwrap_err();
+        let current: ActiveArtifactPointer =
+            serde_json::from_slice(&std::fs::read(current_manifest_path(&model_root)).unwrap())
+                .unwrap();
+
+        assert!(err.to_string().contains("SHA-256 mismatch"));
+        assert_eq!(current.artifact_id, active_id);
+        assert!(stage_dir.exists());
+        assert!(!artifact_dir_path(&model_root, candidate_id).exists());
+    }
+
+    #[tokio::test]
+    async fn download_file_to_stage_rejects_partial_http_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+        let destination = model_root.join(MODEL_FILENAME);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let err = download_file_to_stage(
+            &client,
+            &format!("http://{address}/model.onnx"),
+            &destination,
+            "model",
+        )
+        .await
+        .unwrap_err();
+
+        server.join().unwrap();
+
+        assert!(
+            err.to_string().contains("incomplete download") || err.to_string().contains("stream"),
+        );
+        assert!(!current_manifest_path(&model_root).exists());
     }
 
     #[test]

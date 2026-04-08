@@ -229,7 +229,9 @@ fn init_warns_if_already_initialized() {
 fn start_auto_initializes_project_if_needed() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let data_dir = test_data_dir(home.path());
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
     let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
     fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
@@ -240,10 +242,10 @@ fn start_auto_initializes_project_if_needed() {
     .unwrap();
 
     let output = cmd()
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .args(["--format", "json", "start", dir.path().to_str().unwrap()])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["--format", "json", "start", canonical_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -256,7 +258,7 @@ fn start_auto_initializes_project_if_needed() {
     assert!(payload["progress"]["files_indexed"].as_u64().unwrap() > 0);
     assert!(payload["progress"]["segments_stored"].as_u64().unwrap() > 0);
 
-    let id_path = dir.path().join(".1up").join("project_id");
+    let id_path = canonical_dir.join(".1up").join("project_id");
     assert!(id_path.exists(), "start should create .1up/project_id");
 
     let pid_file = data_dir.join("daemon.pid");
@@ -266,10 +268,15 @@ fn start_auto_initializes_project_if_needed() {
     }
 
     let status = cmd()
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .args(["--format", "json", "status", dir.path().to_str().unwrap()])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args([
+            "--format",
+            "json",
+            "status",
+            canonical_dir.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(status.status.success());
@@ -280,10 +287,10 @@ fn start_auto_initializes_project_if_needed() {
 
     if pid_file.exists() {
         cmd()
-            .env("HOME", home.path())
-            .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-            .env("XDG_CONFIG_HOME", home.path().join(".config"))
-            .args(["--format", "json", "stop", dir.path().to_str().unwrap()])
+            .env("HOME", &canonical_home)
+            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+            .args(["--format", "json", "stop", canonical_dir.to_str().unwrap()])
             .assert()
             .success();
     }
