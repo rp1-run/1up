@@ -43,6 +43,22 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 
+/// Owner-only permissions for the XDG-managed state directory.
+#[allow(dead_code)]
+pub const XDG_STATE_DIR_MODE: u32 = 0o700;
+
+/// Owner-only permissions for the project-local `.1up` directory.
+#[allow(dead_code)]
+pub const PROJECT_STATE_DIR_MODE: u32 = 0o700;
+
+/// Owner-only permissions for security-sensitive state files.
+#[allow(dead_code)]
+pub const SECURE_STATE_FILE_MODE: u32 = 0o600;
+
+/// Owner-only permissions for daemon socket files after bind.
+#[allow(dead_code)]
+pub const SECURE_SOCKET_MODE: u32 = 0o600;
+
 /// Conservative upper bound for auto-selected embedding threads.
 pub const MAX_AUTO_EMBED_THREADS: usize = 4;
 
