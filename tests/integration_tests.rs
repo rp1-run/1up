@@ -681,6 +681,71 @@ fn context_rejects_outside_root_by_default() {
 }
 
 #[test]
+fn context_rejects_absolute_in_root_path_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let project_root = tmp.path().join("project");
+    let in_root_file = project_root.join("in_root.rs");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::write(
+        &in_root_file,
+        "fn internal() {\n    println!(\"inside\");\n}\n",
+    )
+    .unwrap();
+    let location = format!("{}:1", in_root_file.display());
+
+    cmd()
+        .args([
+            "context",
+            &location,
+            "--path",
+            project_root.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "absolute context paths are disabled by default",
+        ))
+        .stderr(predicate::str::contains("--allow-outside-root"));
+}
+
+#[test]
+fn context_allows_absolute_in_root_path_with_explicit_override() {
+    let tmp = TempDir::new().unwrap();
+    let project_root = tmp.path().join("project");
+    let in_root_file = project_root.join("in_root.rs");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::write(
+        &in_root_file,
+        "fn internal() {\n    println!(\"inside\");\n}\n",
+    )
+    .unwrap();
+    let location = format!("{}:1", in_root_file.display());
+
+    let output = cmd()
+        .args([
+            "--format",
+            "json",
+            "context",
+            &location,
+            "--path",
+            project_root.to_str().unwrap(),
+            "--allow-outside-root",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert_eq!(result["scope_type"], "function");
+    assert_eq!(result["access_scope"], "project_root");
+    assert!(result["content"].as_str().unwrap().contains("fn internal"));
+}
+
+#[test]
 fn context_allows_outside_root_with_explicit_override() {
     let tmp = TempDir::new().unwrap();
     let project_root = tmp.path().join("project");

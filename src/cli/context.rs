@@ -61,6 +61,13 @@ fn resolve_context_target(
     allow_outside_root: bool,
 ) -> anyhow::Result<(PathBuf, ContextAccessScope)> {
     let requested = Path::new(requested_file);
+    if requested.is_absolute() && !allow_outside_root {
+        anyhow::bail!(
+            "absolute context paths are disabled by default; rerun with --allow-outside-root to read {}",
+            requested.display()
+        );
+    }
+
     let candidate = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
