@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use crate::shared::constants::{
     EMBED_THREADS_ENV_VAR, INDEX_JOBS_ENV_VAR, INDEX_WRITE_BATCH_FILES_ENV_VAR,
+    MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_CURRENT_MANIFEST_FILENAME, MODEL_STAGING_DIRNAME,
+    MODEL_VERIFIED_DIRNAME,
 };
 use crate::shared::errors::{ConfigError, OneupError};
 use crate::shared::types::IndexingConfig;
@@ -34,6 +36,31 @@ pub fn model_dir() -> Result<PathBuf, OneupError> {
 /// the system should not re-attempt until the marker is cleared.
 pub fn download_failure_marker() -> Result<PathBuf, OneupError> {
     Ok(model_dir()?.join(".download_failed"))
+}
+
+/// Returns the path to the directory containing verified model artifact sets.
+pub fn model_verified_dir() -> Result<PathBuf, OneupError> {
+    Ok(model_dir()?.join(MODEL_VERIFIED_DIRNAME))
+}
+
+/// Returns the path to the staging directory for model downloads/imports.
+pub fn model_staging_dir() -> Result<PathBuf, OneupError> {
+    Ok(model_dir()?.join(MODEL_STAGING_DIRNAME))
+}
+
+/// Returns the path to the active model artifact pointer file.
+pub fn model_current_manifest_path() -> Result<PathBuf, OneupError> {
+    Ok(model_dir()?.join(MODEL_CURRENT_MANIFEST_FILENAME))
+}
+
+/// Returns the path to a specific verified model artifact directory.
+pub fn verified_model_artifact_dir(artifact_id: &str) -> Result<PathBuf, OneupError> {
+    Ok(model_verified_dir()?.join(artifact_id))
+}
+
+/// Returns the path to the manifest for a specific verified model artifact.
+pub fn verified_model_manifest_path(artifact_id: &str) -> Result<PathBuf, OneupError> {
+    Ok(verified_model_artifact_dir(artifact_id)?.join(MODEL_ARTIFACT_MANIFEST_FILENAME))
 }
 
 /// Returns the path to the daemon PID file.

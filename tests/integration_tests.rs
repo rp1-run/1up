@@ -30,8 +30,11 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
 struct HideModelGuard {
     model_path: PathBuf,
     hidden_path: PathBuf,
+    current_path: PathBuf,
+    hidden_current_path: PathBuf,
     marker_path: PathBuf,
     active: bool,
+    current_active: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -47,11 +50,17 @@ impl HideModelGuard {
         let _ = fs::create_dir_all(&model_dir);
         let model_path = model_dir.join("model.onnx");
         let hidden_path = model_dir.join("model.onnx.hidden_by_test");
+        let current_path = model_dir.join("current.json");
+        let hidden_current_path = model_dir.join("current.json.hidden_by_test");
         let marker_path = model_dir.join(".download_failed");
 
         let active = model_path.exists();
         if active {
             fs::rename(&model_path, &hidden_path).unwrap();
+        }
+        let current_active = current_path.exists();
+        if current_active {
+            fs::rename(&current_path, &hidden_current_path).unwrap();
         }
         // Create download failure marker to prevent auto-download during tests
         let _ = fs::write(&marker_path, "hidden_by_test");
@@ -59,8 +68,11 @@ impl HideModelGuard {
         Self {
             model_path,
             hidden_path,
+            current_path,
+            hidden_current_path,
             marker_path,
             active,
+            current_active,
             _lock: lock,
         }
     }
@@ -70,6 +82,9 @@ impl Drop for HideModelGuard {
     fn drop(&mut self) {
         if self.active && self.hidden_path.exists() {
             let _ = fs::rename(&self.hidden_path, &self.model_path);
+        }
+        if self.current_active && self.hidden_current_path.exists() {
+            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
         }
         let _ = fs::remove_file(&self.marker_path);
     }
