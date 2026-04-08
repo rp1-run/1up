@@ -16,6 +16,9 @@ bench:
 bench-parallel repo='.':
     ./scripts/benchmark_parallel_indexing.sh {{repo}}
 
+security-check:
+    ./scripts/security_check.sh
+
 eval *flags:
     @cd evals && bun run eval; if echo "{{flags}}" | grep -q -- '--summary'; then just eval-summary; fi
 
