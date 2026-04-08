@@ -1,7 +1,7 @@
 # Module & Component Breakdown
 
 **Project**: 1up
-**Analysis Date**: 2026-04-07
+**Analysis Date**: 2026-04-08
 **Modules Analyzed**: 9
 
 ## Core Modules
@@ -41,12 +41,12 @@
 
 ### Indexer (`src/indexer/`)
 **Purpose**: Bounded staged indexing: scan, parse, embed, and single-writer persistence
-**Files**: 6 | **Lines**: ~5,784
+**Files**: 6 | **Lines**: ~6,418
 
 **Components**:
 - **Pipeline** (`pipeline.rs`): Config-aware orchestrator accepting `IndexingConfig` for jobs/embed_threads/write_batch_files plus `RunScope`; prepares scoped or full run inputs, falls back safely when watcher paths affect ignore semantics, uses bounded `spawn_blocking` parse workers with sequence IDs, flushes through a `BTreeMap` reorder buffer, batches embeddings through one ONNX session, and persists `IndexProgress`/`IndexParallelism`/`IndexStageTimings` to `.1up/index_status.json`
 - **Parser** (`parser.rs`): Multi-language AST parsing via tree-sitter; 16 language grammars; role classification and symbol collection
-- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with configurable intra-op `embed_threads`, auto-download, batch inference, mean pooling, L2 normalization, and warm runtime reuse keyed by model fingerprints plus thread count
+- **Embedder** (`embedder.rs`): ONNX engine (all-MiniLM-L6-v2) with configurable intra-op `embed_threads`, verified artifact download and activation (`verified/<artifact-id>/`, `current.json`, `.staging/`), legacy-cache import only after digest validation, batch inference, mean pooling, L2 normalization, and warm runtime reuse keyed by model fingerprints plus thread count
 - **Scanner** (`scanner.rs`): Directory walking via ignore crate with .gitignore respect and binary filtering
 - **Chunker** (`chunker.rs`): Sliding-window text chunking (60-line window, 10-line overlap) for unsupported languages flushed through the same staged pipeline
 
@@ -66,27 +66,30 @@
 
 ### Daemon (`src/daemon/`)
 **Purpose**: Background daemon for file watching, scoped incremental re-indexing, daemon-backed search, and persisted per-project indexing settings
-**Files**: 6 | **Lines**: ~1,775
+**Files**: 7 | **Lines**: ~2,465
 
 **Components**:
-- **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project `ProjectRunState` (one active + one queued via dirty flag), scoped `RunScope::Paths` scheduling, burst-collapsing follow-up scheduling, shared config resolution, daemon search handling, and a warm `EmbeddingRuntime` cache per project
-- **Lifecycle** (`lifecycle.rs`): Start/stop/ensure daemon with PID management, stale detection, and SIGHUP signaling
+- **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project `ProjectRunState` (one active + one queued via dirty flag), scoped `RunScope::Paths` scheduling, burst-collapsing follow-up scheduling, shared config resolution, semaphore-bounded daemon search handling, and a warm `EmbeddingRuntime` cache per project
+- **IPC** (`ipc.rs`): Length-prefixed JSON frame helpers with same-UID peer checks plus bounded request/response sizes and read/write deadlines
+- **Lifecycle** (`lifecycle.rs`): Start/stop/ensure daemon with secure PID management, stale detection, and SIGHUP signaling
 - **Watcher** (`watcher.rs`): Filesystem event monitoring via notify crate with debounce and non-blocking drain support
-- **Registry** (`registry.rs`): Project registration with optional persisted `IndexingConfig` in JSON-based project list
-- **Search Service** (`search_service.rs`): Unix domain socket transport for `SearchRequest`/`SearchResponse`; bind/accept/connect helpers plus graceful unavailable responses so CLI search can fall back locally
+- **Registry** (`registry.rs`): Project registration with optional persisted `IndexingConfig` in a JSON-based project list written through atomic, approved-root filesystem helpers
+- **Search Service** (`search_service.rs`): Secure Unix domain socket transport for `SearchRequest`/`SearchResponse`; owner-only socket bind, same-UID authorization, request sanitization, and graceful unavailable/busy responses so CLI search can fall back locally
 
 **Dependencies**: indexer, search, storage, shared
 
 ### Shared (`src/shared/`)
 **Purpose**: Cross-cutting types, config resolution, constants, error types, and project utilities
-**Files**: 7 | **Lines**: ~1,001
+**Files**: 8 | **Lines**: ~1,837
 
 **Components**:
 - **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, `IndexingConfig` (with `from_sources` resolution and validation), `IndexProgress`, `IndexParallelism`, `IndexStageTimings`, `IndexState`, `IndexPhase`, OutputFormat, SegmentRole, ReferenceKind
-- **Config** (`config.rs`): XDG-compliant paths plus `resolve_indexing_config` with priority: CLI > env > registry > defaults; `read_positive_env` for env var validation
-- **Constants** (`constants.rs`): Tuning constants, watcher debounce, env var names (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`, `ONEUP_INDEX_WRITE_BATCH_FILES`), `MAX_AUTO_EMBED_THREADS`, `DEFAULT_INDEX_WRITE_BATCH_FILES`, embedding/search limits
+- **Config** (`config.rs`): XDG-compliant paths plus verified model artifact paths (`verified/`, `.staging/`, `current.json`) and `resolve_indexing_config` with priority: CLI > env > registry > defaults; `read_positive_env` for env var validation
+- **Constants** (`constants.rs`): Tuning constants, watcher debounce, env var names (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`, `ONEUP_INDEX_WRITE_BATCH_FILES`), daemon IPC limits and deadlines, secure filesystem modes, verified artifact metadata, and embedding/search limits
 - **Errors** (`errors.rs`): OneupError hierarchy with thiserror derives
-- **Project** (`project.rs`): Project identity (UUID) and database path resolution
+- **Fs** (`fs.rs`): Approved-root filesystem helpers for secure directory creation, atomic replace, root clamping, and typed file/socket cleanup with symlink rejection
+- **Project** (`project.rs`): Project identity (UUID) and database path resolution backed by secure project-state helpers
+- **Symbols** (`symbols.rs`): Symbol canonicalization helpers shared by indexing and search paths
 
 **Dependencies**: None (foundation module)
 
@@ -134,10 +137,10 @@ graph TD
 |--------|-------|-------|------------|---------------|
 | cli | 13 | 1,658 | 9 | 128 |
 | search | 9 | 3,191 | 8 | 355 |
-| indexer | 6 | 5,784 | 5 | 964 |
+| indexer | 6 | 6,418 | 5 | 1,070 |
 | storage | 5 | 1,999 | 4 | 400 |
-| daemon | 6 | 1,775 | 5 | 296 |
-| shared | 7 | 1,001 | 5 | 143 |
+| daemon | 7 | 2,465 | 6 | 352 |
+| shared | 8 | 1,837 | 7 | 230 |
 | tests | 3 | 1,947 | 3 | 649 |
 | benches | 1 | 482 | 1 | 482 |
 | scripts | 3 | 1,244 | 3 | 415 |
@@ -153,6 +156,8 @@ graph TD
 - **Daemon-Backed Warm Search Reuse**: CLI search prefers daemon socket requests so repeated searches can reuse the daemon's warm embedding runtime
 - **Exact-First Symbol Retrieval**: Storage persists canonical symbol rows and search only widens into prefix/contains/fuzzy matching after exact misses
 - **Candidate-First Hybrid Retrieval**: Search ranks vector/FTS/symbol candidates before hydrating final segment bodies by ID
+- **Secure State Lifecycle**: Shared filesystem helpers enforce approved roots, owner-only permissions, atomic replacement, and typed cleanup for daemon and project state
+- **Verified Artifact Activation**: Embedder only activates model artifacts after staged writes, digest validation, manifest persistence, and atomic `current.json` replacement
 - **Graceful Degradation**: Missing embedder degrades hybrid search to FTS-only with user warnings
 - **Auto-Start Daemon**: Search commands auto-start daemon via `lifecycle::ensure_daemon()`; start auto-inits project if needed
 - **SIGHUP Reload**: Daemon handles SIGHUP to reload registry and per-project settings without restart

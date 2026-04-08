@@ -28,7 +28,14 @@ cd 1up-rs
 cargo install --path .
 ```
 
-The binary is named `1up`. On first use, the embedding model (~80MB) is auto-downloaded from Hugging Face.
+The binary is named `1up`.
+
+On the first indexing or search run, 1up may download `model.onnx` and `tokenizer.json` from
+Hugging Face into `~/.local/share/1up/models/all-MiniLM-L6-v2/verified/<artifact-id>/`. Those
+files only become active after both pass pinned SHA-256 verification and `current.json` is
+updated. If a download fails, the last verified artifact stays active and 1up writes
+`~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed`; remove that marker and rerun
+`1up index` or `1up start` to retry semantic-search setup.
 
 ## Quick Start
 
@@ -109,7 +116,12 @@ Retrieve the enclosing scope (function, class, impl block) around a file locatio
 1up context src/lib.rs:100 --expansion 80
 ```
 
-Uses tree-sitter to snap to structural boundaries. Falls back to a line window (+/- 50 lines) for unsupported languages.
+Uses tree-sitter to snap to structural boundaries. Falls back to a line window (+/- 50 lines) for
+unsupported languages.
+
+By default, `1up context` only reads files whose canonical path stays under the selected project
+root. Absolute paths and outside-root targets are rejected unless you pass
+`--allow-outside-root`, and outside-root reads are marked in the result payload.
 
 ### Structural Search
 
@@ -210,7 +222,9 @@ Files in unsupported languages are indexed via text chunking (sliding window) an
 
 ## Development
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture, storage layout, internals, and contributing.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture, daemon IPC, storage layout, internals, and
+contributing. Before release work, run `just security-check`; it executes the repo security gate
+and writes retained evidence to `target/security/security-check.json`.
 
 ## License
 
