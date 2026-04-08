@@ -1,0 +1,17 @@
+# Repo-local cargo-audit policy for release readiness.
+#
+# Add any accepted advisory exceptions to `ignore` only with a linked release
+# approval or risk acceptance note in this file's comments.
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained", "unsound", "notice"]
+severity_threshold = "low"
+
+[database]
+fetch = true
+stale = false
+
+[output]
+deny = []
+quiet = false
+show_tree = true
