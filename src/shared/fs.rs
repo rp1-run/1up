@@ -240,10 +240,9 @@ fn remove_expected_leaf(
         ))
     })?;
 
-    let canonical_parent = match fs::canonicalize(parent) {
-        Ok(path) => path,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(io_error(parent, err)),
+    let canonical_parent = match canonicalize_existing_if_present(parent)? {
+        Some(path) => path,
+        None => return Ok(false),
     };
     if !canonical_parent.starts_with(&root) {
         return Err(outside_root(&absolute, &root));
@@ -273,28 +272,89 @@ fn remove_expected_leaf(
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf, OneupError> {
-    let absolute = normalize_absolute(path)?;
+    let absolute = match validate_path_components(path, MissingComponentBehavior::Error)? {
+        Some(path) => path,
+        None => {
+            return Err(FilesystemError::InvalidPath(format!(
+                "path must exist: {}",
+                path.display()
+            ))
+            .into())
+        }
+    };
     fs::canonicalize(&absolute).map_err(|source| io_error(&absolute, source))
 }
 
 fn validate_existing_directory(path: &Path) -> Result<PathBuf, OneupError> {
-    let absolute = normalize_absolute(path)?;
-    let mut current = PathBuf::new();
-
-    for component in absolute.components() {
-        current.push(component.as_os_str());
-        let metadata =
-            fs::symlink_metadata(&current).map_err(|source| io_error(&current, source))?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(FilesystemError::SymlinkComponent(current.display().to_string()).into());
+    let absolute = match validate_path_components(path, MissingComponentBehavior::Error)? {
+        Some(path) => path,
+        None => {
+            return Err(FilesystemError::InvalidPath(format!(
+                "path must exist: {}",
+                path.display()
+            ))
+            .into())
         }
-        if !file_type.is_dir() {
-            return Err(unexpected_type(&current, "directory", &file_type));
-        }
+    };
+    let metadata = fs::symlink_metadata(&absolute).map_err(|source| io_error(&absolute, source))?;
+    let file_type = metadata.file_type();
+    if !file_type.is_dir() {
+        return Err(unexpected_type(&absolute, "directory", &file_type));
     }
 
     Ok(absolute)
+}
+
+fn canonicalize_existing_if_present(path: &Path) -> Result<Option<PathBuf>, OneupError> {
+    let absolute = match validate_path_components(path, MissingComponentBehavior::ReturnNone)? {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(&absolute, err)),
+    }
+}
+
+fn validate_path_components(
+    path: &Path,
+    missing_behavior: MissingComponentBehavior,
+) -> Result<Option<PathBuf>, OneupError> {
+    let absolute = normalize_absolute(path)?;
+    let component_count = absolute.components().count();
+    let mut current = PathBuf::new();
+
+    for (index, component) in absolute.components().enumerate() {
+        let is_leaf = index + 1 == component_count;
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    return Err(
+                        FilesystemError::SymlinkComponent(current.display().to_string()).into(),
+                    );
+                }
+                if !is_leaf && !file_type.is_dir() {
+                    return Err(unexpected_type(&current, "directory", &file_type));
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => match missing_behavior {
+                MissingComponentBehavior::Error => return Err(io_error(&current, err)),
+                MissingComponentBehavior::ReturnNone => return Ok(None),
+            },
+            Err(err) => return Err(io_error(&current, err)),
+        }
+    }
+
+    Ok(Some(absolute))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MissingComponentBehavior {
+    Error,
+    ReturnNone,
 }
 
 fn normalize_absolute(path: &Path) -> Result<PathBuf, OneupError> {
@@ -459,7 +519,53 @@ mod tests {
 
         let err = clamp_canonical_path_to_root(&project_root, &project_root.join("escape.txt"))
             .unwrap_err();
-        assert!(err.to_string().contains("outside approved root"));
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn clamp_canonical_path_to_root_rejects_in_root_symlinked_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = canonical_tmp_root(tmp.path()).join("project");
+        let real_dir = project_root.join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("state.json"), "{}").unwrap();
+        symlink(&real_dir, project_root.join("linked")).unwrap();
+
+        let err =
+            clamp_canonical_path_to_root(&project_root, &project_root.join("linked/state.json"))
+                .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn validate_regular_file_path_rejects_in_root_symlinked_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = canonical_tmp_root(tmp.path()).join("project");
+        let real_dir = project_root.join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("state.json"), "{}").unwrap();
+        symlink(&real_dir, project_root.join("linked")).unwrap();
+
+        let err =
+            validate_regular_file_path(&project_root.join("linked/state.json"), &project_root)
+                .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn remove_regular_file_rejects_in_root_symlinked_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = canonical_tmp_root(tmp.path()).join("project");
+        let real_dir = project_root.join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("state.json");
+        fs::write(&real_file, "{}").unwrap();
+        symlink(&real_dir, project_root.join("linked")).unwrap();
+
+        let err = remove_regular_file(&project_root.join("linked/state.json"), &project_root)
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert!(real_file.exists());
     }
 
     #[test]
