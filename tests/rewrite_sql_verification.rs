@@ -81,7 +81,10 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn db_path(dir: &Path) -> PathBuf {
-    dir.join(".1up").join("index.db")
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .join(".1up")
+        .join("index.db")
 }
 
 fn create_search_fixture() -> TempDir {

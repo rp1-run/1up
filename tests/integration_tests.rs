@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -21,6 +23,22 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
     {
         home.join(".local").join("share").join("1up")
     }
+}
+
+fn write_framed_json(stream: &mut UnixStream, value: &serde_json::Value) {
+    let payload = serde_json::to_vec(value).unwrap();
+    let length = u32::try_from(payload.len()).unwrap().to_be_bytes();
+    stream.write_all(&length).unwrap();
+    stream.write_all(&payload).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+}
+
+fn read_framed_json(stream: &mut UnixStream) -> serde_json::Value {
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut payload).unwrap();
+    serde_json::from_slice(&payload).unwrap()
 }
 
 /// RAII guard that temporarily hides the embedding model to force FTS-only mode.
@@ -1241,7 +1259,6 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
     let server_socket_path = socket_path.clone();
     let server_expected_root = expected_root.clone();
     let server = std::thread::spawn(move || {
-        use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
         if let Some(parent) = server_socket_path.parent() {
@@ -1252,9 +1269,7 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
         let listener = UnixListener::bind(&server_socket_path).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
 
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request).unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        let payload = read_framed_json(&mut stream);
         assert_eq!(
             payload["project_root"].as_str().unwrap(),
             server_expected_root.to_str().unwrap()
@@ -1276,7 +1291,7 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
                 }
             ]
         });
-        stream.write_all(response.to_string().as_bytes()).unwrap();
+        write_framed_json(&mut stream, &response);
     });
 
     cmd()

@@ -115,12 +115,11 @@ async fn run_inner() -> Result<(), OneupError> {
                 if let Some(request) = request {
                     match request {
                         Ok(Some(mut stream)) => {
-                            let permit = match request_limit.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    if let Err(err) = search_service::send_busy_response(&mut stream).await {
-                                        warn!("failed to respond to saturated daemon search request: {err}");
-                                    }
+                            let permit = match acquire_request_permit(&request_limit, &mut stream).await {
+                                Ok(Some(permit)) => permit,
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    warn!("failed to respond to saturated daemon search request: {err}");
                                     continue;
                                 }
                             };
@@ -184,6 +183,19 @@ async fn run_inner() -> Result<(), OneupError> {
 
     info!("daemon worker exiting");
     Ok(())
+}
+
+async fn acquire_request_permit(
+    request_limit: &Arc<Semaphore>,
+    stream: &mut UnixStream,
+) -> Result<Option<OwnedSemaphorePermit>, OneupError> {
+    match request_limit.clone().try_acquire_owned() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(_) => {
+            search_service::send_busy_response(stream).await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn serve_search_connection(
@@ -696,6 +708,8 @@ async fn handle_search_request(
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
     #[test]
     fn run_state_collapses_bursts_into_follow_up() {
         let mut state = ProjectRunState::default();
@@ -942,6 +956,29 @@ mod tests {
         assert!(matches!(
             response,
             SearchResponse::Unavailable { ref reason } if reason == "daemon unavailable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquire_request_permit_returns_busy_response_when_saturated() {
+        let request_limit = Arc::new(Semaphore::new(0));
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+
+        let permit = acquire_request_permit(&request_limit, &mut server)
+            .await
+            .unwrap();
+        let response: SearchResponse = crate::daemon::ipc::read_json_frame(
+            &mut client,
+            crate::shared::constants::MAX_DAEMON_RESPONSE_BYTES,
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap();
+
+        assert!(permit.is_none());
+        assert!(matches!(
+            response,
+            SearchResponse::Unavailable { ref reason } if reason == "daemon busy"
         ));
     }
 }
