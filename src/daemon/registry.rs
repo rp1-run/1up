@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::shared::config;
+use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
 use crate::shared::errors::{DaemonError, OneupError};
+use crate::shared::fs::{atomic_replace, ensure_secure_xdg_root, validate_regular_file_path};
 use crate::shared::types::IndexingConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +24,19 @@ pub struct Registry {
 
 impl Registry {
     pub fn load() -> Result<Self, OneupError> {
-        let path = config::projects_registry_path()?;
+        let xdg_root = ensure_secure_xdg_root()?;
+        Self::load_from_path(&config::projects_registry_path()?, &xdg_root)
+    }
+
+    pub fn save(&self) -> Result<(), OneupError> {
+        let xdg_root = ensure_secure_xdg_root()?;
+        self.save_to_path(&config::projects_registry_path()?, &xdg_root)
+    }
+
+    fn load_from_path(path: &Path, approved_root: &Path) -> Result<Self, OneupError> {
+        let path = validate_regular_file_path(path, approved_root).map_err(|err| {
+            DaemonError::WatcherError(format!("failed to validate registry path: {err}"))
+        })?;
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -36,19 +50,17 @@ impl Registry {
         Ok(registry)
     }
 
-    pub fn save(&self) -> Result<(), OneupError> {
-        let path = config::projects_registry_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                DaemonError::WatcherError(format!("failed to create registry dir: {e}"))
-            })?;
-        }
-
-        let content = serde_json::to_string_pretty(self)
+    fn save_to_path(&self, path: &Path, approved_root: &Path) -> Result<(), OneupError> {
+        let content = serde_json::to_vec_pretty(self)
             .map_err(|e| DaemonError::WatcherError(format!("failed to serialize registry: {e}")))?;
-
-        std::fs::write(&path, content)
-            .map_err(|e| DaemonError::WatcherError(format!("failed to write registry: {e}")))?;
+        atomic_replace(
+            path,
+            &content,
+            approved_root,
+            XDG_STATE_DIR_MODE,
+            SECURE_STATE_FILE_MODE,
+        )
+        .map_err(|e| DaemonError::WatcherError(format!("failed to write registry: {e}")))?;
 
         Ok(())
     }
@@ -130,6 +142,7 @@ impl Registry {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
     fn registry_roundtrip() {
@@ -240,5 +253,57 @@ mod tests {
             indexing.write_batch_files,
             crate::shared::types::IndexingConfig::default_write_batch_files_for(indexing.jobs)
         );
+    }
+
+    #[test]
+    fn registry_save_secures_xdg_root_and_registry_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg_root = tmp.path().canonicalize().unwrap().join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::set_permissions(&xdg_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            project_id: "abc-123".to_string(),
+            project_root,
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: Some(IndexingConfig::new(4, 2, 1).unwrap()),
+        });
+
+        registry.save_to_path(&registry_path, &xdg_root).unwrap();
+        let root_mode = fs::metadata(&xdg_root).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&registry_path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(root_mode, XDG_STATE_DIR_MODE);
+        assert_eq!(file_mode, SECURE_STATE_FILE_MODE);
+        assert_eq!(
+            Registry::load_from_path(&registry_path, &xdg_root)
+                .unwrap()
+                .projects
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn registry_load_rejects_symlinked_registry_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let outside_root = tmp_root.join("outside");
+        let registry_path = xdg_root.join("projects.json");
+
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&outside_root).unwrap();
+        fs::write(outside_root.join("projects.json"), "{}").unwrap();
+        symlink(outside_root.join("projects.json"), &registry_path).unwrap();
+
+        let err = Registry::load_from_path(&registry_path, &xdg_root).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
     }
 }
