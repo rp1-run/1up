@@ -620,8 +620,10 @@ fn context_retrieval_returns_enclosing_scope_json() {
     assert!(result.get("line_start").is_some());
     assert!(result.get("line_end").is_some());
     assert!(result.get("scope_type").is_some());
+    assert!(result.get("access_scope").is_some());
 
     assert_eq!(result["scope_type"], "function");
+    assert_eq!(result["access_scope"], "project_root");
     assert!(result["content"].as_str().unwrap().contains("fn greet"));
 }
 
@@ -648,7 +650,70 @@ fn context_retrieval_python_scope() {
     let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
 
     assert_eq!(result["scope_type"], "function");
+    assert_eq!(result["access_scope"], "project_root");
     assert!(result["content"].as_str().unwrap().contains("parse_config"));
+}
+
+#[test]
+fn context_rejects_outside_root_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let project_root = tmp.path().join("project");
+    let outside_file = tmp.path().join("outside.rs");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::write(
+        &outside_file,
+        "fn leaked() {\n    println!(\"outside\");\n}\n",
+    )
+    .unwrap();
+    let location = format!("{}:1", outside_file.display());
+
+    cmd()
+        .args([
+            "context",
+            &location,
+            "--path",
+            project_root.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--allow-outside-root"));
+}
+
+#[test]
+fn context_allows_outside_root_with_explicit_override() {
+    let tmp = TempDir::new().unwrap();
+    let project_root = tmp.path().join("project");
+    let outside_file = tmp.path().join("outside.rs");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::write(
+        &outside_file,
+        "fn leaked() {\n    println!(\"outside\");\n}\n",
+    )
+    .unwrap();
+    let location = format!("{}:1", outside_file.display());
+
+    let output = cmd()
+        .args([
+            "--format",
+            "json",
+            "context",
+            &location,
+            "--path",
+            project_root.to_str().unwrap(),
+            "--allow-outside-root",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert_eq!(result["scope_type"], "function");
+    assert_eq!(result["access_scope"], "outside_root");
+    assert!(result["content"].as_str().unwrap().contains("fn leaked"));
 }
 
 // ---------- Verify JSON output conforms to schema ----------
@@ -758,6 +823,7 @@ fn json_output_context_schema_conformance() {
     assert!(result["line_start"].is_number());
     assert!(result["line_end"].is_number());
     assert!(result["scope_type"].is_string());
+    assert!(result["access_scope"].is_string());
 }
 
 // ---------- Verify incremental indexing ----------
