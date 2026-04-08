@@ -4,7 +4,7 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::indexer::parser::SupportedLanguage;
 use crate::shared::constants::CONTEXT_FALLBACK_LINES;
-use crate::shared::types::ContextResult;
+use crate::shared::types::{ContextAccessScope, ContextResult};
 
 pub struct ContextEngine;
 
@@ -13,6 +13,20 @@ impl ContextEngine {
         file_path: &Path,
         target_line: usize,
         expansion: Option<usize>,
+    ) -> anyhow::Result<ContextResult> {
+        Self::retrieve_with_scope(
+            file_path,
+            target_line,
+            expansion,
+            ContextAccessScope::ProjectRoot,
+        )
+    }
+
+    pub fn retrieve_with_scope(
+        file_path: &Path,
+        target_line: usize,
+        expansion: Option<usize>,
+        access_scope: ContextAccessScope,
     ) -> anyhow::Result<ContextResult> {
         let source = std::fs::read_to_string(file_path)?;
         let total_lines = source.lines().count();
@@ -34,6 +48,7 @@ impl ContextEngine {
                     line_start: scope.line_start,
                     line_end: scope.line_end,
                     scope_type: scope.scope_type,
+                    access_scope: Some(access_scope),
                 }),
                 None => Ok(line_range_fallback(
                     &source,
@@ -42,6 +57,7 @@ impl ContextEngine {
                     total_lines,
                     expansion.unwrap_or(CONTEXT_FALLBACK_LINES),
                     lang.name(),
+                    access_scope,
                 )),
             },
             None => {
@@ -53,6 +69,7 @@ impl ContextEngine {
                     total_lines,
                     expansion.unwrap_or(CONTEXT_FALLBACK_LINES),
                     lang_name,
+                    access_scope,
                 ))
             }
         }
@@ -329,6 +346,7 @@ fn line_range_fallback(
     total_lines: usize,
     window: usize,
     language: &str,
+    access_scope: ContextAccessScope,
 ) -> ContextResult {
     let start = if target_line > window {
         target_line - window
@@ -347,6 +365,7 @@ fn line_range_fallback(
         line_start: start,
         line_end: end,
         scope_type: "lines".to_string(),
+        access_scope: Some(access_scope),
     }
 }
 
@@ -427,6 +446,7 @@ fn another() {
         let (_f, path) = write_temp_file(source, "rs");
         let result = ContextEngine::retrieve(&path, 8, None).unwrap();
         assert_eq!(result.scope_type, "function");
+        assert_eq!(result.access_scope, Some(ContextAccessScope::ProjectRoot));
         assert!(result.content.contains("fn main()"));
         assert!(result.content.contains("println!"));
         assert_eq!(result.line_start, 6);
@@ -493,9 +513,26 @@ class MyClass:
         let (_f, path) = write_temp_file(source, "txt");
         let result = ContextEngine::retrieve(&path, 5, Some(2)).unwrap();
         assert_eq!(result.scope_type, "lines");
+        assert_eq!(result.access_scope, Some(ContextAccessScope::ProjectRoot));
         assert_eq!(result.line_start, 3);
         assert_eq!(result.line_end, 7);
         assert_eq!(result.language, "txt");
+    }
+
+    #[test]
+    fn test_context_retrieve_with_scope_marks_outside_root() {
+        let source = r#"
+fn leaked() {
+    println!("outside");
+}
+"#;
+        let (_f, path) = write_temp_file(source, "rs");
+        let result =
+            ContextEngine::retrieve_with_scope(&path, 2, None, ContextAccessScope::OutsideRoot)
+                .unwrap();
+
+        assert_eq!(result.scope_type, "function");
+        assert_eq!(result.access_scope, Some(ContextAccessScope::OutsideRoot));
     }
 
     #[test]

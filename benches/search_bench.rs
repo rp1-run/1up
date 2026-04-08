@@ -4,8 +4,14 @@ use oneup::search::ranking::rank_candidates;
 use oneup::search::retrieval::{RetrievalBackend, RetrievalMode};
 use oneup::storage::segments::{self, SegmentInsert};
 
+// macOS tempdirs are often exposed through the symlinked `/var` alias.
+fn canonical_temp_root(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    tmp.path().canonicalize().unwrap()
+}
+
 fn setup_db_and_index() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
+    let temp_root = canonical_temp_root(&tmp);
 
     let rust_source = r#"
 use std::io;
@@ -135,34 +141,34 @@ CREATE TABLE routing_rules_preview (
 );
 "#;
 
-    std::fs::write(tmp.path().join("main.rs"), rust_source).unwrap();
-    std::fs::write(tmp.path().join("processor.py"), python_source).unwrap();
-    std::fs::write(tmp.path().join("handler.js"), js_source).unwrap();
-    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("proto")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("sql")).unwrap();
-    std::fs::write(tmp.path().join("config").join("webhooks.yaml"), yaml_source).unwrap();
+    std::fs::write(temp_root.join("main.rs"), rust_source).unwrap();
+    std::fs::write(temp_root.join("processor.py"), python_source).unwrap();
+    std::fs::write(temp_root.join("handler.js"), js_source).unwrap();
+    std::fs::create_dir_all(temp_root.join("config")).unwrap();
+    std::fs::create_dir_all(temp_root.join("proto")).unwrap();
+    std::fs::create_dir_all(temp_root.join("sql")).unwrap();
+    std::fs::write(temp_root.join("config").join("webhooks.yaml"), yaml_source).unwrap();
     std::fs::write(
-        tmp.path().join("proto").join("routing_rules.proto"),
+        temp_root.join("proto").join("routing_rules.proto"),
         proto_source,
     )
     .unwrap();
-    std::fs::write(tmp.path().join("sql").join("routing_rules.sql"), sql_source).unwrap();
-    std::fs::create_dir_all(tmp.path().join(".1up")).unwrap();
+    std::fs::write(temp_root.join("sql").join("routing_rules.sql"), sql_source).unwrap();
+    std::fs::create_dir_all(temp_root.join(".1up")).unwrap();
     std::fs::write(
-        tmp.path().join(".1up").join("project_id"),
+        temp_root.join(".1up").join("project_id"),
         "bench-project-id",
     )
     .unwrap();
 
-    let db_path = tmp.path().join(".1up").join("index.db");
+    let db_path = temp_root.join(".1up").join("index.db");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let db = oneup::storage::db::Db::open_rw(&db_path).await.unwrap();
         let conn = db.connect().unwrap();
         oneup::storage::schema::initialize(&conn).await.unwrap();
-        oneup::indexer::pipeline::run(&conn, tmp.path(), None)
+        oneup::indexer::pipeline::run(&conn, &temp_root, None)
             .await
             .unwrap();
     });
@@ -180,9 +186,10 @@ fn embedding_with(values: &[(usize, f32)]) -> Vec<f32> {
 
 fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, String) {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".1up")).unwrap();
+    let temp_root = canonical_temp_root(&tmp);
+    std::fs::create_dir_all(temp_root.join(".1up")).unwrap();
 
-    let db_path = tmp.path().join(".1up").join("index.db");
+    let db_path = temp_root.join(".1up").join("index.db");
     let query = "request auth token validation".to_string();
     let query_embedding = embedding_with(&[(0, 1.0), (1, 0.8)]);
 

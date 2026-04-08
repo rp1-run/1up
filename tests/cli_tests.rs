@@ -27,8 +27,11 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
 struct HideModelGuard {
     model_path: PathBuf,
     hidden_path: PathBuf,
+    current_path: PathBuf,
+    hidden_current_path: PathBuf,
     marker_path: PathBuf,
     active: bool,
+    current_active: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -44,19 +47,28 @@ impl HideModelGuard {
         let _ = fs::create_dir_all(&model_dir);
         let model_path = model_dir.join("model.onnx");
         let hidden_path = model_dir.join("model.onnx.hidden_by_test");
+        let current_path = model_dir.join("current.json");
+        let hidden_current_path = model_dir.join("current.json.hidden_by_test");
         let marker_path = model_dir.join(".download_failed");
 
         let active = model_path.exists();
         if active {
             fs::rename(&model_path, &hidden_path).unwrap();
         }
+        let current_active = current_path.exists();
+        if current_active {
+            fs::rename(&current_path, &hidden_current_path).unwrap();
+        }
         let _ = fs::write(&marker_path, "hidden_by_test");
 
         Self {
             model_path,
             hidden_path,
+            current_path,
+            hidden_current_path,
             marker_path,
             active,
+            current_active,
             _lock: lock,
         }
     }
@@ -66,6 +78,9 @@ impl Drop for HideModelGuard {
     fn drop(&mut self) {
         if self.active && self.hidden_path.exists() {
             let _ = fs::rename(&self.hidden_path, &self.model_path);
+        }
+        if self.current_active && self.hidden_current_path.exists() {
+            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
         }
         let _ = fs::remove_file(&self.marker_path);
     }
@@ -214,7 +229,9 @@ fn init_warns_if_already_initialized() {
 fn start_auto_initializes_project_if_needed() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let data_dir = test_data_dir(home.path());
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
     let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
     fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
@@ -225,10 +242,10 @@ fn start_auto_initializes_project_if_needed() {
     .unwrap();
 
     let output = cmd()
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .args(["--format", "json", "start", dir.path().to_str().unwrap()])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["--format", "json", "start", canonical_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -241,7 +258,7 @@ fn start_auto_initializes_project_if_needed() {
     assert!(payload["progress"]["files_indexed"].as_u64().unwrap() > 0);
     assert!(payload["progress"]["segments_stored"].as_u64().unwrap() > 0);
 
-    let id_path = dir.path().join(".1up").join("project_id");
+    let id_path = canonical_dir.join(".1up").join("project_id");
     assert!(id_path.exists(), "start should create .1up/project_id");
 
     let pid_file = data_dir.join("daemon.pid");
@@ -251,10 +268,15 @@ fn start_auto_initializes_project_if_needed() {
     }
 
     let status = cmd()
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .args(["--format", "json", "status", dir.path().to_str().unwrap()])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args([
+            "--format",
+            "json",
+            "status",
+            canonical_dir.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(status.status.success());
@@ -265,10 +287,10 @@ fn start_auto_initializes_project_if_needed() {
 
     if pid_file.exists() {
         cmd()
-            .env("HOME", home.path())
-            .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
-            .env("XDG_CONFIG_HOME", home.path().join(".config"))
-            .args(["--format", "json", "stop", dir.path().to_str().unwrap()])
+            .env("HOME", &canonical_home)
+            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+            .args(["--format", "json", "stop", canonical_dir.to_str().unwrap()])
             .assert()
             .success();
     }

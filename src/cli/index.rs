@@ -6,6 +6,7 @@ use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
+use crate::shared::fs::ensure_secure_project_root;
 use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -41,10 +42,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         registry.indexing_config_for(&project_root),
     )?;
 
-    let dot_dir = config::project_dot_dir(&project_root);
-    if !dot_dir.exists() {
-        std::fs::create_dir_all(&dot_dir)?;
-    }
+    ensure_secure_project_root(&project_root)?;
 
     let setup_spinner = spin("Preparing database");
 

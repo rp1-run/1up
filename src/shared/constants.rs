@@ -22,6 +22,24 @@ pub const SYMBOL_WEIGHT: f64 = 4.0;
 /// Maximum search results returned per query.
 pub const MAX_SEARCH_RESULTS: usize = 20;
 
+/// Maximum size of a framed daemon request payload in bytes.
+pub const MAX_DAEMON_REQUEST_BYTES: usize = 16 * 1024;
+
+/// Maximum size of a framed daemon response payload in bytes.
+pub const MAX_DAEMON_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum daemon search query length in bytes.
+pub const MAX_DAEMON_QUERY_BYTES: usize = 4 * 1024;
+
+/// Read deadline for a single daemon IPC frame.
+pub const DAEMON_READ_TIMEOUT_MS: u64 = 250;
+
+/// Write deadline for a single daemon IPC frame.
+pub const DAEMON_WRITE_TIMEOUT_MS: u64 = 250;
+
+/// Maximum number of in-flight daemon requests before new clients are shed.
+pub const MAX_DAEMON_IN_FLIGHT_REQUESTS: usize = 8;
+
 /// Maximum results per file in search output.
 pub const MAX_RESULTS_PER_FILE: usize = 3;
 
@@ -42,6 +60,22 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
+
+/// Owner-only permissions for the XDG-managed state directory.
+#[allow(dead_code)]
+pub const XDG_STATE_DIR_MODE: u32 = 0o700;
+
+/// Owner-only permissions for the project-local `.1up` directory.
+#[allow(dead_code)]
+pub const PROJECT_STATE_DIR_MODE: u32 = 0o700;
+
+/// Owner-only permissions for security-sensitive state files.
+#[allow(dead_code)]
+pub const SECURE_STATE_FILE_MODE: u32 = 0o600;
+
+/// Owner-only permissions for daemon socket files after bind.
+#[allow(dead_code)]
+pub const SECURE_SOCKET_MODE: u32 = 0o600;
 
 /// Conservative upper bound for auto-selected embedding threads.
 pub const MAX_AUTO_EMBED_THREADS: usize = 4;
@@ -69,6 +103,35 @@ pub const MODEL_FILENAME: &str = "model.onnx";
 
 /// Tokenizer filename.
 pub const TOKENIZER_FILENAME: &str = "tokenizer.json";
+
+/// Verified model artifact store directory name.
+pub const MODEL_VERIFIED_DIRNAME: &str = "verified";
+
+/// Model artifact staging directory name.
+pub const MODEL_STAGING_DIRNAME: &str = ".staging";
+
+/// Active model artifact pointer filename.
+pub const MODEL_CURRENT_MANIFEST_FILENAME: &str = "current.json";
+
+/// Verified model artifact manifest filename.
+pub const MODEL_ARTIFACT_MANIFEST_FILENAME: &str = "manifest.json";
+
+/// Schema version for verified model artifact metadata.
+pub const MODEL_ARTIFACT_MANIFEST_VERSION: u32 = 1;
+
+/// Connect timeout for model downloads.
+pub const MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Total request timeout for model downloads.
+pub const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
+/// Pinned SHA-256 digest for the ONNX embedding model.
+pub const MODEL_ONNX_SHA256: &str =
+    "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
+
+/// Pinned SHA-256 digest for the tokenizer artifact.
+pub const TOKENIZER_SHA256: &str =
+    "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
 
 /// Hugging Face model repository for auto-download.
 pub const HF_MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";

@@ -306,7 +306,18 @@ EOF
 
 require_cmd cargo git hyperfine jq
 
-if [[ ! -f "$MODEL_DIR/model.onnx" || ! -f "$MODEL_DIR/tokenizer.json" ]]; then
+MODEL_RUNTIME_DIR="$MODEL_DIR"
+if [[ -f "$MODEL_DIR/current.json" ]]; then
+  ACTIVE_ARTIFACT_ID=$(jq -r '.artifact_id // empty' "$MODEL_DIR/current.json" 2>/dev/null || true)
+  if [[ -n "$ACTIVE_ARTIFACT_ID" ]]; then
+    CANDIDATE_DIR="$MODEL_DIR/verified/$ACTIVE_ARTIFACT_ID"
+    if [[ -f "$CANDIDATE_DIR/model.onnx" && -f "$CANDIDATE_DIR/tokenizer.json" ]]; then
+      MODEL_RUNTIME_DIR="$CANDIDATE_DIR"
+    fi
+  fi
+fi
+
+if [[ ! -f "$MODEL_RUNTIME_DIR/model.onnx" || ! -f "$MODEL_RUNTIME_DIR/tokenizer.json" ]]; then
   printf 'embedding model not available at %s\n' "$MODEL_DIR" >&2
   exit 1
 fi

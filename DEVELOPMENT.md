@@ -41,7 +41,7 @@ Layered architecture with a two-process model:
 - **Search** (`src/search/`): candidate-first hybrid fusion, exact-first symbol lookup, structural queries, context retrieval
 - **Daemon** (`src/daemon/`): background file watcher with scoped follow-up indexing and daemon-backed search reuse
 - **Storage** (`src/storage/`): libSQL with FTS5 and native vector search
-- **Shared** (`src/shared/`): types, config resolution, constants, errors
+- **Shared** (`src/shared/`): types, config resolution, secure filesystem helpers, constants, errors
 
 CLI and daemon both converge on `pipeline::run_with_config` for indexing. No runtime state is shared between processes — they communicate through the database, PID file, project registry, and Unix signals.
 
@@ -95,7 +95,27 @@ The daemon is a detached `1up __worker` process (hidden subcommand) with a `toki
 
 `1up start` registers the project (with optional `IndexingConfig`) and spawns the worker if not already running, or sends `SIGHUP` to reload. `1up stop` deregisters the project and sends `SIGTERM` if no projects remain, `SIGHUP` otherwise.
 
+### Daemon IPC
+
+Daemon-backed search uses one length-prefixed JSON frame per request and response over
+`~/.local/share/1up/daemon.sock`. The transport is hardened in three layers:
+
+- `src/daemon/search_service.rs` binds the socket under the XDG data root, chmods it to `0600`,
+  canonicalizes `project_root`, clamps `limit`, and returns only safe `unavailable` or `busy`
+  reasons to callers.
+- `src/daemon/ipc.rs` enforces same-UID peer authorization, a 16 KiB request cap, a 4 KiB query
+  cap, a 2 MiB response cap, and 250 ms read and write deadlines for each frame.
+- `src/daemon/worker.rs` gates request handling with an 8-slot semaphore. Saturated, malformed,
+  unauthorized, or timed-out clients are shed so the CLI can fall back to local search instead of
+  blocking the daemon loop.
+
 ## Storage Layout
+
+All daemon-managed state goes through `src/shared/fs.rs`. The XDG data root
+(`~/.local/share/1up/`) and each project's `.1up/` directory are created with `0700`
+permissions. Sensitive files such as `daemon.pid`, `projects.json`, `project_id`, and verified
+artifact manifests use `0600`, and write/remove helpers reject symlinked or outside-root paths
+before mutating state.
 
 ```
 ~/.config/1up/                  # XDG config (reserved for future use)
@@ -105,8 +125,15 @@ The daemon is a detached `1up __worker` process (hidden subcommand) with a `toki
   projects.json                 # Global project registry (includes per-project IndexingConfig)
   models/
     all-MiniLM-L6-v2/
-      model.onnx                # ONNX embedding model (auto-downloaded)
-      tokenizer.json            # WordPiece tokenizer (auto-downloaded)
+      current.json              # Active verified artifact pointer
+      .download_failed          # Suppresses auto-retry after a failed download
+      verified/
+        <artifact-id>/
+          manifest.json         # Verified artifact manifest
+          model.onnx            # Active ONNX embedding model
+          tokenizer.json        # Active WordPiece tokenizer
+      .staging/
+        <artifact-id>/          # Transient staging area before activation
 
 <project-root>/
   .1up/
@@ -115,12 +142,17 @@ The daemon is a detached `1up __worker` process (hidden subcommand) with a `toki
     index_status.json           # Latest indexing progress snapshot
 ```
 
+Downloads and legacy flat-file imports both flow through the verified artifact store. Files are
+written into `.staging/<artifact-id>/`, fsynced, SHA-256 checked, and only then renamed into
+`verified/<artifact-id>/` before `current.json` is atomically replaced. Failed or partial downloads
+never replace the last known-good artifact.
+
 ## Search Internals
 
-`1up search` tries the daemon first when the project is registered. The CLI sends
+`1up search` tries the daemon first when the project is registered. The CLI sends a single framed
 `SearchRequest { project_root, query, limit }` over `~/.local/share/1up/daemon.sock` and waits up
-to 250ms; if the daemon is unavailable, rejects the project, or times out, the CLI falls back to
-the same search stack locally.
+to 250 ms; if the daemon is unavailable, rejects the caller, sheds load, or times out, the CLI
+falls back to the same search stack locally.
 
 Both the daemon and the local path execute the same search pipeline:
 
@@ -157,10 +189,10 @@ cargo test -- --ignored     # tests requiring the embedding model
 src/
 ├── main.rs              # Entry point
 ├── cli/                 # CLI subcommands and output formatting (13 files)
-├── daemon/              # Background file watcher, registry, lifecycle, search service (6 files)
+├── daemon/              # Background file watcher, registry, lifecycle, IPC, search service (7 files)
 ├── indexer/             # Scanner, parser, chunker, embedder, pipeline (6 files)
 ├── search/              # Hybrid, symbol, structural, context, ranking (9 files)
-├── shared/              # Types, config, constants, errors, project, symbol helpers (7 files)
+├── shared/              # Types, config, constants, errors, fs, project, symbol helpers (8 files)
 └── storage/             # DB wrapper, schema, segments, queries (5 files)
 tests/                   # Integration, CLI, SQL verification
 benches/                 # Criterion search benchmarks
