@@ -90,6 +90,8 @@ run_step() {
     + (if $stdout_excerpt == "" then {} else {stdout_excerpt: $stdout_excerpt} end)
     + (if $stderr_excerpt == "" then {} else {stderr_excerpt: $stderr_excerpt} end)' \
     >"$STEP_DIR/${id}.json"
+
+  [[ "$status" == "passed" ]]
 }
 
 write_default_audit_summary() {
@@ -199,6 +201,17 @@ write_evidence() {
     >"$EVIDENCE_PATH"
 }
 
+run_gate() {
+  run_step "fmt" "formatter" "cargo fmt --check" cargo fmt --check || return 1
+  run_step "clippy" "linter" "cargo clippy --all-targets -- -D warnings" cargo clippy --all-targets -- -D warnings || return 1
+  run_step "tests_all" "tests" "cargo test --quiet" cargo test --quiet || return 1
+  run_step "tests_shared_fs" "security-tests" "cargo test --quiet shared::fs::tests" cargo test --quiet shared::fs::tests || return 1
+  run_step "tests_daemon_search" "security-tests" "cargo test --quiet daemon::search_service::tests" cargo test --quiet daemon::search_service::tests || return 1
+  run_step "tests_embedder" "security-tests" "cargo test --quiet indexer::embedder::tests" cargo test --quiet indexer::embedder::tests || return 1
+  run_step "tests_context" "security-tests" "cargo test --quiet search::context::tests" cargo test --quiet search::context::tests || return 1
+  run_step "cargo_audit" "audit" "cargo audit --json" cargo audit --json || return 1
+}
+
 require_cmd cargo
 require_cmd jq
 
@@ -208,12 +221,7 @@ OVERALL_STATUS="passed"
 FAILED_STEPS=()
 GENERATED_AT=$(timestamp)
 
-run_step "fmt" "formatter" "cargo fmt --check" cargo fmt --check
-run_step "clippy" "linter" "cargo clippy --all-targets -- -D warnings" cargo clippy --all-targets -- -D warnings
-run_step "tests_all" "tests" "cargo test --quiet" cargo test --quiet
-run_step "tests_shared_fs" "security-tests" "cargo test --quiet shared::fs::tests" cargo test --quiet shared::fs::tests
-run_step "tests_daemon_search" "security-tests" "cargo test --quiet daemon::search_service::tests" cargo test --quiet daemon::search_service::tests
-run_step "cargo_audit" "audit" "cargo audit --json" cargo audit --json
+run_gate || true
 
 write_audit_summary
 write_evidence "$GENERATED_AT"
