@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::lifecycle;
@@ -13,7 +16,7 @@ use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingU
 use crate::indexer::pipeline;
 use crate::search::HybridSearchEngine;
 use crate::shared::config;
-use crate::shared::constants::WATCHER_DEBOUNCE_MS;
+use crate::shared::constants::{MAX_DAEMON_IN_FLIGHT_REQUESTS, WATCHER_DEBOUNCE_MS};
 use crate::shared::errors::OneupError;
 use crate::shared::types::{IndexingConfig, RunScope};
 use crate::storage::{db::Db, schema};
@@ -57,6 +60,11 @@ struct ProjectState {
     run_state: ProjectRunState,
 }
 
+struct QueuedSearchRequest {
+    request: SearchRequest,
+    respond_to: oneshot::Sender<SearchResponse>,
+}
+
 pub async fn run() -> Result<(), OneupError> {
     lifecycle::write_pid_file()?;
 
@@ -81,6 +89,9 @@ async fn run_inner() -> Result<(), OneupError> {
 
     let mut file_watcher = FileWatcher::new()?;
     let mut projects: HashMap<PathBuf, ProjectState> = HashMap::new();
+    let request_limit = Arc::new(Semaphore::new(MAX_DAEMON_IN_FLIGHT_REQUESTS));
+    let (search_requests_tx, mut search_requests_rx) =
+        mpsc::channel::<QueuedSearchRequest>(MAX_DAEMON_IN_FLIGHT_REQUESTS);
     let search_listener = match search_service::bind_listener().await {
         Ok(listener) => Some(listener),
         Err(err) => {
@@ -97,22 +108,42 @@ async fn run_inner() -> Result<(), OneupError> {
         tokio::select! {
             request = async {
                 match search_listener.as_ref() {
-                    Some(listener) => Some(search_service::accept_request(listener).await),
+                    Some(listener) => Some(search_service::accept_connection(listener).await),
                     None => future::pending::<Option<Result<_, OneupError>>>().await,
                 }
             } => {
                 if let Some(request) = request {
                     match request {
-                        Ok((mut stream, request)) => {
-                            let response = handle_search_request(&mut projects, request).await;
-                            if let Err(err) = search_service::send_response(&mut stream, &response).await {
-                                warn!("failed to respond to daemon search request: {err}");
-                            }
+                        Ok(Some(mut stream)) => {
+                            let permit = match request_limit.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    if let Err(err) = search_service::send_busy_response(&mut stream).await {
+                                        warn!("failed to respond to saturated daemon search request: {err}");
+                                    }
+                                    continue;
+                                }
+                            };
+                            let search_requests_tx = search_requests_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = serve_search_connection(stream, permit, search_requests_tx).await {
+                                    warn!("failed to serve daemon search connection: {err}");
+                                }
+                            });
                         }
+                        Ok(None) => {}
                         Err(err) => {
                             warn!("failed to accept daemon search request: {err}");
                         }
                     }
+                }
+            }
+            queued_request = search_requests_rx.recv() => {
+                if let Some(queued_request) = queued_request {
+                    let response = handle_search_request(&mut projects, queued_request.request).await;
+                    let _ = queued_request.respond_to.send(response);
+                } else if search_listener.is_some() {
+                    warn!("daemon search request queue closed unexpectedly");
                 }
             }
             _ = sighup.recv() => {
@@ -153,6 +184,41 @@ async fn run_inner() -> Result<(), OneupError> {
 
     info!("daemon worker exiting");
     Ok(())
+}
+
+async fn serve_search_connection(
+    mut stream: UnixStream,
+    _permit: OwnedSemaphorePermit,
+    search_requests: mpsc::Sender<QueuedSearchRequest>,
+) -> Result<(), OneupError> {
+    let request = match search_service::read_request(&mut stream).await {
+        Ok(request) => request,
+        Err(err) => {
+            debug!("rejecting daemon search request: {err}");
+            let _ = search_service::send_unavailable_response(&mut stream).await;
+            return Ok(());
+        }
+    };
+
+    let (respond_to, response_rx) = oneshot::channel();
+    if search_requests
+        .send(QueuedSearchRequest {
+            request,
+            respond_to,
+        })
+        .await
+        .is_err()
+    {
+        let _ = search_service::send_unavailable_response(&mut stream).await;
+        return Ok(());
+    }
+
+    let response = match response_rx.await {
+        Ok(response) => response,
+        Err(_) => search_service::unavailable_response(),
+    };
+
+    search_service::send_response(&mut stream, &response).await
 }
 
 fn log_indexing_embedding_status(
@@ -563,37 +629,42 @@ async fn handle_search_request(
     request: SearchRequest,
 ) -> SearchResponse {
     let Some(state) = projects.get_mut(&request.project_root) else {
-        return SearchResponse::Unavailable {
-            reason: format!(
-                "project {} is not registered with the daemon",
-                request.project_root.display()
-            ),
-        };
+        debug!(
+            "daemon search requested for unregistered project {}",
+            request.project_root.display()
+        );
+        return search_service::unavailable_response();
     };
 
     let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
     {
         Ok(indexing_config) => indexing_config,
         Err(err) => {
-            return SearchResponse::Unavailable {
-                reason: format!("failed to resolve search configuration: {err}"),
-            };
+            warn!(
+                "failed to resolve daemon search configuration for {}: {err}",
+                state.project_root.display()
+            );
+            return search_service::unavailable_response();
         }
     };
 
     let conn = match state.db.connect() {
         Ok(conn) => conn,
         Err(err) => {
-            return SearchResponse::Unavailable {
-                reason: format!("failed to open search connection: {err}"),
-            };
+            warn!(
+                "failed to open daemon search connection for {}: {err}",
+                state.project_root.display()
+            );
+            return search_service::unavailable_response();
         }
     };
 
     if let Err(err) = schema::ensure_current(&conn).await {
-        return SearchResponse::Unavailable {
-            reason: format!("search index is unavailable: {err}"),
-        };
+        warn!(
+            "daemon search index is unavailable for {}: {err}",
+            state.project_root.display()
+        );
+        return search_service::unavailable_response();
     }
 
     let status = state
@@ -611,9 +682,13 @@ async fn handle_search_request(
 
     match results {
         Ok(results) => SearchResponse::Results { results },
-        Err(err) => SearchResponse::Unavailable {
-            reason: format!("daemon search failed: {err}"),
-        },
+        Err(err) => {
+            warn!(
+                "daemon search failed for {}: {err}",
+                state.project_root.display()
+            );
+            search_service::unavailable_response()
+        }
     }
 }
 
@@ -849,5 +924,24 @@ mod tests {
         projects.get_mut(&beta_root).unwrap().run_state.dirty = false;
         let fallback = next_dirty_project_root(&projects, Some(beta_root.as_path()));
         assert_eq!(fallback, Some(alpha_root));
+    }
+
+    #[tokio::test]
+    async fn handle_search_request_uses_safe_unavailable_reason_for_missing_project() {
+        let mut projects = HashMap::new();
+        let response = handle_search_request(
+            &mut projects,
+            SearchRequest {
+                project_root: PathBuf::from("/tmp/missing-project"),
+                query: "needle".to_string(),
+                limit: 3,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            SearchResponse::Unavailable { ref reason } if reason == "daemon unavailable"
+        ));
     }
 }

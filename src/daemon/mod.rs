@@ -1,3 +1,4 @@
+pub mod ipc;
 pub mod lifecycle;
 pub mod registry;
 pub mod search_service;
