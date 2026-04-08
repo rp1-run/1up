@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -6,6 +7,7 @@ use libsql::{Builder, Connection, Database};
 
 use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
 use crate::shared::errors::{OneupError, StorageError};
+use crate::shared::fs::{ensure_secure_project_root, validate_regular_file_path};
 
 /// A wrapper around a libsql database that manages connections.
 pub struct Db {
@@ -16,15 +18,7 @@ impl Db {
     /// Open a local database at the given path in read-write mode,
     /// creating the file and parent directories if they do not exist.
     pub async fn open_rw(path: &Path) -> Result<Self, OneupError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                StorageError::Connection(format!(
-                    "failed to create database directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-
+        let path = validate_project_db_path_for_write(path)?;
         let path_str = path.to_str().ok_or_else(|| {
             StorageError::Connection(format!(
                 "database path is not valid UTF-8: {}",
@@ -40,6 +34,7 @@ impl Db {
     /// Open a local database at the given path in read-only mode.
     /// The database file must already exist.
     pub async fn open_ro(path: &Path) -> Result<Self, OneupError> {
+        let path = validate_existing_project_db_path(path)?;
         if !path.exists() {
             return Err(StorageError::Connection(format!(
                 "database file not found: {}",
@@ -79,6 +74,66 @@ impl Db {
     }
 }
 
+fn validate_project_db_path_for_write(path: &Path) -> Result<std::path::PathBuf, OneupError> {
+    let project_root = project_root_from_db_path(path)?;
+    let secure_root = ensure_secure_project_root(project_root).map_err(|err| {
+        StorageError::Connection(format!(
+            "failed to prepare project state directory for {}: {err}",
+            path.display()
+        ))
+    })?;
+    validate_regular_file_path(path, &secure_root).map_err(|err| {
+        StorageError::Connection(format!(
+            "failed to validate database path {}: {err}",
+            path.display()
+        ))
+        .into()
+    })
+}
+
+fn validate_existing_project_db_path(path: &Path) -> Result<std::path::PathBuf, OneupError> {
+    let project_root = project_root_from_db_path(path)?;
+    validate_regular_file_path(path, project_root).map_err(|err| {
+        StorageError::Connection(format!(
+            "failed to validate database path {}: {err}",
+            path.display()
+        ))
+        .into()
+    })
+}
+
+fn project_root_from_db_path(path: &Path) -> Result<&Path, OneupError> {
+    if path.file_name() != Some(OsStr::new("index.db")) {
+        return Err(StorageError::Connection(format!(
+            "database path must target <project>/.1up/index.db: {}",
+            path.display()
+        ))
+        .into());
+    }
+
+    let dot_dir = path.parent().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "database path is missing its .1up parent directory: {}",
+            path.display()
+        ))
+    })?;
+    if dot_dir.file_name() != Some(OsStr::new(".1up")) {
+        return Err(StorageError::Connection(format!(
+            "database path must target <project>/.1up/index.db: {}",
+            path.display()
+        ))
+        .into());
+    }
+
+    dot_dir.parent().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "database path is missing its project root: {}",
+            path.display()
+        ))
+        .into()
+    })
+}
+
 async fn build_local_with_retry(path_str: &str) -> Result<Database, OneupError> {
     let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
     let mut last_error = None;
@@ -109,4 +164,64 @@ fn is_lock_error(error: &str) -> bool {
         || lower.contains("locking error")
         || lower.contains("failed locking file")
         || lower.contains("locked by another process")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    use crate::shared::config;
+    use crate::shared::constants::PROJECT_STATE_DIR_MODE;
+
+    #[tokio::test]
+    async fn open_rw_creates_secure_project_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let db_path = config::project_db_path(&project_root);
+
+        let db = Db::open_rw(&db_path).await.unwrap();
+        db.connect().unwrap();
+
+        let dot_dir = config::project_dot_dir(&project_root);
+        let dot_dir_mode = fs::metadata(&dot_dir).unwrap().permissions().mode() & 0o777;
+        assert!(db_path.exists());
+        assert_eq!(dot_dir_mode, PROJECT_STATE_DIR_MODE);
+    }
+
+    #[tokio::test]
+    async fn open_rw_rejects_non_project_db_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let invalid_path = project_root.join("index.db");
+
+        let err = Db::open_rw(&invalid_path).await.err().unwrap();
+        assert!(err.to_string().contains("<project>/.1up/index.db"));
+    }
+
+    #[tokio::test]
+    async fn open_ro_rejects_symlinked_database_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let project_root = tmp_root.join("project");
+        let outside_root = tmp_root.join("outside");
+        fs::create_dir_all(config::project_dot_dir(&project_root)).unwrap();
+        fs::create_dir_all(&outside_root).unwrap();
+        fs::write(outside_root.join("index.db"), b"not-a-real-db").unwrap();
+        symlink(
+            outside_root.join("index.db"),
+            config::project_db_path(&project_root),
+        )
+        .unwrap();
+
+        let err = Db::open_ro(&config::project_db_path(&project_root))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("symlink"));
+    }
 }

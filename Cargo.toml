@@ -18,7 +18,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Database
-libsql = "0.9"
+libsql = { version = "0.9", default-features = false, features = ["core"] }
 
 # Tree-sitter (core + language grammars)
 tree-sitter = "0.26"
@@ -107,4 +107,3 @@ tokio = { version = "1", features = ["full"] }
 [[bench]]
 name = "search_bench"
 harness = false
-

@@ -5,25 +5,43 @@ use nix::unistd::Pid;
 use tracing::{debug, warn};
 
 use crate::shared::config;
+use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
 use crate::shared::errors::{DaemonError, OneupError};
+use crate::shared::fs::{
+    atomic_replace, ensure_secure_xdg_root, remove_regular_file, validate_regular_file_path,
+};
 
 pub fn write_pid_file() -> Result<(), OneupError> {
-    let path = config::pid_file_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| DaemonError::PidFileError(format!("failed to create pid dir: {e}")))?;
-    }
-
+    let xdg_root = ensure_secure_xdg_root()
+        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
     let pid = std::process::id();
-    std::fs::write(&path, pid.to_string())
-        .map_err(|e| DaemonError::PidFileError(format!("failed to write pid file: {e}")))?;
+    write_pid_file_at(&config::pid_file_path()?, &xdg_root, pid)
+}
+
+fn write_pid_file_at(path: &Path, approved_root: &Path, pid: u32) -> Result<(), OneupError> {
+    let pid_text = pid.to_string();
+    atomic_replace(
+        path,
+        pid_text.as_bytes(),
+        approved_root,
+        XDG_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    )
+    .map_err(|err| DaemonError::PidFileError(format!("failed to write pid file: {err}")))?;
 
     debug!("wrote pid file: {} (pid={})", path.display(), pid);
     Ok(())
 }
 
 pub fn read_pid_file() -> Result<Option<u32>, OneupError> {
-    let path = config::pid_file_path()?;
+    let xdg_root = ensure_secure_xdg_root()
+        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
+    read_pid_file_at(&config::pid_file_path()?, &xdg_root)
+}
+
+fn read_pid_file_at(path: &Path, approved_root: &Path) -> Result<Option<u32>, OneupError> {
+    let path = validate_regular_file_path(path, approved_root)
+        .map_err(|err| DaemonError::PidFileError(format!("failed to validate pid file: {err}")))?;
     if !path.exists() {
         return Ok(None);
     }
@@ -40,10 +58,15 @@ pub fn read_pid_file() -> Result<Option<u32>, OneupError> {
 }
 
 pub fn remove_pid_file() -> Result<(), OneupError> {
-    let path = config::pid_file_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| DaemonError::PidFileError(format!("failed to remove pid file: {e}")))?;
+    let xdg_root = ensure_secure_xdg_root()
+        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
+    remove_pid_file_at(&config::pid_file_path()?, &xdg_root)
+}
+
+fn remove_pid_file_at(path: &Path, approved_root: &Path) -> Result<(), OneupError> {
+    let removed = remove_regular_file(path, approved_root)
+        .map_err(|err| DaemonError::PidFileError(format!("failed to remove pid file: {err}")))?;
+    if removed {
         debug!("removed pid file: {}", path.display());
     }
     Ok(())
@@ -155,6 +178,8 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn current_process_is_alive() {
@@ -168,14 +193,34 @@ mod tests {
     }
 
     #[test]
-    fn pid_file_roundtrip() {
+    fn pid_file_roundtrip_uses_secure_state_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("test.pid");
-        let pid = 12345u32;
+        let xdg_root = tmp.path().canonicalize().unwrap().join("xdg-root");
+        let pid_path = xdg_root.join("daemon.pid");
 
-        std::fs::write(&pid_path, pid.to_string()).unwrap();
-        let content = std::fs::read_to_string(&pid_path).unwrap();
-        let read_pid: u32 = content.trim().parse().unwrap();
-        assert_eq!(read_pid, pid);
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::set_permissions(&xdg_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_pid_file_at(&pid_path, &xdg_root, 12345).unwrap();
+
+        let file_mode = fs::metadata(&pid_path).unwrap().permissions().mode() & 0o777;
+        let root_mode = fs::metadata(&xdg_root).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(read_pid_file_at(&pid_path, &xdg_root).unwrap(), Some(12345));
+        assert_eq!(file_mode, SECURE_STATE_FILE_MODE);
+        assert_eq!(root_mode, XDG_STATE_DIR_MODE);
+
+        remove_pid_file_at(&pid_path, &xdg_root).unwrap();
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn read_pid_file_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg_root = tmp.path().canonicalize().unwrap().join("xdg-root");
+        let pid_path = xdg_root.join("daemon.pid");
+        fs::create_dir_all(&xdg_root).unwrap();
+
+        assert_eq!(read_pid_file_at(&pid_path, &xdg_root).unwrap(), None);
     }
 }

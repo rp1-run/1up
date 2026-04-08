@@ -1401,9 +1401,9 @@ mod tests {
 
         let (_db, conn) = setup().await;
         let config = IndexingConfig::new(2, 2, 1).unwrap();
-        let model_dir = crate::shared::config::model_dir().unwrap();
-        let mut embedder =
-            Embedder::from_dir_with_threads(&model_dir, config.embed_threads).unwrap();
+        let mut embedder = Embedder::new_with_threads(config.embed_threads)
+            .await
+            .unwrap();
 
         let stats = run_with_config(&conn, tmp.path(), Some(&mut embedder), &config)
             .await

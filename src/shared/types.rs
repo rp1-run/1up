@@ -158,6 +158,22 @@ pub struct StructuralResult {
     pub line_end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAccessScope {
+    ProjectRoot,
+    OutsideRoot,
+}
+
+impl ContextAccessScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectRoot => "project_root",
+            Self::OutsideRoot => "outside_root",
+        }
+    }
+}
+
 /// A context retrieval result with the enclosing scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextResult {
@@ -167,6 +183,8 @@ pub struct ContextResult {
     pub line_start: usize,
     pub line_end: usize,
     pub scope_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_scope: Option<ContextAccessScope>,
 }
 
 /// Scope for an indexing run.
