@@ -2,7 +2,7 @@
 
 **Project**: 1up
 **Architecture Pattern**: Layered + Two-Process Model
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-08
 
 ## High-Level Architecture
 
@@ -13,11 +13,11 @@ graph TB
     CLI -->|start/stop| Daemon[Daemon Worker<br/>background process]
     CLI -->|index/reindex| Pipeline[Staged Indexing Orchestrator<br/>pipeline::run_with_config]
     CLI -->|search fallback| Search[Search Engine]
-    CLI -->|search request| SearchSocket[Daemon Search Socket<br/>JSON over UnixStream]
+    CLI -->|search request| SearchSocket[Daemon Search Socket<br/>Framed JSON over UnixStream]
 
     Daemon -->|file events| Watcher[File Watcher<br/>notify crate]
     Daemon -->|re-index| Pipeline
-    Daemon -->|serve query requests| SearchService[Search Service<br/>SearchRequest/SearchResponse]
+    Daemon -->|serve query requests| SearchService[Search Service<br/>Framed SearchRequest/SearchResponse]
     Daemon -->|SIGHUP/SIGTERM| Lifecycle[Lifecycle Manager<br/>PID file + signals]
     Daemon -->|load/reload| Registry[Project Registry<br/>projects.json + indexing config]
     Daemon -->|schedule runs| RunState[Per-Project Run State<br/>one active run + queued follow-up]
@@ -52,10 +52,11 @@ graph TB
 
 CLI and daemon runs converge on the same `IndexingConfig` resolution path before entering the
 indexing pipeline. Search now has two entry points: the CLI can search locally, or it can send a
-JSON request to the daemon over a Unix domain socket so repeated searches reuse the daemon's warm
-embedding runtime. Only file-local parse work fans out; embeddings stay in one ONNX session and
-all database mutation flows through a single transactional writer so replacement semantics remain
-deterministic.
+framed JSON request to the daemon over a Unix domain socket so repeated searches reuse the
+daemon's warm embedding runtime. The daemon only serves same-UID peers, bounds frame sizes and
+per-frame deadlines, and sheds excess load with safe fallback responses. Only file-local parse
+work fans out; embeddings stay in one ONNX session and all database mutation flows through a
+single transactional writer so replacement semantics remain deterministic.
 
 ## Architectural Patterns
 
@@ -108,11 +109,11 @@ Database lock contention is handled with bounded retries (10 attempts, 50ms dela
 | Layer | Purpose | Key Files |
 |-------|---------|-----------|
 | CLI | User-facing command parsing and output formatting | `src/main.rs`, `src/cli/` |
-| Daemon | Background file watching, registry management, auto re-indexing | `src/daemon/` |
+| Daemon | Background file watching, framed search IPC, registry management, auto re-indexing | `src/daemon/` |
 | Indexer | File scanning, parsing, chunking, embedding, pipeline orchestration | `src/indexer/` |
 | Search | Query execution, intent detection, RRF fusion, result ranking | `src/search/` |
 | Storage | Database lifecycle, schema management, segment CRUD, queries | `src/storage/` |
-| Shared | Cross-cutting: config paths, constants, error types, data types | `src/shared/` |
+| Shared | Cross-cutting: config paths, secure filesystem helpers, constants, error types, data types | `src/shared/` |
 
 ## Data Flows
 
@@ -133,14 +134,17 @@ Resolve indexing config (CLI flags -> env vars -> registry -> auto defaults)
 ### Search Query
 ```
 CLI canonicalizes --path and auto-starts the daemon when the project is already initialized
-  -> Send SearchRequest { project_root, query, limit } over ~/.local/share/1up/daemon.sock (250ms timeout)
+  -> Send one length-prefixed JSON SearchRequest frame over ~/.local/share/1up/daemon.sock (250ms client timeout)
+  -> Daemon accepts only same-UID peers; unreadable or mismatched peer credentials get SearchResponse::Unavailable
+  -> Daemon enforces a 16 KiB request cap, 4 KiB query cap, 2 MiB response cap, and 250ms read/write deadlines
+  -> Requests enter an 8-slot semaphore-backed queue; saturation returns SearchResponse::Unavailable { reason: "daemon busy" }
   -> Daemon validates registry entry + schema, then reuses or loads a warm EmbeddingRuntime
   -> Detect intent (DEFINITION, FLOW, USAGE, DOCS, GENERAL)
   -> Build symbol variants and run exact-first canonical symbol lookup
   -> Fetch vector and FTS candidate rows concurrently when embeddings are available
   -> Rank candidate IDs with RRF + intent/query/path/content boosts + per-file caps
   -> Hydrate only the final ranked segment IDs from storage
-  -> Return SearchResponse::Results; CLI falls back to the same local search stack if daemon search is unavailable
+  -> Return SearchResponse::Results; CLI falls back to the same local search stack if daemon search is unavailable, busy, rejected, or timed out
 ```
 
 ### Daemon File Watch Loop
@@ -158,12 +162,12 @@ Worker loads project registry and persisted indexing settings, then watches dire
 
 ### Daemon Lifecycle
 ```
-CLI `start` or auto-start registers project in projects.json with optional indexing settings
+CLI `start` or auto-start validates approved roots, then registers the project in projects.json with optional indexing settings
   -> If worker already runs: send SIGHUP so it reloads project list and settings
   -> Else spawn detached `1up __worker` child process (setsid for session leader)
-  -> Worker writes PID file, enters event loop
+  -> Worker writes daemon.pid under the secure XDG root, binds daemon.sock with owner-only permissions, and enters the event loop
   -> CLI `stop` deregisters project; sends SIGTERM if no projects remain, SIGHUP otherwise
-  -> Stale PID files detected and cleaned on next startup
+  -> Stale PID files and stale sockets are cleaned only when the expected file type exists under the approved root
 ```
 
 ## Integration Points
@@ -177,13 +181,23 @@ CLI `start` or auto-start registers project in projects.json with optional index
 
 ## State Management
 
-- **PID file**: `~/.local/share/1up/daemon.pid`
-- **Daemon search socket**: `~/.local/share/1up/daemon.sock`
-- **Project registry**: `~/.local/share/1up/projects.json` (includes per-project IndexingConfig)
-- **Per-project DB**: `<project>/.1up/index.db`
-- **Index progress**: `<project>/.1up/index_status.json` (IndexProgress with parallelism + stage timings)
-- **Model cache**: `~/.local/share/1up/models/`
-- **In-memory daemon state**: per-project `ProjectRunState` (`running`, `dirty`, `pending_scope`) plus a warm `EmbeddingRuntime`
+- **Secure roots**: `~/.local/share/1up/` and each `<project>/.1up/` directory are created with
+  owner-only `0700` permissions by shared filesystem helpers before any state mutation.
+- **PID file**: `~/.local/share/1up/daemon.pid` is written with atomic replace and `0600`
+  permissions.
+- **Daemon search socket**: `~/.local/share/1up/daemon.sock` is bound with `0600` permissions and
+  cleaned up only if the path resolves to a socket under the approved root.
+- **Project registry**: `~/.local/share/1up/projects.json` stores canonicalized project roots and
+  optional per-project `IndexingConfig`; writes reject symlinked and outside-root paths.
+- **Per-project state**: `<project>/.1up/project_id`, `<project>/.1up/index.db`, and
+  `<project>/.1up/index_status.json` stay inside the canonical project root and inherit the same
+  approved-root checks.
+- **Model cache**: `~/.local/share/1up/models/all-MiniLM-L6-v2/` contains `current.json`, a
+  `.download_failed` retry marker, `verified/<artifact-id>/` directories with `manifest.json`,
+  `model.onnx`, and `tokenizer.json`, plus a transient `.staging/<artifact-id>/` tree used before
+  activation.
+- **In-memory daemon state**: per-project `ProjectRunState` (`running`, `dirty`, `pending_scope`)
+  plus a warm `EmbeddingRuntime`
 
 ## Deployment
 
