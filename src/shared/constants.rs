@@ -22,6 +22,24 @@ pub const SYMBOL_WEIGHT: f64 = 4.0;
 /// Maximum search results returned per query.
 pub const MAX_SEARCH_RESULTS: usize = 20;
 
+/// Maximum size of a framed daemon request payload in bytes.
+pub const MAX_DAEMON_REQUEST_BYTES: usize = 16 * 1024;
+
+/// Maximum size of a framed daemon response payload in bytes.
+pub const MAX_DAEMON_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum daemon search query length in bytes.
+pub const MAX_DAEMON_QUERY_BYTES: usize = 4 * 1024;
+
+/// Read deadline for a single daemon IPC frame.
+pub const DAEMON_READ_TIMEOUT_MS: u64 = 250;
+
+/// Write deadline for a single daemon IPC frame.
+pub const DAEMON_WRITE_TIMEOUT_MS: u64 = 250;
+
+/// Maximum number of in-flight daemon requests before new clients are shed.
+pub const MAX_DAEMON_IN_FLIGHT_REQUESTS: usize = 8;
+
 /// Maximum results per file in search output.
 pub const MAX_RESULTS_PER_FILE: usize = 3;
 
