@@ -1203,12 +1203,19 @@ mod tests {
 
     #[test]
     fn legacy_artifacts_import_into_verified_store_only_after_digest_validation() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let model_root = tmp.path().canonicalize().unwrap().join("models");
         std::fs::create_dir_all(&model_root).unwrap();
 
-        let live_model = std::fs::read(model_dir().unwrap().join(MODEL_FILENAME)).unwrap();
-        let live_tokenizer = std::fs::read(model_dir().unwrap().join(TOKENIZER_FILENAME)).unwrap();
+        let runtime_dir = runtime_model_dir();
+        let live_model = std::fs::read(runtime_dir.join(MODEL_FILENAME)).unwrap();
+        let live_tokenizer = std::fs::read(runtime_dir.join(TOKENIZER_FILENAME)).unwrap();
         std::fs::write(model_root.join(MODEL_FILENAME), &live_model).unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), &live_tokenizer).unwrap();
 
