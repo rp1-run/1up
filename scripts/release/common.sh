@@ -155,3 +155,83 @@ native_path() {
 
   printf '%s\n' "$path"
 }
+
+manifest_value() {
+  local manifest_path="$1"
+  local filter="$2"
+
+  jq -er "$filter" "$manifest_path"
+}
+
+manifest_artifact_value() {
+  local manifest_path="$1"
+  local target="$2"
+  local field="$3"
+
+  jq -er --arg target "$target" --arg field "$field" '
+    .artifacts[]
+    | select(.target == $target)
+    | .[$field]
+  ' "$manifest_path"
+}
+
+manifest_release_base_url() {
+  local manifest_path="$1"
+  local github_release_url
+  local git_tag
+  local suffix
+
+  github_release_url=$(manifest_value "$manifest_path" '.channels.github_release')
+  git_tag=$(manifest_value "$manifest_path" '.git_tag')
+  suffix="/tag/${git_tag}"
+
+  if [[ "$github_release_url" != *"$suffix" ]]; then
+    fail "manifest github_release URL must end with ${suffix}"
+  fi
+
+  printf '%s\n' "${github_release_url%"$suffix"}"
+}
+
+manifest_release_download_url() {
+  local manifest_path="$1"
+  local target="$2"
+  local archive
+  local git_tag
+
+  archive=$(manifest_artifact_value "$manifest_path" "$target" 'archive')
+  git_tag=$(manifest_value "$manifest_path" '.git_tag')
+
+  printf '%s/download/%s/%s\n' \
+    "$(manifest_release_base_url "$manifest_path")" \
+    "$git_tag" \
+    "$archive"
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[&|]/\\&/g'
+}
+
+render_template() {
+  local template_path="$1"
+  local output_path="$2"
+
+  shift 2
+
+  if (( $# % 2 != 0 )); then
+    fail "render_template requires placeholder/value pairs"
+  fi
+
+  require_file "$template_path"
+  mkdir -p "$(dirname "$output_path")"
+
+  local sed_args=()
+
+  while [[ $# -gt 0 ]]; do
+    local placeholder="$1"
+    local value="$2"
+    shift 2
+    sed_args+=(-e "s|{{$placeholder}}|$(escape_sed_replacement "$value")|g")
+  done
+
+  sed "${sed_args[@]}" "$template_path" >"$output_path"
+}
