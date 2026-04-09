@@ -26,6 +26,8 @@ fn build_release_fixture() -> tempfile::TempDir {
         "LICENSE",
         "CHANGELOG.md",
         "skills/1up-search/SKILL.md",
+        "packaging/homebrew/1up.rb.tmpl",
+        "packaging/scoop/1up.json.tmpl",
     ] {
         copy_surface(tempdir.path(), relative_path);
     }
@@ -48,6 +50,76 @@ fn run_release_script(root: &Path, name: &str, args: &[&str]) -> std::process::O
         .env("ONEUP_RELEASE_ROOT", root)
         .output()
         .unwrap()
+}
+
+fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
+    let dist_dir = root.join("dist");
+    fs::create_dir_all(&dist_dir).unwrap();
+
+    let artifacts = [
+        ("aarch64-apple-darwin", "macos", "arm64", "tar.gz", "Download the macOS arm64 archive from GitHub Releases and unpack with tar -xzf."),
+        ("x86_64-apple-darwin", "macos", "amd64", "tar.gz", "Download the macOS amd64 archive from GitHub Releases and unpack with tar -xzf."),
+        ("aarch64-unknown-linux-gnu", "linux", "arm64", "tar.gz", "Download the Linux arm64 archive from GitHub Releases and unpack with tar -xzf."),
+        ("x86_64-unknown-linux-gnu", "linux", "amd64", "tar.gz", "Download the Linux amd64 archive from GitHub Releases and unpack with tar -xzf."),
+        ("x86_64-pc-windows-msvc", "windows", "amd64", "zip", "Download the Windows amd64 archive from GitHub Releases and unpack with Expand-Archive."),
+    ];
+
+    for (target, os, arch, extension, install_hint) in artifacts {
+        let archive_name = format!("1up-v{version}-{target}.{extension}");
+        fs::write(dist_dir.join(&archive_name), &archive_name).unwrap();
+        fs::write(
+            dist_dir.join(format!("{archive_name}.metadata.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "target": target,
+                "os": os,
+                "arch": arch,
+                "archive": archive_name,
+                "install_hint": install_hint,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    let checksums_output = run_release_script(
+        root,
+        "write_sha256sums.sh",
+        &[
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--output",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        checksums_output.status.success(),
+        "checksum generation unexpectedly failed: {}",
+        String::from_utf8_lossy(&checksums_output.stderr)
+    );
+
+    let manifest_output = run_release_script(
+        root,
+        "generate_release_manifest.sh",
+        &[
+            "--tag",
+            &format!("v{version}"),
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--output",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--commit-sha",
+            "abc123def456",
+        ],
+    );
+    assert!(
+        manifest_output.status.success(),
+        "manifest generation unexpectedly failed: {}",
+        String::from_utf8_lossy(&manifest_output.stderr)
+    );
+
+    dist_dir
 }
 
 #[test]
@@ -89,109 +161,7 @@ fn release_metadata_validation_rejects_mismatched_tag_and_version() {
 fn release_manifest_generation_includes_platform_mapping_and_checksums() {
     let fixture_root = build_release_fixture();
     write_release_changelog(fixture_root.path(), "0.1.0");
-
-    let dist_dir = fixture_root.path().join("dist");
-    fs::create_dir_all(&dist_dir).unwrap();
-
-    let artifacts = [
-        (
-            "1up-v0.1.0-aarch64-apple-darwin.tar.gz",
-            serde_json::json!({
-                "target": "aarch64-apple-darwin",
-                "os": "macos",
-                "arch": "arm64",
-                "archive": "1up-v0.1.0-aarch64-apple-darwin.tar.gz",
-                "install_hint": "Download the macOS arm64 archive from GitHub Releases and unpack with tar -xzf."
-            }),
-        ),
-        (
-            "1up-v0.1.0-x86_64-apple-darwin.tar.gz",
-            serde_json::json!({
-                "target": "x86_64-apple-darwin",
-                "os": "macos",
-                "arch": "amd64",
-                "archive": "1up-v0.1.0-x86_64-apple-darwin.tar.gz",
-                "install_hint": "Download the macOS amd64 archive from GitHub Releases and unpack with tar -xzf."
-            }),
-        ),
-        (
-            "1up-v0.1.0-aarch64-unknown-linux-gnu.tar.gz",
-            serde_json::json!({
-                "target": "aarch64-unknown-linux-gnu",
-                "os": "linux",
-                "arch": "arm64",
-                "archive": "1up-v0.1.0-aarch64-unknown-linux-gnu.tar.gz",
-                "install_hint": "Download the Linux arm64 archive from GitHub Releases and unpack with tar -xzf."
-            }),
-        ),
-        (
-            "1up-v0.1.0-x86_64-unknown-linux-gnu.tar.gz",
-            serde_json::json!({
-                "target": "x86_64-unknown-linux-gnu",
-                "os": "linux",
-                "arch": "amd64",
-                "archive": "1up-v0.1.0-x86_64-unknown-linux-gnu.tar.gz",
-                "install_hint": "Download the Linux amd64 archive from GitHub Releases and unpack with tar -xzf."
-            }),
-        ),
-        (
-            "1up-v0.1.0-x86_64-pc-windows-msvc.zip",
-            serde_json::json!({
-                "target": "x86_64-pc-windows-msvc",
-                "os": "windows",
-                "arch": "amd64",
-                "archive": "1up-v0.1.0-x86_64-pc-windows-msvc.zip",
-                "install_hint": "Download the Windows amd64 archive from GitHub Releases and unpack with Expand-Archive."
-            }),
-        ),
-    ];
-
-    for (archive_name, metadata) in artifacts {
-        fs::write(dist_dir.join(archive_name), archive_name).unwrap();
-        fs::write(
-            dist_dir.join(format!("{archive_name}.metadata.json")),
-            serde_json::to_vec_pretty(&metadata).unwrap(),
-        )
-        .unwrap();
-    }
-
-    let checksums_output = run_release_script(
-        fixture_root.path(),
-        "write_sha256sums.sh",
-        &[
-            "--assets-dir",
-            dist_dir.to_str().unwrap(),
-            "--output",
-            dist_dir.join("SHA256SUMS").to_str().unwrap(),
-        ],
-    );
-    assert!(
-        checksums_output.status.success(),
-        "checksum generation unexpectedly failed: {}",
-        String::from_utf8_lossy(&checksums_output.stderr)
-    );
-
-    let manifest_output = run_release_script(
-        fixture_root.path(),
-        "generate_release_manifest.sh",
-        &[
-            "--tag",
-            "v0.1.0",
-            "--assets-dir",
-            dist_dir.to_str().unwrap(),
-            "--checksums",
-            dist_dir.join("SHA256SUMS").to_str().unwrap(),
-            "--output",
-            dist_dir.join("release-manifest.json").to_str().unwrap(),
-            "--commit-sha",
-            "abc123def456",
-        ],
-    );
-    assert!(
-        manifest_output.status.success(),
-        "manifest generation unexpectedly failed: {}",
-        String::from_utf8_lossy(&manifest_output.stderr)
-    );
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
@@ -225,6 +195,160 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .unwrap()
         .iter()
         .all(|artifact| artifact["sha256"].as_str().unwrap().len() == 64));
+}
+
+#[test]
+fn homebrew_formula_rendering_uses_release_manifest_urls_and_checksums() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    let output_path = dist_dir.join("1up.rb");
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "render_homebrew_formula.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "Homebrew rendering unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
+    let formula = fs::read_to_string(&output_path).unwrap();
+    let git_tag = manifest["git_tag"].as_str().unwrap();
+
+    for target in [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ] {
+        let artifact = manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["target"] == target)
+            .unwrap();
+        let archive = artifact["archive"].as_str().unwrap();
+        let sha256 = artifact["sha256"].as_str().unwrap();
+        let url = format!("https://github.com/rp1-run/1up/releases/download/{git_tag}/{archive}");
+        assert!(formula.contains(&url));
+        assert!(formula.contains(sha256));
+    }
+
+    assert!(formula.contains("class Oneup < Formula"));
+    assert!(formula.contains("license \"Apache-2.0\""));
+    assert!(!formula.contains("x86_64-pc-windows-msvc.zip"));
+}
+
+#[test]
+fn scoop_manifest_rendering_uses_release_manifest_windows_asset() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    let output_path = dist_dir.join("1up.json");
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "render_scoop_manifest.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "Scoop rendering unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
+    let scoop_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+    let windows_artifact = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["target"] == "x86_64-pc-windows-msvc")
+        .unwrap();
+
+    assert_eq!(scoop_manifest["version"], manifest["version"]);
+    assert_eq!(scoop_manifest["license"], manifest["license"]);
+    assert_eq!(
+        scoop_manifest["url"],
+        format!(
+            "https://github.com/rp1-run/1up/releases/download/{}/{}",
+            manifest["git_tag"].as_str().unwrap(),
+            windows_artifact["archive"].as_str().unwrap()
+        )
+    );
+    assert_eq!(scoop_manifest["hash"], windows_artifact["sha256"]);
+    assert_eq!(
+        scoop_manifest["extract_dir"],
+        "1up-v0.1.0-x86_64-pc-windows-msvc"
+    );
+    assert_eq!(scoop_manifest["bin"], "1up.exe");
+}
+
+#[test]
+fn package_publication_record_captures_repo_commit_refs() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    let output_path = dist_dir.join("package-publication-record.json");
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "write_package_publication_record.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--homebrew-commit",
+            "deadbeef1234",
+            "--scoop-commit",
+            "feedface5678",
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "package publication record unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(record["version"], "0.1.0");
+    assert_eq!(record["git_tag"], "v0.1.0");
+    assert_eq!(
+        record["packages"]["homebrew"]["repo"],
+        "rp1-run/homebrew-tap"
+    );
+    assert_eq!(record["packages"]["homebrew"]["path"], "Formula/1up.rb");
+    assert_eq!(record["packages"]["homebrew"]["commit_sha"], "deadbeef1234");
+    assert_eq!(
+        record["packages"]["homebrew"]["commit_url"],
+        "https://github.com/rp1-run/homebrew-tap/commit/deadbeef1234"
+    );
+    assert_eq!(record["packages"]["scoop"]["repo"], "rp1-run/scoop-bucket");
+    assert_eq!(record["packages"]["scoop"]["path"], "bucket/1up.json");
+    assert_eq!(record["packages"]["scoop"]["commit_sha"], "feedface5678");
+    assert_eq!(
+        record["packages"]["scoop"]["commit_url"],
+        "https://github.com/rp1-run/scoop-bucket/commit/feedface5678"
+    );
 }
 
 #[cfg(unix)]

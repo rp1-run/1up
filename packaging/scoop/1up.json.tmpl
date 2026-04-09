@@ -1,0 +1,17 @@
+{
+  "version": "{{VERSION}}",
+  "description": "Unified search substrate for source repositories",
+  "homepage": "https://github.com/rp1-run/1up",
+  "license": "{{LICENSE}}",
+  "url": "{{WINDOWS_URL}}",
+  "hash": "{{WINDOWS_SHA256}}",
+  "extract_dir": "{{WINDOWS_EXTRACT_DIR}}",
+  "bin": "1up.exe",
+  "checkver": {
+    "github": "https://github.com/rp1-run/1up"
+  },
+  "autoupdate": {
+    "url": "https://github.com/rp1-run/1up/releases/download/v$version/1up-v$version-x86_64-pc-windows-msvc.zip",
+    "extract_dir": "1up-v$version-x86_64-pc-windows-msvc"
+  }
+}
