@@ -1,0 +1,145 @@
+name: release-assets
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: validate release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: validate release metadata
+        shell: bash
+        run: bash scripts/release/validate_release_metadata.sh "${GITHUB_REF_NAME}"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin 1up
+
+      - name: package release asset
+        shell: bash
+        run: |
+          binary_path="target/${{ matrix.target }}/release/1up"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary_path="${binary_path}.exe"
+          fi
+          bash scripts/release/package_release_asset.sh \
+            --target "${{ matrix.target }}" \
+            --binary "$binary_path" \
+            --output-dir "${RUNNER_TEMP}/release-assets" \
+            --version "${{ needs.validate.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
+  publish-draft:
+    name: publish draft release assets
+    runs-on: ubuntu-24.04
+    needs:
+      - validate
+      - build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/downloads
+
+      - name: consolidate release artifacts
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/dist"
+          find "${RUNNER_TEMP}/downloads" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.metadata.json' \) -exec cp {} "${RUNNER_TEMP}/dist/" \;
+
+      - name: generate checksums and manifest
+        shell: bash
+        env:
+          ONEUP_RELEASE_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          bash scripts/release/write_sha256sums.sh \
+            --assets-dir "${RUNNER_TEMP}/dist" \
+            --output "${RUNNER_TEMP}/dist/SHA256SUMS"
+          bash scripts/release/generate_release_manifest.sh \
+            --tag "${GITHUB_REF_NAME}" \
+            --assets-dir "${RUNNER_TEMP}/dist" \
+            --checksums "${RUNNER_TEMP}/dist/SHA256SUMS" \
+            --output "${RUNNER_TEMP}/dist/release-manifest.json"
+          bash scripts/release/extract_release_notes.sh "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/dist/release-notes.md"
+
+      - name: create or update draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          title="1up ${{ needs.validate.outputs.version }}"
+          if release_json=$(gh release view "$tag" --json isDraft,url 2>/dev/null); then
+            is_draft=$(jq -r '.isDraft' <<<"$release_json")
+            if [[ "$is_draft" != "true" ]]; then
+              url=$(jq -r '.url' <<<"$release_json")
+              echo "release ${tag} is already published at ${url}" >&2
+              exit 1
+            fi
+            gh release edit "$tag" --draft --title "$title" --notes-file "${RUNNER_TEMP}/dist/release-notes.md"
+          else
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "$title" \
+              --notes-file "${RUNNER_TEMP}/dist/release-notes.md"
+          fi
+          gh release upload "$tag" \
+            "${RUNNER_TEMP}/dist/"*.tar.gz \
+            "${RUNNER_TEMP}/dist/"*.zip \
+            "${RUNNER_TEMP}/dist/SHA256SUMS" \
+            "${RUNNER_TEMP}/dist/release-manifest.json" \
+            --clobber
