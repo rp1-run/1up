@@ -10,9 +10,11 @@ This project follows an install-first public release posture:
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-09
+
 ### Added
 
-- Install-first onboarding in `README.md`
-- Release operator runbook in `RELEASE.md`
-- Contributor merge and validation policy in `CONTRIBUTING.md`
-- Canonical release-history surface for future tagged releases
+- Public release automation for GitHub release assets, checksums, manifests, and publish-time evidence
+- Homebrew and Scoop packaging flows driven from the release manifest
+- Windows local-mode support for indexing and search when daemon workflows are unavailable
+- Release operator guidance in `RELEASE.md` and contributor validation policy in `CONTRIBUTING.md`
