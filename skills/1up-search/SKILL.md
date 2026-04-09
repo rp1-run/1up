@@ -12,7 +12,7 @@ description: >
   that grep/rg require. Available when the project has a `.1up/` directory or `1up` is on PATH.
   Do NOT use for: searching non-code files (logs, data), exact byte-level pattern matching,
   or projects without 1up installed.
-license: MIT
+license: Apache-2.0
 metadata:
   author: rp1-run/1up
   version: "1.0"
