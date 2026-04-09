@@ -29,6 +29,16 @@ pub struct StartArgs {
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
+    if !lifecycle::supports_daemon() {
+        println!(
+            "{}",
+            fmt.format_message(
+                "Background daemon workflows are not supported on this platform yet. Use `1up init` and `1up index`, then rerun `1up index` or `1up reindex` to refresh the local database."
+            )
+        );
+        return Ok(());
+    }
+
     let mut registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         args.jobs,
