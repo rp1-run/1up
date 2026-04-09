@@ -2,10 +2,12 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -25,6 +27,7 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
     }
 }
 
+#[cfg(unix)]
 fn write_framed_json(stream: &mut UnixStream, value: &serde_json::Value) {
     let payload = serde_json::to_vec(value).unwrap();
     let length = u32::try_from(payload.len()).unwrap().to_be_bytes();
@@ -33,6 +36,7 @@ fn write_framed_json(stream: &mut UnixStream, value: &serde_json::Value) {
     stream.shutdown(std::net::Shutdown::Write).unwrap();
 }
 
+#[cfg(unix)]
 fn read_framed_json(stream: &mut UnixStream) -> serde_json::Value {
     let mut length = [0u8; 4];
     stream.read_exact(&mut length).unwrap();
@@ -1103,6 +1107,7 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
 
 // ---------- Daemon lifecycle test ----------
 
+#[cfg(unix)]
 #[test]
 fn daemon_pid_file_lifecycle() {
     let tmp = TempDir::new().unwrap();
@@ -1125,6 +1130,7 @@ fn daemon_pid_file_lifecycle() {
     assert!(!pid_path.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn daemon_stale_pid_detection() {
     let tmp = TempDir::new().unwrap();
@@ -1246,6 +1252,7 @@ fn status_json_reports_noop_index_progress() {
     assert!(payload["indexed_files"].as_u64().unwrap() > 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_search_uses_daemon_results_before_local_fallback() {
     let home = tempfile::Builder::new()

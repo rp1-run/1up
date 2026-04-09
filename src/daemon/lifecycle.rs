@@ -11,6 +11,10 @@ use crate::shared::fs::{
     atomic_replace, ensure_secure_xdg_root, remove_regular_file, validate_regular_file_path,
 };
 
+pub const fn supports_daemon() -> bool {
+    true
+}
+
 pub fn write_pid_file() -> Result<(), OneupError> {
     let xdg_root = ensure_secure_xdg_root()
         .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;

@@ -171,7 +171,16 @@ mod tests {
     use super::*;
 
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    fn mode_bits(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     use crate::shared::config;
     use crate::shared::constants::PROJECT_STATE_DIR_MODE;
@@ -187,9 +196,9 @@ mod tests {
         db.connect().unwrap();
 
         let dot_dir = config::project_dot_dir(&project_root);
-        let dot_dir_mode = fs::metadata(&dot_dir).unwrap().permissions().mode() & 0o777;
         assert!(db_path.exists());
-        assert_eq!(dot_dir_mode, PROJECT_STATE_DIR_MODE);
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
     }
 
     #[tokio::test]
@@ -203,6 +212,7 @@ mod tests {
         assert!(err.to_string().contains("<project>/.1up/index.db"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn open_ro_rejects_symlinked_database_leaf() {
         let tmp = tempfile::tempdir().unwrap();
