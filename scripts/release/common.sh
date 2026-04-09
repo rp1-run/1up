@@ -42,6 +42,26 @@ require_file() {
   fi
 }
 
+sha256_file() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+
+  fail "missing required command: sha256sum or shasum"
+}
+
+utc_timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 cargo_package_field() {
   local field="$1"
 
