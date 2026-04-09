@@ -49,10 +49,11 @@ ls .1up/project_id 2>/dev/null && echo "indexed" || echo "not indexed"
 If not indexed, initialize and index first:
 
 ```sh
-1up start    # initializes, indexes, and starts the daemon
+1up init
+1up index
 ```
 
-After this, the index stays current automatically via the background daemon.
+On platforms with daemon support, `1up start` still combines initialization, indexing, and daemon startup. On Windows and other local-mode platforms, refresh the local database with `1up index` or `1up reindex`.
 
 ## Commands
 

@@ -69,7 +69,7 @@ Release-time evidence is heavier and should be reviewed before publishing a publ
 8. Review the draft GitHub Release generated from the tag-triggered release workflows.
 9. Confirm the release includes archives, `SHA256SUMS`, manifest data, and release evidence references.
 10. Publish the GitHub Release.
-11. Confirm the package publication step updates Homebrew and Scoop to the same release.
+11. Confirm the package publication step updates Homebrew and Scoop to the same release, then wait for `release-evidence.json` to refresh with the published package references.
 
 ## Publish Checklist
 
@@ -79,6 +79,7 @@ Release-time evidence is heavier and should be reviewed before publishing a publ
 - `SHA256SUMS` and release metadata are attached to the draft release
 - Security, eval, and benchmark evidence are retained or explicitly marked as skipped with a reason
 - Homebrew and Scoop point at the published immutable assets
+- The final `release-evidence.json` references `package-publication-record.json` after package publication completes
 
 ## Rollback And Repair
 
