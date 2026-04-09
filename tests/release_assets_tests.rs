@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,6 +52,12 @@ fn run_release_script(root: &Path, name: &str, args: &[&str]) -> std::process::O
         .env("ONEUP_RELEASE_ROOT", root)
         .output()
         .unwrap()
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
@@ -121,6 +129,169 @@ fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
 
     dist_dir
 }
+
+fn write_real_release_archive(
+    root: &Path,
+    dist_dir: &Path,
+    version: &str,
+    target: &str,
+    binary_name: &str,
+) {
+    let stage_root = root.join(format!("stage-{target}"));
+    let package_dir_name = format!("1up-v{version}-{target}");
+    let package_dir = stage_root.join(&package_dir_name);
+    fs::create_dir_all(&package_dir).unwrap();
+    write_executable(
+        &package_dir.join(binary_name),
+        &format!("#!/bin/sh\nprintf '1up {version} ({target})\\n'\n"),
+    );
+    fs::copy(repo_root().join("LICENSE"), package_dir.join("LICENSE")).unwrap();
+    fs::write(
+        package_dir.join("README.txt"),
+        format!("1up {version}\nTarget: {target}\n"),
+    )
+    .unwrap();
+
+    let extension = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    let archive_name = format!("1up-v{version}-{target}.{extension}");
+    let archive_path = dist_dir.join(&archive_name);
+
+    if extension == "tar.gz" {
+        let output = Command::new("tar")
+            .arg("-C")
+            .arg(&stage_root)
+            .arg("-czf")
+            .arg(&archive_path)
+            .arg(&package_dir_name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "tar packaging unexpectedly failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        let output = Command::new("zip")
+            .arg("-qr")
+            .arg(&archive_path)
+            .arg(&package_dir_name)
+            .current_dir(&stage_root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "zip packaging unexpectedly failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let os = if target.contains("apple-darwin") {
+        "macos"
+    } else if target.contains("windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    let arch = if target.starts_with("aarch64-") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let install_hint = if os == "windows" {
+        format!("Download the Windows {arch} archive from GitHub Releases and unpack with Expand-Archive.")
+    } else if os == "macos" {
+        format!("Download the macOS {arch} archive from GitHub Releases and unpack with tar -xzf.")
+    } else {
+        format!("Download the Linux {arch} archive from GitHub Releases and unpack with tar -xzf.")
+    };
+
+    fs::write(
+        dist_dir.join(format!("{archive_name}.metadata.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "target": target,
+            "os": os,
+            "arch": arch,
+            "archive": archive_name,
+            "install_hint": install_hint,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_verifiable_release_artifacts(root: &Path, version: &str) -> PathBuf {
+    let dist_dir = root.join("verifiable-dist");
+    fs::create_dir_all(&dist_dir).unwrap();
+
+    for (target, binary_name) in [
+        ("aarch64-apple-darwin", "1up"),
+        ("x86_64-apple-darwin", "1up"),
+        ("aarch64-unknown-linux-gnu", "1up"),
+        ("x86_64-unknown-linux-gnu", "1up"),
+        ("x86_64-pc-windows-msvc", "1up.exe"),
+    ] {
+        write_real_release_archive(root, &dist_dir, version, target, binary_name);
+    }
+
+    let checksums_output = run_release_script(
+        root,
+        "write_sha256sums.sh",
+        &[
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--output",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+        ],
+    );
+    assert!(
+        checksums_output.status.success(),
+        "checksum generation unexpectedly failed: {}",
+        String::from_utf8_lossy(&checksums_output.stderr)
+    );
+
+    let manifest_output = run_release_script(
+        root,
+        "generate_release_manifest.sh",
+        &[
+            "--tag",
+            &format!("v{version}"),
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--output",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--commit-sha",
+            "abc123def456",
+        ],
+    );
+    assert!(
+        manifest_output.status.success(),
+        "manifest generation unexpectedly failed: {}",
+        String::from_utf8_lossy(&manifest_output.stderr)
+    );
+
+    dist_dir
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(target_arch = "aarch64")]
+const HOST_RELEASE_TARGET: &str = "aarch64-apple-darwin";
+#[cfg(target_os = "macos")]
+#[cfg(target_arch = "x86_64")]
+const HOST_RELEASE_TARGET: &str = "x86_64-apple-darwin";
+#[cfg(target_os = "linux")]
+#[cfg(target_arch = "aarch64")]
+const HOST_RELEASE_TARGET: &str = "aarch64-unknown-linux-gnu";
+#[cfg(target_os = "linux")]
+#[cfg(target_arch = "x86_64")]
+const HOST_RELEASE_TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(target_os = "windows")]
+const HOST_RELEASE_TARGET: &str = "x86_64-pc-windows-msvc";
 
 #[test]
 fn release_metadata_validation_passes_for_matching_tag_and_changelog() {
@@ -349,6 +520,457 @@ fn package_publication_record_captures_repo_commit_refs() {
         record["packages"]["scoop"]["commit_url"],
         "https://github.com/rp1-run/scoop-bucket/commit/feedface5678"
     );
+}
+
+#[test]
+fn archive_verification_confirms_expected_release_contents() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    let output_path = dist_dir.join("archive-verification.json");
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "verify_release_archives.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--target",
+            HOST_RELEASE_TARGET,
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "archive verification unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let verification: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(verification["archive_count"], 1);
+    assert_eq!(verification["archives"][0]["target"], HOST_RELEASE_TARGET);
+    assert_eq!(
+        verification["archives"][0]["verified_contents"]["license"],
+        format!("1up-v0.1.0-{}/LICENSE", HOST_RELEASE_TARGET)
+    );
+    assert_eq!(
+        verification["archives"][0]["smoke_test"]["status"],
+        "passed"
+    );
+    assert!(verification["archives"][0]["smoke_test"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("--version"));
+    assert!(verification["archives"][0]["smoke_test"]["output"]
+        .as_str()
+        .unwrap()
+        .contains("0.1.0"));
+}
+
+#[test]
+fn release_evidence_supports_explicit_skipped_eval_reason() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    let merge_gate_path = dist_dir.join("merge-gate.json");
+    let security_check_path = dist_dir.join("security-check.json");
+    let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
+    let archive_verification_path = dist_dir.join("archive-verification.json");
+    let output_path = dist_dir.join("release-evidence.json");
+
+    fs::write(
+        &merge_gate_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workflow": "ci",
+            "run_id": 42,
+            "run_number": 7,
+            "run_url": "https://github.com/rp1-run/1up/actions/runs/42",
+            "head_sha": "abc123def456",
+            "conclusion": "success",
+            "required_checks": [
+                "security-check",
+                "release-smoke-macos",
+                "release-smoke-linux",
+                "release-smoke-windows",
+                "release-consistency"
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &security_check_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "passed"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &benchmark_summary_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "scenario": "parallel-indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let archive_output = run_release_script(
+        fixture_root.path(),
+        "verify_release_archives.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--target",
+            HOST_RELEASE_TARGET,
+            "--output",
+            archive_verification_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        archive_output.status.success(),
+        "archive verification unexpectedly failed: {}",
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "generate_release_evidence.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--merge-gate",
+            merge_gate_path.to_str().unwrap(),
+            "--security-check",
+            security_check_path.to_str().unwrap(),
+            "--eval-skipped-reason",
+            "Hosted eval artifacts are not retained for this release candidate.",
+            "--benchmark-summary",
+            benchmark_summary_path.to_str().unwrap(),
+            "--archive-verification",
+            archive_verification_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "release evidence generation unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(evidence["version"], "0.1.0");
+    assert_eq!(evidence["git_tag"], "v0.1.0");
+    assert_eq!(evidence["merge_gate"]["workflow"], "ci");
+    assert_eq!(
+        evidence["security_check"]["artifact"],
+        "security-check.json"
+    );
+    assert_eq!(evidence["evals"]["status"], "skipped");
+    assert_eq!(
+        evidence["evals"]["skipped_reason"],
+        "Hosted eval artifacts are not retained for this release candidate."
+    );
+    assert_eq!(evidence["benchmarks"]["status"], "recorded");
+    assert_eq!(
+        evidence["benchmarks"]["summary_asset"],
+        "benchmark-summary.json"
+    );
+    assert_eq!(evidence["archive_verification"]["status"], "recorded");
+    assert_eq!(evidence["archive_verification"]["archive_count"], 1);
+    assert_eq!(evidence["packages"]["status"], "pending");
+}
+
+#[test]
+fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    let merge_gate_path = dist_dir.join("merge-gate.json");
+    let security_check_path = dist_dir.join("security-check.json");
+    let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
+    let archive_verification_path = dist_dir.join("archive-verification.json");
+    let output_path = dist_dir.join("release-evidence.json");
+
+    fs::write(
+        &merge_gate_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workflow": "ci",
+            "run_id": 42,
+            "run_number": 7,
+            "run_url": "https://github.com/rp1-run/1up/actions/runs/42",
+            "head_sha": "abc123def456",
+            "conclusion": "success",
+            "required_checks": ["security-check"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &security_check_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "passed"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &benchmark_summary_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "scenario": "parallel-indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let archive_output = run_release_script(
+        fixture_root.path(),
+        "verify_release_archives.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--target",
+            HOST_RELEASE_TARGET,
+            "--output",
+            archive_verification_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        archive_output.status.success(),
+        "archive verification unexpectedly failed: {}",
+        String::from_utf8_lossy(&archive_output.stderr)
+    );
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "generate_release_evidence.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--merge-gate",
+            merge_gate_path.to_str().unwrap(),
+            "--security-check",
+            security_check_path.to_str().unwrap(),
+            "--benchmark-summary",
+            benchmark_summary_path.to_str().unwrap(),
+            "--archive-verification",
+            archive_verification_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "release evidence unexpectedly passed without eval evidence: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("eval evidence requires a summary path or a skipped reason"));
+}
+
+#[test]
+fn release_evidence_rejects_archive_verification_without_smoke_results() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    let merge_gate_path = dist_dir.join("merge-gate.json");
+    let security_check_path = dist_dir.join("security-check.json");
+    let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
+    let archive_verification_path = dist_dir.join("archive-verification.json");
+    let output_path = dist_dir.join("release-evidence.json");
+
+    fs::write(
+        &merge_gate_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workflow": "ci",
+            "run_id": 42,
+            "run_number": 7,
+            "run_url": "https://github.com/rp1-run/1up/actions/runs/42",
+            "head_sha": "abc123def456",
+            "conclusion": "success",
+            "required_checks": ["security-check"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &security_check_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "passed",
+            "summary": {},
+            "steps": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &benchmark_summary_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "scenario": "parallel-indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &archive_verification_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generated_at": "2026-04-09T00:00:00Z",
+            "manifest_asset": "release-manifest.json",
+            "checksums_asset": "SHA256SUMS",
+            "archive_count": 1,
+            "archives": [{
+                "target": HOST_RELEASE_TARGET,
+                "archive": format!(
+                    "1up-v0.1.0-{HOST_RELEASE_TARGET}.{}",
+                    if HOST_RELEASE_TARGET.contains("windows") { "zip" } else { "tar.gz" }
+                ),
+                "sha256": "abc123"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "generate_release_evidence.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--merge-gate",
+            merge_gate_path.to_str().unwrap(),
+            "--security-check",
+            security_check_path.to_str().unwrap(),
+            "--eval-skipped-reason",
+            "Hosted eval artifacts are not retained for this release candidate.",
+            "--benchmark-summary",
+            benchmark_summary_path.to_str().unwrap(),
+            "--archive-verification",
+            archive_verification_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "release evidence unexpectedly accepted incomplete archive verification: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("archive verification summary is missing required fields"));
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_security_download_helper_uses_run_artifact() {
+    let fixture_root = build_release_fixture();
+    let fake_gh_dir = tempfile::tempdir().unwrap();
+    let artifact_path = fake_gh_dir.path().join("security-check.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "passed",
+            "summary": { "failed_steps": 0 },
+            "steps": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let gh_path = fake_gh_dir.path().join("gh");
+    write_executable(
+        &gh_path,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${FAKE_GH_LOG:?}"
+dir="."
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D|--dir)
+      dir="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+mkdir -p "$dir"
+cp "${FAKE_GH_ARTIFACT:?}" "$dir/security-check.json"
+"#,
+    );
+
+    let log_path = fake_gh_dir.path().join("gh.log");
+    let output_path = fixture_root.path().join("downloaded-security-check.json");
+    let path = std::env::var("PATH").unwrap();
+    let output = Command::new("bash")
+        .arg(release_script("download_retained_security_check.sh"))
+        .args([
+            "--repo",
+            "rp1-run/1up",
+            "--run-id",
+            "42",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .current_dir(repo_root())
+        .env("ONEUP_RELEASE_ROOT", fixture_root.path())
+        .env("PATH", format!("{}:{path}", fake_gh_dir.path().display()))
+        .env("FAKE_GH_ARTIFACT", &artifact_path)
+        .env("FAKE_GH_LOG", &log_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "retained security download unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let downloaded: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(downloaded["status"], "passed");
+
+    let gh_log = fs::read_to_string(log_path).unwrap();
+    assert!(gh_log.contains("run download 42"));
+    assert!(gh_log.contains("--repo rp1-run/1up"));
+    assert!(gh_log.contains("--name security-check"));
+}
+
+#[test]
+fn ci_workflow_retains_security_check_artifact() {
+    let workflow = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    assert!(workflow.contains("retain security evidence"));
+    assert!(workflow.contains("actions/upload-artifact@v4"));
+    assert!(workflow.contains("target/security/security-check.json"));
+    assert!(workflow.contains("retention-days: 30"));
+}
+
+#[test]
+fn release_evidence_workflow_uses_retained_security_and_native_archive_verification() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/release-evidence.yml")).unwrap();
+
+    assert!(workflow.contains("download retained security check"));
+    assert!(workflow.contains("bash scripts/release/download_retained_security_check.sh"));
+    assert!(workflow.contains("pattern: archive-verification-*"));
+    assert!(workflow.contains("ubuntu-24.04-arm"));
+    assert!(workflow.contains("--target \"${{ matrix.target }}\""));
 }
 
 #[cfg(unix)]
