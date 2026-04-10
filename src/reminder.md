@@ -1,8 +1,9 @@
 # 1up -- Agent Quick Reference
 
-IMPORTANT: DO NOT use Grep or rg for code exploration in this project.
-Use the `1up` CLI commands below instead. `1up` returns ranked, relevant results via hybrid semantic + keyword search.
-Grep is only acceptable for exact string matches in non-code files (error codes, UUIDs, config keys).
+IMPORTANT: Prefer `1up` over Grep/rg for code exploration in this project.
+`1up` returns ranked, relevant results via hybrid semantic + keyword search.
+Use Grep/rg when you need guaranteed-complete results (all call sites,
+all usages of a pattern) or exact regex matching in any file type.
 
 ## Prerequisites
 
