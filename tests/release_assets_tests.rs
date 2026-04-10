@@ -384,7 +384,7 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .iter()
         .all(|artifact| artifact["sha256"].as_str().unwrap().len() == 64));
 
-    // Update lifecycle fields (T12)
+    // Update lifecycle fields
     let published_at = manifest["published_at"].as_str().unwrap();
     assert!(
         published_at.ends_with('Z') && published_at.contains('T'),
