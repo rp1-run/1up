@@ -5,7 +5,7 @@ Use this prompt with an agent runtime that supports:
 - child/sub-agent spawning
 - Python
 
-This prompt is intentionally narrow. It compares a baseline child against a 1up-guided child on one fixed investigation task. The children are told to look for a specific set of checkpoints and nothing else.
+This prompt is intentionally narrow. It compares a baseline child against a 1up-guided child on one selected task from a curated task pack. The children are told to look for a specific set of checkpoints and nothing else.
 
 ## Objective
 
@@ -60,32 +60,131 @@ After checkout:
 
 Do not start child runs until indexing is ready.
 
-## Fixed Task Pack
+## Curated Task Pack
 
-Use this exact task pack for the first iteration:
+Use this exact task pack.
+
+For quick iteration, run one selected task.
+For a stronger benchmark, run all four selected tasks sequentially.
 
 ```json
 {
-  "task_id": "search-stack",
-  "task_label": "Search Stack",
-  "task_prompt": "Trace how emdash content search is enabled and queried, from a field becoming searchable through to admin search results. Identify the key files involved in each step.",
-  "checkpoints": [
-    "Find where a field becomes searchable in the admin or schema layer.",
-    "Find where that searchability state is persisted or updated in the core schema/registry layer.",
-    "Find where search is enabled, rebuilt, or configured in the FTS/search-management layer.",
-    "Find where the search API endpoint handles the incoming query.",
-    "Find where the admin UI requests and renders the returned search results."
+  "quick_iteration_task_ids": [
+    "search-stack"
   ],
-  "master_only_expected_file_basenames": [
-    "fts-manager.ts",
-    "query.ts",
-    "AdminCommandPalette.tsx"
+  "recommended_full_run_task_ids": [
+    "search-stack",
+    "wordpress-import",
+    "plugin-architecture",
+    "live-content-query"
+  ],
+  "tasks": [
+    {
+      "task_id": "search-stack",
+      "task_label": "Search Stack",
+      "task_prompt": "Trace how emdash content search is enabled and queried, from a field becoming searchable through to admin search results. Identify the key files involved in each step.",
+      "checkpoints": [
+        "Find where a field becomes searchable in the admin or schema layer.",
+        "Find where that searchability state is persisted or updated in the core schema or registry layer.",
+        "Find where search is enabled, rebuilt, or configured in the FTS or search-management layer.",
+        "Find where the search API endpoint handles the incoming query.",
+        "Find where the admin UI requests and renders the returned search results."
+      ],
+      "master_only_expected_evidence_fragments": [
+        "fts-manager.ts",
+        "query.ts",
+        "AdminCommandPalette.tsx"
+      ],
+      "why_this_task_is_hard_for_grep": [
+        "The user phrasing spans admin UI, schema persistence, FTS setup, API routing, and result rendering.",
+        "Key concepts are expressed with different identifiers such as searchable, search_config, FTS, and command palette.",
+        "The correct answer is a cross-file flow, not a single symbol lookup."
+      ]
+    },
+    {
+      "task_id": "wordpress-import",
+      "task_label": "WordPress Import",
+      "task_prompt": "Explain the WordPress import pipeline from the admin wizard through schema preparation, WXR execution, and Gutenberg-to-Portable-Text conversion. Identify the key files involved in each step.",
+      "checkpoints": [
+        "Find the admin wizard entry point for the WordPress import flow.",
+        "Find where schema preparation is performed before import execution.",
+        "Find where the WXR import is executed or parsed.",
+        "Find where Gutenberg content is converted into Portable Text.",
+        "Find where the pipeline hands converted content back into the import flow."
+      ],
+      "master_only_expected_evidence_fragments": [
+        "WordPressImport.tsx",
+        "prepare.ts",
+        "execute.ts",
+        "gutenberg-to-portable-text/src/index.ts"
+      ],
+      "why_this_task_is_hard_for_grep": [
+        "The flow crosses UI, import orchestration, parser/executor, and conversion layers.",
+        "The user language mixes WordPress, WXR, and Gutenberg concepts that are unlikely to share one consistent identifier family.",
+        "One crucial file is a converter package entrypoint, not an obvious import-specific filename."
+      ]
+    },
+    {
+      "task_id": "plugin-architecture",
+      "task_label": "Plugin Architecture",
+      "task_prompt": "Trace how a sandboxed emdash plugin is registered, capability-gated, loaded into Cloudflare Worker isolation, and given controlled access to content, storage, and network. Identify the key files involved in each step.",
+      "checkpoints": [
+        "Find where plugins are registered or discovered.",
+        "Find where plugin capabilities or hooks are defined or enforced.",
+        "Find where plugins are loaded into a Worker or sandbox runtime.",
+        "Find where the sandbox wrapper or isolation boundary is applied.",
+        "Find where controlled access to content, storage, or network is bridged into the plugin runtime."
+      ],
+      "master_only_expected_evidence_fragments": [
+        "manager.ts",
+        "hooks.ts",
+        "runner.ts",
+        "wrapper.ts",
+        "bridge.ts"
+      ],
+      "why_this_task_is_hard_for_grep": [
+        "The task is phrased in platform language such as capability-gated and isolation, while the code may split that behavior across unrelated filenames.",
+        "The answer requires following a permissioned handoff across several runtime layers.",
+        "The relevant files are conceptually connected, but a literal text search often returns many partial matches and infrastructure noise."
+      ]
+    },
+    {
+      "task_id": "live-content-query",
+      "task_label": "Live Content Query",
+      "task_prompt": "Explain how emdash stores schema in the database and exposes typed live content queries through Astro. Identify the key files involved in each step.",
+      "checkpoints": [
+        "Find where schema definitions are registered or stored for runtime use.",
+        "Find where stored schema is loaded back into the runtime.",
+        "Find where content queries are executed against that schema.",
+        "Find where Astro live-query integration is configured.",
+        "Find where the typed live query surface is exposed back to the application."
+      ],
+      "master_only_expected_evidence_fragments": [
+        "registry.ts",
+        "loader.ts",
+        "query.ts",
+        "live.config.ts"
+      ],
+      "why_this_task_is_hard_for_grep": [
+        "The task blends schema storage, runtime loading, query execution, and framework integration in one trace.",
+        "Terms like live and typed may not appear consistently in the storage or loader layers.",
+        "The correct answer depends on following a semantic flow across database, runtime, and Astro integration files."
+      ]
+    }
   ]
 }
 ```
 
 The checkpoints are the only things the children are allowed to investigate.
 They must not broaden the task into general architecture exploration.
+
+## Why These Tasks
+
+These tasks were chosen because simple grep tends to fragment on them:
+- they span multiple layers with different local vocabularies
+- the user phrasing does not map cleanly to a single symbol or filename family
+- the right answer is a traced flow, not a bag of isolated matches
+- a weaker search strategy often needs more iterative probing to bridge the semantic gaps
 
 ## Master Rules
 
@@ -113,7 +212,7 @@ Do not trust child-reported timing.
 
 ### Child Run Order
 
-Run sequentially:
+For each selected task, run sequentially:
 1. `baseline`
 2. `1up`
 
@@ -129,6 +228,7 @@ Pass typed JSON into each child. The master may serialize this into the child pr
   "variant": "baseline | 1up",
   "repo_path": "/absolute/path/to/repo",
   "task_id": "search-stack",
+  "task_label": "Search Stack",
   "task_prompt": "Trace how emdash content search is enabled and queried, from a field becoming searchable through to admin search results. Identify the key files involved in each step.",
   "checkpoints": [
     "Find where a field becomes searchable in the admin or schema layer.",
@@ -139,8 +239,7 @@ Pass typed JSON into each child. The master may serialize this into the child pr
   ],
   "rules": {
     "forbid_1up": true,
-    "require_1up_first": false,
-    "max_shell_commands": 12
+    "require_1up_first": false
   }
 }
 ```
@@ -148,6 +247,9 @@ Pass typed JSON into each child. The master may serialize this into the child pr
 For the `1up` variant:
 - set `forbid_1up` to `false`
 - set `require_1up_first` to `true`
+
+Do not pass `master_only_expected_evidence_fragments` into the child prompt.
+Those fragments are for master-side grading only.
 
 ## Child Output Schema
 
@@ -194,14 +296,17 @@ INPUT_JSON:
 
 Execution rules:
 - Work only in `{{repo_path}}`.
+- Process the checkpoints in order.
 - Investigate only the listed checkpoints.
 - Do not explore anything outside those checkpoints.
 - Stop as soon as you have enough evidence to answer the five checkpoints.
+- For each checkpoint, find only the minimal evidence needed to resolve it.
+- Do not inspect tests, docs, benchmarks, or unrelated features unless a checkpoint directly requires them.
 - Do not use the `1up` command.
 - Use standard CLI tools only.
 - Every shell command must start with `cd {{repo_path}} && ...`.
 - Keep an incremental command log and return it exactly as `shell_commands` in execution order.
-- Use at most `{{rules.max_shell_commands}}` shell commands.
+- Before emitting final JSON, recount your final `shell_commands` list and set `tool_calls_estimated` to that exact integer.
 - `tool_calls_estimated` must equal the number of shell commands you executed.
 - `used_1up` must be `false`.
 - `files_cited` must include only files directly used as evidence in your answer.
@@ -226,15 +331,18 @@ INPUT_JSON:
 
 Execution rules:
 - Work only in `{{repo_path}}`.
+- Process the checkpoints in order.
 - Investigate only the listed checkpoints.
 - Do not explore anything outside those checkpoints.
 - Stop as soon as you have enough evidence to answer the five checkpoints.
+- For each checkpoint, find only the minimal evidence needed to resolve it.
+- Do not inspect tests, docs, benchmarks, or unrelated features unless a checkpoint directly requires them.
 - After any optional index check, your first exploration command must use `1up`.
 - Prefer `1up search`, `1up symbol`, and `1up context`.
 - Use fallback tools only for exact file inspection or exact string verification.
 - Every shell command must start with `cd {{repo_path}} && ...`.
 - Keep an incremental command log and return it exactly as `shell_commands` in execution order.
-- Use at most `{{rules.max_shell_commands}}` shell commands.
+- Before emitting final JSON, recount your final `shell_commands` list and set `tool_calls_estimated` to that exact integer.
 - `tool_calls_estimated` must equal the number of shell commands you executed.
 - `used_1up` must be `true`.
 - `files_cited` must include only files directly used as evidence in your answer.
@@ -262,7 +370,6 @@ Mark a run invalid if any of the following are true:
 - `baseline.used_1up == true`
 - `1up.used_1up == false`
 - `1up` does not use `1up` in its first exploration step
-- command budget exceeded
 
 ## Python Aggregation
 
@@ -278,13 +385,10 @@ Aggregate at least:
 - `schema_valid`
 - `violations`
 
-Compute `correctness_score` by checking whether the child answer or `files_cited` references the master-only expected basenames:
-- `fts-manager.ts`
-- `query.ts`
-- `AdminCommandPalette.tsx`
+Compute `correctness_score` per task by checking whether the child answer or `files_cited` references the current task's `master_only_expected_evidence_fragments`.
 
 Use a simple score:
-- `found / 3`
+- `found / len(master_only_expected_evidence_fragments)`
 
 ## Final Output
 
@@ -307,9 +411,10 @@ This first version optimizes for:
 - narrow child scope
 - external timing
 - easy manual reruns
+- semantically difficult traced-flow tasks
 
 It does not yet optimize for:
 - the best possible 1up prompt efficiency
 - multi-task loops
 - resumable result files
-- hidden grading beyond the simple basename check
+- hidden grading beyond the simple evidence-fragment check
