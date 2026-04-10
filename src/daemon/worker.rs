@@ -3,6 +3,7 @@ use std::future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -16,9 +17,13 @@ use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingU
 use crate::indexer::pipeline;
 use crate::search::HybridSearchEngine;
 use crate::shared::config;
-use crate::shared::constants::{MAX_DAEMON_IN_FLIGHT_REQUESTS, WATCHER_DEBOUNCE_MS};
+use crate::shared::constants::{
+    DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
+    SECURE_STATE_FILE_MODE, WATCHER_DEBOUNCE_MS,
+};
 use crate::shared::errors::OneupError;
-use crate::shared::types::{IndexingConfig, RunScope};
+use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
+use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope};
 use crate::storage::{db::Db, schema};
 
 #[derive(Debug, Default)]
@@ -58,6 +63,7 @@ struct ProjectState {
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
+    last_file_check_persisted_at: Option<DateTime<Utc>>,
 }
 
 struct QueuedSearchRequest {
@@ -101,6 +107,7 @@ async fn run_inner() -> Result<(), OneupError> {
     };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
+    record_file_check_for_all_projects(&mut projects, Utc::now(), true);
 
     let debounce = std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS);
 
@@ -149,6 +156,8 @@ async fn run_inner() -> Result<(), OneupError> {
                 info!("received SIGHUP, reloading project registry");
                 if let Err(e) = reload_projects(&mut file_watcher, &mut projects).await {
                     error!("failed to reload projects: {e}");
+                } else {
+                    record_file_check_for_all_projects(&mut projects, Utc::now(), true);
                 }
             }
             _ = sigterm.recv() => {
@@ -157,6 +166,7 @@ async fn run_inner() -> Result<(), OneupError> {
             }
             _ = tokio::time::sleep(debounce) => {
                 let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
+                record_file_check_for_all_projects(&mut projects, Utc::now(), false);
                 if filtered.is_empty() {
                     continue;
                 }
@@ -412,7 +422,77 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
+        last_file_check_persisted_at: None,
     }))
+}
+
+fn record_file_check_for_all_projects(
+    projects: &mut HashMap<PathBuf, ProjectState>,
+    checked_at: DateTime<Utc>,
+    force: bool,
+) {
+    for state in projects.values_mut() {
+        record_file_check(state, checked_at, force);
+    }
+}
+
+fn record_file_check(state: &mut ProjectState, checked_at: DateTime<Utc>, force: bool) {
+    if !force
+        && state
+            .last_file_check_persisted_at
+            .is_some_and(|last_persisted_at| {
+                checked_at
+                    .signed_duration_since(last_persisted_at)
+                    .num_milliseconds()
+                    < DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS as i64
+            })
+    {
+        return;
+    }
+
+    let status = DaemonProjectStatus {
+        last_file_check_at: checked_at,
+    };
+    persist_daemon_project_status(&state.project_root, &status);
+    state.last_file_check_persisted_at = Some(checked_at);
+}
+
+fn persist_daemon_project_status(project_root: &Path, status: &DaemonProjectStatus) {
+    let secure_root = match ensure_secure_project_root(project_root) {
+        Ok(root) => root,
+        Err(err) => {
+            debug!(
+                "failed to prepare secure project root for daemon heartbeat {}: {err}",
+                project_root.display()
+            );
+            return;
+        }
+    };
+
+    let payload = match serde_json::to_vec_pretty(status) {
+        Ok(payload) => payload,
+        Err(err) => {
+            debug!(
+                "failed to serialize daemon heartbeat for {}: {err}",
+                project_root.display()
+            );
+            return;
+        }
+    };
+
+    let path = config::project_daemon_status_path(project_root);
+    if let Err(err) = atomic_replace(
+        &path,
+        &payload,
+        &secure_root,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    ) {
+        debug!(
+            "failed to persist daemon heartbeat for {}: {err}",
+            project_root.display()
+        );
+    }
 }
 
 fn normalize_relative_path(project_root: &Path, changed_path: &Path) -> Option<PathBuf> {
@@ -520,6 +600,7 @@ async fn run_dirty_projects_until_clean(
         let result = run_project(&root, projects).await;
 
         let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
+        record_file_check_for_all_projects(projects, Utc::now(), false);
         if !filtered.is_empty() {
             debug!(
                 "detected {} changed files and {} ambiguous paths while re-indexing",
@@ -768,6 +849,7 @@ mod tests {
                     dirty: false,
                     pending_scope: None,
                 },
+                last_file_check_persisted_at: None,
             },
         );
         projects.insert(
@@ -778,6 +860,7 @@ mod tests {
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
+                last_file_check_persisted_at: None,
             },
         );
 
@@ -834,6 +917,7 @@ mod tests {
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
+                last_file_check_persisted_at: None,
             },
         );
         projects.insert(
@@ -844,6 +928,7 @@ mod tests {
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
                 run_state: ProjectRunState::default(),
+                last_file_check_persisted_at: None,
             },
         );
 
@@ -913,6 +998,7 @@ mod tests {
                         RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap(),
                     ),
                 },
+                last_file_check_persisted_at: None,
             },
         );
         projects.insert(
@@ -929,6 +1015,7 @@ mod tests {
                         RunScope::from_paths([PathBuf::from("src/mod.rs")]).unwrap(),
                     ),
                 },
+                last_file_check_persisted_at: None,
             },
         );
 
@@ -980,5 +1067,76 @@ mod tests {
             response,
             SearchResponse::Unavailable { ref reason } if reason == "daemon busy"
         ));
+    }
+
+    #[test]
+    fn record_file_check_persists_immediately_and_then_throttles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut state = ProjectState {
+            project_root: project_root.clone(),
+            db,
+            indexing: None,
+            embedding_runtime: EmbeddingRuntime::default(),
+            run_state: ProjectRunState::default(),
+            last_file_check_persisted_at: None,
+        };
+
+        let first_check = Utc::now();
+        record_file_check(&mut state, first_check, false);
+        let status_path = config::project_daemon_status_path(&project_root);
+        let first_status: DaemonProjectStatus =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        assert_eq!(first_status.last_file_check_at, first_check);
+        assert_eq!(state.last_file_check_persisted_at, Some(first_check));
+
+        let throttled_check = first_check + chrono::Duration::seconds(10);
+        record_file_check(&mut state, throttled_check, false);
+        let throttled_status: DaemonProjectStatus =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        assert_eq!(throttled_status.last_file_check_at, first_check);
+        assert_eq!(state.last_file_check_persisted_at, Some(first_check));
+
+        let next_check = first_check + chrono::Duration::seconds(31);
+        record_file_check(&mut state, next_check, false);
+        let next_status: DaemonProjectStatus =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        assert_eq!(next_status.last_file_check_at, next_check);
+        assert_eq!(state.last_file_check_persisted_at, Some(next_check));
+    }
+
+    #[test]
+    fn record_file_check_force_bypasses_throttle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut state = ProjectState {
+            project_root: project_root.clone(),
+            db,
+            indexing: None,
+            embedding_runtime: EmbeddingRuntime::default(),
+            run_state: ProjectRunState::default(),
+            last_file_check_persisted_at: None,
+        };
+
+        let first_check = Utc::now();
+        let forced_check = first_check + chrono::Duration::seconds(1);
+        record_file_check(&mut state, first_check, false);
+        record_file_check(&mut state, forced_check, true);
+
+        let status_path = config::project_daemon_status_path(&project_root);
+        let status: DaemonProjectStatus =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        assert_eq!(status.last_file_check_at, forced_check);
+        assert_eq!(state.last_file_check_persisted_at, Some(forced_check));
     }
 }

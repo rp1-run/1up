@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::Serialize;
 
@@ -27,6 +27,7 @@ pub struct StatusInfo {
     pub project_id: Option<String>,
     pub index_present: bool,
     pub index_readable: bool,
+    pub last_file_check_at: Option<DateTime<Utc>>,
     pub index_progress: Option<IndexProgress>,
 }
 
@@ -101,6 +102,7 @@ impl Formatter for JsonFormatter {
             "total_segments": status.total_segments,
             "project_id": &status.project_id,
             "index_status": render_index_health_plain(status),
+            "last_file_check_at": status.last_file_check_at,
             "index_progress": &status.index_progress,
             "index_work": index_work,
         }))
@@ -272,10 +274,16 @@ impl Formatter for HumanFormatter {
         } else {
             out.push_str(&format!("Project: {}\n", "not initialized".yellow()));
         }
-        out.push_str(&format!(
-            "Index: {}\n",
-            render_index_health_human(status)
-        ));
+        out.push_str(&format!("Index: {}\n", render_index_health_human(status)));
+        if let Some(last_file_check_at) = &status.last_file_check_at {
+            out.push_str(&format!(
+                "Last file check: {} ({})\n",
+                render_time_ago(last_file_check_at),
+                last_file_check_at.to_rfc3339()
+            ));
+        } else {
+            out.push_str(&format!("Last file check: {}\n", "never recorded".yellow()));
+        }
         if let Some(files) = status.indexed_files {
             out.push_str(&format!("Indexed files: {files}\n"));
         }
@@ -476,6 +484,14 @@ impl Formatter for PlainFormatter {
             out.push_str(&format!("\tproject:{id}"));
         }
         out.push_str(&format!("\tindex:{}", render_index_health_plain(status)));
+        match &status.last_file_check_at {
+            Some(last_file_check_at) => out.push_str(&format!(
+                "\tlast_file_check:{}\tlast_file_check_ago:{}",
+                last_file_check_at.to_rfc3339(),
+                render_time_ago(last_file_check_at)
+            )),
+            None => out.push_str("\tlast_file_check:none"),
+        }
         if let Some(files) = status.indexed_files {
             out.push_str(&format!("\tfiles:{files}"));
         }
@@ -754,6 +770,7 @@ mod tests {
             project_id: Some("project-123".to_string()),
             index_present: true,
             index_readable: true,
+            last_file_check_at: Some(sample_progress().updated_at),
             index_progress: Some(sample_progress()),
         });
 
@@ -774,11 +791,13 @@ mod tests {
             project_id: None,
             index_present: false,
             index_readable: false,
+            last_file_check_at: None,
             index_progress: None,
         });
 
         assert!(rendered.contains("Project: not initialized"));
         assert!(rendered.contains("Index: not built"));
+        assert!(rendered.contains("Last file check: never recorded"));
     }
 
     #[test]
@@ -793,10 +812,12 @@ mod tests {
             project_id: None,
             index_present: false,
             index_readable: false,
+            last_file_check_at: None,
             index_progress: None,
         });
 
         assert!(rendered.contains("project_initialized:false"));
         assert!(rendered.contains("index:not_built"));
+        assert!(rendered.contains("last_file_check:none"));
     }
 }

@@ -186,6 +186,18 @@ mod tests {
     }
 
     #[test]
+    fn condensed_reminder_mentions_status_heartbeat() {
+        assert!(
+            CONDENSED_REMINDER.contains("Last file check"),
+            "condensed reminder should mention the status heartbeat"
+        );
+        assert!(
+            CONDENSED_REMINDER.contains("30 seconds"),
+            "condensed reminder should describe the heartbeat cadence"
+        );
+    }
+
+    #[test]
     fn find_fence_detects_existing_fence() {
         let content = format!(
             "Some preamble\n\n{FENCE_PREFIX}0.0.9{MARKER_CLOSE}\nold content\n{FENCE_SUFFIX}0.0.9{MARKER_CLOSE}\n\nSome postamble\n"

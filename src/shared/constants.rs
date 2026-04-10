@@ -55,6 +55,9 @@ pub const CHUNK_OVERLAP: usize = 10;
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
+/// Maximum interval between persisted daemon file-check heartbeats.
+pub const DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS: u64 = 30_000;
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 

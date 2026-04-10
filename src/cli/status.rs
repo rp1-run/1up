@@ -4,7 +4,7 @@ use crate::cli::output::{formatter_for, StatusInfo};
 use crate::daemon::lifecycle;
 use crate::shared::config;
 use crate::shared::project;
-use crate::shared::types::{IndexProgress, OutputFormat};
+use crate::shared::types::{DaemonProjectStatus, IndexProgress, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments;
@@ -24,6 +24,12 @@ fn read_index_progress(project_root: &std::path::Path) -> Option<IndexProgress> 
     serde_json::from_str(&content).ok()
 }
 
+fn read_daemon_status(project_root: &std::path::Path) -> Option<DaemonProjectStatus> {
+    let path = config::project_daemon_status_path(project_root);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
@@ -38,6 +44,7 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     let db_path = config::project_db_path(&project_root);
     let index_present = db_path.exists();
     let mut index_readable = false;
+    let daemon_status = read_daemon_status(&project_root);
 
     let (indexed_files, total_segments) = {
         if db_path.exists() {
@@ -71,6 +78,7 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         project_id,
         index_present,
         index_readable,
+        last_file_check_at: daemon_status.map(|status| status.last_file_check_at),
         index_progress: read_index_progress(&project_root),
     };
 

@@ -407,6 +407,12 @@ impl IndexProgress {
     }
 }
 
+/// Latest persisted daemon heartbeat for file checks on a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonProjectStatus {
+    pub last_file_check_at: DateTime<Utc>,
+}
+
 /// Output format for CLI results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {

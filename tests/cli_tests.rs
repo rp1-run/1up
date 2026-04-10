@@ -201,6 +201,7 @@ fn status_reports_uninitialized_project_and_missing_index() {
     let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(payload["project_initialized"], false);
     assert_eq!(payload["index_status"], "not_built");
+    assert!(payload["last_file_check_at"].is_null());
     assert!(payload["project_id"].is_null());
     assert!(payload["indexed_files"].is_null());
 }
@@ -302,6 +303,7 @@ fn start_auto_initializes_project_if_needed() {
     let status_payload: serde_json::Value = serde_json::from_str(status_stdout.trim()).unwrap();
     assert!(status_payload["indexed_files"].as_u64().unwrap() > 0);
     assert!(status_payload["total_segments"].as_u64().unwrap() > 0);
+    assert!(status_payload["last_file_check_at"].as_str().is_some());
 
     if pid_file.exists() {
         cmd()

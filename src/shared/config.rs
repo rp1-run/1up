@@ -88,6 +88,11 @@ pub fn project_db_path(project_root: &std::path::Path) -> PathBuf {
     project_dot_dir(project_root).join("index.db")
 }
 
+/// Returns the path to the project-local daemon status file.
+pub fn project_daemon_status_path(project_root: &std::path::Path) -> PathBuf {
+    project_dot_dir(project_root).join("daemon_status.json")
+}
+
 /// Returns the path to the project_id file within the .1up directory.
 pub fn project_id_path(project_root: &std::path::Path) -> PathBuf {
     project_dot_dir(project_root).join("project_id")

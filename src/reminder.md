@@ -11,6 +11,8 @@ Check repository health before searching:
 ```
 1up status
 ```
+Confirm the project is initialized, the index is built, and `Last file check` is recent.
+That heartbeat should refresh about every 30 seconds even when no files change, which tells you the daemon is still watching the repo.
 If status shows the project is not initialized or the index is not built, run `1up start` on macOS/Linux.
 On Windows or other local-mode platforms, run `1up init` and then `1up index .`.
 
