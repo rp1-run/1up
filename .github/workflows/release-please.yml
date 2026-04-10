@@ -1,0 +1,38 @@
+# Release Please - Versioning & Changelog Automation
+#
+# Rolling Release PR Strategy:
+# - One open release PR always exists, accumulating changes
+# - Every merged PR updates the release PR (changelog, version bump)
+# - NO release happens until the release PR itself is merged
+# - Merging the release PR triggers: tag creation, GitHub release
+#
+# Downstream workflows (release-assets, release-evidence, publish-packages)
+# trigger automatically on the created tag or release event.
+
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Release Please
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

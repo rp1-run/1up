@@ -22,7 +22,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
       - name: install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
         shell: bash
         run: cargo install --locked cargo-audit
 
@@ -47,6 +55,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-release-
+
       - name: build release binary
         shell: bash
         run: cargo build --locked --release --bin 1up
@@ -59,6 +77,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-release-
+
       - name: build release binary
         shell: bash
         run: cargo build --locked --release --bin 1up
@@ -70,6 +98,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-release-
 
       - name: build release binary
         shell: bash
