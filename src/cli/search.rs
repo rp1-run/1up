@@ -8,7 +8,8 @@ use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingU
 use crate::search::HybridSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
-use crate::shared::types::OutputFormat;
+use crate::shared::reminder::VERSION;
+use crate::shared::types::{OutputFormat, SearchResult};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -39,8 +40,17 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
         }
     }
 
-    if let Some(results) = try_daemon_search(&project_root, &args.query, args.limit).await {
+    if let Some((results, daemon_version)) =
+        try_daemon_search(&project_root, &args.query, args.limit).await
+    {
         println!("{}", fmt.format_search_results(&results));
+        if let Some(ref dv) = daemon_version {
+            if dv != VERSION && format != OutputFormat::Json {
+                eprintln!(
+                    "warning: CLI version ({VERSION}) differs from daemon version ({dv}). Run `1up stop` and re-run your command to restart the daemon under the current binary."
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -93,7 +103,7 @@ async fn try_daemon_search(
     project_root: &Path,
     query: &str,
     limit: usize,
-) -> Option<Vec<crate::shared::types::SearchResult>> {
+) -> Option<(Vec<SearchResult>, Option<String>)> {
     let result = tokio::time::timeout(
         DAEMON_SEARCH_TIMEOUT,
         search_service::request_search(project_root, query, limit),
@@ -101,7 +111,7 @@ async fn try_daemon_search(
     .await;
 
     match result {
-        Ok(Ok(Some(results))) => Some(results),
+        Ok(Ok(Some(response))) => Some(response),
         Ok(Ok(None)) => {
             tracing::debug!("daemon search unavailable; falling back to local runtime");
             None

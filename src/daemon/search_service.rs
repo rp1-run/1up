@@ -36,8 +36,14 @@ pub(crate) struct SearchRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum SearchResponse {
-    Results { results: Vec<SearchResult> },
-    Unavailable { reason: String },
+    Results {
+        results: Vec<SearchResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_version: Option<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 pub(crate) async fn bind_listener() -> Result<SearchListener, OneupError> {
@@ -86,7 +92,7 @@ pub(crate) async fn request_search(
     project_root: &Path,
     query: &str,
     limit: usize,
-) -> Result<Option<Vec<SearchResult>>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
     request_search_at(&config::daemon_socket_path()?, project_root, query, limit).await
 }
 
@@ -163,7 +169,7 @@ async fn request_search_at(
     project_root: &Path,
     query: &str,
     limit: usize,
-) -> Result<Option<Vec<SearchResult>>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
     let mut stream = UnixStream::connect(socket_path).await.map_err(|err| {
         DaemonError::RequestError(format!(
             "failed to connect to search socket {}: {err}",
@@ -185,7 +191,10 @@ async fn request_search_at(
     .await?;
 
     match ipc::read_json_frame(&mut stream, MAX_DAEMON_RESPONSE_BYTES, read_deadline()).await? {
-        SearchResponse::Results { results } => Ok(Some(results)),
+        SearchResponse::Results {
+            results,
+            daemon_version,
+        } => Ok(Some((results, daemon_version))),
         SearchResponse::Unavailable { .. } => Ok(None),
     }
 }
@@ -308,13 +317,14 @@ mod tests {
                         referenced_symbols: None,
                         called_symbols: None,
                     }],
+                    daemon_version: Some("0.1.0".to_string()),
                 },
             )
             .await
             .unwrap();
         });
 
-        let results = request_search_at(&socket_path, &project_root, "needle", 7)
+        let (results, daemon_version) = request_search_at(&socket_path, &project_root, "needle", 7)
             .await
             .unwrap()
             .unwrap();
@@ -322,6 +332,7 @@ mod tests {
         server.await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "src/lib.rs");
+        assert_eq!(daemon_version, Some("0.1.0".to_string()));
     }
 
     #[tokio::test]
@@ -363,6 +374,33 @@ mod tests {
 
         assert_eq!(request.project_root, project_root.canonicalize().unwrap());
         assert_eq!(request.limit, MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
+    fn search_response_results_serializes_with_daemon_version() {
+        let response = SearchResponse::Results {
+            results: vec![],
+            daemon_version: Some("0.1.0".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"daemon_version\":\"0.1.0\""));
+        assert!(json.contains("\"status\":\"results\""));
+    }
+
+    #[test]
+    fn search_response_results_deserializes_without_daemon_version() {
+        let json = r#"{"status":"results","results":[]}"#;
+        let response: SearchResponse = serde_json::from_str(json).unwrap();
+        match response {
+            SearchResponse::Results {
+                results,
+                daemon_version,
+            } => {
+                assert!(results.is_empty());
+                assert!(daemon_version.is_none());
+            }
+            _ => panic!("expected Results variant"),
+        }
     }
 
     #[tokio::test]

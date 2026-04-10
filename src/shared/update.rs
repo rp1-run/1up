@@ -866,6 +866,29 @@ mod tests {
     }
 
     #[test]
+    fn build_update_status_prerelease_current_shows_update_to_release() {
+        let cache = make_cache("0.1.0-alpha.1", "0.1.0", false, None, None);
+        assert_eq!(
+            build_update_status(&cache),
+            UpdateStatus::UpdateAvailable {
+                latest: "0.1.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_update_status_returns_up_to_date_for_unparseable_current() {
+        let cache = make_cache("not-semver", "0.1.0", false, None, None);
+        assert_eq!(build_update_status(&cache), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn build_update_status_returns_up_to_date_for_unparseable_latest() {
+        let cache = make_cache("0.1.0", "garbage", false, None, None);
+        assert_eq!(build_update_status(&cache), UpdateStatus::UpToDate);
+    }
+
+    #[test]
     fn build_update_check_client_succeeds() {
         let client = build_update_check_client();
         assert!(client.is_ok(), "expected client to build successfully");

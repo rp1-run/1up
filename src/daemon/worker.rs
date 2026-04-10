@@ -23,6 +23,7 @@ use crate::shared::constants::{
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
+use crate::shared::reminder::VERSION;
 use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope};
 use crate::storage::{db::Db, schema};
 
@@ -774,7 +775,10 @@ async fn handle_search_request(
     };
 
     match results {
-        Ok(results) => SearchResponse::Results { results },
+        Ok(results) => SearchResponse::Results {
+            results,
+            daemon_version: Some(VERSION.to_string()),
+        },
         Err(err) => {
             warn!(
                 "daemon search failed for {}: {err}",

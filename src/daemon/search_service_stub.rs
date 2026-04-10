@@ -7,7 +7,7 @@ pub(crate) async fn request_search(
     _project_root: &Path,
     _query: &str,
     _limit: usize,
-) -> Result<Option<Vec<SearchResult>>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
     Ok(None)
 }
 
