@@ -161,6 +161,38 @@ pub fn current_target_triple() -> Option<&'static str> {
     }
 }
 
+/// Detects how 1up was installed by examining the resolved binary path.
+///
+/// Uses `std::env::current_exe()` with canonicalization to resolve symlinks,
+/// then delegates to [`detect_channel_from_path`] for heuristic matching.
+pub fn detect_install_channel() -> InstallChannel {
+    let exe_path = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(p) => p,
+        Err(_) => return InstallChannel::Unknown,
+    };
+    detect_channel_from_path(&exe_path)
+}
+
+/// Determines the install channel from a resolved binary path.
+///
+/// Heuristics:
+/// - macOS/Linux: path containing `/Cellar/` or `/homebrew/` indicates Homebrew
+/// - Windows: path containing `\scoop\apps\` indicates Scoop
+/// - All other paths are classified as manual/unmanaged installs
+fn detect_channel_from_path(path: &std::path::Path) -> InstallChannel {
+    let path_str = path.to_string_lossy();
+
+    if (cfg!(target_os = "macos") || cfg!(target_os = "linux"))
+        && (path_str.contains("/Cellar/") || path_str.contains("/homebrew/"))
+    {
+        return InstallChannel::Homebrew;
+    }
+    if cfg!(target_os = "windows") && path_str.contains(r"\scoop\apps\") {
+        return InstallChannel::Scoop;
+    }
+    InstallChannel::Manual
+}
+
 /// Returns the channel-appropriate upgrade instruction for the given install channel.
 pub fn upgrade_instruction_for_channel(channel: InstallChannel) -> String {
     match channel {
@@ -427,6 +459,61 @@ mod tests {
         assert_eq!(
             upgrade_instruction_for_channel(InstallChannel::Unknown),
             "1up update"
+        );
+    }
+
+    #[test]
+    fn detect_channel_from_path_returns_manual_for_generic_path() {
+        let path = std::path::Path::new("/usr/local/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Manual);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn detect_channel_from_path_returns_homebrew_for_cellar_path() {
+        let path = std::path::Path::new("/opt/homebrew/Cellar/1up/0.1.0/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Homebrew);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn detect_channel_from_path_returns_homebrew_for_homebrew_prefix_path() {
+        let path = std::path::Path::new("/opt/homebrew/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Homebrew);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn detect_channel_from_path_returns_homebrew_for_linuxbrew_cellar_path() {
+        let path = std::path::Path::new("/home/linuxbrew/.linuxbrew/Cellar/1up/0.1.0/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Homebrew);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn detect_channel_from_path_returns_scoop_for_scoop_path() {
+        let path = std::path::Path::new(r"C:\Users\user\scoop\apps\1up\current\1up.exe");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Scoop);
+    }
+
+    #[test]
+    fn detect_channel_from_path_returns_manual_for_cargo_install_path() {
+        let path = std::path::Path::new("/home/user/.cargo/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Manual);
+    }
+
+    #[test]
+    fn detect_install_channel_returns_known_channel() {
+        let channel = detect_install_channel();
+        assert!(
+            matches!(
+                channel,
+                InstallChannel::Homebrew
+                    | InstallChannel::Scoop
+                    | InstallChannel::Manual
+                    | InstallChannel::Unknown
+            ),
+            "expected a valid InstallChannel variant, got: {channel}"
         );
     }
 }
