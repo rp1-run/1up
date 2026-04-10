@@ -70,6 +70,14 @@ trap cleanup EXIT
 
 mkdir -p "$STAGE_DIR" "$OUTPUT_DIR"
 cp "$BINARY_PATH" "$STAGE_DIR/$TARGET_BINARY"
+if [[ "$TARGET_OS" == "windows" ]]; then
+  binary_dir=$(dirname "$BINARY_PATH")
+  shopt -s nullglob
+  for dll_path in "$binary_dir"/*.dll; do
+    cp "$dll_path" "$STAGE_DIR/$(basename "$dll_path")"
+  done
+  shopt -u nullglob
+fi
 cp "$ROOT_DIR/LICENSE" "$STAGE_DIR/LICENSE"
 
 cat >"$README_PATH" <<EOF

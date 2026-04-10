@@ -60,6 +60,45 @@ jobs:
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin 1up
 
+      - name: stage Windows ONNX Runtime DLL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $archiveUrl = 'https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-pc-windows-msvc.tar.lzma2'
+          $archiveSha256 = 'b685bfc8d336e0ba95c066a7a982c03aa6dedd528a492eb99ca4ccb7f3af9e7a'
+          $archivePath = Join-Path $env:RUNNER_TEMP 'onnxruntime-windows.tar.lzma2'
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'onnxruntime-windows'
+          $payloadRoot = Join-Path $extractRoot 'payload'
+          $targetDir = 'target/${{ matrix.target }}/release'
+
+          Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath
+
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $archiveSha256) {
+            throw "unexpected ONNX Runtime archive hash: $actualSha256"
+          }
+
+          if (Test-Path $extractRoot) {
+            Remove-Item $extractRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+
+          7z x $archivePath "-o$extractRoot" | Out-Null
+          $tarPath = Get-ChildItem $extractRoot -Filter '*.tar' -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $tarPath) {
+            throw 'archive extraction did not produce a tar payload'
+          }
+
+          7z x $tarPath "-o$payloadRoot" | Out-Null
+          $dllPath = Get-ChildItem $payloadRoot -Filter 'onnxruntime.dll' -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dllPath) {
+            throw 'onnxruntime.dll not found in extracted payload'
+          }
+
+          Copy-Item $dllPath (Join-Path $targetDir 'onnxruntime.dll') -Force
+
       - name: package release asset
         shell: bash
         run: |
