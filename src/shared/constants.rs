@@ -144,3 +144,25 @@ pub const HF_BASE_URL: &str = "https://huggingface.co";
 
 /// Target files for 1up fence installation.
 pub const FENCE_TARGET_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// Stable URL for the machine-readable update manifest.
+pub const UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json";
+
+/// Filename for the local update-check cache.
+pub const UPDATE_CHECK_CACHE_FILENAME: &str = "update-check.json";
+
+/// Time-to-live for the update-check cache in seconds (24 hours).
+pub const UPDATE_CHECK_TTL_SECS: u64 = 86_400;
+
+/// HTTP request timeout for update manifest fetches in seconds.
+pub const UPDATE_CHECK_TIMEOUT_SECS: u64 = 5;
+
+/// TCP connect timeout for update manifest fetches in seconds.
+pub const UPDATE_CHECK_CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// HTTP request timeout for update binary downloads in seconds.
+pub const UPDATE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
+/// TCP connect timeout for update binary downloads in seconds.
+pub const UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
