@@ -383,6 +383,59 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .unwrap()
         .iter()
         .all(|artifact| artifact["sha256"].as_str().unwrap().len() == 64));
+
+    // Update lifecycle fields (T12)
+    let published_at = manifest["published_at"].as_str().unwrap();
+    assert!(
+        published_at.ends_with('Z') && published_at.contains('T'),
+        "published_at should be ISO 8601 UTC: {published_at}"
+    );
+    assert_eq!(
+        manifest["notes_url"],
+        "https://github.com/rp1-run/1up/releases/tag/v0.1.0"
+    );
+    assert_eq!(manifest["yanked"], false);
+    assert!(manifest["minimum_safe_version"].is_null());
+    assert!(manifest["message"].is_null());
+    assert!(manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|artifact| {
+            let url = artifact["url"].as_str().unwrap();
+            url.starts_with("https://github.com/rp1-run/1up/releases/download/v0.1.0/")
+                && url.ends_with(artifact["archive"].as_str().unwrap())
+        }));
+}
+
+#[test]
+fn release_manifest_deserializes_as_update_manifest() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+
+    let raw = fs::read(dist_dir.join("release-manifest.json")).unwrap();
+    let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
+        .expect("release manifest should deserialize as UpdateManifest");
+
+    assert_eq!(manifest.version, "0.1.0");
+    assert_eq!(manifest.git_tag, "v0.1.0");
+    assert!(!manifest.published_at.is_empty());
+    assert!(manifest.notes_url.contains("/releases/tag/v0.1.0"));
+    assert_eq!(manifest.artifacts.len(), 5);
+    assert!(!manifest.yanked);
+    assert!(manifest.minimum_safe_version.is_none());
+    assert!(manifest.message.is_none());
+
+    for artifact in &manifest.artifacts {
+        assert!(!artifact.target.is_empty());
+        assert!(!artifact.archive.is_empty());
+        assert_eq!(artifact.sha256.len(), 64);
+        assert!(
+            artifact.url.contains(&artifact.archive),
+            "artifact url should contain archive name"
+        );
+    }
 }
 
 #[test]

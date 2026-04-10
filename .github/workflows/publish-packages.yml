@@ -110,3 +110,51 @@ jobs:
           name: package-publication-record
           path: ${{ runner.temp }}/release/package-publication-record.json
           if-no-files-found: error
+
+  publish-update-manifest:
+    name: publish update manifest to main
+    runs-on: ubuntu-24.04
+    needs: publish
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: download release manifest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern release-manifest.json \
+            --dir "${RUNNER_TEMP}/release"
+
+      - name: generate update manifest
+        shell: bash
+        run: |
+          jq '{
+            version,
+            git_tag,
+            published_at,
+            notes_url,
+            artifacts: [.artifacts[] | {target, archive, sha256, url}],
+            channels,
+            yanked,
+            minimum_safe_version,
+            message
+          }' "${RUNNER_TEMP}/release/release-manifest.json" > update-manifest.json
+
+      - name: commit and push update manifest
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update-manifest.json
+          if git diff --cached --quiet; then
+            echo "update-manifest.json is unchanged, skipping commit" >&2
+            exit 0
+          fi
+          version=$(jq -r '.version' update-manifest.json)
+          git commit -m "chore: publish update manifest for v${version}"
+          git push origin main
