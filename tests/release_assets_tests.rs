@@ -54,6 +54,23 @@ fn run_release_script(root: &Path, name: &str, args: &[&str]) -> std::process::O
         .unwrap()
 }
 
+fn run_release_script_with_path(
+    root: &Path,
+    name: &str,
+    args: &[&str],
+    path_prefix: &Path,
+) -> std::process::Output {
+    let path = std::env::var("PATH").unwrap();
+    Command::new("bash")
+        .arg(release_script(name))
+        .args(args)
+        .current_dir(repo_root())
+        .env("ONEUP_RELEASE_ROOT", root)
+        .env("PATH", format!("{}:{path}", path_prefix.display()))
+        .output()
+        .unwrap()
+}
+
 fn write_executable(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
     #[cfg(unix)]
@@ -973,6 +990,26 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
     assert!(workflow.contains("--target \"${{ matrix.target }}\""));
 }
 
+#[test]
+fn cargo_manifest_uses_runtime_loaded_ort_on_windows() {
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+
+    assert!(manifest.contains("[target.'cfg(windows)'.dependencies]"));
+    assert!(manifest.contains("load-dynamic"));
+    assert!(manifest.contains("[target.'cfg(not(windows))'.dependencies]"));
+}
+
+#[test]
+fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
+
+    assert!(workflow.contains("stage Windows ONNX Runtime DLL"));
+    assert!(workflow.contains("onnxruntime.dll"));
+    assert!(workflow.contains("Get-FileHash"));
+    assert!(workflow.contains("x86_64-pc-windows-msvc.tar.lzma2"));
+}
+
 #[cfg(unix)]
 #[test]
 fn packaging_helper_creates_release_archive_with_license_and_readme() {
@@ -1024,4 +1061,85 @@ fn packaging_helper_creates_release_archive_with_license_and_readme() {
     assert!(listing_text.contains("1up-v0.1.0-x86_64-unknown-linux-gnu/1up"));
     assert!(listing_text.contains("1up-v0.1.0-x86_64-unknown-linux-gnu/LICENSE"));
     assert!(listing_text.contains("1up-v0.1.0-x86_64-unknown-linux-gnu/README.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn packaging_helper_includes_windows_dll_sidecars() {
+    let fixture_root = tempfile::tempdir().unwrap();
+    let fake_pwsh_dir = tempfile::tempdir().unwrap();
+    copy_surface(fixture_root.path(), "LICENSE");
+
+    let bin_dir = fixture_root.path().join("bin");
+    let out_dir = fixture_root.path().join("dist");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(bin_dir.join("1up.exe"), "fake binary").unwrap();
+    fs::write(bin_dir.join("onnxruntime.dll"), "fake runtime").unwrap();
+    fs::write(bin_dir.join("ignored.txt"), "not packaged").unwrap();
+
+    let pwsh_path = fake_pwsh_dir.path().join("pwsh");
+    write_executable(
+        &pwsh_path,
+        r#"#!/bin/sh
+set -eu
+cmd=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -Command)
+      cmd="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+stage_root=$(printf '%s' "$cmd" | sed -n "s/.*Set-Location -LiteralPath '\([^']*\)'.*/\1/p")
+package_dir=$(printf '%s' "$cmd" | sed -n "s/.*Compress-Archive -Path '\([^']*\)'.*/\1/p")
+archive_path=$(printf '%s' "$cmd" | sed -n "s/.*-DestinationPath '\([^']*\)'.*/\1/p")
+test -n "$stage_root"
+test -n "$package_dir"
+test -n "$archive_path"
+cd "$stage_root"
+zip -qr "$archive_path" "$package_dir"
+"#,
+    );
+
+    let output = run_release_script_with_path(
+        fixture_root.path(),
+        "package_release_asset.sh",
+        &[
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "--binary",
+            bin_dir.join("1up.exe").to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--version",
+            "0.1.0",
+        ],
+        fake_pwsh_dir.path(),
+    );
+    assert!(
+        output.status.success(),
+        "windows packaging unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let archive_path = out_dir.join("1up-v0.1.0-x86_64-pc-windows-msvc.zip");
+    let listing = Command::new("unzip")
+        .arg("-Z1")
+        .arg(&archive_path)
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "failed to inspect windows archive: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+
+    let listing_text = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing_text.contains("1up-v0.1.0-x86_64-pc-windows-msvc/1up.exe"));
+    assert!(listing_text.contains("1up-v0.1.0-x86_64-pc-windows-msvc/onnxruntime.dll"));
+    assert!(!listing_text.contains("1up-v0.1.0-x86_64-pc-windows-msvc/ignored.txt"));
 }
