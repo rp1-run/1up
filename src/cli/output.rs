@@ -1,3 +1,4 @@
+use chrono::Utc;
 use colored::Colorize;
 use serde::Serialize;
 
@@ -313,7 +314,11 @@ impl Formatter for HumanFormatter {
                 "Embeddings: {}\n",
                 render_embeddings_human(progress.embeddings_enabled)
             ));
-            out.push_str(&format!("Updated: {}\n", progress.updated_at.to_rfc3339()));
+            out.push_str(&format!(
+                "Updated: {} ({})\n",
+                render_time_ago(&progress.updated_at),
+                progress.updated_at.to_rfc3339()
+            ));
         }
         out
     }
@@ -492,7 +497,11 @@ impl Formatter for PlainFormatter {
                     timings.total_ms,
                 ));
             }
-            out.push_str(&format!("\tupdated:{}", progress.updated_at.to_rfc3339()));
+            out.push_str(&format!(
+                "\tupdated:{}\tago:{}",
+                progress.updated_at.to_rfc3339(),
+                render_time_ago(&progress.updated_at)
+            ));
         }
         out.push('\n');
         out
@@ -533,6 +542,16 @@ fn render_embeddings_human(enabled: bool) -> String {
 
 fn render_duration_ms(duration_ms: u128) -> String {
     format!("{duration_ms}ms")
+}
+
+fn render_time_ago(ts: &chrono::DateTime<Utc>) -> String {
+    let secs = Utc::now().signed_duration_since(*ts).num_seconds().max(0);
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
 }
 
 fn render_index_state_plain(state: IndexState) -> &'static str {
