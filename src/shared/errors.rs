@@ -197,12 +197,14 @@ pub enum UpdateError {
     ParseFailed(String),
 
     #[error("update cache error: {0}")]
+    #[allow(dead_code)]
     CacheError(String),
 
     #[error("self-update failed: {0}")]
     SelfUpdateFailed(String),
 
     #[error("daemon stop required for update but failed: {0}")]
+    #[allow(dead_code)]
     DaemonStopFailed(String),
 
     #[error("no artifact available for platform: {0}")]

@@ -125,7 +125,14 @@ async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
             println!("{}", fmt.format_update_result(&result));
             return Ok(());
         }
-        InstallChannel::Manual | InstallChannel::Unknown => {}
+        InstallChannel::Unknown => {
+            eprintln!(
+                "Could not detect how 1up was installed. Self-update is not available.\n\
+                 Check https://github.com/rp1-run/1up/releases for manual update instructions."
+            );
+            return Ok(());
+        }
+        InstallChannel::Manual => {}
     }
 
     stop_daemon_for_update()?;

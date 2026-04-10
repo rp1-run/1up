@@ -148,20 +148,6 @@ pub fn build_update_status(cache: &UpdateCheckCache) -> UpdateStatus {
     UpdateStatus::UpToDate
 }
 
-/// Returns `true` when `latest_version` is strictly newer than `current_version`
-/// according to semver ordering.
-pub fn is_newer_version(current_version: &str, latest_version: &str) -> bool {
-    let current = match semver::Version::parse(current_version) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let latest = match semver::Version::parse(latest_version) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    latest > current
-}
-
 /// Returns the Rust target triple for the current platform, matching the
 /// naming convention used in release archives.
 pub fn current_target_triple() -> Option<&'static str> {
@@ -445,9 +431,9 @@ pub fn build_download_client() -> Result<reqwest::Client, UpdateError> {
 }
 
 /// Finds the artifact matching the current platform in the manifest.
-pub fn find_artifact_for_platform<'a>(
-    manifest: &'a UpdateManifest,
-) -> Result<&'a UpdateArtifact, UpdateError> {
+pub fn find_artifact_for_platform(
+    manifest: &UpdateManifest,
+) -> Result<&UpdateArtifact, UpdateError> {
     let triple = current_target_triple().ok_or_else(|| {
         UpdateError::NoArtifactForPlatform(format!(
             "{}-{}",
@@ -796,27 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn is_newer_version_compares_correctly() {
-        assert!(is_newer_version("0.1.0", "0.1.1"));
-        assert!(is_newer_version("0.1.0", "0.2.0"));
-        assert!(is_newer_version("0.1.0", "1.0.0"));
-        assert!(!is_newer_version("0.1.0", "0.1.0"));
-        assert!(!is_newer_version("0.2.0", "0.1.0"));
-    }
-
-    #[test]
-    fn is_newer_version_prerelease_sorts_before_release() {
-        assert!(is_newer_version("0.1.0-alpha.1", "0.1.0"));
-        assert!(!is_newer_version("0.1.0", "0.1.0-alpha.1"));
-    }
-
-    #[test]
-    fn is_newer_version_handles_unparseable_versions() {
-        assert!(!is_newer_version("not-a-version", "0.1.0"));
-        assert!(!is_newer_version("0.1.0", "not-a-version"));
-    }
-
-    #[test]
     fn current_target_triple_returns_some_on_supported_platform() {
         let triple = current_target_triple();
         assert!(
@@ -1110,7 +1075,6 @@ mod tests {
 
     #[test]
     fn write_and_read_cache_round_trip() {
-        use std::ffi::OsString;
         use std::sync::Mutex;
 
         static CACHE_ENV_MUTEX: Mutex<()> = Mutex::new(());
