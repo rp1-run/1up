@@ -1,13 +1,16 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::shared::config;
 use crate::shared::constants::{
     SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS,
-    UPDATE_CHECK_TTL_SECS, UPDATE_MANIFEST_URL, XDG_STATE_DIR_MODE,
+    UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
+    UPDATE_MANIFEST_URL, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
 use crate::shared::reminder::VERSION;
@@ -369,6 +372,277 @@ pub fn read_cache_and_spawn_refresh() -> Option<UpdateCheckCache> {
     }
 
     cache
+}
+
+/// Outcome of a successful self-update binary replacement.
+#[derive(Debug, Clone)]
+pub struct SelfUpdateResult {
+    pub old_version: String,
+    pub new_version: String,
+}
+
+/// Builds a pre-configured HTTP client for downloading update artifacts.
+pub fn build_download_client() -> Result<reqwest::Client, UpdateError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(UPDATE_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("http client: {e}")))
+}
+
+/// Finds the artifact matching the current platform in the manifest.
+pub fn find_artifact_for_platform<'a>(
+    manifest: &'a UpdateManifest,
+) -> Result<&'a UpdateArtifact, UpdateError> {
+    let triple = current_target_triple().ok_or_else(|| {
+        UpdateError::NoArtifactForPlatform(format!(
+            "{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        ))
+    })?;
+    manifest
+        .artifacts
+        .iter()
+        .find(|a| a.target == triple)
+        .ok_or_else(|| UpdateError::NoArtifactForPlatform(triple.to_string()))
+}
+
+/// Downloads a release archive to a temporary file.
+///
+/// Returns the path to the temporary file. The caller is responsible for
+/// cleanup. The file is created adjacent to the current binary so that
+/// rename-based replacement stays on the same filesystem.
+async fn download_archive(
+    client: &reqwest::Client,
+    artifact: &UpdateArtifact,
+    staging_dir: &Path,
+) -> Result<PathBuf, UpdateError> {
+    use futures_util::StreamExt;
+
+    let response = client
+        .get(&artifact.url)
+        .send()
+        .await
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("download request: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(UpdateError::SelfUpdateFailed(format!(
+            "download failed: HTTP {}",
+            response.status()
+        )));
+    }
+
+    let archive_path = staging_dir.join(&artifact.archive);
+    let mut file = std::fs::File::create(&archive_path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("create temp file: {e}")))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| UpdateError::SelfUpdateFailed(format!("download read: {e}")))?;
+        std::io::Write::write_all(&mut file, &chunk)
+            .map_err(|e| UpdateError::SelfUpdateFailed(format!("write temp file: {e}")))?;
+    }
+
+    std::io::Write::flush(&mut file)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("flush temp file: {e}")))?;
+
+    Ok(archive_path)
+}
+
+/// Computes the SHA-256 digest of a file and verifies it against the expected
+/// value from the manifest.
+fn verify_archive_checksum(path: &Path, expected_sha256: &str) -> Result<(), UpdateError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("open for checksum: {e}")))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| UpdateError::SelfUpdateFailed(format!("checksum read: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest != expected_sha256 {
+        debug!(
+            "checksum mismatch: expected {}, got {}",
+            expected_sha256, digest
+        );
+        return Err(UpdateError::ChecksumMismatch);
+    }
+    Ok(())
+}
+
+/// Extracts the 1up binary from a tar.gz archive into the staging directory.
+///
+/// The archive structure is `1up-v{version}-{target}/{binary_name}` where
+/// `binary_name` is `1up` on Unix and `1up.exe` on Windows.
+#[cfg(not(windows))]
+fn extract_binary_from_archive(
+    archive_path: &Path,
+    staging_dir: &Path,
+) -> Result<PathBuf, UpdateError> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("open archive: {e}")))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    let binary_name = "1up";
+
+    for entry_result in archive
+        .entries()
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("read archive entries: {e}")))?
+    {
+        let mut entry = entry_result
+            .map_err(|e| UpdateError::SelfUpdateFailed(format!("read archive entry: {e}")))?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| UpdateError::SelfUpdateFailed(format!("archive entry path: {e}")))?
+            .to_path_buf();
+
+        if let Some(file_name) = entry_path.file_name() {
+            if file_name == binary_name {
+                let dest = staging_dir.join(binary_name);
+                entry
+                    .unpack(&dest)
+                    .map_err(|e| UpdateError::SelfUpdateFailed(format!("extract binary: {e}")))?;
+                return Ok(dest);
+            }
+        }
+    }
+
+    Err(UpdateError::SelfUpdateFailed(format!(
+        "binary '{}' not found in archive",
+        binary_name
+    )))
+}
+
+/// Extracts the 1up binary from a zip archive into the staging directory.
+#[cfg(windows)]
+fn extract_binary_from_archive(
+    archive_path: &Path,
+    staging_dir: &Path,
+) -> Result<PathBuf, UpdateError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("open archive: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("read zip archive: {e}")))?;
+
+    let binary_name = "1up.exe";
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| UpdateError::SelfUpdateFailed(format!("read zip entry: {e}")))?;
+        let entry_path = PathBuf::from(entry.name());
+
+        if let Some(file_name) = entry_path.file_name() {
+            if file_name == binary_name {
+                let dest = staging_dir.join(binary_name);
+                let mut out = std::fs::File::create(&dest)
+                    .map_err(|e| UpdateError::SelfUpdateFailed(format!("create binary: {e}")))?;
+                std::io::copy(&mut entry, &mut out)
+                    .map_err(|e| UpdateError::SelfUpdateFailed(format!("extract binary: {e}")))?;
+                return Ok(dest);
+            }
+        }
+    }
+
+    Err(UpdateError::SelfUpdateFailed(format!(
+        "binary '{}' not found in archive",
+        binary_name
+    )))
+}
+
+/// Replaces the current binary with the new one atomically on Unix.
+///
+/// Uses rename for atomic replacement and sets executable permissions.
+#[cfg(unix)]
+fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(new_binary, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("set permissions: {e}")))?;
+
+    std::fs::rename(new_binary, target)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("replace binary: {e}")))?;
+
+    Ok(())
+}
+
+/// Replaces the current binary with the new one on Windows.
+///
+/// Renames the running binary to `.old`, moves the new binary into place,
+/// then deletes the old binary (best-effort; the OS may lock it).
+#[cfg(windows)]
+fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
+    let old_path = target.with_extension("old");
+
+    if old_path.exists() {
+        let _ = std::fs::remove_file(&old_path);
+    }
+
+    std::fs::rename(target, &old_path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("rename current binary: {e}")))?;
+
+    if let Err(e) = std::fs::rename(new_binary, target) {
+        let _ = std::fs::rename(&old_path, target);
+        return Err(UpdateError::SelfUpdateFailed(format!(
+            "install new binary: {e}"
+        )));
+    }
+
+    let _ = std::fs::remove_file(&old_path);
+    Ok(())
+}
+
+/// Performs a self-update: downloads, verifies, and atomically replaces the
+/// running binary.
+///
+/// This function is only valid for manual/unmanaged installs. Callers must
+/// ensure the daemon has been stopped before invoking this function.
+///
+/// Returns the old and new versions on success.
+pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, UpdateError> {
+    let artifact = find_artifact_for_platform(manifest)?;
+
+    let current_exe = std::env::current_exe()
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("resolve current binary: {e}")))?;
+
+    let staging_dir = tempfile::tempdir()
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("create staging dir: {e}")))?;
+
+    let client = build_download_client()?;
+
+    let archive_path = download_archive(&client, artifact, staging_dir.path()).await?;
+
+    verify_archive_checksum(&archive_path, &artifact.sha256)?;
+
+    let new_binary = extract_binary_from_archive(&archive_path, staging_dir.path())?;
+
+    replace_binary(&new_binary, &current_exe)?;
+
+    Ok(SelfUpdateResult {
+        old_version: VERSION.to_string(),
+        new_version: manifest.version.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -892,5 +1166,200 @@ mod tests {
     fn build_update_check_client_succeeds() {
         let client = build_update_check_client();
         assert!(client.is_ok(), "expected client to build successfully");
+    }
+
+    #[test]
+    fn build_download_client_succeeds() {
+        let client = build_download_client();
+        assert!(client.is_ok(), "expected download client to build");
+    }
+
+    fn make_manifest_with_artifact(target: &str, sha256: &str) -> UpdateManifest {
+        UpdateManifest {
+            version: "0.2.0".to_string(),
+            git_tag: "v0.2.0".to_string(),
+            published_at: "2026-04-10T12:00:00Z".to_string(),
+            notes_url: "https://example.com/notes".to_string(),
+            artifacts: vec![UpdateArtifact {
+                target: target.to_string(),
+                archive: format!("1up-v0.2.0-{target}.tar.gz"),
+                sha256: sha256.to_string(),
+                url: "https://example.com/archive.tar.gz".to_string(),
+            }],
+            channels: UpdateChannels {
+                github_release: "https://example.com".to_string(),
+                homebrew_tap: "rp1-run/tap".to_string(),
+                homebrew_formula: "1up".to_string(),
+                scoop_bucket: "rp1-run".to_string(),
+                scoop_manifest: "1up".to_string(),
+            },
+            yanked: false,
+            minimum_safe_version: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn find_artifact_for_platform_succeeds_with_matching_target() {
+        let triple = current_target_triple().unwrap();
+        let manifest = make_manifest_with_artifact(triple, "abc123");
+        let artifact = find_artifact_for_platform(&manifest);
+        assert!(artifact.is_ok());
+        assert_eq!(artifact.unwrap().target, triple);
+    }
+
+    #[test]
+    fn find_artifact_for_platform_returns_error_for_missing_target() {
+        let manifest = make_manifest_with_artifact("mips-unknown-linux-gnu", "abc123");
+        let result = find_artifact_for_platform(&manifest);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UpdateError::NoArtifactForPlatform(t) => {
+                let expected = current_target_triple().unwrap();
+                assert_eq!(t, expected);
+            }
+            other => panic!("expected NoArtifactForPlatform, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_artifact_for_platform_returns_error_for_empty_artifacts() {
+        let mut manifest = make_manifest_with_artifact("x", "y");
+        manifest.artifacts.clear();
+        let result = find_artifact_for_platform(&manifest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_archive_checksum_passes_for_correct_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("test-file");
+        std::fs::write(&file_path, b"hello world\n").unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello world\n");
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let result = verify_archive_checksum(&file_path, &expected);
+        assert!(result.is_ok(), "checksum should pass for correct digest");
+    }
+
+    #[test]
+    fn verify_archive_checksum_fails_for_wrong_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("test-file");
+        std::fs::write(&file_path, b"hello world\n").unwrap();
+
+        let result = verify_archive_checksum(&file_path, "0000000000000000");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UpdateError::ChecksumMismatch => {}
+            other => panic!("expected ChecksumMismatch, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_binary_from_tar_gz_archive() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("test.tar.gz");
+
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let binary_content = b"#!/bin/sh\necho hello";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(binary_content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+
+        builder
+            .append_data(
+                &mut header,
+                "1up-v0.2.0-aarch64-apple-darwin/1up",
+                &binary_content[..],
+            )
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let result = extract_binary_from_archive(&archive_path, staging_dir.path());
+        assert!(result.is_ok(), "extraction should succeed");
+
+        let extracted = result.unwrap();
+        assert!(extracted.exists(), "extracted binary should exist");
+        assert_eq!(
+            std::fs::read(&extracted).unwrap(),
+            binary_content,
+            "binary content should match"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_binary_from_archive_fails_when_binary_missing() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("test.tar.gz");
+
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let content = b"license text";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "1up-v0.2.0/LICENSE", &content[..])
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let result = extract_binary_from_archive(&archive_path, staging_dir.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UpdateError::SelfUpdateFailed(msg) => {
+                assert!(
+                    msg.contains("not found in archive"),
+                    "error should mention missing binary: {msg}"
+                );
+            }
+            other => panic!("expected SelfUpdateFailed, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_binary_atomically_replaces_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("1up");
+        let new_binary = tmp.path().join("1up-new");
+
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&new_binary, b"new binary").unwrap();
+
+        let result = replace_binary(&new_binary, &target);
+        assert!(result.is_ok(), "replace should succeed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+        assert!(!new_binary.exists(), "staging file should be removed");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "binary should be executable");
     }
 }
