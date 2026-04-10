@@ -1262,6 +1262,7 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
     let project = TempDir::new().unwrap();
     let socket_path = test_data_dir(home.path()).join("daemon.sock");
     let expected_root = project.path().canonicalize().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     let server_socket_path = socket_path.clone();
     let server_expected_root = expected_root.clone();
@@ -1274,6 +1275,7 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
         let _ = fs::remove_file(&server_socket_path);
 
         let listener = UnixListener::bind(&server_socket_path).unwrap();
+        ready_tx.send(()).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
 
         let payload = read_framed_json(&mut stream);
@@ -1300,6 +1302,10 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
         });
         write_framed_json(&mut stream, &response);
     });
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
 
     cmd()
         .env("HOME", home.path())
