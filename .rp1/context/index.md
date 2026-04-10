@@ -1,56 +1,67 @@
 # 1up — Knowledge Base Index
 
-**1up** is a local code search and indexing CLI that combines semantic vector search (ONNX embeddings), FTS5 full-text search, symbol lookup, and structural AST queries over a libSQL database. A background daemon watches for file changes and incrementally re-indexes with configurable bounded parallelism.
+**What**: A semantic code search engine that indexes source repositories using tree-sitter AST parsing and ONNX embeddings, providing hybrid vector+FTS search, symbol lookup, structural queries, and context retrieval through a CLI with a background daemon for incremental re-indexing and warm search.
+
+**Why**: Gives developers and AI agents fast, ranked code exploration by meaning and structure — not just text matching — with automatic background indexing that keeps results fresh.
 
 ## Quick Reference
 
-| Aspect | Value |
-|--------|-------|
-| Entry point | `src/main.rs` -> `src/cli/mod.rs` |
-| Key pattern | Staged single-writer pipeline with bounded parallel parse workers |
-| Tech stack | Rust, libSQL, ONNX Runtime, tree-sitter (16 languages), tokio |
-| Architecture | Layered + two-process model (CLI + daemon) |
+| Attribute | Value |
+|-----------|-------|
+| Entry point | `src/main.rs` -> `src/cli/mod.rs` (clap dispatch) |
+| Key pattern | Layered + Two-Process Model (CLI + daemon), Candidate-First Search Hydration |
+| Tech stack | Rust, Tokio, libSQL (FTS5 + vector), ONNX Runtime (all-MiniLM-L6-v2), tree-sitter (16 grammars), clap |
+| License | Apache-2.0 |
+| Distribution | Homebrew, Scoop, GitHub Releases (5 targets) |
 
 ## KB File Manifest
 
 | File | Lines | Load For |
 |------|-------|----------|
-| [concept_map.md](concept_map.md) | ~120 | Domain terminology, concept relationships |
-| [architecture.md](architecture.md) | ~156 | System layers, data flows, integration points |
-| [interaction-model.md](interaction-model.md) | ~98 | CLI surfaces, feedback loops, output modes |
-| [modules.md](modules.md) | ~166 | Component breakdown, dependencies, metrics |
-| [patterns.md](patterns.md) | ~74 | Coding conventions, error handling, concurrency |
+| [concept_map.md](concept_map.md) | ~182 | Understanding domain terminology, type definitions, cross-cutting concerns |
+| [architecture.md](architecture.md) | ~247 | System topology, data flows, integration points, deployment |
+| [interaction-model.md](interaction-model.md) | ~119 | CLI surfaces, user-visible states, feedback loops, output format semantics |
+| [modules.md](modules.md) | ~201 | Component breakdown, file counts, dependencies, metrics |
+| [patterns.md](patterns.md) | ~93 | Coding conventions, error handling, testing idioms, I/O patterns |
 
 ## Task-Based Loading
 
-| Task | Load These Files |
-|------|-----------------|
+| Task | Load Files |
+|------|-----------|
 | Code review | `patterns.md` |
 | Bug investigation | `architecture.md`, `modules.md` |
 | Feature work | `modules.md`, `patterns.md` |
-| CLI/UX changes | `interaction-model.md`, `modules.md` |
+| Search/ranking changes | `concept_map.md`, `architecture.md` |
+| Daemon/IPC work | `architecture.md`, `modules.md` |
+| CLI/UX changes | `interaction-model.md`, `patterns.md` |
 | Strategic / system-wide | All files |
 
 ## How to Load
 
-1. Always read `index.md` first (this file)
-2. Load additional files based on task type above
-3. Only load all files for holistic analysis
+Agents load this KB automatically via CLAUDE.md instructions:
+1. Read `index.md` first (this file)
+2. Load additional files based on task type per table above
+3. Never load all files unless performing holistic analysis
 
 ## Project Structure
 
 ```
 src/
-├── main.rs              # Entry point
-├── cli/                 # CLI commands and output formatting (12 files)
-├── daemon/              # Background file watcher and registry (5 files)
-├── indexer/             # Scan, parse, embed, pipeline (6 files)
-├── search/              # Hybrid, symbol, structural, context search (9 files)
-├── shared/              # Types, config, constants, errors (6 files)
-└── storage/             # libSQL DB, schema, segments, queries (5 files)
-tests/                   # Integration, CLI, SQL verification (3 files)
-benches/                 # Search benchmarks (1 file)
-scripts/                 # Benchmark tooling
+├── main.rs              # Binary entry point
+├── lib.rs               # Library root
+├── reminder.md          # Agent instruction source
+├── cli/                 # CLI layer (14 files) — clap subcommands + output formatting
+├── daemon/              # Daemon layer (10 files) — file watching, IPC, search service, lifecycle
+├── indexer/             # Indexer layer (6 files) — pipeline, parser, embedder, scanner, chunker
+├── search/              # Search layer (9 files) — hybrid, symbol, structural, context, ranking
+├── shared/              # Shared layer (9 files) — types, config, errors, fs, constants, reminder
+└── storage/             # Storage layer (5 files) — db, schema, segments, queries
+tests/                   # Integration + release tests (6 files)
+benches/                 # Criterion benchmarks (1 file)
+scripts/                 # Benchmark + release scripts (15 files)
+evals/                   # Search quality evals (8 files)
+packaging/               # Homebrew + Scoop templates
+.github/workflows/       # CI/CD + release automation (6 workflows)
 ```
 
 ## Navigation

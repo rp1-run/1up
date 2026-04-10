@@ -1,76 +1,93 @@
 # Implementation Patterns
 
 **Project**: 1up
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-10
 
 ## Naming & Organization
 
 **Files**: snake_case.rs, one module per concern, grouped by layer (`cli/`, `daemon/`, `indexer/`, `search/`, `storage/`, `shared/`)
-**Functions**: snake_case verbs; CLI handlers use `async fn exec(args, format) -> anyhow::Result<()>`; constructors use `new()`, `from_dir()`, `open_rw()`/`open_ro()`; config resolution uses `from_sources()` for multi-tier defaults
+**Functions**: snake_case verbs; CLI handlers use `async fn exec(args, format) -> anyhow::Result<()>`; constructors use `new()`, `from_dir()`, `open_rw()`/`open_ro()`; config resolution uses `from_sources()`
 **Imports**: Absolute paths (`crate::shared::types::...`), grouped std -> external -> internal, no wildcard imports
-**Constants**: `SCREAMING_SNAKE_CASE`, centralized in `shared/constants.rs`; env var names as `pub const &str`
-**Types**: PascalCase; CLI args as `<Subcommand>Args`; engines as `<Feature>Engine`; internal pipeline structs (`ScannedWorkItem`, `ParsedWorkItem`, `ParseResult`) kept private
+**Constants**: `SCREAMING_SNAKE_CASE`, centralized in `shared/constants.rs`; env var names as `pub const &str`; pinned SHA-256 digests as const for artifact verification
+**Types**: PascalCase; CLI args as `<Subcommand>Args`; engines as `<Feature>Engine`; IPC messages as `<Noun>Request`/`<Noun>Response`
 
-Evidence: `src/shared/constants.rs`, `src/cli/mod.rs`, `src/indexer/pipeline.rs:148-183`
+Evidence: `src/shared/constants.rs`, `src/cli/mod.rs`, `src/daemon/search_service.rs:29-41`
 
 ## Type & Data Modeling
 
-**Data Representation**: Plain structs with pub fields; serde Serialize/Deserialize on API-facing and persisted types; `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields; private inner structs for pipeline work items
-**Type Strictness**: Strong typing with dedicated enums (SegmentRole, QueryIntent, RetrievalMode, OutputFormat, IndexState, IndexPhase); `FromStr` impls for CLI-facing enums; custom Deserialize impls for validation-on-load (`IndexingConfig`)
+**Data Representation**: Plain structs with pub fields; serde Serialize/Deserialize on API-facing and persisted types; `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields; private inner structs for pipeline work items and verified artifact metadata
+**Type Strictness**: Strong typing with dedicated enums (SegmentRole, QueryIntent, RetrievalMode, OutputFormat, IndexState, IndexPhase, EmbeddingLoadStatus, EmbeddingUnavailableReason, FenceAction); `FromStr` impls for CLI-facing enums; custom Deserialize impls for validation-on-load
 **Immutability**: Structs mutable by default (pub fields); small enums are Copy; Clone derived broadly
 **Nullability**: `Option<T>` for nullable fields; `some_if_not_empty(Vec<T>) -> Option<Vec<T>>` helper pattern
 
-Evidence: `src/shared/types.rs:1-98`, `src/shared/types.rs:168-260`
+Evidence: `src/shared/types.rs:1-98`, `src/indexer/embedder.rs:180-194`, `src/shared/reminder.rs:24-29`
 
 ## Error Handling
 
 **Strategy**: Two-tier: thiserror for domain errors (`OneupError` with nested per-module enums), `anyhow::Result` at CLI boundary
-**Propagation**: Domain modules return `Result<T, OneupError>` with `#[from]` conversions; CLI uses `bail!()` for user-facing errors; `eprintln!("warning: ...")` for degraded-mode warnings; `debug_assert!()` for internal invariants (sequence ordering, trailing embeddings)
-**Common Types**: OneupError, StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, ProjectError
-**Recovery**: Embedding failures -> FTS-only search; vector retrieval failures -> FTS fallback within same query; tree-sitter failures -> text chunking; non-critical persistence failures (progress JSON) silently logged at debug level
+**Propagation**: Domain modules return `Result<T, OneupError>` with `#[from]` conversions; CLI uses `bail!()` for user-facing errors; `eprintln!("warning: ...")` for degraded-mode warnings; `debug_assert!()` for internal invariants
+**Common Types**: OneupError, StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError
+**Recovery**: Embedding failures -> FTS-only search; vector retrieval failures -> FTS fallback within same query; tree-sitter failures -> text chunking; download failures -> marker file to prevent automatic retry; daemon unavailability -> local execution fallback
 
-Evidence: `src/shared/errors.rs`, `src/search/hybrid.rs:39-51`, `src/indexer/pipeline.rs:20-45`
+Evidence: `src/shared/errors.rs`, `src/search/hybrid.rs:39-51`, `src/indexer/embedder.rs:396-427`
 
 ## Validation & Boundaries
 
-**Location**: CLI boundary (clap derive), config resolution entry points, and query execution entry points
-**Method**: clap derive for args; manual guards at function entry (empty query, line range bounds, file existence); schema version validation before DB read/write; `IndexingConfig::new()` validates all fields > 0; `read_positive_env()` rejects zero and non-numeric env vars
-**Early Rejection**: `bail!()` for missing index, schema mismatch, out-of-range lines; `SearchError::InvalidQuery` for invalid queries; `ConfigError::ReadFailed` for invalid env values
+**Location**: CLI boundary (clap derive), config resolution entry points, query execution entry points, and filesystem security boundaries
+**Method**: clap derive for args; manual guards at function entry; schema version validation before DB read/write; `IndexingConfig::new()` validates all fields > 0; `read_positive_env()` rejects zero and non-numeric env vars; IPC `sanitize_request()` canonicalizes paths and clamps limits
+**Filesystem Security**: Approved-root validation pattern: all file operations require an approved_root parameter; every path component checked via `symlink_metadata()`; `normalize_absolute()` resolves `../` before I/O; distinct leaf-type enforcement via `ExpectedLeaf` enum (RegularFile vs Socket)
+**Early Rejection**: `bail!()` for missing index, schema mismatch; `FilesystemError::OutsideApprovedRoot` and `FilesystemError::SymlinkComponent` for path escapes
 
-Evidence: `src/shared/config.rs:64-101`, `src/shared/types.rs:176-196`, `src/storage/schema.rs`
+Evidence: `src/shared/config.rs:64-134`, `src/shared/fs.rs:56-136`, `src/daemon/search_service.rs:193-218`
 
 ## Observability
 
-**Logging**: tracing crate with `debug!`/`info!` macros; `-v`/`-vv` CLI flag for verbosity; debug-level for skipped files, queued follow-up runs, and fallback decisions; info-level for pipeline summaries with configured/effective workers and per-stage timings
-**Metrics**: None detected
-**Tracing**: None detected
-**Progress**: `IndexProgress` snapshots persisted to `.1up/index_status.json`; human, plain, and JSON formatters render work summaries, effective parallelism, and scan/parse/embed/store/total timings; nanospinner remains the interactive CLI progress indicator
+**Logging**: tracing crate with `debug!`/`info!`/`warn!`/`error!` macros; `-v`/`-vv` CLI flag for verbosity; debug-level for skipped files, cache hits, fallback decisions; info-level for pipeline summaries and project lifecycle; warn-level for degraded functionality
+**Progress**: `IndexProgress` snapshots persisted to `.1up/index_status.json`; human, plain, and JSON formatters render work summaries, effective parallelism, and per-stage timings; nanospinner for interactive CLI progress
 
-Evidence: `src/indexer/pipeline.rs:20-45`, `src/cli/output.rs`, `src/daemon/worker.rs`
+Evidence: `src/daemon/worker.rs:236-321`, `src/cli/output.rs`
 
 ## Testing Idioms
 
-**Organization**: Unit tests live in `#[cfg(test)]` blocks inside modules; integration tests live in `tests/`; Criterion performance coverage lives in `benches/search_bench.rs`; repo-scale benchmark scripts live in `scripts/`
-**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem, snapshot, and daemon-socket tests; helper builders (`make_result`, `test_segment`, `make_segment`); acceptance fixtures that create multi-language corpora; RAII guards for env vars (`EnvGuard`) and model visibility (`HideModelGuard`)
-**Levels**: Unit coverage for config resolution, warm embedding reuse, daemon search socket transport, ranking, and storage symbol rows; integration coverage for exact/canonical/reference symbol lookup, scoped-run planning/fallback, schema rebuild guidance, and add/edit/delete freshness; benchmark coverage for candidate-first retrieval and real-repo warm-query workloads
-**Patterns**: `#[tokio::test]` for async; descriptive regression names; parity tests compare `jobs=1` and parallel incremental runs; scoped-index tests assert safe fallback to full scans; daemon request tests treat unavailability as a fallback path instead of a fatal error; benchmark scripts verify that indexing actually performed work before accepting timings
+**Organization**: Unit tests in `#[cfg(test)]` blocks inside modules; integration tests in `tests/`; Criterion benchmarks in `benches/`; repo-scale benchmark scripts in `scripts/`; search quality evals in `evals/`
+**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem and daemon-socket tests; helper builders (`make_result`, `test_segment`); RAII guards: `EnvGuard` for env vars (save/restore via Drop), `HideModelGuard` for model visibility (rename-based); `static Mutex` for env-var test isolation
+**Levels**: Unit coverage for config resolution, warm embedding reuse, secure filesystem ops (symlink rejection, atomic replace, path clamping), IPC framing (round-trip, oversized, timeout), fence parsing and idempotency; integration for symbol lookup, scoped-run fallback, schema rebuild; benchmarks for candidate-first retrieval and warm-query workloads
+**Patterns**: `#[tokio::test]` for async; `cfg(unix)` guards on symlink/socket tests for cross-platform CI; parity tests compare jobs=1 vs parallel runs; daemon request tests treat unavailability as fallback path
 
-Evidence: `src/shared/config.rs`, `src/indexer/embedder.rs`, `src/indexer/pipeline.rs`, `src/daemon/search_service.rs`, `tests/integration_tests.rs`, `tests/cli_tests.rs`, `benches/search_bench.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_emdash.sh`
+Evidence: `src/shared/fs.rs:480-697`, `src/daemon/ipc.rs:144-276`, `tests/cli_tests.rs`, `tests/integration_tests.rs`
 
 ## I/O & Integration
 
-**Database**: libsql via `Db` wrapper with `open_rw`/`open_ro`/`open_memory`; SQL as `pub const &str` in `storage/queries.rs`; async row iteration with column extraction by index; schema versioning via meta table; transactional batch writes via `replace_file_batch_tx`; `segment_symbols` stores raw + canonical symbols so search can do exact-first lookup before broader fallback queries
-**IPC**: Daemon-backed search uses JSON `SearchRequest`/`SearchResponse` messages over a Unix domain socket at `~/.local/share/1up/daemon.sock`; CLI search times out quickly and falls back to local execution instead of blocking on daemon availability
-**HTTP Clients**: reqwest for model downloads with streaming byte transfer; no retry for HTTP (only DB lock contention)
-**File I/O**: ignore crate (WalkBuilder) for gitignore-aware scanning; `scan_directory` for full runs and `scan_paths` for scoped follow-ups; SHA-256 hashing for incremental detection; full-scan fallback when ignore-control files or excluded paths change; `std::fs` for synchronous reads in parser/context and search fallback
-**Benchmark Tooling**: hyperfine + jq + rsync/git snapshots in `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_emdash.sh`, and `scripts/benchmark_rewrite_sql.sh`
+**Database**: libsql via `Db` wrapper; SQL as `pub const &str` in `storage/queries.rs`; async row iteration with column extraction by index; schema versioning via meta table; transactional batch writes; `segment_symbols` stores raw + canonical symbols for exact-first lookup
+**IPC**: Length-prefixed JSON frames over Unix domain socket; 4-byte big-endian length header + JSON payload; bounded frame sizes (16KB request, 2MB response, 4KB query); 250ms read/write deadlines; same-UID peer auth via `stream.peer_cred()`; semaphore-based in-flight limiting (8 slots); socket bound with 0o600 permissions
+**HTTP Clients**: reqwest for model downloads with streaming byte transfer and connect/total timeouts; no retry for HTTP (only DB lock contention)
+**File I/O**: ignore crate for gitignore-aware scanning; SHA-256 hashing for incremental detection and artifact verification; `atomic_replace` for crash-safe writes (temp file + fsync + rename + dir sync)
 
-Evidence: `src/storage/queries.rs`, `src/storage/segments.rs`, `src/daemon/search_service.rs`, `src/indexer/scanner.rs`, `src/indexer/pipeline.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_emdash.sh`
+Evidence: `src/daemon/ipc.rs:20-89`, `src/daemon/search_service.rs:43-218`, `src/shared/fs.rs:90-136`
 
 ## Concurrency & Async
 
-**Async Usage**: Tokio full runtime; all CLI handlers and DB operations async; file-local parse work runs through a bounded `JoinSet::spawn_blocking` pool capped at `config.jobs`; embedder inference stays synchronous inside one ONNX session; storage writes remain serialized
-**Patterns**: Sequence IDs assigned at scan time plus `BTreeMap` reorder buffer restore deterministic file order before flush; `write_batch_files` controls transactional replacement batch size; daemon `ProjectRunState` enforces one active run per project and collapses bursts into at most one queued follow-up pass
-**Config Resolution**: Three-tier priority: CLI flags -> env vars (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`) -> registry persisted config -> auto defaults (`available_parallelism - 1`, clamped embed threads)
+**Async Usage**: Tokio full runtime; all CLI handlers and DB operations async; bounded `JoinSet::spawn_blocking` parse pool capped at `config.jobs`; embedder inference stays synchronous; storage writes remain serialized
+**Patterns**: Sequence IDs + BTreeMap reorder buffer for deterministic file order; `write_batch_files` controls transactional batch size; `ProjectRunState` enforces one active run + burst collapse; Semaphore admission control for daemon search; oneshot channels for request-response plumbing between connection tasks and search handler
+**Warm Cache**: `EmbeddingCompatibilityKey` (model_dir + file fingerprints + embed_threads) keys `WarmRuntime<T>` generic cache; cache-on-match avoids redundant ONNX reload; `cache.clear()` on any error ensures no stale state
+**Config Resolution**: Three-tier priority: CLI flags -> env vars -> registry persisted config -> auto defaults
 
-Evidence: `src/indexer/pipeline.rs:678-720`, `src/shared/config.rs:64-82`, `src/daemon/worker.rs:18-47`, `src/shared/types.rs:203-242`
+Evidence: `src/indexer/embedder.rs:131-240`, `src/daemon/worker.rs:18-53`, `src/shared/config.rs:96-115`
+
+## Verified Artifact Lifecycle
+
+**Pattern**: Download to `.staging/<artifact_id>/` -> verify SHA-256 against pinned constants -> write `VerifiedArtifactManifest` to `verified/<artifact_id>/manifest.json` -> move files from staging -> atomically switch `current.json` pointer -> legacy flat-file artifacts auto-migrated on first access after digest validation -> cleanup on failure (remove_dir_all on staging)
+
+Evidence: `src/indexer/embedder.rs:64-109`, `src/shared/constants.rs:107-134`
+
+## Agent Instruction Pattern
+
+**Pattern**: Compile-time `CONDENSED_REMINDER` via `include_str!("../reminder.md")`; versioned fence markers (`<!-- 1up:start:VERSION -->`) for idempotent injection into AGENTS.md/CLAUDE.md; `hello-agent` subcommand emits reminder in all formats; fence operations handle create/update/already-current with malformed detection; coexists with other tools' fences by matching only 1up-prefixed markers
+
+Evidence: `src/shared/reminder.rs:1-154`, `src/cli/hello_agent.rs`, `src/shared/constants.rs:143`
+
+## Conditional Compilation
+
+**Pattern**: `cfg(unix)`/`cfg(not(unix))` guards for platform-specific daemon modules (lifecycle, search_service, worker, watcher, ipc vs stubs); `cfg(unix)` test guards for symlink/socket tests; `cfg(not(windows))`/`cfg(windows)` for ort linking strategy; filesystem permission operations are no-ops on non-Unix
+
+Evidence: `src/daemon/mod.rs`, `src/shared/fs.rs:387-432`, `Cargo.toml` target-specific dependencies
