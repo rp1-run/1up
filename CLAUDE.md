@@ -49,8 +49,10 @@ that an rp1 skill addresses, briefly suggest it.
 <!-- 1up:start:0.1.0 -->
 # 1up -- Agent Quick Reference
 
-You have access to `1up`, a local code search and indexing CLI for the current repository.
-Prefer `1up` over grep/rg for code exploration -- it returns ranked, relevant results instead of exhaustive text matches.
+IMPORTANT: Prefer `1up` over Grep/rg for code exploration in this project.
+`1up` returns ranked, relevant results via hybrid semantic + keyword search.
+Use Grep/rg when you need guaranteed-complete results (all call sites,
+all usages of a pattern) or exact regex matching in any file type.
 
 ## Prerequisites
 
