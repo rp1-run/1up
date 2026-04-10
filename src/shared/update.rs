@@ -348,10 +348,6 @@ pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
 /// - The cache cannot be read (non-fatal, AC-10a)
 /// - No update is available (current version matches or exceeds latest)
 ///
-/// When the cache is stale, a background `tokio::spawn` task refreshes it so
-/// the next CLI invocation gets fresh data. The current invocation uses
-/// whatever cache exists (possibly outdated).
-///
 /// The notification is formatted differently depending on `UpdateStatus`:
 /// - `UpdateAvailable`: informational notice with upgrade instruction
 /// - `Yanked`: urgent warning with operator message
