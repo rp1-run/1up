@@ -1,0 +1,4 @@
+pre-push:
+  commands:
+    protect-main:
+      run: .lefthook/protect-main.sh {push_remote} {push_args}
