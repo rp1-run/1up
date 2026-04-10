@@ -6,6 +6,7 @@ use crate::shared::types::{
     ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
     StructuralResult, SymbolResult,
 };
+use crate::shared::update::{InstallChannel, UpdateStatus};
 
 pub trait Formatter {
     fn format_search_results(&self, results: &[SearchResult]) -> String;
@@ -15,6 +16,8 @@ pub trait Formatter {
     fn format_message(&self, message: &str) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
+    fn format_update_status(&self, status: &UpdateStatusInfo) -> String;
+    fn format_update_result(&self, result: &UpdateResult) -> String;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +40,54 @@ struct WorkSummary {
     files_indexed: usize,
     files_skipped: usize,
     files_deleted: usize,
+}
+
+/// Data needed to render the output of `1up update --check` and `1up update --status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateStatusInfo {
+    pub current_version: String,
+    pub cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    #[serde(skip)]
+    pub status: UpdateStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_channel: Option<InstallChannel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_age_secs: Option<i64>,
+    pub yanked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_safe_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_instruction: Option<String>,
+}
+
+/// Outcome of running `1up update` (no flags).
+#[derive(Debug, Clone)]
+pub enum UpdateResult {
+    UpToDate {
+        current_version: String,
+        latest_version: String,
+    },
+    ChannelManaged {
+        current_version: String,
+        latest_version: String,
+        install_channel: InstallChannel,
+        upgrade_instruction: String,
+        status: UpdateStatus,
+        message: Option<String>,
+    },
+    Updated {
+        old_version: String,
+        new_version: String,
+    },
 }
 
 impl From<&IndexProgress> for WorkSummary {
@@ -106,6 +157,75 @@ impl Formatter for JsonFormatter {
             "index_progress": &status.index_progress,
             "index_work": index_work,
         }))
+    }
+
+    fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
+        if !info.cached {
+            return to_json(&serde_json::json!({
+                "current_version": info.current_version,
+                "cached": false,
+                "message": "No cached update information. Run `1up update --check` to check for updates.",
+            }));
+        }
+        let mut obj = serde_json::json!({
+            "current_version": info.current_version,
+            "latest_version": info.latest_version,
+            "update_available": info.update_available,
+            "install_channel": info.install_channel,
+            "yanked": info.yanked,
+            "minimum_safe_version": info.minimum_safe_version,
+            "message": info.message,
+            "notes_url": info.notes_url,
+            "upgrade_instruction": info.upgrade_instruction,
+        });
+        if let Some(checked_at) = &info.checked_at {
+            obj["checked_at"] = serde_json::json!(checked_at.to_rfc3339());
+        }
+        if let Some(cache_age_secs) = info.cache_age_secs {
+            obj["cache_age_secs"] = serde_json::json!(cache_age_secs);
+            obj["cached"] = serde_json::json!(true);
+        }
+        to_json(&obj)
+    }
+
+    fn format_update_result(&self, result: &UpdateResult) -> String {
+        match result {
+            UpdateResult::UpToDate {
+                current_version,
+                latest_version,
+            } => to_json(&serde_json::json!({
+                "current_version": current_version,
+                "latest_version": latest_version,
+                "update_available": false,
+                "message": "Already up to date.",
+            })),
+            UpdateResult::ChannelManaged {
+                current_version,
+                latest_version,
+                install_channel,
+                upgrade_instruction,
+                status,
+                message,
+            } => to_json(&serde_json::json!({
+                "current_version": current_version,
+                "latest_version": latest_version,
+                "update_available": true,
+                "install_channel": install_channel,
+                "managed": true,
+                "status": render_update_status_label(status),
+                "upgrade_instruction": upgrade_instruction,
+                "message": message,
+            })),
+            UpdateResult::Updated {
+                old_version,
+                new_version,
+            } => to_json(&serde_json::json!({
+                "updated": true,
+                "old_version": old_version,
+                "new_version": new_version,
+                "message": format!("Updated 1up from {old_version} to {new_version}."),
+            })),
+        }
     }
 }
 
@@ -343,6 +463,153 @@ impl Formatter for HumanFormatter {
         }
         out
     }
+
+    fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
+        if !info.cached {
+            return format!(
+                "Current version: {}\nNo cached update information.\nRun `1up update --check` to check for updates.\n",
+                info.current_version.bold()
+            );
+        }
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Current version: {}\n",
+            info.current_version.bold()
+        ));
+        if let Some(ref latest) = info.latest_version {
+            out.push_str(&format!("Latest version:  {}\n", latest.bold()));
+        }
+        if let Some(ref channel) = info.install_channel {
+            out.push_str(&format!("Install source:  {channel}\n"));
+        }
+        if let (Some(ref checked_at), Some(cache_age_secs)) =
+            (&info.checked_at, info.cache_age_secs)
+        {
+            out.push_str(&format!(
+                "Last checked:    {} ({})\n",
+                checked_at.to_rfc3339(),
+                render_cache_age(cache_age_secs),
+            ));
+        }
+        match &info.status {
+            UpdateStatus::UpToDate => {
+                out.push_str(&format!("Status: {}\n", "up to date".green()));
+            }
+            UpdateStatus::UpdateAvailable { latest } => {
+                out.push_str(&format!(
+                    "Status: {}\n",
+                    format!("update available ({latest})").yellow()
+                ));
+                if let Some(ref instruction) = info.upgrade_instruction {
+                    out.push_str(&format!("Run: {instruction}\n"));
+                }
+            }
+            UpdateStatus::Yanked { message, .. } => {
+                out.push_str(&format!(
+                    "Status: {}\n",
+                    "YANKED -- upgrade immediately".red()
+                ));
+                if let Some(msg) = message {
+                    out.push_str(&format!("Message: {msg}\n"));
+                }
+                if let Some(ref instruction) = info.upgrade_instruction {
+                    out.push_str(&format!("Run: {instruction}\n"));
+                }
+            }
+            UpdateStatus::BelowMinimumSafe {
+                minimum_safe,
+                message,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "Status: {}\n",
+                    format!("below minimum safe version ({minimum_safe})").red()
+                ));
+                if let Some(msg) = message {
+                    out.push_str(&format!("Message: {msg}\n"));
+                }
+                if let Some(ref instruction) = info.upgrade_instruction {
+                    out.push_str(&format!("Run: {instruction}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    fn format_update_result(&self, result: &UpdateResult) -> String {
+        match result {
+            UpdateResult::UpToDate {
+                current_version, ..
+            } => {
+                format!("Already up to date (version {current_version}).")
+            }
+            UpdateResult::ChannelManaged {
+                latest_version,
+                install_channel,
+                upgrade_instruction,
+                status,
+                message,
+                current_version,
+            } => {
+                let mut out = String::new();
+                out.push_str(&format!(
+                    "Update available: 1up {} (current: {})\n",
+                    latest_version.bold(),
+                    current_version
+                ));
+                match status {
+                    UpdateStatus::Yanked { message, .. } => {
+                        out.push_str(&format!(
+                            "{}\n",
+                            "WARNING: this version has been recalled. Upgrade immediately.".red()
+                        ));
+                        if let Some(msg) = message {
+                            out.push_str(&format!("Message: {msg}\n"));
+                        }
+                    }
+                    UpdateStatus::BelowMinimumSafe {
+                        minimum_safe,
+                        message,
+                        ..
+                    } => {
+                        out.push_str(&format!(
+                            "{}\n",
+                            format!(
+                                "WARNING: current version is below minimum safe version ({minimum_safe}). Upgrade immediately."
+                            )
+                            .red()
+                        ));
+                        if let Some(msg) = message {
+                            out.push_str(&format!("Message: {msg}\n"));
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(msg) = message {
+                    if !matches!(
+                        status,
+                        UpdateStatus::Yanked { .. } | UpdateStatus::BelowMinimumSafe { .. }
+                    ) {
+                        out.push_str(&format!("Message: {msg}\n"));
+                    }
+                }
+                out.push_str(&format!(
+                    "1up is managed by {install_channel}. Run: {upgrade_instruction}\n"
+                ));
+                out
+            }
+            UpdateResult::Updated {
+                old_version,
+                new_version,
+            } => {
+                format!(
+                    "Updated 1up from {} to {}.",
+                    old_version,
+                    new_version.green().bold()
+                )
+            }
+        }
+    }
 }
 
 impl Formatter for PlainFormatter {
@@ -540,6 +807,77 @@ impl Formatter for PlainFormatter {
         out.push('\n');
         out
     }
+
+    fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
+        if !info.cached {
+            return format!("current:{}\tcached:false\n", info.current_version);
+        }
+        let status_label = render_update_status_label(&info.status);
+        let mut out = format!(
+            "current:{}\tlatest:{}\tstatus:{}\tupdate_available:{}\tchannel:{}\tinstruction:{}",
+            info.current_version,
+            info.latest_version.as_deref().unwrap_or("unknown"),
+            status_label,
+            info.update_available,
+            info.install_channel
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            info.upgrade_instruction.as_deref().unwrap_or(""),
+        );
+        if let Some(ref checked_at) = info.checked_at {
+            out.push_str(&format!("\tchecked_at:{}", checked_at.to_rfc3339()));
+        }
+        if let Some(cache_age_secs) = info.cache_age_secs {
+            out.push_str(&format!("\tcache_age_secs:{cache_age_secs}"));
+        }
+        if info.yanked {
+            out.push_str("\tyanked:true");
+        }
+        if let Some(ref min_safe) = info.minimum_safe_version {
+            out.push_str(&format!("\tminimum_safe_version:{min_safe}"));
+        }
+        if let Some(ref msg) = info.message {
+            out.push_str(&format!("\tmessage:{msg}"));
+        }
+        out.push('\n');
+        out
+    }
+
+    fn format_update_result(&self, result: &UpdateResult) -> String {
+        match result {
+            UpdateResult::UpToDate {
+                current_version,
+                latest_version,
+            } => {
+                format!(
+                    "current:{current_version}\tlatest:{latest_version}\tupdate_available:false\n"
+                )
+            }
+            UpdateResult::ChannelManaged {
+                current_version,
+                latest_version,
+                install_channel,
+                upgrade_instruction,
+                message,
+                ..
+            } => {
+                let mut out = format!(
+                    "current:{current_version}\tlatest:{latest_version}\tupdate_available:true\tchannel:{install_channel}\tmanaged:true\tinstruction:{upgrade_instruction}"
+                );
+                if let Some(ref msg) = message {
+                    out.push_str(&format!("\tmessage:{msg}"));
+                }
+                out.push('\n');
+                out
+            }
+            UpdateResult::Updated {
+                old_version,
+                new_version,
+            } => {
+                format!("updated:true\told_version:{old_version}\tnew_version:{new_version}\n")
+            }
+        }
+    }
 }
 
 fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
@@ -634,6 +972,24 @@ fn render_index_phase(progress: &IndexProgress) -> &'static str {
         IndexPhase::Storing if progress.embeddings_enabled => "embedding_and_storing",
         IndexPhase::Storing => "storing",
         IndexPhase::Complete => "complete",
+    }
+}
+
+fn render_update_status_label(status: &UpdateStatus) -> &'static str {
+    match status {
+        UpdateStatus::UpToDate => "up_to_date",
+        UpdateStatus::UpdateAvailable { .. } => "update_available",
+        UpdateStatus::Yanked { .. } => "yanked",
+        UpdateStatus::BelowMinimumSafe { .. } => "below_minimum_safe",
+    }
+}
+
+fn render_cache_age(secs: i64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
     }
 }
 
@@ -819,5 +1175,173 @@ mod tests {
         assert!(rendered.contains("project_initialized:false"));
         assert!(rendered.contains("index:not_built"));
         assert!(rendered.contains("last_file_check:none"));
+    }
+
+    fn sample_update_status_info(status: UpdateStatus) -> UpdateStatusInfo {
+        let update_available = !matches!(status, UpdateStatus::UpToDate);
+        UpdateStatusInfo {
+            current_version: "0.1.0".to_string(),
+            cached: true,
+            latest_version: Some("0.2.0".to_string()),
+            update_available,
+            status,
+            install_channel: Some(InstallChannel::Manual),
+            checked_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-10T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            cache_age_secs: Some(3600),
+            yanked: false,
+            minimum_safe_version: None,
+            message: None,
+            notes_url: Some("https://github.com/rp1-run/1up/releases/v0.2.0".to_string()),
+            upgrade_instruction: Some("1up update".to_string()),
+        }
+    }
+
+    #[test]
+    fn json_update_status_with_cache_includes_required_fields() {
+        let formatter = JsonFormatter;
+        let info = sample_update_status_info(UpdateStatus::UpdateAvailable {
+            latest: "0.2.0".to_string(),
+        });
+        let rendered = formatter.format_update_status(&info);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["current_version"], "0.1.0");
+        assert_eq!(value["latest_version"], "0.2.0");
+        assert_eq!(value["update_available"], true);
+        assert_eq!(value["install_channel"], "manual");
+        assert_eq!(value["upgrade_instruction"], "1up update");
+        assert!(value["cache_age_secs"].is_number());
+        assert!(value["checked_at"].is_string());
+    }
+
+    #[test]
+    fn json_update_status_without_cache_shows_cached_false() {
+        let formatter = JsonFormatter;
+        let info = UpdateStatusInfo {
+            current_version: "0.1.0".to_string(),
+            cached: false,
+            latest_version: None,
+            update_available: false,
+            status: UpdateStatus::UpToDate,
+            install_channel: None,
+            checked_at: None,
+            cache_age_secs: None,
+            yanked: false,
+            minimum_safe_version: None,
+            message: None,
+            notes_url: None,
+            upgrade_instruction: None,
+        };
+        let rendered = formatter.format_update_status(&info);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["cached"], false);
+        assert_eq!(value["current_version"], "0.1.0");
+    }
+
+    #[test]
+    fn human_update_status_shows_version_and_status() {
+        let formatter = HumanFormatter;
+        let info = sample_update_status_info(UpdateStatus::UpdateAvailable {
+            latest: "0.2.0".to_string(),
+        });
+        let rendered = formatter.format_update_status(&info);
+
+        assert!(rendered.contains("Current version:"));
+        assert!(rendered.contains("0.1.0"));
+        assert!(rendered.contains("Latest version:"));
+        assert!(rendered.contains("0.2.0"));
+        assert!(rendered.contains("update available"));
+        assert!(rendered.contains("Run: 1up update"));
+    }
+
+    #[test]
+    fn plain_update_status_produces_tab_delimited_output() {
+        let formatter = PlainFormatter;
+        let info = sample_update_status_info(UpdateStatus::UpdateAvailable {
+            latest: "0.2.0".to_string(),
+        });
+        let rendered = formatter.format_update_status(&info);
+
+        assert!(rendered.contains("current:0.1.0"));
+        assert!(rendered.contains("\tlatest:0.2.0"));
+        assert!(rendered.contains("\tstatus:update_available"));
+        assert!(rendered.contains("\tupdate_available:true"));
+        assert!(rendered.contains("\tchannel:manual"));
+        assert!(rendered.contains("\tinstruction:1up update"));
+    }
+
+    #[test]
+    fn json_update_result_updated_has_version_fields() {
+        let formatter = JsonFormatter;
+        let result = UpdateResult::Updated {
+            old_version: "0.1.0".to_string(),
+            new_version: "0.2.0".to_string(),
+        };
+        let rendered = formatter.format_update_result(&result);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["updated"], true);
+        assert_eq!(value["old_version"], "0.1.0");
+        assert_eq!(value["new_version"], "0.2.0");
+    }
+
+    #[test]
+    fn plain_update_result_up_to_date() {
+        let formatter = PlainFormatter;
+        let result = UpdateResult::UpToDate {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.1.0".to_string(),
+        };
+        let rendered = formatter.format_update_result(&result);
+
+        assert!(rendered.contains("current:0.1.0"));
+        assert!(rendered.contains("update_available:false"));
+    }
+
+    #[test]
+    fn human_update_result_channel_managed_shows_instruction() {
+        let formatter = HumanFormatter;
+        let result = UpdateResult::ChannelManaged {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.2.0".to_string(),
+            install_channel: InstallChannel::Homebrew,
+            upgrade_instruction: "brew upgrade rp1-run/tap/1up".to_string(),
+            status: UpdateStatus::UpdateAvailable {
+                latest: "0.2.0".to_string(),
+            },
+            message: None,
+        };
+        let rendered = formatter.format_update_result(&result);
+
+        assert!(rendered.contains("Update available: 1up"));
+        assert!(rendered.contains("0.2.0"));
+        assert!(rendered.contains("managed by homebrew"));
+        assert!(rendered.contains("brew upgrade rp1-run/tap/1up"));
+    }
+
+    #[test]
+    fn human_update_result_channel_managed_yanked_shows_warning() {
+        let formatter = HumanFormatter;
+        let result = UpdateResult::ChannelManaged {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.2.0".to_string(),
+            install_channel: InstallChannel::Homebrew,
+            upgrade_instruction: "brew upgrade rp1-run/tap/1up".to_string(),
+            status: UpdateStatus::Yanked {
+                latest: "0.2.0".to_string(),
+                message: Some("Critical bug fix".to_string()),
+            },
+            message: None,
+        };
+        let rendered = formatter.format_update_result(&result);
+
+        assert!(rendered.contains("WARNING"));
+        assert!(rendered.contains("recalled"));
+        assert!(rendered.contains("Critical bug fix"));
     }
 }
