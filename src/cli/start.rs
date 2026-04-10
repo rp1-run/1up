@@ -1,12 +1,16 @@
+use std::path::Path;
+
 use clap::Args;
 
-use crate::cli::output::formatter_for;
+use crate::cli::output::{formatter_for, Formatter};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
+use crate::shared::constants;
 use crate::shared::project;
+use crate::shared::reminder;
 use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -29,6 +33,9 @@ pub struct StartArgs {
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
+
+    install_fences(&project_root, &*fmt);
+
     if !lifecycle::supports_daemon() {
         println!(
             "{}",
@@ -132,6 +139,17 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     registry.register(&project_id, &project_root, Some(indexing_config))?;
 
+    // Double-check: another `1up start` may have spawned a daemon while we were indexing.
+    if let Some(pid) = lifecycle::is_daemon_running()? {
+        lifecycle::send_sighup(pid)?;
+        let msg = format!(
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            stats.files_indexed, stats.segments_stored,
+        );
+        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+        return Ok(());
+    }
+
     let binary = lifecycle::current_binary_path()?;
     let pid = lifecycle::spawn_daemon(&binary)?;
 
@@ -141,4 +159,42 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     );
     println!("{}", fmt.format_index_summary(&msg, &stats.progress));
     Ok(())
+}
+
+fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
+    for filename in constants::FENCE_TARGET_FILES {
+        let file_path = project_root.join(filename);
+        let existing = std::fs::read_to_string(&file_path).ok();
+        let (new_content, action) = reminder::apply_fence(existing.as_deref());
+
+        match action {
+            reminder::FenceAction::AlreadyCurrent => {}
+            reminder::FenceAction::Created => {
+                if let Err(e) = std::fs::write(&file_path, &new_content) {
+                    eprintln!("warning: failed to create {filename}: {e}");
+                    continue;
+                }
+                eprintln!(
+                    "{}",
+                    fmt.format_message(&format!(
+                        "Created {filename} with 1up agent reminder (v{}).",
+                        reminder::VERSION
+                    ))
+                );
+            }
+            reminder::FenceAction::Updated { old_version } => {
+                if let Err(e) = std::fs::write(&file_path, &new_content) {
+                    eprintln!("warning: failed to update {filename}: {e}");
+                    continue;
+                }
+                eprintln!(
+                    "{}",
+                    fmt.format_message(&format!(
+                        "Updated 1up reminder in {filename} ({old_version} -> {}).",
+                        reminder::VERSION
+                    ))
+                );
+            }
+        }
+    }
 }

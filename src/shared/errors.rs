@@ -30,6 +30,9 @@ pub enum OneupError {
     #[error("project error: {0}")]
     Project(#[from] ProjectError),
 
+    #[error("fence error: {0}")]
+    Fence(#[from] FenceError),
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
@@ -174,6 +177,12 @@ pub enum ProjectError {
 
     #[error("project ID write failed: {0}")]
     WriteFailed(String),
+}
+
+#[derive(Error, Debug)]
+pub enum FenceError {
+    #[error("malformed 1up fence: {0}")]
+    Malformed(String),
 }
 
 #[allow(dead_code)]
