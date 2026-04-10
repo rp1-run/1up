@@ -13,8 +13,8 @@ bench:
     cargo build --release
     @cd evals && ONEUP_BENCH_BIN=../target/release/1up bun run bench
 
-bench-parallel repo='.':
-    ./scripts/benchmark_parallel_indexing.sh {{repo}}
+bench-parallel:
+    ./scripts/benchmark_parallel_indexing.sh
 
 security-check:
     ./scripts/security_check.sh

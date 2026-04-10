@@ -346,7 +346,7 @@ jobs:
           fi
 
           out_dir="${RUNNER_TEMP}/benchmark"
-          OUT_DIR="$out_dir" bash scripts/benchmark_parallel_indexing.sh "$GITHUB_WORKSPACE"
+          OUT_DIR="$out_dir" bash scripts/benchmark_parallel_indexing.sh
           cp "$out_dir/summary.json" "$evidence_dir/benchmark-summary.json"
           echo "summary_path=${evidence_dir}/benchmark-summary.json" >> "$GITHUB_OUTPUT"
 

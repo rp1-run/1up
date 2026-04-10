@@ -10,41 +10,55 @@ import {
 
 interface BenchmarkCase {
   name: string;
-  query: string;
+  oneupQuery: string;
+  baselineCommand: string;
 }
 
 interface SearchResult {
   file_path: string;
 }
 
-interface CaseSummary {
-  name: string;
+interface CommandSummary {
   resultCount: number;
   meanMs: number;
   minMs: number;
   maxMs: number;
 }
 
+interface CaseSummary {
+  name: string;
+  oneup: CommandSummary;
+  baseline: CommandSummary;
+}
+
 const BENCHMARK_CASES: BenchmarkCase[] = [
   {
     name: "Search Stack",
-    query:
+    oneupQuery:
       "Trace how emdash content search is enabled and queried, from a field becoming searchable through to admin search results. Identify the key files involved in each step.",
+    baselineCommand:
+      'rg -n -S "FTSManager|searchSingleCollection|AdminCommandPalette" .',
   },
   {
     name: "WordPress Import",
-    query:
+    oneupQuery:
       "Explain the WordPress import pipeline from the admin wizard through schema preparation, WXR execution, and Gutenberg-to-Portable-Text conversion. Identify the key files involved in each step.",
+    baselineCommand:
+      'rg -n -S "WordPressImport|prepare\\.ts|execute\\.ts|gutenberg-to-portable-text" .',
   },
   {
     name: "Plugin Architecture",
-    query:
+    oneupQuery:
       "Trace how a sandboxed emdash plugin is registered, capability-gated, loaded into Cloudflare Worker isolation, and given controlled access to content, storage, and network. Identify the key files involved in each step.",
+    baselineCommand:
+      'rg -n -S "manager\\.ts|hooks\\.ts|runner\\.ts|wrapper\\.ts|bridge\\.ts" .',
   },
   {
     name: "Live Content Query",
-    query:
+    oneupQuery:
       "Explain how emdash stores schema in the database and exposes typed live content queries through Astro. Identify the key files involved in each step.",
+    baselineCommand:
+      'rg -n -S "registry\\.ts|loader\\.ts|query\\.ts|live\\.config\\.ts" .',
   },
 ];
 
@@ -56,6 +70,7 @@ const PASSING_TOTAL_MEAN_MS = positiveNumberEnv(
   200,
 );
 const BENCHMARK_BINARY = process.env.ONEUP_BENCH_BIN ?? "1up";
+const BASELINE_LABEL = "rg";
 
 function positiveIntegerEnv(name: string, fallback: number): number {
   const rawValue = process.env[name];
@@ -128,7 +143,7 @@ function benchmarkEnv(homeDir: string): NodeJS.ProcessEnv {
   };
 }
 
-function runSearch(
+function runOneupSearch(
   query: string,
   repoDir: string,
   homeDir: string,
@@ -160,35 +175,63 @@ function runSearch(
   return parsedOutput as SearchResult[];
 }
 
-function measureCase(
-  benchCase: BenchmarkCase,
-  repoDir: string,
-  homeDir: string,
-): CaseSummary {
-  for (let run = 0; run < WARMUP_RUNS; run += 1) {
-    runSearch(benchCase.query, repoDir, homeDir);
+function runBaselineSearch(command: string, repoDir: string, homeDir: string): string[] {
+  const rawOutput = execFileSync("bash", ["-lc", command], {
+    cwd: repoDir,
+    encoding: "utf8",
+    env: benchmarkEnv(homeDir),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const lines = rawOutput
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) {
+    throw new Error(`baseline search returned no results for command: ${command}`);
+  }
+
+  return lines;
+}
+
+function measureCommand(run: () => number): CommandSummary {
+  for (let runIndex = 0; runIndex < WARMUP_RUNS; runIndex += 1) {
+    run();
   }
 
   const samplesMs: number[] = [];
   let resultCount = 0;
 
-  for (let run = 0; run < MEASURED_RUNS; run += 1) {
+  for (let runIndex = 0; runIndex < MEASURED_RUNS; runIndex += 1) {
     const startedAt = process.hrtime.bigint();
-    const results = runSearch(benchCase.query, repoDir, homeDir);
+    resultCount = run();
     const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-
     samplesMs.push(elapsedMs);
-    resultCount = results.length;
   }
 
   const totalMs = samplesMs.reduce((sum, sample) => sum + sample, 0);
 
   return {
-    name: benchCase.name,
     resultCount,
     meanMs: totalMs / samplesMs.length,
     minMs: Math.min(...samplesMs),
     maxMs: Math.max(...samplesMs),
+  };
+}
+
+function measureCase(
+  benchCase: BenchmarkCase,
+  repoDir: string,
+  homeDir: string,
+): CaseSummary {
+  return {
+    name: benchCase.name,
+    oneup: measureCommand(
+      () => runOneupSearch(benchCase.oneupQuery, repoDir, homeDir).length,
+    ),
+    baseline: measureCommand(
+      () => runBaselineSearch(benchCase.baselineCommand, repoDir, homeDir).length,
+    ),
   };
 }
 
@@ -198,19 +241,21 @@ function formatMs(value: number): string {
 
 function printSummary(
   summaries: CaseSummary[],
-  aggregateMeanMs: number,
+  aggregateOneupMeanMs: number,
+  aggregateBaselineMeanMs: number,
   modelCachePath: string | null,
 ): void {
   const perQueryBudgetMs = PASSING_TOTAL_MEAN_MS / BENCHMARK_CASES.length;
-  const outcome = aggregateMeanMs <= PASSING_TOTAL_MEAN_MS ? "PASS" : "FAIL";
+  const outcome = aggregateOneupMeanMs <= PASSING_TOTAL_MEAN_MS ? "PASS" : "FAIL";
 
-  console.log(`1up search perf bench: ${outcome}`);
-  console.log(`Binary: ${BENCHMARK_BINARY}`);
+  console.log(`1up search comparison bench: ${outcome}`);
+  console.log(`1up binary: ${BENCHMARK_BINARY}`);
+  console.log(`Baseline: raw ${BASELINE_LABEL}`);
   console.log(`Queries: ${BENCHMARK_CASES.length}`);
   console.log(`Warmup runs/query: ${WARMUP_RUNS}`);
   console.log(`Measured runs/query: ${MEASURED_RUNS}`);
   console.log(
-    `Passing goal: aggregate mean <= ${formatMs(PASSING_TOTAL_MEAN_MS)} (${formatMs(perQueryBudgetMs)} average/query)`,
+    `Passing goal: 1up aggregate mean <= ${formatMs(PASSING_TOTAL_MEAN_MS)} (${formatMs(perQueryBudgetMs)} average/query)`,
   );
   console.log(
     `Model cache: ${modelCachePath ?? "not linked; searches will run in FTS-only fallback mode"}`,
@@ -218,13 +263,18 @@ function printSummary(
   console.log("");
 
   for (const summary of summaries) {
+    const speedup = summary.baseline.meanMs / summary.oneup.meanMs;
     console.log(
-      `- ${summary.name}: mean ${formatMs(summary.meanMs)} | min ${formatMs(summary.minMs)} | max ${formatMs(summary.maxMs)} | results ${summary.resultCount}`,
+      `- ${summary.name}: 1up mean ${formatMs(summary.oneup.meanMs)} | ${BASELINE_LABEL} mean ${formatMs(summary.baseline.meanMs)} | speedup ${speedup.toFixed(2)}x | 1up results ${summary.oneup.resultCount} | ${BASELINE_LABEL} hits ${summary.baseline.resultCount}`,
     );
   }
 
   console.log("");
-  console.log(`Aggregate mean: ${formatMs(aggregateMeanMs)}`);
+  console.log(`1up aggregate mean: ${formatMs(aggregateOneupMeanMs)}`);
+  console.log(`${BASELINE_LABEL} aggregate mean: ${formatMs(aggregateBaselineMeanMs)}`);
+  console.log(
+    `Aggregate speedup: ${(aggregateBaselineMeanMs / aggregateOneupMeanMs).toFixed(2)}x`,
+  );
 }
 
 let workspaceDir: string | null = null;
@@ -241,14 +291,23 @@ try {
   const summaries = BENCHMARK_CASES.map((benchCase) =>
     measureCase(benchCase, workspace.repoDir, workspace.homeDir),
   );
-  const aggregateMeanMs = summaries.reduce(
-    (sum, summary) => sum + summary.meanMs,
+  const aggregateOneupMeanMs = summaries.reduce(
+    (sum, summary) => sum + summary.oneup.meanMs,
+    0,
+  );
+  const aggregateBaselineMeanMs = summaries.reduce(
+    (sum, summary) => sum + summary.baseline.meanMs,
     0,
   );
 
-  printSummary(summaries, aggregateMeanMs, modelCachePath);
+  printSummary(
+    summaries,
+    aggregateOneupMeanMs,
+    aggregateBaselineMeanMs,
+    modelCachePath,
+  );
 
-  if (aggregateMeanMs > PASSING_TOTAL_MEAN_MS) {
+  if (aggregateOneupMeanMs > PASSING_TOTAL_MEAN_MS) {
     benchmarkFailed = true;
     preserveWorkspace = process.env.PRESERVE_EVAL_WORKSPACES === "true";
     process.exitCode = 1;

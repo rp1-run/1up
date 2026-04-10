@@ -121,7 +121,7 @@ module.exports = { handleRequest, handleGet, handlePost, validateInput };
 "#;
 
     let yaml_source = r#"
-request_signing_secret: sq-test-secret
+request_signing_secret: test-secret
 description: request signing secret used for request validation
 policy_rule_preview_enabled: true
 "#;
@@ -147,7 +147,7 @@ CREATE TABLE policy_rules_preview (
     std::fs::create_dir_all(temp_root.join("config")).unwrap();
     std::fs::create_dir_all(temp_root.join("proto")).unwrap();
     std::fs::create_dir_all(temp_root.join("sql")).unwrap();
-    std::fs::write(temp_root.join("config").join("webhooks.yaml"), yaml_source).unwrap();
+    std::fs::write(temp_root.join("config").join("signatures.yaml"), yaml_source).unwrap();
     std::fs::write(
         temp_root.join("proto").join("policy_rules.proto"),
         proto_source,

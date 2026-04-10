@@ -118,24 +118,16 @@ That pattern is important. Semantic search is ranked and intentionally selective
 - If embeddings are unavailable, `1up` can still fall back to full-text search instead of failing outright.
 - Windows currently focuses on local-mode workflows rather than daemon-backed `start`.
 
-## Latest Benchmark We Have
+## Benchmarking
 
-The latest retained benchmark in this workspace was captured on **April 4, 2026** with `scripts/benchmark_emdash.sh` against the `emdash` repository. That corpus had **294 tracked files**, was **1.5 MiB** on disk, and had **72.4% structural-language coverage** for `1up` symbol-aware indexing.
-
-| Workflow | `1up` median | `rg` median | Result |
-|---|---:|---:|---|
-| Clean index | 9.80 s | 30.89 s | `1up` was 3.16x faster |
-| Warm search: `PolicyRuleValidator` | 153.8 ms | 823.5 ms | `1up` was 5.41x faster |
-| Warm search: `request signing secret` | 153.0 ms | 818.6 ms | `1up` was 5.39x faster |
-| Warm search: `WorkItemUpdateEvent` | 149.4 ms | 826.1 ms | `1up` was 5.55x faster |
-| Exact symbol: `PolicyRuleValidator` | 15.3 ms | 308.2 ms | `1up` was 18.67x faster |
-| Partial symbol: `RoutingRule` | 17.8 ms | 317.9 ms | `1up` was 16.90x faster |
-
-These numbers are useful because they reflect an actual retained run on a real codebase, not a synthetic marketing claim. They are still just one benchmark on one corpus. If you want to reproduce them on your own repo, run:
+The public benchmark and eval corpus for this repo is the pinned `emdash` repository. Search comparisons use raw `rg` workflows as the baseline, not another semantic search tool.
 
 ```sh
-bash scripts/benchmark_emdash.sh /path/to/repo
+just bench
+just bench-parallel
 ```
+
+`just bench` runs the search comparison on pinned `emdash` checkouts and reports `1up` against raw `rg` command sequences for the same tasks. `just bench-parallel` runs the parallel indexing benchmark on the same pinned `emdash` corpus.
 
 ## Upgrade
 

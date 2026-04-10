@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+EMDASH_REPO="https://github.com/emdash-cms/emdash.git"
+EMDASH_COMMIT="5beb0ddc334deb862ba90cedbf03f052b58e4974"
+EMDASH_CACHE_DIR="$ROOT_DIR/evals/.cache/emdash"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -48,6 +51,19 @@ sync_repo() {
   rm -rf "$target_dir"
   mkdir -p "$target_dir"
   rsync -a --delete --exclude .git --exclude .1up --exclude target "$source_dir"/ "$target_dir"/
+}
+
+ensure_emdash_fixture() {
+  mkdir -p "$(dirname "$EMDASH_CACHE_DIR")"
+
+  if [[ ! -d "$EMDASH_CACHE_DIR/.git" ]]; then
+    log "cloning pinned emdash fixture"
+    git clone --single-branch --branch main "$EMDASH_REPO" "$EMDASH_CACHE_DIR" >/dev/null 2>&1
+  fi
+
+  log "checking out pinned emdash commit"
+  git -C "$EMDASH_CACHE_DIR" fetch --depth 1 origin "$EMDASH_COMMIT" >/dev/null 2>&1 || true
+  git -C "$EMDASH_CACHE_DIR" checkout --force "$EMDASH_COMMIT" >/dev/null 2>&1
 }
 
 prepare_full_case() {
@@ -232,17 +248,22 @@ if [[ "${1:-}" == "__run_write_heavy_case" ]]; then
   exit 0
 fi
 
-REPO_INPUT="${1:-$ROOT_DIR}"
+REPO_INPUT="${1:-$EMDASH_CACHE_DIR}"
+
+require_cmd cargo
+require_cmd git
+require_cmd hyperfine
+require_cmd jq
+require_cmd rsync
+
+if [[ "$REPO_INPUT" == "$EMDASH_CACHE_DIR" ]]; then
+  ensure_emdash_fixture
+fi
 
 if [[ ! -d "$REPO_INPUT" ]]; then
   printf 'repo not found: %s\n' "$REPO_INPUT" >&2
   exit 1
 fi
-
-require_cmd cargo
-require_cmd hyperfine
-require_cmd jq
-require_cmd rsync
 
 REPO=$(cd "$REPO_INPUT" && pwd -P)
 REPO_NAME=$(basename "$REPO")

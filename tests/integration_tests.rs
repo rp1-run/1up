@@ -336,12 +336,12 @@ fn create_search_acceptance_fixture() -> TempDir {
     fs::create_dir_all(tmp.path().join("sql")).unwrap();
 
     fs::write(
-        tmp.path().join("src").join("routing.rs"),
+        tmp.path().join("src").join("policy.rs"),
         r#"pub struct PolicyRuleValidator;
 
 impl PolicyRuleValidator {
-    pub fn validate(&self, route: &str) -> bool {
-        !route.is_empty()
+    pub fn validate(&self, policy: &str) -> bool {
+        !policy.is_empty()
     }
 }
 "#,
@@ -350,18 +350,18 @@ impl PolicyRuleValidator {
 
     fs::write(
         tmp.path().join("src").join("runner.rs"),
-        r#"use crate::routing::PolicyRuleValidator;
+        r#"use crate::policy::PolicyRuleValidator;
 
 pub fn run_validation(validator: &PolicyRuleValidator) -> bool {
-    validator.validate("orders")
+    validator.validate("allow")
 }
 "#,
     )
     .unwrap();
 
     fs::write(
-        tmp.path().join("src").join("webhooks.rs"),
-        r#"// validate incoming webhook signatures
+        tmp.path().join("src").join("signatures.rs"),
+        r#"// validate incoming request signatures
 pub fn validate_incoming_request_signatures(secret: &str, header: &str) -> bool {
     !secret.is_empty() && header.contains(secret)
 }
@@ -370,8 +370,8 @@ pub fn validate_incoming_request_signatures(secret: &str, header: &str) -> bool 
     .unwrap();
 
     fs::write(
-        tmp.path().join("config").join("webhooks.yaml"),
-        r#"request_signing_secret: sq-test-secret
+        tmp.path().join("config").join("signatures.yaml"),
+        r#"request_signing_secret: test-secret
 description: request signing secret used for request validation
 policy_rule_preview_enabled: true
 "#,
@@ -379,8 +379,8 @@ policy_rule_preview_enabled: true
     .unwrap();
 
     fs::write(
-        tmp.path().join("docs").join("webhooks.md"),
-        r#"# Webhooks API documentation guide
+        tmp.path().join("docs").join("signatures.md"),
+        r#"# Request signing documentation guide
 
 Use config/signatures.yaml to set the request signing secret for local development.
 "#,
@@ -506,7 +506,7 @@ fn symbol_lookup_acceptance_queries_cover_exact_canonical_and_references() {
     assert_eq!(exact[0]["name"], "PolicyRuleValidator");
     assert_eq!(exact[0]["file_path"], "src/policy.rs");
 
-    let canonical = lookup_symbol_json(tmp.path(), "routing rule validator");
+    let canonical = lookup_symbol_json(tmp.path(), "policy rule validator");
     assert_eq!(canonical[0]["name"], "PolicyRuleValidator");
     assert_eq!(canonical[0]["file_path"], "src/policy.rs");
 
@@ -591,7 +591,7 @@ fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
             "api documentation guide local development",
             "docs/signatures.md",
         ),
-        ("validate incoming webhook signatures", "src/signatures.rs"),
+        ("validate incoming request signatures", "src/signatures.rs"),
         ("PolicyRulePreview", "proto/policy_rules.proto"),
         ("policy_rules_preview table", "sql/policy_rules.sql"),
     ];

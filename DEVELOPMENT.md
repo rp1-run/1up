@@ -48,11 +48,13 @@ just eval-parallel --summary
 ## Benchmarking
 
 ```sh
-just bench-parallel [repo]
-bash scripts/benchmark_emdash.sh [repo]
+just bench
+just bench-parallel
 ```
 
-`just bench-parallel` wraps `scripts/benchmark_parallel_indexing.sh`. It snapshots the target repo, warms the indexing environment once, and then measures three scenarios across serial, auto, and constrained settings:
+`just bench` runs the public search benchmark on the pinned `emdash` fixture and compares `1up` against raw `rg` command sequences for the same task prompts.
+
+`just bench-parallel` wraps `scripts/benchmark_parallel_indexing.sh`. It checks out the pinned `emdash` fixture, warms the indexing environment once, and then measures three scenarios across serial, auto, and constrained settings:
 
 - full reindex
 - scoped follow-up indexing after a small edit
@@ -60,7 +62,7 @@ bash scripts/benchmark_emdash.sh [repo]
 
 Artifacts land under `target/parallel-index-bench/<repo>-<timestamp>/` as `full-index.json`, `incremental-index.json`, `write-heavy-index.json`, and `summary.json`.
 
-`scripts/benchmark_emdash.sh` captures a tracked-file snapshot and compares `1up` against `rg` for clean indexing, warm search queries, and symbol lookups when the corpus has enough structurally parsed files. It writes per-query hyperfine JSON, preview outputs, and `summary.md` under `target/benchmarks/<repo>-<timestamp>/`.
+For public eval workflows, use the authored suite under `evals/suites/1up-search/`. That suite also targets the same pinned `emdash` fixture.
 
 ## Release And Governance Docs
 

@@ -33,7 +33,7 @@ Expected on the `main` merge path:
 
 - [ ] Not needed for this change
 - [ ] `just eval-parallel --summary`
-- [ ] `just bench-parallel .`
+- [ ] `just bench-parallel`
 - [ ] Manual archive or package verification
 - [ ] Skipped with explanation below
 
