@@ -595,7 +595,8 @@ mod tests {
         markdown.role = Some(SegmentRole::Docs);
         markdown.breadcrumb = Some("request signing secret configuration guide".to_string());
 
-        let mut config = make_candidate("service/src/main/resources/app-common.yaml", 1, "chunk", 1);
+        let mut config =
+            make_candidate("service/src/main/resources/app-common.yaml", 1, "chunk", 1);
         config.breadcrumb = Some("request signing secret".to_string());
         config.defined_symbols = Some(vec!["request_signing_secret".to_string()]);
 

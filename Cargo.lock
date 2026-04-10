@@ -1907,6 +1907,7 @@ dependencies = [
  "ort",
  "predicates",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

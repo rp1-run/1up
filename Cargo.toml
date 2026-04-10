@@ -91,6 +91,9 @@ nix = { version = "0.31", features = ["signal", "process"] }
 # Chrono for timestamps
 chrono = { version = "0.4", features = ["serde"] }
 
+# Semantic versioning
+semver = "1"
+
 [target.'cfg(not(windows))'.dependencies]
 # Non-Windows targets keep the crate's downloaded static runtime path.
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
