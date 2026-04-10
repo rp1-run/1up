@@ -2,59 +2,139 @@
   <img src="assets/logo.png" alt="1up" width="128" height="128" />
 </p>
 
-# 1up
+<p align="center">
+  <strong>Semantic code search for agents and developers.</strong>
+</p>
 
-Unified search substrate for source repositories. `1up` is a single CLI binary for symbol lookup, reference search, context retrieval, structural queries, and hybrid semantic plus full-text code search with machine-readable output.
+<p align="center">
+  <code>1up</code> combines ranked semantic search, exact-first symbol lookup, file:line context retrieval,
+  and structural AST search in one CLI so agents can find the right code path fast.
+</p>
 
-Built in Rust with tree-sitter for multi-language parsing, ONNX embeddings (`all-MiniLM-L6-v2`) for semantic retrieval, and libSQL for persistent indexing. On macOS and Linux, a background daemon can watch for file changes and keep the index warm between queries.
+`1up` is built for code exploration, not raw text dumping. Use it when you want to understand how a system works, jump to the right symbol, or inspect surrounding code with minimal noise. Keep `rg` for exact strings, logs, config keys, and any search where you need guaranteed-complete text matches.
+
+## Why 1up
+
+- Search by intent, not just keywords.
+- Move from discovery to verification with `search`, `symbol -r`, and `context`.
+- Return compact, ranked results that fit agent workflows and context windows.
+- Emit `plain`, `human`, or `json` output for terminals, scripts, and coding agents.
+- Keep the index warm on macOS and Linux with a background daemon.
 
 ## Install
 
 Public installs are intended to come from tagged GitHub releases and first-party package definitions. The distributed executable is always named `1up`.
 
 | Channel | Platforms | Command |
-|---------|-----------|---------|
+|---|---|---|
 | Homebrew | macOS, Linux | `brew install rp1-run/tap/1up` |
 | Scoop | Windows | `scoop install https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json` |
 | Direct release asset | macOS arm64, macOS amd64, Linux arm64, Linux amd64, Windows amd64 | Download the matching archive from [GitHub Releases](https://github.com/rp1-run/1up/releases) |
 
-### Supported Platforms
-
-| OS | Architectures | Notes |
-|----|---------------|-------|
-| macOS | arm64, amd64 | Full install-first workflow with daemon support |
-| Linux | arm64, amd64 | Full install-first workflow with daemon support |
-| Windows | amd64 | Local-mode workflow only for the first public release |
-
-## Verify
-
-Confirm the binary is available and reports the expected version:
+Verify the install:
 
 ```sh
 1up --version
 1up --help
 ```
 
-If you downloaded a release archive directly, also download `SHA256SUMS` from the same GitHub Release and verify the one archive you actually downloaded before unpacking it.
+If you downloaded a release archive directly, download the matching `SHA256SUMS` file from the same GitHub Release and verify the archive before unpacking it.
 
-On macOS and Linux, replace `ASSET` with the archive filename you downloaded:
+## Strongly Recommended: Install the Agent Skill
+
+After you install `1up`, the most effective setup for agentic work is to install the portable agent skill once:
 
 ```sh
-ASSET=1up-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-EXPECTED=$(awk -v asset="$ASSET" '$2 == asset {print $1}' SHA256SUMS)
-printf '%s  %s\n' "$EXPECTED" "$ASSET" | shasum -a 256 -c -
+npx skills add rp1-run/1up
 ```
 
-On Windows PowerShell:
+This teaches supported agents when to use `1up search`, `1up symbol`, `1up context`, and `1up structural`, and when `rg` is still the better choice.
+
+On macOS and Linux, `1up start` also creates or updates versioned 1up reminder fences in `AGENTS.md` and `CLAUDE.md` inside the repo. You can preview the injected reminder with:
+
+```sh
+1up --format human hello-agent
+```
+
+## Get Started
+
+From the root of the repository you want to search:
+
+### macOS and Linux
+
+```sh
+cd /path/to/repo
+1up --format human start
+```
+
+### Windows
 
 ```powershell
-$Asset = "1up-vX.Y.Z-x86_64-pc-windows-msvc.zip"
-$Line = Select-String -Path .\SHA256SUMS -Pattern $Asset -SimpleMatch
-if (-not $Line) { throw "No checksum entry found for $Asset" }
-$Expected = ($Line.Line -split '\s+')[0].ToLower()
-$Actual = (Get-FileHash ".\$Asset" -Algorithm SHA256).Hash.ToLower()
-if ($Actual -ne $Expected) { throw "SHA256 mismatch for $Asset" }
-"SHA256 OK: $Asset"
+cd C:\path\to\repo
+1up --format human init
+1up --format human index .
+```
+
+For interactive use in a terminal, the examples below use `--format human` so results render nicely instead of the default agent-friendly `plain` format.
+
+Try a few common workflows:
+
+```sh
+1up --format human search "authentication flow" -n 5
+1up --format human symbol -r AuthManager
+1up --format human context src/auth/manager.rs:84
+1up --format human structural "(function_item name: (identifier) @name)"
+```
+
+The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts. On macOS and Linux, the daemon keeps the index current after `1up start`.
+
+## Choose the Right Command
+
+| If you need to... | Use | Why |
+|---|---|---|
+| Explore unfamiliar code by meaning | `1up --format human search "retry logic with backoff" -n 5` | Ranked semantic and keyword search for discovery |
+| Jump to a definition and all callers | `1up --format human symbol -r validate_token` | Exact-first symbol lookup with reference search |
+| Understand code at a specific file and line | `1up --format human context src/auth.rs:87` | Snaps to the enclosing function, impl, or scope |
+| Match code structure instead of text | `1up --format human structural "(function_item name: (identifier) @name)"` | Tree-sitter AST search |
+
+All commands support `--format plain|json|human`. Use `--format human` for interactive terminal use and `--format json` when an agent or script needs structured output.
+
+## Recommended Workflow
+
+Use semantic search for discovery, then switch to symbol lookup for completeness:
+
+```sh
+1up --format human search "rate limit handling" -n 5
+1up --format human symbol -r RateLimiter
+1up --format human context src/rate_limit.rs:87
+```
+
+That pattern is important. Semantic search is ranked and intentionally selective. It is excellent for finding the right place to look, but `1up symbol -r` is the safer follow-up when you need all definitions and references for a symbol.
+
+## A Few Honest Notes
+
+- Semantic search is a ranked discovery tool, not proof of completeness. Verify important findings with `1up symbol -r`.
+- The first semantic run may download verified model artifacts.
+- If embeddings are unavailable, `1up` can still fall back to full-text search instead of failing outright.
+- Windows currently focuses on local-mode workflows rather than daemon-backed `start`.
+
+## Latest Benchmark We Have
+
+The latest retained benchmark in this workspace was captured on **April 4, 2026** with `scripts/benchmark_emdash.sh` against the `emdash` repository. That corpus had **294 tracked files**, was **1.5 MiB** on disk, and had **72.4% structural-language coverage** for `1up` symbol-aware indexing.
+
+| Workflow | `1up` median | `rg` median | Result |
+|---|---:|---:|---|
+| Clean index | 9.80 s | 30.89 s | `1up` was 3.16x faster |
+| Warm search: `PolicyRuleValidator` | 153.8 ms | 823.5 ms | `1up` was 5.41x faster |
+| Warm search: `request signing secret` | 153.0 ms | 818.6 ms | `1up` was 5.39x faster |
+| Warm search: `WorkItemUpdateEvent` | 149.4 ms | 826.1 ms | `1up` was 5.55x faster |
+| Exact symbol: `PolicyRuleValidator` | 15.3 ms | 308.2 ms | `1up` was 18.67x faster |
+| Partial symbol: `RoutingRule` | 17.8 ms | 317.9 ms | `1up` was 16.90x faster |
+
+These numbers are useful because they reflect an actual retained run on a real codebase, not a synthetic marketing claim. They are still just one benchmark on one corpus. If you want to reproduce them on your own repo, run:
+
+```sh
+bash scripts/benchmark_emdash.sh /path/to/repo
 ```
 
 ## Upgrade
@@ -66,63 +146,11 @@ brew upgrade 1up
 scoop update 1up
 ```
 
-For direct release assets, download the newer archive from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify its checksum, and replace the existing binary.
-
-## First Use
-
-Initialize a project from the repository root you want to search:
-
-```sh
-cd /path/to/your/repo
-1up init
-```
-
-On macOS and Linux, start daemon-backed indexing:
-
-```sh
-1up start
-```
-
-On Windows, use the local-mode workflow instead of daemon commands:
-
-```sh
-1up index .
-```
-
-Run a few common workflows:
-
-```sh
-1up search "error handling"
-1up symbol MyFunction
-1up context src/main.rs:42
-1up structural "(function_item name: (identifier) @name)"
-```
-
-## Model Download
-
-On the first indexing or semantic search run, `1up` may download `model.onnx` and `tokenizer.json` from Hugging Face into `~/.local/share/1up/models/all-MiniLM-L6-v2/verified/<artifact-id>/`.
-
-Those files only become active after both pass pinned SHA-256 verification and `current.json` is updated. If a download fails, the last verified artifact stays active and `1up` writes `~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed`; remove that marker and rerun `1up index` or `1up start` to retry semantic-search setup.
-
-## Windows Differences
-
-The first Windows release is intended to support local-mode commands only: `init`, `index`, `reindex`, `search`, `symbol`, `context`, and `structural`.
-
-Daemon-oriented workflows such as `start`, `stop`, and daemon-backed auto-start remain Unix-first surfaces. Use direct indexing on Windows and rerun `1up index` or `1up reindex` when you want to refresh the local database.
-
-## Agent Skill
-
-`1up` ships a portable [Agent Skill](https://agentskills.io/specification) that teaches AI coding agents to prefer `1up` over grep-like text search for code exploration.
-
-```sh
-npx skills add rp1-run/1up
-```
-
-This auto-detects supported agent clients and configures the skill for each one.
+For direct release assets, download the newer archive from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify it against `SHA256SUMS`, and replace the existing binary.
 
 ## Source Builds
 
-Package-based installs and direct release assets are the supported onboarding path. If you need a development build instead, see [DEVELOPMENT.md](DEVELOPMENT.md).
+Package installs and release assets are the supported onboarding path. If you need a development build instead:
 
 ```sh
 git clone https://github.com/rp1-run/1up.git
@@ -132,10 +160,10 @@ cargo install --path .
 
 ## Project Docs
 
-- Public release history: [CHANGELOG.md](CHANGELOG.md)
+- Release history: [CHANGELOG.md](CHANGELOG.md)
 - Release runbook: [RELEASE.md](RELEASE.md)
 - Contributor policy and merge expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Source-build and internal engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
+- Source-build and engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
 
 ## License
 

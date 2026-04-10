@@ -34,14 +34,18 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     };
 
     let project_id = project::read_project_id(&project_root).ok();
+    let project_initialized = project_id.is_some();
+    let db_path = config::project_db_path(&project_root);
+    let index_present = db_path.exists();
+    let mut index_readable = false;
 
     let (indexed_files, total_segments) = {
-        let db_path = config::project_db_path(&project_root);
         if db_path.exists() {
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
                         if schema::ensure_current(&conn).await.is_ok() {
+                            index_readable = true;
                             let files = segments::count_files(&conn).await.ok();
                             let segs = segments::count_segments(&conn).await.ok();
                             (files, segs)
@@ -61,9 +65,12 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     let status = StatusInfo {
         daemon_running,
         pid,
+        project_initialized,
         indexed_files,
         total_segments,
         project_id,
+        index_present,
+        index_readable,
         index_progress: read_index_progress(&project_root),
     };
 

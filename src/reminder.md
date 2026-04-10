@@ -7,11 +7,12 @@ all usages of a pattern) or exact regex matching in any file type.
 
 ## Prerequisites
 
-Check if the project is indexed before searching:
+Check repository health before searching:
 ```
-ls .1up/project_id 2>/dev/null && echo "indexed" || echo "not indexed"
+1up status
 ```
-If not indexed, run `1up start` to initialize, index, and start the background daemon.
+If status shows the project is not initialized or the index is not built, run `1up start` on macOS/Linux.
+On Windows or other local-mode platforms, run `1up init` and then `1up index .`.
 
 ## Commands
 

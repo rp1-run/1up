@@ -188,6 +188,24 @@ fn status_defaults_to_plain_output() {
 }
 
 #[test]
+fn status_reports_uninitialized_project_and_missing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = cmd()
+        .args(["--format", "json", "status", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(payload["project_initialized"], false);
+    assert_eq!(payload["index_status"], "not_built");
+    assert!(payload["project_id"].is_null());
+    assert!(payload["indexed_files"].is_null());
+}
+
+#[test]
 fn invalid_format_flag_rejected() {
     cmd()
         .args(["--format", "xml", "search", "test"])

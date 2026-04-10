@@ -21,9 +21,12 @@ pub trait Formatter {
 pub struct StatusInfo {
     pub daemon_running: bool,
     pub pid: Option<u32>,
+    pub project_initialized: bool,
     pub indexed_files: Option<u64>,
     pub total_segments: Option<u64>,
     pub project_id: Option<String>,
+    pub index_present: bool,
+    pub index_readable: bool,
     pub index_progress: Option<IndexProgress>,
 }
 
@@ -93,9 +96,11 @@ impl Formatter for JsonFormatter {
         to_json(&serde_json::json!({
             "daemon_running": status.daemon_running,
             "pid": status.pid,
+            "project_initialized": status.project_initialized,
             "indexed_files": status.indexed_files,
             "total_segments": status.total_segments,
             "project_id": &status.project_id,
+            "index_status": render_index_health_plain(status),
             "index_progress": &status.index_progress,
             "index_work": index_work,
         }))
@@ -262,7 +267,15 @@ impl Formatter for HumanFormatter {
         }
         if let Some(id) = &status.project_id {
             out.push_str(&format!("Project: {id}\n"));
+        } else if status.project_initialized {
+            out.push_str("Project: initialized\n");
+        } else {
+            out.push_str(&format!("Project: {}\n", "not initialized".yellow()));
         }
+        out.push_str(&format!(
+            "Index: {}\n",
+            render_index_health_human(status)
+        ));
         if let Some(files) = status.indexed_files {
             out.push_str(&format!("Indexed files: {files}\n"));
         }
@@ -455,9 +468,14 @@ impl Formatter for PlainFormatter {
         if let Some(pid) = status.pid {
             out.push_str(&format!("\tpid:{pid}"));
         }
+        out.push_str(&format!(
+            "\tproject_initialized:{}",
+            status.project_initialized
+        ));
         if let Some(id) = &status.project_id {
             out.push_str(&format!("\tproject:{id}"));
         }
+        out.push_str(&format!("\tindex:{}", render_index_health_plain(status)));
         if let Some(files) = status.indexed_files {
             out.push_str(&format!("\tfiles:{files}"));
         }
@@ -571,6 +589,24 @@ fn render_embeddings_plain(enabled: bool) -> &'static str {
         "enabled"
     } else {
         "disabled"
+    }
+}
+
+fn render_index_health_human(status: &StatusInfo) -> colored::ColoredString {
+    match render_index_health_plain(status) {
+        "ready" => "ready".green(),
+        "not_built" => "not built".yellow(),
+        _ => "unavailable".red(),
+    }
+}
+
+fn render_index_health_plain(status: &StatusInfo) -> &'static str {
+    if !status.index_present {
+        "not_built"
+    } else if status.index_readable {
+        "ready"
+    } else {
+        "unavailable"
     }
 }
 
@@ -712,14 +748,55 @@ mod tests {
         let rendered = formatter.format_status(&StatusInfo {
             daemon_running: true,
             pid: Some(42),
+            project_initialized: true,
             indexed_files: Some(3),
             total_segments: Some(14),
             project_id: Some("project-123".to_string()),
+            index_present: true,
+            index_readable: true,
             index_progress: Some(sample_progress()),
         });
 
         assert!(rendered.contains("last_completed:4"));
         assert!(rendered.contains("jobs_effective:3"));
         assert!(rendered.contains("total_ms:41"));
+    }
+
+    #[test]
+    fn human_status_reports_uninitialized_project_and_missing_index() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_status(&StatusInfo {
+            daemon_running: false,
+            pid: None,
+            project_initialized: false,
+            indexed_files: None,
+            total_segments: None,
+            project_id: None,
+            index_present: false,
+            index_readable: false,
+            index_progress: None,
+        });
+
+        assert!(rendered.contains("Project: not initialized"));
+        assert!(rendered.contains("Index: not built"));
+    }
+
+    #[test]
+    fn plain_status_reports_uninitialized_project_and_missing_index() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_status(&StatusInfo {
+            daemon_running: false,
+            pid: None,
+            project_initialized: false,
+            indexed_files: None,
+            total_segments: None,
+            project_id: None,
+            index_present: false,
+            index_readable: false,
+            index_progress: None,
+        });
+
+        assert!(rendered.contains("project_initialized:false"));
+        assert!(rendered.contains("index:not_built"));
     }
 }

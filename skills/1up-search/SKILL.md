@@ -40,13 +40,13 @@ grep and rg treat code as text. They return every line that matches a pattern â€
 
 ## Prerequisites
 
-Check if the project is indexed:
+Check repository health:
 
 ```sh
-ls .1up/project_id 2>/dev/null && echo "indexed" || echo "not indexed"
+1up status
 ```
 
-If not indexed, initialize and index first:
+If status shows the project is not initialized or the index is not built, initialize and index first:
 
 ```sh
 1up init
