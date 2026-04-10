@@ -1,7 +1,8 @@
 # 1up -- Agent Quick Reference
 
-You have access to `1up`, a local code search and indexing CLI for the current repository.
-Prefer `1up` over grep/rg for code exploration -- it returns ranked, relevant results instead of exhaustive text matches.
+IMPORTANT: DO NOT use Grep or rg for code exploration in this project.
+Use the `1up` CLI commands below instead. `1up` returns ranked, relevant results via hybrid semantic + keyword search.
+Grep is only acceptable for exact string matches in non-code files (error codes, UUIDs, config keys).
 
 ## Prerequisites
 
