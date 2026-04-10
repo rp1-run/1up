@@ -374,6 +374,60 @@ pub fn read_cache_and_spawn_refresh() -> Option<UpdateCheckCache> {
     cache
 }
 
+/// Reads the update cache and formats a passive notification string, if an
+/// update is available.
+///
+/// Returns `None` when:
+/// - The cache cannot be read (non-fatal, AC-10a)
+/// - No update is available (current version matches or exceeds latest)
+///
+/// When the cache is stale, a background `tokio::spawn` task refreshes it so
+/// the next CLI invocation gets fresh data. The current invocation uses
+/// whatever cache exists (possibly outdated).
+///
+/// The notification is formatted differently depending on `UpdateStatus`:
+/// - `UpdateAvailable`: informational notice with upgrade instruction
+/// - `Yanked`: urgent warning with operator message
+/// - `BelowMinimumSafe`: urgent warning with minimum safe version
+pub fn format_update_notification() -> Option<String> {
+    let cache = read_cache_and_spawn_refresh()?;
+    let status = build_update_status(&cache);
+
+    match status {
+        UpdateStatus::UpToDate => None,
+        UpdateStatus::UpdateAvailable { latest } => Some(format!(
+            "Update available: 1up {} (current: {})\nRun: {}",
+            latest, VERSION, cache.upgrade_instruction
+        )),
+        UpdateStatus::Yanked { latest, message } => {
+            let mut out = format!(
+                "WARNING: 1up {} has been recalled. Upgrade immediately to {}+",
+                VERSION, latest
+            );
+            if let Some(msg) = message {
+                out.push_str(&format!("\nMessage from maintainer: {}", msg));
+            }
+            out.push_str(&format!("\nRun: {}", cache.upgrade_instruction));
+            Some(out)
+        }
+        UpdateStatus::BelowMinimumSafe {
+            latest,
+            minimum_safe,
+            message,
+        } => {
+            let mut out = format!(
+                "WARNING: 1up {} is below the minimum safe version ({}). Upgrade immediately to {}+",
+                VERSION, minimum_safe, latest
+            );
+            if let Some(msg) = message {
+                out.push_str(&format!("\nMessage from maintainer: {}", msg));
+            }
+            out.push_str(&format!("\nRun: {}", cache.upgrade_instruction));
+            Some(out)
+        }
+    }
+}
+
 /// Outcome of a successful self-update binary replacement.
 #[derive(Debug, Clone)]
 pub struct SelfUpdateResult {
@@ -1361,5 +1415,46 @@ mod tests {
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "binary should be executable");
+    }
+
+    #[test]
+    fn format_notification_returns_none_for_up_to_date() {
+        let cache = make_cache(VERSION, VERSION, false, None, None);
+        let status = build_update_status(&cache);
+        assert_eq!(status, UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn format_notification_includes_versions_and_instruction_for_update() {
+        let cache = make_cache("0.1.0", "0.1.1", false, None, None);
+        let status = build_update_status(&cache);
+        assert!(matches!(status, UpdateStatus::UpdateAvailable { .. }));
+    }
+
+    #[test]
+    fn format_notification_shows_urgent_warning_for_yanked() {
+        let cache = make_cache("0.1.0", "0.1.1", true, None, Some("data corruption bug"));
+        let status = build_update_status(&cache);
+        assert!(matches!(status, UpdateStatus::Yanked { .. }));
+    }
+
+    #[test]
+    fn format_notification_shows_urgency_for_below_minimum_safe() {
+        let cache = make_cache("0.1.0", "0.1.2", false, Some("0.1.1"), Some("security fix"));
+        let status = build_update_status(&cache);
+        assert!(matches!(status, UpdateStatus::BelowMinimumSafe { .. }));
+    }
+
+    #[test]
+    fn format_notification_uses_channel_upgrade_instruction() {
+        let mut cache = make_cache("0.1.0", "0.1.1", false, None, None);
+        cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Homebrew);
+        assert_eq!(cache.upgrade_instruction, "brew upgrade rp1-run/tap/1up");
+
+        cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Scoop);
+        assert_eq!(cache.upgrade_instruction, "scoop update 1up");
+
+        cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Manual);
+        assert_eq!(cache.upgrade_instruction, "1up update");
     }
 }
