@@ -12,7 +12,7 @@ description: >
   that grep/rg require. Available when the project has a `.1up/` directory or `1up` is on PATH.
   Do NOT use for: searching non-code files (logs, data), exact byte-level pattern matching,
   or projects without 1up installed.
-license: MIT
+license: Apache-2.0
 metadata:
   author: rp1-run/1up
   version: "1.0"
@@ -49,10 +49,11 @@ ls .1up/project_id 2>/dev/null && echo "indexed" || echo "not indexed"
 If not indexed, initialize and index first:
 
 ```sh
-1up start    # initializes, indexes, and starts the daemon
+1up init
+1up index
 ```
 
-After this, the index stays current automatically via the background daemon.
+On platforms with daemon support, `1up start` still combines initialization, indexing, and daemon startup. On Windows and other local-mode platforms, refresh the local database with `1up index` or `1up reindex`.
 
 ## Commands
 

@@ -400,3 +400,29 @@ fn hello_agent_human_output_has_header() {
                 .and(predicate::str::contains("1up search")),
         );
 }
+
+#[cfg(not(unix))]
+#[test]
+fn start_reports_local_mode_guidance_on_non_unix_platforms() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args(["start", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Background daemon workflows are not supported",
+        ));
+}
+
+#[cfg(not(unix))]
+#[test]
+fn stop_is_a_safe_noop_on_non_unix_platforms() {
+    let dir = tempfile::tempdir().unwrap();
+
+    cmd()
+        .args(["stop", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no local daemon to stop"));
+}

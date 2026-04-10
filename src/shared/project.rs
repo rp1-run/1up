@@ -61,7 +61,16 @@ mod tests {
     use super::*;
 
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    fn mode_bits(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn write_project_id_secures_project_state_and_roundtrips() {
@@ -72,14 +81,16 @@ mod tests {
         let project_id = write_project_id(&project_root).unwrap();
         let dot_dir = config::project_dot_dir(&project_root);
         let project_id_path = config::project_id_path(&project_root);
-        let dot_dir_mode = fs::metadata(&dot_dir).unwrap().permissions().mode() & 0o777;
-        let file_mode = fs::metadata(&project_id_path).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(read_project_id(&project_root).unwrap(), project_id);
-        assert_eq!(dot_dir_mode, PROJECT_STATE_DIR_MODE);
-        assert_eq!(file_mode, SECURE_STATE_FILE_MODE);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
+            assert_eq!(mode_bits(&project_id_path), SECURE_STATE_FILE_MODE);
+        }
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_project_id_rejects_symlinked_project_state_dir() {
         let tmp = tempfile::tempdir().unwrap();

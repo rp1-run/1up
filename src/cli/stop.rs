@@ -16,6 +16,16 @@ pub async fn exec(args: StopArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = std::path::Path::new(&args.path).canonicalize()?;
     let fmt = formatter_for(format);
 
+    if !lifecycle::supports_daemon() {
+        println!(
+            "{}",
+            fmt.format_message(
+                "Background daemon workflows are not supported on this platform, so there is no local daemon to stop."
+            )
+        );
+        return Ok(());
+    }
+
     let daemon_pid = match lifecycle::is_daemon_running()? {
         Some(pid) => pid,
         None => {

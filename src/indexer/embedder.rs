@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -940,9 +939,9 @@ async fn download_file_to_stage(
     file.sync_all()
         .await
         .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} sync: {err}")))?;
-    fs::set_permissions(dest, fs::Permissions::from_mode(SECURE_STATE_FILE_MODE)).map_err(
-        |err| EmbeddingError::DownloadFailed(format!("{label} chmod {}: {err}", dest.display())),
-    )?;
+    set_path_mode(dest, SECURE_STATE_FILE_MODE).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("{label} chmod {}: {err}", dest.display()))
+    })?;
 
     dl_spinner.success_with(format!("{label} downloaded"));
     Ok(())
@@ -967,9 +966,11 @@ fn copy_file_to_stage(source: &Path, dest: &Path, label: &str) -> Result<(), One
     let mut dest_file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .mode(SECURE_STATE_FILE_MODE)
         .open(dest)
         .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy create: {err}")))?;
+    set_path_mode(dest, SECURE_STATE_FILE_MODE).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("{label} copy chmod {}: {err}", dest.display()))
+    })?;
     std::io::copy(&mut src, &mut dest_file)
         .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} copy write: {err}")))?;
     dest_file
@@ -1034,11 +1035,13 @@ fn write_stage_file(path: &Path, contents: &[u8]) -> Result<(), OneupError> {
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .mode(SECURE_STATE_FILE_MODE)
         .open(path)
         .map_err(|err| {
             EmbeddingError::DownloadFailed(format!("write stage file {}: {err}", path.display()))
         })?;
+    set_path_mode(path, SECURE_STATE_FILE_MODE).map_err(|err| {
+        EmbeddingError::DownloadFailed(format!("chmod stage file {}: {err}", path.display()))
+    })?;
     file.write_all(contents).map_err(|err| {
         EmbeddingError::DownloadFailed(format!("write stage file {}: {err}", path.display()))
     })?;
@@ -1077,12 +1080,39 @@ fn sha256_digest_file(path: &Path) -> Result<String, OneupError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), OneupError> {
-    let file = File::open(path).map_err(|err| {
-        EmbeddingError::DownloadFailed(format!("open directory {}: {err}", path.display()))
-    })?;
-    file.sync_all().map_err(|err| {
-        EmbeddingError::DownloadFailed(format!("sync directory {}: {err}", path.display())).into()
-    })
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    {
+        let file = File::open(path).map_err(|err| {
+            EmbeddingError::DownloadFailed(format!("open directory {}: {err}", path.display()))
+        })?;
+        file.sync_all().map_err(|err| {
+            EmbeddingError::DownloadFailed(format!("sync directory {}: {err}", path.display()))
+                .into()
+        })
+    }
+}
+
+fn set_path_mode(path: &Path, mode: u32) -> Result<(), OneupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|err| {
+            EmbeddingError::DownloadFailed(format!("chmod {}: {err}", path.display())).into()
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

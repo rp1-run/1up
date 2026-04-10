@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-check:
+    name: security-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-audit
+        shell: bash
+        run: cargo install --locked cargo-audit
+
+      - name: run security gate
+        shell: bash
+        run: bash scripts/security_check.sh
+
+      - name: retain security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-check
+          path: target/security/security-check.json
+          if-no-files-found: error
+          retention-days: 30
+
+  release-smoke-macos:
+    name: release-smoke-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build release binary
+        shell: bash
+        run: cargo build --locked --release --bin 1up
+
+  release-smoke-linux:
+    name: release-smoke-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build release binary
+        shell: bash
+        run: cargo build --locked --release --bin 1up
+
+  release-smoke-windows:
+    name: release-smoke-windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build release binary
+        shell: bash
+        run: cargo build --locked --release --bin 1up
+
+  release-consistency:
+    name: release-consistency
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate release metadata surfaces
+        shell: bash
+        run: |
+          version=$(awk -F'"' '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          bash scripts/release/validate_release_metadata.sh "v${version}"
