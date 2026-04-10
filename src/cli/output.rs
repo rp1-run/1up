@@ -16,8 +16,12 @@ pub trait Formatter {
     fn format_message(&self, message: &str) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
-    fn format_update_status(&self, status: &UpdateStatusInfo) -> String;
-    fn format_update_result(&self, result: &UpdateResult) -> String;
+    fn format_update_status(&self, _status: &UpdateStatusInfo) -> String {
+        String::new()
+    }
+    fn format_update_result(&self, _result: &UpdateResult) -> String {
+        String::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

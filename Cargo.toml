@@ -109,6 +109,7 @@ ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 # Windows MSVC hits duplicate CRT symbols when linking the downloaded runtime
 # statically, so we load the DLL at runtime instead.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic"] }
+zip = "2"
 
 [dev-dependencies]
 assert_cmd = "2"

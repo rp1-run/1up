@@ -29,12 +29,21 @@ async fn main() {
     let format = cli.format;
     let show_notification = should_show_notification(format, &cli.command);
 
+    let refresh_handle = if show_notification {
+        Some(tokio::spawn(shared::update::refresh_cache_if_stale()))
+    } else {
+        None
+    };
+
     if let Err(e) = cli::run(cli).await {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
 
     if show_notification {
+        if let Some(handle) = refresh_handle {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        }
         if let Some(notice) = shared::update::format_update_notification() {
             eprintln!("{notice}");
         }

@@ -340,25 +340,6 @@ pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
     }
 }
 
-/// Reads the cache for passive notification purposes, spawning a background
-/// refresh if the cache is stale.
-///
-/// Returns the current cache immediately without blocking. If the cache is
-/// stale, a `tokio::spawn` task refreshes it in the background so the next
-/// invocation gets fresh data.
-pub fn read_cache_and_spawn_refresh() -> Option<UpdateCheckCache> {
-    let cache = read_update_cache();
-
-    if let Some(ref c) = cache {
-        if !is_cache_valid(c, VERSION) {
-            tokio::spawn(async {
-                let _ = refresh_cache_if_stale().await;
-            });
-        }
-    }
-
-    cache
-}
 
 /// Reads the update cache and formats a passive notification string, if an
 /// update is available.
@@ -376,7 +357,7 @@ pub fn read_cache_and_spawn_refresh() -> Option<UpdateCheckCache> {
 /// - `Yanked`: urgent warning with operator message
 /// - `BelowMinimumSafe`: urgent warning with minimum safe version
 pub fn format_update_notification() -> Option<String> {
-    let cache = read_cache_and_spawn_refresh()?;
+    let cache = read_update_cache()?;
     let status = build_update_status(&cache);
 
     match status {
@@ -666,7 +647,10 @@ pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, 
     let current_exe = std::env::current_exe()
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("resolve current binary: {e}")))?;
 
-    let staging_dir = tempfile::tempdir()
+    let staging_parent = current_exe
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let staging_dir = tempfile::tempdir_in(staging_parent)
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("create staging dir: {e}")))?;
 
     let client = build_download_client()?;
