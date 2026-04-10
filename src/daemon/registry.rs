@@ -142,7 +142,16 @@ impl Registry {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    fn mode_bits(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn registry_roundtrip() {
@@ -262,7 +271,12 @@ mod tests {
         let registry_path = xdg_root.join("projects.json");
 
         fs::create_dir_all(&xdg_root).unwrap();
-        fs::set_permissions(&xdg_root, fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&xdg_root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -276,11 +290,11 @@ mod tests {
         });
 
         registry.save_to_path(&registry_path, &xdg_root).unwrap();
-        let root_mode = fs::metadata(&xdg_root).unwrap().permissions().mode() & 0o777;
-        let file_mode = fs::metadata(&registry_path).unwrap().permissions().mode() & 0o777;
-
-        assert_eq!(root_mode, XDG_STATE_DIR_MODE);
-        assert_eq!(file_mode, SECURE_STATE_FILE_MODE);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_bits(&xdg_root), XDG_STATE_DIR_MODE);
+            assert_eq!(mode_bits(&registry_path), SECURE_STATE_FILE_MODE);
+        }
         assert_eq!(
             Registry::load_from_path(&registry_path, &xdg_root)
                 .unwrap()
@@ -290,6 +304,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn registry_load_rejects_symlinked_registry_file() {
         let tmp = tempfile::tempdir().unwrap();

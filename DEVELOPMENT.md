@@ -1,200 +1,114 @@
 # Development
 
-Internal architecture and developer reference for 1up.
+Internal build, test, and engineering reference for `1up`.
 
-## Building
+`README.md` is the install-first user guide. This document is the secondary source-build and repo-maintainer reference.
+
+## Source Build
+
+Clone the public repository and build from source:
 
 ```sh
+git clone https://github.com/rp1-run/1up.git
+cd 1up
 cargo build --release
-just install   # builds release, copies to ~/.local/bin/1up, codesigns on macOS
 ```
+
+Install a development binary into Cargo's bin directory:
+
+```sh
+cargo install --path .
+```
+
+For a local macOS developer install that copies the release binary into `~/.local/bin/1up` and applies ad hoc codesigning, use:
+
+```sh
+just install
+```
+
+## Testing
+
+Run the default validation set before opening a pull request:
+
+```sh
+cargo fmt --check
+cargo test
+just security-check
+```
+
+Additional commands for heavier or optional validation:
+
+```sh
+cargo test -- --ignored
+just eval-parallel --summary
+```
+
+`just security-check` executes the repo security gate and writes retained evidence to `target/security/security-check.json`.
 
 ## Benchmarking
 
 ```sh
-just bench-parallel [repo]                # release-binary indexing benchmarks via hyperfine
-bash scripts/benchmark_emdash.sh [repo]   # 1up vs rg on clean index + warm queries
+just bench-parallel [repo]
+bash scripts/benchmark_emdash.sh [repo]
 ```
 
-`just bench-parallel` wraps `scripts/benchmark_parallel_indexing.sh`. It snapshots the target
-repo, warms the indexing environment once, and then measures three scenarios across serial,
-auto, and constrained settings:
+`just bench-parallel` wraps `scripts/benchmark_parallel_indexing.sh`. It snapshots the target repo, warms the indexing environment once, and then measures three scenarios across serial, auto, and constrained settings:
 
 - full reindex
 - scoped follow-up indexing after a small edit
 - write-heavy follow-up indexing after 24 file rewrites
 
-Artifacts land under `target/parallel-index-bench/<repo>-<timestamp>/` as `full-index.json`,
-`incremental-index.json`, `write-heavy-index.json`, and `summary.json`.
+Artifacts land under `target/parallel-index-bench/<repo>-<timestamp>/` as `full-index.json`, `incremental-index.json`, `write-heavy-index.json`, and `summary.json`.
 
-`scripts/benchmark_emdash.sh` captures a tracked-file snapshot and compares `1up` against
-`rg` for clean indexing, warm search queries, and symbol lookups when the corpus has enough
-structurally parsed files. It writes per-query hyperfine JSON, preview outputs, and
-`summary.md` under `target/benchmarks/<repo>-<timestamp>/`.
+`scripts/benchmark_emdash.sh` captures a tracked-file snapshot and compares `1up` against `rg` for clean indexing, warm search queries, and symbol lookups when the corpus has enough structurally parsed files. It writes per-query hyperfine JSON, preview outputs, and `summary.md` under `target/benchmarks/<repo>-<timestamp>/`.
+
+## Release And Governance Docs
+
+- Release history: [CHANGELOG.md](CHANGELOG.md)
+- Release runbook: [RELEASE.md](RELEASE.md)
+- Contributor and merge policy: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Architecture
 
-Layered architecture with a two-process model:
+1up uses a layered architecture with a two-process model:
 
-- **CLI** (`src/cli/`): clap-derived subcommands and output formatting (human/json/plain)
-- **Indexer** (`src/indexer/`): staged pipeline — scan, parse, embed, store
-- **Search** (`src/search/`): candidate-first hybrid fusion, exact-first symbol lookup, structural queries, context retrieval
+- **CLI** (`src/cli/`): clap-derived subcommands and output formatting
+- **Indexer** (`src/indexer/`): staged scan, parse, embed, and store pipeline
+- **Search** (`src/search/`): hybrid ranking, exact-first symbol lookup, structural queries, and context retrieval
 - **Daemon** (`src/daemon/`): background file watcher with scoped follow-up indexing and daemon-backed search reuse
 - **Storage** (`src/storage/`): libSQL with FTS5 and native vector search
-- **Shared** (`src/shared/`): types, config resolution, secure filesystem helpers, constants, errors
+- **Shared** (`src/shared/`): types, config resolution, secure filesystem helpers, constants, and errors
 
-CLI and daemon both converge on `pipeline::run_with_config` for indexing. No runtime state is shared between processes — they communicate through the database, PID file, project registry, and Unix signals.
+CLI and daemon both converge on `pipeline::run_with_config` for indexing. Runtime state is shared through the database, PID file, project registry, and Unix signals rather than process-local memory.
 
 ## Indexing Pipeline
 
-The pipeline now starts with scope planning instead of assuming every follow-up run must rescan
-the full repository:
+The indexing pipeline is staged and bounded:
 
-1. **Scope** — `RunScope::Full` scans the whole tree; `RunScope::Paths` uses
-   `scanner::scan_paths()` plus stored file hashes to touch only changed files and tracked
-   deletions.
-2. **Fallback** — scoped runs escalate to a full scan when a path can change scanner semantics,
-   such as `.gitignore`, `.ignore`, `.git/info/exclude`, directories, or hidden/excluded files
-   that no longer reconcile cleanly with indexed state.
-3. **Delete** — remove segments for indexed files that disappeared. Deletes use the same batch
-   transaction helpers as writes.
-4. **Parse** — dispatch changed files to a bounded `spawn_blocking` worker pool (`--jobs`), each
-   tagged with a sequence ID.
-5. **Reorder** — `BTreeMap` reorder buffer restores deterministic file order from out-of-order
-   worker completions.
-6. **Embed** — batch embeddings through a single ONNX session (`--embed-threads` controls
-   intra-op threads).
-7. **Store** — flush ready files through the single writer. `write_batch_files` defaults scale
-   with `jobs`, then `effective_write_batch_files()` caps each run to the amount of work that is
-   actually ready so small follow-up runs do not over-batch.
-8. **Progress** — persist `IndexProgress` (state, phase, work counters, parallelism, stage
-   timings) to `.1up/index_status.json`.
+1. **Scope**: `RunScope::Full` scans the whole tree; `RunScope::Paths` only touches changed files and tracked deletions.
+2. **Fallback**: scoped runs escalate to a full scan when ignore files, directories, or hidden-path semantics can affect correctness.
+3. **Delete**: remove segments for indexed files that disappeared.
+4. **Parse**: dispatch changed files to a bounded `spawn_blocking` worker pool (`--jobs`).
+5. **Reorder**: a `BTreeMap` buffer restores deterministic file order.
+6. **Embed**: batch embeddings through a single ONNX session (`--embed-threads`).
+7. **Store**: flush ready files through the single writer with adaptive batching.
+8. **Progress**: persist `IndexProgress` to `.1up/index_status.json`.
 
-The daemon feeds these scoped follow-up runs from watcher events and collapses bursts into one
-queued rerun. If the embedding model is unavailable, the pipeline stores null vectors and indexing
-still succeeds for full-text and symbol search.
+If the embedding model is unavailable, indexing still succeeds for full-text and symbol search.
 
 ## Concurrency Configuration
 
-Settings resolve through a priority chain:
+Settings resolve through this priority chain:
 
 1. CLI flags (`--jobs`, `--embed-threads`)
 2. Environment variables (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`, `ONEUP_INDEX_WRITE_BATCH_FILES`)
 3. Per-project settings persisted in the daemon registry
-4. Automatic defaults (available cores - 1 for jobs, clamped embed threads)
+4. Automatic defaults based on available cores
 
-`1up start` persists the resolved settings so the daemon reuses them. The daemon reloads settings on `SIGHUP`.
+`1up start` persists the resolved settings so the daemon can reuse them later. The daemon reloads settings on `SIGHUP`.
 
-## Daemon Internals
+## Daemon And Storage Internals
 
-The daemon is a detached `1up __worker` process (hidden subcommand) with a `tokio::select!` event loop:
+The daemon is a detached `1up __worker` process with a `tokio::select!` event loop that coordinates file watching, scoped re-indexing, and daemon-backed search requests. IPC uses length-prefixed JSON frames over `~/.local/share/1up/daemon.sock` with same-UID checks, bounded request and response sizes, and short timeouts so the CLI can fall back to local execution.
 
-- **File events**: drained from notify watchers, filtered, and mapped to owning projects. Each project's `ProjectRunState` enforces one active indexing pass at a time; file-change bursts collapse into at most one queued follow-up run.
-- **SIGHUP**: reloads the project registry, adds/removes watchers, and refreshes per-project indexing settings.
-- **SIGTERM**: unwatches all directories, cleans up the PID file, and exits.
-
-`1up start` registers the project (with optional `IndexingConfig`) and spawns the worker if not already running, or sends `SIGHUP` to reload. `1up stop` deregisters the project and sends `SIGTERM` if no projects remain, `SIGHUP` otherwise.
-
-### Daemon IPC
-
-Daemon-backed search uses one length-prefixed JSON frame per request and response over
-`~/.local/share/1up/daemon.sock`. The transport is hardened in three layers:
-
-- `src/daemon/search_service.rs` binds the socket under the XDG data root, chmods it to `0600`,
-  canonicalizes `project_root`, clamps `limit`, and returns only safe `unavailable` or `busy`
-  reasons to callers.
-- `src/daemon/ipc.rs` enforces same-UID peer authorization, a 16 KiB request cap, a 4 KiB query
-  cap, a 2 MiB response cap, and 250 ms read and write deadlines for each frame.
-- `src/daemon/worker.rs` gates request handling with an 8-slot semaphore. Saturated, malformed,
-  unauthorized, or timed-out clients are shed so the CLI can fall back to local search instead of
-  blocking the daemon loop.
-
-## Storage Layout
-
-All daemon-managed state goes through `src/shared/fs.rs`. The XDG data root
-(`~/.local/share/1up/`) and each project's `.1up/` directory are created with `0700`
-permissions. Sensitive files such as `daemon.pid`, `projects.json`, `project_id`, and verified
-artifact manifests use `0600`, and write/remove helpers reject symlinked or outside-root paths
-before mutating state.
-
-```
-~/.config/1up/                  # XDG config (reserved for future use)
-~/.local/share/1up/             # XDG data
-  daemon.pid                    # Daemon PID file
-  daemon.sock                   # Daemon search socket
-  projects.json                 # Global project registry (includes per-project IndexingConfig)
-  models/
-    all-MiniLM-L6-v2/
-      current.json              # Active verified artifact pointer
-      .download_failed          # Suppresses auto-retry after a failed download
-      verified/
-        <artifact-id>/
-          manifest.json         # Verified artifact manifest
-          model.onnx            # Active ONNX embedding model
-          tokenizer.json        # Active WordPiece tokenizer
-      .staging/
-        <artifact-id>/          # Transient staging area before activation
-
-<project-root>/
-  .1up/
-    project_id                  # UUID identifying this project
-    index.db                    # libSQL database (segments, FTS, vectors)
-    index_status.json           # Latest indexing progress snapshot
-```
-
-Downloads and legacy flat-file imports both flow through the verified artifact store. Files are
-written into `.staging/<artifact-id>/`, fsynced, SHA-256 checked, and only then renamed into
-`verified/<artifact-id>/` before `current.json` is atomically replaced. Failed or partial downloads
-never replace the last known-good artifact.
-
-## Search Internals
-
-`1up search` tries the daemon first when the project is registered. The CLI sends a single framed
-`SearchRequest { project_root, query, limit }` over `~/.local/share/1up/daemon.sock` and waits up
-to 250 ms; if the daemon is unavailable, rejects the caller, sheds load, or times out, the CLI
-falls back to the same search stack locally.
-
-Both the daemon and the local path execute the same search pipeline:
-
-- **Intent detection** classifies the query (`Definition`, `Usage`, `Flow`, `Docs`, `General`).
-- **Exact-first symbol lookup** queries the `segment_symbols` table by normalized
-  `canonical_symbol` values. Only exact misses fan out into prefix/contains candidate loads and
-  fuzzy matching.
-- **Candidate-first retrieval** fetches vector and FTS candidate rows first, ranks them with RRF
-  plus intent/query/path/content boosts, and hydrates only the final ranked segment IDs from
-  storage.
-- **Warm runtime reuse** lets the daemon keep a per-project `EmbeddingRuntime`, so repeated
-  searches can reuse a loaded model when the model files and `embed_threads` setting have not
-  changed.
-
-If query embedding or vector retrieval fails, that query degrades to `FtsOnly`; if the model is
-missing entirely, both daemon and CLI stay in FTS-only mode and still return symbol and FTS
-matches.
-
-## Testing
-
-```sh
-cargo test                  # unit + integration tests
-cargo test -- --ignored     # tests requiring the embedding model
-```
-
-- Unit tests: `#[cfg(test)]` modules within source files
-- Integration tests: `tests/` directory (assert_cmd for CLI, pipeline parity tests)
-- RAII test guards: `EnvGuard` for env vars, `HideModelGuard` for model availability
-- Parallel parity tests verify `--jobs 1` matches auto-parallel output
-
-## Project Structure
-
-```
-src/
-├── main.rs              # Entry point
-├── cli/                 # CLI subcommands and output formatting (13 files)
-├── daemon/              # Background file watcher, registry, lifecycle, IPC, search service (7 files)
-├── indexer/             # Scanner, parser, chunker, embedder, pipeline (6 files)
-├── search/              # Hybrid, symbol, structural, context, ranking (9 files)
-├── shared/              # Types, config, constants, errors, fs, project, symbol helpers (8 files)
-└── storage/             # DB wrapper, schema, segments, queries (5 files)
-tests/                   # Integration, CLI, SQL verification
-benches/                 # Criterion search benchmarks
-scripts/                 # benchmark_parallel_indexing.sh, benchmark_emdash.sh, benchmark_rewrite_sql.sh
-```
+All daemon-managed state goes through `src/shared/fs.rs`. The XDG data root (`~/.local/share/1up/`) and each project's `.1up/` directory are created with owner-only permissions. Sensitive files such as `daemon.pid`, `projects.json`, `project_id`, and verified model manifests are written atomically and validated against approved roots.

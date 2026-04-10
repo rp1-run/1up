@@ -2,7 +2,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use uuid::Uuid;
@@ -43,15 +42,13 @@ pub fn ensure_secure_dir(path: &Path, mode: u32) -> Result<PathBuf, OneupError> 
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 fs::create_dir(&current).map_err(|source| io_error(&current, source))?;
-                fs::set_permissions(&current, fs::Permissions::from_mode(mode))
-                    .map_err(|source| io_error(&current, source))?;
+                set_path_mode(&current, mode)?;
             }
             Err(err) => return Err(io_error(&current, err)),
         }
     }
 
-    fs::set_permissions(&absolute, fs::Permissions::from_mode(mode))
-        .map_err(|source| io_error(&absolute, source))?;
+    set_path_mode(&absolute, mode)?;
 
     Ok(absolute)
 }
@@ -112,9 +109,9 @@ pub fn atomic_replace(
         let mut temp_file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(file_mode)
             .open(&temp_path)
             .map_err(|source| io_error(&temp_path, source))?;
+        set_path_mode(&temp_path, file_mode)?;
         temp_file
             .write_all(contents)
             .map_err(|source| io_error(&temp_path, source))?;
@@ -124,8 +121,7 @@ pub fn atomic_replace(
 
         fs::rename(&temp_path, &validated_path)
             .map_err(|source| io_error(&validated_path, source))?;
-        fs::set_permissions(&validated_path, fs::Permissions::from_mode(file_mode))
-            .map_err(|source| io_error(&validated_path, source))?;
+        set_path_mode(&validated_path, file_mode)?;
         sync_directory(&secure_parent)?;
 
         Ok(())
@@ -164,7 +160,7 @@ impl ExpectedLeaf {
     fn matches(self, file_type: &fs::FileType) -> bool {
         match self {
             Self::RegularFile => file_type.is_file(),
-            Self::Socket => file_type.is_socket(),
+            Self::Socket => is_socket_type(file_type),
         }
     }
 }
@@ -389,10 +385,57 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn sync_directory(path: &Path) -> Result<(), OneupError> {
-    File::open(path)
-        .map_err(|source| io_error(path, source))?
-        .sync_all()
-        .map_err(|source| io_error(path, source))
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .map_err(|source| io_error(path, source))?
+            .sync_all()
+            .map_err(|source| io_error(path, source))
+    }
+}
+
+fn set_path_mode(path: &Path, mode: u32) -> Result<(), OneupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|source| io_error(path, source))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
+fn is_socket_type(file_type: &fs::FileType) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        file_type.is_socket()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = file_type;
+        false
+    }
+}
+
+#[cfg(unix)]
+fn mode_bits(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> OneupError {
@@ -427,7 +470,7 @@ fn file_type_name(file_type: &fs::FileType) -> &'static str {
         "regular file"
     } else if file_type.is_symlink() {
         "symlink"
-    } else if file_type.is_socket() {
+    } else if is_socket_type(file_type) {
         "socket"
     } else {
         "special file"
@@ -440,12 +483,15 @@ mod tests {
 
     use std::ffi::OsString;
     use std::io::Read;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
     use crate::shared::constants::SECURE_STATE_FILE_MODE;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -486,12 +532,12 @@ mod tests {
         );
 
         let root = ensure_secure_xdg_root().unwrap();
-        let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-
         assert!(root.ends_with("1up"));
-        assert_eq!(mode, XDG_STATE_DIR_MODE);
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&root), XDG_STATE_DIR_MODE);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_secure_project_root_rejects_symlink_component() {
         let tmp = tempfile::tempdir().unwrap();
@@ -505,6 +551,7 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn clamp_canonical_path_to_root_rejects_symlink_escape() {
         let tmp = tempfile::tempdir().unwrap();
@@ -522,6 +569,7 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn clamp_canonical_path_to_root_rejects_in_root_symlinked_parent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -537,6 +585,7 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_regular_file_path_rejects_in_root_symlinked_parent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -552,6 +601,7 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_regular_file_rejects_in_root_symlinked_parent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -598,15 +648,15 @@ mod tests {
             .unwrap()
             .read_to_string(&mut content)
             .unwrap();
-        let mode = fs::metadata(&second).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(first, second);
         assert_eq!(content, r#"{"version":2}"#);
-        assert_eq!(mode, SECURE_STATE_FILE_MODE);
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&second), SECURE_STATE_FILE_MODE);
     }
 
     #[test]
-    fn remove_helpers_only_remove_expected_file_types() {
+    fn remove_helpers_only_remove_regular_files() {
         let tmp = tempfile::tempdir().unwrap();
         let root = ensure_secure_dir(
             &canonical_tmp_root(tmp.path()).join("secure"),
@@ -623,6 +673,17 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let err = remove_regular_file(&directory, &root).unwrap_err();
         assert!(err.to_string().contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_helpers_only_remove_socket_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ensure_secure_dir(
+            &canonical_tmp_root(tmp.path()).join("secure"),
+            PROJECT_STATE_DIR_MODE,
+        )
+        .unwrap();
 
         let socket_path = root.join("daemon.sock");
         let _listener = UnixListener::bind(&socket_path).unwrap();

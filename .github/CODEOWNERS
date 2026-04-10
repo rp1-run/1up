@@ -1,0 +1,10 @@
+* @prem
+
+/README.md @prem
+/DEVELOPMENT.md @prem
+/CHANGELOG.md @prem
+/RELEASE.md @prem
+/CONTRIBUTING.md @prem
+/.github/ @prem
+/scripts/release/ @prem
+/packaging/ @prem

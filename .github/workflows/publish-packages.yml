@@ -1,0 +1,112 @@
+name: publish-packages
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: publish Homebrew and Scoop definitions
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_PUBLISH_TOKEN: ${{ secrets.PACKAGE_PUBLISH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate publish token
+        shell: bash
+        run: |
+          if [[ -z "${PACKAGE_PUBLISH_TOKEN:-}" ]]; then
+            echo "PACKAGE_PUBLISH_TOKEN is required to publish package definitions" >&2
+            exit 1
+          fi
+
+      - name: download release manifest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern release-manifest.json \
+            --dir "${RUNNER_TEMP}/release"
+
+      - name: render package definitions
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/rendered"
+          bash scripts/release/render_homebrew_formula.sh \
+            --manifest "${RUNNER_TEMP}/release/release-manifest.json" \
+            --output "${RUNNER_TEMP}/rendered/1up.rb"
+          bash scripts/release/render_scoop_manifest.sh \
+            --manifest "${RUNNER_TEMP}/release/release-manifest.json" \
+            --output "${RUNNER_TEMP}/rendered/1up.json"
+
+      - name: publish package definitions
+        id: publish
+        shell: bash
+        run: |
+          manifest_path="${RUNNER_TEMP}/release/release-manifest.json"
+          version=$(jq -r '.version' "$manifest_path")
+          homebrew_repo=$(jq -r '.channels.homebrew_tap' "$manifest_path")
+          scoop_repo=$(jq -r '.channels.scoop_bucket' "$manifest_path")
+
+          publish_repo() {
+            local repo="$1"
+            local relative_path="$2"
+            local source_path="$3"
+            local workdir="$4"
+            local branch_name
+
+            git clone "https://x-access-token:${PACKAGE_PUBLISH_TOKEN}@github.com/${repo}.git" "$workdir" >&2
+            git -C "$workdir" config user.name "github-actions[bot]"
+            git -C "$workdir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            mkdir -p "$(dirname "$workdir/$relative_path")"
+            cp "$source_path" "$workdir/$relative_path"
+
+            git -C "$workdir" add "$relative_path"
+
+            if git -C "$workdir" diff --cached --quiet; then
+              git -C "$workdir" rev-parse HEAD
+              return
+            fi
+
+            branch_name=$(git -C "$workdir" branch --show-current)
+            git -C "$workdir" commit -m "1up ${version}" >&2
+            git -C "$workdir" push origin "HEAD:${branch_name}" >&2
+            git -C "$workdir" rev-parse HEAD
+          }
+
+          homebrew_commit=$(publish_repo "$homebrew_repo" "Formula/1up.rb" "${RUNNER_TEMP}/rendered/1up.rb" "${RUNNER_TEMP}/homebrew-tap")
+          scoop_commit=$(publish_repo "$scoop_repo" "bucket/1up.json" "${RUNNER_TEMP}/rendered/1up.json" "${RUNNER_TEMP}/scoop-bucket")
+
+          {
+            echo "homebrew_commit=${homebrew_commit}"
+            echo "scoop_commit=${scoop_commit}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: write package publication record
+        shell: bash
+        run: |
+          bash scripts/release/write_package_publication_record.sh \
+            --manifest "${RUNNER_TEMP}/release/release-manifest.json" \
+            --homebrew-commit "${{ steps.publish.outputs.homebrew_commit }}" \
+            --scoop-commit "${{ steps.publish.outputs.scoop_commit }}" \
+            --output "${RUNNER_TEMP}/release/package-publication-record.json"
+
+      - name: upload package publication record to release
+        shell: bash
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${RUNNER_TEMP}/release/package-publication-record.json" \
+            --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-publication-record
+          path: ${{ runner.temp }}/release/package-publication-record.json
+          if-no-files-found: error
