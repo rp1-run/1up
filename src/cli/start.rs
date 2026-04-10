@@ -139,6 +139,17 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     registry.register(&project_id, &project_root, Some(indexing_config))?;
 
+    // Double-check: another `1up start` may have spawned a daemon while we were indexing.
+    if let Some(pid) = lifecycle::is_daemon_running()? {
+        lifecycle::send_sighup(pid)?;
+        let msg = format!(
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            stats.files_indexed, stats.segments_stored,
+        );
+        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+        return Ok(());
+    }
+
     let binary = lifecycle::current_binary_path()?;
     let pid = lifecycle::spawn_daemon(&binary)?;
 
