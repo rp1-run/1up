@@ -4,12 +4,26 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const TEST_RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn release_script(name: &str) -> PathBuf {
     repo_root().join("scripts").join("release").join(name)
+}
+
+fn test_release_tag() -> String {
+    format!("v{TEST_RELEASE_VERSION}")
+}
+
+fn next_patch_tag() -> String {
+    let mut parts = TEST_RELEASE_VERSION.split('.');
+    let major = parts.next().unwrap();
+    let minor = parts.next().unwrap();
+    let patch = parts.next().unwrap().parse::<u64>().unwrap() + 1;
+    format!("v{major}.{minor}.{patch}")
 }
 
 fn copy_surface(root: &Path, relative_path: &str) {
@@ -313,12 +327,13 @@ const HOST_RELEASE_TARGET: &str = "x86_64-pc-windows-msvc";
 #[test]
 fn release_metadata_validation_passes_for_matching_tag_and_changelog() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let release_tag = test_release_tag();
 
     let output = run_release_script(
         fixture_root.path(),
         "validate_release_metadata.sh",
-        &["v0.1.0"],
+        &[&release_tag],
     );
     assert!(
         output.status.success(),
@@ -330,12 +345,13 @@ fn release_metadata_validation_passes_for_matching_tag_and_changelog() {
 #[test]
 fn release_metadata_validation_rejects_mismatched_tag_and_version() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let mismatched_tag = next_patch_tag();
 
     let output = run_release_script(
         fixture_root.path(),
         "validate_release_metadata.sh",
-        &["v0.1.1"],
+        &[&mismatched_tag],
     );
     assert!(
         !output.status.success(),
@@ -348,18 +364,22 @@ fn release_metadata_validation_rejects_mismatched_tag_and_version() {
 #[test]
 fn release_manifest_generation_includes_platform_mapping_and_checksums() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
+    let release_tag = test_release_tag();
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["version"], "0.1.0");
-    assert_eq!(manifest["git_tag"], "v0.1.0");
+    assert_eq!(manifest["version"], TEST_RELEASE_VERSION);
+    assert_eq!(manifest["git_tag"], release_tag);
     assert_eq!(manifest["commit_sha"], "abc123def456");
     assert_eq!(manifest["license"], "Apache-2.0");
     assert_eq!(manifest["binary_name"], "1up");
     assert_eq!(manifest["checksums_file"], "SHA256SUMS");
-    assert_eq!(manifest["notes_source"], "CHANGELOG.md#[0.1.0]");
+    assert_eq!(
+        manifest["notes_source"],
+        format!("CHANGELOG.md#[{TEST_RELEASE_VERSION}]")
+    );
     assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 5);
     assert_eq!(manifest["artifacts"][0]["target"], "aarch64-apple-darwin");
     assert_eq!(manifest["artifacts"][0]["arch"], "arm64");
@@ -376,7 +396,7 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
     assert_eq!(manifest["channels"]["scoop_bucket"], "rp1-run/scoop-bucket");
     assert_eq!(
         manifest["channels"]["github_release"],
-        "https://github.com/rp1-run/1up/releases/tag/v0.1.0"
+        format!("https://github.com/rp1-run/1up/releases/tag/{release_tag}")
     );
     assert!(manifest["artifacts"]
         .as_array()
@@ -392,7 +412,7 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
     );
     assert_eq!(
         manifest["notes_url"],
-        "https://github.com/rp1-run/1up/releases/tag/v0.1.0"
+        format!("https://github.com/rp1-run/1up/releases/tag/{release_tag}")
     );
     assert_eq!(manifest["yanked"], false);
     assert!(manifest["minimum_safe_version"].is_null());
@@ -403,25 +423,28 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .iter()
         .all(|artifact| {
             let url = artifact["url"].as_str().unwrap();
-            url.starts_with("https://github.com/rp1-run/1up/releases/download/v0.1.0/")
-                && url.ends_with(artifact["archive"].as_str().unwrap())
+            url.starts_with(&format!(
+                "https://github.com/rp1-run/1up/releases/download/{release_tag}/"
+            )) && url.ends_with(artifact["archive"].as_str().unwrap())
         }));
 }
 
 #[test]
 fn release_manifest_deserializes_as_update_manifest() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
 
     let raw = fs::read(dist_dir.join("release-manifest.json")).unwrap();
     let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
         .expect("release manifest should deserialize as UpdateManifest");
 
-    assert_eq!(manifest.version, "0.1.0");
-    assert_eq!(manifest.git_tag, "v0.1.0");
+    assert_eq!(manifest.version, TEST_RELEASE_VERSION);
+    assert_eq!(manifest.git_tag, test_release_tag());
     assert!(!manifest.published_at.is_empty());
-    assert!(manifest.notes_url.contains("/releases/tag/v0.1.0"));
+    assert!(manifest
+        .notes_url
+        .contains(&format!("/releases/tag/{}", test_release_tag())));
     assert_eq!(manifest.artifacts.len(), 5);
     assert!(!manifest.yanked);
     assert!(manifest.minimum_safe_version.is_none());
@@ -441,8 +464,8 @@ fn release_manifest_deserializes_as_update_manifest() {
 #[test]
 fn homebrew_formula_rendering_uses_release_manifest_urls_and_checksums() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let output_path = dist_dir.join("1up.rb");
 
     let output = run_release_script(
@@ -493,8 +516,8 @@ fn homebrew_formula_rendering_uses_release_manifest_urls_and_checksums() {
 #[test]
 fn scoop_manifest_rendering_uses_release_manifest_windows_asset() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let output_path = dist_dir.join("1up.json");
 
     let output = run_release_script(
@@ -537,7 +560,7 @@ fn scoop_manifest_rendering_uses_release_manifest_windows_asset() {
     assert_eq!(scoop_manifest["hash"], windows_artifact["sha256"]);
     assert_eq!(
         scoop_manifest["extract_dir"],
-        "1up-v0.1.0-x86_64-pc-windows-msvc"
+        format!("1up-v{TEST_RELEASE_VERSION}-x86_64-pc-windows-msvc")
     );
     assert_eq!(scoop_manifest["bin"], "1up.exe");
 }
@@ -545,8 +568,8 @@ fn scoop_manifest_rendering_uses_release_manifest_windows_asset() {
 #[test]
 fn package_publication_record_captures_repo_commit_refs() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let output_path = dist_dir.join("package-publication-record.json");
 
     let output = run_release_script(
@@ -571,8 +594,8 @@ fn package_publication_record_captures_repo_commit_refs() {
 
     let record: serde_json::Value =
         serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
-    assert_eq!(record["version"], "0.1.0");
-    assert_eq!(record["git_tag"], "v0.1.0");
+    assert_eq!(record["version"], TEST_RELEASE_VERSION);
+    assert_eq!(record["git_tag"], test_release_tag());
     assert_eq!(
         record["packages"]["homebrew"]["repo"],
         "rp1-run/homebrew-tap"
@@ -595,8 +618,8 @@ fn package_publication_record_captures_repo_commit_refs() {
 #[test]
 fn archive_verification_confirms_expected_release_contents() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let output_path = dist_dir.join("archive-verification.json");
 
     let output = run_release_script(
@@ -627,7 +650,10 @@ fn archive_verification_confirms_expected_release_contents() {
     assert_eq!(verification["archives"][0]["target"], HOST_RELEASE_TARGET);
     assert_eq!(
         verification["archives"][0]["verified_contents"]["license"],
-        format!("1up-v0.1.0-{}/LICENSE", HOST_RELEASE_TARGET)
+        format!(
+            "1up-v{TEST_RELEASE_VERSION}-{}/LICENSE",
+            HOST_RELEASE_TARGET
+        )
     );
     assert_eq!(
         verification["archives"][0]["smoke_test"]["status"],
@@ -640,14 +666,14 @@ fn archive_verification_confirms_expected_release_contents() {
     assert!(verification["archives"][0]["smoke_test"]["output"]
         .as_str()
         .unwrap()
-        .contains("0.1.0"));
+        .contains(TEST_RELEASE_VERSION));
 }
 
 #[test]
 fn release_evidence_supports_explicit_skipped_eval_reason() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let merge_gate_path = dist_dir.join("merge-gate.json");
     let security_check_path = dist_dir.join("security-check.json");
     let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
@@ -741,8 +767,8 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
 
     let evidence: serde_json::Value =
         serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
-    assert_eq!(evidence["version"], "0.1.0");
-    assert_eq!(evidence["git_tag"], "v0.1.0");
+    assert_eq!(evidence["version"], TEST_RELEASE_VERSION);
+    assert_eq!(evidence["git_tag"], test_release_tag());
     assert_eq!(evidence["merge_gate"]["workflow"], "ci");
     assert_eq!(
         evidence["security_check"]["artifact"],
@@ -766,8 +792,8 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
 #[test]
 fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let merge_gate_path = dist_dir.join("merge-gate.json");
     let security_check_path = dist_dir.join("security-check.json");
     let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
@@ -857,8 +883,8 @@ fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
 #[test]
 fn release_evidence_rejects_archive_verification_without_smoke_results() {
     let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), "0.1.0");
-    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), "0.1.0");
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
     let merge_gate_path = dist_dir.join("merge-gate.json");
     let security_check_path = dist_dir.join("security-check.json");
     let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
@@ -907,7 +933,7 @@ fn release_evidence_rejects_archive_verification_without_smoke_results() {
             "archives": [{
                 "target": HOST_RELEASE_TARGET,
                 "archive": format!(
-                    "1up-v0.1.0-{HOST_RELEASE_TARGET}.{}",
+                    "1up-v{TEST_RELEASE_VERSION}-{HOST_RELEASE_TARGET}.{}",
                     if HOST_RELEASE_TARGET.contains("windows") { "zip" } else { "tar.gz" }
                 ),
                 "sha256": "abc123"
