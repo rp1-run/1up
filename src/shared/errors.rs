@@ -190,8 +190,11 @@ pub enum FenceError {
 
 #[derive(Error, Debug)]
 pub enum UpdateError {
-    #[error("update check failed: {0}")]
-    FetchFailed(String),
+    #[error("updates are disabled for this build")]
+    Disabled,
+
+    #[error("update check failed: {detail}")]
+    FetchFailed { detail: String, permanent: bool },
 
     #[error("manifest parse failed: {0}")]
     ParseFailed(String),
@@ -212,6 +215,20 @@ pub enum UpdateError {
 
     #[error("checksum verification failed")]
     ChecksumMismatch,
+}
+
+impl UpdateError {
+    pub fn should_invalidate_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled
+                | Self::ParseFailed(_)
+                | Self::FetchFailed {
+                    permanent: true,
+                    ..
+                }
+        )
+    }
 }
 
 #[allow(dead_code)]

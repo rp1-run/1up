@@ -10,12 +10,12 @@ use crate::shared::config;
 use crate::shared::constants::{
     SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS,
     UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
-    UPDATE_MANIFEST_URL, XDG_STATE_DIR_MODE,
+    UPDATE_MANIFEST_URL_ENV_VAR, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
 use crate::shared::reminder::VERSION;
 
-/// Machine-readable update manifest published at a stable URL.
+/// Machine-readable update manifest fetched from the configured update URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateManifest {
     pub version: String,
@@ -202,28 +202,66 @@ pub fn upgrade_instruction_for_channel(channel: InstallChannel) -> String {
     }
 }
 
+/// Returns the configured update manifest URL, if update support is enabled.
+///
+/// Release builds bake the manifest URL in at compile time. A runtime env var
+/// of the same name can override that value for testing or operator-driven
+/// canaries; an empty runtime value disables updates for the current process.
+pub fn configured_update_manifest_url() -> Option<String> {
+    if let Some(value) = std::env::var_os(UPDATE_MANIFEST_URL_ENV_VAR) {
+        let trimmed = value.to_string_lossy().trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(trimmed);
+    }
+
+    option_env!("ONEUP_UPDATE_MANIFEST_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Returns true when this binary has a configured update manifest endpoint.
+pub fn updates_enabled() -> bool {
+    configured_update_manifest_url().is_some()
+}
+
+fn update_http_failure_is_permanent(status: reqwest::StatusCode) -> bool {
+    status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Fetches the remote update manifest over HTTPS with bounded timeouts.
 pub async fn fetch_update_manifest(
     client: &reqwest::Client,
 ) -> Result<UpdateManifest, UpdateError> {
+    let manifest_url = configured_update_manifest_url().ok_or(UpdateError::Disabled)?;
     let response = client
-        .get(UPDATE_MANIFEST_URL)
+        .get(&manifest_url)
         .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
         .send()
         .await
-        .map_err(|e| UpdateError::FetchFailed(format!("manifest fetch: {e}")))?;
+        .map_err(|e| UpdateError::FetchFailed {
+            detail: format!("manifest fetch: {e}"),
+            permanent: false,
+        })?;
 
     if !response.status().is_success() {
-        return Err(UpdateError::FetchFailed(format!(
-            "manifest fetch: HTTP {}",
-            response.status()
-        )));
+        return Err(UpdateError::FetchFailed {
+            detail: format!("manifest fetch: HTTP {}", response.status()),
+            permanent: update_http_failure_is_permanent(response.status()),
+        });
     }
 
     let body = response
         .text()
         .await
-        .map_err(|e| UpdateError::FetchFailed(format!("manifest read: {e}")))?;
+        .map_err(|e| UpdateError::FetchFailed {
+            detail: format!("manifest read: {e}"),
+            permanent: false,
+        })?;
 
     serde_json::from_str(&body)
         .map_err(|e| UpdateError::ParseFailed(format!("manifest parse: {e}")))
@@ -235,7 +273,10 @@ pub fn build_update_check_client() -> Result<reqwest::Client, UpdateError> {
         .connect_timeout(Duration::from_secs(UPDATE_CHECK_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
         .build()
-        .map_err(|e| UpdateError::FetchFailed(format!("http client: {e}")))
+        .map_err(|e| UpdateError::FetchFailed {
+            detail: format!("http client: {e}"),
+            permanent: false,
+        })
 }
 
 /// Reads and parses the local update-check cache file.
@@ -271,6 +312,24 @@ fn write_update_cache_inner(cache: &UpdateCheckCache) -> Result<(), Box<dyn std:
         XDG_STATE_DIR_MODE,
         SECURE_STATE_FILE_MODE,
     )?;
+    Ok(())
+}
+
+/// Removes the cached update-check result, if present.
+pub fn clear_update_cache() {
+    let result = clear_update_cache_inner();
+    if let Err(e) = result {
+        debug!("update cache clear failed: {e}");
+    }
+}
+
+fn clear_update_cache_inner() -> Result<(), Box<dyn std::error::Error>> {
+    let path = config::update_check_cache_path()?;
+    let data_dir = config::data_dir()?;
+    if !data_dir.exists() {
+        return Ok(());
+    }
+    let _ = crate::shared::fs::remove_regular_file(&path, &data_dir)?;
     Ok(())
 }
 
@@ -311,6 +370,11 @@ pub fn build_cache_from_manifest(manifest: &UpdateManifest) -> UpdateCheckCache 
 /// This preserves the non-fatal failure policy: a failed fetch never
 /// overwrites or corrupts a valid cache entry (AC-01d).
 pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
+    if !updates_enabled() {
+        clear_update_cache();
+        return None;
+    }
+
     let existing = read_update_cache();
 
     if let Some(ref cache) = existing {
@@ -335,11 +399,14 @@ pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
         }
         Err(e) => {
             debug!("update manifest fetch failed: {e}");
+            if e.should_invalidate_cache() {
+                clear_update_cache();
+                return None;
+            }
             existing
         }
     }
 }
-
 
 /// Reads the update cache and formats a passive notification string, if an
 /// update is available.
@@ -353,6 +420,10 @@ pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
 /// - `Yanked`: urgent warning with operator message
 /// - `BelowMinimumSafe`: urgent warning with minimum safe version
 pub fn format_update_notification() -> Option<String> {
+    if !updates_enabled() {
+        return None;
+    }
+
     let cache = read_update_cache()?;
     let status = build_update_status(&cache);
 
@@ -643,9 +714,7 @@ pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, 
     let current_exe = std::env::current_exe()
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("resolve current binary: {e}")))?;
 
-    let staging_parent = current_exe
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
+    let staging_parent = current_exe.parent().unwrap_or(std::path::Path::new("."));
     let staging_dir = tempfile::tempdir_in(staging_parent)
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("create staging dir: {e}")))?;
 
@@ -669,6 +738,32 @@ pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, 
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static UPDATE_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnvGuard {
+        key: &'static str,
+        saved: Option<OsString>,
+    }
+
+    impl ScopedEnvGuard {
+        fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+            let saved = std::env::var_os(key);
+            std::env::set_var(key, value.into());
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for ScopedEnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn make_cache(
         current: &str,
@@ -986,6 +1081,46 @@ mod tests {
     }
 
     #[test]
+    fn configured_update_manifest_url_uses_runtime_override() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ScopedEnvGuard::set(
+            UPDATE_MANIFEST_URL_ENV_VAR,
+            "https://example.com/update-manifest.json",
+        );
+
+        assert_eq!(
+            configured_update_manifest_url().as_deref(),
+            Some("https://example.com/update-manifest.json")
+        );
+        assert!(updates_enabled());
+    }
+
+    #[test]
+    fn configured_update_manifest_url_allows_runtime_disable_override() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
+
+        assert_eq!(configured_update_manifest_url(), None);
+        assert!(!updates_enabled());
+    }
+
+    #[test]
+    fn update_errors_invalidate_cache_only_for_permanent_failures() {
+        assert!(UpdateError::Disabled.should_invalidate_cache());
+        assert!(UpdateError::ParseFailed("invalid json".to_string()).should_invalidate_cache());
+        assert!(UpdateError::FetchFailed {
+            detail: "manifest fetch: HTTP 404 Not Found".to_string(),
+            permanent: true,
+        }
+        .should_invalidate_cache());
+        assert!(!UpdateError::FetchFailed {
+            detail: "manifest fetch: timeout".to_string(),
+            permanent: false,
+        }
+        .should_invalidate_cache());
+    }
+
+    #[test]
     fn read_update_cache_returns_none_for_missing_file() {
         let cache = read_update_cache();
         // The file may or may not exist depending on test environment;
@@ -1135,6 +1270,22 @@ mod tests {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
+    }
+
+    #[test]
+    fn refresh_cache_if_stale_clears_cache_when_updates_disabled() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _manifest_guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let _xdg_guard =
+            ScopedEnvGuard::set("XDG_DATA_HOME", tmp_root.join("xdg-data").into_os_string());
+
+        write_update_cache(&make_cache(VERSION, "99.0.0", false, None, None));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(refresh_cache_if_stale()).is_none());
+        assert!(read_update_cache().is_none());
     }
 
     #[test]
@@ -1400,5 +1551,20 @@ mod tests {
 
         cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Manual);
         assert_eq!(cache.upgrade_instruction, "1up update");
+    }
+
+    #[test]
+    fn format_update_notification_returns_none_when_updates_disabled() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _manifest_guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let _xdg_guard =
+            ScopedEnvGuard::set("XDG_DATA_HOME", tmp_root.join("xdg-data").into_os_string());
+
+        write_update_cache(&make_cache(VERSION, "99.0.0", false, None, None));
+
+        assert_eq!(format_update_notification(), None);
+        assert!(read_update_cache().is_some());
     }
 }

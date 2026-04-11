@@ -4,12 +4,14 @@ use clap::Args;
 
 use crate::cli::output::{formatter_for, UpdateResult, UpdateStatusInfo};
 use crate::daemon::lifecycle;
+use crate::shared::constants::UPDATE_DISABLED_MESSAGE;
 use crate::shared::reminder::VERSION;
 use crate::shared::types::OutputFormat;
 use crate::shared::update::{
-    build_cache_from_manifest, build_update_check_client, build_update_status,
+    build_cache_from_manifest, build_update_check_client, build_update_status, clear_update_cache,
     detect_install_channel, fetch_update_manifest, read_update_cache, refresh_cache_if_stale,
-    self_update, write_update_cache, InstallChannel, UpdateCheckCache, UpdateStatus,
+    self_update, updates_enabled, write_update_cache, InstallChannel, UpdateCheckCache,
+    UpdateStatus,
 };
 
 #[derive(Args)]
@@ -37,12 +39,14 @@ pub async fn exec(args: UpdateArgs, format: OutputFormat) -> anyhow::Result<()> 
 
 /// `1up update --check`: force a fresh manifest fetch, update cache, display result.
 async fn exec_check(format: OutputFormat) -> anyhow::Result<()> {
+    ensure_updates_enabled()?;
+
     let client = build_update_check_client()
         .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
 
     let manifest = fetch_update_manifest(&client)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(map_update_error)?;
 
     let cache = build_cache_from_manifest(&manifest);
     write_update_cache(&cache);
@@ -56,6 +60,18 @@ async fn exec_check(format: OutputFormat) -> anyhow::Result<()> {
 
 /// `1up update --status`: display cached update information.
 async fn exec_status(format: OutputFormat) -> anyhow::Result<()> {
+    if !updates_enabled() {
+        clear_update_cache();
+        let fmt = formatter_for(format);
+        println!(
+            "{}",
+            fmt.format_update_status(&build_uncached_status_info(Some(
+                UPDATE_DISABLED_MESSAGE.to_string(),
+            )))
+        );
+        return Ok(());
+    }
+
     let cache = read_update_cache();
     let info = match cache {
         Some(ref c) => {
@@ -66,21 +82,7 @@ async fn exec_status(format: OutputFormat) -> anyhow::Result<()> {
                 .max(0);
             build_status_info_from_cache(c, &status, Some(cache_age_secs))
         }
-        None => UpdateStatusInfo {
-            current_version: VERSION.to_string(),
-            cached: false,
-            latest_version: None,
-            update_available: false,
-            status: UpdateStatus::UpToDate,
-            install_channel: None,
-            checked_at: None,
-            cache_age_secs: None,
-            yanked: false,
-            minimum_safe_version: None,
-            message: None,
-            notes_url: None,
-            upgrade_instruction: None,
-        },
+        None => build_uncached_status_info(None),
     };
     let fmt = formatter_for(format);
     println!("{}", fmt.format_update_status(&info));
@@ -89,6 +91,8 @@ async fn exec_status(format: OutputFormat) -> anyhow::Result<()> {
 
 /// `1up update` (no flags): refresh if stale, then apply update or print channel instruction.
 async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
+    ensure_updates_enabled()?;
+
     let cache = refresh_cache_if_stale().await;
 
     let cache = match cache {
@@ -141,7 +145,7 @@ async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
     let manifest = fetch_update_manifest(&client)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(map_update_error)?;
 
     let self_update_result = self_update(&manifest)
         .await
@@ -215,5 +219,41 @@ fn build_status_info_from_cache(
         message: cache.message.clone(),
         notes_url: cache.notes_url.clone(),
         upgrade_instruction: Some(cache.upgrade_instruction.clone()),
+        status_message: None,
     }
+}
+
+fn build_uncached_status_info(status_message: Option<String>) -> UpdateStatusInfo {
+    UpdateStatusInfo {
+        current_version: VERSION.to_string(),
+        cached: false,
+        latest_version: None,
+        update_available: false,
+        status: UpdateStatus::UpToDate,
+        install_channel: None,
+        checked_at: None,
+        cache_age_secs: None,
+        yanked: false,
+        minimum_safe_version: None,
+        message: None,
+        notes_url: None,
+        upgrade_instruction: None,
+        status_message,
+    }
+}
+
+fn ensure_updates_enabled() -> anyhow::Result<()> {
+    if updates_enabled() {
+        return Ok(());
+    }
+
+    clear_update_cache();
+    bail!(UPDATE_DISABLED_MESSAGE);
+}
+
+fn map_update_error(error: crate::shared::errors::UpdateError) -> anyhow::Error {
+    if error.should_invalidate_cache() {
+        clear_update_cache();
+    }
+    anyhow::anyhow!("{error}")
 }

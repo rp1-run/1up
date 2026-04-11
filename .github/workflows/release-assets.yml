@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/update-manifest.json
+
 jobs:
   validate:
     name: validate release metadata
@@ -57,6 +60,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: build release binary
+        env:
+          ONEUP_UPDATE_MANIFEST_URL: ${{ env.UPDATE_MANIFEST_URL }}
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" --bin 1up
 

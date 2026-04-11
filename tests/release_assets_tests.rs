@@ -1057,10 +1057,25 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
 
+    assert!(workflow.contains("UPDATE_MANIFEST_URL"));
+    assert!(workflow.contains("ONEUP_UPDATE_MANIFEST_URL"));
     assert!(workflow.contains("stage Windows ONNX Runtime DLL"));
     assert!(workflow.contains("onnxruntime.dll"));
     assert!(workflow.contains("Get-FileHash"));
     assert!(workflow.contains("x86_64-pc-windows-msvc.tar.lzma2"));
+}
+
+#[test]
+fn publish_packages_workflow_verifies_stable_update_manifest() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
+
+    assert!(workflow.contains("verify stable update manifest"));
+    assert!(workflow.contains("wait for stable update manifest"));
+    assert!(workflow.contains("curl --fail --silent --show-error --location"));
+    assert!(workflow.contains("jq -S"));
+    assert!(workflow.contains("diff -u"));
+    assert!(workflow.contains("UPDATE_MANIFEST_URL"));
 }
 
 #[cfg(unix)]

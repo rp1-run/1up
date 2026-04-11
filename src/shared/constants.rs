@@ -145,12 +145,18 @@ pub const HF_BASE_URL: &str = "https://huggingface.co";
 /// Target files for 1up fence installation.
 pub const FENCE_TARGET_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
-/// Stable URL for the machine-readable update manifest.
-pub const UPDATE_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json";
+/// Build/runtime env var that enables the update manifest endpoint.
+///
+/// Release builds set this at compile time. A runtime value overrides the
+/// baked value; an empty runtime value disables updates for the current
+/// process.
+pub const UPDATE_MANIFEST_URL_ENV_VAR: &str = "ONEUP_UPDATE_MANIFEST_URL";
 
 /// Filename for the local update-check cache.
 pub const UPDATE_CHECK_CACHE_FILENAME: &str = "update-check.json";
+
+/// User-facing message shown when the binary was built without update support.
+pub const UPDATE_DISABLED_MESSAGE: &str = "Updates are disabled for this build.";
 
 /// Time-to-live for the update-check cache in seconds (24 hours).
 pub const UPDATE_CHECK_TTL_SECS: u64 = 86_400;

@@ -207,6 +207,32 @@ fn status_reports_uninitialized_project_and_missing_index() {
 }
 
 #[test]
+fn update_status_reports_disabled_when_manifest_is_unconfigured() {
+    let output = cmd()
+        .env("ONEUP_UPDATE_MANIFEST_URL", "")
+        .args(["--format", "human", "update", "--status"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Updates are disabled for this build."));
+}
+
+#[test]
+fn update_check_fails_when_manifest_is_unconfigured() {
+    cmd()
+        .env("ONEUP_UPDATE_MANIFEST_URL", "")
+        .args(["update", "--check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Updates are disabled for this build.",
+        ));
+}
+
+#[test]
 fn invalid_format_flag_rejected() {
     cmd()
         .args(["--format", "xml", "search", "test"])

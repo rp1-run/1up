@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/update-manifest.json
+
 jobs:
   publish:
     name: publish Homebrew and Scoop definitions
@@ -158,3 +161,49 @@ jobs:
           version=$(jq -r '.version' update-manifest.json)
           git commit -m "chore: publish update manifest for v${version}"
           git push origin main
+
+  verify-update-manifest:
+    name: verify stable update manifest
+    runs-on: ubuntu-24.04
+    needs: publish-update-manifest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: download release manifest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern release-manifest.json \
+            --dir "${RUNNER_TEMP}/release"
+
+      - name: wait for stable update manifest
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --location "${UPDATE_MANIFEST_URL}" \
+              --output "${RUNNER_TEMP}/update-manifest.json"; then
+              break
+            fi
+            rm -f "${RUNNER_TEMP}/update-manifest.json"
+            echo "waiting for ${UPDATE_MANIFEST_URL} (attempt ${attempt}/30)" >&2
+            sleep 10
+          done
+          test -f "${RUNNER_TEMP}/update-manifest.json"
+
+      - name: verify stable update manifest matches release
+        shell: bash
+        run: |
+          jq -S '{
+            version,
+            git_tag,
+            published_at,
+            notes_url,
+            artifacts: [.artifacts[] | {target, archive, sha256, url}],
+            channels,
+            yanked,
+            minimum_safe_version,
+            message
+          }' "${RUNNER_TEMP}/release/release-manifest.json" > "${RUNNER_TEMP}/expected-update-manifest.json"
+          jq -S . "${RUNNER_TEMP}/update-manifest.json" > "${RUNNER_TEMP}/actual-update-manifest.json"
+          diff -u "${RUNNER_TEMP}/expected-update-manifest.json" "${RUNNER_TEMP}/actual-update-manifest.json"

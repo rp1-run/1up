@@ -71,6 +71,8 @@ pub struct UpdateStatusInfo {
     pub notes_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade_instruction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
 }
 
 /// Outcome of running `1up update` (no flags).
@@ -165,10 +167,13 @@ impl Formatter for JsonFormatter {
 
     fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
         if !info.cached {
+            let message = info.status_message.as_deref().unwrap_or(
+                "No cached update information. Run `1up update --check` to check for updates.",
+            );
             return to_json(&serde_json::json!({
                 "current_version": info.current_version,
                 "cached": false,
-                "message": "No cached update information. Run `1up update --check` to check for updates.",
+                "message": message,
             }));
         }
         let mut obj = serde_json::json!({
@@ -470,9 +475,13 @@ impl Formatter for HumanFormatter {
 
     fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
         if !info.cached {
+            let message = info.status_message.as_deref().unwrap_or(
+                "No cached update information.\nRun `1up update --check` to check for updates.",
+            );
             return format!(
-                "Current version: {}\nNo cached update information.\nRun `1up update --check` to check for updates.\n",
-                info.current_version.bold()
+                "Current version: {}\n{}\n",
+                info.current_version.bold(),
+                message
             );
         }
         let mut out = String::new();
@@ -814,7 +823,12 @@ impl Formatter for PlainFormatter {
 
     fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
         if !info.cached {
-            return format!("current:{}\tcached:false\n", info.current_version);
+            let mut out = format!("current:{}\tcached:false", info.current_version);
+            if let Some(message) = info.status_message.as_deref() {
+                out.push_str(&format!("\tmessage:{message}"));
+            }
+            out.push('\n');
+            return out;
         }
         let status_label = render_update_status_label(&info.status);
         let mut out = format!(
@@ -1201,6 +1215,7 @@ mod tests {
             message: None,
             notes_url: Some("https://github.com/rp1-run/1up/releases/v0.2.0".to_string()),
             upgrade_instruction: Some("1up update".to_string()),
+            status_message: None,
         }
     }
 
@@ -1239,12 +1254,38 @@ mod tests {
             message: None,
             notes_url: None,
             upgrade_instruction: None,
+            status_message: None,
         };
         let rendered = formatter.format_update_status(&info);
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["cached"], false);
         assert_eq!(value["current_version"], "0.1.0");
+    }
+
+    #[test]
+    fn human_update_status_without_cache_uses_custom_status_message() {
+        let formatter = HumanFormatter;
+        let info = UpdateStatusInfo {
+            current_version: "0.1.0".to_string(),
+            cached: false,
+            latest_version: None,
+            update_available: false,
+            status: UpdateStatus::UpToDate,
+            install_channel: None,
+            checked_at: None,
+            cache_age_secs: None,
+            yanked: false,
+            minimum_safe_version: None,
+            message: None,
+            notes_url: None,
+            upgrade_instruction: None,
+            status_message: Some("Updates are disabled for this build.".to_string()),
+        };
+        let rendered = formatter.format_update_status(&info);
+
+        assert!(rendered.contains("Updates are disabled for this build."));
+        assert!(!rendered.contains("Run `1up update --check`"));
     }
 
     #[test]
