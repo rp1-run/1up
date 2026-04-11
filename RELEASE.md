@@ -75,7 +75,7 @@ Release-time evidence is heavier and should be reviewed before publishing a publ
 
 - Version in `Cargo.toml` matches the release tag
 - `CHANGELOG.md` contains the released notes
-- Archives are present for macOS arm64, macOS amd64, Linux arm64, Linux amd64, and Windows amd64
+- Archives are present for macOS arm64, Linux arm64, Linux amd64, and Windows amd64
 - `SHA256SUMS` and release metadata are attached to the draft release
 - Security, eval, and benchmark evidence are retained or explicitly marked as skipped with a reason
 - Homebrew and Scoop point at the published immutable assets

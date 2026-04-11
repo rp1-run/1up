@@ -101,7 +101,6 @@ fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
 
     let artifacts = [
         ("aarch64-apple-darwin", "macos", "arm64", "tar.gz", "Download the macOS arm64 archive from GitHub Releases and unpack with tar -xzf."),
-        ("x86_64-apple-darwin", "macos", "amd64", "tar.gz", "Download the macOS amd64 archive from GitHub Releases and unpack with tar -xzf."),
         ("aarch64-unknown-linux-gnu", "linux", "arm64", "tar.gz", "Download the Linux arm64 archive from GitHub Releases and unpack with tar -xzf."),
         ("x86_64-unknown-linux-gnu", "linux", "amd64", "tar.gz", "Download the Linux amd64 archive from GitHub Releases and unpack with tar -xzf."),
         ("x86_64-pc-windows-msvc", "windows", "amd64", "zip", "Download the Windows amd64 archive from GitHub Releases and unpack with Expand-Archive."),
@@ -264,7 +263,6 @@ fn write_verifiable_release_artifacts(root: &Path, version: &str) -> PathBuf {
 
     for (target, binary_name) in [
         ("aarch64-apple-darwin", "1up"),
-        ("x86_64-apple-darwin", "1up"),
         ("aarch64-unknown-linux-gnu", "1up"),
         ("x86_64-unknown-linux-gnu", "1up"),
         ("x86_64-pc-windows-msvc", "1up.exe"),
@@ -313,20 +311,20 @@ fn write_verifiable_release_artifacts(root: &Path, version: &str) -> PathBuf {
     dist_dir
 }
 
-#[cfg(target_os = "macos")]
-#[cfg(target_arch = "aarch64")]
-const HOST_RELEASE_TARGET: &str = "aarch64-apple-darwin";
-#[cfg(target_os = "macos")]
-#[cfg(target_arch = "x86_64")]
-const HOST_RELEASE_TARGET: &str = "x86_64-apple-darwin";
-#[cfg(target_os = "linux")]
-#[cfg(target_arch = "aarch64")]
-const HOST_RELEASE_TARGET: &str = "aarch64-unknown-linux-gnu";
-#[cfg(target_os = "linux")]
-#[cfg(target_arch = "x86_64")]
-const HOST_RELEASE_TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const HOST_RELEASE_TARGET: Option<&str> = Some("aarch64-apple-darwin");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const HOST_RELEASE_TARGET: Option<&str> = None;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HOST_RELEASE_TARGET: Option<&str> = Some("aarch64-unknown-linux-gnu");
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HOST_RELEASE_TARGET: Option<&str> = Some("x86_64-unknown-linux-gnu");
 #[cfg(target_os = "windows")]
-const HOST_RELEASE_TARGET: &str = "x86_64-pc-windows-msvc";
+const HOST_RELEASE_TARGET: Option<&str> = Some("x86_64-pc-windows-msvc");
+
+fn supported_host_release_target() -> Option<&'static str> {
+    HOST_RELEASE_TARGET
+}
 
 #[test]
 fn release_metadata_validation_passes_for_matching_tag_and_changelog() {
@@ -437,7 +435,7 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         manifest["notes_source"],
         format!("CHANGELOG.md#[{TEST_RELEASE_VERSION}]")
     );
-    assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 5);
+    assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 4);
     assert_eq!(manifest["artifacts"][0]["target"], "aarch64-apple-darwin");
     assert_eq!(manifest["artifacts"][0]["arch"], "arm64");
     assert!(manifest["artifacts"]
@@ -502,7 +500,7 @@ fn release_manifest_deserializes_as_update_manifest() {
     assert!(manifest
         .notes_url
         .contains(&format!("/releases/tag/{}", test_release_tag())));
-    assert_eq!(manifest.artifacts.len(), 5);
+    assert_eq!(manifest.artifacts.len(), 4);
     assert!(!manifest.yanked);
     assert!(manifest.minimum_safe_version.is_none());
     assert!(manifest.message.is_none());
@@ -548,7 +546,6 @@ fn homebrew_formula_rendering_uses_release_manifest_urls_and_checksums() {
 
     for target in [
         "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ] {
@@ -674,6 +671,9 @@ fn package_publication_record_captures_repo_commit_refs() {
 
 #[test]
 fn archive_verification_confirms_expected_release_contents() {
+    let Some(host_release_target) = supported_host_release_target() else {
+        return;
+    };
     let fixture_root = build_release_fixture();
     write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
     let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
@@ -690,7 +690,7 @@ fn archive_verification_confirms_expected_release_contents() {
             "--checksums",
             dist_dir.join("SHA256SUMS").to_str().unwrap(),
             "--target",
-            HOST_RELEASE_TARGET,
+            host_release_target,
             "--output",
             output_path.to_str().unwrap(),
         ],
@@ -704,13 +704,10 @@ fn archive_verification_confirms_expected_release_contents() {
     let verification: serde_json::Value =
         serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
     assert_eq!(verification["archive_count"], 1);
-    assert_eq!(verification["archives"][0]["target"], HOST_RELEASE_TARGET);
+    assert_eq!(verification["archives"][0]["target"], host_release_target);
     assert_eq!(
         verification["archives"][0]["verified_contents"]["license"],
-        format!(
-            "1up-v{TEST_RELEASE_VERSION}-{}/LICENSE",
-            HOST_RELEASE_TARGET
-        )
+        format!("1up-v{TEST_RELEASE_VERSION}-{host_release_target}/LICENSE")
     );
     assert_eq!(
         verification["archives"][0]["smoke_test"]["status"],
@@ -728,6 +725,9 @@ fn archive_verification_confirms_expected_release_contents() {
 
 #[test]
 fn release_evidence_supports_explicit_skipped_eval_reason() {
+    let Some(host_release_target) = supported_host_release_target() else {
+        return;
+    };
     let fixture_root = build_release_fixture();
     write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
     let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
@@ -785,7 +785,7 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
             "--checksums",
             dist_dir.join("SHA256SUMS").to_str().unwrap(),
             "--target",
-            HOST_RELEASE_TARGET,
+            host_release_target,
             "--output",
             archive_verification_path.to_str().unwrap(),
         ],
@@ -848,6 +848,9 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
 
 #[test]
 fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
+    let Some(host_release_target) = supported_host_release_target() else {
+        return;
+    };
     let fixture_root = build_release_fixture();
     write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
     let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
@@ -899,7 +902,7 @@ fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
             "--checksums",
             dist_dir.join("SHA256SUMS").to_str().unwrap(),
             "--target",
-            HOST_RELEASE_TARGET,
+            host_release_target,
             "--output",
             archive_verification_path.to_str().unwrap(),
         ],
@@ -939,6 +942,9 @@ fn release_evidence_rejects_missing_eval_reference_and_skip_reason() {
 
 #[test]
 fn release_evidence_rejects_archive_verification_without_smoke_results() {
+    let Some(host_release_target) = supported_host_release_target() else {
+        return;
+    };
     let fixture_root = build_release_fixture();
     write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
     let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
@@ -988,10 +994,10 @@ fn release_evidence_rejects_archive_verification_without_smoke_results() {
             "checksums_asset": "SHA256SUMS",
             "archive_count": 1,
             "archives": [{
-                "target": HOST_RELEASE_TARGET,
+                "target": host_release_target,
                 "archive": format!(
-                    "1up-v{TEST_RELEASE_VERSION}-{HOST_RELEASE_TARGET}.{}",
-                    if HOST_RELEASE_TARGET.contains("windows") { "zip" } else { "tar.gz" }
+                    "1up-v{TEST_RELEASE_VERSION}-{host_release_target}.{}",
+                    if host_release_target.contains("windows") { "zip" } else { "tar.gz" }
                 ),
                 "sha256": "abc123"
             }]
@@ -1120,9 +1126,9 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
         fs::read_to_string(repo_root().join(".github/workflows/release-evidence.yml")).unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
-    assert!(workflow.contains("macos-26-intel"));
     assert!(workflow.contains("macos-26"));
     assert!(!workflow.contains("macos-13"));
+    assert!(!workflow.contains("x86_64-apple-darwin"));
     assert!(workflow.contains("download retained security check"));
     assert!(workflow.contains("bash scripts/release/download_retained_security_check.sh"));
     assert!(workflow.contains("pattern: archive-verification-*"));
@@ -1145,9 +1151,9 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
         fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
-    assert!(workflow.contains("macos-26-intel"));
     assert!(workflow.contains("macos-26"));
     assert!(!workflow.contains("macos-13"));
+    assert!(!workflow.contains("x86_64-apple-darwin"));
     assert!(workflow.contains("oneup-v*.*.*"));
     assert!(workflow.contains("RELEASE_TAG"));
     assert!(workflow.contains("ref: ${{ env.RELEASE_TAG }}"));
