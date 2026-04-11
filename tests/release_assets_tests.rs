@@ -1120,6 +1120,9 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
         fs::read_to_string(repo_root().join(".github/workflows/release-evidence.yml")).unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("macos-26-intel"));
+    assert!(workflow.contains("macos-26"));
+    assert!(!workflow.contains("macos-13"));
     assert!(workflow.contains("download retained security check"));
     assert!(workflow.contains("bash scripts/release/download_retained_security_check.sh"));
     assert!(workflow.contains("pattern: archive-verification-*"));
@@ -1142,6 +1145,9 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
         fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("macos-26-intel"));
+    assert!(workflow.contains("macos-26"));
+    assert!(!workflow.contains("macos-13"));
     assert!(workflow.contains("oneup-v*.*.*"));
     assert!(workflow.contains("RELEASE_TAG"));
     assert!(workflow.contains("ref: ${{ env.RELEASE_TAG }}"));
