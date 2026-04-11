@@ -238,52 +238,47 @@ fn write_deadline() -> Duration {
 mod tests {
     use super::*;
 
-    use std::ffi::OsString;
-    use tokio::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
+    fn test_socket_path(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("daemon.sock")
     }
 
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            }
+    async fn bind_test_listener(socket_path: &Path) -> Result<SearchListener, OneupError> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                DaemonError::RequestError(format!(
+                    "failed to create test socket dir {}: {err}",
+                    parent.display()
+                ))
+            })?;
         }
-    }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+        let listener = UnixListener::bind(socket_path).map_err(|err| -> OneupError {
+            DaemonError::RequestError(format!(
+                "failed to bind test search socket {}: {err}",
+                socket_path.display()
+            ))
+            .into()
+        })?;
+        let daemon_uid = std::fs::metadata(socket_path)
+            .map_err(|err| {
+                DaemonError::RequestError(format!(
+                    "failed to stat test search socket {}: {err}",
+                    socket_path.display()
+                ))
+            })?
+            .uid();
 
-    fn configure_test_socket_path(tmp: &tempfile::TempDir) -> PathBuf {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            tmp.path().canonicalize().unwrap().join("xdg-data"),
-        );
-        config::daemon_socket_path().unwrap()
+        Ok(SearchListener {
+            listener,
+            daemon_uid,
+        })
     }
 
     #[tokio::test]
     async fn request_search_returns_results() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
@@ -337,11 +332,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_search_returns_none_for_unavailable_daemon() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
@@ -405,11 +398,9 @@ mod tests {
 
     #[tokio::test]
     async fn accept_connection_rejects_mismatched_peer_uid() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
 
         let server = tokio::spawn(async move {
             let maybe_stream = accept_connection(&SearchListener {

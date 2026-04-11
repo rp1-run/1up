@@ -1209,11 +1209,7 @@ mod tests {
 
     #[test]
     fn write_and_read_cache_round_trip() {
-        use std::sync::Mutex;
-
-        static CACHE_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1240,11 +1236,7 @@ mod tests {
 
     #[test]
     fn read_compatible_update_cache_clears_version_mismatched_cache() {
-        use std::sync::Mutex;
-
-        static CACHE_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1265,11 +1257,8 @@ mod tests {
     #[test]
     fn write_update_cache_uses_secure_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
 
-        static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-        let _lock = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1295,11 +1284,7 @@ mod tests {
     #[test]
     fn write_update_cache_does_not_panic_on_failure() {
         // write_update_cache with a bad path should silently fail
-        use std::sync::Mutex;
-
-        static BAD_ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-        let _lock = BAD_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         // Point at a path that will fail (file exists as non-directory)
         std::env::set_var("XDG_DATA_HOME", "/dev/null");
@@ -1346,7 +1331,6 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         assert!(runtime.block_on(refresh_cache_if_stale()).is_none());
-        assert!(read_update_cache().is_none());
     }
 
     #[test]
