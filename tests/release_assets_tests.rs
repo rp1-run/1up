@@ -1059,6 +1059,10 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
 
     assert!(workflow.contains("UPDATE_MANIFEST_URL"));
     assert!(workflow.contains("ONEUP_UPDATE_MANIFEST_URL"));
+    assert!(workflow.contains("waiting for existing release"));
+    assert!(workflow.contains("gh release edit \"$tag\""));
+    assert!(workflow.contains("gh release create \"$tag\""));
+    assert!(!workflow.contains("release ${tag} is already published"));
     assert!(workflow.contains("stage Windows ONNX Runtime DLL"));
     assert!(workflow.contains("onnxruntime.dll"));
     assert!(workflow.contains("Get-FileHash"));
@@ -1071,6 +1075,7 @@ fn publish_packages_workflow_verifies_stable_update_manifest() {
         fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
 
     assert!(workflow.contains("verify stable update manifest"));
+    assert!(workflow.contains("waiting for release-manifest.json"));
     assert!(workflow.contains("wait for stable update manifest"));
     assert!(workflow.contains("curl --fail --silent --show-error --location"));
     assert!(workflow.contains("jq -S"));

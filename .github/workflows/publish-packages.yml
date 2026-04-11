@@ -33,9 +33,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/release"
-          gh release download "${{ github.event.release.tag_name }}" \
-            --pattern release-manifest.json \
-            --dir "${RUNNER_TEMP}/release"
+
+          for attempt in $(seq 1 30); do
+            rm -f "${RUNNER_TEMP}/release/release-manifest.json"
+            if gh release download "${{ github.event.release.tag_name }}" \
+              --pattern release-manifest.json \
+              --dir "${RUNNER_TEMP}/release" \
+              --clobber >/dev/null 2>&1; then
+              break
+            fi
+
+            echo "waiting for release-manifest.json for ${{ github.event.release.tag_name }} (attempt ${attempt}/30)" >&2
+            sleep 20
+          done
+
+          test -f "${RUNNER_TEMP}/release/release-manifest.json"
 
       - name: render package definitions
         shell: bash
@@ -129,9 +141,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/release"
-          gh release download "${{ github.event.release.tag_name }}" \
-            --pattern release-manifest.json \
-            --dir "${RUNNER_TEMP}/release"
+
+          for attempt in $(seq 1 30); do
+            rm -f "${RUNNER_TEMP}/release/release-manifest.json"
+            if gh release download "${{ github.event.release.tag_name }}" \
+              --pattern release-manifest.json \
+              --dir "${RUNNER_TEMP}/release" \
+              --clobber >/dev/null 2>&1; then
+              break
+            fi
+
+            echo "waiting for release-manifest.json for ${{ github.event.release.tag_name }} (attempt ${attempt}/30)" >&2
+            sleep 20
+          done
+
+          test -f "${RUNNER_TEMP}/release/release-manifest.json"
 
       - name: generate update manifest
         shell: bash

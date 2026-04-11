@@ -159,21 +159,29 @@ jobs:
             --output "${RUNNER_TEMP}/dist/release-manifest.json"
           bash scripts/release/extract_release_notes.sh "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/dist/release-notes.md"
 
-      - name: create or update draft release
+      - name: create or update release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
           title="1up ${{ needs.validate.outputs.version }}"
-          if release_json=$(gh release view "$tag" --json isDraft,url 2>/dev/null); then
-            is_draft=$(jq -r '.isDraft' <<<"$release_json")
-            if [[ "$is_draft" != "true" ]]; then
-              url=$(jq -r '.url' <<<"$release_json")
-              echo "release ${tag} is already published at ${url}" >&2
-              exit 1
+          release_json=""
+
+          for attempt in $(seq 1 12); do
+            if release_json=$(gh release view "$tag" --json isDraft,url 2>/dev/null); then
+              break
             fi
-            gh release edit "$tag" --draft --title "$title" --notes-file "${RUNNER_TEMP}/dist/release-notes.md"
+
+            release_json=""
+            echo "waiting for existing release ${tag} (attempt ${attempt}/12)" >&2
+            sleep 10
+          done
+
+          if [[ -n "$release_json" ]]; then
+            gh release edit "$tag" \
+              --title "$title" \
+              --notes-file "${RUNNER_TEMP}/dist/release-notes.md"
           else
             gh release create "$tag" \
               --draft \
