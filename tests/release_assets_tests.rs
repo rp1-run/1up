@@ -1155,7 +1155,8 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     assert!(workflow.contains("stage Windows ONNX Runtime DLL"));
     assert!(workflow.contains("onnxruntime.dll"));
     assert!(workflow.contains("Get-FileHash"));
-    assert!(workflow.contains("x86_64-pc-windows-msvc.tar.lzma2"));
+    assert!(workflow.contains("onnxruntime-win-x64-1.24.2.zip"));
+    assert!(workflow.contains("Expand-Archive -LiteralPath $archivePath"));
 }
 
 #[test]
