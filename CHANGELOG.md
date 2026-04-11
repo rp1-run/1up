@@ -8,6 +8,13 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.3](https://github.com/rp1-run/1up/compare/v0.1.2...v0.1.3) (2026-04-11)
+
+
+### Bug Fixes
+
+* **release:** use official windows onnxruntime zip ([31d44d5](https://github.com/rp1-run/1up/commit/31d44d55bb5385109b2418c9fd819ebfbc07520f))
+
 ## [0.1.2](https://github.com/rp1-run/1up/compare/v0.1.1...v0.1.2) (2026-04-11)
 
 
