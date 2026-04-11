@@ -8,6 +8,13 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.4](https://github.com/rp1-run/1up/compare/v0.1.3...v0.1.4) (2026-04-11)
+
+
+### Bug Fixes
+
+* **ci:** move release runners to macos 26 and harden status test ([#17](https://github.com/rp1-run/1up/issues/17)) ([4ace4ab](https://github.com/rp1-run/1up/commit/4ace4abd05ee2768e55348c87abb3732935e9be4))
+
 ## [0.1.3](https://github.com/rp1-run/1up/compare/v0.1.2...v0.1.3) (2026-04-11)
 
 
