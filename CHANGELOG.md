@@ -8,6 +8,13 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.5](https://github.com/rp1-run/1up/compare/v0.1.4...v0.1.5) (2026-04-11)
+
+
+### Bug Fixes
+
+* **release:** drop intel macos artifacts ([#19](https://github.com/rp1-run/1up/issues/19)) ([ae5d941](https://github.com/rp1-run/1up/commit/ae5d9413b07a3f4907939a5e184a2f2b07ba80b6))
+
 ## [0.1.4](https://github.com/rp1-run/1up/compare/v0.1.3...v0.1.4) (2026-04-11)
 
 
