@@ -82,6 +82,8 @@ trap cleanup EXIT
 
 ARTIFACTS_JSONL="$TMP_DIR/artifacts.jsonl"
 
+RELEASE_DOWNLOAD_BASE="$(release_repo_url)/releases/download/${TAG}"
+
 for metadata_path in "${METADATA_FILES[@]}"; do
   archive_name=$(jq -r '.archive' "$metadata_path")
 
@@ -94,22 +96,30 @@ for metadata_path in "${METADATA_FILES[@]}"; do
     fail "SHA256SUMS is missing an entry for ${archive_name}"
   fi
 
-  jq --arg sha256 "$checksum" '. + {sha256: $sha256}' "$metadata_path" >>"$ARTIFACTS_JSONL"
+  artifact_url="${RELEASE_DOWNLOAD_BASE}/${archive_name}"
+
+  jq --arg sha256 "$checksum" --arg url "$artifact_url" \
+    '. + {sha256: $sha256, url: $url}' "$metadata_path" >>"$ARTIFACTS_JSONL"
 done
 
 jq -s 'sort_by(.target)' "$ARTIFACTS_JSONL" >"$TMP_DIR/artifacts.json"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
+PUBLISHED_AT=$(utc_timestamp)
+NOTES_URL="$(release_repo_url)/releases/tag/${TAG}"
+
 jq -n \
   --arg version "$VERSION" \
   --arg git_tag "$TAG" \
   --arg commit_sha "$COMMIT_SHA" \
+  --arg published_at "$PUBLISHED_AT" \
   --arg binary_name "1up" \
   --arg license "$LICENSE" \
   --arg checksums_file "$(basename "$CHECKSUMS_PATH")" \
   --arg notes_source "CHANGELOG.md#[${VERSION}]" \
-  --arg github_release "$(release_repo_url)/releases/tag/${TAG}" \
+  --arg notes_url "$NOTES_URL" \
+  --arg github_release "$NOTES_URL" \
   --arg homebrew_tap "$HOMEBREW_TAP_REPO" \
   --arg homebrew_formula "$HOMEBREW_FORMULA" \
   --arg scoop_bucket "$SCOOP_BUCKET_REPO" \
@@ -119,18 +129,23 @@ jq -n \
     version: $version,
     git_tag: $git_tag,
     commit_sha: $commit_sha,
+    published_at: $published_at,
     binary_name: $binary_name,
     license: $license,
     artifacts: $artifacts[0],
     checksums_file: $checksums_file,
     notes_source: $notes_source,
+    notes_url: $notes_url,
     channels: {
       github_release: $github_release,
       homebrew_tap: $homebrew_tap,
       homebrew_formula: $homebrew_formula,
       scoop_bucket: $scoop_bucket,
       scoop_manifest: $scoop_manifest
-    }
+    },
+    yanked: false,
+    minimum_safe_version: null,
+    message: null
   }' \
   >"$OUTPUT_PATH"
 

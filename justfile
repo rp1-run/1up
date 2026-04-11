@@ -28,3 +28,17 @@ eval-parallel *flags:
 
 eval-summary:
     @cd evals && ./summary.sh
+
+# Exercise the local binary against a manifest URL.
+update-test url="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "{{url}}" ]]; then
+      echo "usage: just update-test url=<manifest-url>"
+      echo "example: just update-test url=http://127.0.0.1:8000/update-manifest.json"
+      exit 0
+    fi
+    cargo build --bin 1up
+    ONEUP_UPDATE_MANIFEST_URL="{{url}}" ./target/debug/1up update --check -f human
+    echo
+    ONEUP_UPDATE_MANIFEST_URL="{{url}}" ./target/debug/1up update --status -f human

@@ -147,7 +147,11 @@ CREATE TABLE policy_rules_preview (
     std::fs::create_dir_all(temp_root.join("config")).unwrap();
     std::fs::create_dir_all(temp_root.join("proto")).unwrap();
     std::fs::create_dir_all(temp_root.join("sql")).unwrap();
-    std::fs::write(temp_root.join("config").join("signatures.yaml"), yaml_source).unwrap();
+    std::fs::write(
+        temp_root.join("config").join("signatures.yaml"),
+        yaml_source,
+    )
+    .unwrap();
     std::fs::write(
         temp_root.join("proto").join("policy_rules.proto"),
         proto_source,

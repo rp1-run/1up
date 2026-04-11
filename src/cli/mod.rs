@@ -10,6 +10,7 @@ pub mod status;
 pub mod stop;
 pub mod structural;
 pub mod symbol;
+pub mod update;
 
 use clap::{Parser, Subcommand};
 
@@ -70,6 +71,9 @@ pub enum Command {
     /// Output a concise agent instruction for AI assistants
     HelloAgent(hello_agent::HelloAgentArgs),
 
+    /// Check for updates, view update status, or apply an update
+    Update(update::UpdateArgs),
+
     /// Internal: daemon worker process (not for direct use)
     #[command(name = "__worker", hide = true)]
     Worker,
@@ -88,6 +92,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Index(args) => index::exec(args, cli.format).await,
         Command::Reindex(args) => reindex::exec(args, cli.format).await,
         Command::HelloAgent(args) => hello_agent::exec(args, cli.format).await,
+        Command::Update(args) => update::exec(args, cli.format).await,
         Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
 }

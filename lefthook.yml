@@ -1,4 +1,7 @@
 pre-push:
+  parallel: false
   commands:
     protect-main:
       run: .lefthook/protect-main.sh {push_remote} {push_args}
+    rustfmt:
+      run: cargo fmt --check

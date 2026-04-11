@@ -8,6 +8,8 @@ mod storage;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use crate::shared::types::OutputFormat;
+
 #[tokio::main]
 async fn main() {
     let cli = cli::Cli::parse();
@@ -24,8 +26,40 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let format = cli.format;
+    let show_notification = should_show_notification(format, &cli.command);
+
+    let refresh_handle = if show_notification {
+        Some(tokio::spawn(shared::update::refresh_cache_if_stale()))
+    } else {
+        None
+    };
+
     if let Err(e) = cli::run(cli).await {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
+
+    if show_notification {
+        if let Some(handle) = refresh_handle {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        }
+        if let Some(notice) = shared::update::format_update_notification() {
+            eprintln!("{notice}");
+        }
+    }
+}
+
+/// Returns `true` when a passive update notification should be shown after the
+/// command completes.
+///
+/// Notifications are suppressed for:
+/// - JSON output mode (AC-02c)
+/// - The internal Worker command (AC-02d)
+/// - The Update command (it handles its own update output)
+fn should_show_notification(format: OutputFormat, command: &cli::Command) -> bool {
+    if format == OutputFormat::Json {
+        return false;
+    }
+    !matches!(command, cli::Command::Worker | cli::Command::Update(_))
 }

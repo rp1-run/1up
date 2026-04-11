@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/update-manifest.json
+
 jobs:
   publish:
     name: publish Homebrew and Scoop definitions
@@ -30,9 +33,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/release"
-          gh release download "${{ github.event.release.tag_name }}" \
-            --pattern release-manifest.json \
-            --dir "${RUNNER_TEMP}/release"
+
+          for attempt in $(seq 1 30); do
+            rm -f "${RUNNER_TEMP}/release/release-manifest.json"
+            if gh release download "${{ github.event.release.tag_name }}" \
+              --pattern release-manifest.json \
+              --dir "${RUNNER_TEMP}/release" \
+              --clobber >/dev/null 2>&1; then
+              break
+            fi
+
+            echo "waiting for release-manifest.json for ${{ github.event.release.tag_name }} (attempt ${attempt}/30)" >&2
+            sleep 20
+          done
+
+          test -f "${RUNNER_TEMP}/release/release-manifest.json"
 
       - name: render package definitions
         shell: bash
@@ -110,3 +125,119 @@ jobs:
           name: package-publication-record
           path: ${{ runner.temp }}/release/package-publication-record.json
           if-no-files-found: error
+
+  publish-update-manifest:
+    name: publish update manifest to main
+    runs-on: ubuntu-24.04
+    needs: publish
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+      RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+    steps:
+      - name: validate release pat
+        shell: bash
+        run: |
+          if [[ -z "${RELEASE_PAT:-}" ]]; then
+            echo "RELEASE_PAT is required to publish update-manifest.json to main" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: download release manifest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+
+          for attempt in $(seq 1 30); do
+            rm -f "${RUNNER_TEMP}/release/release-manifest.json"
+            if gh release download "${{ github.event.release.tag_name }}" \
+              --pattern release-manifest.json \
+              --dir "${RUNNER_TEMP}/release" \
+              --clobber >/dev/null 2>&1; then
+              break
+            fi
+
+            echo "waiting for release-manifest.json for ${{ github.event.release.tag_name }} (attempt ${attempt}/30)" >&2
+            sleep 20
+          done
+
+          test -f "${RUNNER_TEMP}/release/release-manifest.json"
+
+      - name: generate update manifest
+        shell: bash
+        run: |
+          jq '{
+            version,
+            git_tag,
+            published_at,
+            notes_url,
+            artifacts: [.artifacts[] | {target, archive, sha256, url}],
+            channels,
+            yanked,
+            minimum_safe_version,
+            message
+          }' "${RUNNER_TEMP}/release/release-manifest.json" > update-manifest.json
+
+      - name: commit and push update manifest
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update-manifest.json
+          if git diff --cached --quiet; then
+            echo "update-manifest.json is unchanged, skipping commit" >&2
+            exit 0
+          fi
+          version=$(jq -r '.version' update-manifest.json)
+          git commit -m "chore: publish update manifest for v${version}"
+          git push origin HEAD:main
+
+  verify-update-manifest:
+    name: verify stable update manifest
+    runs-on: ubuntu-24.04
+    needs: publish-update-manifest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: download release manifest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/release"
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern release-manifest.json \
+            --dir "${RUNNER_TEMP}/release"
+
+      - name: wait for stable update manifest
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --location "${UPDATE_MANIFEST_URL}" \
+              --output "${RUNNER_TEMP}/update-manifest.json"; then
+              break
+            fi
+            rm -f "${RUNNER_TEMP}/update-manifest.json"
+            echo "waiting for ${UPDATE_MANIFEST_URL} (attempt ${attempt}/30)" >&2
+            sleep 10
+          done
+          test -f "${RUNNER_TEMP}/update-manifest.json"
+
+      - name: verify stable update manifest matches release
+        shell: bash
+        run: |
+          jq -S '{
+            version,
+            git_tag,
+            published_at,
+            notes_url,
+            artifacts: [.artifacts[] | {target, archive, sha256, url}],
+            channels,
+            yanked,
+            minimum_safe_version,
+            message
+          }' "${RUNNER_TEMP}/release/release-manifest.json" > "${RUNNER_TEMP}/expected-update-manifest.json"
+          jq -S . "${RUNNER_TEMP}/update-manifest.json" > "${RUNNER_TEMP}/actual-update-manifest.json"
+          diff -u "${RUNNER_TEMP}/expected-update-manifest.json" "${RUNNER_TEMP}/actual-update-manifest.json"

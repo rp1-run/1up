@@ -383,6 +383,59 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .unwrap()
         .iter()
         .all(|artifact| artifact["sha256"].as_str().unwrap().len() == 64));
+
+    // Update lifecycle fields
+    let published_at = manifest["published_at"].as_str().unwrap();
+    assert!(
+        published_at.ends_with('Z') && published_at.contains('T'),
+        "published_at should be ISO 8601 UTC: {published_at}"
+    );
+    assert_eq!(
+        manifest["notes_url"],
+        "https://github.com/rp1-run/1up/releases/tag/v0.1.0"
+    );
+    assert_eq!(manifest["yanked"], false);
+    assert!(manifest["minimum_safe_version"].is_null());
+    assert!(manifest["message"].is_null());
+    assert!(manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|artifact| {
+            let url = artifact["url"].as_str().unwrap();
+            url.starts_with("https://github.com/rp1-run/1up/releases/download/v0.1.0/")
+                && url.ends_with(artifact["archive"].as_str().unwrap())
+        }));
+}
+
+#[test]
+fn release_manifest_deserializes_as_update_manifest() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), "0.1.0");
+    let dist_dir = write_release_artifacts(fixture_root.path(), "0.1.0");
+
+    let raw = fs::read(dist_dir.join("release-manifest.json")).unwrap();
+    let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
+        .expect("release manifest should deserialize as UpdateManifest");
+
+    assert_eq!(manifest.version, "0.1.0");
+    assert_eq!(manifest.git_tag, "v0.1.0");
+    assert!(!manifest.published_at.is_empty());
+    assert!(manifest.notes_url.contains("/releases/tag/v0.1.0"));
+    assert_eq!(manifest.artifacts.len(), 5);
+    assert!(!manifest.yanked);
+    assert!(manifest.minimum_safe_version.is_none());
+    assert!(manifest.message.is_none());
+
+    for artifact in &manifest.artifacts {
+        assert!(!artifact.target.is_empty());
+        assert!(!artifact.archive.is_empty());
+        assert_eq!(artifact.sha256.len(), 64);
+        assert!(
+            artifact.url.contains(&artifact.archive),
+            "artifact url should contain archive name"
+        );
+    }
 }
 
 #[test]
@@ -1004,10 +1057,34 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
 
+    assert!(workflow.contains("UPDATE_MANIFEST_URL"));
+    assert!(workflow.contains("ONEUP_UPDATE_MANIFEST_URL"));
+    assert!(workflow.contains("waiting for existing release"));
+    assert!(workflow.contains("gh release edit \"$tag\""));
+    assert!(workflow.contains("gh release create \"$tag\""));
+    assert!(!workflow.contains("release ${tag} is already published"));
     assert!(workflow.contains("stage Windows ONNX Runtime DLL"));
     assert!(workflow.contains("onnxruntime.dll"));
     assert!(workflow.contains("Get-FileHash"));
     assert!(workflow.contains("x86_64-pc-windows-msvc.tar.lzma2"));
+}
+
+#[test]
+fn publish_packages_workflow_verifies_stable_update_manifest() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
+
+    assert!(workflow.contains("verify stable update manifest"));
+    assert!(workflow.contains("validate release pat"));
+    assert!(workflow.contains("RELEASE_PAT"));
+    assert!(workflow.contains("token: ${{ secrets.RELEASE_PAT }}"));
+    assert!(workflow.contains("git push origin HEAD:main"));
+    assert!(workflow.contains("waiting for release-manifest.json"));
+    assert!(workflow.contains("wait for stable update manifest"));
+    assert!(workflow.contains("curl --fail --silent --show-error --location"));
+    assert!(workflow.contains("jq -S"));
+    assert!(workflow.contains("diff -u"));
+    assert!(workflow.contains("UPDATE_MANIFEST_URL"));
 }
 
 #[cfg(unix)]

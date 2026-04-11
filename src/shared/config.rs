@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::shared::constants::{
     EMBED_THREADS_ENV_VAR, INDEX_JOBS_ENV_VAR, INDEX_WRITE_BATCH_FILES_ENV_VAR,
     MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_CURRENT_MANIFEST_FILENAME, MODEL_STAGING_DIRNAME,
-    MODEL_VERIFIED_DIRNAME,
+    MODEL_VERIFIED_DIRNAME, UPDATE_CHECK_CACHE_FILENAME,
 };
 use crate::shared::errors::{ConfigError, OneupError};
 use crate::shared::types::IndexingConfig;
@@ -71,6 +71,11 @@ pub fn pid_file_path() -> Result<PathBuf, OneupError> {
 /// Returns the path to the daemon search socket.
 pub fn daemon_socket_path() -> Result<PathBuf, OneupError> {
     Ok(data_dir()?.join("daemon.sock"))
+}
+
+/// Returns the path to the update-check cache file (~/.local/share/1up/update-check.json).
+pub fn update_check_cache_path() -> Result<PathBuf, OneupError> {
+    Ok(data_dir()?.join(UPDATE_CHECK_CACHE_FILENAME))
 }
 
 /// Returns the path to the global project registry.

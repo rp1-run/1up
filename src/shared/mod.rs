@@ -6,3 +6,4 @@ pub mod project;
 pub mod reminder;
 pub mod symbols;
 pub mod types;
+pub mod update;

@@ -36,8 +36,14 @@ pub(crate) struct SearchRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum SearchResponse {
-    Results { results: Vec<SearchResult> },
-    Unavailable { reason: String },
+    Results {
+        results: Vec<SearchResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_version: Option<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 pub(crate) async fn bind_listener() -> Result<SearchListener, OneupError> {
@@ -86,7 +92,7 @@ pub(crate) async fn request_search(
     project_root: &Path,
     query: &str,
     limit: usize,
-) -> Result<Option<Vec<SearchResult>>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
     request_search_at(&config::daemon_socket_path()?, project_root, query, limit).await
 }
 
@@ -163,7 +169,7 @@ async fn request_search_at(
     project_root: &Path,
     query: &str,
     limit: usize,
-) -> Result<Option<Vec<SearchResult>>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
     let mut stream = UnixStream::connect(socket_path).await.map_err(|err| {
         DaemonError::RequestError(format!(
             "failed to connect to search socket {}: {err}",
@@ -185,7 +191,10 @@ async fn request_search_at(
     .await?;
 
     match ipc::read_json_frame(&mut stream, MAX_DAEMON_RESPONSE_BYTES, read_deadline()).await? {
-        SearchResponse::Results { results } => Ok(Some(results)),
+        SearchResponse::Results {
+            results,
+            daemon_version,
+        } => Ok(Some((results, daemon_version))),
         SearchResponse::Unavailable { .. } => Ok(None),
     }
 }
@@ -229,52 +238,47 @@ fn write_deadline() -> Duration {
 mod tests {
     use super::*;
 
-    use std::ffi::OsString;
-    use tokio::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
+    fn test_socket_path(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("daemon.sock")
     }
 
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            }
+    async fn bind_test_listener(socket_path: &Path) -> Result<SearchListener, OneupError> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                DaemonError::RequestError(format!(
+                    "failed to create test socket dir {}: {err}",
+                    parent.display()
+                ))
+            })?;
         }
-    }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+        let listener = UnixListener::bind(socket_path).map_err(|err| -> OneupError {
+            DaemonError::RequestError(format!(
+                "failed to bind test search socket {}: {err}",
+                socket_path.display()
+            ))
+            .into()
+        })?;
+        let daemon_uid = std::fs::metadata(socket_path)
+            .map_err(|err| {
+                DaemonError::RequestError(format!(
+                    "failed to stat test search socket {}: {err}",
+                    socket_path.display()
+                ))
+            })?
+            .uid();
 
-    fn configure_test_socket_path(tmp: &tempfile::TempDir) -> PathBuf {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            tmp.path().canonicalize().unwrap().join("xdg-data"),
-        );
-        config::daemon_socket_path().unwrap()
+        Ok(SearchListener {
+            listener,
+            daemon_uid,
+        })
     }
 
     #[tokio::test]
     async fn request_search_returns_results() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
@@ -308,13 +312,14 @@ mod tests {
                         referenced_symbols: None,
                         called_symbols: None,
                     }],
+                    daemon_version: Some("0.1.0".to_string()),
                 },
             )
             .await
             .unwrap();
         });
 
-        let results = request_search_at(&socket_path, &project_root, "needle", 7)
+        let (results, daemon_version) = request_search_at(&socket_path, &project_root, "needle", 7)
             .await
             .unwrap()
             .unwrap();
@@ -322,15 +327,14 @@ mod tests {
         server.await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "src/lib.rs");
+        assert_eq!(daemon_version, Some("0.1.0".to_string()));
     }
 
     #[tokio::test]
     async fn request_search_returns_none_for_unavailable_daemon() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
@@ -365,13 +369,38 @@ mod tests {
         assert_eq!(request.limit, MAX_SEARCH_RESULTS);
     }
 
+    #[test]
+    fn search_response_results_serializes_with_daemon_version() {
+        let response = SearchResponse::Results {
+            results: vec![],
+            daemon_version: Some("0.1.0".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"daemon_version\":\"0.1.0\""));
+        assert!(json.contains("\"status\":\"results\""));
+    }
+
+    #[test]
+    fn search_response_results_deserializes_without_daemon_version() {
+        let json = r#"{"status":"results","results":[]}"#;
+        let response: SearchResponse = serde_json::from_str(json).unwrap();
+        match response {
+            SearchResponse::Results {
+                results,
+                daemon_version,
+            } => {
+                assert!(results.is_empty());
+                assert!(daemon_version.is_none());
+            }
+            _ => panic!("expected Results variant"),
+        }
+    }
+
     #[tokio::test]
     async fn accept_connection_rejects_mismatched_peer_uid() {
-        let _lock = ENV_MUTEX.lock().await;
-        let _guard = EnvGuard::new(&["XDG_DATA_HOME"]);
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = configure_test_socket_path(&tmp);
-        let listener = bind_listener_at(&socket_path).await.unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
 
         let server = tokio::spawn(async move {
             let maybe_stream = accept_connection(&SearchListener {

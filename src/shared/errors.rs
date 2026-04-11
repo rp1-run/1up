@@ -33,6 +33,9 @@ pub enum OneupError {
     #[error("fence error: {0}")]
     Fence(#[from] FenceError),
 
+    #[error("update error: {0}")]
+    Update(#[from] UpdateError),
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
@@ -183,6 +186,49 @@ pub enum ProjectError {
 pub enum FenceError {
     #[error("malformed 1up fence: {0}")]
     Malformed(String),
+}
+
+#[derive(Error, Debug)]
+pub enum UpdateError {
+    #[error("updates are disabled for this build")]
+    Disabled,
+
+    #[error("update check failed: {detail}")]
+    FetchFailed { detail: String, permanent: bool },
+
+    #[error("manifest parse failed: {0}")]
+    ParseFailed(String),
+
+    #[error("update cache error: {0}")]
+    #[allow(dead_code)]
+    CacheError(String),
+
+    #[error("self-update failed: {0}")]
+    SelfUpdateFailed(String),
+
+    #[error("daemon stop required for update but failed: {0}")]
+    #[allow(dead_code)]
+    DaemonStopFailed(String),
+
+    #[error("no artifact available for platform: {0}")]
+    NoArtifactForPlatform(String),
+
+    #[error("checksum verification failed")]
+    ChecksumMismatch,
+}
+
+impl UpdateError {
+    pub fn should_invalidate_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled
+                | Self::ParseFailed(_)
+                | Self::FetchFailed {
+                    permanent: true,
+                    ..
+                }
+        )
+    }
 }
 
 #[allow(dead_code)]
