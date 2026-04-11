@@ -349,21 +349,30 @@ fn start_auto_initializes_project_if_needed() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    let status = cmd()
-        .env("HOME", &canonical_home)
-        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-        .args([
-            "--format",
-            "json",
-            "status",
-            canonical_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    let status_stdout = String::from_utf8(status.stdout).unwrap();
-    let status_payload: serde_json::Value = serde_json::from_str(status_stdout.trim()).unwrap();
+    let status_deadline = Instant::now() + Duration::from_secs(2);
+    let status_payload = loop {
+        let status = cmd()
+            .env("HOME", &canonical_home)
+            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+            .args([
+                "--format",
+                "json",
+                "status",
+                canonical_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status_stdout = String::from_utf8(status.stdout).unwrap();
+        let status_payload: serde_json::Value = serde_json::from_str(status_stdout.trim()).unwrap();
+        if status_payload["last_file_check_at"].as_str().is_some()
+            || Instant::now() >= status_deadline
+        {
+            break status_payload;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(status_payload["indexed_files"].as_u64().unwrap() > 0);
     assert!(status_payload["total_segments"].as_u64().unwrap() > 0);
     assert!(status_payload["last_file_check_at"].as_str().is_some());
