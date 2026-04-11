@@ -242,7 +242,10 @@ fn update_status_ignores_cache_from_different_binary_version() {
     let output = cmd()
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
-        .env("ONEUP_UPDATE_MANIFEST_URL", "https://example.com/update-manifest.json")
+        .env(
+            "ONEUP_UPDATE_MANIFEST_URL",
+            "https://example.com/update-manifest.json",
+        )
         .args(["--format", "human", "update", "--status"])
         .output()
         .unwrap();
