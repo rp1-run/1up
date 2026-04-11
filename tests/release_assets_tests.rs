@@ -1075,6 +1075,10 @@ fn publish_packages_workflow_verifies_stable_update_manifest() {
         fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
 
     assert!(workflow.contains("verify stable update manifest"));
+    assert!(workflow.contains("validate release pat"));
+    assert!(workflow.contains("RELEASE_PAT"));
+    assert!(workflow.contains("token: ${{ secrets.RELEASE_PAT }}"));
+    assert!(workflow.contains("git push origin HEAD:main"));
     assert!(workflow.contains("waiting for release-manifest.json"));
     assert!(workflow.contains("wait for stable update manifest"));
     assert!(workflow.contains("curl --fail --silent --show-error --location"));

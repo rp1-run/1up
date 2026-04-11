@@ -131,11 +131,21 @@ jobs:
     runs-on: ubuntu-24.04
     needs: publish
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+      RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
     steps:
+      - name: validate release pat
+        shell: bash
+        run: |
+          if [[ -z "${RELEASE_PAT:-}" ]]; then
+            echo "RELEASE_PAT is required to publish update-manifest.json to main" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: main
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: download release manifest
         shell: bash
@@ -184,7 +194,7 @@ jobs:
           fi
           version=$(jq -r '.version' update-manifest.json)
           git commit -m "chore: publish update manifest for v${version}"
-          git push origin main
+          git push origin HEAD:main
 
   verify-update-manifest:
     name: verify stable update manifest
