@@ -27,9 +27,9 @@ Public installs are intended to come from tagged GitHub releases and first-party
 
 | Channel | Platforms | Command |
 |---|---|---|
-| Homebrew | macOS, Linux | `brew install rp1-run/tap/1up` |
+| Homebrew | macOS arm64, Linux | `brew install rp1-run/tap/1up` |
 | Scoop | Windows | `scoop install https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json` |
-| Direct release asset | macOS arm64, macOS amd64, Linux arm64, Linux amd64, Windows amd64 | Download the matching archive from [GitHub Releases](https://github.com/rp1-run/1up/releases) |
+| Direct release asset | macOS arm64, Linux arm64, Linux amd64, Windows amd64 | Download the matching archive from [GitHub Releases](https://github.com/rp1-run/1up/releases) |
 
 Verify the install:
 

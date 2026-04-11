@@ -40,8 +40,6 @@ VERSION=$(manifest_value "$MANIFEST_PATH" '.version')
 LICENSE=$(manifest_value "$MANIFEST_PATH" '.license')
 MACOS_ARM64_URL=$(manifest_release_download_url "$MANIFEST_PATH" 'aarch64-apple-darwin')
 MACOS_ARM64_SHA256=$(manifest_artifact_value "$MANIFEST_PATH" 'aarch64-apple-darwin' 'sha256')
-MACOS_AMD64_URL=$(manifest_release_download_url "$MANIFEST_PATH" 'x86_64-apple-darwin')
-MACOS_AMD64_SHA256=$(manifest_artifact_value "$MANIFEST_PATH" 'x86_64-apple-darwin' 'sha256')
 LINUX_ARM64_URL=$(manifest_release_download_url "$MANIFEST_PATH" 'aarch64-unknown-linux-gnu')
 LINUX_ARM64_SHA256=$(manifest_artifact_value "$MANIFEST_PATH" 'aarch64-unknown-linux-gnu' 'sha256')
 LINUX_AMD64_URL=$(manifest_release_download_url "$MANIFEST_PATH" 'x86_64-unknown-linux-gnu')
@@ -54,8 +52,6 @@ render_template \
   LICENSE "$LICENSE" \
   MACOS_ARM64_URL "$MACOS_ARM64_URL" \
   MACOS_ARM64_SHA256 "$MACOS_ARM64_SHA256" \
-  MACOS_AMD64_URL "$MACOS_AMD64_URL" \
-  MACOS_AMD64_SHA256 "$MACOS_AMD64_SHA256" \
   LINUX_ARM64_URL "$LINUX_ARM64_URL" \
   LINUX_ARM64_SHA256 "$LINUX_ARM64_SHA256" \
   LINUX_AMD64_URL "$LINUX_AMD64_URL" \
