@@ -83,11 +83,12 @@ cargo_license() {
 release_tag_to_version() {
   local tag="$1"
 
-  if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    fail "release tag must have form vX.Y.Z, found ${tag}"
+  if [[ "$tag" =~ ^(oneup-)?v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+    return
   fi
 
-  printf '%s\n' "${tag#v}"
+  fail "release tag must have form vX.Y.Z or oneup-vX.Y.Z, found ${tag}"
 }
 
 read_versioned_changelog_section() {

@@ -4,12 +4,20 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "oneup-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish assets for
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/update-manifest.json
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   validate:
@@ -19,6 +27,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - id: version
         shell: bash
@@ -32,7 +42,7 @@ jobs:
 
       - name: validate release metadata
         shell: bash
-        run: bash scripts/release/validate_release_metadata.sh "${GITHUB_REF_NAME}"
+        run: bash scripts/release/validate_release_metadata.sh "${RELEASE_TAG}"
 
   build:
     name: build ${{ matrix.target }}
@@ -54,6 +64,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -132,6 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -146,25 +159,25 @@ jobs:
 
       - name: generate checksums and manifest
         shell: bash
-        env:
-          ONEUP_RELEASE_COMMIT_SHA: ${{ github.sha }}
         run: |
+          commit_sha=$(git rev-parse HEAD)
           bash scripts/release/write_sha256sums.sh \
             --assets-dir "${RUNNER_TEMP}/dist" \
             --output "${RUNNER_TEMP}/dist/SHA256SUMS"
           bash scripts/release/generate_release_manifest.sh \
-            --tag "${GITHUB_REF_NAME}" \
+            --tag "${RELEASE_TAG}" \
             --assets-dir "${RUNNER_TEMP}/dist" \
             --checksums "${RUNNER_TEMP}/dist/SHA256SUMS" \
-            --output "${RUNNER_TEMP}/dist/release-manifest.json"
-          bash scripts/release/extract_release_notes.sh "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/dist/release-notes.md"
+            --output "${RUNNER_TEMP}/dist/release-manifest.json" \
+            --commit-sha "${commit_sha}"
+          bash scripts/release/extract_release_notes.sh "${RELEASE_TAG}" > "${RUNNER_TEMP}/dist/release-notes.md"
 
       - name: create or update release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           title="1up ${{ needs.validate.outputs.version }}"
           release_json=""
 

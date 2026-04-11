@@ -1,9 +1,6 @@
 name: release-evidence
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   release:
     types:
       - published
@@ -80,13 +77,13 @@ jobs:
           release_dir="${RUNNER_TEMP}/release"
           mkdir -p "$release_dir"
 
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             rm -f "$release_dir/release-manifest.json"
             if gh release download "${RELEASE_TAG}" --pattern release-manifest.json --dir "$release_dir" --clobber >/dev/null 2>&1; then
               break
             fi
 
-            echo "waiting for release-manifest.json for ${RELEASE_TAG} (attempt ${attempt}/30)" >&2
+            echo "waiting for release-manifest.json for ${RELEASE_TAG} (attempt ${attempt}/60)" >&2
             sleep 20
           done
 
@@ -159,13 +156,13 @@ jobs:
           release_dir="${RUNNER_TEMP}/release"
           mkdir -p "$release_dir"
 
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             rm -f "$release_dir/release-manifest.json"
             if gh release download "${RELEASE_TAG}" --pattern release-manifest.json --dir "$release_dir" --clobber >/dev/null 2>&1; then
               break
             fi
 
-            echo "waiting for release-manifest.json for ${RELEASE_TAG} (attempt ${attempt}/30)" >&2
+            echo "waiting for release-manifest.json for ${RELEASE_TAG} (attempt ${attempt}/60)" >&2
             sleep 20
           done
 
@@ -190,7 +187,7 @@ jobs:
           }
 
           if [[ "${EXPECT_PACKAGE_RECORD}" == "true" ]]; then
-            for attempt in $(seq 1 20); do
+            for attempt in $(seq 1 40); do
               rm -f "$release_dir/package-publication-record.json"
 
               if release_has_asset package-publication-record.json; then
@@ -199,7 +196,7 @@ jobs:
                 break
               fi
 
-              echo "waiting for package-publication-record.json for ${RELEASE_TAG} (attempt ${attempt}/20)" >&2
+              echo "waiting for package-publication-record.json for ${RELEASE_TAG} (attempt ${attempt}/40)" >&2
               sleep 15
             done
 
