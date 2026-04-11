@@ -9,9 +9,9 @@ use crate::shared::reminder::VERSION;
 use crate::shared::types::OutputFormat;
 use crate::shared::update::{
     build_cache_from_manifest, build_update_check_client, build_update_status, clear_update_cache,
-    detect_install_channel, fetch_update_manifest, read_update_cache, refresh_cache_if_stale,
-    self_update, updates_enabled, write_update_cache, InstallChannel, UpdateCheckCache,
-    UpdateStatus,
+    detect_install_channel, fetch_update_manifest, read_compatible_update_cache,
+    refresh_cache_if_stale, self_update, updates_enabled, write_update_cache, InstallChannel,
+    UpdateCheckCache, UpdateStatus,
 };
 
 #[derive(Args)]
@@ -72,7 +72,7 @@ async fn exec_status(format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cache = read_update_cache();
+    let cache = read_compatible_update_cache(VERSION);
     let info = match cache {
         Some(ref c) => {
             let status = build_update_status(c);

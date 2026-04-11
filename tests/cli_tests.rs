@@ -221,6 +221,40 @@ fn update_status_reports_disabled_when_manifest_is_unconfigured() {
 }
 
 #[test]
+fn update_status_ignores_cache_from_different_binary_version() {
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = test_data_dir(home.path());
+    fs::create_dir_all(&data_dir).unwrap();
+
+    fs::write(
+        data_dir.join("update-check.json"),
+        r#"{
+  "current_version": "0.0.1",
+  "latest_version": "99.0.0",
+  "checked_at": "2026-04-10T10:27:24Z",
+  "install_channel": "manual",
+  "yanked": false,
+  "upgrade_instruction": "1up update"
+}"#,
+    )
+    .unwrap();
+
+    let output = cmd()
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .env("ONEUP_UPDATE_MANIFEST_URL", "https://example.com/update-manifest.json")
+        .args(["--format", "human", "update", "--status"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("No cached update information."));
+    assert!(!stdout.contains("Latest version:"));
+}
+
+#[test]
 fn update_check_fails_when_manifest_is_unconfigured() {
     cmd()
         .env("ONEUP_UPDATE_MANIFEST_URL", "")

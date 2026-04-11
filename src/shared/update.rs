@@ -289,6 +289,25 @@ pub fn read_update_cache() -> Option<UpdateCheckCache> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Reads the local update cache only when it matches the running binary version.
+///
+/// If the cache was written by a different binary version, it is cleared and
+/// treated as absent so stale update state cannot leak across manual upgrades
+/// or downgrades.
+pub fn read_compatible_update_cache(running_version: &str) -> Option<UpdateCheckCache> {
+    let cache = read_update_cache()?;
+    if cache.current_version == running_version {
+        return Some(cache);
+    }
+
+    debug!(
+        "discarding update cache for version {} while running {}",
+        cache.current_version, running_version
+    );
+    clear_update_cache();
+    None
+}
+
 /// Writes the update-check cache atomically with secure file permissions.
 ///
 /// Uses `atomic_replace` to ensure the cache file is never partially written.
@@ -375,7 +394,7 @@ pub async fn refresh_cache_if_stale() -> Option<UpdateCheckCache> {
         return None;
     }
 
-    let existing = read_update_cache();
+    let existing = read_compatible_update_cache(VERSION);
 
     if let Some(ref cache) = existing {
         if is_cache_valid(cache, VERSION) {
@@ -424,7 +443,7 @@ pub fn format_update_notification() -> Option<String> {
         return None;
     }
 
-    let cache = read_update_cache()?;
+    let cache = read_compatible_update_cache(VERSION)?;
     let status = build_update_status(&cache);
 
     match status {
@@ -1219,6 +1238,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_compatible_update_cache_clears_version_mismatched_cache() {
+        use std::sync::Mutex;
+
+        static CACHE_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp_root.join("xdg-data"));
+
+        write_update_cache(&make_cache("0.0.1", "99.0.0", false, None, None));
+
+        assert!(read_compatible_update_cache(VERSION).is_none());
+        assert!(read_update_cache().is_none());
+
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_update_cache_uses_secure_permissions() {
@@ -1282,6 +1324,25 @@ mod tests {
             ScopedEnvGuard::set("XDG_DATA_HOME", tmp_root.join("xdg-data").into_os_string());
 
         write_update_cache(&make_cache(VERSION, "99.0.0", false, None, None));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(refresh_cache_if_stale()).is_none());
+        assert!(read_update_cache().is_none());
+    }
+
+    #[test]
+    fn refresh_cache_if_stale_does_not_reuse_version_mismatched_cache() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _manifest_guard = ScopedEnvGuard::set(
+            UPDATE_MANIFEST_URL_ENV_VAR,
+            "http://127.0.0.1:9/update-manifest.json",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let _xdg_guard =
+            ScopedEnvGuard::set("XDG_DATA_HOME", tmp_root.join("xdg-data").into_os_string());
+
+        write_update_cache(&make_cache("0.0.1", "99.0.0", false, None, None));
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         assert!(runtime.block_on(refresh_cache_if_stale()).is_none());
@@ -1566,5 +1627,23 @@ mod tests {
 
         assert_eq!(format_update_notification(), None);
         assert!(read_update_cache().is_some());
+    }
+
+    #[test]
+    fn format_update_notification_ignores_version_mismatched_cache() {
+        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _manifest_guard = ScopedEnvGuard::set(
+            UPDATE_MANIFEST_URL_ENV_VAR,
+            "https://example.com/update-manifest.json",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let _xdg_guard =
+            ScopedEnvGuard::set("XDG_DATA_HOME", tmp_root.join("xdg-data").into_os_string());
+
+        write_update_cache(&make_cache("0.0.1", "99.0.0", false, None, None));
+
+        assert_eq!(format_update_notification(), None);
+        assert!(read_update_cache().is_none());
     }
 }
