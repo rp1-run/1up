@@ -18,6 +18,10 @@ fn test_release_tag() -> String {
     format!("v{TEST_RELEASE_VERSION}")
 }
 
+fn legacy_component_release_tag() -> String {
+    format!("oneup-v{TEST_RELEASE_VERSION}")
+}
+
 fn next_patch_tag() -> String {
     let mut parts = TEST_RELEASE_VERSION.split('.');
     let major = parts.next().unwrap();
@@ -359,6 +363,59 @@ fn release_metadata_validation_rejects_mismatched_tag_and_version() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not match release tag"));
+}
+
+#[test]
+fn release_metadata_validation_accepts_component_prefixed_tag_and_changelog() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let release_tag = legacy_component_release_tag();
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "validate_release_metadata.sh",
+        &[&release_tag],
+    );
+    assert!(
+        output.status.success(),
+        "validation unexpectedly failed for component-prefixed tag: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn release_manifest_generation_accepts_component_prefixed_tag() {
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
+    let release_tag = legacy_component_release_tag();
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "generate_release_manifest.sh",
+        &[
+            "--tag",
+            &release_tag,
+            "--assets-dir",
+            dist_dir.to_str().unwrap(),
+            "--checksums",
+            dist_dir.join("SHA256SUMS").to_str().unwrap(),
+            "--output",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--commit-sha",
+            "abc123def456",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "manifest generation unexpectedly failed for component-prefixed tag: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["version"], TEST_RELEASE_VERSION);
+    assert_eq!(manifest["git_tag"], release_tag);
 }
 
 #[test]
@@ -1062,6 +1119,7 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/release-evidence.yml")).unwrap();
 
+    assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("download retained security check"));
     assert!(workflow.contains("bash scripts/release/download_retained_security_check.sh"));
     assert!(workflow.contains("pattern: archive-verification-*"));
@@ -1083,8 +1141,13 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
 
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("oneup-v*.*.*"));
+    assert!(workflow.contains("RELEASE_TAG"));
+    assert!(workflow.contains("ref: ${{ env.RELEASE_TAG }}"));
     assert!(workflow.contains("UPDATE_MANIFEST_URL"));
     assert!(workflow.contains("ONEUP_UPDATE_MANIFEST_URL"));
+    assert!(workflow.contains("--commit-sha \"${commit_sha}\""));
     assert!(workflow.contains("waiting for existing release"));
     assert!(workflow.contains("gh release edit \"$tag\""));
     assert!(workflow.contains("gh release create \"$tag\""));
@@ -1100,17 +1163,27 @@ fn publish_packages_workflow_verifies_stable_update_manifest() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
 
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("RELEASE_TAG"));
     assert!(workflow.contains("verify stable update manifest"));
     assert!(workflow.contains("validate release pat"));
     assert!(workflow.contains("RELEASE_PAT"));
     assert!(workflow.contains("token: ${{ secrets.RELEASE_PAT }}"));
     assert!(workflow.contains("git push origin HEAD:main"));
+    assert!(workflow.contains("seq 1 60"));
     assert!(workflow.contains("waiting for release-manifest.json"));
     assert!(workflow.contains("wait for stable update manifest"));
     assert!(workflow.contains("curl --fail --silent --show-error --location"));
     assert!(workflow.contains("jq -S"));
     assert!(workflow.contains("diff -u"));
     assert!(workflow.contains("UPDATE_MANIFEST_URL"));
+}
+
+#[test]
+fn release_please_config_disables_component_prefixed_tags() {
+    let config = fs::read_to_string(repo_root().join("release-please-config.json")).unwrap();
+
+    assert!(config.contains("\"include-component-in-tag\": false"));
 }
 
 #[cfg(unix)]
