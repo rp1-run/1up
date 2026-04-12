@@ -1,11 +1,11 @@
 use clap::Args;
-use nanospinner::Spinner;
 
 use crate::cli::output::{formatter_for, spawn_index_watch_renderer};
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
+use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -29,9 +29,14 @@ pub struct ReindexArgs {
     pub watch: bool,
 }
 
-fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
+fn spin(msg: impl Into<String>, show_progress_ui: bool) -> ProgressUi {
+    ProgressUi::stderr_if(ProgressState::spinner(msg), show_progress_ui)
+}
+
+fn should_use_direct_watch_progress_ui(format: OutputFormat) -> bool {
     use std::io::IsTerminal;
-    Spinner::with_writer_tty(msg, std::io::stderr(), std::io::stderr().is_terminal()).start()
+
+    format == OutputFormat::Human && std::io::stderr().is_terminal()
 }
 
 fn model_status_message(status: &EmbeddingLoadStatus) -> String {
@@ -79,40 +84,33 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
         registry.indexing_config_for(&project_root),
     )?;
 
+    if should_use_direct_watch_progress_ui(format) {
+        let stats = run_reindex_once(&db_path, &project_root, &indexing_config, true, None).await?;
+
+        let msg = format!(
+            "Re-indexed {} files ({} segments). Clean rebuild complete.{}",
+            stats.files_indexed,
+            stats.segments_stored,
+            if stats.embeddings_generated {
+                ""
+            } else {
+                " [no embeddings]"
+            },
+        );
+        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+        return Ok(());
+    }
+
     let (progress_tx, progress_handle) = spawn_index_watch_renderer(format);
     send_watch_progress(&progress_tx, IndexPhase::Rebuilding, "Rebuilding database");
 
-    let result = async {
-        let db = Db::open_rw(&db_path).await?;
-        let conn = db.connect()?;
-        schema::rebuild(&conn).await?;
-        send_watch_progress(&progress_tx, IndexPhase::Rebuilding, "Rebuilt schema v5");
-
-        send_watch_progress(
-            &progress_tx,
-            IndexPhase::LoadingModel,
-            "Loading embedding model",
-        );
-
-        let mut runtime = EmbeddingRuntime::default();
-        let status = runtime
-            .prepare_for_indexing(indexing_config.embed_threads)
-            .await;
-        send_watch_progress(
-            &progress_tx,
-            IndexPhase::LoadingModel,
-            model_status_message(&status),
-        );
-
-        pipeline::run_with_config_and_progress(
-            &conn,
-            &project_root,
-            runtime.current_embedder(),
-            &indexing_config,
-            Some(progress_tx.clone()),
-        )
-        .await
-    }
+    let result = run_reindex_once(
+        &db_path,
+        &project_root,
+        &indexing_config,
+        false,
+        Some(&progress_tx),
+    )
     .await;
 
     drop(progress_tx);
@@ -150,32 +148,13 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         args.embed_threads,
         registry.indexing_config_for(&project_root),
     )?;
-
-    let setup_spinner = spin("Rebuilding database");
-
-    let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect()?;
-    schema::rebuild(&conn).await?;
-    setup_spinner.success_with("Rebuilt schema v5");
-
-    let model_spinner = spin("Loading embedding model");
-
-    let mut runtime = EmbeddingRuntime::default();
-    let status = runtime
-        .prepare_for_indexing(indexing_config.embed_threads)
-        .await;
-    let status_message = model_status_message(&status);
-    match &status {
-        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => model_spinner.success(),
-        EmbeddingLoadStatus::Downloaded => model_spinner.success_with(status_message),
-        EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message),
-    }
-
-    let stats = pipeline::run_with_config(
-        &conn,
+    let show_progress_ui = format == OutputFormat::Human;
+    let stats = run_reindex_once(
+        &db_path,
         &project_root,
-        runtime.current_embedder(),
         &indexing_config,
+        show_progress_ui,
+        None,
     )
     .await?;
 
@@ -191,4 +170,56 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     );
     println!("{}", fmt.format_index_summary(&msg, &stats.progress));
     Ok(())
+}
+
+async fn run_reindex_once(
+    db_path: &std::path::Path,
+    project_root: &std::path::Path,
+    indexing_config: &crate::shared::types::IndexingConfig,
+    show_progress_ui: bool,
+    progress_tx: Option<&pipeline::ProgressSender>,
+) -> anyhow::Result<pipeline::PipelineStats> {
+    let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
+
+    let db = Db::open_rw(db_path).await?;
+    let conn = db.connect()?;
+    schema::rebuild(&conn).await?;
+    setup_spinner.success_with("Rebuilt schema v5");
+
+    if let Some(progress_tx) = progress_tx {
+        send_watch_progress(progress_tx, IndexPhase::Rebuilding, "Rebuilt schema v5");
+        send_watch_progress(
+            progress_tx,
+            IndexPhase::LoadingModel,
+            "Loading embedding model",
+        );
+    }
+
+    let mut model_spinner = spin("Loading embedding model", show_progress_ui);
+
+    let mut runtime = EmbeddingRuntime::default();
+    let status = runtime
+        .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)
+        .await;
+    let status_message = model_status_message(&status);
+    match &status {
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => model_spinner.success(),
+        EmbeddingLoadStatus::Downloaded => model_spinner.success_with(status_message.clone()),
+        EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message.clone()),
+    }
+
+    if let Some(progress_tx) = progress_tx {
+        send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
+    }
+
+    pipeline::run_with_config_and_progress_ui(
+        &conn,
+        project_root,
+        runtime.current_embedder(),
+        indexing_config,
+        progress_tx.cloned(),
+        show_progress_ui,
+    )
+    .await
+    .map_err(Into::into)
 }

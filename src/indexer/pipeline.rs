@@ -4,15 +4,9 @@ use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use libsql::Connection;
-use nanospinner::Spinner;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
-
-fn spin(msg: impl Into<String>) -> nanospinner::SpinnerHandle {
-    use std::io::IsTerminal;
-    Spinner::with_writer_tty(msg, std::io::stderr(), std::io::stderr().is_terminal()).start()
-}
 
 fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
     config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME)
@@ -68,9 +62,7 @@ fn pipeline_progress_message(
                 format!("Scanning {files_total} files")
             }
         }
-        IndexPhase::Parsing | IndexPhase::Storing => {
-            format!("Processing files ({}/{files_total})", stats.files_processed)
-        }
+        IndexPhase::Parsing | IndexPhase::Storing => "Processing files".to_string(),
         IndexPhase::Complete => format!(
             "Processed {files_total} files: {} indexed, {} skipped, {} deleted, {} segments{}",
             stats.files_indexed,
@@ -86,6 +78,20 @@ fn pipeline_progress_message(
     };
 
     Some(message)
+}
+
+fn pipeline_progress_ui_state(
+    stats: &PipelineStats,
+    phase: IndexPhase,
+    files_total: usize,
+) -> ProgressState {
+    let message = pipeline_progress_message(stats, phase, files_total).unwrap_or_default();
+    match phase {
+        IndexPhase::Parsing | IndexPhase::Storing if files_total > 0 => {
+            ProgressState::items(message, stats.files_processed as u64, files_total as u64)
+        }
+        _ => ProgressState::spinner(message),
+    }
 }
 
 struct ProgressUpdate {
@@ -132,6 +138,7 @@ use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{EMBEDDING_DIM, HF_MODEL_REPO};
 use crate::shared::errors::{IndexingError, OneupError};
+use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
     IndexParallelism, IndexPhase, IndexProgress, IndexStageTimings, IndexState, IndexingConfig,
     ParsedSegment, RunScope,
@@ -804,9 +811,21 @@ pub async fn run_with_config(
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_config_and_progress(conn, project_root, embedder, config, None).await
+    run_with_config_with_progress_ui(conn, project_root, embedder, config, true).await
 }
 
+pub async fn run_with_config_with_progress_ui(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    config: &IndexingConfig,
+    show_progress_ui: bool,
+) -> Result<PipelineStats, OneupError> {
+    run_with_config_and_progress_ui(conn, project_root, embedder, config, None, show_progress_ui)
+        .await
+}
+
+#[allow(dead_code)]
 pub async fn run_with_config_and_progress(
     conn: &Connection,
     project_root: &Path,
@@ -814,13 +833,25 @@ pub async fn run_with_config_and_progress(
     config: &IndexingConfig,
     progress_tx: Option<ProgressSender>,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_scope_and_progress(
+    run_with_config_and_progress_ui(conn, project_root, embedder, config, progress_tx, true).await
+}
+
+pub async fn run_with_config_and_progress_ui(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+) -> Result<PipelineStats, OneupError> {
+    run_with_scope_and_progress_ui(
         conn,
         project_root,
         embedder,
         &RunScope::Full,
         config,
         progress_tx,
+        show_progress_ui,
     )
     .await
 }
@@ -832,9 +863,10 @@ pub async fn run_with_scope(
     scope: &RunScope,
     config: &IndexingConfig,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_scope_and_progress(conn, project_root, embedder, scope, config, None).await
+    run_with_scope_and_progress_ui(conn, project_root, embedder, scope, config, None, true).await
 }
 
+#[allow(dead_code)]
 pub async fn run_with_scope_and_progress(
     conn: &Connection,
     project_root: &Path,
@@ -842,6 +874,27 @@ pub async fn run_with_scope_and_progress(
     scope: &RunScope,
     config: &IndexingConfig,
     progress_tx: Option<ProgressSender>,
+) -> Result<PipelineStats, OneupError> {
+    run_with_scope_and_progress_ui(
+        conn,
+        project_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        true,
+    )
+    .await
+}
+
+pub async fn run_with_scope_and_progress_ui(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
 ) -> Result<PipelineStats, OneupError> {
     let run_inputs = match scope {
         RunScope::Full => prepare_full_run_inputs(conn, project_root).await?,
@@ -867,6 +920,7 @@ pub async fn run_with_scope_and_progress(
         config,
         run_inputs,
         progress_tx,
+        show_progress_ui,
     )
     .await
 }
@@ -878,6 +932,7 @@ async fn execute_run_with_inputs(
     config: &IndexingConfig,
     run_inputs: RunInputs,
     progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
 ) -> Result<PipelineStats, OneupError> {
     let run_started_at = Instant::now();
     let mut stats = PipelineStats::default();
@@ -912,12 +967,19 @@ async fn execute_run_with_inputs(
         },
     );
 
-    let progress_spinner = spin("Scanning files");
+    let mut progress_ui = ProgressUi::stderr_if(
+        pipeline_progress_ui_state(&stats, IndexPhase::Scanning, 0),
+        show_progress_ui,
+    );
     let scan_started_at = Instant::now();
 
     stats.files_scanned = scanned_files.len();
-    progress_spinner.update(format!("Scanning {} files", scanned_files.len()));
     let total_files = scanned_files.len();
+    progress_ui.set_state(pipeline_progress_ui_state(
+        &stats,
+        IndexPhase::Scanning,
+        total_files,
+    ));
     timings.scan_ms = scan_started_at.elapsed().as_millis();
     parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
 
@@ -966,7 +1028,11 @@ async fn execute_run_with_inputs(
         },
     );
 
-    progress_spinner.update(format!("Processing files (0/{total_files})"));
+    progress_ui.set_state(pipeline_progress_ui_state(
+        &stats,
+        IndexPhase::Parsing,
+        total_files,
+    ));
     let parse_started_at = Instant::now();
 
     let mut reorder_buffer = BTreeMap::new();
@@ -1027,7 +1093,11 @@ async fn execute_run_with_inputs(
             .await?;
 
             flush_state.refresh(current_progress_phase(flush_state.stats), false);
-            progress_spinner.update(format!("Processing files ({next_to_flush}/{total_files})"));
+            progress_ui.set_state(pipeline_progress_ui_state(
+                flush_state.stats,
+                current_progress_phase(flush_state.stats),
+                total_files,
+            ));
         }
 
         flush_reorder_buffer(
@@ -1052,7 +1122,7 @@ async fn execute_run_with_inputs(
         total_files, timings.parse_ms
     );
 
-    progress_spinner.success_with(format!(
+    progress_ui.success_with(format!(
         "Processed {} files: {} indexed, {} skipped, {} deleted, {} segments",
         total_files,
         stats.files_indexed,

@@ -79,7 +79,7 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 
 # Terminal UI
-nanospinner = "0.3"
+indicatif = "0.18"
 
 # Logging
 tracing = "0.1"

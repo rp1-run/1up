@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use colored::Colorize;
-use nanospinner::Spinner;
 use serde::Serialize;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
     ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
     StructuralResult, SymbolResult,
@@ -128,6 +129,41 @@ pub fn spawn_index_watch_renderer(format: OutputFormat) -> (Sender<IndexProgress
 struct JsonFormatter;
 struct HumanFormatter;
 struct PlainFormatter;
+
+const WATCH_RENDER_INTERVAL: Duration = Duration::from_millis(125);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchRenderState {
+    state: IndexState,
+    phase: IndexPhase,
+    message: Option<String>,
+    files_processed: usize,
+    files_total: usize,
+    files_indexed: usize,
+    files_skipped: usize,
+    files_deleted: usize,
+    segments_stored: usize,
+    embeddings_enabled: bool,
+    parallelism: Option<crate::shared::types::IndexParallelism>,
+}
+
+impl From<&IndexProgress> for WatchRenderState {
+    fn from(progress: &IndexProgress) -> Self {
+        Self {
+            state: progress.state,
+            phase: progress.phase,
+            message: progress.message.clone(),
+            files_processed: progress.files_processed,
+            files_total: progress.files_total,
+            files_indexed: progress.files_indexed,
+            files_skipped: progress.files_skipped,
+            files_deleted: progress.files_deleted,
+            segments_stored: progress.segments_stored,
+            embeddings_enabled: progress.embeddings_enabled,
+            parallelism: progress.parallelism.clone(),
+        }
+    }
+}
 
 impl Formatter for JsonFormatter {
     fn format_search_results(&self, results: &[SearchResult]) -> String {
@@ -978,45 +1014,152 @@ impl Formatter for PlainFormatter {
 }
 
 fn render_watch_updates(format: OutputFormat, rx: Receiver<IndexProgress>) {
-    let formatter = formatter_for(format);
-    let mut spinner = start_watch_spinner(format);
-    let mut last_progress = None;
+    use std::io::IsTerminal;
 
-    while let Ok(progress) = rx.recv() {
-        let spinner_label = render_index_watch_message(&progress);
-        if let Some(spinner) = spinner.as_mut() {
-            spinner.update(spinner_label.clone());
+    let formatter = formatter_for(format);
+    let mut progress_ui = start_watch_progress_ui(format);
+    let stream_updates = should_stream_watch_updates(format, std::io::stderr().is_terminal());
+    let mut last_rendered_state: Option<WatchRenderState> = None;
+    let mut last_rendered_at: Option<Instant> = None;
+    let mut disconnected = false;
+
+    while !disconnected {
+        let mut progress = match rx.recv() {
+            Ok(progress) => progress,
+            Err(_) => break,
+        };
+
+        loop {
+            let current_state = WatchRenderState::from(&progress);
+            if should_render_watch_update(
+                last_rendered_state.as_ref(),
+                &current_state,
+                last_rendered_at,
+            ) {
+                break;
+            }
+
+            let Some(last_rendered_at) = last_rendered_at else {
+                break;
+            };
+
+            let wait_for = WATCH_RENDER_INTERVAL.saturating_sub(last_rendered_at.elapsed());
+            match rx.recv_timeout(wait_for) {
+                Ok(next_progress) => progress = next_progress,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
 
-        let rendered = formatter.format_index_watch_update(&progress);
-        if last_progress.as_ref() != Some(&rendered) {
+        let current_state = WatchRenderState::from(&progress);
+        if last_rendered_state.as_ref() == Some(&current_state) {
+            if progress.state == IndexState::Complete {
+                let spinner_label = render_index_watch_message(&progress);
+                if let Some(mut progress_ui) = progress_ui.take() {
+                    progress_ui.success_with(spinner_label);
+                }
+            }
+            if progress.state == IndexState::Complete {
+                break;
+            }
+            continue;
+        }
+
+        let spinner_label = render_index_watch_message(&progress);
+        if let Some(progress_ui) = progress_ui.as_mut() {
+            progress_ui.set_state(watch_progress_ui_state(&progress));
+        }
+
+        if stream_updates {
+            let rendered = formatter.format_index_watch_update(&progress);
             print_watch_output(&rendered);
-            last_progress = Some(rendered);
         }
 
         if progress.state == IndexState::Complete {
-            if let Some(spinner) = spinner.take() {
-                spinner.success_with(spinner_label);
+            if let Some(mut progress_ui) = progress_ui.take() {
+                progress_ui.success_with(spinner_label);
             }
+        }
+
+        last_rendered_state = Some(current_state);
+        last_rendered_at = Some(Instant::now());
+
+        if progress.state == IndexState::Complete {
+            break;
         }
     }
 }
 
-fn start_watch_spinner(format: OutputFormat) -> Option<nanospinner::SpinnerHandle> {
-    use std::io::IsTerminal;
-
+fn start_watch_progress_ui(format: OutputFormat) -> Option<ProgressUi> {
     if format != OutputFormat::Human {
         return None;
     }
 
-    Some(
-        Spinner::with_writer_tty(
-            "Watching index progress",
-            std::io::stderr(),
-            std::io::stderr().is_terminal(),
-        )
-        .start(),
-    )
+    Some(ProgressUi::stderr_if(
+        ProgressState::spinner("Watching index progress"),
+        true,
+    ))
+}
+
+fn should_stream_watch_updates(format: OutputFormat, stderr_is_terminal: bool) -> bool {
+    match format {
+        OutputFormat::Human => !stderr_is_terminal,
+        OutputFormat::Json | OutputFormat::Plain => true,
+    }
+}
+
+fn should_render_watch_update(
+    last_rendered_state: Option<&WatchRenderState>,
+    current_state: &WatchRenderState,
+    last_rendered_at: Option<Instant>,
+) -> bool {
+    let Some(last_rendered_state) = last_rendered_state else {
+        return true;
+    };
+
+    if current_state == last_rendered_state {
+        return false;
+    }
+
+    if current_state.state == IndexState::Complete
+        || current_state.state != last_rendered_state.state
+        || current_state.phase != last_rendered_state.phase
+        || (same_progress_counters(last_rendered_state, current_state)
+            && current_state.message != last_rendered_state.message)
+    {
+        return true;
+    }
+
+    last_rendered_at
+        .is_none_or(|last_rendered_at| last_rendered_at.elapsed() >= WATCH_RENDER_INTERVAL)
+}
+
+fn same_progress_counters(left: &WatchRenderState, right: &WatchRenderState) -> bool {
+    left.files_processed == right.files_processed
+        && left.files_total == right.files_total
+        && left.files_indexed == right.files_indexed
+        && left.files_skipped == right.files_skipped
+        && left.files_deleted == right.files_deleted
+        && left.segments_stored == right.segments_stored
+        && left.embeddings_enabled == right.embeddings_enabled
+        && left.parallelism == right.parallelism
+}
+
+fn watch_progress_ui_state(progress: &IndexProgress) -> ProgressState {
+    let message = render_index_watch_message(progress);
+    match progress.phase {
+        IndexPhase::Parsing | IndexPhase::Storing if progress.files_total > 0 => {
+            ProgressState::items(
+                message,
+                progress.files_processed as u64,
+                progress.files_total as u64,
+            )
+        }
+        _ => ProgressState::spinner(message),
+    }
 }
 
 fn print_watch_output(rendered: &str) {
@@ -1314,6 +1457,99 @@ mod tests {
         assert!(rendered.contains("event:index_progress"));
         assert!(rendered.contains("files_processed:6"));
         assert!(rendered.contains("message:Processed 6 files"));
+    }
+
+    #[test]
+    fn human_watch_updates_use_in_place_rendering_on_ttys() {
+        assert!(!should_stream_watch_updates(OutputFormat::Human, true));
+        assert!(should_stream_watch_updates(OutputFormat::Human, false));
+    }
+
+    #[test]
+    fn plain_and_json_watch_updates_always_stream() {
+        assert!(should_stream_watch_updates(OutputFormat::Plain, true));
+        assert!(should_stream_watch_updates(OutputFormat::Plain, false));
+        assert!(should_stream_watch_updates(OutputFormat::Json, true));
+        assert!(should_stream_watch_updates(OutputFormat::Json, false));
+    }
+
+    #[test]
+    fn watch_render_state_ignores_timing_and_timestamp_noise() {
+        let baseline = WatchRenderState::from(&sample_progress());
+        let mut noisy = sample_progress();
+        noisy.timings = Some(IndexStageTimings {
+            scan_ms: 99,
+            parse_ms: 101,
+            embed_ms: 103,
+            store_ms: 105,
+            total_ms: 407,
+        });
+        noisy.updated_at = chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:09Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(baseline, WatchRenderState::from(&noisy));
+    }
+
+    #[test]
+    fn watch_render_changes_are_throttled_within_the_same_phase() {
+        let mut previous_progress = sample_progress();
+        previous_progress.state = IndexState::Running;
+        previous_progress.phase = IndexPhase::Storing;
+        let previous = WatchRenderState::from(&previous_progress);
+        let mut next = previous_progress;
+        next.files_processed += 1;
+        next.message = Some("Processed 7 files".to_string());
+        let next_state = WatchRenderState::from(&next);
+
+        assert!(!should_render_watch_update(
+            Some(&previous),
+            &next_state,
+            Some(Instant::now())
+        ));
+    }
+
+    #[test]
+    fn watch_render_phase_changes_are_emitted_immediately() {
+        let previous = WatchRenderState::from(&sample_progress());
+        let mut next = sample_progress();
+        next.phase = IndexPhase::LoadingModel;
+        next.message = Some("Embedding model ready".to_string());
+        let next_state = WatchRenderState::from(&next);
+
+        assert!(should_render_watch_update(
+            Some(&previous),
+            &next_state,
+            Some(Instant::now())
+        ));
+    }
+
+    #[test]
+    fn watch_progress_ui_state_uses_bar_for_file_processing() {
+        let mut progress = sample_progress();
+        progress.state = IndexState::Running;
+        progress.phase = IndexPhase::Parsing;
+        progress.files_processed = 3;
+        progress.files_total = 6;
+        progress.message = Some("Processing files".to_string());
+
+        assert_eq!(
+            watch_progress_ui_state(&progress),
+            ProgressState::items("Processing files", 3, 6)
+        );
+    }
+
+    #[test]
+    fn watch_progress_ui_state_keeps_spinner_for_unbounded_phases() {
+        let mut progress = sample_progress();
+        progress.state = IndexState::Running;
+        progress.phase = IndexPhase::LoadingModel;
+        progress.message = Some("Loading embedding model".to_string());
+
+        assert_eq!(
+            watch_progress_ui_state(&progress),
+            ProgressState::spinner("Loading embedding model")
+        );
     }
 
     #[test]

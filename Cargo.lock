@@ -1964,12 +1964,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanospinner"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189900f581af8fe6a8e02d4a31aecffbebcdb7a0266a7aed3c35f14fc4ca6bf8"
-
-[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,9 +2119,9 @@ dependencies = [
  "flate2",
  "futures-util",
  "ignore",
+ "indicatif",
  "libc",
  "libsql",
- "nanospinner",
  "nix",
  "notify",
  "ort",

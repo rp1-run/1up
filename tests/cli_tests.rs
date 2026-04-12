@@ -491,6 +491,60 @@ fn index_watch_plain_output_streams_progress_updates() {
 }
 
 #[test]
+fn index_watch_json_output_streams_progress_updates() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "json",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"event\":\"index_progress\"")
+                .and(predicate::str::contains("\"phase\":\"preparing\""))
+                .and(predicate::str::contains("\"phase\":\"loading_model\""))
+                .and(predicate::str::contains("\"phase\":\"complete\"")),
+        );
+}
+
+#[test]
+fn index_watch_human_output_keeps_progress_off_stdout() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "human",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Indexed 1 files")
+                .and(predicate::str::contains("event:index_progress").not()),
+        );
+}
+
+#[test]
 fn reindex_watch_plain_output_streams_rebuild_and_completion() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
