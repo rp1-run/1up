@@ -82,7 +82,7 @@
 **Implementation**: `src/search/retrieval.rs`
 
 ### SearchRequest / SearchResponse
-**Definition**: Daemon IPC message types for the Unix domain socket search service. SearchRequest contains project_root, query, and limit. SearchResponse is tagged-union: Results{results} or Unavailable{reason}. Transmitted as length-prefixed JSON frames.
+**Definition**: Daemon IPC message types for the Unix domain socket search service. SearchRequest contains project_root, query, and limit. SearchResponse is tagged-union: Results{results, daemon_version} or Unavailable{reason}. Transmitted as length-prefixed JSON frames. The optional `daemon_version` field enables CLI/daemon version mismatch detection.
 **Implementation**: `src/daemon/search_service.rs`
 
 ### Fence
@@ -100,6 +100,30 @@
 ### IPC Frame Protocol
 **Definition**: Length-prefixed JSON framing for daemon Unix domain socket communication. 4-byte big-endian length header + JSON payload. Bounded by MAX_DAEMON_REQUEST_BYTES (16KB) and MAX_DAEMON_RESPONSE_BYTES (2MB). All reads/writes have millisecond-level deadlines. Peer UID authorization via SO_PEERCRED.
 **Implementation**: `src/daemon/ipc.rs`, `src/shared/constants.rs`
+
+### UpdateManifest
+**Definition**: Machine-readable update manifest fetched from a configured HTTPS endpoint. Contains version, git_tag, published_at, notes_url, per-platform artifacts (target triple, archive name, SHA-256, download URL), distribution channel metadata (GitHub release, Homebrew tap/formula, Scoop bucket/manifest), and safety signals (yanked flag, minimum_safe_version, operator message).
+**Implementation**: `src/shared/update.rs`
+
+### UpdateCheckCache
+**Definition**: Locally persisted result of the most recent update check at `~/.local/share/1up/update-check.json`. Stores current_version, latest_version, checked_at timestamp, install_channel, yanked flag, minimum_safe_version, operator message, notes_url, and upgrade_instruction. Valid for 24 hours (UPDATE_CHECK_TTL_SECS). Version-pinned: cache written by a different binary version is silently discarded.
+**Implementation**: `src/shared/update.rs`, `src/shared/config.rs`
+
+### InstallChannel
+**Definition**: How 1up was installed on the system: Homebrew, Scoop, Manual, or Unknown. Auto-detected by examining the canonicalized binary path for Cellar/homebrew (macOS/Linux) or scoop\apps (Windows) path segments. Determines the upgrade instruction shown to users.
+**Implementation**: `src/shared/update.rs`
+
+### UpdateStatus
+**Definition**: Assessed update urgency relative to the running binary version: UpToDate, UpdateAvailable{latest}, Yanked{latest, message} (version recalled, upgrade immediately), or BelowMinimumSafe{latest, minimum_safe, message} (below operator-set floor). Yanked takes precedence over BelowMinimumSafe; both take precedence over UpdateAvailable.
+**Implementation**: `src/shared/update.rs`
+
+### DaemonProjectStatus
+**Definition**: Persisted daemon heartbeat for a project, written to `.1up/daemon_status.json`. Contains a single `last_file_check_at` timestamp updated every 30 seconds (DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS) to prove the daemon is still watching the repo. Surfaced in `1up status` output.
+**Implementation**: `src/shared/types.rs`, `src/shared/config.rs`
+
+### SelfUpdateResult
+**Definition**: Outcome of a successful in-place binary replacement via `self_update`. Contains old_version and new_version. Only valid for Manual/Unknown install channels; managed installs (Homebrew, Scoop) use their respective package manager commands.
+**Implementation**: `src/shared/update.rs`
 
 ## Technical Concepts
 
@@ -120,6 +144,15 @@
 ### Schema Versioning
 **Purpose**: Meta table tracks schema version; `prepare_for_write` validates or initializes; stale versions require explicit `1up reindex`
 **Implementation**: `src/storage/schema.rs`
+
+### Non-Fatal Update Checks
+**Purpose**: Update check failures never block normal operation. Cache read/write/clear failures are logged at debug level but not propagated. Stale cache is returned on fetch failure. Permanent HTTP errors (4xx except 408/429) invalidate cache; transient errors preserve it.
+
+### Version-Pinned Cache
+**Purpose**: Update check cache is bound to the binary version that wrote it. `read_compatible_update_cache` discards and clears cache entries from different binary versions, preventing stale state from leaking across manual upgrades or downgrades.
+
+### Download-Verify-Replace Pipeline
+**Purpose**: `self_update` stages artifacts in a temp dir adjacent to the binary: download archive -> verify SHA-256 checksum -> extract binary from tar.gz (Unix) or zip (Windows) -> atomic rename replacement with platform-specific strategy.
 
 ## Terminology Glossary
 
@@ -146,9 +179,17 @@
 - **Sequence ID**: Monotonic index assigned to each scanned file before parallel dispatch, ensuring deterministic output order
 - **Write Batch**: Configurable number of parsed files grouped into a single storage transaction (`write_batch_files`)
 
+### Update Terms
+- **Update Manifest URL**: HTTPS endpoint serving the UpdateManifest JSON. Set at compile time for release builds via ONEUP_UPDATE_MANIFEST_URL env var; runtime value overrides baked value; empty runtime value disables updates for the process
+- **Update Check TTL**: Time-to-live for the local update-check cache: 24 hours (86400 seconds). Stale cache triggers a background manifest re-fetch
+- **Target Triple**: Rust target triple (e.g., aarch64-apple-darwin) used to match the current platform against release artifacts. Supports 5 platforms: macOS ARM/x86, Linux ARM/x86, Windows x86
+- **Yanked Version**: A released version marked as recalled in the update manifest. Yanked status takes precedence over all other update assessments and triggers an urgent upgrade warning
+- **Minimum Safe Version**: Operator-set version floor in the update manifest. Binaries below this version receive urgent upgrade warnings with the BelowMinimumSafe status
+
 ### Infrastructure Terms
 - **Daemon**: Background file watcher process that triggers incremental re-indexing on file changes and serves search requests via Unix domain socket. Supports SIGHUP for registry reload, SIGTERM for graceful shutdown, and semaphore-bounded concurrent search handling
-- **XDG-Compliant Storage**: Global config in `~/.config/1up/`, data in `~/.local/share/1up/` (models, registry, daemon.pid, daemon.sock); per-project data in `.1up/`
+- **Daemon Heartbeat**: Periodic timestamp (`last_file_check_at`) persisted to `.1up/daemon_status.json` every 30 seconds, proving the daemon is actively watching the project. Surfaced in `1up status` output for health checking
+- **XDG-Compliant Storage**: Global config in `~/.config/1up/`, data in `~/.local/share/1up/` (models, registry, daemon.pid, daemon.sock, update-check.json); per-project data in `.1up/`
 - **IndexingConfig Resolution Chain**: Priority-ordered config resolution: CLI flags > env vars (ONEUP_INDEX_JOBS, ONEUP_EMBED_THREADS, ONEUP_INDEX_WRITE_BATCH_FILES) > registry persisted values > auto defaults
 - **Scope Escalation**: Ambiguous watcher events (directory changes, pathless errors) escalate RunScope from Paths to Full for the affected project
 - **Peer UID Authorization**: Unix domain socket security check verifying connecting client runs under same UID as daemon
@@ -161,19 +202,20 @@
 | Indexing | `src/indexer/` | Parser, Chunker, Embedder, EmbeddingRuntime, Pipeline, Scanner, Parallel Worker Pool, Reorder Buffer, IndexingConfig, Staged Model Management, Verified Artifacts |
 | Search | `src/search/` | HybridSearchEngine, SymbolSearchEngine, StructuralSearchEngine, ContextEngine, QueryIntent, RetrievalBackend, CandidateRow, RRF Ranking, Multi-Signal Boosting |
 | Storage | `src/storage/` | Schema, Segments CRUD, FTS Virtual Table, Vector Index, Segment Symbols Table, Meta Table, Transactional Batch Writes |
-| Shared | `src/shared/` | Types, Config, Errors, Constants, Project, Secure Filesystem, Symbol Canonicalization, Fence/Reminder, IndexingConfig Resolution |
-| Daemon | `src/daemon/` | Registry, Worker, FileWatcher, ProjectRunState, RunScope, SearchService, IPC Frame Protocol, Lifecycle, SIGHUP Reload, Semaphore-Bounded Search |
+| Shared | `src/shared/` | Types, Config, Errors, Constants, Project, Secure Filesystem, Symbol Canonicalization, Fence/Reminder, IndexingConfig Resolution, UpdateManifest, UpdateCheckCache, InstallChannel, UpdateStatus, DaemonProjectStatus, SelfUpdateResult |
+| Daemon | `src/daemon/` | Registry, Worker, FileWatcher, ProjectRunState, RunScope, SearchService, IPC Frame Protocol, Lifecycle, SIGHUP Reload, Semaphore-Bounded Search, DaemonProjectStatus Heartbeat |
 
 ## Cross-Cutting Concerns
 
-- **Error Handling**: Typed hierarchy with `OneupError` wrapping domain-specific enums (StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError) via thiserror
+- **Error Handling**: Typed hierarchy with `OneupError` wrapping domain-specific enums (StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError, UpdateError) via thiserror
 - **Filesystem Security**: All state file operations go through shared/fs.rs helpers that reject symlinks, enforce owner-only permissions (0o700 dirs, 0o600 files/sockets), use atomic writes, and validate paths against approved roots
 - **Output Formatting**: Three modes (JSON, Human, Plain) selectable via CLI flag; plain is default
 - **Model Management**: Staged artifact pipeline with SHA-256 verification, warm cache via EmbeddingRuntime, download failure markers to prevent retry storms
 - **Incremental Updates**: File hashing + daemon filesystem monitoring with debounce + deleted file detection via set difference + RunScope for targeted re-indexing
 - **Parallelism Configuration**: IndexingConfig resolution chain (CLI > env > registry > auto) with per-project persistence; daemon reloads on SIGHUP
-- **Observability**: IndexProgress with IndexParallelism and IndexStageTimings persisted to `.1up/index_status.json`; phase-granular progress updates
-- **Platform Portability**: Daemon modules are Unix-only with conditional compilation; non-Unix platforms get stub implementations; Windows uses conditional ort configuration
+- **Observability**: IndexProgress with IndexParallelism and IndexStageTimings persisted to `.1up/index_status.json`; DaemonProjectStatus heartbeat persisted to `.1up/daemon_status.json` every 30 seconds; phase-granular progress updates
+- **Platform Portability**: Daemon modules are Unix-only with conditional compilation; non-Unix platforms get stub implementations; Windows uses conditional ort configuration; self-update uses tar.gz on Unix and zip on Windows with platform-specific binary replacement strategy
+- **Self-Update System**: Non-blocking 24-hour TTL cache with version-pinned validity, manifest fetch with bounded timeouts (5s request / 3s connect), passive update notifications on CLI invocation, in-place binary replacement for manual installs, package manager delegation for managed installs (Homebrew/Scoop). UpdateError.should_invalidate_cache() distinguishes permanent from transient failures
 
 ## Cross-References
 - **Architecture**: See [architecture.md](architecture.md) for system layers and data flows
