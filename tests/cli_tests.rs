@@ -173,15 +173,18 @@ fn format_flag_accepts_all_variants() {
 }
 
 #[test]
-fn help_shows_plain_as_default_output_format() {
+fn help_describes_command_specific_output_defaults() {
     cmd().arg("--help").assert().success().stdout(
-        predicate::str::contains("Output format: plain (default), json, human")
-            .and(predicate::str::contains("[default: plain]")),
+        predicate::str::contains("Output format override.")
+            .and(predicate::str::contains(
+                "Defaults to human for start/status/stop/update/hello-agent; plain otherwise",
+            ))
+            .and(predicate::str::contains("[default:").not()),
     );
 }
 
 #[test]
-fn status_defaults_to_plain_output() {
+fn status_defaults_to_human_output() {
     let dir = tempfile::tempdir().unwrap();
 
     cmd()
@@ -189,7 +192,9 @@ fn status_defaults_to_plain_output() {
         .assert()
         .success()
         .stdout(
-            predicate::str::starts_with("daemon:").and(predicate::str::contains("Daemon:").not()),
+            predicate::str::contains("Daemon:")
+                .and(predicate::str::contains("Project:"))
+                .and(predicate::str::contains("daemon:").not()),
         );
 }
 
