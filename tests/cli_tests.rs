@@ -135,11 +135,17 @@ fn subcommand_help_works() {
 
 #[test]
 fn indexing_subcommands_expose_parallel_controls() {
-    for sub in &["index", "reindex", "start"] {
+    for sub in &["index", "reindex"] {
         cmd().args([sub, "--help"]).assert().success().stdout(
-            predicate::str::contains("--jobs").and(predicate::str::contains("--embed-threads")),
+            predicate::str::contains("--jobs")
+                .and(predicate::str::contains("--embed-threads"))
+                .and(predicate::str::contains("--watch")),
         );
     }
+
+    cmd().args(["start", "--help"]).assert().success().stdout(
+        predicate::str::contains("--jobs").and(predicate::str::contains("--embed-threads")),
+    );
 }
 
 #[test]
@@ -451,7 +457,63 @@ fn status_human_output_includes_last_index_progress() {
         .stdout(
             predicate::str::contains("Index status:")
                 .and(predicate::str::contains("Index phase:"))
+                .and(predicate::str::contains("Processed:"))
                 .and(predicate::str::contains("Last index:")),
+        );
+}
+
+#[test]
+fn index_watch_plain_output_streams_progress_updates() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "plain",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("event:index_progress")
+                .and(predicate::str::contains("index_phase:preparing"))
+                .and(predicate::str::contains("index_phase:loading_model"))
+                .and(predicate::str::contains("index_phase:complete")),
+        );
+}
+
+#[test]
+fn reindex_watch_plain_output_streams_rebuild_and_completion() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn watch_mode() -> &'static str {\n    \"ready\"\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "plain",
+            "reindex",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("event:index_progress")
+                .and(predicate::str::contains("index_phase:rebuilding"))
+                .and(predicate::str::contains("index_phase:complete")),
         );
 }
 

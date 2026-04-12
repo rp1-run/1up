@@ -363,6 +363,9 @@ pub enum IndexState {
 #[serde(rename_all = "snake_case")]
 pub enum IndexPhase {
     Pending,
+    Preparing,
+    Rebuilding,
+    LoadingModel,
     Scanning,
     Parsing,
     Storing,
@@ -376,11 +379,15 @@ pub struct IndexProgress {
     pub phase: IndexPhase,
     pub files_total: usize,
     pub files_scanned: usize,
+    #[serde(default)]
+    pub files_processed: usize,
     pub files_indexed: usize,
     pub files_skipped: usize,
     pub files_deleted: usize,
     pub segments_stored: usize,
     pub embeddings_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<IndexParallelism>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,14 +402,25 @@ impl IndexProgress {
             phase: IndexPhase::Pending,
             files_total: 0,
             files_scanned: 0,
+            files_processed: 0,
             files_indexed: 0,
             files_skipped: 0,
             files_deleted: 0,
             segments_stored: 0,
             embeddings_enabled: false,
+            message: None,
             parallelism: None,
             timings: None,
             updated_at: Utc::now(),
+        }
+    }
+
+    pub fn watch(state: IndexState, phase: IndexPhase, message: impl Into<String>) -> Self {
+        Self {
+            state,
+            phase,
+            message: Some(message.into()),
+            ..Self::pending()
         }
     }
 }

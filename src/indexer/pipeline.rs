@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use libsql::Connection;
@@ -44,30 +45,84 @@ fn persist_progress(project_root: &Path, progress: &IndexProgress) {
     }
 }
 
-fn refresh_progress(
-    stats: &mut PipelineStats,
-    project_root: &Path,
+fn emit_progress(progress_tx: Option<&ProgressSender>, progress: &IndexProgress) {
+    if let Some(progress_tx) = progress_tx {
+        let _ = progress_tx.send(progress.clone());
+    }
+}
+
+fn pipeline_progress_message(
+    stats: &PipelineStats,
+    phase: IndexPhase,
+    files_total: usize,
+) -> Option<String> {
+    let message = match phase {
+        IndexPhase::Pending => return None,
+        IndexPhase::Preparing => "Preparing database".to_string(),
+        IndexPhase::Rebuilding => "Rebuilding database".to_string(),
+        IndexPhase::LoadingModel => "Loading embedding model".to_string(),
+        IndexPhase::Scanning => {
+            if files_total == 0 {
+                "Scanning files".to_string()
+            } else {
+                format!("Scanning {files_total} files")
+            }
+        }
+        IndexPhase::Parsing | IndexPhase::Storing => {
+            format!("Processing files ({}/{files_total})", stats.files_processed)
+        }
+        IndexPhase::Complete => format!(
+            "Processed {files_total} files: {} indexed, {} skipped, {} deleted, {} segments{}",
+            stats.files_indexed,
+            stats.files_skipped,
+            stats.files_deleted,
+            stats.segments_stored,
+            if stats.embeddings_generated {
+                ""
+            } else {
+                " [no embeddings]"
+            },
+        ),
+    };
+
+    Some(message)
+}
+
+struct ProgressUpdate {
     state: IndexState,
     phase: IndexPhase,
     files_total: usize,
     parallelism: Option<IndexParallelism>,
     timings: Option<IndexStageTimings>,
+    persist: bool,
+}
+
+fn refresh_progress(
+    stats: &mut PipelineStats,
+    project_root: &Path,
+    progress_tx: Option<&ProgressSender>,
+    update: ProgressUpdate,
 ) {
     stats.progress = IndexProgress {
-        state,
-        phase,
-        files_total,
+        state: update.state,
+        phase: update.phase,
+        files_total: update.files_total,
         files_scanned: stats.files_scanned,
+        files_processed: stats.files_processed,
         files_indexed: stats.files_indexed,
         files_skipped: stats.files_skipped,
         files_deleted: stats.files_deleted,
         segments_stored: stats.segments_stored,
         embeddings_enabled: stats.embeddings_generated,
-        parallelism,
-        timings,
+        message: pipeline_progress_message(stats, update.phase, update.files_total),
+        parallelism: update.parallelism,
+        timings: update.timings,
         updated_at: chrono::Utc::now(),
     };
-    persist_progress(project_root, &stats.progress);
+    if update.persist {
+        persist_progress(project_root, &stats.progress);
+    }
+    emit_progress(progress_tx, &stats.progress);
 }
 
 use crate::indexer::chunker;
@@ -85,6 +140,7 @@ use crate::storage::schema;
 use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
+pub type ProgressSender = Sender<IndexProgress>;
 
 #[derive(Debug, Default)]
 struct TimingAccumulator {
@@ -609,18 +665,23 @@ struct FlushState<'a> {
     timings: &'a mut TimingAccumulator,
     run_started_at: Instant,
     unsupported_extensions: &'a mut HashSet<String>,
+    progress_tx: Option<ProgressSender>,
 }
 
 impl FlushState<'_> {
-    fn refresh(&mut self, phase: IndexPhase) {
+    fn refresh(&mut self, phase: IndexPhase, persist: bool) {
         refresh_progress(
             self.stats,
             self.project_root,
-            IndexState::Running,
-            phase,
-            self.files_total,
-            self.parallelism.clone(),
-            Some(self.timings.snapshot(self.run_started_at)),
+            self.progress_tx.as_ref(),
+            ProgressUpdate {
+                state: IndexState::Running,
+                phase,
+                files_total: self.files_total,
+                parallelism: self.parallelism.clone(),
+                timings: Some(self.timings.snapshot(self.run_started_at)),
+                persist,
+            },
         );
     }
 }
@@ -654,7 +715,7 @@ async fn flush_reorder_buffer(
                         )
                         .await?;
                     }
-                    state.refresh(IndexPhase::Storing);
+                    state.refresh(IndexPhase::Storing, true);
                 }
             }
             ParseResultKind::Skipped(reason) => {
@@ -670,7 +731,7 @@ async fn flush_reorder_buffer(
                         )
                         .await?;
                     }
-                    state.refresh(IndexPhase::Storing);
+                    state.refresh(IndexPhase::Storing, true);
                 }
 
                 if let ParseSkipReason::UnsupportedExtension(extension) = reason {
@@ -679,7 +740,7 @@ async fn flush_reorder_buffer(
 
                 state.stats.files_skipped += 1;
                 *next_sequence += 1;
-                state.refresh(current_progress_phase(state.stats));
+                state.refresh(current_progress_phase(state.stats), true);
             }
         }
     }
@@ -689,7 +750,7 @@ async fn flush_reorder_buffer(
             let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
             store_ready_files(conn, &mut ready_files, embedder, state.stats, state.timings).await?;
         }
-        state.refresh(IndexPhase::Storing);
+        state.refresh(IndexPhase::Storing, true);
     }
 
     Ok(())
@@ -699,6 +760,7 @@ async fn flush_reorder_buffer(
 #[derive(Debug, Clone)]
 pub struct PipelineStats {
     pub files_scanned: usize,
+    pub files_processed: usize,
     pub files_indexed: usize,
     pub files_skipped: usize,
     pub files_deleted: usize,
@@ -711,6 +773,7 @@ impl Default for PipelineStats {
     fn default() -> Self {
         Self {
             files_scanned: 0,
+            files_processed: 0,
             files_indexed: 0,
             files_skipped: 0,
             files_deleted: 0,
@@ -741,7 +804,25 @@ pub async fn run_with_config(
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_scope(conn, project_root, embedder, &RunScope::Full, config).await
+    run_with_config_and_progress(conn, project_root, embedder, config, None).await
+}
+
+pub async fn run_with_config_and_progress(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+) -> Result<PipelineStats, OneupError> {
+    run_with_scope_and_progress(
+        conn,
+        project_root,
+        embedder,
+        &RunScope::Full,
+        config,
+        progress_tx,
+    )
+    .await
 }
 
 pub async fn run_with_scope(
@@ -750,6 +831,17 @@ pub async fn run_with_scope(
     embedder: Option<&mut Embedder>,
     scope: &RunScope,
     config: &IndexingConfig,
+) -> Result<PipelineStats, OneupError> {
+    run_with_scope_and_progress(conn, project_root, embedder, scope, config, None).await
+}
+
+pub async fn run_with_scope_and_progress(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
 ) -> Result<PipelineStats, OneupError> {
     let run_inputs = match scope {
         RunScope::Full => prepare_full_run_inputs(conn, project_root).await?,
@@ -768,7 +860,15 @@ pub async fn run_with_scope(
         }
     };
 
-    execute_run_with_inputs(conn, project_root, embedder, config, run_inputs).await
+    execute_run_with_inputs(
+        conn,
+        project_root,
+        embedder,
+        config,
+        run_inputs,
+        progress_tx,
+    )
+    .await
 }
 
 async fn execute_run_with_inputs(
@@ -777,6 +877,7 @@ async fn execute_run_with_inputs(
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
     run_inputs: RunInputs,
+    progress_tx: Option<ProgressSender>,
 ) -> Result<PipelineStats, OneupError> {
     let run_started_at = Instant::now();
     let mut stats = PipelineStats::default();
@@ -800,11 +901,15 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
-        IndexState::Running,
-        IndexPhase::Scanning,
-        0,
-        parallelism.clone(),
-        Some(timings.snapshot(run_started_at)),
+        progress_tx.as_ref(),
+        ProgressUpdate {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            files_total: 0,
+            parallelism: parallelism.clone(),
+            timings: Some(timings.snapshot(run_started_at)),
+            persist: true,
+        },
     );
 
     let progress_spinner = spin("Scanning files");
@@ -850,11 +955,15 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
-        IndexState::Running,
-        IndexPhase::Parsing,
-        total_files,
-        parallelism.clone(),
-        Some(timings.snapshot(run_started_at)),
+        progress_tx.as_ref(),
+        ProgressUpdate {
+            state: IndexState::Running,
+            phase: IndexPhase::Parsing,
+            files_total: total_files,
+            parallelism: parallelism.clone(),
+            timings: Some(timings.snapshot(run_started_at)),
+            persist: true,
+        },
     );
 
     progress_spinner.update(format!("Processing files (0/{total_files})"));
@@ -874,6 +983,7 @@ async fn execute_run_with_inputs(
             timings: &mut timings,
             run_started_at,
             unsupported_extensions: &mut unsupported_extensions,
+            progress_tx: progress_tx.clone(),
         };
 
         while next_to_dispatch < total_files || !parse_workers.is_empty() {
@@ -898,6 +1008,7 @@ async fn execute_run_with_inputs(
                 .timings
                 .parse_ms
                 .max(parse_result.completed_at_ms);
+            flush_state.stats.files_processed += 1;
             let previous = reorder_buffer.insert(parse_result.sequence_id, parse_result.outcome);
             debug_assert!(
                 previous.is_none(),
@@ -915,6 +1026,7 @@ async fn execute_run_with_inputs(
             )
             .await?;
 
+            flush_state.refresh(current_progress_phase(flush_state.stats), false);
             progress_spinner.update(format!("Processing files ({next_to_flush}/{total_files})"));
         }
 
@@ -973,11 +1085,15 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
-        IndexState::Complete,
-        IndexPhase::Complete,
-        total_files,
-        parallelism,
-        Some(final_timings),
+        progress_tx.as_ref(),
+        ProgressUpdate {
+            state: IndexState::Complete,
+            phase: IndexPhase::Complete,
+            files_total: total_files,
+            parallelism,
+            timings: Some(final_timings),
+            persist: true,
+        },
     );
 
     Ok(stats)
@@ -1381,6 +1497,11 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
 
+        assert_eq!(persisted["files_processed"], 1);
+        assert!(persisted["message"]
+            .as_str()
+            .unwrap()
+            .contains("Processed 1 files"));
         assert_eq!(persisted["parallelism"]["jobs_configured"], 3);
         assert_eq!(persisted["parallelism"]["jobs_effective"], 1);
         assert_eq!(persisted["parallelism"]["embed_threads"], 0);
@@ -1388,6 +1509,30 @@ mod tests {
             persisted["timings"]["total_ms"].as_u64().unwrap()
                 >= persisted["timings"]["scan_ms"].as_u64().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn progress_sender_emits_live_processed_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let stats = run_with_config_and_progress(&conn, tmp.path(), None, &config, Some(tx))
+            .await
+            .unwrap();
+        let progress: Vec<IndexProgress> = rx.try_iter().collect();
+
+        assert!(!progress.is_empty());
+        assert!(progress.iter().any(|snapshot| {
+            snapshot.state == IndexState::Running && snapshot.files_processed > 0
+        }));
+        assert_eq!(progress.last().unwrap().state, IndexState::Complete);
+        assert_eq!(progress.last().unwrap().files_processed, 2);
+        assert_eq!(stats.progress.files_processed, 2);
     }
 
     #[tokio::test]

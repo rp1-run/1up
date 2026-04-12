@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use colored::Colorize;
+use nanospinner::Spinner;
 use serde::Serialize;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 use crate::shared::types::{
     ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
@@ -15,6 +18,7 @@ pub trait Formatter {
     fn format_structural_results(&self, results: &[StructuralResult]) -> String;
     fn format_message(&self, message: &str) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
+    fn format_index_watch_update(&self, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
     fn format_update_status(&self, _status: &UpdateStatusInfo) -> String {
         String::new()
@@ -115,6 +119,12 @@ pub fn formatter_for(format: OutputFormat) -> Box<dyn Formatter> {
     }
 }
 
+pub fn spawn_index_watch_renderer(format: OutputFormat) -> (Sender<IndexProgress>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || render_watch_updates(format, rx));
+    (tx, handle)
+}
+
 struct JsonFormatter;
 struct HumanFormatter;
 struct PlainFormatter;
@@ -147,6 +157,15 @@ impl Formatter for JsonFormatter {
             "progress": progress,
             "work": work,
         }))
+    }
+
+    fn format_index_watch_update(&self, progress: &IndexProgress) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "event": "index_progress",
+            "progress": progress,
+            "work": WorkSummary::from(progress),
+        }))
+        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     }
 
     fn format_status(&self, status: &StatusInfo) -> String {
@@ -385,6 +404,21 @@ impl Formatter for HumanFormatter {
         out
     }
 
+    fn format_index_watch_update(&self, progress: &IndexProgress) -> String {
+        format!(
+            "{} | {} ({}) | processed {} of {} | indexed {} | skipped {} | deleted {} | segments {}",
+            render_index_watch_message(progress),
+            render_index_state_human(progress.state),
+            render_index_phase_human(progress),
+            progress.files_processed,
+            progress.files_total,
+            progress.files_indexed,
+            progress.files_skipped,
+            progress.files_deleted,
+            progress.segments_stored,
+        )
+    }
+
     fn format_status(&self, status: &StatusInfo) -> String {
         let mut out = String::new();
         let state = if status.daemon_running {
@@ -438,6 +472,13 @@ impl Formatter for HumanFormatter {
                 progress.files_deleted,
                 progress.segments_stored,
             ));
+            out.push_str(&format!(
+                "Processed: {} of {}\n",
+                progress.files_processed, progress.files_total
+            ));
+            if let Some(message) = progress.message.as_deref() {
+                out.push_str(&format!("Index message: {message}\n"));
+            }
             out.push_str(&format!(
                 "Work: completed {} ({} indexed, {} deleted) | skipped {}\n",
                 work.files_completed, work.files_indexed, work.files_deleted, work.files_skipped,
@@ -746,6 +787,40 @@ impl Formatter for PlainFormatter {
         out
     }
 
+    fn format_index_watch_update(&self, progress: &IndexProgress) -> String {
+        let mut out = format!(
+            "event:index_progress\tindex_state:{}\tindex_phase:{}\tmessage:{}\tfiles_processed:{}\tfiles_total:{}\tfiles_indexed:{}\tfiles_skipped:{}\tfiles_deleted:{}\tsegments_stored:{}\tembeddings:{}",
+            render_index_state_plain(progress.state),
+            render_index_phase_plain(progress),
+            render_index_watch_message(progress),
+            progress.files_processed,
+            progress.files_total,
+            progress.files_indexed,
+            progress.files_skipped,
+            progress.files_deleted,
+            progress.segments_stored,
+            render_embeddings_plain(progress.embeddings_enabled),
+        );
+        if let Some(parallelism) = &progress.parallelism {
+            out.push_str(&format!(
+                "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
+                parallelism.jobs_configured, parallelism.jobs_effective, parallelism.embed_threads,
+            ));
+        }
+        if let Some(timings) = &progress.timings {
+            out.push_str(&format!(
+                "\tscan_ms:{}\tparse_ms:{}\tembed_ms:{}\tstore_ms:{}\ttotal_ms:{}",
+                timings.scan_ms,
+                timings.parse_ms,
+                timings.embed_ms,
+                timings.store_ms,
+                timings.total_ms,
+            ));
+        }
+        out.push_str(&format!("\tupdated:{}\n", progress.updated_at.to_rfc3339()));
+        out
+    }
+
     fn format_status(&self, status: &StatusInfo) -> String {
         let state = if status.daemon_running {
             "running"
@@ -793,6 +868,10 @@ impl Formatter for PlainFormatter {
                 progress.segments_stored,
                 render_embeddings_plain(progress.embeddings_enabled),
             ));
+            out.push_str(&format!("\tlast_processed:{}", progress.files_processed));
+            if let Some(message) = progress.message.as_deref() {
+                out.push_str(&format!("\tindex_message:{message}"));
+            }
             if let Some(parallelism) = &progress.parallelism {
                 out.push_str(&format!(
                     "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
@@ -898,6 +977,56 @@ impl Formatter for PlainFormatter {
     }
 }
 
+fn render_watch_updates(format: OutputFormat, rx: Receiver<IndexProgress>) {
+    let formatter = formatter_for(format);
+    let mut spinner = start_watch_spinner(format);
+    let mut last_progress = None;
+
+    while let Ok(progress) = rx.recv() {
+        let spinner_label = render_index_watch_message(&progress);
+        if let Some(spinner) = spinner.as_mut() {
+            spinner.update(spinner_label.clone());
+        }
+
+        let rendered = formatter.format_index_watch_update(&progress);
+        if last_progress.as_ref() != Some(&rendered) {
+            print_watch_output(&rendered);
+            last_progress = Some(rendered);
+        }
+
+        if progress.state == IndexState::Complete {
+            if let Some(spinner) = spinner.take() {
+                spinner.success_with(spinner_label);
+            }
+        }
+    }
+}
+
+fn start_watch_spinner(format: OutputFormat) -> Option<nanospinner::SpinnerHandle> {
+    use std::io::IsTerminal;
+
+    if format != OutputFormat::Human {
+        return None;
+    }
+
+    Some(
+        Spinner::with_writer_tty(
+            "Watching index progress",
+            std::io::stderr(),
+            std::io::stderr().is_terminal(),
+        )
+        .start(),
+    )
+}
+
+fn print_watch_output(rendered: &str) {
+    if rendered.ends_with('\n') {
+        print!("{rendered}");
+    } else {
+        println!("{rendered}");
+    }
+}
+
 fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
@@ -913,6 +1042,9 @@ fn render_index_state_human(state: IndexState) -> String {
 fn render_index_phase_human(progress: &IndexProgress) -> String {
     let label = match progress.phase {
         IndexPhase::Pending => "pending",
+        IndexPhase::Preparing => "preparing",
+        IndexPhase::Rebuilding => "rebuilding",
+        IndexPhase::LoadingModel => "loading model",
         IndexPhase::Scanning => "scanning",
         IndexPhase::Parsing => "parsing",
         IndexPhase::Storing if progress.embeddings_enabled => "embedding & storing",
@@ -932,6 +1064,32 @@ fn render_embeddings_human(enabled: bool) -> String {
 
 fn render_duration_ms(duration_ms: u128) -> String {
     format!("{duration_ms}ms")
+}
+
+fn render_index_watch_message(progress: &IndexProgress) -> String {
+    progress
+        .message
+        .clone()
+        .unwrap_or_else(|| match progress.phase {
+            IndexPhase::Pending => "Waiting for indexing".to_string(),
+            IndexPhase::Preparing => "Preparing database".to_string(),
+            IndexPhase::Rebuilding => "Rebuilding database".to_string(),
+            IndexPhase::LoadingModel => "Loading embedding model".to_string(),
+            IndexPhase::Scanning => {
+                if progress.files_total == 0 {
+                    "Scanning files".to_string()
+                } else {
+                    format!("Scanning {} files", progress.files_total)
+                }
+            }
+            IndexPhase::Parsing | IndexPhase::Storing => {
+                format!(
+                    "Processing files ({}/{})",
+                    progress.files_processed, progress.files_total
+                )
+            }
+            IndexPhase::Complete => "Index complete".to_string(),
+        })
 }
 
 fn render_time_ago(ts: &chrono::DateTime<Utc>) -> String {
@@ -985,6 +1143,9 @@ fn render_index_health_plain(status: &StatusInfo) -> &'static str {
 fn render_index_phase(progress: &IndexProgress) -> &'static str {
     match progress.phase {
         IndexPhase::Pending => "pending",
+        IndexPhase::Preparing => "preparing",
+        IndexPhase::Rebuilding => "rebuilding",
+        IndexPhase::LoadingModel => "loading_model",
         IndexPhase::Scanning => "scanning",
         IndexPhase::Parsing => "parsing",
         IndexPhase::Storing if progress.embeddings_enabled => "embedding_and_storing",
@@ -1083,11 +1244,13 @@ mod tests {
             phase: IndexPhase::Complete,
             files_total: 6,
             files_scanned: 6,
+            files_processed: 6,
             files_indexed: 3,
             files_skipped: 2,
             files_deleted: 1,
             segments_stored: 14,
             embeddings_enabled: true,
+            message: Some("Processed 6 files".to_string()),
             parallelism: Some(IndexParallelism {
                 jobs_configured: 4,
                 jobs_effective: 3,
@@ -1133,6 +1296,27 @@ mod tests {
     }
 
     #[test]
+    fn json_watch_update_is_compact_and_includes_progress_event() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_index_watch_update(&sample_progress());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["event"], "index_progress");
+        assert_eq!(value["progress"]["files_processed"], 6);
+        assert_eq!(value["progress"]["message"], "Processed 6 files");
+    }
+
+    #[test]
+    fn plain_watch_update_includes_processed_and_message() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_index_watch_update(&sample_progress());
+
+        assert!(rendered.contains("event:index_progress"));
+        assert!(rendered.contains("files_processed:6"));
+        assert!(rendered.contains("message:Processed 6 files"));
+    }
+
+    #[test]
     fn plain_status_renders_last_work_and_total_duration() {
         let formatter = PlainFormatter;
         let rendered = formatter.format_status(&StatusInfo {
@@ -1149,6 +1333,8 @@ mod tests {
         });
 
         assert!(rendered.contains("last_completed:4"));
+        assert!(rendered.contains("last_processed:6"));
+        assert!(rendered.contains("index_message:Processed 6 files"));
         assert!(rendered.contains("jobs_effective:3"));
         assert!(rendered.contains("total_ms:41"));
     }
