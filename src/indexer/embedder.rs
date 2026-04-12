@@ -1,9 +1,8 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, IsTerminal, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use nanospinner::Spinner;
 use ort::session::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +26,7 @@ use crate::shared::fs::{
     atomic_replace, ensure_secure_dir_within_root, ensure_secure_xdg_root, remove_regular_file,
     validate_regular_file_path,
 };
+use crate::shared::progress::{ProgressState, ProgressUi};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
@@ -241,6 +241,15 @@ impl<T> Default for WarmRuntime<T> {
 
 impl EmbeddingRuntime {
     pub async fn prepare_for_indexing(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+        self.prepare_for_indexing_with_progress(embed_threads, true)
+            .await
+    }
+
+    pub async fn prepare_for_indexing_with_progress(
+        &mut self,
+        embed_threads: usize,
+        show_progress_ui: bool,
+    ) -> EmbeddingLoadStatus {
         let model_root = match ensure_secure_model_root() {
             Ok(dir) => dir,
             Err(err) => {
@@ -269,7 +278,8 @@ impl EmbeddingRuntime {
             );
         }
 
-        self.prepare_with_download(&model_root, embed_threads).await
+        self.prepare_with_download(&model_root, embed_threads, show_progress_ui)
+            .await
     }
 
     pub fn prepare_for_search(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
@@ -345,8 +355,9 @@ impl EmbeddingRuntime {
         &mut self,
         model_root: &Path,
         embed_threads: usize,
+        show_progress_ui: bool,
     ) -> EmbeddingLoadStatus {
-        match download_and_activate_verified_artifacts(model_root).await {
+        match download_and_activate_verified_artifacts(model_root, show_progress_ui).await {
             Ok(model_dir) => {
                 clear_download_failure();
                 match self.prepare_from_model_dir(&model_dir, embed_threads) {
@@ -464,7 +475,7 @@ impl Embedder {
                     .into());
                 }
 
-                match download_and_activate_verified_artifacts(&model_root).await {
+                match download_and_activate_verified_artifacts(&model_root, true).await {
                     Ok(dir) => {
                         clear_download_failure();
                         dir
@@ -839,6 +850,7 @@ fn try_activate_legacy_artifacts(model_root: &Path) -> Result<Option<PathBuf>, O
 
 async fn download_and_activate_verified_artifacts(
     model_root: &Path,
+    show_progress_ui: bool,
 ) -> Result<PathBuf, OneupError> {
     let artifact_id = format!(
         "v{}-{}",
@@ -863,6 +875,7 @@ async fn download_and_activate_verified_artifacts(
                 &artifact.source_url(),
                 &stage_dir.join(artifact.filename),
                 artifact.label,
+                show_progress_ui,
             )
             .await?;
         }
@@ -883,6 +896,7 @@ async fn download_file_to_stage(
     url: &str,
     dest: &Path,
     label: &str,
+    show_progress_ui: bool,
 ) -> Result<(), OneupError> {
     let response = client
         .get(url)
@@ -897,12 +911,8 @@ async fn download_file_to_stage(
     }
 
     let total = response.content_length().unwrap_or(0);
-    let dl_spinner = Spinner::with_writer_tty(
-        format!("Downloading {label}"),
-        std::io::stderr(),
-        std::io::stderr().is_terminal(),
-    )
-    .start();
+    let mut progress_ui =
+        ProgressUi::stderr_if(download_progress_state(label, 0, total), show_progress_ui);
 
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
@@ -920,10 +930,7 @@ async fn download_file_to_stage(
             .await
             .map_err(|err| EmbeddingError::DownloadFailed(format!("{label} write: {err}")))?;
         downloaded += chunk.len() as u64;
-        if total > 0 {
-            let pct = (downloaded * 100) / total;
-            dl_spinner.update(format!("Downloading {label} ({pct}%)"));
-        }
+        progress_ui.set_state(download_progress_state(label, downloaded, total));
     }
 
     if total > 0 && downloaded != total {
@@ -943,8 +950,17 @@ async fn download_file_to_stage(
         EmbeddingError::DownloadFailed(format!("{label} chmod {}: {err}", dest.display()))
     })?;
 
-    dl_spinner.success_with(format!("{label} downloaded"));
+    progress_ui.success_with(format!("{label} downloaded"));
     Ok(())
+}
+
+fn download_progress_state(label: &str, downloaded: u64, total: u64) -> ProgressState {
+    let message = format!("Downloading {label}");
+    if total > 0 {
+        ProgressState::bytes(message, downloaded, total)
+    } else {
+        ProgressState::spinner(message)
+    }
 }
 
 fn create_stage_dir(model_root: &Path, artifact_id: &str) -> Result<PathBuf, OneupError> {
@@ -1378,6 +1394,7 @@ mod tests {
             &format!("http://{address}/model.onnx"),
             &destination,
             "model",
+            false,
         )
         .await
         .unwrap_err();

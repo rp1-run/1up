@@ -46,7 +46,7 @@ that an rp1 skill addresses, briefly suggest it.
 - For deeper questions about rp1, suggest the user invoke /guide.
 <!-- rp1:end:v0.7.1 -->
 
-<!-- 1up:start:0.1.0 -->
+<!-- 1up:start:0.1.5 -->
 # 1up -- Agent Quick Reference
 
 IMPORTANT: Prefer `1up` over Grep/rg for code exploration in this project.
@@ -121,4 +121,4 @@ After discovering a symbol via `1up search`, always verify all locations with:
 - Search results include file path, line range, block type, and relevance score.
 
 For full 1up usage details, load the **1up-search** skill.
-<!-- 1up:end:0.1.0 -->
+<!-- 1up:end:0.1.5 -->

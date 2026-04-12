@@ -1,7 +1,7 @@
 # Implementation Patterns
 
 **Project**: 1up
-**Last Updated**: 2026-04-10
+**Last Updated**: 2026-04-12
 
 ## Naming & Organization
 
@@ -26,8 +26,8 @@ Evidence: `src/shared/types.rs:1-98`, `src/indexer/embedder.rs:180-194`, `src/sh
 
 **Strategy**: Two-tier: thiserror for domain errors (`OneupError` with nested per-module enums), `anyhow::Result` at CLI boundary
 **Propagation**: Domain modules return `Result<T, OneupError>` with `#[from]` conversions; CLI uses `bail!()` for user-facing errors; `eprintln!("warning: ...")` for degraded-mode warnings; `debug_assert!()` for internal invariants
-**Common Types**: OneupError, StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError
-**Recovery**: Embedding failures -> FTS-only search; vector retrieval failures -> FTS fallback within same query; tree-sitter failures -> text chunking; download failures -> marker file to prevent automatic retry; daemon unavailability -> local execution fallback
+**Common Types**: OneupError, StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError, UpdateError
+**Recovery**: Embedding failures -> FTS-only search; vector retrieval failures -> FTS fallback within same query; tree-sitter failures -> text chunking; download failures -> marker file to prevent automatic retry; daemon unavailability -> local execution fallback; `UpdateError::should_invalidate_cache()` for selective cache purge on permanent vs transient errors
 
 Evidence: `src/shared/errors.rs`, `src/search/hybrid.rs:39-51`, `src/indexer/embedder.rs:396-427`
 
@@ -50,35 +50,43 @@ Evidence: `src/daemon/worker.rs:236-321`, `src/cli/output.rs`
 ## Testing Idioms
 
 **Organization**: Unit tests in `#[cfg(test)]` blocks inside modules; integration tests in `tests/`; Criterion benchmarks in `benches/`; repo-scale benchmark scripts in `scripts/`; search quality evals in `evals/`
-**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem and daemon-socket tests; helper builders (`make_result`, `test_segment`); RAII guards: `EnvGuard` for env vars (save/restore via Drop), `HideModelGuard` for model visibility (rename-based); `static Mutex` for env-var test isolation
-**Levels**: Unit coverage for config resolution, warm embedding reuse, secure filesystem ops (symlink rejection, atomic replace, path clamping), IPC framing (round-trip, oversized, timeout), fence parsing and idempotency; integration for symbol lookup, scoped-run fallback, schema rebuild; benchmarks for candidate-first retrieval and warm-query workloads
+**Fixtures**: `setup() -> (Db, Connection)` using `Db::open_memory()`; `tempfile::tempdir()` for filesystem and daemon-socket tests; helper builders (`make_result`, `test_segment`); RAII guards: `EnvGuard` for env vars (save/restore via Drop), `HideModelGuard` for model visibility (rename-based); `static Mutex` for env-var test isolation in config tests; search_service tests use `bind_test_listener` with direct socket paths for env-free isolation
+**Levels**: Unit coverage for config resolution, warm embedding reuse, secure filesystem ops (symlink rejection, atomic replace, path clamping), IPC framing (round-trip, oversized, timeout), fence parsing and idempotency, IPC backward compat (`daemon_version` present/absent round-trip); integration for symbol lookup, scoped-run fallback, schema rebuild; benchmarks for candidate-first retrieval and warm-query workloads
 **Patterns**: `#[tokio::test]` for async; `cfg(unix)` guards on symlink/socket tests for cross-platform CI; parity tests compare jobs=1 vs parallel runs; daemon request tests treat unavailability as fallback path
 
-Evidence: `src/shared/fs.rs:480-697`, `src/daemon/ipc.rs:144-276`, `tests/cli_tests.rs`, `tests/integration_tests.rs`
+Evidence: `src/shared/fs.rs:480-697`, `src/daemon/ipc.rs:144-276`, `src/daemon/search_service.rs:245-395`, `tests/cli_tests.rs`
 
 ## I/O & Integration
 
 **Database**: libsql via `Db` wrapper; SQL as `pub const &str` in `storage/queries.rs`; async row iteration with column extraction by index; schema versioning via meta table; transactional batch writes; `segment_symbols` stores raw + canonical symbols for exact-first lookup
-**IPC**: Length-prefixed JSON frames over Unix domain socket; 4-byte big-endian length header + JSON payload; bounded frame sizes (16KB request, 2MB response, 4KB query); 250ms read/write deadlines; same-UID peer auth via `stream.peer_cred()`; semaphore-based in-flight limiting (8 slots); socket bound with 0o600 permissions
-**HTTP Clients**: reqwest for model downloads with streaming byte transfer and connect/total timeouts; no retry for HTTP (only DB lock contention)
-**File I/O**: ignore crate for gitignore-aware scanning; SHA-256 hashing for incremental detection and artifact verification; `atomic_replace` for crash-safe writes (temp file + fsync + rename + dir sync)
+**IPC**: Length-prefixed JSON frames over Unix domain socket; 4-byte big-endian length header + JSON payload; bounded frame sizes (16KB request, 2MB response, 4KB query); 250ms read/write deadlines; same-UID peer auth via `stream.peer_cred()`; semaphore-based in-flight limiting (8 slots); socket bound with 0o600 permissions; `daemon_version` field in `SearchResponse` with `#[serde(default, skip_serializing_if)]` for backward-compatible IPC evolution
+**HTTP Clients**: reqwest with connect/total timeouts for model downloads and update manifest fetches; streaming byte transfer; no retry for HTTP (only DB lock contention)
+**File I/O**: ignore crate for gitignore-aware scanning; SHA-256 hashing for incremental detection, artifact verification, and update binary verification; `atomic_replace` for crash-safe writes (temp file + fsync + rename + dir sync) used by index state, update cache, and daemon heartbeat
 
-Evidence: `src/daemon/ipc.rs:20-89`, `src/daemon/search_service.rs:43-218`, `src/shared/fs.rs:90-136`
+Evidence: `src/daemon/ipc.rs:20-89`, `src/daemon/search_service.rs:36-47`, `src/shared/update.rs:237-280`, `src/shared/fs.rs:90-136`
 
 ## Concurrency & Async
 
 **Async Usage**: Tokio full runtime; all CLI handlers and DB operations async; bounded `JoinSet::spawn_blocking` parse pool capped at `config.jobs`; embedder inference stays synchronous; storage writes remain serialized
-**Patterns**: Sequence IDs + BTreeMap reorder buffer for deterministic file order; `write_batch_files` controls transactional batch size; `ProjectRunState` enforces one active run + burst collapse; Semaphore admission control for daemon search; oneshot channels for request-response plumbing between connection tasks and search handler
+**Patterns**: Sequence IDs + BTreeMap reorder buffer for deterministic file order; `write_batch_files` controls transactional batch size; `ProjectRunState` enforces one active run + burst collapse; Semaphore admission control for daemon search; oneshot channels for request-response plumbing between connection tasks and search handler; daemon heartbeat uses throttled periodic persistence (`DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS`) with force bypass for immediate writes; `main.rs` spawns background `tokio::spawn` for update cache refresh, awaits with bounded timeout after command completes
 **Warm Cache**: `EmbeddingCompatibilityKey` (model_dir + file fingerprints + embed_threads) keys `WarmRuntime<T>` generic cache; cache-on-match avoids redundant ONNX reload; `cache.clear()` on any error ensures no stale state
 **Config Resolution**: Three-tier priority: CLI flags -> env vars -> registry persisted config -> auto defaults
 
-Evidence: `src/indexer/embedder.rs:131-240`, `src/daemon/worker.rs:18-53`, `src/shared/config.rs:96-115`
+Evidence: `src/indexer/embedder.rs:131-240`, `src/daemon/worker.rs:18-53`, `src/daemon/worker.rs:440-497`, `src/main.rs:32-51`
 
 ## Verified Artifact Lifecycle
 
 **Pattern**: Download to `.staging/<artifact_id>/` -> verify SHA-256 against pinned constants -> write `VerifiedArtifactManifest` to `verified/<artifact_id>/manifest.json` -> move files from staging -> atomically switch `current.json` pointer -> legacy flat-file artifacts auto-migrated on first access after digest validation -> cleanup on failure (remove_dir_all on staging)
 
 Evidence: `src/indexer/embedder.rs:64-109`, `src/shared/constants.rs:107-134`
+
+## Update Lifecycle
+
+**Passive Notification**: `main.rs` spawns background cache refresh via `tokio::spawn`, shows `eprintln` notice after command completes; suppressed for JSON output, Worker, and Update commands
+**Cache**: 24h TTL (`UPDATE_CHECK_TTL_SECS`), version-pinned (discards cache from different binary version), `atomic_replace` writes with secure permissions, non-fatal failures throughout (debug-level logging only)
+**Self-Update**: `detect_install_channel` via resolved binary path heuristics (Homebrew/Scoop/Manual/Unknown); channel-managed installs show upgrade instruction; manual installs do streaming binary download with SHA-256 verification; `stop_daemon_for_update` with bounded polling (30 x 100ms) via `lifecycle::is_process_alive`
+
+Evidence: `src/main.rs:30-51`, `src/shared/update.rs:297-320`, `src/cli/update.rs:93-195`
 
 ## Agent Instruction Pattern
 

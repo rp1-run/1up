@@ -26,7 +26,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let format = cli.format;
+    let format = cli.resolved_format();
     let show_notification = should_show_notification(format, &cli.command);
 
     let refresh_handle = if show_notification {

@@ -135,11 +135,17 @@ fn subcommand_help_works() {
 
 #[test]
 fn indexing_subcommands_expose_parallel_controls() {
-    for sub in &["index", "reindex", "start"] {
+    for sub in &["index", "reindex"] {
         cmd().args([sub, "--help"]).assert().success().stdout(
-            predicate::str::contains("--jobs").and(predicate::str::contains("--embed-threads")),
+            predicate::str::contains("--jobs")
+                .and(predicate::str::contains("--embed-threads"))
+                .and(predicate::str::contains("--watch")),
         );
     }
+
+    cmd().args(["start", "--help"]).assert().success().stdout(
+        predicate::str::contains("--jobs").and(predicate::str::contains("--embed-threads")),
+    );
 }
 
 #[test]
@@ -167,15 +173,18 @@ fn format_flag_accepts_all_variants() {
 }
 
 #[test]
-fn help_shows_plain_as_default_output_format() {
+fn help_describes_command_specific_output_defaults() {
     cmd().arg("--help").assert().success().stdout(
-        predicate::str::contains("Output format: plain (default), json, human")
-            .and(predicate::str::contains("[default: plain]")),
+        predicate::str::contains("Output format override.")
+            .and(predicate::str::contains(
+                "Defaults to human for start/status/stop/update/hello-agent; plain otherwise",
+            ))
+            .and(predicate::str::contains("[default:").not()),
     );
 }
 
 #[test]
-fn status_defaults_to_plain_output() {
+fn status_defaults_to_human_output() {
     let dir = tempfile::tempdir().unwrap();
 
     cmd()
@@ -183,7 +192,9 @@ fn status_defaults_to_plain_output() {
         .assert()
         .success()
         .stdout(
-            predicate::str::starts_with("daemon:").and(predicate::str::contains("Daemon:").not()),
+            predicate::str::contains("Daemon:")
+                .and(predicate::str::contains("Project:"))
+                .and(predicate::str::contains("daemon:").not()),
         );
 }
 
@@ -389,6 +400,89 @@ fn start_auto_initializes_project_if_needed() {
 }
 
 #[test]
+fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let canonical_project_a = project_a.path().canonicalize().unwrap();
+    let canonical_project_b = project_b.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
+    let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+    fs::write(
+        canonical_project_a.join("lib.rs"),
+        "pub fn first_project() -> &'static str {\n    \"ready\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        canonical_project_b.join("main.rs"),
+        "fn main() {\n    println!(\"second project\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args([
+            "--format",
+            "json",
+            "start",
+            canonical_project_a.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let pid_file = data_dir.join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pid_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        pid_file.exists(),
+        "daemon pid file should exist after start"
+    );
+
+    let output = cmd()
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args([
+            "--format",
+            "json",
+            "start",
+            canonical_project_b.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let message = payload["message"].as_str().unwrap();
+    assert!(message.contains("Indexed"));
+    assert!(message.contains("Daemon already running"));
+    assert!(payload["progress"]["files_indexed"].as_u64().unwrap() > 0);
+    assert!(payload["progress"]["segments_stored"].as_u64().unwrap() > 0);
+    assert!(canonical_project_b.join(".1up").join("index.db").exists());
+
+    cmd()
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args([
+            "--format",
+            "json",
+            "stop",
+            canonical_project_a.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn json_output_is_valid_json() {
     let dir = tempfile::tempdir().unwrap();
     let output = cmd()
@@ -451,7 +545,117 @@ fn status_human_output_includes_last_index_progress() {
         .stdout(
             predicate::str::contains("Index status:")
                 .and(predicate::str::contains("Index phase:"))
+                .and(predicate::str::contains("Processed:"))
                 .and(predicate::str::contains("Last index:")),
+        );
+}
+
+#[test]
+fn index_watch_plain_output_streams_progress_updates() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "plain",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("event:index_progress")
+                .and(predicate::str::contains("index_phase:preparing"))
+                .and(predicate::str::contains("index_phase:loading_model"))
+                .and(predicate::str::contains("index_phase:complete")),
+        );
+}
+
+#[test]
+fn index_watch_json_output_streams_progress_updates() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "json",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"event\":\"index_progress\"")
+                .and(predicate::str::contains("\"phase\":\"preparing\""))
+                .and(predicate::str::contains("\"phase\":\"loading_model\""))
+                .and(predicate::str::contains("\"phase\":\"complete\"")),
+        );
+}
+
+#[test]
+fn index_watch_human_output_keeps_progress_off_stdout() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"watch\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "human",
+            "index",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Indexed 1 files")
+                .and(predicate::str::contains("event:index_progress").not()),
+        );
+}
+
+#[test]
+fn reindex_watch_plain_output_streams_rebuild_and_completion() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn watch_mode() -> &'static str {\n    \"ready\"\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--format",
+            "plain",
+            "reindex",
+            "--watch",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("event:index_progress")
+                .and(predicate::str::contains("index_phase:rebuilding"))
+                .and(predicate::str::contains("index_phase:complete")),
         );
 }
 

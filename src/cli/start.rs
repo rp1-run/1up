@@ -11,7 +11,7 @@ use crate::shared::config;
 use crate::shared::constants;
 use crate::shared::project;
 use crate::shared::reminder;
-use crate::shared::types::OutputFormat;
+use crate::shared::types::{IndexingConfig, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -69,32 +69,95 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     } else {
         String::new()
     };
+    let index_ready = project_has_usable_index(&project_root).await?;
 
     if let Some(pid) = lifecycle::is_daemon_running()? {
-        let already_registered = registry
-            .projects
-            .iter()
-            .any(|p| p.project_root == project_root);
+        if index_ready {
+            let already_registered = registry
+                .projects
+                .iter()
+                .any(|p| p.project_root == project_root);
 
-        registry.register(&project_id, &project_root, Some(indexing_config.clone()))?;
-        lifecycle::send_sighup(pid)?;
-        let msg = if already_registered {
-            format!("{init_prefix}Daemon already running (pid={pid}); project settings refreshed.")
-        } else {
-            format!(
-                "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
-                project_root.display()
-            )
-        };
-        if already_registered {
-            eprintln!("{}", fmt.format_message(&msg));
-        } else {
-            println!("{}", fmt.format_message(&msg));
+            registry.register(&project_id, &project_root, Some(indexing_config.clone()))?;
+            lifecycle::send_sighup(pid)?;
+            let msg = if already_registered {
+                format!(
+                    "{init_prefix}Daemon already running (pid={pid}); project settings refreshed."
+                )
+            } else {
+                format!(
+                    "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
+                    project_root.display()
+                )
+            };
+            if already_registered {
+                eprintln!("{}", fmt.format_message(&msg));
+            } else {
+                println!("{}", fmt.format_message(&msg));
+            }
+            return Ok(());
         }
+
+        let stats = run_initial_index(&project_root, &indexing_config).await?;
+        registry.register(&project_id, &project_root, Some(indexing_config))?;
+        lifecycle::send_sighup(pid)?;
+        let msg = format!(
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            stats.files_indexed, stats.segments_stored,
+        );
+        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
         return Ok(());
     }
 
-    let db_path = config::project_db_path(&project_root);
+    let stats = run_initial_index(&project_root, &indexing_config).await?;
+
+    registry.register(&project_id, &project_root, Some(indexing_config))?;
+
+    // Double-check: another `1up start` may have spawned a daemon while we were indexing.
+    if let Some(pid) = lifecycle::is_daemon_running()? {
+        lifecycle::send_sighup(pid)?;
+        let msg = format!(
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            stats.files_indexed, stats.segments_stored,
+        );
+        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+        return Ok(());
+    }
+
+    let binary = lifecycle::current_binary_path()?;
+    let pid = lifecycle::spawn_daemon(&binary)?;
+
+    let msg = format!(
+        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
+        stats.files_indexed, stats.segments_stored,
+    );
+    println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+    Ok(())
+}
+
+async fn project_has_usable_index(project_root: &Path) -> anyhow::Result<bool> {
+    let db_path = config::project_db_path(project_root);
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let db = match Db::open_ro(&db_path).await {
+        Ok(db) => db,
+        Err(_) => return Ok(false),
+    };
+    let conn = match db.connect() {
+        Ok(conn) => conn,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(schema::ensure_current(&conn).await.is_ok())
+}
+
+async fn run_initial_index(
+    project_root: &Path,
+    indexing_config: &IndexingConfig,
+) -> anyhow::Result<pipeline::PipelineStats> {
+    let db_path = config::project_db_path(project_root);
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect()?;
     schema::prepare_for_write(&conn).await?;
@@ -131,34 +194,13 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let stats = pipeline::run_with_config(
         &conn,
-        &project_root,
+        project_root,
         runtime.current_embedder(),
-        &indexing_config,
+        indexing_config,
     )
     .await?;
 
-    registry.register(&project_id, &project_root, Some(indexing_config))?;
-
-    // Double-check: another `1up start` may have spawned a daemon while we were indexing.
-    if let Some(pid) = lifecycle::is_daemon_running()? {
-        lifecycle::send_sighup(pid)?;
-        let msg = format!(
-            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
-            stats.files_indexed, stats.segments_stored,
-        );
-        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
-        return Ok(());
-    }
-
-    let binary = lifecycle::current_binary_path()?;
-    let pid = lifecycle::spawn_daemon(&binary)?;
-
-    let msg = format!(
-        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
-        stats.files_indexed, stats.segments_stored,
-    );
-    println!("{}", fmt.format_index_summary(&msg, &stats.progress));
-    Ok(())
+    Ok(stats)
 }
 
 fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
