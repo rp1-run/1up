@@ -2,13 +2,20 @@
   "strategy": "parallel-map-reduce",
   "repo_type": "single-project",
   "monorepo_projects": [],
-  "generated_at": "2026-04-12T00:00:00Z",
-  "git_commit": "f4d8325563da458776c4185b367d5ef93a0c374d",
-  "files_analyzed": 48,
-  "languages": ["Rust", "Shell", "TypeScript", "Markdown"],
+  "generated_at": "2026-04-13T09:23:52Z",
+  "git_commit": "97552885f6ce5ead1363b5ed6c55b285f14a2c59",
+  "files_analyzed": 18,
+  "languages": ["Rust", "Markdown"],
   "metrics": {
-    "modules": 10,
-    "components": 53,
-    "concepts": 30
+    "mode": "FEATURE_LEARNING",
+    "feature_id": "impact-horizon",
+    "section_lines": {
+      "concept_map": 73,
+      "architecture": 114,
+      "interaction_model": 110,
+      "modules": 90,
+      "patterns": 74
+    },
+    "total_files_scanned": 18
   }
 }
