@@ -189,6 +189,67 @@ pub const DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID: &str =
     "DELETE FROM segment_symbols WHERE segment_id = ?1";
 
 #[allow(dead_code)]
+pub const INSERT_SEGMENT_RELATION: &str = "
+INSERT OR REPLACE INTO segment_relations (
+    source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol, created_at
+) VALUES (
+    ?1, ?2, ?3, ?4, datetime('now')
+)";
+
+#[allow(dead_code)]
+pub const DELETE_SEGMENT_RELATIONS_BY_SOURCE_SEGMENT_ID: &str =
+    "DELETE FROM segment_relations WHERE source_segment_id = ?1";
+
+#[allow(dead_code)]
+pub const DELETE_SEGMENT_RELATIONS_BY_FILE: &str = "
+DELETE FROM segment_relations
+WHERE source_segment_id IN (
+    SELECT id
+    FROM segments
+    WHERE file_path = ?1
+)";
+
+#[allow(dead_code)]
+pub const SELECT_OUTBOUND_RELATIONS: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE source_segment_id = ?1
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  canonical_target_symbol,
+  raw_target_symbol
+LIMIT ?2";
+
+#[allow(dead_code)]
+pub const SELECT_OUTBOUND_RELATIONS_BY_KIND: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE source_segment_id = ?1
+  AND relation_kind = ?2
+ORDER BY canonical_target_symbol, raw_target_symbol
+LIMIT ?3";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE canonical_target_symbol = ?1
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  source_segment_id,
+  raw_target_symbol
+LIMIT ?2";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS_BY_KIND: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE canonical_target_symbol = ?1
+  AND relation_kind = ?2
+ORDER BY source_segment_id, raw_target_symbol
+LIMIT ?3";
+
+#[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, breadcrumb, complexity, role,

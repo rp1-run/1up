@@ -6,6 +6,7 @@ use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::{ReferenceKind, SegmentRole};
 use crate::storage::queries;
+use crate::storage::relations::{self, RelationInsert};
 
 /// A stored segment row read from the database.
 #[derive(Debug, Clone)]
@@ -93,7 +94,15 @@ struct SegmentSymbolInsert {
 }
 
 /// Insert or replace a segment in the database.
+#[allow(dead_code)]
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
+    upsert_segment_record(conn, seg).await?;
+    relations::replace_segment_relations(conn, &seg.id, &build_segment_relation_rows(seg)).await?;
+
+    Ok(())
+}
+
+async fn upsert_segment_record(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
     conn.execute(
         queries::UPSERT_SEGMENT,
         libsql::params![
@@ -208,6 +217,8 @@ pub async fn delete_segments_by_file(
     conn: &Connection,
     file_path: &str,
 ) -> Result<u64, OneupError> {
+    relations::delete_relations_by_file(conn, file_path).await?;
+
     let count = conn
         .execute(queries::DELETE_SEGMENTS_BY_FILE, [file_path])
         .await
@@ -480,6 +491,14 @@ fn build_segment_symbol_rows(seg: &SegmentInsert) -> Vec<SegmentSymbolInsert> {
     rows
 }
 
+fn build_segment_relation_rows(seg: &SegmentInsert) -> Vec<RelationInsert> {
+    relations::build_relation_inserts(
+        &seg.id,
+        &parse_symbols(&seg.called_symbols),
+        &parse_symbols(&seg.referenced_symbols),
+    )
+}
+
 async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
     conn.execute(
         queries::DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID,
@@ -532,9 +551,13 @@ async fn replace_file_segments_in_transaction(
 ) -> Result<(), OneupError> {
     delete_segments_by_file(conn, file_path).await?;
 
+    let mut relation_rows = Vec::new();
     for segment in segments {
-        upsert_segment(conn, segment).await?;
+        upsert_segment_record(conn, segment).await?;
+        relation_rows.extend(build_segment_relation_rows(segment));
     }
+
+    relations::insert_relations(conn, &relation_rows).await?;
 
     Ok(())
 }
@@ -648,6 +671,30 @@ mod tests {
         results
     }
 
+    async fn relation_rows(conn: &Connection, segment_id: &str) -> Vec<(String, String, String)> {
+        let mut rows = conn
+            .query(
+                "SELECT relation_kind, raw_target_symbol, canonical_target_symbol
+                 FROM segment_relations
+                 WHERE source_segment_id = ?1
+                 ORDER BY relation_kind, canonical_target_symbol",
+                [segment_id],
+            )
+            .await
+            .unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            results.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            ));
+        }
+
+        results
+    }
+
     #[tokio::test]
     async fn upsert_and_query_by_file() {
         let (_db, conn) = setup().await;
@@ -700,15 +747,15 @@ mod tests {
     async fn delete_by_file() {
         let (_db, conn) = setup().await;
 
-        upsert_segment(&conn, &test_segment("s1", "src/a.rs", "h1"))
-            .await
-            .unwrap();
+        let mut segment_a1 = test_segment("s1", "src/a.rs", "h1");
+        segment_a1.called_symbols = r#"["load_config"]"#.to_string();
+        upsert_segment(&conn, &segment_a1).await.unwrap();
         upsert_segment(&conn, &test_segment("s2", "src/a.rs", "h1"))
             .await
             .unwrap();
-        upsert_segment(&conn, &test_segment("s3", "src/b.rs", "h2"))
-            .await
-            .unwrap();
+        let mut segment_b = test_segment("s3", "src/b.rs", "h2");
+        segment_b.referenced_symbols = r#"["ConfigLoader"]"#.to_string();
+        upsert_segment(&conn, &segment_b).await.unwrap();
 
         let deleted = delete_segments_by_file(&conn, "src/a.rs").await.unwrap();
         assert_eq!(deleted, 2);
@@ -718,6 +765,15 @@ mod tests {
 
         let other = get_segments_by_file(&conn, "src/b.rs").await.unwrap();
         assert_eq!(other.len(), 1);
+        assert!(relation_rows(&conn, "s1").await.is_empty());
+        assert_eq!(
+            relation_rows(&conn, "s3").await,
+            vec![(
+                "reference".to_string(),
+                "ConfigLoader".to_string(),
+                "configloader".to_string(),
+            )]
+        );
     }
 
     #[tokio::test]
@@ -946,20 +1002,21 @@ mod tests {
     async fn replace_file_segments_tx_replaces_one_file_without_touching_others() {
         let (_db, conn) = setup().await;
 
-        upsert_segment(&conn, &test_segment("old_a_1", "src/a.rs", "old-a"))
-            .await
-            .unwrap();
+        let mut old_a_1 = test_segment("old_a_1", "src/a.rs", "old-a");
+        old_a_1.called_symbols = r#"["legacy_call"]"#.to_string();
+        old_a_1.referenced_symbols = r#"["LegacyType"]"#.to_string();
+        upsert_segment(&conn, &old_a_1).await.unwrap();
         upsert_segment(&conn, &test_segment("old_a_2", "src/a.rs", "old-a"))
             .await
             .unwrap();
-        upsert_segment(&conn, &test_segment("old_b_1", "src/b.rs", "old-b"))
-            .await
-            .unwrap();
+        let mut old_b_1 = test_segment("old_b_1", "src/b.rs", "old-b");
+        old_b_1.called_symbols = r#"["keep_b"]"#.to_string();
+        upsert_segment(&conn, &old_b_1).await.unwrap();
 
-        let replacement = [
-            test_segment("new_a_1", "src/a.rs", "new-a"),
-            test_segment("new_a_2", "src/a.rs", "new-a"),
-        ];
+        let mut new_a_1 = test_segment("new_a_1", "src/a.rs", "new-a");
+        new_a_1.called_symbols = r#"["new_call"]"#.to_string();
+        new_a_1.referenced_symbols = r#"["NewType"]"#.to_string();
+        let replacement = [new_a_1, test_segment("new_a_2", "src/a.rs", "new-a")];
 
         replace_file_segments_tx(&conn, "src/a.rs", &replacement)
             .await
@@ -978,11 +1035,18 @@ mod tests {
         let new_symbol_rows = symbol_rows(&conn, "new_a_1").await;
         assert_eq!(
             new_symbol_rows,
-            vec![(
-                "new_a_1".to_string(),
-                "newa1".to_string(),
-                "definition".to_string(),
-            )]
+            vec![
+                (
+                    "new_a_1".to_string(),
+                    "newa1".to_string(),
+                    "definition".to_string(),
+                ),
+                (
+                    "NewType".to_string(),
+                    "newtype".to_string(),
+                    "usage".to_string(),
+                ),
+            ]
         );
 
         let mut rows = conn
@@ -995,22 +1059,49 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let stale_symbol_count: i64 = row.get(0).unwrap();
         assert_eq!(stale_symbol_count, 0);
+        assert_eq!(
+            relation_rows(&conn, "new_a_1").await,
+            vec![
+                (
+                    "call".to_string(),
+                    "new_call".to_string(),
+                    "newcall".to_string(),
+                ),
+                (
+                    "reference".to_string(),
+                    "NewType".to_string(),
+                    "newtype".to_string(),
+                ),
+            ]
+        );
+        assert!(relation_rows(&conn, "old_a_1").await.is_empty());
+        assert_eq!(
+            relation_rows(&conn, "old_b_1").await,
+            vec![(
+                "call".to_string(),
+                "keep_b".to_string(),
+                "keepb".to_string(),
+            )]
+        );
     }
 
     #[tokio::test]
     async fn replace_file_batch_tx_rolls_back_all_files_on_failure() {
         let (_db, conn) = setup().await;
 
-        upsert_segment(&conn, &test_segment("old_a_1", "src/a.rs", "old-a"))
-            .await
-            .unwrap();
-        upsert_segment(&conn, &test_segment("old_b_1", "src/b.rs", "old-b"))
-            .await
-            .unwrap();
+        let mut old_a_1 = test_segment("old_a_1", "src/a.rs", "old-a");
+        old_a_1.called_symbols = r#"["legacy_a"]"#.to_string();
+        upsert_segment(&conn, &old_a_1).await.unwrap();
+        let mut old_b_1 = test_segment("old_b_1", "src/b.rs", "old-b");
+        old_b_1.referenced_symbols = r#"["LegacyB"]"#.to_string();
+        upsert_segment(&conn, &old_b_1).await.unwrap();
 
-        let replacement_a = [test_segment("new_a_1", "src/a.rs", "new-a")];
+        let mut replacement_a_segment = test_segment("new_a_1", "src/a.rs", "new-a");
+        replacement_a_segment.called_symbols = r#"["replacement_a"]"#.to_string();
+        let replacement_a = [replacement_a_segment];
         let mut replacement_b = test_segment("new_b_1", "src/b.rs", "new-b");
         replacement_b.embedding_vec = Some("not-a-vector".to_string());
+        replacement_b.called_symbols = r#"["replacement_b"]"#.to_string();
         let replacement_b = [replacement_b];
 
         let result = replace_file_batch_tx(
@@ -1049,11 +1140,54 @@ mod tests {
         );
         assert_eq!(
             symbol_rows(&conn, "old_b_1").await,
+            vec![
+                (
+                    "old_b_1".to_string(),
+                    "oldb1".to_string(),
+                    "definition".to_string(),
+                ),
+                (
+                    "LegacyB".to_string(),
+                    "legacyb".to_string(),
+                    "usage".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            relation_rows(&conn, "old_a_1").await,
             vec![(
-                "old_b_1".to_string(),
-                "oldb1".to_string(),
-                "definition".to_string(),
+                "call".to_string(),
+                "legacy_a".to_string(),
+                "legacya".to_string(),
             )]
         );
+        assert_eq!(
+            relation_rows(&conn, "old_b_1").await,
+            vec![(
+                "reference".to_string(),
+                "LegacyB".to_string(),
+                "legacyb".to_string(),
+            )]
+        );
+        assert!(relation_rows(&conn, "new_a_1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_file_segments_tx_with_empty_segments_removes_relation_rows() {
+        let (_db, conn) = setup().await;
+
+        let mut old_a_1 = test_segment("old_a_1", "src/a.rs", "old-a");
+        old_a_1.called_symbols = r#"["delete_me"]"#.to_string();
+        upsert_segment(&conn, &old_a_1).await.unwrap();
+
+        replace_file_segments_tx(&conn, "src/a.rs", &[])
+            .await
+            .unwrap();
+
+        assert!(get_segments_by_file(&conn, "src/a.rs")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(relation_rows(&conn, "old_a_1").await.is_empty());
     }
 }
