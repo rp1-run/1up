@@ -5,9 +5,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::search::impact::{
+    ImpactCandidate, ImpactReason, ImpactResultEnvelope, ImpactStatus, ResolvedImpactAnchor,
+};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
-    ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
+    ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult, SegmentRole,
     StructuralResult, SymbolResult,
 };
 use crate::shared::update::{InstallChannel, UpdateStatus};
@@ -17,6 +20,7 @@ pub trait Formatter {
     fn format_symbol_results(&self, results: &[SymbolResult]) -> String;
     fn format_context_result(&self, result: &ContextResult) -> String;
     fn format_structural_results(&self, results: &[StructuralResult]) -> String;
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String;
     fn format_message(&self, message: &str) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_index_watch_update(&self, progress: &IndexProgress) -> String;
@@ -180,6 +184,10 @@ impl Formatter for JsonFormatter {
 
     fn format_structural_results(&self, results: &[StructuralResult]) -> String {
         to_json(results)
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        to_json(result)
     }
 
     fn format_message(&self, message: &str) -> String {
@@ -389,6 +397,78 @@ impl Formatter for HumanFormatter {
                 out.push_str(&format!("  {}\n", "...".dimmed()));
             }
         }
+        out
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} {}\n",
+            "Likely Impact".bold().underline(),
+            format!("[{}]", render_impact_status_label(result.status)).dimmed()
+        ));
+
+        if let Some(anchor) = &result.resolved_anchor {
+            out.push_str(&format!(
+                "Anchor: {}\n",
+                render_impact_anchor_human(anchor).cyan()
+            ));
+        }
+
+        if let Some(refusal) = &result.refusal {
+            out.push_str(&format!(
+                "Refusal: {} {}\n",
+                refusal.reason.yellow().bold(),
+                refusal.message
+            ));
+        } else if result.results.is_empty() {
+            out.push_str("No likely-impact candidates found.\n");
+        } else {
+            for (i, candidate) in result.results.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "{}. {} {}\n",
+                    i + 1,
+                    format!(
+                        "{}:{}-{}",
+                        candidate.file_path, candidate.line_start, candidate.line_end
+                    )
+                    .cyan(),
+                    format!("[{}]", candidate.block_type).dimmed()
+                ));
+                out.push_str(&format!(
+                    "{}\n",
+                    render_impact_candidate_metadata(candidate).dimmed()
+                ));
+                if let Some(breadcrumb) = &candidate.breadcrumb {
+                    out.push_str(&format!("{}\n", format!("Scope: {breadcrumb}").dimmed()));
+                }
+                if !candidate.reasons.is_empty() {
+                    out.push_str(&format!(
+                        "{}\n",
+                        format!("Why: {}", render_impact_reasons(&candidate.reasons)).dimmed()
+                    ));
+                }
+            }
+        }
+
+        if let Some(hint) = &result.hint {
+            out.push('\n');
+            out.push_str(&format!(
+                "Hint {} {}\n",
+                format!("[{}]", hint.code).dimmed(),
+                hint.message
+            ));
+            if let Some(scope) = &hint.suggested_scope {
+                out.push_str(&format!("Suggested scope: {}\n", scope.cyan()));
+            }
+            if let Some(segment_id) = &hint.suggested_segment_id {
+                out.push_str(&format!("Suggested segment: {}\n", segment_id.cyan()));
+            }
+        }
+
         out
     }
 
@@ -778,6 +858,65 @@ impl Formatter for PlainFormatter {
             }
             out.push('\n');
         }
+        out
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "status\t{}\n",
+            render_impact_status_label(result.status)
+        ));
+
+        if let Some(anchor) = &result.resolved_anchor {
+            out.push_str(&format!(
+                "anchor\t{}\t{}\n",
+                anchor.kind,
+                render_impact_anchor_plain(anchor)
+            ));
+        }
+
+        if let Some(refusal) = &result.refusal {
+            out.push_str(&format!(
+                "refusal\t{}\t{}\n",
+                refusal.reason, refusal.message
+            ));
+        }
+
+        if let Some(hint) = &result.hint {
+            out.push_str(&format!("hint\t{}\t{}\n", hint.code, hint.message));
+            if let Some(scope) = &hint.suggested_scope {
+                out.push_str(&format!("hint_scope\t{scope}\n"));
+            }
+            if let Some(segment_id) = &hint.suggested_segment_id {
+                out.push_str(&format!("hint_segment\t{segment_id}\n"));
+            }
+        }
+
+        for (i, candidate) in result.results.iter().enumerate() {
+            out.push_str(&format!(
+                "result\t{}\t{}:{}-{}\t{}\t{:.4}\thop={}\tsegment={}\n",
+                i + 1,
+                candidate.file_path,
+                candidate.line_start,
+                candidate.line_end,
+                candidate.block_type,
+                candidate.score,
+                candidate.hop,
+                candidate.segment_id
+            ));
+            out.push_str(&format!(
+                "result_meta\t{}\n",
+                render_impact_candidate_metadata(candidate)
+            ));
+            if !candidate.reasons.is_empty() {
+                out.push_str(&format!(
+                    "result_why\t{}\n",
+                    render_impact_reasons(&candidate.reasons)
+                ));
+            }
+        }
+
         out
     }
 
@@ -1364,6 +1503,117 @@ fn render_symbol_metadata(result: &SymbolResult) -> String {
     }
 
     parts.join(" | ")
+}
+
+fn render_impact_status_label(status: ImpactStatus) -> &'static str {
+    match status {
+        ImpactStatus::Expanded => "expanded",
+        ImpactStatus::ExpandedScoped => "expanded_scoped",
+        ImpactStatus::Refused => "refused",
+    }
+}
+
+fn render_impact_anchor_human(anchor: &ResolvedImpactAnchor) -> String {
+    let mut parts = vec![format!("{} {}", anchor.kind, anchor.value)];
+    parts.extend(render_impact_anchor_parts(anchor));
+    parts.join(" | ")
+}
+
+fn render_impact_anchor_plain(anchor: &ResolvedImpactAnchor) -> String {
+    let mut parts = vec![anchor.value.clone()];
+    parts.extend(render_impact_anchor_parts(anchor));
+    parts.join("\t")
+}
+
+fn render_impact_anchor_parts(anchor: &ResolvedImpactAnchor) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    if let Some(line) = anchor.line {
+        parts.push(format!("line {line}"));
+    }
+    if let Some(scope) = &anchor.scope {
+        parts.push(format!("scope {scope}"));
+    }
+    if !anchor.matched_files.is_empty() {
+        parts.push(format!(
+            "matched {}",
+            truncate_items(&anchor.matched_files, 3)
+        ));
+    }
+    if !anchor.seed_segment_ids.is_empty() {
+        let seeds = anchor
+            .seed_segment_ids
+            .iter()
+            .map(|segment_id| short_segment_id(segment_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("seeds {seeds}"));
+    }
+
+    parts
+}
+
+fn render_impact_candidate_metadata(candidate: &ImpactCandidate) -> String {
+    let mut parts = vec![
+        format!("Score: {:.4}", candidate.score),
+        format!("Hop: {}", candidate.hop),
+        format!("Segment: {}", candidate.segment_id),
+    ];
+
+    if let Some(role) = candidate.role {
+        parts.push(format!("Role: {}", render_segment_role(role)));
+    }
+    if let Some(complexity) = candidate.complexity {
+        if complexity > 0 {
+            parts.push(format!("Complexity: {complexity}"));
+        }
+    }
+    if let Some(defined_symbols) = &candidate.defined_symbols {
+        if !defined_symbols.is_empty() {
+            parts.push(format!("Defines: {}", truncate_items(defined_symbols, 5)));
+        }
+    }
+
+    parts.join(" | ")
+}
+
+fn render_impact_reasons(reasons: &[ImpactReason]) -> String {
+    reasons
+        .iter()
+        .map(render_impact_reason)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn render_impact_reason(reason: &ImpactReason) -> String {
+    let mut label = reason.kind.clone();
+
+    if let Some(symbol) = &reason.symbol {
+        label.push('(');
+        label.push_str(symbol);
+        label.push(')');
+    }
+
+    if let Some(from_segment_id) = &reason.from_segment_id {
+        label.push_str(" from ");
+        label.push_str(&short_segment_id(from_segment_id));
+    }
+
+    label
+}
+
+fn render_segment_role(role: SegmentRole) -> &'static str {
+    match role {
+        SegmentRole::Definition => "definition",
+        SegmentRole::Implementation => "implementation",
+        SegmentRole::Orchestration => "orchestration",
+        SegmentRole::Import => "import",
+        SegmentRole::Docs => "docs",
+    }
+}
+
+fn short_segment_id(segment_id: &str) -> String {
+    segment_id.chars().take(12).collect()
 }
 
 fn truncate_items(items: &[String], limit: usize) -> String {
