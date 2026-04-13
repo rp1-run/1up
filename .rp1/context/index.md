@@ -1,74 +1,49 @@
 # 1up — Knowledge Base Index
 
-**What**: A semantic code search engine that indexes source repositories using tree-sitter AST parsing and ONNX embeddings, providing hybrid vector+FTS search, symbol lookup, structural queries, and context retrieval through a CLI with a background daemon for incremental re-indexing, warm search, and built-in self-update.
+**What**: A semantic code search engine that indexes local repositories with tree-sitter parsing and ONNX embeddings, then serves hybrid search, symbol lookup, structural queries, context retrieval, and bounded impact exploration through a CLI with an optional background daemon.
 
-**Why**: Gives developers and AI agents fast, ranked code exploration by meaning and structure — not just text matching — with automatic background indexing that keeps results fresh.
+**Why**: It gives developers and agents fast code discovery by meaning and structure while keeping indexing local, incremental, and stable enough for interactive workflows.
 
 ## Quick Reference
 
 | Attribute | Value |
-|-----------|-------|
-| Entry point | `src/main.rs` -> `src/cli/mod.rs` (clap dispatch) |
-| Key pattern | Layered + Two-Process Model (CLI + daemon), Candidate-First Search Hydration, Channel-Aware Self-Update |
-| Tech stack | Rust, Tokio, libSQL (FTS5 + vector), ONNX Runtime (all-MiniLM-L6-v2), tree-sitter (16 grammars), clap |
-| License | Apache-2.0 |
-| Distribution | Homebrew, Scoop, GitHub Releases (4 targets), built-in self-update |
+|---|---|
+| Entry point | `src/main.rs` -> `src/cli/mod.rs` |
+| Key patterns | Layered CLI + daemon model, candidate-first retrieval, local-only impact analysis |
+| Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, clap |
+| Distribution | Homebrew, Scoop, GitHub Releases, built-in self-update |
 
 ## KB File Manifest
 
 | File | Lines | Load For |
-|------|-------|----------|
-| [concept_map.md](concept_map.md) | ~224 | Understanding domain terminology, type definitions, cross-cutting concerns |
-| [architecture.md](architecture.md) | ~304 | System topology, data flows, integration points, deployment |
-| [interaction-model.md](interaction-model.md) | ~151 | CLI surfaces, user-visible states, feedback loops, output format semantics |
-| [modules.md](modules.md) | ~213 | Component breakdown, file counts, dependencies, metrics |
-| [patterns.md](patterns.md) | ~101 | Coding conventions, error handling, testing idioms, I/O patterns |
+|---|---:|---|
+| [concept_map.md](concept_map.md) | ~73 | Terminology, types, domain relationships |
+| [architecture.md](architecture.md) | ~114 | Topology, data flow, storage, daemon boundaries |
+| [interaction-model.md](interaction-model.md) | ~110 | CLI states, output contracts, follow-up flows |
+| [modules.md](modules.md) | ~90 | Component ownership, dependencies, feature deltas |
+| [patterns.md](patterns.md) | ~74 | Coding, storage, error, output, and test idioms |
 
 ## Task-Based Loading
 
 | Task | Load Files |
-|------|-----------|
+|---|---|
 | Code review | `patterns.md` |
 | Bug investigation | `architecture.md`, `modules.md` |
 | Feature work | `modules.md`, `patterns.md` |
-| Search/ranking changes | `concept_map.md`, `architecture.md` |
-| Daemon/IPC work | `architecture.md`, `modules.md` |
-| CLI/UX changes | `interaction-model.md`, `patterns.md` |
-| Update system work | `architecture.md`, `modules.md`, `interaction-model.md` |
-| Strategic / system-wide | All files |
+| Search and ranking changes | `concept_map.md`, `architecture.md`, `interaction-model.md` |
+| Impact or relation work | `concept_map.md`, `architecture.md`, `modules.md`, `interaction-model.md` |
+| Strategic or system-wide analysis | All files |
 
-## How to Load
+## Recent Learnings
 
-Agents load this KB automatically via CLAUDE.md instructions:
-1. Read `index.md` first (this file)
-2. Load additional files based on task type per table above
-3. Never load all files unless performing holistic analysis
+- `impact-horizon` added an explicit local-only `1up impact` path instead of extending daemon IPC.
+- Search results can now expose additive machine-readable `segment_id` handles for exact impact follow-up.
+- Schema v8 introduces persisted `segment_relations`, with bounded expansion and refusal semantics to protect interactivity.
+- Benchmarks and black-box tests now guard against regressions to core search behavior while impact support evolves.
 
-## Project Structure
+## How To Load
 
-```
-src/
-├── main.rs              # Binary entry point + passive update notification
-├── lib.rs               # Library root
-├── reminder.md          # Agent instruction source
-├── cli/                 # CLI layer (15 files) — clap subcommands + output formatting + update command
-├── daemon/              # Daemon layer (10 files) — file watching, IPC, search service, lifecycle, heartbeat
-├── indexer/             # Indexer layer (6 files) — pipeline, parser, embedder, scanner, chunker
-├── search/              # Search layer (9 files) — hybrid, symbol, structural, context, ranking
-├── shared/              # Shared layer (10 files) — types, config, errors, fs, constants, reminder, update
-└── storage/             # Storage layer (5 files) — db, schema, segments, queries
-tests/                   # Integration + release tests (6 files)
-benches/                 # Criterion benchmarks (1 file)
-scripts/                 # Benchmark + release scripts (15 files)
-evals/                   # Search quality evals (8 files)
-packaging/               # Homebrew + Scoop templates
-.github/workflows/       # CI/CD + release automation (6 workflows)
-```
-
-## Navigation
-
-- **Concepts & terminology** -> [concept_map.md](concept_map.md)
-- **System architecture & data flows** -> [architecture.md](architecture.md)
-- **CLI interaction model** -> [interaction-model.md](interaction-model.md)
-- **Module & component details** -> [modules.md](modules.md)
-- **Implementation patterns** -> [patterns.md](patterns.md)
+Agents load this KB automatically:
+1. Read `index.md` first.
+2. Load only the files needed for the current task.
+3. Avoid loading the full KB unless the work is system-wide.

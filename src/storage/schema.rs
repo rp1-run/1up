@@ -11,6 +11,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segments"),
     ("table", "segment_vectors"),
     ("table", "segment_symbols"),
+    ("table", "segment_relations"),
     ("table", "segments_fts"),
     ("table", "meta"),
     ("index", "idx_segments_file_path"),
@@ -19,6 +20,8 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segment_vectors_embedding"),
     ("index", "idx_segment_symbols_exact"),
     ("index", "idx_segment_symbols_prefix"),
+    ("index", "idx_segment_relations_source"),
+    ("index", "idx_segment_relations_target"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
@@ -30,13 +33,14 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{}",
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
         queries::CREATE_SEGMENT_VECTORS_TABLE,
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
+        queries::CREATE_SEGMENT_RELATIONS_TABLE,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
@@ -46,12 +50,16 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
 
     conn.execute_batch(&format!(
-        "{};{}",
+        "{};{};{};{}",
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
+        queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
+        queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
     ))
     .await
-    .map_err(|e| StorageError::Migration(format!("failed to create symbol indexes: {e}")))?;
+    .map_err(|e| {
+        StorageError::Migration(format!("failed to create symbol and relation indexes: {e}"))
+    })?;
 
     // FTS5 virtual table and sync triggers
     conn.execute_batch(queries::CREATE_FTS_TABLE)
@@ -477,6 +485,9 @@ mod tests {
         assert!(schema_object_exists(&conn, "table", "segment_symbols")
             .await
             .unwrap());
+        assert!(schema_object_exists(&conn, "table", "segment_relations")
+            .await
+            .unwrap());
         assert!(
             schema_object_exists(&conn, "index", "idx_segment_symbols_exact")
                 .await
@@ -484,6 +495,16 @@ mod tests {
         );
         assert!(
             schema_object_exists(&conn, "index", "idx_segment_symbols_prefix")
+                .await
+                .unwrap()
+        );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_relations_source")
+                .await
+                .unwrap()
+        );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_relations_target")
                 .await
                 .unwrap()
         );
@@ -510,7 +531,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v7_schema() {
+    async fn prepare_for_write_rejects_pre_v8_schema() {
+        let (_db, conn) = setup().await;
+
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "7"])
+            .await
+            .unwrap();
+
+        let err = prepare_for_write(&conn).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("found v7, expected v8"));
+        assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_rejects_partial_v8_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(

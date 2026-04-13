@@ -95,9 +95,14 @@ The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts.
 | Explore unfamiliar code by meaning | `1up --format human search "retry logic with backoff" -n 5` | Ranked semantic and keyword search for discovery |
 | Jump to a definition and all callers | `1up --format human symbol -r validate_token` | Exact-first symbol lookup with reference search |
 | Understand code at a specific file and line | `1up --format human context src/auth.rs:87` | Snaps to the enclosing function, impl, or scope |
+| Inspect likely blast radius from an exact anchor | `1up --format human impact --from-file src/auth.rs:87` | Opt-in, local likely-impact follow-up that keeps normal search behavior unchanged |
 | Match code structure instead of text | `1up --format human structural "(function_item name: (identifier) @name)"` | Tree-sitter AST search |
 
 All commands support `--format plain|json|human`. Use `--format human` for interactive terminal use and `--format json` when an agent or script needs structured output.
+
+For agent handoff loops, `1up --format json search ...` exposes `segment_id` on segment-backed hits. Reuse that exact handle with `1up --format json impact --from-segment <segment_id>` when you want bounded likely-impact follow-up without reconstructing a `file:line` anchor.
+
+That handoff is additive. Reusing `segment_id` moves you into the explicit `impact` workflow, but it does not change `search` ranking, candidate selection, or the default discovery loop.
 
 ## Recommended Workflow
 
@@ -110,6 +115,13 @@ Use semantic search for discovery, then switch to symbol lookup for completeness
 ```
 
 That pattern is important. Semantic search is ranked and intentionally selective. It is excellent for finding the right place to look, but `1up symbol -r` is the safer follow-up when you need all definitions and references for a symbol.
+
+When an agent needs the next likely inspection targets after discovery, prefer the explicit handoff:
+
+```sh
+1up --format json search "load auth config" -n 5
+1up --format json impact --from-segment <segment_id>
+```
 
 ## A Few Honest Notes
 
@@ -128,6 +140,8 @@ just bench-parallel
 ```
 
 `just bench` runs the search comparison on pinned `emdash` checkouts and reports `1up` against raw `rg` command sequences for the same tasks. `just bench-parallel` runs the parallel indexing benchmark on the same pinned `emdash` corpus.
+
+The Criterion bench suite also covers `impact_file_anchor`, `impact_symbol_anchor_narrow`, and `impact_symbol_anchor_refused` while keeping the existing search benches as the non-regression guardrail for core discovery commands.
 
 ## Upgrade
 

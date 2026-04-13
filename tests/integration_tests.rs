@@ -295,6 +295,25 @@ fn search_json(dir: &std::path::Path, query: &str) -> Vec<serde_json::Value> {
     serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
 }
 
+fn impact_json(dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let mut command = cmd();
+    command.arg("--format").arg("json").arg("impact");
+    for arg in args {
+        command.arg(arg);
+    }
+    command.arg("--path").arg(dir);
+
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "impact failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
 fn write_parallel_regression_fixture(dir: &std::path::Path) {
     fs::write(
         dir.join("changed.rs"),
@@ -404,6 +423,101 @@ message PolicyRulePreview {
     id TEXT PRIMARY KEY,
     validator_name TEXT NOT NULL
 );
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
+fn create_impact_acceptance_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for dir in ["src/auth", "src/cache", "src/ui", "tests"] {
+        fs::create_dir_all(tmp.path().join(dir)).unwrap();
+    }
+
+    fs::write(
+        tmp.path().join("src").join("auth").join("runtime.rs"),
+        r#"pub fn load_auth_config() -> &'static str {
+    "auth"
+}
+
+pub fn parse_auth_config(raw: &str) -> bool {
+    !raw.trim().is_empty()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("auth").join("bootstrap.rs"),
+        r#"use crate::auth::runtime::load_auth_config;
+
+pub fn boot_auth() -> &'static str {
+    load_auth_config()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("tests").join("auth_runtime_test.rs"),
+        r#"use crate::auth::runtime::load_auth_config;
+
+#[test]
+fn loads_auth_runtime() {
+    assert_eq!(load_auth_config(), "auth");
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("auth").join("config.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "auth-scope"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path()
+            .join("src")
+            .join("auth")
+            .join("config_builder.rs"),
+        r#"use crate::auth::config::load_config;
+
+pub fn build_auth_config() -> &'static str {
+    load_config()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("config.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "cache"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("config.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "ui"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("tests").join("config_fixture.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "tests"
+}
 "#,
     )
     .unwrap();
@@ -625,6 +739,198 @@ fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
             "query {query:?} should keep a stable top-3 result set"
         );
     }
+}
+
+#[test]
+fn impact_file_anchor_returns_ranked_results_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "file");
+    assert_eq!(result["resolved_anchor"]["value"], "src/auth/runtime.rs");
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+    assert_eq!(results[0]["reasons"][0]["kind"], "called_by");
+}
+
+#[test]
+fn impact_file_line_anchor_resolves_requested_line_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs:1"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
+    assert_eq!(result["resolved_anchor"]["value"], "src/auth/runtime.rs");
+    assert_eq!(result["resolved_anchor"]["line"], 1);
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+}
+
+#[test]
+fn impact_symbol_anchor_expands_with_resolved_seed_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "load_auth_config"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "load_auth_config");
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert!(results
+        .iter()
+        .any(|candidate| candidate["file_path"] == "src/auth/bootstrap.rs"));
+}
+
+#[test]
+fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(
+        tmp.path(),
+        &["--from-symbol", "load_config", "--scope", "src/auth"],
+    );
+
+    assert_eq!(result["status"], "expanded_scoped");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "load_config");
+    assert_eq!(result["resolved_anchor"]["scope"], "src/auth");
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/auth/config_builder.rs");
+}
+
+#[test]
+fn impact_file_anchor_scope_refuses_out_of_scope_seed_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(
+        tmp.path(),
+        &["--from-file", "src/auth/runtime.rs", "--scope", "src/cache"],
+    );
+
+    assert_eq!(result["status"], "refused");
+    assert_eq!(result["refusal"]["reason"], "anchor_out_of_scope");
+    assert_eq!(result["hint"]["code"], "align_anchor_and_scope");
+}
+
+#[test]
+fn impact_symbol_anchor_refuses_broad_requests_with_hint_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "load_config"]);
+
+    assert_eq!(result["status"], "refused");
+    assert_eq!(result["refusal"]["reason"], "symbol_too_broad");
+    assert_eq!(result["hint"]["code"], "narrow_with_scope");
+    assert!(result["hint"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--scope"));
+}
+
+#[test]
+fn search_segment_id_round_trips_into_impact_from_segment_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let search_results = search_json(tmp.path(), "load auth config");
+    assert!(
+        !search_results.is_empty(),
+        "search fixture should produce ranked hits"
+    );
+
+    let seed = search_results
+        .iter()
+        .find(|result| {
+            result["file_path"].as_str() == Some("src/auth/runtime.rs")
+                && result["content"]
+                    .as_str()
+                    .map(|content| content.contains("load_auth_config"))
+                    .unwrap_or(false)
+        })
+        .expect("search should return the runtime definition segment");
+    let segment_id = seed["segment_id"]
+        .as_str()
+        .expect("search results should expose a segment_id follow-up handle");
+
+    let result = impact_json(tmp.path(), &["--from-segment", segment_id]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "segment");
+    assert_eq!(result["resolved_anchor"]["value"], segment_id);
+
+    let results = result["results"].as_array().unwrap();
+    assert!(
+        !results.is_empty(),
+        "round-tripped impact should return candidates"
+    );
+    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+    assert!(results[0]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason["from_segment_id"].as_str() == Some(segment_id)));
+}
+
+#[test]
+fn search_segment_id_handoff_keeps_search_top_hits_stable() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let before = search_json(tmp.path(), "load auth config");
+    assert!(
+        !before.is_empty(),
+        "search fixture should produce ranked hits"
+    );
+
+    let segment_id = before
+        .iter()
+        .find_map(|result| result["segment_id"].as_str())
+        .expect("search results should expose at least one segment_id");
+
+    let _result = impact_json(tmp.path(), &["--from-segment", segment_id]);
+    let after = search_json(tmp.path(), "load auth config");
+
+    let before_ranked: Vec<_> = before
+        .iter()
+        .take(5)
+        .map(|result| {
+            (
+                result["file_path"].as_str().unwrap().to_string(),
+                result["line_number"].as_u64().unwrap(),
+                result["block_type"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let after_ranked: Vec<_> = after
+        .iter()
+        .take(5)
+        .map(|result| {
+            (
+                result["file_path"].as_str().unwrap().to_string(),
+                result["line_number"].as_u64().unwrap(),
+                result["block_type"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    assert_eq!(before_ranked, after_ranked);
 }
 
 // ---------- Verify context retrieval returns enclosing scope ----------

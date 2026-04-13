@@ -45,6 +45,21 @@ CREATE TABLE IF NOT EXISTS segment_symbols (
     PRIMARY KEY (segment_id, canonical_symbol, reference_kind)
 )";
 
+pub const CREATE_SEGMENT_RELATIONS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS segment_relations (
+    source_segment_id TEXT NOT NULL,
+    relation_kind TEXT NOT NULL,
+    raw_target_symbol TEXT NOT NULL,
+    canonical_target_symbol TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (
+        source_segment_id,
+        relation_kind,
+        canonical_target_symbol,
+        raw_target_symbol
+    )
+)";
+
 pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec))";
 
@@ -53,6 +68,12 @@ pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_prefix ON segment_symbols(canonical_symbol)";
+
+pub const CREATE_INDEX_SEGMENT_RELATIONS_SOURCE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_source ON segment_relations(source_segment_id)";
+
+pub const CREATE_INDEX_SEGMENT_RELATIONS_TARGET: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_target ON segment_relations(canonical_target_symbol, relation_kind)";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -97,8 +118,11 @@ DROP TABLE IF EXISTS segments_fts;
 DROP INDEX IF EXISTS idx_segment_vectors_embedding;
 DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
+DROP INDEX IF EXISTS idx_segment_relations_source;
+DROP INDEX IF EXISTS idx_segment_relations_target;
 DROP TABLE IF EXISTS segment_vectors;
 DROP TABLE IF EXISTS segment_symbols;
+DROP TABLE IF EXISTS segment_relations;
 DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
@@ -165,6 +189,67 @@ pub const DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID: &str =
     "DELETE FROM segment_symbols WHERE segment_id = ?1";
 
 #[allow(dead_code)]
+pub const INSERT_SEGMENT_RELATION: &str = "
+INSERT OR REPLACE INTO segment_relations (
+    source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol, created_at
+) VALUES (
+    ?1, ?2, ?3, ?4, datetime('now')
+)";
+
+#[allow(dead_code)]
+pub const DELETE_SEGMENT_RELATIONS_BY_SOURCE_SEGMENT_ID: &str =
+    "DELETE FROM segment_relations WHERE source_segment_id = ?1";
+
+#[allow(dead_code)]
+pub const DELETE_SEGMENT_RELATIONS_BY_FILE: &str = "
+DELETE FROM segment_relations
+WHERE source_segment_id IN (
+    SELECT id
+    FROM segments
+    WHERE file_path = ?1
+)";
+
+#[allow(dead_code)]
+pub const SELECT_OUTBOUND_RELATIONS: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE source_segment_id = ?1
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  canonical_target_symbol,
+  raw_target_symbol
+LIMIT ?2";
+
+#[allow(dead_code)]
+pub const SELECT_OUTBOUND_RELATIONS_BY_KIND: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE source_segment_id = ?1
+  AND relation_kind = ?2
+ORDER BY canonical_target_symbol, raw_target_symbol
+LIMIT ?3";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE canonical_target_symbol = ?1
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  source_segment_id,
+  raw_target_symbol
+LIMIT ?2";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS_BY_KIND: &str = "
+SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+FROM segment_relations
+WHERE canonical_target_symbol = ?1
+  AND relation_kind = ?2
+ORDER BY source_segment_id, raw_target_symbol
+LIMIT ?3";
+
+#[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
 SELECT id, file_path, language, block_type, content,
        line_start, line_end, breadcrumb, complexity, role,
@@ -185,6 +270,43 @@ LIMIT 1";
 
 pub const SELECT_ALL_FILE_PATHS: &str = "
 SELECT DISTINCT file_path FROM segments ORDER BY file_path";
+
+pub const SELECT_TEST_FILE_PATHS_LIMITED: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE lower(file_path) LIKE 'tests/%'
+   OR lower(file_path) LIKE '%/tests/%'
+   OR lower(file_path) LIKE '%/test/%'
+   OR lower(file_path) LIKE '%/spec/%'
+   OR lower(file_path) LIKE '%/__tests__/%'
+   OR lower(file_path) LIKE '%_test.rs'
+   OR lower(file_path) LIKE '%_spec.rs'
+   OR lower(file_path) LIKE '%.test.ts'
+   OR lower(file_path) LIKE '%.spec.ts'
+   OR lower(file_path) LIKE '%.test.js'
+   OR lower(file_path) LIKE '%.spec.js'
+ORDER BY file_path
+LIMIT ?1";
+
+pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE (file_path = ?1 OR file_path LIKE ?2)
+  AND (
+       lower(file_path) LIKE 'tests/%'
+    OR lower(file_path) LIKE '%/tests/%'
+    OR lower(file_path) LIKE '%/test/%'
+    OR lower(file_path) LIKE '%/spec/%'
+    OR lower(file_path) LIKE '%/__tests__/%'
+    OR lower(file_path) LIKE '%_test.rs'
+    OR lower(file_path) LIKE '%_spec.rs'
+    OR lower(file_path) LIKE '%.test.ts'
+    OR lower(file_path) LIKE '%.spec.ts'
+    OR lower(file_path) LIKE '%.test.js'
+    OR lower(file_path) LIKE '%.spec.js'
+  )
+ORDER BY file_path
+LIMIT ?3";
 
 #[allow(dead_code)]
 pub const SELECT_ALL_FILE_HASHES: &str = "

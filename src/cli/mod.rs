@@ -1,5 +1,6 @@
 pub mod context;
 pub mod hello_agent;
+pub mod impact;
 pub mod index;
 pub mod init;
 pub mod output;
@@ -59,6 +60,9 @@ pub enum Command {
     /// Retrieve code context around a file location
     Context(context::ContextArgs),
 
+    /// Explore probable impact from a known anchor
+    Impact(impact::ImpactArgs),
+
     /// Structural AST-pattern search using tree-sitter queries
     Structural(structural::StructuralArgs),
 
@@ -97,6 +101,7 @@ impl Command {
             | Command::Search(_)
             | Command::Symbol(_)
             | Command::Context(_)
+            | Command::Impact(_)
             | Command::Structural(_)
             | Command::Index(_)
             | Command::Reindex(_)
@@ -115,6 +120,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Symbol(args) => symbol::exec(args, format).await,
         Command::Search(args) => search::exec(args, format).await,
         Command::Context(args) => context::exec(args, format).await,
+        Command::Impact(args) => impact::exec(args, format).await,
         Command::Structural(args) => structural::exec(args, format).await,
         Command::Index(args) => index::exec(args, format).await,
         Command::Reindex(args) => reindex::exec(args, format).await,
@@ -160,6 +166,7 @@ mod tests {
             &["1up", "search", "needle"][..],
             &["1up", "symbol", "Config"][..],
             &["1up", "context", "src/main.rs:1"][..],
+            &["1up", "impact", "--from-symbol", "Config"][..],
             &["1up", "structural", "(identifier) @id"][..],
             &["1up", "init", "."][..],
             &["1up", "index", "."][..],

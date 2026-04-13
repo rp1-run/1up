@@ -175,7 +175,11 @@ function runOneupSearch(
   return parsedOutput as SearchResult[];
 }
 
-function runBaselineSearch(command: string, repoDir: string, homeDir: string): string[] {
+function runBaselineSearch(
+  command: string,
+  repoDir: string,
+  homeDir: string,
+): string[] {
   const rawOutput = execFileSync("bash", ["-lc", command], {
     cwd: repoDir,
     encoding: "utf8",
@@ -188,7 +192,9 @@ function runBaselineSearch(command: string, repoDir: string, homeDir: string): s
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
   if (lines.length === 0) {
-    throw new Error(`baseline search returned no results for command: ${command}`);
+    throw new Error(
+      `baseline search returned no results for command: ${command}`,
+    );
   }
 
   return lines;
@@ -230,7 +236,8 @@ function measureCase(
       () => runOneupSearch(benchCase.oneupQuery, repoDir, homeDir).length,
     ),
     baseline: measureCommand(
-      () => runBaselineSearch(benchCase.baselineCommand, repoDir, homeDir).length,
+      () =>
+        runBaselineSearch(benchCase.baselineCommand, repoDir, homeDir).length,
     ),
   };
 }
@@ -246,7 +253,8 @@ function printSummary(
   modelCachePath: string | null,
 ): void {
   const perQueryBudgetMs = PASSING_TOTAL_MEAN_MS / BENCHMARK_CASES.length;
-  const outcome = aggregateOneupMeanMs <= PASSING_TOTAL_MEAN_MS ? "PASS" : "FAIL";
+  const outcome =
+    aggregateOneupMeanMs <= PASSING_TOTAL_MEAN_MS ? "PASS" : "FAIL";
 
   console.log(`1up search comparison bench: ${outcome}`);
   console.log(`1up binary: ${BENCHMARK_BINARY}`);
@@ -271,7 +279,9 @@ function printSummary(
 
   console.log("");
   console.log(`1up aggregate mean: ${formatMs(aggregateOneupMeanMs)}`);
-  console.log(`${BASELINE_LABEL} aggregate mean: ${formatMs(aggregateBaselineMeanMs)}`);
+  console.log(
+    `${BASELINE_LABEL} aggregate mean: ${formatMs(aggregateBaselineMeanMs)}`,
+  );
   console.log(
     `Aggregate speedup: ${(aggregateBaselineMeanMs / aggregateOneupMeanMs).toFixed(2)}x`,
   );

@@ -5,9 +5,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::search::impact::{
+    ImpactCandidate, ImpactReason, ImpactResultEnvelope, ImpactStatus, ResolvedImpactAnchor,
+};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
-    ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult,
+    ContextResult, IndexPhase, IndexProgress, IndexState, OutputFormat, SearchResult, SegmentRole,
     StructuralResult, SymbolResult,
 };
 use crate::shared::update::{InstallChannel, UpdateStatus};
@@ -17,6 +20,7 @@ pub trait Formatter {
     fn format_symbol_results(&self, results: &[SymbolResult]) -> String;
     fn format_context_result(&self, result: &ContextResult) -> String;
     fn format_structural_results(&self, results: &[StructuralResult]) -> String;
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String;
     fn format_message(&self, message: &str) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_index_watch_update(&self, progress: &IndexProgress) -> String;
@@ -180,6 +184,10 @@ impl Formatter for JsonFormatter {
 
     fn format_structural_results(&self, results: &[StructuralResult]) -> String {
         to_json(results)
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        to_json(result)
     }
 
     fn format_message(&self, message: &str) -> String {
@@ -389,6 +397,85 @@ impl Formatter for HumanFormatter {
                 out.push_str(&format!("  {}\n", "...".dimmed()));
             }
         }
+        out
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} {}\n",
+            "Likely Impact".bold().underline(),
+            format!("[{}]", render_impact_status_label(result.status)).dimmed()
+        ));
+
+        if let Some(anchor) = &result.resolved_anchor {
+            out.push_str(&format!(
+                "Resolved: {}\n",
+                render_impact_anchor_head(anchor).cyan()
+            ));
+            if let Some(context) = render_impact_anchor_context_human(anchor) {
+                out.push_str(&format!("{}\n", format!("Context: {context}").dimmed()));
+            }
+        }
+
+        if let Some(refusal) = &result.refusal {
+            out.push_str(&format!(
+                "Refusal: {} {}\n",
+                refusal.reason.yellow().bold(),
+                refusal.message
+            ));
+        } else if result.results.is_empty() {
+            out.push_str("No likely-impact candidates found.\n");
+        } else {
+            for (i, candidate) in result.results.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "{}. {} {}\n",
+                    i + 1,
+                    format!(
+                        "{}:{}-{}",
+                        candidate.file_path, candidate.line_start, candidate.line_end
+                    )
+                    .cyan(),
+                    format!("[{}]", candidate.block_type).dimmed()
+                ));
+                out.push_str(&format!(
+                    "{}\n",
+                    render_impact_candidate_metadata(candidate).dimmed()
+                ));
+                if let Some(breadcrumb) = &candidate.breadcrumb {
+                    out.push_str(&format!(
+                        "{}\n",
+                        format!("Breadcrumb: {breadcrumb}").dimmed()
+                    ));
+                }
+                if !candidate.reasons.is_empty() {
+                    out.push_str(&format!(
+                        "{}\n",
+                        format!("Why: {}", render_impact_reasons_human(&candidate.reasons))
+                            .dimmed()
+                    ));
+                }
+            }
+        }
+
+        if let Some(hint) = &result.hint {
+            out.push('\n');
+            out.push_str(&format!(
+                "Next step {} {}\n",
+                format!("[{}]", hint.code).dimmed(),
+                hint.message
+            ));
+            if let Some(scope) = &hint.suggested_scope {
+                out.push_str(&format!("Suggested scope: {}\n", scope.cyan()));
+            }
+            if let Some(segment_id) = &hint.suggested_segment_id {
+                out.push_str(&format!("Suggested segment: {}\n", segment_id.cyan()));
+            }
+        }
+
         out
     }
 
@@ -710,9 +797,13 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for r in results {
             out.push_str(&format!(
-                "{}:{}-{}\t{}\t{:.4}\n",
+                "{}:{}-{}\t{}\t{:.4}",
                 r.file_path, r.line_number, r.line_end, r.block_type, r.score
             ));
+            if let Some(segment_id) = r.segment_id.as_deref() {
+                out.push_str(&format!("\tsegment={segment_id}"));
+            }
+            out.push('\n');
             out.push_str(&format!("{}\n", render_search_metadata(r)));
             out.push_str(&r.content);
             if !r.content.ends_with('\n') {
@@ -778,6 +869,72 @@ impl Formatter for PlainFormatter {
             }
             out.push('\n');
         }
+        out
+    }
+
+    fn format_impact_result(&self, result: &ImpactResultEnvelope) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "status\t{}\n",
+            render_impact_status_label(result.status)
+        ));
+
+        if let Some(anchor) = &result.resolved_anchor {
+            out.push_str(&format!("anchor\t{}\t{}\n", anchor.kind, anchor.value));
+            for line in render_impact_anchor_context_plain(anchor) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        if let Some(refusal) = &result.refusal {
+            out.push_str(&format!(
+                "refusal\t{}\t{}\n",
+                refusal.reason, refusal.message
+            ));
+        }
+
+        if let Some(hint) = &result.hint {
+            out.push_str(&format!("hint\t{}\t{}\n", hint.code, hint.message));
+            if let Some(scope) = &hint.suggested_scope {
+                out.push_str(&format!("hint_scope\t{scope}\n"));
+            }
+            if let Some(segment_id) = &hint.suggested_segment_id {
+                out.push_str(&format!("hint_segment\t{segment_id}\n"));
+            }
+        }
+
+        for (i, candidate) in result.results.iter().enumerate() {
+            out.push_str(&format!(
+                "result\t{}\t{}:{}-{}\t{}\tlang={}\tscore={:.4}\thop={}\tsegment={}\n",
+                i + 1,
+                candidate.file_path,
+                candidate.line_start,
+                candidate.line_end,
+                candidate.block_type,
+                candidate.language,
+                candidate.score,
+                candidate.hop,
+                candidate.segment_id
+            ));
+            out.push_str(&format!(
+                "result_meta\t{}\n",
+                render_impact_candidate_metadata(candidate)
+            ));
+            if let Some(breadcrumb) = &candidate.breadcrumb {
+                out.push_str(&format!("result_breadcrumb\t{}\n", breadcrumb));
+            }
+            if !candidate.reasons.is_empty() {
+                for reason in &candidate.reasons {
+                    out.push_str(&format!(
+                        "result_reason\t{}\t{}\n",
+                        i + 1,
+                        render_impact_reason_plain(reason)
+                    ));
+                }
+            }
+        }
+
         out
     }
 
@@ -1366,6 +1523,141 @@ fn render_symbol_metadata(result: &SymbolResult) -> String {
     parts.join(" | ")
 }
 
+fn render_impact_status_label(status: ImpactStatus) -> &'static str {
+    match status {
+        ImpactStatus::Expanded => "expanded",
+        ImpactStatus::ExpandedScoped => "expanded_scoped",
+        ImpactStatus::Refused => "refused",
+    }
+}
+
+fn render_impact_anchor_head(anchor: &ResolvedImpactAnchor) -> String {
+    format!("{} {}", anchor.kind, anchor.value)
+}
+
+fn render_impact_anchor_context_human(anchor: &ResolvedImpactAnchor) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(line) = anchor.line {
+        parts.push(format!("line {line}"));
+    }
+    if let Some(scope) = &anchor.scope {
+        parts.push(format!("scope {scope}"));
+    }
+    if !anchor.matched_files.is_empty() {
+        parts.push(format!(
+            "matched {}",
+            truncate_items(&anchor.matched_files, 3)
+        ));
+    }
+    if !anchor.seed_segment_ids.is_empty() {
+        let seeds = anchor
+            .seed_segment_ids
+            .iter()
+            .map(|segment_id| short_segment_id(segment_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("seed segments {seeds}"));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+fn render_impact_anchor_context_plain(anchor: &ResolvedImpactAnchor) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(line) = anchor.line {
+        lines.push(format!("anchor_line\t{line}"));
+    }
+    if let Some(scope) = &anchor.scope {
+        lines.push(format!("anchor_scope\t{scope}"));
+    }
+    for matched_file in &anchor.matched_files {
+        lines.push(format!("anchor_match\t{matched_file}"));
+    }
+    for seed_segment_id in &anchor.seed_segment_ids {
+        lines.push(format!("anchor_seed_segment\t{seed_segment_id}"));
+    }
+
+    lines
+}
+
+fn render_impact_candidate_metadata(candidate: &ImpactCandidate) -> String {
+    let mut parts = vec![
+        format!("Language: {}", candidate.language),
+        format!("Score: {:.4}", candidate.score),
+        format!("Hop: {}", candidate.hop),
+        format!("Segment: {}", candidate.segment_id),
+    ];
+
+    if let Some(role) = candidate.role {
+        parts.push(format!("Role: {}", render_segment_role(role)));
+    }
+    if let Some(complexity) = candidate.complexity {
+        if complexity > 0 {
+            parts.push(format!("Complexity: {complexity}"));
+        }
+    }
+    if let Some(defined_symbols) = &candidate.defined_symbols {
+        if !defined_symbols.is_empty() {
+            parts.push(format!("Defines: {}", truncate_items(defined_symbols, 5)));
+        }
+    }
+
+    parts.join(" | ")
+}
+
+fn render_impact_reasons_human(reasons: &[ImpactReason]) -> String {
+    reasons
+        .iter()
+        .map(render_impact_reason_human)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn render_impact_reason_human(reason: &ImpactReason) -> String {
+    let mut label = reason.kind.clone();
+
+    if let Some(symbol) = &reason.symbol {
+        label.push('(');
+        label.push_str(symbol);
+        label.push(')');
+    }
+
+    if let Some(from_segment_id) = &reason.from_segment_id {
+        label.push_str(" from ");
+        label.push_str(&short_segment_id(from_segment_id));
+    }
+
+    label
+}
+
+fn render_impact_reason_plain(reason: &ImpactReason) -> String {
+    let mut parts = vec![format!("kind={}", reason.kind)];
+
+    if let Some(symbol) = &reason.symbol {
+        parts.push(format!("symbol={symbol}"));
+    }
+    if let Some(from_segment_id) = &reason.from_segment_id {
+        parts.push(format!("from_segment={from_segment_id}"));
+    }
+
+    parts.join("\t")
+}
+
+fn render_segment_role(role: SegmentRole) -> &'static str {
+    match role {
+        SegmentRole::Definition => "definition",
+        SegmentRole::Implementation => "implementation",
+        SegmentRole::Orchestration => "orchestration",
+        SegmentRole::Import => "import",
+        SegmentRole::Docs => "docs",
+    }
+}
+
+fn short_segment_id(segment_id: &str) -> String {
+    segment_id.chars().take(12).collect()
+}
+
 fn truncate_items(items: &[String], limit: usize) -> String {
     if items.len() <= limit {
         return items.join(", ");
@@ -1380,6 +1672,93 @@ fn truncate_items(items: &[String], limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::shared::types::{IndexParallelism, IndexStageTimings};
+
+    fn sample_search_result() -> SearchResult {
+        SearchResult {
+            file_path: "src/auth/builder.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn build_auth() {\n    apply_config();\n}".to_string(),
+            score: 0.945,
+            line_number: 21,
+            line_end: 23,
+            segment_id: Some("candidate-segment-abcdef123456".to_string()),
+            breadcrumb: Some("AuthConfig::build".to_string()),
+            complexity: Some(4),
+            role: Some(SegmentRole::Orchestration),
+            defined_symbols: Some(vec!["build_auth".to_string()]),
+            referenced_symbols: None,
+            called_symbols: Some(vec!["apply_config".to_string()]),
+        }
+    }
+
+    fn sample_impact_result() -> ImpactResultEnvelope {
+        ImpactResultEnvelope {
+            status: ImpactStatus::ExpandedScoped,
+            resolved_anchor: Some(ResolvedImpactAnchor {
+                kind: "symbol".to_string(),
+                value: "Config".to_string(),
+                line: Some(14),
+                scope: Some("src/auth".to_string()),
+                seed_segment_ids: vec!["seed-segment-1234567890".to_string()],
+                matched_files: vec![
+                    "src/auth/config.rs".to_string(),
+                    "src/auth/mod.rs".to_string(),
+                ],
+            }),
+            results: vec![ImpactCandidate {
+                segment_id: "candidate-segment-abcdef123456".to_string(),
+                file_path: "src/auth/builder.rs".to_string(),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                line_start: 21,
+                line_end: 38,
+                score: 0.945,
+                hop: 1,
+                reasons: vec![
+                    ImpactReason {
+                        kind: "called_by".to_string(),
+                        symbol: Some("Config".to_string()),
+                        from_segment_id: Some("seed-segment-1234567890".to_string()),
+                    },
+                    ImpactReason {
+                        kind: "same_file".to_string(),
+                        symbol: None,
+                        from_segment_id: None,
+                    },
+                ],
+                breadcrumb: Some("AuthConfig::build".to_string()),
+                complexity: Some(4),
+                role: Some(SegmentRole::Orchestration),
+                defined_symbols: Some(vec!["build_auth".to_string()]),
+            }],
+            hint: Some(crate::search::impact::ImpactHint {
+                code: "inspect_candidate".to_string(),
+                message: "Inspect `src/auth/builder.rs` next.".to_string(),
+                suggested_scope: Some("src/auth".to_string()),
+                suggested_segment_id: Some("candidate-segment-abcdef123456".to_string()),
+            }),
+            refusal: None,
+        }
+    }
+
+    fn sample_refused_impact_result() -> ImpactResultEnvelope {
+        ImpactResultEnvelope {
+            status: ImpactStatus::Refused,
+            resolved_anchor: None,
+            results: Vec::new(),
+            hint: Some(crate::search::impact::ImpactHint {
+                code: "narrow_with_scope".to_string(),
+                message: "Pass `--scope src/auth` or reuse an exact segment anchor.".to_string(),
+                suggested_scope: Some("src/auth".to_string()),
+                suggested_segment_id: Some("seed-segment-1234567890".to_string()),
+            }),
+            refusal: Some(crate::search::impact::ImpactRefusal {
+                reason: "symbol_too_broad".to_string(),
+                message: "Symbol `Config` matched too many unrelated definitions.".to_string(),
+            }),
+        }
+    }
 
     fn sample_progress() -> IndexProgress {
         IndexProgress {
@@ -1426,6 +1805,52 @@ mod tests {
     }
 
     #[test]
+    fn json_search_results_include_segment_id_when_available() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            value[0]["segment_id"],
+            serde_json::Value::String("candidate-segment-abcdef123456".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_search_results_append_segment_field() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+        let first_line = rendered.lines().next().unwrap();
+
+        assert_eq!(
+            first_line,
+            "src/auth/builder.rs:21-23\tfunction\t0.9450\tsegment=candidate-segment-abcdef123456"
+        );
+    }
+
+    #[test]
+    fn plain_search_results_preserve_legacy_shape_without_segment_field() {
+        let formatter = PlainFormatter;
+        let mut result = sample_search_result();
+        result.segment_id = None;
+
+        let rendered = formatter.format_search_results(&[result]);
+        let first_line = rendered.lines().next().unwrap();
+
+        assert_eq!(first_line, "src/auth/builder.rs:21-23\tfunction\t0.9450");
+    }
+
+    #[test]
+    fn human_search_results_remain_concise_without_full_segment_id() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+
+        assert!(!rendered.contains("candidate-segment-abcdef123456"));
+        assert!(rendered.contains("src/auth/builder.rs:21"));
+        assert!(rendered.contains("Kind: function | Scope: AuthConfig::build"));
+    }
+
+    #[test]
     fn human_index_summary_renders_work_parallelism_and_timings() {
         let formatter = HumanFormatter;
         let rendered = formatter.format_index_summary("indexed", &sample_progress());
@@ -1436,6 +1861,102 @@ mod tests {
         );
         assert!(rendered
             .contains("Timings: scan 11ms | parse 17ms | embed 23ms | store 5ms | total 41ms"));
+    }
+
+    #[test]
+    fn json_impact_result_keeps_nested_expanded_fields() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_impact_result(&sample_impact_result());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "expanded_scoped");
+        assert_eq!(value["resolved_anchor"]["scope"], "src/auth");
+        assert!(value["resolved_anchor"]["seed_segment_ids"].is_array());
+        assert_eq!(
+            value["results"][0]["reasons"][0]["from_segment_id"],
+            "seed-segment-1234567890"
+        );
+        assert_eq!(
+            value["hint"]["suggested_segment_id"],
+            "candidate-segment-abcdef123456"
+        );
+    }
+
+    #[test]
+    fn json_impact_refusal_keeps_structured_hint_and_refusal() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_impact_result(&sample_refused_impact_result());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["refusal"]["reason"], "symbol_too_broad");
+        assert_eq!(value["hint"]["code"], "narrow_with_scope");
+        assert_eq!(value["hint"]["suggested_scope"], "src/auth");
+    }
+
+    #[test]
+    fn human_impact_result_renders_context_breadcrumb_and_next_step() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_impact_result(&sample_impact_result());
+
+        assert!(rendered.contains("Likely Impact"));
+        assert!(rendered.contains("Resolved: symbol Config"));
+        assert!(rendered.contains("Context: line 14 | scope src/auth"));
+        assert!(rendered.contains("Language: rust"));
+        assert!(rendered.contains("Breadcrumb: AuthConfig::build"));
+        assert!(rendered.contains("Why: called_by(Config) from seed-segment; same_file"));
+        assert!(
+            rendered.contains("Next step [inspect_candidate] Inspect `src/auth/builder.rs` next.")
+        );
+        assert!(rendered.contains("Suggested segment: candidate-segment-abcdef123456"));
+    }
+
+    #[test]
+    fn human_impact_refusal_renders_actionable_guidance() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_impact_result(&sample_refused_impact_result());
+
+        assert!(rendered.contains("Refusal: symbol_too_broad"));
+        assert!(rendered.contains("Next step [narrow_with_scope]"));
+        assert!(rendered.contains("Suggested scope: src/auth"));
+        assert!(rendered.contains("Suggested segment: seed-segment-1234567890"));
+    }
+
+    #[test]
+    fn plain_impact_result_renders_full_anchor_context_and_reason_fields() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_impact_result(&sample_impact_result());
+
+        assert!(rendered.contains("status\texpanded_scoped"));
+        assert!(rendered.contains("anchor\tsymbol\tConfig"));
+        assert!(rendered.contains("anchor_line\t14"));
+        assert!(rendered.contains("anchor_scope\tsrc/auth"));
+        assert!(rendered.contains("anchor_match\tsrc/auth/config.rs"));
+        assert!(rendered.contains("anchor_seed_segment\tseed-segment-1234567890"));
+        assert!(rendered.contains(
+            "result\t1\tsrc/auth/builder.rs:21-38\tfunction\tlang=rust\tscore=0.9450\thop=1\tsegment=candidate-segment-abcdef123456"
+        ));
+        assert!(rendered.contains("result_breadcrumb\tAuthConfig::build"));
+        assert!(rendered.contains(
+            "result_reason\t1\tkind=called_by\tsymbol=Config\tfrom_segment=seed-segment-1234567890"
+        ));
+        assert!(rendered.contains("result_reason\t1\tkind=same_file"));
+    }
+
+    #[test]
+    fn plain_impact_refusal_renders_structured_guidance() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_impact_result(&sample_refused_impact_result());
+
+        assert!(rendered.contains("status\trefused"));
+        assert!(rendered.contains(
+            "refusal\tsymbol_too_broad\tSymbol `Config` matched too many unrelated definitions."
+        ));
+        assert!(rendered.contains(
+            "hint\tnarrow_with_scope\tPass `--scope src/auth` or reuse an exact segment anchor."
+        ));
+        assert!(rendered.contains("hint_scope\tsrc/auth"));
+        assert!(rendered.contains("hint_segment\tseed-segment-1234567890"));
     }
 
     #[test]
