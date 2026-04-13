@@ -1,36 +1,38 @@
 # Module & Component Breakdown
 
 **Project**: 1up
-**Analysis Date**: 2026-04-12
+**Analysis Date**: 2026-04-13
 **Modules Analyzed**: 10
 
 ## Core Modules
 
 ### CLI (`src/cli/`)
 **Purpose**: User-facing command parsing and output formatting via clap derive
-**Files**: 15 | **Lines**: ~2,732
+**Files**: 15 | **Lines**: ~4,252
 
 **Components**:
 - **Cli** (`mod.rs`): Top-level CLI struct with `Command` enum dispatch, global `--format` (default plain) and `--verbose` flags, `parse_positive_usize` validator for concurrency flags
 - **SearchArgs** (`search.rs`): Hybrid search with `--limit` and auto-daemon-start; tries daemon socket first with 250ms timeout, falls back to local; returns `(results, daemon_version)` tuple and emits version-mismatch warning when CLI and daemon versions differ
 - **SymbolArgs** (`symbol.rs`): Symbol lookup with optional `--references` flag
 - **ContextArgs** (`context.rs`): Context retrieval for `file:line` locations with `--allow-outside-root` flag and ContextAccessScope tracking
+- **ImpactArgs** (`impact.rs`): Exact-one-anchor parser for `--from-file`, `--from-symbol`, or `--from-segment`; clamps depth/limit, opens the current index read-only, and dispatches local-only Impact Horizon exploration
 - **StructuralArgs** (`structural.rs`): AST pattern search using tree-sitter S-expression queries
 - **IndexArgs** (`index.rs`): Explicit indexing with `--jobs`, `--embed-threads`, EmbeddingRuntime-based model management, progress spinners
 - **ReindexArgs** (`reindex.rs`): Force clear + full re-index with schema rebuild and `--jobs`/`--embed-threads` flags
 - **StartArgs** (`start.rs`): Auto-init project, install fenced agent reminders, index with config, register project in registry, spawn daemon or SIGHUP existing
 - **HelloAgentArgs** (`hello_agent.rs`): Output condensed agent instruction (CONDENSED_REMINDER) in plain/json/human formats
 - **UpdateArgs** (`update.rs`): Self-update command with `--check` (force fresh manifest fetch), `--status` (display cached update info), and bare `1up update` (refresh-if-stale then apply or print channel instruction); detects InstallChannel (Homebrew/Scoop/Manual/Unknown), stops daemon before binary replacement via `stop_daemon_for_update` with bounded poll
-- **Formatter** (`output.rs`): Output formatting trait with JSON, Human, and Plain implementations; progress-aware rendering with parallelism, timing breakdown, and relative "time ago" timestamps; `StatusInfo` includes project_initialized, index health (present/readable), and `last_file_check_at` fields; `UpdateStatusInfo` struct and `UpdateResult` enum with `format_update_status`/`format_update_result` trait methods; helpers for index health rendering, update status labels, and cache age display
+- **Formatter** (`output.rs`): Output formatting trait with JSON, Human, and Plain implementations; progress-aware rendering with parallelism, timing breakdown, and relative "time ago" timestamps; `StatusInfo` includes project_initialized, index health (present/readable), and `last_file_check_at` fields; `UpdateStatusInfo` struct and `UpdateResult` enum with `format_update_status`/`format_update_result` trait methods; search plain/json output can expose additive `segment_id` handles, and impact output renders expanded/scoped/refused envelopes with reasons and hints
 
 **Dependencies**: search, indexer, storage, daemon, shared
 
 ### Search (`src/search/`)
-**Purpose**: Search engines: hybrid semantic+FTS, symbol lookup, structural AST queries, and context retrieval
-**Files**: 9 | **Lines**: ~3,228
+**Purpose**: Search engines: hybrid semantic+FTS, symbol lookup, structural AST queries, context retrieval, and bounded advisory impact exploration
+**Files**: 10 | **Lines**: ~4,678
 
 **Components**:
 - **HybridSearchEngine** (`hybrid.rs`): Shared execution path for local CLI and daemon-backed search; builds symbol variants, embeds queries when available, executes candidate-first fusion, and degrades per query to FTS-only when embedding/vector work fails
+- **ImpactHorizonEngine** (`impact.rs`): Local-only advisory expansion from exact file, symbol, or segment anchors; refuses broad symbols with narrowing hints, traverses persisted relations plus same-file/test heuristics, and emits bounded expanded/scoped/refused envelopes
 - **RetrievalBackend** (`retrieval.rs`): Backend selection (SqlVectorV2 or FtsOnly) based on index state; fetches vector and FTS `CandidateRow` sets first, then leaves segment hydration until after ranking
 - **SymbolSearchEngine** (`symbol.rs`): Exact-first definition and reference lookup over canonicalized symbols stored in `segment_symbols`; prefix/contains fallback seeds fuzzy matching only when exact lookup misses
 - **ContextEngine** (`context.rs`): Source context retrieval using tree-sitter scope detection with line-range fallback; supports ContextAccessScope for inside/outside project root tracking
@@ -43,7 +45,7 @@
 
 ### Indexer (`src/indexer/`)
 **Purpose**: Bounded staged indexing: scan, parse, embed, and single-writer persistence
-**Files**: 6 | **Lines**: ~6,448
+**Files**: 6 | **Lines**: ~6,680
 
 **Components**:
 - **Pipeline** (`pipeline.rs`): Config-aware orchestrator accepting `IndexingConfig` for jobs/embed_threads/write_batch_files plus `RunScope`; prepares scoped or full run inputs, falls back safely when watcher paths affect ignore semantics, uses bounded `spawn_blocking` parse workers with sequence IDs, flushes through a `BTreeMap` reorder buffer, batches embeddings through one ONNX session, and persists `IndexProgress`/`IndexParallelism`/`IndexStageTimings` to `.1up/index_status.json`
@@ -55,20 +57,21 @@
 **Dependencies**: storage, shared
 
 ### Storage (`src/storage/`)
-**Purpose**: Database access layer using libSQL with FTS5, vector indexing, and transactional file replacement helpers
-**Files**: 5 | **Lines**: ~2,124
+**Purpose**: Database access layer using libSQL with FTS5, vector indexing, relation persistence, and transactional file replacement helpers
+**Files**: 6 | **Lines**: ~2,751
 
 **Components**:
 - **Db** (`db.rs`): Database connection wrapper with `open_rw`/`open_ro`/`open_memory` constructors, lock retry
-- **Schema** (`schema.rs`): Schema initialization, validation, vector-model compatibility checks, and rebuild with recovery guidance for schema v7
-- **Segments** (`segments.rs`): Segment CRUD, bulk file-hash preload, deleted-file cleanup, transactional replacement helpers with configurable batch size, and maintenance of canonical symbol rows in `segment_symbols`
-- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, `segment_symbols`, meta, bulk hash preload, and candidate-first vector/FTS retrieval
+- **Schema** (`schema.rs`): Schema initialization, validation, vector-model compatibility checks, and rebuild with recovery guidance for schema v8, including `segment_relations`
+- **Relations** (`relations.rs`): Relation-row construction plus bounded outbound and inbound relation lookup helpers; transactional replace/delete helpers keep relation rows aligned with segment writes
+- **Segments** (`segments.rs`): Segment CRUD, bulk file-hash preload, deleted-file cleanup, transactional replacement helpers with configurable batch size, and maintenance of canonical symbol rows in `segment_symbols` plus synchronized relation cleanup
+- **Queries** (`queries.rs`): SQL DDL and query constants for segments, FTS, `segment_symbols`, `segment_relations`, meta, bulk hash preload, and candidate-first vector/FTS retrieval
 
 **Dependencies**: shared
 
 ### Daemon (`src/daemon/`)
 **Purpose**: Background daemon for file watching, scoped incremental re-indexing, daemon-backed search, persisted per-project indexing settings, and file-check heartbeat persistence; platform-conditional with Unix-only implementations and cross-platform stubs
-**Files**: 10 | **Lines**: ~2,808
+**Files**: 10 | **Lines**: ~2,810
 
 **Components**:
 - **Worker** (`worker.rs`): Main event loop with `tokio::select!`, per-project `ProjectRunState` (one active + one queued via dirty flag), scoped `RunScope::Paths` scheduling, burst-collapsing follow-up scheduling, shared config resolution, semaphore-bounded daemon search handling, a warm `EmbeddingRuntime` cache per project, and throttled file-check heartbeat persistence (`last_file_check_persisted_at` per project, `DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS` = 30s) via `record_file_check`/`persist_daemon_project_status` triggered on startup, SIGHUP, and each event loop tick
@@ -82,14 +85,15 @@
 
 ### Shared (`src/shared/`)
 **Purpose**: Cross-cutting types, config resolution, constants, error types, secure filesystem helpers, symbol canonicalization, fenced agent reminder management, project utilities, and self-update infrastructure
-**Files**: 10 | **Lines**: ~3,976
+**Files**: 11 | **Lines**: ~4,234
 
 **Components**:
-- **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, `IndexingConfig` (with `from_sources` resolution and validation), `IndexProgress`, `IndexParallelism`, `IndexStageTimings`, `IndexState`, `IndexPhase`, OutputFormat, SegmentRole, ReferenceKind, RunScope, ContextAccessScope, `DaemonProjectStatus` (persisted daemon heartbeat with `last_file_check_at`)
+- **Types** (`types.rs`): ParsedSegment, SearchResult, SymbolResult, ContextResult, StructuralResult, `IndexingConfig` (with `from_sources` resolution and validation), `IndexProgress`, `IndexParallelism`, `IndexStageTimings`, `IndexState`, `IndexPhase`, OutputFormat, SegmentRole, ReferenceKind, RunScope, ContextAccessScope, `DaemonProjectStatus` (persisted daemon heartbeat with `last_file_check_at`); `SearchResult` now carries an additive optional `segment_id` handoff handle for segment-backed hits
 - **Config** (`config.rs`): XDG-compliant paths plus verified model artifact paths (`verified/`, `.staging/`, `current.json`) and `resolve_indexing_config` with priority: CLI > env > registry > defaults; `read_positive_env` for env var validation; `update_check_cache_path()` for update cache and `project_daemon_status_path()` for per-project daemon heartbeat file
 - **Constants** (`constants.rs`): Tuning constants, watcher debounce, env var names, daemon IPC limits and deadlines, secure filesystem modes, verified artifact metadata, fence target files, embedding/search limits, daemon file-check heartbeat interval (`DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS`), and update-related constants: `UPDATE_MANIFEST_URL_ENV_VAR`, `UPDATE_CHECK_CACHE_FILENAME`, `UPDATE_DISABLED_MESSAGE`, `UPDATE_CHECK_TTL_SECS` (24h), `UPDATE_CHECK_TIMEOUT_SECS`, `UPDATE_CHECK_CONNECT_TIMEOUT_SECS`, `UPDATE_DOWNLOAD_TIMEOUT_SECS`, `UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS`
 - **Errors** (`errors.rs`): OneupError hierarchy with thiserror derives covering StorageError, IndexingError, SearchError, EmbeddingError, ParserError, DaemonError, ConfigError, FilesystemError, ProjectError, FenceError, UpdateError; `UpdateError` has 7 variants (Disabled, FetchFailed, ParseFailed, CacheError, SelfUpdateFailed, DaemonStopFailed, NoArtifactForPlatform, ChecksumMismatch) with `should_invalidate_cache()` method
 - **Fs** (`fs.rs`): Approved-root filesystem helpers for secure directory creation, atomic replace, root clamping, and typed file/socket cleanup with symlink rejection at every path component
+- **Progress** (`progress.rs`): Shared progress snapshot helpers for work counters, effective parallelism, stage timings, and timestamp propagation used by index and status reporting
 - **Project** (`project.rs`): Project identity (UUID) and database path resolution backed by secure project-state helpers
 - **Reminder** (`reminder.rs`): Versioned fenced agent reminder management for AGENTS.md/CLAUDE.md files; compile-time CONDENSED_REMINDER from `src/reminder.md`; idempotent fence create/update/replace lifecycle
 - **Symbols** (`symbols.rs`): Symbol canonicalization helpers (normalize_symbolish) shared by indexing and search paths
@@ -100,8 +104,8 @@
 ## Support Modules
 
 ### Tests (`tests/`)
-**Files**: 6 | **Lines**: ~3,899
-- `integration_tests.rs`: End-to-end pipeline and search tests, including exact/canonical/reference symbol acceptance and incremental freshness checks
+**Files**: 6 | **Lines**: ~4,394
+- `integration_tests.rs`: End-to-end pipeline and search tests, including exact/canonical/reference symbol acceptance, incremental freshness checks, Impact Horizon file/symbol/refusal flows, and `search -> segment_id -> impact` round trips that prove search top hits stay stable
 - `cli_tests.rs`: CLI subcommand tests via assert_cmd including concurrency flag validation, daemon lifecycle behaviors, degraded search coverage, and update command validation
 - `rewrite_sql_verification.rs`: Schema rebuild guidance plus add/edit/delete search freshness under degraded FTS-only indexing
 - `release_assets_tests.rs`: Release archive, manifest, and evidence validation tests
@@ -109,18 +113,18 @@
 - `license_consistency_tests.rs`: License metadata consistency validation
 
 ### Benchmarks (`benches/`)
-**Files**: 1 | **Lines**: ~493
-- `search_bench.rs`: Criterion benchmarks for exact/partial symbol lookup, chunked-content retrieval, candidate-first backend selection, and hybrid fusion
+**Files**: 1 | **Lines**: ~698
+- `search_bench.rs`: Criterion benchmarks for exact/partial symbol lookup, chunked-content retrieval, candidate-first backend selection, hybrid fusion, and Impact Horizon file-anchor/narrow-symbol/refused-symbol workloads used to guard the feature's interactive latency posture
 
 ### Scripts (`scripts/`)
-**Files**: 15 | **Lines**: ~2,914
+**Files**: 16 | **Lines**: ~2,550
 - `benchmark_parallel_indexing.sh`: Hyperfine benchmarks for full reindex, scoped follow-up, and write-heavy follow-up indexing
 - `benchmark_rewrite_sql.sh`: Baseline-vs-candidate benchmark evidence generator for SQL rewrite work
 - `security_check.sh`: Security audit wrapper
 - `scripts/release/`: 12 release pipeline scripts covering packaging, evidence generation, manifest rendering, archive verification, and metadata validation
 
 ### Evals (`evals/`)
-**Files**: 8 | **Lines**: ~1,043
+**Files**: 16 | **Lines**: ~3,613
 - `suites/1up-search/evals.yaml`: Search quality evaluation definitions comparing 1up-backed vs baseline agent search
 - `suites/1up-search/search-bench.ts`: TypeScript search benchmark harness
 - `suites/shared/assertions/`: Shared assertion library for eval suites
@@ -154,16 +158,16 @@ graph TD
 
 | Module | Files | Lines | Components | Avg File Size |
 |--------|-------|-------|------------|---------------|
-| cli | 15 | 2,732 | 11 | 182 |
-| search | 9 | 3,228 | 8 | 359 |
-| indexer | 6 | 6,448 | 5 | 1,075 |
-| storage | 5 | 2,124 | 4 | 425 |
-| daemon | 10 | 2,808 | 6 | 281 |
-| shared | 10 | 3,976 | 9 | 398 |
-| tests | 6 | 3,899 | 6 | 650 |
-| benches | 1 | 493 | 1 | 493 |
-| scripts | 15 | 2,914 | 15 | 194 |
-| evals | 8 | 1,043 | 5 | 130 |
+| cli | 15 | 4,252 | 12 | 283 |
+| search | 10 | 4,678 | 9 | 468 |
+| indexer | 6 | 6,680 | 5 | 1,113 |
+| storage | 6 | 2,751 | 5 | 459 |
+| daemon | 10 | 2,810 | 6 | 281 |
+| shared | 11 | 4,234 | 10 | 385 |
+| tests | 6 | 4,394 | 6 | 732 |
+| benches | 1 | 698 | 1 | 698 |
+| scripts | 16 | 2,550 | 15 | 159 |
+| evals | 16 | 3,613 | 5 | 226 |
 
 ## Cross-Module Patterns
 
@@ -176,6 +180,9 @@ graph TD
 - **Daemon-Backed Warm Search Reuse**: CLI search prefers daemon socket requests so repeated searches can reuse the daemon's warm embedding runtime
 - **Exact-First Symbol Retrieval**: Storage persists canonical symbol rows and search only widens into prefix/contains/fuzzy matching after exact misses
 - **Candidate-First Hybrid Retrieval**: Search ranks vector/FTS/symbol candidates before hydrating final segment bodies by ID
+- **Impact Horizon Read Path**: The CLI-only `impact` command resolves exact file/symbol/segment anchors, expands through persisted relation rows plus same-file/test heuristics, and returns bounded advisory results without changing daemon IPC
+- **Additive Search Handoff**: Search hydrates segment-backed hits with optional `segment_id` handles in machine-readable output so agent loops can pass exact anchors into `impact --from-segment` without altering search ranking or candidate selection
+- **Transactional Relation Maintenance**: Storage replaces `segment_relations` in the same transaction as segment writes and file deletes so impact reads always see relation rows aligned with the indexed content
 - **Verified Artifact Activation**: Embedder only activates model artifacts after staged writes, digest validation, manifest persistence, and atomic `current.json` replacement
 - **Secure State Lifecycle**: Shared filesystem helpers enforce approved roots, owner-only permissions, atomic replacement, and typed cleanup for daemon and project state
 - **Platform-Conditional Compilation**: Daemon modules use cfg(unix)/cfg(not(unix)) to swap real implementations with stub modules

@@ -23,7 +23,7 @@ On Windows or other local-mode platforms, run `1up init` and then `1up index .`.
 1up search "<query>" -n 5
 ```
 Hybrid search combining vector similarity and keyword matching. Use for natural-language queries like "how does authentication work" or "error handling in the API layer".
-Machine-readable `search` results can include a `segment_id` follow-up handle for segment-backed hits.
+Machine-readable `search` results can include an additive `segment_id` follow-up handle for segment-backed hits. It does not change normal search ranking or behavior.
 
 ### Symbol Lookup
 ```

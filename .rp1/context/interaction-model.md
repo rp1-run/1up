@@ -1,7 +1,7 @@
 # Interaction Model
 
 **Project**: 1up
-**Last Updated**: 2026-04-12
+**Last Updated**: 2026-04-13
 
 ## Experience Principles
 
@@ -11,6 +11,7 @@
 - **Configuration cascade**: Concurrency settings resolve through CLI flags > env vars (`ONEUP_INDEX_JOBS`, `ONEUP_EMBED_THREADS`) > registry persisted values > automatic defaults.
 - **Idempotent lifecycle operations**: `start` is safe to re-run (refreshes registry + SIGHUP instead of spawning a second worker; fence install is idempotent via version check). `stop` deregisters the project and only sends SIGTERM when no projects remain.
 - **Daemon-first with local fallback**: Search attempts daemon-served results first via Unix socket with a 250ms timeout, then falls back to a local in-process search runtime transparently. Search and context commands also auto-start the daemon if a project ID exists.
+- **Explicit impact follow-up with additive search handoff**: `1up impact` is a separate local-only workflow for bounded likely-impact exploration. `search` stays discovery-oriented; machine-readable `search` output may expose `segment_id` handles for segment-backed hits, but they do not change ranking, candidate selection, or implicitly trigger impact expansion.
 - **Agent instruction automation**: `start` auto-installs versioned, fenced agent reminder blocks into target files (e.g., CLAUDE.md). Fences use HTML comment markers (`<!-- 1up:start:VERSION -->`) for idempotent create/update/skip lifecycle. The `hello-agent` command outputs the condensed reminder directly for on-demand agent onboarding.
 - **Non-intrusive update awareness**: Every non-JSON, non-Worker, non-Update command spawns a background cache refresh and shows a passive update notification on stderr after the primary command completes (with a 2-second timeout). This keeps users informed without interrupting workflows. The `update` command handles its own output, and JSON consumers are never polluted with update notices.
 
@@ -18,10 +19,10 @@
 
 | Actor | Goals | Surface |
 |-------|-------|---------|
-| Developer | Semantic/keyword search, symbol lookup, context retrieval, structural queries, indexing, checking for and applying updates | CLI (human format) |
-| AI agent / host tool | Code exploration via ranked results, receiving condensed operational instructions, consuming machine-friendly output | CLI (plain/json), fenced instruction blocks in CLAUDE.md |
+| Developer | Semantic/keyword search, symbol lookup, context retrieval, likely-impact follow-up, structural queries, indexing, checking for and applying updates | CLI (human format) |
+| AI agent / host tool | Code exploration via ranked results, explicit `segment_id` handoff into likely-impact follow-up, receiving condensed operational instructions, consuming machine-friendly output | CLI (plain/json), fenced instruction blocks in CLAUDE.md |
 | Script / automation | Consume structured data programmatically, automate lifecycle | CLI (json/plain formats) |
-| Background daemon | Watch files, incrementally re-index, serve search requests via Unix socket, persist progress, report daemon version to CLI | Daemon process (surfaced via `status`) |
+| Background daemon | Watch files, incrementally re-index, serve search requests via Unix socket, persist progress, report daemon version to CLI | Daemon process (surfaced via `status`; `impact` stays local-only) |
 
 ## CLI Entry Points
 
@@ -31,9 +32,10 @@
 | `1up start [PATH]` | Auto-init + install fences + index + daemon start/refresh | `--jobs`, `--embed-threads` |
 | `1up stop [PATH]` | Deregister project, SIGTERM if last | |
 | `1up status [PATH]` | Daemon state, project initialization, index health, file-watcher heartbeat, counts, indexing progress | |
-| `1up search <QUERY>` | Hybrid semantic + FTS search (daemon-first, local fallback); version mismatch warning | `--limit/-n`, `--path` |
+| `1up search <QUERY>` | Hybrid semantic + FTS search (daemon-first, local fallback); plain/json can expose additive `segment_id` follow-up handles; version mismatch warning | `--limit/-n`, `--path` |
 | `1up symbol <NAME>` | Symbol definition/reference lookup | `--references/-r` |
 | `1up context <LOCATION>` | Enclosing scope context retrieval with access scope tracking | `--expansion`, `--allow-outside-root` |
+| `1up impact` | Bounded likely-impact exploration from exact file, symbol, or segment anchors with refusal guidance for broad symbols | `--from-file`, `--from-symbol`, `--from-segment`, `--scope`, `--depth`, `--limit`, `--path` |
 | `1up structural <PATTERN>` | Tree-sitter S-expression queries | `--language/-l` |
 | `1up index [PATH]` | Incremental index | `--jobs`, `--embed-threads` |
 | `1up reindex [PATH]` | Full rebuild from scratch | `--jobs`, `--embed-threads` |
@@ -57,6 +59,7 @@ Global flags: `--format (plain|json|human)` (default: plain), `--verbose (-v/-vv
 | Embeddings enabled/disabled | Semantic vector search availability | Green "enabled" / yellow "disabled" |
 | EmbeddingLoadStatus | Granular model readiness: Warm, Loaded, Downloaded, Unavailable(reason) | Spinner resolves to success or warn with specific message |
 | ContextAccessScope | Whether context target is within project root or outside it | Dimmed "[outside_root]" label after scope type |
+| ImpactStatus::Expanded / ExpandedScoped / Refused | Impact request expanded normally, expanded under a narrowed scope, or was refused as too broad | Status label in human/plain output and structured `status` field in JSON |
 | FenceAction | Outcome of agent instruction fence installation | stderr: "Created..." / "Updated..." / silent for AlreadyCurrent |
 | UpdateStatus::UpToDate | Current version matches or exceeds latest | Green "up to date" |
 | UpdateStatus::UpdateAvailable | Newer version exists | Yellow "update available ({version})" with upgrade instruction |
@@ -86,8 +89,19 @@ Global flags: `--format (plain|json|human)` (default: plain), `--verbose (-v/-vv
 - **Output**: Granular feedback per EmbeddingLoadStatus variant: Warm/Loaded are silent success; Downloaded gets info message; Unavailable variants produce context-specific warnings with actionable hints.
 
 ### Search Results
-- **Human mode**: Bold kind labels, cyan file:line locations, dimmed metadata (scope, symbols, complexity, score), content preview truncated to 12 lines with "..." indicator
+- **Human mode**: Bold kind labels, cyan file:line locations, dimmed metadata (scope, symbols, complexity, score), content preview truncated to 12 lines with "..." indicator; full `segment_id` handles stay hidden to keep results concise
+- **Plain/json mode**: Segment-backed hits can expose additive handoff handles (`segment=<id>` in plain output, `segment_id` in JSON) for explicit `impact --from-segment` follow-up
 - **Empty results**: "No results found." or "No symbols found."
+
+### Impact Results
+- **Trigger**: `1up impact`
+- **Output**: Bounded ranked candidates with resolved-anchor context, advisory ranking reasons, and concise next-step hints
+- **States**: `expanded` when exact-anchor expansion succeeds, `expanded_scoped` when a supplied scope narrows a symbol request, and `refused` when a request is too broad or low-confidence to expand safely
+- **Guidance**: Refusals include structured narrowing hints such as `--scope` or a suggested exact `segment_id`
+
+### Search-to-Impact Handoff
+- **Trigger**: `1up search --format plain|json` followed by `1up impact --from-segment`
+- **Output**: Search stays the discovery step; the follow-up handle is additive and durable for machine loops, and the subsequent `impact` request leaves later search results unchanged
 
 ### Search Daemon Fallback
 - **Trigger**: Daemon socket unavailable or times out
@@ -131,11 +145,11 @@ Global flags: `--format (plain|json|human)` (default: plain), `--verbose (-v/-vv
 
 | Mode | Encoding | Use Case |
 |------|----------|----------|
-| Plain | Tab-separated `key:value` pairs, no ANSI (default) | Agent consumption, simple text processing (grep, awk) |
-| Human | ANSI colors (bold, cyan, dimmed, green, yellow, red), multiline labeled sections | Interactive terminal |
-| JSON | Structured objects with nested progress/work/parallelism/timings | Programmatic consumption |
+| Plain | Tab-separated `key:value` pairs, no ANSI (default) | Agent consumption, simple text processing (grep, awk); includes additive `segment=<id>` search handoff fields and line-oriented impact envelopes |
+| Human | ANSI colors (bold, cyan, dimmed, green, yellow, red), multiline labeled sections | Interactive terminal; keeps search output concise while rendering impact anchor/reason context clearly |
+| JSON | Structured objects with nested progress/work/parallelism/timings | Programmatic consumption; search exposes `segment_id` when available and impact returns structured status/anchor/result/hint/refusal data |
 
-All three formats carry the same information density for index summaries, status, and update output.
+Across index summaries, status, and update output, the three formats carry the same core facts. For search and impact, the machine-oriented formats expose extra handoff structure while human mode stays intentionally concise.
 
 ## Accessibility
 

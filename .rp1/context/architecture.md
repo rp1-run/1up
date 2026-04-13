@@ -2,7 +2,7 @@
 
 **Project**: 1up
 **Architecture Pattern**: Layered + Two-Process Model
-**Last Updated**: 2026-04-12
+**Last Updated**: 2026-04-13
 
 ## High-Level Architecture
 
@@ -14,6 +14,7 @@ graph TB
     CLI -->|index/reindex| Pipeline[Staged Indexing Orchestrator<br/>pipeline::run_with_config]
     CLI -->|search fallback| Search[Search Engine]
     CLI -->|search request| SearchSocket[Daemon Search Socket<br/>Framed JSON over UnixStream]
+    CLI -->|impact| Impact[Impact Horizon Engine<br/>local advisory expansion]
     CLI -->|hello-agent| Reminder[Agent Reminder<br/>fenced versioned blocks]
     CLI -->|1up update| UpdateCLI[Update Command<br/>check / status / self-update]
 
@@ -42,13 +43,14 @@ graph TB
     Reorder -->|fallback chunking| Chunker[Text Chunker]
     Reorder -->|embed batches| Embedder[Single Embed Session<br/>ONNX Runtime]
     Embedder -->|single writer| Writer[Transactional Writer<br/>batch replace]
-    Writer --> DB[(libSQL<br/>.1up/index.db)]
+    Writer --> DB[(libSQL<br/>.1up/index.db<br/>segments + segment_relations)]
 
     SearchService --> Search
     Search -->|vector search| DB
     Search -->|FTS5 match| DB
     Search -->|hydrate ranked ids| DB
     Search -->|embed query| Embedder
+    Impact -->|seed lookup + relation expansion| DB
 
     Scanner -->|walks| FS[Project Files]
     Watcher -->|monitors| FS
@@ -76,7 +78,11 @@ per-frame deadlines, and sheds excess load with safe fallback responses. Only fi
 work fans out; embeddings stay in one ONNX session and all database mutation flows through a
 single transactional writer so replacement semantics remain deterministic. The update subsystem
 runs independently: a background cache refresh on CLI startup and a passive notification after
-command completion keep users informed without interrupting workflows.
+command completion keep users informed without interrupting workflows. Impact Horizon is
+intentionally separate: the CLI opens the same schema-validated index read-only, resolves exact
+file, symbol, or `segment_id` anchors, expands through persisted `segment_relations` plus bounded
+same-file and test heuristics, and returns advisory results without changing the daemon search
+path.
 
 ## Architectural Patterns
 
@@ -101,6 +107,17 @@ Parsed definition and usage symbols are persisted into `segment_symbols` with no
 ### Candidate-First Search Hydration
 Search ranks lightweight candidate IDs across three retrieval channels (vector, FTS, symbol) before hydrating only the top-ranked segments, avoiding expensive full-row reads for discarded results.
 
+### Local-Only Impact Read Path
+`1up impact` bypasses daemon IPC in v1 and reads the index directly from the CLI. This keeps
+likely-impact exploration explicitly opt-in, avoids transport and warm-runtime changes, and
+preserves the existing daemon-backed `search` path.
+
+### Relation-Backed Advisory Expansion
+The storage layer persists unresolved outbound call/reference rows in `segment_relations`. Impact
+Horizon resolves those relations against current segment definitions at query time, applies hop
+limits plus same-file and test heuristics, and emits bounded advisory rankings rather than exact
+dependency claims.
+
 ### Warm Search Runtime Reuse
 The daemon maintains a per-project `EmbeddingRuntime` that stays warm across indexing and search requests. `EmbeddingLoadStatus::Warm` indicates the ONNX session was reused without rebuilding when model fingerprint and thread count are unchanged.
 
@@ -108,7 +125,7 @@ The daemon maintains a per-project `EmbeddingRuntime` that stays warm across ind
 Every optional component (embeddings, daemon socket, model download, update check) has a defined fallback path so the system continues operating at reduced capability rather than failing. Embedding failures degrade to FTS-only; daemon unavailability triggers local search; update check failures preserve stale cache or silently skip.
 
 ### Schema-Gated Access
-`schema::ensure_current()` validates version + required objects (15 tables, indexes, triggers, and the `embedding_vec` column) before any read/write; stale schemas require explicit `1up reindex`. `check_embedding_model_compatible` validates model provenance before mixing embeddings.
+`schema::ensure_current()` validates schema version plus the required tables, indexes, triggers, and the `embedding_vec` column before any read/write; stale schemas require explicit `1up reindex`. `check_embedding_model_compatible` validates model provenance before mixing embeddings.
 
 ### Shared Config Resolution
 Indexing settings (jobs, embed_threads, write_batch_files) resolve in one chain: CLI flags -> environment variables -> persisted registry config -> automatic defaults. Manual and daemon-triggered runs share the same concurrency model.
@@ -141,11 +158,11 @@ The daemon persists a `DaemonProjectStatus` with `last_file_check_at` to `<proje
 
 | Layer | Purpose | Key Files |
 |-------|---------|-----------|
-| CLI | User-facing command parsing, output formatting, agent reminder management, and passive update notifications | `src/main.rs`, `src/cli/` |
+| CLI | User-facing command parsing, output formatting, agent reminder management, passive update notifications, and local-only Impact Horizon dispatch | `src/main.rs`, `src/cli/` |
 | Daemon | Background file watching, framed search IPC, registry management, auto re-indexing, heartbeat persistence | `src/daemon/` |
 | Indexer | File scanning, parsing, chunking, embedding, pipeline orchestration | `src/indexer/` |
-| Search | Query execution, intent detection, RRF fusion, result ranking | `src/search/` |
-| Storage | Database lifecycle, schema management, segment CRUD, queries | `src/storage/` |
+| Search | Query execution, intent detection, RRF fusion, result ranking, and advisory impact expansion | `src/search/` |
+| Storage | Database lifecycle, schema management, segment CRUD, relation persistence, and queries | `src/storage/` |
 | Shared | Cross-cutting: config paths, secure filesystem helpers, constants, error types, data types, agent reminders, update system | `src/shared/` |
 
 ## Data Flows
@@ -177,7 +194,19 @@ CLI canonicalizes --path and auto-starts the daemon when the project is already 
   -> Fetch vector and FTS candidate rows concurrently when embeddings are available
   -> Rank candidate IDs with RRF + intent/query/path/content boosts + per-file caps
   -> Hydrate only the final ranked segment IDs from storage
+  -> Expose additive `segment_id` follow-up handles in plain/json output when a result is backed by an indexed segment
   -> Return SearchResponse::Results with optional daemon_version field; CLI warns on version mismatch and falls back to local search if daemon search is unavailable, busy, rejected, or timed out
+```
+
+### Impact Horizon Query
+```
+CLI validates exactly one of --from-file, --from-symbol, or --from-segment
+  -> Open the current index read-only and require schema v8 compatibility
+  -> Resolve the anchor into a bounded seed set or refuse broad symbol requests with narrowing hints
+  -> Traverse persisted `segment_relations` plus same-file and test heuristics within depth and per-file caps
+  -> Apply hop decay, scope boost, and role boost to produce advisory candidate scores
+  -> Return one structured envelope with status = expanded, expanded_scoped, or refused
+  -> For search handoff loops, the same path accepts the additive `segment_id` emitted by plain/json search output
 ```
 
 ### Daemon File Watch Loop
@@ -284,7 +313,8 @@ Conventional-commit PR titles enforced by pr-title.yml
   with 24h TTL, version-pinned to the running binary. Written atomically with secure permissions.
 - **Per-project state**: `<project>/.1up/project_id`, `<project>/.1up/index.db`, and
   `<project>/.1up/index_status.json` stay inside the canonical project root and inherit the same
-  approved-root checks.
+  approved-root checks. `index.db` now carries the `segment_relations` table in schema v8, so
+  stale pre-v8 indexes require `1up reindex`.
 - **Daemon heartbeat**: `<project>/.1up/daemon_status.json` stores `last_file_check_at` timestamp
   updated every 30 seconds by the daemon worker. Read by the status command for liveness display.
 - **Model cache**: `~/.local/share/1up/models/all-MiniLM-L6-v2/` contains `current.json`, a
