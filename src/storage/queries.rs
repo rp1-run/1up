@@ -271,6 +271,43 @@ LIMIT 1";
 pub const SELECT_ALL_FILE_PATHS: &str = "
 SELECT DISTINCT file_path FROM segments ORDER BY file_path";
 
+pub const SELECT_TEST_FILE_PATHS_LIMITED: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE lower(file_path) LIKE 'tests/%'
+   OR lower(file_path) LIKE '%/tests/%'
+   OR lower(file_path) LIKE '%/test/%'
+   OR lower(file_path) LIKE '%/spec/%'
+   OR lower(file_path) LIKE '%/__tests__/%'
+   OR lower(file_path) LIKE '%_test.rs'
+   OR lower(file_path) LIKE '%_spec.rs'
+   OR lower(file_path) LIKE '%.test.ts'
+   OR lower(file_path) LIKE '%.spec.ts'
+   OR lower(file_path) LIKE '%.test.js'
+   OR lower(file_path) LIKE '%.spec.js'
+ORDER BY file_path
+LIMIT ?1";
+
+pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE (file_path = ?1 OR file_path LIKE ?2)
+  AND (
+       lower(file_path) LIKE 'tests/%'
+    OR lower(file_path) LIKE '%/tests/%'
+    OR lower(file_path) LIKE '%/test/%'
+    OR lower(file_path) LIKE '%/spec/%'
+    OR lower(file_path) LIKE '%/__tests__/%'
+    OR lower(file_path) LIKE '%_test.rs'
+    OR lower(file_path) LIKE '%_spec.rs'
+    OR lower(file_path) LIKE '%.test.ts'
+    OR lower(file_path) LIKE '%.spec.ts'
+    OR lower(file_path) LIKE '%.test.js'
+    OR lower(file_path) LIKE '%.spec.js'
+  )
+ORDER BY file_path
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_ALL_FILE_HASHES: &str = "
 SELECT file_path, MAX(file_hash) AS file_hash

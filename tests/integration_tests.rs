@@ -814,6 +814,21 @@ fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
 }
 
 #[test]
+fn impact_file_anchor_scope_refuses_out_of_scope_seed_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(
+        tmp.path(),
+        &["--from-file", "src/auth/runtime.rs", "--scope", "src/cache"],
+    );
+
+    assert_eq!(result["status"], "refused");
+    assert_eq!(result["refusal"]["reason"], "anchor_out_of_scope");
+    assert_eq!(result["hint"]["code"], "align_anchor_and_scope");
+}
+
+#[test]
 fn impact_symbol_anchor_refuses_broad_requests_with_hint_json() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);

@@ -13,7 +13,7 @@ use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::SegmentRole;
 use crate::storage::relations::{get_inbound_relations, get_outbound_relations, RelationKind};
 use crate::storage::segments::{
-    get_all_file_paths, get_segment_by_id, get_segments_by_file, StoredSegment,
+    get_segment_by_id, get_segments_by_file, get_test_file_paths, StoredSegment,
 };
 
 const DEFAULT_IMPACT_DEPTH: usize = 2;
@@ -24,6 +24,8 @@ const MAX_SYMBOL_FILES: usize = 3;
 const MAX_SYMBOL_TOP_LEVEL_DIRS: usize = 2;
 const MAX_RELATIONS_PER_HOP: usize = 8;
 const MAX_DEFINITION_TARGETS_PER_SYMBOL: usize = 3;
+const MAX_TEST_FILE_BUDGET: usize = 12;
+const TEST_FILE_QUERY_FACTOR: usize = 2;
 
 const CALL_WEIGHT: f64 = 1.0;
 const SAME_FILE_WEIGHT: f64 = 0.70;
@@ -175,6 +177,8 @@ impl<'a> ImpactHorizonEngine<'a> {
         let depth = clamp_depth(request.depth);
         let limit = clamp_limit(request.limit);
         let explicit_scope = normalize_scope(request.scope.as_deref());
+        let test_file_budget = clamp_test_file_budget(limit, depth);
+        let test_observation_budget = clamp_test_observation_budget(limit);
 
         let resolution = match &request.anchor {
             ImpactAnchor::File { path, line } => {
@@ -255,6 +259,8 @@ impl<'a> ImpactHorizonEngine<'a> {
                 &resolution.seeds,
                 &seed_ids,
                 resolution.effective_scope.as_deref(),
+                test_file_budget,
+                test_observation_budget,
             )
             .await?
         {
@@ -263,7 +269,11 @@ impl<'a> ImpactHorizonEngine<'a> {
 
         let mut results = finalize_impact_results(aggregates, limit);
         if results.is_empty() {
-            results = fallback_seed_results(&resolution.seeds, limit);
+            results = fallback_seed_results(
+                &resolution.seeds,
+                limit,
+                resolution.effective_scope.as_deref(),
+            );
         }
 
         let status = if resolution.resolved_anchor.scope.is_some() {
@@ -329,6 +339,14 @@ impl<'a> ImpactHorizonEngine<'a> {
                 .collect::<Vec<_>>()
         };
 
+        if let Some(scope) = explicit_scope.as_deref() {
+            if let Some(refusal) =
+                out_of_scope_anchor_refusal("file", &normalized_path, scope, &seeds)
+            {
+                return Ok(ResolveOutcome::Refused(refusal));
+            }
+        }
+
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
                 if line.is_some() { "file_line" } else { "file" },
@@ -361,6 +379,13 @@ impl<'a> ImpactHorizonEngine<'a> {
         };
 
         let seed = candidate_from_stored_segment(segment);
+        if let Some(scope) = explicit_scope.as_deref() {
+            if let Some(refusal) =
+                out_of_scope_anchor_refusal("segment", id, scope, &[seed.clone()])
+            {
+                return Ok(ResolveOutcome::Refused(refusal));
+            }
+        }
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
                 "segment",
@@ -582,7 +607,13 @@ impl<'a> ImpactHorizonEngine<'a> {
         seeds: &[CandidateRow],
         seed_ids: &HashSet<String>,
         scope: Option<&str>,
+        max_files: usize,
+        max_observations: usize,
     ) -> Result<Vec<CandidateObservation>, OneupError> {
+        if max_files == 0 || max_observations == 0 {
+            return Ok(Vec::new());
+        }
+
         let anchor_files: Vec<String> = seeds.iter().map(|seed| seed.file_path.clone()).collect();
         let anchor_symbols: HashSet<String> = seeds
             .iter()
@@ -591,12 +622,24 @@ impl<'a> ImpactHorizonEngine<'a> {
             .filter(|symbol| !symbol.is_empty())
             .collect();
 
-        let mut observations = Vec::new();
-        for file_path in get_all_file_paths(self.conn).await? {
-            if !is_test_path(&file_path) || !scope_matches(&file_path, scope) {
-                continue;
-            }
+        let mut candidate_files = get_test_file_paths(
+            self.conn,
+            scope,
+            max_files.saturating_mul(TEST_FILE_QUERY_FACTOR),
+        )
+        .await?;
+        candidate_files.sort_by(|left, right| {
+            test_file_priority(left, &anchor_files)
+                .cmp(&test_file_priority(right, &anchor_files))
+                .then_with(|| left.cmp(right))
+        });
+        candidate_files.truncate(max_files);
 
+        let mut observations = Vec::new();
+        for file_path in candidate_files {
+            if observations.len() >= max_observations {
+                break;
+            }
             let matches_file = anchor_files
                 .iter()
                 .any(|anchor_file| shares_test_stem(anchor_file, &file_path));
@@ -605,6 +648,9 @@ impl<'a> ImpactHorizonEngine<'a> {
             }
 
             for segment in get_segments_by_file(self.conn, &file_path).await? {
+                if observations.len() >= max_observations {
+                    break;
+                }
                 let content = segment.content.to_ascii_lowercase();
                 let symbol_match = segment
                     .parsed_defined_symbols()
@@ -773,9 +819,14 @@ fn finalize_impact_results(
     results
 }
 
-fn fallback_seed_results(seeds: &[CandidateRow], limit: usize) -> Vec<ImpactCandidate> {
+fn fallback_seed_results(
+    seeds: &[CandidateRow],
+    limit: usize,
+    scope: Option<&str>,
+) -> Vec<ImpactCandidate> {
     let mut results: Vec<ImpactCandidate> = seeds
         .iter()
+        .filter(|seed| scope_matches(&seed.file_path, scope))
         .take(limit)
         .map(|seed| ImpactCandidate {
             segment_id: seed.segment_id.clone(),
@@ -987,6 +1038,17 @@ fn clamp_limit(limit: usize) -> usize {
     }
 }
 
+fn clamp_test_file_budget(limit: usize, depth: usize) -> usize {
+    limit
+        .max(1)
+        .saturating_mul(depth.max(1))
+        .clamp(2, MAX_TEST_FILE_BUDGET)
+}
+
+fn clamp_test_observation_budget(limit: usize) -> usize {
+    limit.max(1).saturating_mul(MAX_RESULTS_PER_FILE)
+}
+
 fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
     if values.is_empty() {
         None
@@ -1086,6 +1148,33 @@ fn suggested_scope_from_candidates(candidates: &[CandidateRow]) -> Option<String
         .map(|(scope, _)| scope)
 }
 
+fn out_of_scope_anchor_refusal(
+    anchor_kind: &str,
+    anchor_value: &str,
+    scope: &str,
+    seeds: &[CandidateRow],
+) -> Option<ImpactResultEnvelope> {
+    let first_out_of_scope = seeds
+        .iter()
+        .find(|seed| !scope_matches(&seed.file_path, Some(scope)))?;
+    let suggested_scope = suggested_scope_from_candidates(seeds)
+        .or_else(|| parent_scope(&first_out_of_scope.file_path));
+
+    Some(refused_result(
+        "anchor_out_of_scope",
+        format!(
+            "{anchor_kind} anchor `{anchor_value}` resolves to `{}`, which is outside requested scope `{scope}`.",
+            first_out_of_scope.file_path
+        ),
+        impact_hint(
+            "align_anchor_and_scope",
+            "Choose an anchor inside the requested scope or retry without `--scope`.",
+            suggested_scope,
+            Some(first_out_of_scope.segment_id.clone()),
+        ),
+    ))
+}
+
 fn is_test_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
     lower.contains("/tests/")
@@ -1098,6 +1187,17 @@ fn is_test_path(file_path: &str) -> bool {
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".test.js")
         || lower.ends_with(".spec.js")
+}
+
+fn test_file_priority(file_path: &str, anchor_files: &[String]) -> usize {
+    if anchor_files
+        .iter()
+        .any(|anchor_file| shares_test_stem(anchor_file, file_path))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn shares_test_stem(anchor_file: &str, test_file: &str) -> bool {
@@ -1351,6 +1451,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_anchor_refuses_when_scope_excludes_anchor_file() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![make_segment(SegmentFixture {
+                id: "auth-runtime",
+                file_path: "src/auth/runtime.rs",
+                line_start: 1,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &["load_runtime"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            })],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::File {
+                    path: "src/auth/runtime.rs".to_string(),
+                    line: None,
+                },
+                scope: Some("src/cache".to_string()),
+                depth: 1,
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Refused);
+        assert_eq!(result.refusal.unwrap().reason, "anchor_out_of_scope");
+        assert_eq!(result.hint.unwrap().code, "align_anchor_and_scope");
+    }
+
+    #[tokio::test]
+    async fn scoped_file_anchor_fallback_keeps_in_scope_seed() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![make_segment(SegmentFixture {
+                id: "auth-runtime",
+                file_path: "src/auth/runtime.rs",
+                line_start: 1,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &["load_runtime"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            })],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::File {
+                    path: "src/auth/runtime.rs".to_string(),
+                    line: None,
+                },
+                scope: Some("src/auth".to_string()),
+                depth: 1,
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::ExpandedScoped);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-runtime");
+        assert_eq!(result.results[0].reasons[0].kind, "resolved_anchor");
+    }
+
+    #[tokio::test]
+    async fn segment_anchor_refuses_when_scope_excludes_anchor_file() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![make_segment(SegmentFixture {
+                id: "auth-runtime",
+                file_path: "src/auth/runtime.rs",
+                line_start: 1,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &["load_runtime"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            })],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "auth-runtime".to_string(),
+                },
+                scope: Some("src/cache".to_string()),
+                depth: 1,
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Refused);
+        assert_eq!(result.refusal.unwrap().reason, "anchor_out_of_scope");
+    }
+
+    #[tokio::test]
     async fn segment_anchor_ranks_relation_same_file_and_test_candidates() {
         let (_db, conn) = setup().await;
         insert_segments(
@@ -1424,5 +1634,62 @@ mod tests {
             result.results[2].reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
+    }
+
+    #[tokio::test]
+    async fn collect_test_observations_honors_file_budget() {
+        let (_db, conn) = setup().await;
+        let seed = make_segment(SegmentFixture {
+            id: "load-config",
+            file_path: "src/config.rs",
+            line_start: 1,
+            block_type: "function",
+            role: "DEFINITION",
+            defined_symbols: &["load_config"],
+            referenced_symbols: &[],
+            called_symbols: &[],
+        });
+
+        let mut fixtures = vec![seed];
+        for idx in 1..=4 {
+            fixtures.push(make_segment(SegmentFixture {
+                id: Box::leak(format!("config-test-{idx}").into_boxed_str()),
+                file_path: Box::leak(format!("tests/config_test_{idx}.rs").into_boxed_str()),
+                line_start: idx,
+                block_type: "function",
+                role: "DEFINITION",
+                defined_symbols: &[],
+                referenced_symbols: &["load_config"],
+                called_symbols: &[],
+            }));
+        }
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let seed = CandidateRow {
+            segment_id: "load-config".to_string(),
+            file_path: "src/config.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            line_number: 1,
+            line_end: 5,
+            breadcrumb: None,
+            complexity: Some(1),
+            role: Some(SegmentRole::Definition),
+            defined_symbols: Some(vec!["load_config".to_string()]),
+            referenced_symbols: None,
+            called_symbols: None,
+        };
+        let seed_ids = HashSet::from(["load-config".to_string()]);
+
+        let observations = engine
+            .collect_test_observations(&[seed], &seed_ids, None, 2, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(observations.len(), 2);
+        assert!(observations
+            .iter()
+            .all(|observation| observation.candidate.file_path.starts_with("tests/")));
     }
 }

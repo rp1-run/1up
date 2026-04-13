@@ -797,14 +797,13 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for r in results {
             out.push_str(&format!(
-                "{}:{}-{}\t{}\t{:.4}\tsegment={}\n",
-                r.file_path,
-                r.line_number,
-                r.line_end,
-                r.block_type,
-                r.score,
-                r.segment_id.as_deref().unwrap_or("")
+                "{}:{}-{}\t{}\t{:.4}",
+                r.file_path, r.line_number, r.line_end, r.block_type, r.score
             ));
+            if let Some(segment_id) = r.segment_id.as_deref() {
+                out.push_str(&format!("\tsegment={segment_id}"));
+            }
+            out.push('\n');
             out.push_str(&format!("{}\n", render_search_metadata(r)));
             out.push_str(&r.content);
             if !r.content.ends_with('\n') {
@@ -1827,6 +1826,18 @@ mod tests {
             first_line,
             "src/auth/builder.rs:21-23\tfunction\t0.9450\tsegment=candidate-segment-abcdef123456"
         );
+    }
+
+    #[test]
+    fn plain_search_results_preserve_legacy_shape_without_segment_field() {
+        let formatter = PlainFormatter;
+        let mut result = sample_search_result();
+        result.segment_id = None;
+
+        let rendered = formatter.format_search_results(&[result]);
+        let first_line = rendered.lines().next().unwrap();
+
+        assert_eq!(first_line, "src/auth/builder.rs:21-23\tfunction\t0.9450");
     }
 
     #[test]

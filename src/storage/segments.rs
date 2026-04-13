@@ -319,6 +319,46 @@ pub async fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, OneupE
     Ok(paths)
 }
 
+/// Get distinct test-like file paths, optionally constrained to a scope prefix.
+pub async fn get_test_file_paths(
+    conn: &Connection,
+    scope: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = match scope {
+        Some(scope) => {
+            conn.query(
+                queries::SELECT_SCOPED_TEST_FILE_PATHS_LIMITED,
+                libsql::params![scope, format!("{scope}/%"), limit as i64],
+            )
+            .await
+            .map_err(|e| StorageError::Query(format!("query scoped test file paths failed: {e}")))?
+        }
+        None => conn
+            .query(queries::SELECT_TEST_FILE_PATHS_LIMITED, [limit as i64])
+            .await
+            .map_err(|e| StorageError::Query(format!("query test file paths failed: {e}")))?,
+    };
+
+    let mut paths = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
 /// Get all distinct file paths for a given language.
 pub async fn get_file_paths_by_language(
     conn: &Connection,
