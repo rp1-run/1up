@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use oneup::search::impact::{ImpactAnchor, ImpactHorizonEngine, ImpactRequest, ImpactStatus};
 use oneup::search::intent::detect_intent;
 use oneup::search::ranking::rank_candidates;
 use oneup::search::retrieval::{RetrievalBackend, RetrievalMode};
@@ -297,6 +298,141 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
     (tmp, db_path, query_embedding, query)
 }
 
+fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let temp_root = canonical_temp_root(&tmp);
+    std::fs::create_dir_all(temp_root.join(".1up")).unwrap();
+
+    let db_path = temp_root.join(".1up").join("index.db");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = oneup::storage::db::Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        oneup::storage::schema::initialize(&conn).await.unwrap();
+
+        let anchor = SegmentInsert {
+            id: "auth-runtime-anchor".to_string(),
+            file_path: "src/auth/runtime.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn load_auth_config() -> &'static str {\n    \"auth\"\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("auth".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"load_auth_config\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "hash-auth-runtime-anchor".to_string(),
+        };
+        segments::upsert_segment(&conn, &anchor).await.unwrap();
+
+        let sibling = SegmentInsert {
+            id: "auth-runtime-parse".to_string(),
+            file_path: "src/auth/runtime.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn parse_auth_config(raw: &str) -> bool {\n    !raw.trim().is_empty()\n}\n"
+                .to_string(),
+            line_start: 5,
+            line_end: 7,
+            embedding_vec: None,
+            breadcrumb: Some("auth".to_string()),
+            complexity: 3,
+            role: "IMPLEMENTATION".to_string(),
+            defined_symbols: "[\"parse_auth_config\"]".to_string(),
+            referenced_symbols: "[\"raw\"]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "hash-auth-runtime-parse".to_string(),
+        };
+        segments::upsert_segment(&conn, &sibling).await.unwrap();
+
+        for idx in 0..24 {
+            let caller = SegmentInsert {
+                id: format!("auth-caller-{idx}"),
+                file_path: format!("src/auth/service_{idx}.rs"),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "pub fn boot_auth_{idx}() -> &'static str {{\n    load_auth_config()\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 3,
+                embedding_vec: None,
+                breadcrumb: Some("auth".to_string()),
+                complexity: 2,
+                role: "ORCHESTRATION".to_string(),
+                defined_symbols: format!("[\"boot_auth_{idx}\"]"),
+                referenced_symbols: "[]".to_string(),
+                called_symbols: "[\"load_auth_config\"]".to_string(),
+                file_hash: format!("hash-auth-caller-{idx}"),
+            };
+            segments::upsert_segment(&conn, &caller).await.unwrap();
+        }
+
+        for idx in 0..12 {
+            let test_segment = SegmentInsert {
+                id: format!("auth-test-{idx}"),
+                file_path: format!("tests/auth/runtime_test_{idx}.rs"),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "#[test]\nfn runtime_test_{idx}() {{\n    assert_eq!(load_auth_config(), \"auth\");\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 4,
+                embedding_vec: None,
+                breadcrumb: Some("tests".to_string()),
+                complexity: 1,
+                role: "DEFINITION".to_string(),
+                defined_symbols: format!("[\"runtime_test_{idx}\"]"),
+                referenced_symbols: "[\"load_auth_config\"]".to_string(),
+                called_symbols: "[]".to_string(),
+                file_hash: format!("hash-auth-test-{idx}"),
+            };
+            segments::upsert_segment(&conn, &test_segment).await.unwrap();
+        }
+
+        for (idx, file_path) in [
+            "src/auth/config.rs",
+            "src/cache/config.rs",
+            "src/ui/config.rs",
+            "tests/config_fixture.rs",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let broad_definition = SegmentInsert {
+                id: format!("broad-config-{idx}"),
+                file_path: (*file_path).to_string(),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "pub fn load_config() -> &'static str {{\n    \"{}\"\n}}\n",
+                    idx
+                ),
+                line_start: 1,
+                line_end: 3,
+                embedding_vec: None,
+                breadcrumb: Some("config".to_string()),
+                complexity: 1,
+                role: "DEFINITION".to_string(),
+                defined_symbols: "[\"load_config\"]".to_string(),
+                referenced_symbols: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                file_hash: format!("hash-broad-config-{idx}"),
+            };
+            segments::upsert_segment(&conn, &broad_definition)
+                .await
+                .unwrap();
+        }
+    });
+
+    (tmp, db_path)
+}
+
 fn bench_symbol_lookup(c: &mut Criterion) {
     let (_tmp, db_path) = setup_db_and_index();
 
@@ -483,11 +619,80 @@ fn bench_retrieval_backend(c: &mut Criterion) {
     });
 }
 
+fn bench_impact_horizon(c: &mut Criterion) {
+    let (_tmp, db_path) = setup_impact_db();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = rt
+        .block_on(async { oneup::storage::db::Db::open_ro(&db_path).await })
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    let file_request = ImpactRequest {
+        anchor: ImpactAnchor::File {
+            path: "src/auth/runtime.rs".to_string(),
+            line: None,
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
+    let symbol_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "load_auth_config".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
+    let refused_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "load_config".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
+
+    c.bench_function("impact_file_anchor", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(file_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_narrow", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(symbol_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_refused", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(refused_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Refused);
+                assert!(result.results.is_empty());
+            });
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_symbol_lookup,
     bench_fts_search,
     bench_chunked_content_search,
-    bench_retrieval_backend
+    bench_retrieval_backend,
+    bench_impact_horizon
 );
 criterion_main!(benches);
