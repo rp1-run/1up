@@ -45,6 +45,21 @@ CREATE TABLE IF NOT EXISTS segment_symbols (
     PRIMARY KEY (segment_id, canonical_symbol, reference_kind)
 )";
 
+pub const CREATE_SEGMENT_RELATIONS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS segment_relations (
+    source_segment_id TEXT NOT NULL,
+    relation_kind TEXT NOT NULL,
+    raw_target_symbol TEXT NOT NULL,
+    canonical_target_symbol TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (
+        source_segment_id,
+        relation_kind,
+        canonical_target_symbol,
+        raw_target_symbol
+    )
+)";
+
 pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec))";
 
@@ -53,6 +68,12 @@ pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_prefix ON segment_symbols(canonical_symbol)";
+
+pub const CREATE_INDEX_SEGMENT_RELATIONS_SOURCE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_source ON segment_relations(source_segment_id)";
+
+pub const CREATE_INDEX_SEGMENT_RELATIONS_TARGET: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_target ON segment_relations(canonical_target_symbol, relation_kind)";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -97,8 +118,11 @@ DROP TABLE IF EXISTS segments_fts;
 DROP INDEX IF EXISTS idx_segment_vectors_embedding;
 DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
+DROP INDEX IF EXISTS idx_segment_relations_source;
+DROP INDEX IF EXISTS idx_segment_relations_target;
 DROP TABLE IF EXISTS segment_vectors;
 DROP TABLE IF EXISTS segment_symbols;
+DROP TABLE IF EXISTS segment_relations;
 DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
