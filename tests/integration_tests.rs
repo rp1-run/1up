@@ -830,7 +830,51 @@ fn impact_symbol_anchor_refuses_broad_requests_with_hint_json() {
 }
 
 #[test]
-fn impact_command_keeps_search_top_hits_stable() {
+fn search_segment_id_round_trips_into_impact_from_segment_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let search_results = search_json(tmp.path(), "load auth config");
+    assert!(
+        !search_results.is_empty(),
+        "search fixture should produce ranked hits"
+    );
+
+    let seed = search_results
+        .iter()
+        .find(|result| {
+            result["file_path"].as_str() == Some("src/auth/runtime.rs")
+                && result["content"]
+                    .as_str()
+                    .map(|content| content.contains("load_auth_config"))
+                    .unwrap_or(false)
+        })
+        .expect("search should return the runtime definition segment");
+    let segment_id = seed["segment_id"]
+        .as_str()
+        .expect("search results should expose a segment_id follow-up handle");
+
+    let result = impact_json(tmp.path(), &["--from-segment", segment_id]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "segment");
+    assert_eq!(result["resolved_anchor"]["value"], segment_id);
+
+    let results = result["results"].as_array().unwrap();
+    assert!(
+        !results.is_empty(),
+        "round-tripped impact should return candidates"
+    );
+    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+    assert!(results[0]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason["from_segment_id"].as_str() == Some(segment_id)));
+}
+
+#[test]
+fn search_segment_id_handoff_keeps_search_top_hits_stable() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
@@ -840,21 +884,38 @@ fn impact_command_keeps_search_top_hits_stable() {
         "search fixture should produce ranked hits"
     );
 
-    let _result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs"]);
+    let segment_id = before
+        .iter()
+        .find_map(|result| result["segment_id"].as_str())
+        .expect("search results should expose at least one segment_id");
+
+    let _result = impact_json(tmp.path(), &["--from-segment", segment_id]);
     let after = search_json(tmp.path(), "load auth config");
 
-    let before_paths: Vec<_> = before
+    let before_ranked: Vec<_> = before
         .iter()
         .take(5)
-        .map(|result| result["file_path"].as_str().unwrap().to_string())
+        .map(|result| {
+            (
+                result["file_path"].as_str().unwrap().to_string(),
+                result["line_number"].as_u64().unwrap(),
+                result["block_type"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
-    let after_paths: Vec<_> = after
+    let after_ranked: Vec<_> = after
         .iter()
         .take(5)
-        .map(|result| result["file_path"].as_str().unwrap().to_string())
+        .map(|result| {
+            (
+                result["file_path"].as_str().unwrap().to_string(),
+                result["line_number"].as_u64().unwrap(),
+                result["block_type"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
 
-    assert_eq!(before_paths, after_paths);
+    assert_eq!(before_ranked, after_ranked);
 }
 
 // ---------- Verify context retrieval returns enclosing scope ----------

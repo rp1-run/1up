@@ -23,6 +23,7 @@ On Windows or other local-mode platforms, run `1up init` and then `1up index .`.
 1up search "<query>" -n 5
 ```
 Hybrid search combining vector similarity and keyword matching. Use for natural-language queries like "how does authentication work" or "error handling in the API layer".
+Machine-readable `search` results can include a `segment_id` follow-up handle for segment-backed hits.
 
 ### Symbol Lookup
 ```
@@ -35,6 +36,14 @@ Find definitions (and optionally all usages) of functions, types, and variables 
 1up context <file>:<line>
 ```
 Retrieve the enclosing scope (function, class, block) around a specific file location. Useful for understanding code from a search hit or stack trace.
+
+### Impact Horizon
+```
+1up impact --from-file <path[:line]>
+1up impact --from-symbol <name>
+1up impact --from-segment <segment_id>
+```
+Use for bounded likely-impact exploration after you already have an anchor. For agent loops, prefer `1up --format json search ...` followed by `1up --format json impact --from-segment <segment_id>` when `search` returns a `segment_id`.
 
 ### Structural Search
 ```
