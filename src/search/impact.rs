@@ -381,7 +381,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         let seed = candidate_from_stored_segment(segment);
         if let Some(scope) = explicit_scope.as_deref() {
             if let Some(refusal) =
-                out_of_scope_anchor_refusal("segment", id, scope, &[seed.clone()])
+                out_of_scope_anchor_refusal("segment", id, scope, std::slice::from_ref(&seed))
             {
                 return Ok(ResolveOutcome::Refused(refusal));
             }
