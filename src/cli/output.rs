@@ -797,8 +797,13 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for r in results {
             out.push_str(&format!(
-                "{}:{}-{}\t{}\t{:.4}\n",
-                r.file_path, r.line_number, r.line_end, r.block_type, r.score
+                "{}:{}-{}\t{}\t{:.4}\tsegment={}\n",
+                r.file_path,
+                r.line_number,
+                r.line_end,
+                r.block_type,
+                r.score,
+                r.segment_id.as_deref().unwrap_or("")
             ));
             out.push_str(&format!("{}\n", render_search_metadata(r)));
             out.push_str(&r.content);
@@ -1669,6 +1674,25 @@ mod tests {
     use super::*;
     use crate::shared::types::{IndexParallelism, IndexStageTimings};
 
+    fn sample_search_result() -> SearchResult {
+        SearchResult {
+            file_path: "src/auth/builder.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn build_auth() {\n    apply_config();\n}".to_string(),
+            score: 0.945,
+            line_number: 21,
+            line_end: 23,
+            segment_id: Some("candidate-segment-abcdef123456".to_string()),
+            breadcrumb: Some("AuthConfig::build".to_string()),
+            complexity: Some(4),
+            role: Some(SegmentRole::Orchestration),
+            defined_symbols: Some(vec!["build_auth".to_string()]),
+            referenced_symbols: None,
+            called_symbols: Some(vec!["apply_config".to_string()]),
+        }
+    }
+
     fn sample_impact_result() -> ImpactResultEnvelope {
         ImpactResultEnvelope {
             status: ImpactStatus::ExpandedScoped,
@@ -1779,6 +1803,40 @@ mod tests {
         assert_eq!(value["work"]["files_skipped"], 2);
         assert_eq!(value["progress"]["parallelism"]["jobs_effective"], 3);
         assert_eq!(value["progress"]["timings"]["total_ms"], 41);
+    }
+
+    #[test]
+    fn json_search_results_include_segment_id_when_available() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            value[0]["segment_id"],
+            serde_json::Value::String("candidate-segment-abcdef123456".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_search_results_append_segment_field() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+        let first_line = rendered.lines().next().unwrap();
+
+        assert_eq!(
+            first_line,
+            "src/auth/builder.rs:21-23\tfunction\t0.9450\tsegment=candidate-segment-abcdef123456"
+        );
+    }
+
+    #[test]
+    fn human_search_results_remain_concise_without_full_segment_id() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_search_results(&[sample_search_result()]);
+
+        assert!(!rendered.contains("candidate-segment-abcdef123456"));
+        assert!(rendered.contains("src/auth/builder.rs:21"));
+        assert!(rendered.contains("Kind: function | Scope: AuthConfig::build"));
     }
 
     #[test]

@@ -305,6 +305,7 @@ mod tests {
                         score: 1.0,
                         line_number: 1,
                         line_end: 1,
+                        segment_id: Some("seg-1".to_string()),
                         breadcrumb: None,
                         complexity: None,
                         role: None,
@@ -327,6 +328,7 @@ mod tests {
         server.await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "src/lib.rs");
+        assert_eq!(results[0].segment_id.as_deref(), Some("seg-1"));
         assert_eq!(daemon_version, Some("0.1.0".to_string()));
     }
 

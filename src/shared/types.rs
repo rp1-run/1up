@@ -46,6 +46,8 @@ pub struct SearchResult {
     pub score: f64,
     pub line_number: usize,
     pub line_end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breadcrumb: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

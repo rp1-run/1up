@@ -198,6 +198,7 @@ fn search_result_from_segment(segment: StoredSegment) -> SearchResult {
         score: 0.0,
         line_number: segment.line_start as usize,
         line_end: segment.line_end as usize,
+        segment_id: Some(segment.id),
         breadcrumb: segment.breadcrumb,
         complexity: Some(segment.complexity as u32),
         role,
@@ -235,6 +236,30 @@ mod tests {
         let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
 
         assert!(variants.is_empty());
+    }
+
+    #[test]
+    fn search_result_from_segment_preserves_segment_id() {
+        let result = search_result_from_segment(StoredSegment {
+            id: "seg-123".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn needle() {}".to_string(),
+            line_start: 7,
+            line_end: 9,
+            breadcrumb: Some("needle".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"needle\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "hash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            updated_at: "2026-04-13T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(result.segment_id.as_deref(), Some("seg-123"));
     }
 
     #[tokio::test]
