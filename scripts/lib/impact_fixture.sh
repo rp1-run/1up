@@ -4,20 +4,16 @@ impact_utc_timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+impact_requirements_baseline_ref() {
+  printf '%s\n' "${IMPACT_REQUIREMENTS_BASELINE_REF:-310097091d6dc3666563ee4ca4b8755a3e6e2934}"
+}
+
 impact_default_baseline_ref() {
   local root_dir="$1"
+  local baseline_ref
 
-  if git -C "$root_dir" rev-parse --verify origin/main >/dev/null 2>&1; then
-    git -C "$root_dir" merge-base HEAD origin/main
-    return
-  fi
-
-  if git -C "$root_dir" rev-parse --verify main >/dev/null 2>&1; then
-    git -C "$root_dir" rev-parse main
-    return
-  fi
-
-  git -C "$root_dir" rev-parse HEAD^
+  baseline_ref=$(impact_requirements_baseline_ref)
+  git -C "$root_dir" rev-parse "$baseline_ref"
 }
 
 impact_oneup_data_dir() {

@@ -6,6 +6,7 @@ OUTPUT_DIR="$ROOT_DIR/target/impact/rollout-approval"
 OUTPUT_PATH=""
 ACCURACY_SUMMARY=""
 PERFORMANCE_SUMMARY=""
+FIELD_NOTES_PATH=""
 
 log() {
   printf '[impact-rollout-approve] %s\n' "$*" >&2
@@ -62,6 +63,26 @@ validate_performance_summary() {
   fi
 }
 
+collect_unresolved_field_note_blockers() {
+  local path="$1"
+
+  [[ -f "$path" ]] || fail "field notes do not exist: $path"
+
+  awk '
+    /^## Rollout Blockers$/ {
+      in_blockers = 1
+      next
+    }
+    /^## / {
+      in_blockers = 0
+    }
+    in_blockers && /^- \[ \] / {
+      sub(/^- \[ \] /, "", $0)
+      print
+    }
+  ' "$path"
+}
+
 run_accuracy_summary() {
   local out_dir="$1"
 
@@ -90,6 +111,10 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_DIR="${2:-}"
       shift 2
       ;;
+    --field-notes)
+      FIELD_NOTES_PATH="${2:-}"
+      shift 2
+      ;;
     --output)
       OUTPUT_PATH="${2:-}"
       shift 2
@@ -108,6 +133,7 @@ OUTPUT_PATH="${OUTPUT_PATH:-$OUTPUT_DIR/summary.json}"
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 OUTPUT_PATH=$(canonical_path "$OUTPUT_PATH")
 
+field_note_blockers_json='[]'
 if [[ -z "$ACCURACY_SUMMARY" ]]; then
   ACCURACY_SUMMARY=$(run_accuracy_summary "$OUTPUT_DIR/impact-eval")
 fi
@@ -117,6 +143,9 @@ fi
 
 ACCURACY_SUMMARY=$(canonical_path "$ACCURACY_SUMMARY")
 PERFORMANCE_SUMMARY=$(canonical_path "$PERFORMANCE_SUMMARY")
+if [[ -n "$FIELD_NOTES_PATH" ]]; then
+  FIELD_NOTES_PATH=$(canonical_path "$FIELD_NOTES_PATH")
+fi
 
 validate_accuracy_summary "$ACCURACY_SUMMARY"
 validate_performance_summary "$PERFORMANCE_SUMMARY"
@@ -142,6 +171,15 @@ fi
 if [[ "$accuracy_candidate_commit" != "$performance_candidate_commit" ]]; then
   blocking_reasons+=("impact-eval and impact-bench candidate commits do not match")
 fi
+if [[ -n "$FIELD_NOTES_PATH" ]]; then
+  mapfile -t field_note_blockers < <(collect_unresolved_field_note_blockers "$FIELD_NOTES_PATH")
+  if (( ${#field_note_blockers[@]} > 0 )); then
+    field_note_blockers_json=$(printf '%s\n' "${field_note_blockers[@]}" | jq -R . | jq -s .)
+    for blocker in "${field_note_blockers[@]}"; do
+      blocking_reasons+=("field-notes unresolved blocker: $blocker")
+    done
+  fi
+fi
 
 gate_passed=true
 if (( ${#blocking_reasons[@]} > 0 )); then
@@ -159,8 +197,10 @@ jq -n \
   --arg output_path "$OUTPUT_PATH" \
   --arg accuracy_summary_path "$ACCURACY_SUMMARY" \
   --arg performance_summary_path "$PERFORMANCE_SUMMARY" \
+  --arg field_notes_path "$FIELD_NOTES_PATH" \
   --argjson gate_passed "$(if [[ "$gate_passed" == "true" ]]; then printf 'true'; else printf 'false'; fi)" \
   --argjson blocking_reasons "$blocking_reasons_json" \
+  --argjson field_note_blockers "$field_note_blockers_json" \
   --slurpfile accuracy "$ACCURACY_SUMMARY" \
   --slurpfile performance "$PERFORMANCE_SUMMARY" \
   '{
@@ -188,6 +228,17 @@ jq -n \
       max_p95_regression_pct: $performance[0].gate.max_p95_regression_pct,
       gate_passed: $performance[0].gate_passed
     },
+    field_notes: (
+      if $field_notes_path == "" then
+        null
+      else
+        {
+          path: $field_notes_path,
+          unresolved_blockers: $field_note_blockers,
+          has_unresolved_blockers: (($field_note_blockers | length) > 0)
+        }
+      end
+    ),
     blocking_reasons: $blocking_reasons
   }' >"$OUTPUT_PATH"
 
