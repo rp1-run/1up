@@ -1527,6 +1527,8 @@ fn render_impact_status_label(status: ImpactStatus) -> &'static str {
     match status {
         ImpactStatus::Expanded => "expanded",
         ImpactStatus::ExpandedScoped => "expanded_scoped",
+        ImpactStatus::Empty => "empty",
+        ImpactStatus::EmptyScoped => "empty_scoped",
         ImpactStatus::Refused => "refused",
     }
 }
@@ -1732,6 +1734,7 @@ mod tests {
                 role: Some(SegmentRole::Orchestration),
                 defined_symbols: Some(vec!["build_auth".to_string()]),
             }],
+            contextual_results: None,
             hint: Some(crate::search::impact::ImpactHint {
                 code: "inspect_candidate".to_string(),
                 message: "Inspect `src/auth/builder.rs` next.".to_string(),
@@ -1747,6 +1750,7 @@ mod tests {
             status: ImpactStatus::Refused,
             resolved_anchor: None,
             results: Vec::new(),
+            contextual_results: None,
             hint: Some(crate::search::impact::ImpactHint {
                 code: "narrow_with_scope".to_string(),
                 message: "Pass `--scope src/auth` or reuse an exact segment anchor.".to_string(),

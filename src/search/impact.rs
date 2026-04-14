@@ -55,6 +55,8 @@ pub struct ImpactRequest {
 pub enum ImpactStatus {
     Expanded,
     ExpandedScoped,
+    Empty,
+    EmptyScoped,
     Refused,
 }
 
@@ -125,6 +127,8 @@ pub struct ImpactResultEnvelope {
     pub resolved_anchor: Option<ResolvedImpactAnchor>,
     pub results: Vec<ImpactCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub contextual_results: Option<Vec<ImpactCandidate>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<ImpactHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<ImpactRefusal>,
@@ -148,9 +152,12 @@ enum ResolveOutcome {
 
 struct CandidateAggregate {
     candidate: CandidateRow,
-    score: f64,
-    hop: usize,
-    reasons: HashMap<String, ReasonContribution>,
+    primary_score: f64,
+    primary_hop: Option<usize>,
+    primary_reasons: HashMap<String, ReasonContribution>,
+    contextual_score: f64,
+    contextual_hop: Option<usize>,
+    contextual_reasons: HashMap<String, ReasonContribution>,
 }
 
 struct ReasonContribution {
@@ -158,11 +165,23 @@ struct ReasonContribution {
     score: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationBucket {
+    Primary,
+    Contextual,
+}
+
 struct CandidateObservation {
     candidate: CandidateRow,
     score: f64,
     hop: usize,
     reason: ImpactReason,
+    bucket: ObservationBucket,
+}
+
+struct FinalizedImpactResults {
+    primary: Vec<ImpactCandidate>,
+    contextual: Vec<ImpactCandidate>,
 }
 
 impl<'a> ImpactHorizonEngine<'a> {
@@ -267,26 +286,29 @@ impl<'a> ImpactHorizonEngine<'a> {
             observe_candidate(&mut aggregates, observation);
         }
 
-        let mut results = finalize_impact_results(aggregates, limit);
-        if results.is_empty() {
-            results = fallback_seed_results(
-                &resolution.seeds,
-                limit,
-                resolution.effective_scope.as_deref(),
-            );
-        }
-
-        let status = if resolution.resolved_anchor.scope.is_some() {
-            ImpactStatus::ExpandedScoped
-        } else {
-            ImpactStatus::Expanded
+        let finalized = finalize_impact_results(aggregates, limit);
+        let status = match (
+            !finalized.primary.is_empty(),
+            resolution.resolved_anchor.scope.is_some(),
+        ) {
+            (true, true) => ImpactStatus::ExpandedScoped,
+            (true, false) => ImpactStatus::Expanded,
+            (false, true) => ImpactStatus::EmptyScoped,
+            (false, false) => ImpactStatus::Empty,
         };
-        let hint = success_hint(&results, resolution.effective_scope.clone());
+        let contextual_results = (!finalized.contextual.is_empty()).then_some(finalized.contextual);
+        let hint = outcome_hint(
+            &status,
+            &finalized.primary,
+            contextual_results.as_deref(),
+            resolution.effective_scope.clone(),
+        );
 
         Ok(ImpactResultEnvelope {
             status,
             resolved_anchor: Some(resolution.resolved_anchor),
-            results,
+            results: finalized.primary,
+            contextual_results,
             hint,
             refusal: None,
         })
@@ -509,6 +531,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(source.segment_id.clone()),
                     },
                     candidate: target,
+                    bucket: ObservationBucket::Primary,
                 });
             }
         }
@@ -557,6 +580,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(source.segment_id.clone()),
                     },
                     candidate,
+                    bucket: ObservationBucket::Primary,
                 });
             }
         }
@@ -595,6 +619,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(seed.segment_id.clone()),
                     },
                     candidate,
+                    bucket: ObservationBucket::Contextual,
                 });
             }
         }
@@ -685,6 +710,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: None,
                     },
                     candidate,
+                    bucket: ObservationBucket::Contextual,
                 });
             }
         }
@@ -730,16 +756,32 @@ fn observe_candidate(
         .entry(observation.candidate.segment_id.clone())
         .or_insert_with(|| CandidateAggregate {
             candidate: observation.candidate.clone(),
-            score: 0.0,
-            hop: observation.hop,
-            reasons: HashMap::new(),
+            primary_score: 0.0,
+            primary_hop: None,
+            primary_reasons: HashMap::new(),
+            contextual_score: 0.0,
+            contextual_hop: None,
+            contextual_reasons: HashMap::new(),
         });
 
-    entry.score += observation.score;
-    entry.hop = entry.hop.min(observation.hop);
+    let (score, hop, reasons) = match observation.bucket {
+        ObservationBucket::Primary => (
+            &mut entry.primary_score,
+            &mut entry.primary_hop,
+            &mut entry.primary_reasons,
+        ),
+        ObservationBucket::Contextual => (
+            &mut entry.contextual_score,
+            &mut entry.contextual_hop,
+            &mut entry.contextual_reasons,
+        ),
+    };
+
+    *score += observation.score;
+    *hop = Some(hop.map_or(observation.hop, |existing| existing.min(observation.hop)));
 
     let key = reason_key(&observation.reason);
-    match entry.reasons.get_mut(&key) {
+    match reasons.get_mut(&key) {
         Some(existing) => {
             if observation.score > existing.score {
                 existing.score = observation.score;
@@ -747,7 +789,7 @@ fn observe_candidate(
             }
         }
         None => {
-            entry.reasons.insert(
+            reasons.insert(
                 key,
                 ReasonContribution {
                     reason: observation.reason,
@@ -761,35 +803,86 @@ fn observe_candidate(
 fn finalize_impact_results(
     aggregates: HashMap<String, CandidateAggregate>,
     limit: usize,
-) -> Vec<ImpactCandidate> {
-    let mut ranked: Vec<ImpactCandidate> = aggregates
-        .into_values()
-        .map(|aggregate| {
-            let mut reasons: Vec<ReasonContribution> = aggregate.reasons.into_values().collect();
-            reasons.sort_by(|left, right| right.score.total_cmp(&left.score));
+) -> FinalizedImpactResults {
+    let mut primary = Vec::new();
+    let mut contextual = Vec::new();
 
-            ImpactCandidate {
-                segment_id: aggregate.candidate.segment_id,
-                file_path: aggregate.candidate.file_path,
-                language: aggregate.candidate.language,
-                block_type: aggregate.candidate.block_type,
-                line_start: aggregate.candidate.line_number,
-                line_end: aggregate.candidate.line_end,
-                score: aggregate.score,
-                hop: aggregate.hop,
-                reasons: reasons
-                    .into_iter()
-                    .map(|reason| reason.reason)
-                    .take(3)
-                    .collect(),
-                breadcrumb: aggregate.candidate.breadcrumb,
-                complexity: aggregate.candidate.complexity,
-                role: aggregate.candidate.role,
-                defined_symbols: aggregate.candidate.defined_symbols,
-            }
-        })
-        .collect();
+    for aggregate in aggregates.into_values() {
+        let CandidateAggregate {
+            candidate,
+            primary_score,
+            primary_hop,
+            primary_reasons,
+            contextual_score,
+            contextual_hop,
+            contextual_reasons,
+        } = aggregate;
 
+        let mut primary_reasons: Vec<ReasonContribution> = primary_reasons.into_values().collect();
+        primary_reasons.sort_by(|left, right| right.score.total_cmp(&left.score));
+
+        let mut contextual_reasons: Vec<ReasonContribution> =
+            contextual_reasons.into_values().collect();
+        contextual_reasons.sort_by(|left, right| right.score.total_cmp(&left.score));
+
+        if primary_score > 0.0 && !primary_reasons.is_empty() {
+            let reasons = primary_reasons
+                .into_iter()
+                .map(|reason| reason.reason)
+                .chain(contextual_reasons.into_iter().map(|reason| reason.reason))
+                .take(3)
+                .collect();
+            primary.push(build_impact_candidate(
+                candidate,
+                primary_score,
+                primary_hop.unwrap_or_default(),
+                reasons,
+            ));
+        } else if contextual_score > 0.0 && !contextual_reasons.is_empty() {
+            let reasons = contextual_reasons
+                .into_iter()
+                .map(|reason| reason.reason)
+                .take(3)
+                .collect();
+            contextual.push(build_impact_candidate(
+                candidate,
+                contextual_score,
+                contextual_hop.unwrap_or_default(),
+                reasons,
+            ));
+        }
+    }
+
+    FinalizedImpactResults {
+        primary: rank_impact_candidates(primary, limit),
+        contextual: rank_impact_candidates(contextual, limit),
+    }
+}
+
+fn build_impact_candidate(
+    candidate: CandidateRow,
+    score: f64,
+    hop: usize,
+    reasons: Vec<ImpactReason>,
+) -> ImpactCandidate {
+    ImpactCandidate {
+        segment_id: candidate.segment_id,
+        file_path: candidate.file_path,
+        language: candidate.language,
+        block_type: candidate.block_type,
+        line_start: candidate.line_number,
+        line_end: candidate.line_end,
+        score,
+        hop,
+        reasons,
+        breadcrumb: candidate.breadcrumb,
+        complexity: candidate.complexity,
+        role: candidate.role,
+        defined_symbols: candidate.defined_symbols,
+    }
+}
+
+fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec<ImpactCandidate> {
     ranked.sort_by(|left, right| {
         right
             .score
@@ -819,63 +912,46 @@ fn finalize_impact_results(
     results
 }
 
-fn fallback_seed_results(
-    seeds: &[CandidateRow],
-    limit: usize,
-    scope: Option<&str>,
-) -> Vec<ImpactCandidate> {
-    let mut results: Vec<ImpactCandidate> = seeds
-        .iter()
-        .filter(|seed| scope_matches(&seed.file_path, scope))
-        .take(limit)
-        .map(|seed| ImpactCandidate {
-            segment_id: seed.segment_id.clone(),
-            file_path: seed.file_path.clone(),
-            language: seed.language.clone(),
-            block_type: seed.block_type.clone(),
-            line_start: seed.line_number,
-            line_end: seed.line_end,
-            score: 0.0,
-            hop: 0,
-            reasons: vec![ImpactReason {
-                kind: "resolved_anchor".to_string(),
-                symbol: None,
-                from_segment_id: None,
-            }],
-            breadcrumb: seed.breadcrumb.clone(),
-            complexity: seed.complexity,
-            role: seed.role,
-            defined_symbols: seed.defined_symbols.clone(),
-        })
-        .collect();
-
-    results.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then_with(|| left.line_start.cmp(&right.line_start))
-            .then_with(|| left.segment_id.cmp(&right.segment_id))
-    });
-    results
-}
-
-fn success_hint(results: &[ImpactCandidate], scope: Option<String>) -> Option<ImpactHint> {
-    if let Some(first) = results.first() {
-        Some(impact_hint(
-            "inspect_candidate",
-            &format!(
-                "Inspect `{}` next or reuse segment `{}` for a narrower follow-up.",
-                first.file_path, first.segment_id
-            ),
-            scope,
-            Some(first.segment_id.clone()),
-        ))
-    } else {
-        Some(impact_hint(
-            "inspect_anchor",
-            "No additional likely-impact candidates survived the current budgets.",
-            scope,
-            None,
-        ))
+fn outcome_hint(
+    status: &ImpactStatus,
+    results: &[ImpactCandidate],
+    contextual_results: Option<&[ImpactCandidate]>,
+    scope: Option<String>,
+) -> Option<ImpactHint> {
+    match status {
+        ImpactStatus::Expanded | ImpactStatus::ExpandedScoped => {
+            let first = results.first()?;
+            Some(impact_hint(
+                "inspect_candidate",
+                &format!(
+                    "Inspect `{}` next or reuse segment `{}` for a narrower follow-up.",
+                    first.file_path, first.segment_id
+                ),
+                scope,
+                Some(first.segment_id.clone()),
+            ))
+        }
+        ImpactStatus::Empty | ImpactStatus::EmptyScoped => {
+            if let Some(first) = contextual_results.and_then(|results| results.first()) {
+                Some(impact_hint(
+                    "context_only",
+                    &format!(
+                        "No likely-impact candidates were found. Review the contextual guidance or reuse segment `{}` for a narrower follow-up.",
+                        first.segment_id
+                    ),
+                    scope,
+                    Some(first.segment_id.clone()),
+                ))
+            } else {
+                Some(impact_hint(
+                    "no_likely_impact",
+                    "No likely-impact candidates were found for the resolved anchor.",
+                    scope,
+                    None,
+                ))
+            }
+        }
+        ImpactStatus::Refused => None,
     }
 }
 
@@ -908,6 +984,7 @@ fn refused_result(reason: &str, message: String, hint: ImpactHint) -> ImpactResu
         status: ImpactStatus::Refused,
         resolved_anchor: None,
         results: Vec::new(),
+        contextual_results: None,
         hint: Some(hint),
         refusal: Some(ImpactRefusal {
             reason: reason.to_string(),
@@ -1445,9 +1522,17 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(result.status, ImpactStatus::Empty);
         let resolved = result.resolved_anchor.unwrap();
         assert_eq!(resolved.kind, "file_line");
         assert_eq!(resolved.seed_segment_ids, vec!["late".to_string()]);
+        assert!(result.results.is_empty());
+        let contextual = result
+            .contextual_results
+            .expect("same-file observations should remain contextual");
+        assert_eq!(contextual.len(), 1);
+        assert_eq!(contextual[0].segment_id, "early");
+        assert_eq!(contextual[0].reasons[0].kind, "same_file");
     }
 
     #[tokio::test]
@@ -1488,7 +1573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_file_anchor_fallback_keeps_in_scope_seed() {
+    async fn scoped_file_anchor_without_relations_returns_empty_scoped() {
         let (_db, conn) = setup().await;
         insert_segments(
             &conn,
@@ -1519,10 +1604,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.status, ImpactStatus::ExpandedScoped);
-        assert_eq!(result.results.len(), 1);
-        assert_eq!(result.results[0].segment_id, "auth-runtime");
-        assert_eq!(result.results[0].reasons[0].kind, "resolved_anchor");
+        assert_eq!(result.status, ImpactStatus::EmptyScoped);
+        assert!(result.results.is_empty());
+        assert!(result.contextual_results.is_none());
+        assert_eq!(result.hint.unwrap().code, "no_likely_impact");
     }
 
     #[tokio::test]
@@ -1624,14 +1709,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, ImpactStatus::Expanded);
-        assert_eq!(result.results.len(), 3);
+        assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].segment_id, "boot-app");
         assert_eq!(result.results[0].reasons[0].kind, "called_by");
-        assert_eq!(result.results[1].segment_id, "parse-config");
-        assert_eq!(result.results[1].reasons[0].kind, "same_file");
-        assert_eq!(result.results[2].segment_id, "config-test");
+        let contextual = result
+            .contextual_results
+            .expect("same-file and test candidates should remain contextual");
+        assert_eq!(contextual.len(), 2);
+        assert_eq!(contextual[0].segment_id, "parse-config");
+        assert_eq!(contextual[0].reasons[0].kind, "same_file");
+        assert_eq!(contextual[1].segment_id, "config-test");
         assert!(matches!(
-            result.results[2].reasons[0].kind.as_str(),
+            contextual[1].reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
     }
