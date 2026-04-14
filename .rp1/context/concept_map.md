@@ -9,7 +9,8 @@
 | `Impact Horizon` | Process | Explicit local-only workflow for bounded likely-impact exploration from a known anchor. | `src/search/impact.rs`, `src/cli/impact.rs` |
 | `ImpactAnchor` | Value object | Exact-one-anchor request model: file, file:line, symbol, or segment. | `src/search/impact.rs`, `src/cli/impact.rs` |
 | `ImpactCandidate` | Entity | Ranked likely-impact segment with hop distance, advisory score, and reason evidence. | `src/search/impact.rs`, `src/cli/output.rs` |
-| `ImpactResultEnvelope` | Value object | Shared output envelope for `expanded`, `expanded_scoped`, and `refused` impact outcomes. | `src/search/impact.rs`, `src/cli/output.rs` |
+| `Contextual Guidance` | Contract concept | Lower-confidence impact support backed only by same-file or test heuristics and surfaced separately from primary likely impact. | `src/search/impact.rs`, `src/cli/output.rs` |
+| `ImpactResultEnvelope` | Value object | Shared output envelope for `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, and `refused` outcomes, with additive optional `contextual_results`. | `src/search/impact.rs`, `src/cli/output.rs` |
 | `SegmentRelation` | Entity | Persisted unresolved call/reference edge keyed by source segment and canonical target symbol. | `src/storage/relations.rs`, `src/storage/queries.rs`, `src/storage/schema.rs` |
 | `Daemon Search IPC` | Interface | Unix-socket discovery protocol for daemon-backed search. Responses now optionally carry `daemon_version`. | `src/daemon/search_service.rs`, `src/cli/search.rs` |
 
@@ -23,6 +24,9 @@
 | `scope` | Repo-relative subtree constraint that narrows anchor resolution and candidate retention. |
 | `relation row` | Stored unresolved call/reference record in `segment_relations`. |
 | `refusal envelope` | Structured impact response that explains why expansion was refused and what to do next. |
+| `contextual_results` | Additive machine-readable field that holds non-primary same-file or test-only guidance. |
+| `empty` | Impact status meaning the anchor resolved, but no primary likely-impact candidates were found. |
+| `empty_scoped` | Scoped variant of `empty`; no primary likely-impact candidates survived within the requested scope. |
 | `daemon_version` | Optional search-response metadata used to warn about CLI/daemon version skew. |
 | `schema v8` | Index schema version that includes `segment_relations` and requires reindexing from older layouts. |
 | `advisory impact` | Likely-impact guidance derived from relations and heuristics, not exact dependency truth. |
@@ -30,9 +34,10 @@
 ## Relationships
 
 - `SearchResult` provides an exact follow-up handle to `ImpactAnchor` through optional `segment_id`.
-- `Impact Horizon` traverses `SegmentRelation` rows plus same-file and test heuristics to build ranked candidates.
+- `Impact Horizon` traverses `SegmentRelation` rows plus same-file and test heuristics to build primary likely-impact candidates and contextual guidance.
 - `Impact Horizon` resolves symbol anchors and canonical relation targets through definition lookup at query time.
-- `ImpactResultEnvelope` contains `ImpactCandidate` values on success and refusal metadata on rejected requests.
+- `ImpactResultEnvelope.results` contains only primary likely-impact candidates, while `contextual_results` carries lower-confidence guidance.
+- `ImpactResultEnvelope` uses explicit empty statuses when the anchor resolves but no primary candidates survive.
 - `SegmentInsert` materializes `SegmentRelation` rows during storage writes.
 - `Daemon Search IPC` returns `SearchResult` values but remains a separate surface from Impact Horizon.
 
@@ -42,6 +47,7 @@
 |---|---|---|
 | Additive search-to-impact handoff | Discovery workflow | Search keeps existing ranking semantics and only adds optional `segment_id` handles for exact follow-up. |
 | Bounded advisory expansion | Impact Horizon | Depth, seed count, relation fan-out, and result budgets stay capped; broad symbols are refused with hints. |
+| Trust bucket separation | Impact Horizon, Output | Primary relation-backed impact stays distinct from heuristic-only contextual guidance and empty-state handling. |
 | Late relation resolution | Local index graph | Indexing stores unresolved canonical symbol relations and impact resolves exact targets only for active seeds. |
 | Transactional relation maintenance | Storage writes | Segment upsert, replace, and delete flows keep `segment_relations` aligned with `segments` and `segment_symbols`. |
 | Backward-compatible surface evolution | CLI output and daemon IPC | New fields such as `segment_id` and `daemon_version` stay optional to preserve compatibility. |
@@ -68,6 +74,7 @@
 
 - Ambiguity management: broad symbol anchors are refused with narrowing hints instead of widened into noisy output.
 - Advisory semantics: scores are framed as likely/probable guidance, not guaranteed blast radius.
+- Empty-state trust: resolved anchors without relation-backed evidence stay empty instead of being echoed back as synthetic success results.
 - Interactive latency: budgets and benchmarks keep impact additive without regressing core discovery commands.
 - Compatibility: new fields are additive and optional so existing search and IPC consumers continue to deserialize cleanly.
 - Reindex safety: schema mismatches fail early with explicit `1up reindex` guidance.
