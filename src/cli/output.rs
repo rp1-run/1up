@@ -424,39 +424,18 @@ impl Formatter for HumanFormatter {
                 refusal.reason.yellow().bold(),
                 refusal.message
             ));
-        } else if result.results.is_empty() {
-            out.push_str("No likely-impact candidates found.\n");
         } else {
-            for (i, candidate) in result.results.iter().enumerate() {
-                if i > 0 {
+            if result.results.is_empty() {
+                out.push_str("No likely-impact candidates found.\n");
+            } else {
+                append_impact_candidates_human(&mut out, &result.results);
+            }
+
+            if let Some(contextual_results) = result.contextual_results.as_deref() {
+                if !contextual_results.is_empty() {
                     out.push('\n');
-                }
-                out.push_str(&format!(
-                    "{}. {} {}\n",
-                    i + 1,
-                    format!(
-                        "{}:{}-{}",
-                        candidate.file_path, candidate.line_start, candidate.line_end
-                    )
-                    .cyan(),
-                    format!("[{}]", candidate.block_type).dimmed()
-                ));
-                out.push_str(&format!(
-                    "{}\n",
-                    render_impact_candidate_metadata(candidate).dimmed()
-                ));
-                if let Some(breadcrumb) = &candidate.breadcrumb {
-                    out.push_str(&format!(
-                        "{}\n",
-                        format!("Breadcrumb: {breadcrumb}").dimmed()
-                    ));
-                }
-                if !candidate.reasons.is_empty() {
-                    out.push_str(&format!(
-                        "{}\n",
-                        format!("Why: {}", render_impact_reasons_human(&candidate.reasons))
-                            .dimmed()
-                    ));
+                    out.push_str(&format!("{}\n", "Contextual Guidance".bold()));
+                    append_impact_candidates_human(&mut out, contextual_results);
                 }
             }
         }
@@ -904,35 +883,23 @@ impl Formatter for PlainFormatter {
             }
         }
 
-        for (i, candidate) in result.results.iter().enumerate() {
-            out.push_str(&format!(
-                "result\t{}\t{}:{}-{}\t{}\tlang={}\tscore={:.4}\thop={}\tsegment={}\n",
-                i + 1,
-                candidate.file_path,
-                candidate.line_start,
-                candidate.line_end,
-                candidate.block_type,
-                candidate.language,
-                candidate.score,
-                candidate.hop,
-                candidate.segment_id
-            ));
-            out.push_str(&format!(
-                "result_meta\t{}\n",
-                render_impact_candidate_metadata(candidate)
-            ));
-            if let Some(breadcrumb) = &candidate.breadcrumb {
-                out.push_str(&format!("result_breadcrumb\t{}\n", breadcrumb));
-            }
-            if !candidate.reasons.is_empty() {
-                for reason in &candidate.reasons {
-                    out.push_str(&format!(
-                        "result_reason\t{}\t{}\n",
-                        i + 1,
-                        render_impact_reason_plain(reason)
-                    ));
-                }
-            }
+        append_impact_candidates_plain(
+            &mut out,
+            &result.results,
+            "result",
+            "result_meta",
+            "result_breadcrumb",
+            "result_reason",
+        );
+        if let Some(contextual_results) = result.contextual_results.as_deref() {
+            append_impact_candidates_plain(
+                &mut out,
+                contextual_results,
+                "context_result",
+                "context_result_meta",
+                "context_result_breadcrumb",
+                "context_result_reason",
+            );
         }
 
         out
@@ -1608,6 +1575,80 @@ fn render_impact_candidate_metadata(candidate: &ImpactCandidate) -> String {
     parts.join(" | ")
 }
 
+fn append_impact_candidates_human(out: &mut String, candidates: &[ImpactCandidate]) {
+    for (i, candidate) in candidates.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{}. {} {}\n",
+            i + 1,
+            format!(
+                "{}:{}-{}",
+                candidate.file_path, candidate.line_start, candidate.line_end
+            )
+            .cyan(),
+            format!("[{}]", candidate.block_type).dimmed()
+        ));
+        out.push_str(&format!(
+            "{}\n",
+            render_impact_candidate_metadata(candidate).dimmed()
+        ));
+        if let Some(breadcrumb) = &candidate.breadcrumb {
+            out.push_str(&format!(
+                "{}\n",
+                format!("Breadcrumb: {breadcrumb}").dimmed()
+            ));
+        }
+        if !candidate.reasons.is_empty() {
+            out.push_str(&format!(
+                "{}\n",
+                format!("Why: {}", render_impact_reasons_human(&candidate.reasons)).dimmed()
+            ));
+        }
+    }
+}
+
+fn append_impact_candidates_plain(
+    out: &mut String,
+    candidates: &[ImpactCandidate],
+    result_prefix: &str,
+    meta_prefix: &str,
+    breadcrumb_prefix: &str,
+    reason_prefix: &str,
+) {
+    for (i, candidate) in candidates.iter().enumerate() {
+        out.push_str(&format!(
+            "{result_prefix}\t{}\t{}:{}-{}\t{}\tlang={}\tscore={:.4}\thop={}\tsegment={}\n",
+            i + 1,
+            candidate.file_path,
+            candidate.line_start,
+            candidate.line_end,
+            candidate.block_type,
+            candidate.language,
+            candidate.score,
+            candidate.hop,
+            candidate.segment_id
+        ));
+        out.push_str(&format!(
+            "{meta_prefix}\t{}\n",
+            render_impact_candidate_metadata(candidate)
+        ));
+        if let Some(breadcrumb) = &candidate.breadcrumb {
+            out.push_str(&format!("{breadcrumb_prefix}\t{breadcrumb}\n"));
+        }
+        if !candidate.reasons.is_empty() {
+            for reason in &candidate.reasons {
+                out.push_str(&format!(
+                    "{reason_prefix}\t{}\t{}\n",
+                    i + 1,
+                    render_impact_reason_plain(reason)
+                ));
+            }
+        }
+    }
+}
+
 fn render_impact_reasons_human(reasons: &[ImpactReason]) -> String {
     reasons
         .iter()
@@ -1764,6 +1805,51 @@ mod tests {
         }
     }
 
+    fn sample_contextual_candidate() -> ImpactCandidate {
+        ImpactCandidate {
+            segment_id: "context-segment-fedcba654321".to_string(),
+            file_path: "tests/auth/config_test.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "test".to_string(),
+            line_start: 8,
+            line_end: 17,
+            score: 0.554,
+            hop: 1,
+            reasons: vec![ImpactReason {
+                kind: "test_for_file".to_string(),
+                symbol: Some("Config".to_string()),
+                from_segment_id: None,
+            }],
+            breadcrumb: Some("config_tests::loads_config".to_string()),
+            complexity: Some(2),
+            role: Some(SegmentRole::Implementation),
+            defined_symbols: Some(vec!["loads_config".to_string()]),
+        }
+    }
+
+    fn sample_empty_contextual_impact_result() -> ImpactResultEnvelope {
+        ImpactResultEnvelope {
+            status: ImpactStatus::EmptyScoped,
+            resolved_anchor: Some(ResolvedImpactAnchor {
+                kind: "symbol".to_string(),
+                value: "Config".to_string(),
+                line: Some(14),
+                scope: Some("src/auth".to_string()),
+                seed_segment_ids: vec!["seed-segment-1234567890".to_string()],
+                matched_files: vec!["src/auth/config.rs".to_string()],
+            }),
+            results: Vec::new(),
+            contextual_results: Some(vec![sample_contextual_candidate()]),
+            hint: Some(crate::search::impact::ImpactHint {
+                code: "context_only".to_string(),
+                message: "No likely-impact candidates were found. Review the contextual guidance or reuse segment `context-segment-fedcba654321` for a narrower follow-up.".to_string(),
+                suggested_scope: Some("src/auth".to_string()),
+                suggested_segment_id: Some("context-segment-fedcba654321".to_string()),
+            }),
+            refusal: None,
+        }
+    }
+
     fn sample_progress() -> IndexProgress {
         IndexProgress {
             state: IndexState::Complete,
@@ -1884,6 +1970,7 @@ mod tests {
             value["hint"]["suggested_segment_id"],
             "candidate-segment-abcdef123456"
         );
+        assert!(value.get("contextual_results").is_none());
     }
 
     #[test]
@@ -1896,6 +1983,21 @@ mod tests {
         assert_eq!(value["refusal"]["reason"], "symbol_too_broad");
         assert_eq!(value["hint"]["code"], "narrow_with_scope");
         assert_eq!(value["hint"]["suggested_scope"], "src/auth");
+    }
+
+    #[test]
+    fn json_impact_empty_result_serializes_contextual_bucket() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_impact_result(&sample_empty_contextual_impact_result());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "empty_scoped");
+        assert_eq!(value["results"], serde_json::json!([]));
+        assert_eq!(
+            value["contextual_results"][0]["segment_id"],
+            "context-segment-fedcba654321"
+        );
+        assert_eq!(value["hint"]["code"], "context_only");
     }
 
     #[test]
@@ -1913,6 +2015,19 @@ mod tests {
             rendered.contains("Next step [inspect_candidate] Inspect `src/auth/builder.rs` next.")
         );
         assert!(rendered.contains("Suggested segment: candidate-segment-abcdef123456"));
+    }
+
+    #[test]
+    fn human_impact_empty_result_separates_contextual_guidance() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_impact_result(&sample_empty_contextual_impact_result());
+
+        assert!(rendered.contains("[empty_scoped]"));
+        assert!(rendered.contains("No likely-impact candidates found."));
+        assert!(rendered.contains("Contextual Guidance"));
+        assert!(rendered.contains("tests/auth/config_test.rs:8-17"));
+        assert!(rendered.contains("Why: test_for_file(Config)"));
+        assert!(rendered.contains("Next step [context_only]"));
     }
 
     #[test]
@@ -1945,6 +2060,22 @@ mod tests {
             "result_reason\t1\tkind=called_by\tsymbol=Config\tfrom_segment=seed-segment-1234567890"
         ));
         assert!(rendered.contains("result_reason\t1\tkind=same_file"));
+    }
+
+    #[test]
+    fn plain_impact_empty_result_renders_context_result_lines_without_primary_results() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_impact_result(&sample_empty_contextual_impact_result());
+
+        assert!(rendered.contains("status\tempty_scoped"));
+        assert!(rendered.contains("hint\tcontext_only\tNo likely-impact candidates were found."));
+        assert!(rendered
+            .lines()
+            .all(|line| !line.starts_with("result\t") && !line.starts_with("result_meta\t")));
+        assert!(rendered.contains(
+            "context_result\t1\ttests/auth/config_test.rs:8-17\ttest\tlang=rust\tscore=0.5540\thop=1\tsegment=context-segment-fedcba654321"
+        ));
+        assert!(rendered.contains("context_result_reason\t1\tkind=test_for_file\tsymbol=Config"));
     }
 
     #[test]
