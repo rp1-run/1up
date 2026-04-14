@@ -19,6 +19,9 @@ impact-eval *flags:
 impact-bench *flags:
     ./scripts/benchmark_impact.sh {{flags}}
 
+impact-rollout-approve *flags:
+    ./scripts/approve_impact_rollout.sh {{flags}}
+
 bench-parallel:
     ./scripts/benchmark_parallel_indexing.sh
 
