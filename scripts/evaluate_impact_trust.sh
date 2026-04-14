@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+source "$ROOT_DIR/scripts/lib/impact_fixture.sh"
+
 DEFAULT_OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/1up-impact-trust.XXXXXX")
 OUT_DIR="$DEFAULT_OUT_DIR"
 BASELINE_REF=""
@@ -23,173 +25,11 @@ require_cmd() {
   fi
 }
 
-utc_timestamp() {
-  date -u +"%Y-%m-%dT%H:%M:%SZ"
-}
-
-default_baseline_ref() {
-  if git -C "$ROOT_DIR" rev-parse --verify origin/main >/dev/null 2>&1; then
-    git -C "$ROOT_DIR" merge-base HEAD origin/main
-    return
-  fi
-
-  if git -C "$ROOT_DIR" rev-parse --verify main >/dev/null 2>&1; then
-    git -C "$ROOT_DIR" rev-parse main
-    return
-  fi
-
-  git -C "$ROOT_DIR" rev-parse HEAD^
-}
-
-oneup_data_dir() {
-  local home_dir="$1"
-
-  case "$(uname -s)" in
-    Darwin)
-      printf '%s/Library/Application Support/1up\n' "$home_dir"
-      ;;
-    *)
-      printf '%s/.local/share/1up\n' "$home_dir"
-      ;;
-  esac
-}
-
-prepare_fts_only_home() {
-  local home_dir="$1"
-  local data_dir
-
-  mkdir -p "$home_dir"
-  data_dir=$(oneup_data_dir "$home_dir")
-  mkdir -p "$data_dir/models/all-MiniLM-L6-v2"
-  printf 'impact-trust-eval\n' > "$data_dir/models/all-MiniLM-L6-v2/.download_failed"
-}
-
-run_oneup_json() {
-  local bin_path="$1"
-  local home_dir="$2"
-  shift 2
-
-  HOME="$home_dir" \
-    XDG_DATA_HOME="$home_dir/.local/share" \
-    "$bin_path" --format json "$@"
-}
-
 build_binary() {
   local repo_dir="$1"
 
   log "building $(basename "$repo_dir") binary"
-  cargo build --release --bin 1up --manifest-path "$repo_dir/Cargo.toml" >/dev/null
-}
-
-sync_repo() {
-  local source_dir="$1"
-  local target_dir="$2"
-
-  rm -rf "$target_dir"
-  mkdir -p "$target_dir"
-  cp -R "$source_dir"/. "$target_dir"/
-}
-
-create_fixture() {
-  local repo_dir="$1"
-
-  rm -rf "$repo_dir"
-  mkdir -p "$repo_dir/src/auth" "$repo_dir/src/cache" "$repo_dir/src/ui" "$repo_dir/tests"
-
-  cat > "$repo_dir/src/auth/runtime.rs" <<'EOF'
-pub fn load_auth_config() -> &'static str {
-    "auth"
-}
-
-pub fn parse_auth_config(raw: &str) -> bool {
-    !raw.trim().is_empty()
-}
-EOF
-
-  cat > "$repo_dir/src/auth/bootstrap.rs" <<'EOF'
-use crate::auth::runtime::load_auth_config;
-
-pub fn boot_auth() -> &'static str {
-    load_auth_config()
-}
-EOF
-
-  cat > "$repo_dir/tests/auth_runtime_test.rs" <<'EOF'
-use crate::auth::runtime::load_auth_config;
-
-#[test]
-fn loads_auth_runtime() {
-    assert_eq!(load_auth_config(), "auth");
-}
-EOF
-
-  cat > "$repo_dir/src/auth/config.rs" <<'EOF'
-pub fn load_config() -> &'static str {
-    "auth-scope"
-}
-EOF
-
-  cat > "$repo_dir/src/auth/config_builder.rs" <<'EOF'
-use crate::auth::config::load_config;
-
-pub fn build_auth_config() -> &'static str {
-    load_config()
-}
-EOF
-
-  cat > "$repo_dir/src/cache/config.rs" <<'EOF'
-pub fn load_config() -> &'static str {
-    "cache"
-}
-EOF
-
-  cat > "$repo_dir/src/ui/config.rs" <<'EOF'
-pub fn load_config() -> &'static str {
-    "ui"
-}
-EOF
-
-  cat > "$repo_dir/tests/config_fixture.rs" <<'EOF'
-pub fn load_config() -> &'static str {
-    "tests"
-}
-EOF
-
-  cat > "$repo_dir/src/cache/runtime.rs" <<'EOF'
-pub fn warm_cache_key() -> &'static str {
-    "cache"
-}
-
-pub fn normalize_cache_key(raw: &str) -> String {
-    raw.trim().to_lowercase()
-}
-EOF
-
-  cat > "$repo_dir/src/cache/priming.rs" <<'EOF'
-use crate::cache::runtime::warm_cache_key;
-
-pub fn prime_cache() -> &'static str {
-    warm_cache_key()
-}
-EOF
-
-  cat > "$repo_dir/tests/cache_runtime_test.rs" <<'EOF'
-use crate::cache::runtime::warm_cache_key;
-
-#[test]
-fn warms_cache_runtime() {
-    assert_eq!(warm_cache_key(), "cache");
-}
-EOF
-}
-
-init_and_index_repo() {
-  local bin_path="$1"
-  local home_dir="$2"
-  local repo_dir="$3"
-
-  run_oneup_json "$bin_path" "$home_dir" init "$repo_dir" >/dev/null
-  run_oneup_json "$bin_path" "$home_dir" index "$repo_dir" >/dev/null
+  impact_build_binary "$repo_dir"
 }
 
 evaluate_case() {
@@ -231,7 +71,7 @@ evaluate_case() {
 
   mapfile -t impact_args < <(jq -r '.args[]' <<<"$case_json")
 
-  run_oneup_json "$bin_path" "$home_dir" impact "${impact_args[@]}" --path "$repo_dir" \
+  impact_run_oneup_json "$bin_path" "$home_dir" impact "${impact_args[@]}" --path "$repo_dir" \
     >"$output_path" \
     2>"$stderr_path"
 
@@ -368,7 +208,7 @@ require_cmd cargo
 require_cmd git
 require_cmd jq
 
-BASELINE_REF="${BASELINE_REF:-$(default_baseline_ref)}"
+BASELINE_REF="${BASELINE_REF:-$(impact_default_baseline_ref "$ROOT_DIR")}"
 
 if ! git -C "$ROOT_DIR" rev-parse --verify "$BASELINE_REF" >/dev/null 2>&1; then
   fail "baseline ref does not resolve: $BASELINE_REF"
@@ -412,13 +252,13 @@ CANDIDATE_HOME="$OUT_DIR/runtime/candidate_home"
 DETAILS_JSONL="$OUT_DIR/case-results.jsonl"
 SUMMARY_PATH="$OUT_DIR/summary.json"
 
-create_fixture "$TEMPLATE_REPO"
-sync_repo "$TEMPLATE_REPO" "$BASELINE_REPO"
-sync_repo "$TEMPLATE_REPO" "$CANDIDATE_REPO"
-prepare_fts_only_home "$BASELINE_HOME"
-prepare_fts_only_home "$CANDIDATE_HOME"
-init_and_index_repo "$BASELINE_BIN" "$BASELINE_HOME" "$BASELINE_REPO"
-init_and_index_repo "$CANDIDATE_BIN" "$CANDIDATE_HOME" "$CANDIDATE_REPO"
+impact_create_fixture "$TEMPLATE_REPO"
+impact_sync_repo "$TEMPLATE_REPO" "$BASELINE_REPO"
+impact_sync_repo "$TEMPLATE_REPO" "$CANDIDATE_REPO"
+impact_prepare_fts_only_home "$BASELINE_HOME"
+impact_prepare_fts_only_home "$CANDIDATE_HOME"
+impact_init_and_index_repo "$BASELINE_BIN" "$BASELINE_HOME" "$BASELINE_REPO"
+impact_init_and_index_repo "$CANDIDATE_BIN" "$CANDIDATE_HOME" "$CANDIDATE_REPO"
 
 CASES_JSON=$(cat <<'EOF'
 [
@@ -497,7 +337,7 @@ jq -s \
   --arg baseline_commit "$BASELINE_COMMIT" \
   --arg candidate_commit "$CANDIDATE_COMMIT" \
   --arg output_dir "$OUT_DIR" \
-  --arg generated_at "$(utc_timestamp)" \
+  --arg generated_at "$(impact_utc_timestamp)" \
   '
   . as $cases
   | ($cases | map(select(.kind == "ambiguous" and .variant == "baseline") | .false_positive_count) | add // 0) as $false_positives_before

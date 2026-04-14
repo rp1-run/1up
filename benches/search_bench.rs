@@ -636,14 +636,6 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
-    let symbol_request = ImpactRequest {
-        anchor: ImpactAnchor::Symbol {
-            name: "load_auth_config".to_string(),
-        },
-        scope: None,
-        depth: 2,
-        limit: 20,
-    };
     let refused_request = ImpactRequest {
         anchor: ImpactAnchor::Symbol {
             name: "load_config".to_string(),
@@ -652,23 +644,28 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+    let empty_request = ImpactRequest {
+        anchor: ImpactAnchor::Segment {
+            id: "auth-runtime-parse".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
+    let empty_scoped_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "parse_auth_config".to_string(),
+        },
+        scope: Some("src/auth".to_string()),
+        depth: 2,
+        limit: 20,
+    };
 
-    c.bench_function("impact_file_anchor", |b| {
+    c.bench_function("impact_file_anchor_primary", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
                 let result = engine.explore(file_request.clone()).await.unwrap();
-                assert_eq!(result.status, ImpactStatus::Expanded);
-                assert!(!result.results.is_empty());
-            });
-        });
-    });
-
-    c.bench_function("impact_symbol_anchor_narrow", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let engine = ImpactHorizonEngine::new(&conn);
-                let result = engine.explore(symbol_request.clone()).await.unwrap();
                 assert_eq!(result.status, ImpactStatus::Expanded);
                 assert!(!result.results.is_empty());
             });
@@ -681,6 +678,28 @@ fn bench_impact_horizon(c: &mut Criterion) {
                 let engine = ImpactHorizonEngine::new(&conn);
                 let result = engine.explore(refused_request.clone()).await.unwrap();
                 assert_eq!(result.status, ImpactStatus::Refused);
+                assert!(result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_segment_anchor_empty", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(empty_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Empty);
+                assert!(result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_empty_scoped", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(empty_scoped_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::EmptyScoped);
                 assert!(result.results.is_empty());
             });
         });
