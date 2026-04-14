@@ -845,6 +845,72 @@ fn impact_symbol_anchor_refuses_broad_requests_with_hint_json() {
 }
 
 #[test]
+fn impact_file_line_anchor_returns_empty_with_contextual_guidance_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs:5"]);
+
+    assert_eq!(result["status"], "empty");
+    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
+    assert_eq!(result["hint"]["code"], "context_only");
+    assert_eq!(result["results"], serde_json::json!([]));
+
+    let seed_id = result["resolved_anchor"]["seed_segment_ids"][0]
+        .as_str()
+        .expect("file-line anchor should resolve to a seed segment");
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("empty impact should still surface contextual guidance");
+
+    assert!(!contextual.is_empty());
+    assert_eq!(contextual[0]["file_path"], "src/auth/runtime.rs");
+    assert!(contextual
+        .iter()
+        .all(|candidate| candidate["segment_id"].as_str() != Some(seed_id)));
+}
+
+#[test]
+fn impact_scoped_file_line_anchor_returns_empty_scoped_without_anchor_echo_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(
+        tmp.path(),
+        &[
+            "--from-file",
+            "src/auth/runtime.rs:5",
+            "--scope",
+            "src/auth",
+        ],
+    );
+
+    assert_eq!(result["status"], "empty_scoped");
+    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
+    assert_eq!(result["resolved_anchor"]["scope"], "src/auth");
+    assert_eq!(result["hint"]["code"], "context_only");
+    assert_eq!(result["results"], serde_json::json!([]));
+
+    let seed_id = result["resolved_anchor"]["seed_segment_ids"][0]
+        .as_str()
+        .expect("scoped file-line anchor should resolve to a seed segment");
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("empty-scoped impact should retain contextual guidance");
+
+    assert!(!contextual.is_empty());
+    assert!(contextual.iter().all(|candidate| {
+        candidate["file_path"]
+            .as_str()
+            .map(|path| path.starts_with("src/auth/"))
+            .unwrap_or(false)
+    }));
+    assert!(contextual
+        .iter()
+        .all(|candidate| candidate["segment_id"].as_str() != Some(seed_id)));
+}
+
+#[test]
 fn search_segment_id_round_trips_into_impact_from_segment_json() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
@@ -881,11 +947,19 @@ fn search_segment_id_round_trips_into_impact_from_segment_json() {
         "round-tripped impact should return candidates"
     );
     assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+    assert!(results
+        .iter()
+        .all(|candidate| candidate["segment_id"].as_str() != Some(segment_id)));
     assert!(results[0]["reasons"]
         .as_array()
         .unwrap()
         .iter()
         .any(|reason| reason["from_segment_id"].as_str() == Some(segment_id)));
+    if let Some(contextual) = result["contextual_results"].as_array() {
+        assert!(contextual
+            .iter()
+            .all(|candidate| candidate["segment_id"].as_str() != Some(segment_id)));
+    }
 }
 
 #[test]

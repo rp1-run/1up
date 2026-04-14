@@ -1850,6 +1850,42 @@ mod tests {
         }
     }
 
+    fn sample_unscoped_expanded_impact_result() -> ImpactResultEnvelope {
+        let mut result = sample_impact_result();
+        result.status = ImpactStatus::Expanded;
+        if let Some(anchor) = result.resolved_anchor.as_mut() {
+            anchor.scope = None;
+        }
+        if let Some(hint) = result.hint.as_mut() {
+            hint.suggested_scope = None;
+        }
+        result
+    }
+
+    fn sample_empty_impact_result() -> ImpactResultEnvelope {
+        ImpactResultEnvelope {
+            status: ImpactStatus::Empty,
+            resolved_anchor: Some(ResolvedImpactAnchor {
+                kind: "file_line".to_string(),
+                value: "src/auth/runtime.rs:14".to_string(),
+                line: Some(14),
+                scope: None,
+                seed_segment_ids: vec!["seed-segment-1234567890".to_string()],
+                matched_files: vec!["src/auth/runtime.rs".to_string()],
+            }),
+            results: Vec::new(),
+            contextual_results: None,
+            hint: Some(crate::search::impact::ImpactHint {
+                code: "no_likely_impact".to_string(),
+                message: "No likely-impact candidates were found for the resolved anchor."
+                    .to_string(),
+                suggested_scope: None,
+                suggested_segment_id: None,
+            }),
+            refusal: None,
+        }
+    }
+
     fn sample_progress() -> IndexProgress {
         IndexProgress {
             state: IndexState::Complete,
@@ -1974,6 +2010,17 @@ mod tests {
     }
 
     #[test]
+    fn json_impact_expanded_result_omits_scope_when_unscoped() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_impact_result(&sample_unscoped_expanded_impact_result());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "expanded");
+        assert!(value["resolved_anchor"].get("scope").is_none());
+        assert_eq!(value["hint"]["code"], "inspect_candidate");
+    }
+
+    #[test]
     fn json_impact_refusal_keeps_structured_hint_and_refusal() {
         let formatter = JsonFormatter;
         let rendered = formatter.format_impact_result(&sample_refused_impact_result());
@@ -2031,6 +2078,17 @@ mod tests {
     }
 
     #[test]
+    fn human_impact_empty_result_without_contextual_guidance_reports_empty_state() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_impact_result(&sample_empty_impact_result());
+
+        assert!(rendered.contains("[empty]"));
+        assert!(rendered.contains("No likely-impact candidates found."));
+        assert!(!rendered.contains("Contextual Guidance"));
+        assert!(rendered.contains("Next step [no_likely_impact]"));
+    }
+
+    #[test]
     fn human_impact_refusal_renders_actionable_guidance() {
         let formatter = HumanFormatter;
         let rendered = formatter.format_impact_result(&sample_refused_impact_result());
@@ -2060,6 +2118,16 @@ mod tests {
             "result_reason\t1\tkind=called_by\tsymbol=Config\tfrom_segment=seed-segment-1234567890"
         ));
         assert!(rendered.contains("result_reason\t1\tkind=same_file"));
+    }
+
+    #[test]
+    fn plain_impact_expanded_result_omits_scope_lines_when_unscoped() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_impact_result(&sample_unscoped_expanded_impact_result());
+
+        assert!(rendered.contains("status\texpanded"));
+        assert!(!rendered.contains("anchor_scope\t"));
+        assert!(rendered.contains("hint\tinspect_candidate"));
     }
 
     #[test]

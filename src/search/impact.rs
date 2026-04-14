@@ -1533,6 +1533,14 @@ mod tests {
         assert_eq!(contextual.len(), 1);
         assert_eq!(contextual[0].segment_id, "early");
         assert_eq!(contextual[0].reasons[0].kind, "same_file");
+        assert!(
+            result
+                .results
+                .iter()
+                .chain(contextual.iter())
+                .all(|candidate| candidate.segment_id != "late"),
+            "resolved anchor seed should never echo back as an impact candidate"
+        );
     }
 
     #[tokio::test]
@@ -1723,6 +1731,14 @@ mod tests {
             contextual[1].reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
+        assert!(
+            result
+                .results
+                .iter()
+                .chain(contextual.iter())
+                .all(|candidate| candidate.segment_id != "load-config"),
+            "resolved anchor seed should never echo back as an impact candidate"
+        );
     }
 
     #[tokio::test]
