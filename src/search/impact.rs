@@ -853,9 +853,17 @@ fn finalize_impact_results(
         }
     }
 
+    let primary = rank_impact_candidates(primary, limit);
+    let contextual_limit = limit.saturating_sub(primary.len());
+    let contextual = if contextual_limit == 0 {
+        Vec::new()
+    } else {
+        rank_impact_candidates(contextual, contextual_limit)
+    };
+
     FinalizedImpactResults {
-        primary: rank_impact_candidates(primary, limit),
-        contextual: rank_impact_candidates(contextual, limit),
+        primary,
+        contextual,
     }
 }
 

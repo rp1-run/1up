@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+source "$ROOT_DIR/scripts/lib/impact_fixture.sh"
 OUTPUT_DIR="$ROOT_DIR/target/impact/rollout-approval"
 OUTPUT_PATH=""
 ACCURACY_SUMMARY=""
@@ -41,6 +42,8 @@ validate_accuracy_summary() {
     and (.candidate_commit | type == "string")
     and (.false_positive_reduction_pct | numbers)
     and (.gate.required_reduction_pct | numbers)
+    and (.gate.exact_anchor_regressions_after | numbers)
+    and (.gate.status_contract_failures_after | numbers)
     and (.gate_passed | type == "boolean")
   ' "$path" >/dev/null 2>&1; then
     fail "accuracy summary is missing required rollout fields: $path"
@@ -57,10 +60,47 @@ validate_performance_summary() {
     and (.candidate_commit | type == "string")
     and (.aggregate.p95_regression_pct | numbers)
     and (.gate.max_p95_regression_pct | numbers)
+    and (.cases | type == "array")
+    and ((.cases | length) > 0)
+    and all(
+      .cases[];
+      (.baseline.command_failures | type == "number")
+      and (.baseline.contract_failures | type == "number")
+      and (.candidate.command_failures | type == "number")
+      and (.candidate.contract_failures | type == "number")
+      and (.regression_pct.p95 | numbers)
+      and (.gate.max_p95_regression_pct | numbers)
+    )
     and (.gate_passed | type == "boolean")
   ' "$path" >/dev/null 2>&1; then
     fail "performance summary is missing required rollout fields: $path"
   fi
+}
+
+recompute_accuracy_gate() {
+  local path="$1"
+
+  jq -e '
+    (.false_positive_reduction_pct >= .gate.required_reduction_pct)
+    and (.gate.exact_anchor_regressions_after == 0)
+    and (.gate.status_contract_failures_after == 0)
+  ' "$path" >/dev/null 2>&1
+}
+
+recompute_performance_gate() {
+  local path="$1"
+
+  jq -e '
+    (.cases | length) > 0
+    and all(
+      .cases[];
+      .baseline.command_failures == 0
+      and .baseline.contract_failures == 0
+      and .candidate.command_failures == 0
+      and .candidate.contract_failures == 0
+      and (.regression_pct.p95 <= .gate.max_p95_regression_pct)
+    )
+  ' "$path" >/dev/null 2>&1
 }
 
 collect_unresolved_field_note_blockers() {
@@ -125,6 +165,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+require_cmd git
 require_cmd jq
 
 mkdir -p "$OUTPUT_DIR"
@@ -156,6 +197,20 @@ accuracy_baseline_commit=$(jq -r '.baseline_commit' "$ACCURACY_SUMMARY")
 performance_baseline_commit=$(jq -r '.baseline_commit' "$PERFORMANCE_SUMMARY")
 accuracy_candidate_commit=$(jq -r '.candidate_commit' "$ACCURACY_SUMMARY")
 performance_candidate_commit=$(jq -r '.candidate_commit' "$PERFORMANCE_SUMMARY")
+required_baseline_commit=$(impact_default_baseline_ref "$ROOT_DIR")
+current_head_commit=$(git -C "$ROOT_DIR" rev-parse HEAD)
+
+if recompute_accuracy_gate "$ACCURACY_SUMMARY"; then
+  accuracy_gate_passed=true
+else
+  accuracy_gate_passed=false
+fi
+
+if recompute_performance_gate "$PERFORMANCE_SUMMARY"; then
+  performance_gate_passed=true
+else
+  performance_gate_passed=false
+fi
 
 declare -a blocking_reasons=()
 
@@ -165,8 +220,20 @@ fi
 if [[ "$performance_gate_passed" != "true" ]]; then
   blocking_reasons+=("impact-bench gate failed")
 fi
+if [[ "$accuracy_baseline_commit" != "$required_baseline_commit" ]]; then
+  blocking_reasons+=("impact-eval baseline commit does not match the required requirements baseline")
+fi
+if [[ "$performance_baseline_commit" != "$required_baseline_commit" ]]; then
+  blocking_reasons+=("impact-bench baseline commit does not match the required requirements baseline")
+fi
 if [[ "$accuracy_baseline_commit" != "$performance_baseline_commit" ]]; then
   blocking_reasons+=("impact-eval and impact-bench baseline commits do not match")
+fi
+if [[ "$accuracy_candidate_commit" != "$current_head_commit" ]]; then
+  blocking_reasons+=("impact-eval candidate commit does not match current HEAD")
+fi
+if [[ "$performance_candidate_commit" != "$current_head_commit" ]]; then
+  blocking_reasons+=("impact-bench candidate commit does not match current HEAD")
 fi
 if [[ "$accuracy_candidate_commit" != "$performance_candidate_commit" ]]; then
   blocking_reasons+=("impact-eval and impact-bench candidate commits do not match")
@@ -198,6 +265,7 @@ jq -n \
   --arg accuracy_summary_path "$ACCURACY_SUMMARY" \
   --arg performance_summary_path "$PERFORMANCE_SUMMARY" \
   --arg field_notes_path "$FIELD_NOTES_PATH" \
+  --arg required_baseline_commit "$required_baseline_commit" \
   --argjson gate_passed "$(if [[ "$gate_passed" == "true" ]]; then printf 'true'; else printf 'false'; fi)" \
   --argjson blocking_reasons "$blocking_reasons_json" \
   --argjson field_note_blockers "$field_note_blockers_json" \
@@ -210,7 +278,8 @@ jq -n \
     output_path: $output_path,
     requirements: {
       both_gates_required: true,
-      required_entry_points: ["impact-eval", "impact-bench"]
+      required_entry_points: ["impact-eval", "impact-bench"],
+      required_baseline_commit: $required_baseline_commit
     },
     accuracy: {
       summary_path: $accuracy_summary_path,

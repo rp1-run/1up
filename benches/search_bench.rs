@@ -644,6 +644,14 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+    let symbol_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "load_auth_config".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
     let empty_request = ImpactRequest {
         anchor: ImpactAnchor::Segment {
             id: "auth-runtime-parse".to_string(),
@@ -660,6 +668,28 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+
+    c.bench_function("impact_file_anchor", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(file_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_narrow", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(symbol_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+            });
+        });
+    });
 
     c.bench_function("impact_file_anchor_primary", |b| {
         b.iter(|| {

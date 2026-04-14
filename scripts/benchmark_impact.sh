@@ -383,9 +383,12 @@ jq -s \
               gate: {
                 max_p95_regression_pct: $max_p95_regression_pct,
                 p95_within_threshold: ($p95_regression_pct <= $max_p95_regression_pct),
+                baseline_contract_passed: ($baseline.command_failures == 0 and $baseline.contract_failures == 0),
                 candidate_contract_passed: ($candidate.command_failures == 0 and $candidate.contract_failures == 0),
                 gate_passed: (
-                  $candidate.command_failures == 0
+                  $baseline.command_failures == 0
+                  and $baseline.contract_failures == 0
+                  and $candidate.command_failures == 0
                   and $candidate.contract_failures == 0
                   and $p95_regression_pct <= $max_p95_regression_pct
                 )
@@ -432,3 +435,7 @@ aggregate_p95=$(jq -r '.aggregate.p95_regression_pct' "$SUMMARY_PATH")
 log "wrote summary to $SUMMARY_PATH"
 log "performance gate: ${gate_passed} (aggregate p95 regression ${aggregate_p95}%)"
 printf '%s\n' "$SUMMARY_PATH"
+
+if [[ "$gate_passed" != "true" ]]; then
+  exit 1
+fi

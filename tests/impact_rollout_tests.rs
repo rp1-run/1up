@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const REQUIREMENTS_BASELINE_COMMIT: &str = "310097091d6dc3666563ee4ca4b8755a3e6e2934";
+
 fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -23,38 +25,95 @@ fn run_rollout_approval(args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-fn write_accuracy_summary(path: &Path, gate_passed: bool) {
+fn current_head_commit() -> String {
+    String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root())
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+struct AccuracySummarySpec<'a> {
+    baseline_commit: &'a str,
+    candidate_commit: &'a str,
+    false_positive_reduction_pct: u64,
+    required_reduction_pct: u64,
+    exact_anchor_regressions_after: u64,
+    status_contract_failures_after: u64,
+    gate_passed: bool,
+}
+
+fn write_accuracy_summary(path: &Path, spec: &AccuracySummarySpec<'_>) {
     fs::write(
         path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "baseline_commit": "baseline123",
-            "candidate_commit": "candidate456",
-            "false_positive_reduction_pct": 75,
+            "baseline_commit": spec.baseline_commit,
+            "candidate_commit": spec.candidate_commit,
+            "false_positive_reduction_pct": spec.false_positive_reduction_pct,
             "gate": {
-                "required_reduction_pct": 50,
-                "gate_passed": gate_passed
+                "required_reduction_pct": spec.required_reduction_pct,
+                "exact_anchor_regressions_after": spec.exact_anchor_regressions_after,
+                "status_contract_failures_after": spec.status_contract_failures_after,
+                "gate_passed": spec.gate_passed
             },
-            "gate_passed": gate_passed
+            "gate_passed": spec.gate_passed
         }))
         .unwrap(),
     )
     .unwrap();
 }
 
-fn write_performance_summary(path: &Path, gate_passed: bool) {
+struct PerformanceSummarySpec<'a> {
+    baseline_commit: &'a str,
+    candidate_commit: &'a str,
+    baseline_command_failures: u64,
+    baseline_contract_failures: u64,
+    candidate_command_failures: u64,
+    candidate_contract_failures: u64,
+    p95_regression_pct: f64,
+    max_p95_regression_pct: f64,
+    gate_passed: bool,
+}
+
+fn write_performance_summary(path: &Path, spec: &PerformanceSummarySpec<'_>) {
     fs::write(
         path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "baseline_commit": "baseline123",
-            "candidate_commit": "candidate456",
+            "baseline_commit": spec.baseline_commit,
+            "candidate_commit": spec.candidate_commit,
             "aggregate": {
-                "p95_regression_pct": 12.5
+                "p95_regression_pct": spec.p95_regression_pct
             },
             "gate": {
-                "max_p95_regression_pct": 20,
-                "gate_passed": gate_passed
+                "max_p95_regression_pct": spec.max_p95_regression_pct,
+                "gate_passed": spec.gate_passed
             },
-            "gate_passed": gate_passed
+            "gate_passed": spec.gate_passed,
+            "cases": [{
+                "name": "rollout-case",
+                "baseline": {
+                    "command_failures": spec.baseline_command_failures,
+                    "contract_failures": spec.baseline_contract_failures
+                },
+                "candidate": {
+                    "command_failures": spec.candidate_command_failures,
+                    "contract_failures": spec.candidate_contract_failures
+                },
+                "regression_pct": {
+                    "p95": spec.p95_regression_pct
+                },
+                "gate": {
+                    "max_p95_regression_pct": spec.max_p95_regression_pct
+                }
+            }]
         }))
         .unwrap(),
     )
@@ -81,8 +140,33 @@ fn impact_rollout_approval_requires_both_gate_summaries_to_pass() {
     let performance_summary = tempdir.path().join("impact-bench.json");
     let field_notes = tempdir.path().join("field-notes.md");
     let output_path = tempdir.path().join("rollout-approval.json");
-    write_accuracy_summary(&accuracy_summary, true);
-    write_performance_summary(&performance_summary, true);
+    let head_commit = current_head_commit();
+    write_accuracy_summary(
+        &accuracy_summary,
+        &AccuracySummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            false_positive_reduction_pct: 75,
+            required_reduction_pct: 50,
+            exact_anchor_regressions_after: 0,
+            status_contract_failures_after: 0,
+            gate_passed: true,
+        },
+    );
+    write_performance_summary(
+        &performance_summary,
+        &PerformanceSummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            baseline_command_failures: 0,
+            baseline_contract_failures: 0,
+            candidate_command_failures: 0,
+            candidate_contract_failures: 0,
+            p95_regression_pct: 12.5,
+            max_p95_regression_pct: 20.0,
+            gate_passed: true,
+        },
+    );
     write_field_notes(
         &field_notes,
         &["baseline pin and blocker ingestion verified"],
@@ -110,6 +194,10 @@ fn impact_rollout_approval_requires_both_gate_summaries_to_pass() {
     assert_eq!(summary["status"], "approved");
     assert_eq!(summary["gate_passed"], true);
     assert_eq!(summary["requirements"]["both_gates_required"], true);
+    assert_eq!(
+        summary["requirements"]["required_baseline_commit"],
+        REQUIREMENTS_BASELINE_COMMIT
+    );
     assert_eq!(
         summary["requirements"]["required_entry_points"],
         serde_json::json!(["impact-eval", "impact-bench"])
@@ -148,8 +236,33 @@ fn impact_rollout_approval_blocks_when_any_gate_fails() {
     let accuracy_summary = tempdir.path().join("impact-eval.json");
     let performance_summary = tempdir.path().join("impact-bench.json");
     let output_path = tempdir.path().join("rollout-approval.json");
-    write_accuracy_summary(&accuracy_summary, true);
-    write_performance_summary(&performance_summary, false);
+    let head_commit = current_head_commit();
+    write_accuracy_summary(
+        &accuracy_summary,
+        &AccuracySummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            false_positive_reduction_pct: 75,
+            required_reduction_pct: 50,
+            exact_anchor_regressions_after: 0,
+            status_contract_failures_after: 0,
+            gate_passed: true,
+        },
+    );
+    write_performance_summary(
+        &performance_summary,
+        &PerformanceSummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            baseline_command_failures: 0,
+            baseline_contract_failures: 0,
+            candidate_command_failures: 0,
+            candidate_contract_failures: 1,
+            p95_regression_pct: 12.5,
+            max_p95_regression_pct: 20.0,
+            gate_passed: false,
+        },
+    );
 
     let output = run_rollout_approval(&[
         "--accuracy-summary",
@@ -182,8 +295,33 @@ fn impact_rollout_approval_blocks_when_field_notes_list_unresolved_blockers() {
     let performance_summary = tempdir.path().join("impact-bench.json");
     let field_notes = tempdir.path().join("field-notes.md");
     let output_path = tempdir.path().join("rollout-approval.json");
-    write_accuracy_summary(&accuracy_summary, true);
-    write_performance_summary(&performance_summary, true);
+    let head_commit = current_head_commit();
+    write_accuracy_summary(
+        &accuracy_summary,
+        &AccuracySummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            false_positive_reduction_pct: 75,
+            required_reduction_pct: 50,
+            exact_anchor_regressions_after: 0,
+            status_contract_failures_after: 0,
+            gate_passed: true,
+        },
+    );
+    write_performance_summary(
+        &performance_summary,
+        &PerformanceSummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            baseline_command_failures: 0,
+            baseline_contract_failures: 0,
+            candidate_command_failures: 0,
+            candidate_contract_failures: 0,
+            p95_regression_pct: 12.5,
+            max_p95_regression_pct: 20.0,
+            gate_passed: true,
+        },
+    );
     write_field_notes(
         &field_notes,
         &["baseline pin landed"],
@@ -220,5 +358,121 @@ fn impact_rollout_approval_blocks_when_field_notes_list_unresolved_blockers() {
         serde_json::json!([
             "field-notes unresolved blocker: refresh the feature verification artifact"
         ])
+    );
+}
+
+#[test]
+fn impact_rollout_approval_blocks_when_candidate_commit_is_not_head() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let accuracy_summary = tempdir.path().join("impact-eval.json");
+    let performance_summary = tempdir.path().join("impact-bench.json");
+    let output_path = tempdir.path().join("rollout-approval.json");
+    write_accuracy_summary(
+        &accuracy_summary,
+        &AccuracySummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: "not-head",
+            false_positive_reduction_pct: 75,
+            required_reduction_pct: 50,
+            exact_anchor_regressions_after: 0,
+            status_contract_failures_after: 0,
+            gate_passed: true,
+        },
+    );
+    write_performance_summary(
+        &performance_summary,
+        &PerformanceSummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: "not-head",
+            baseline_command_failures: 0,
+            baseline_contract_failures: 0,
+            candidate_command_failures: 0,
+            candidate_contract_failures: 0,
+            p95_regression_pct: 12.5,
+            max_p95_regression_pct: 20.0,
+            gate_passed: true,
+        },
+    );
+
+    let output = run_rollout_approval(&[
+        "--accuracy-summary",
+        accuracy_summary.to_str().unwrap(),
+        "--performance-summary",
+        performance_summary.to_str().unwrap(),
+        "--output",
+        output_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "rollout approval unexpectedly passed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(summary["status"], "blocked");
+    assert_eq!(
+        summary["blocking_reasons"],
+        serde_json::json!([
+            "impact-eval candidate commit does not match current HEAD",
+            "impact-bench candidate commit does not match current HEAD"
+        ])
+    );
+}
+
+#[test]
+fn impact_rollout_approval_recomputes_performance_gate_from_case_details() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let accuracy_summary = tempdir.path().join("impact-eval.json");
+    let performance_summary = tempdir.path().join("impact-bench.json");
+    let output_path = tempdir.path().join("rollout-approval.json");
+    let head_commit = current_head_commit();
+    write_accuracy_summary(
+        &accuracy_summary,
+        &AccuracySummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            false_positive_reduction_pct: 75,
+            required_reduction_pct: 50,
+            exact_anchor_regressions_after: 0,
+            status_contract_failures_after: 0,
+            gate_passed: true,
+        },
+    );
+    write_performance_summary(
+        &performance_summary,
+        &PerformanceSummarySpec {
+            baseline_commit: REQUIREMENTS_BASELINE_COMMIT,
+            candidate_commit: &head_commit,
+            baseline_command_failures: 1,
+            baseline_contract_failures: 0,
+            candidate_command_failures: 0,
+            candidate_contract_failures: 0,
+            p95_regression_pct: 12.5,
+            max_p95_regression_pct: 20.0,
+            gate_passed: true,
+        },
+    );
+
+    let output = run_rollout_approval(&[
+        "--accuracy-summary",
+        accuracy_summary.to_str().unwrap(),
+        "--performance-summary",
+        performance_summary.to_str().unwrap(),
+        "--output",
+        output_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "rollout approval unexpectedly passed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(summary["status"], "blocked");
+    assert_eq!(
+        summary["blocking_reasons"],
+        serde_json::json!(["impact-bench gate failed"])
     );
 }

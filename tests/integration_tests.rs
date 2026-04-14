@@ -814,6 +814,28 @@ fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
 }
 
 #[test]
+fn impact_file_anchor_limit_caps_total_primary_and_contextual_results_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(
+        tmp.path(),
+        &["--from-file", "src/auth/runtime.rs", "--limit", "1"],
+    );
+
+    assert_eq!(result["status"], "expanded");
+
+    let results = result["results"].as_array().unwrap();
+    let contextual_len = result["contextual_results"]
+        .as_array()
+        .map(|results| results.len())
+        .unwrap_or(0);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.len() + contextual_len, 1);
+}
+
+#[test]
 fn impact_file_anchor_scope_refuses_out_of_scope_seed_json() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);

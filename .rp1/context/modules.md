@@ -12,7 +12,7 @@
 | `src/shared` | Shared types, constants, config, errors, reminder/update helpers, and cross-layer contracts. | `src/shared/types.rs`, `src/shared/constants.rs`, `src/shared/update.rs` |
 | `tests` | Black-box CLI and integration coverage. | `tests/integration_tests.rs`, `tests/cli_tests.rs` |
 | `benches` | Criterion non-regression and latency guardrails, including impact outcome coverage. | `benches/search_bench.rs` |
-| `scripts` | Trust/performance gate automation plus release and security helpers. | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/lib/impact_fixture.sh` |
+| `scripts` | Trust/performance gate automation plus release and security helpers, including pinned-baseline rollout approval. | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/approve_impact_rollout.sh`, `scripts/lib/impact_fixture.sh` |
 | `evals` | Search-quality evaluation suites and support scripts. | includes `evals/suites/1up-search/search-bench.ts` |
 
 ## Key Components
@@ -29,7 +29,7 @@
 | `Relations` | `src/storage/relations.rs` | Persist and query unresolved relation rows. | `src/storage/queries.rs`, `src/shared/symbols.rs` |
 | `Segments` | `src/storage/segments.rs` | Transactional segment replacement and symbol/relation synchronization. | `src/storage/queries.rs`, `src/storage/relations.rs`, `src/shared/types.rs` |
 | `SearchService` | `src/daemon/search_service.rs` | Secure daemon-backed search IPC with optional version metadata. | `src/daemon/ipc.rs`, `src/shared/constants.rs`, `src/shared/types.rs` |
-| `ImpactEvidenceScripts` | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh` | Produce baseline-versus-candidate trust and latency summaries for rollout gating. | `scripts/lib/impact_fixture.sh`, `justfile`, candidate/baseline binaries |
+| `ImpactEvidenceScripts` | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/approve_impact_rollout.sh` | Produce baseline-versus-candidate trust and latency summaries, then approve rollout only when both gates pass against the pinned April 14, 2026 requirements baseline and field notes contain no unresolved blockers. | `scripts/lib/impact_fixture.sh`, `justfile`, candidate/baseline binaries |
 | `SharedTypes` | `src/shared/types.rs` | Cross-layer result, config, progress, and daemon status contracts. | `src/shared/constants.rs`, `serde`, `chrono` |
 | `IntegrationTests` | `tests/integration_tests.rs` | Black-box regression coverage for CLI, impact, and search stability. | binary + real local fixtures |
 | `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery plus expanded, refused, empty, and empty-scoped impact paths. | `criterion`, search + storage engines |
@@ -89,4 +89,4 @@
 - `src/search` gained `src/search/impact.rs` for bounded advisory expansion with primary/contextual bucketing and explicit empty outcomes.
 - `src/storage` gained `segment_relations` support and schema v8.
 - `src/shared` extended `SearchResult` with additive optional `segment_id`.
-- `tests`, `benches`, and `scripts` now encode search-to-impact stability plus trust and latency rollout gates.
+- `tests`, `benches`, and `scripts` now encode search-to-impact stability plus trust and latency rollout gates, with `impact-rollout-approve` binding both summaries to the pinned April 14, 2026 baseline and current HEAD while honoring unresolved field-note blockers.
