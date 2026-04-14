@@ -17,10 +17,10 @@
 
 | File | Lines | Load For |
 |---|---:|---|
-| [concept_map.md](concept_map.md) | ~73 | Terminology, types, domain relationships |
-| [architecture.md](architecture.md) | ~114 | Topology, data flow, storage, daemon boundaries |
-| [interaction-model.md](interaction-model.md) | ~110 | CLI states, output contracts, follow-up flows |
-| [modules.md](modules.md) | ~90 | Component ownership, dependencies, feature deltas |
+| [concept_map.md](concept_map.md) | ~80 | Terminology, types, domain relationships, impact outcome vocabulary |
+| [architecture.md](architecture.md) | ~120 | Topology, data flow, storage, daemon boundaries, impact outcome flow |
+| [interaction-model.md](interaction-model.md) | ~120 | CLI states, output contracts, follow-up flows, machine-readable impact semantics |
+| [modules.md](modules.md) | ~100 | Component ownership, dependencies, feature deltas, rollout evidence entry points |
 | [patterns.md](patterns.md) | ~74 | Coding, storage, error, output, and test idioms |
 
 ## Task-Based Loading
@@ -31,15 +31,15 @@
 | Bug investigation | `architecture.md`, `modules.md` |
 | Feature work | `modules.md`, `patterns.md` |
 | Search and ranking changes | `concept_map.md`, `architecture.md`, `interaction-model.md` |
-| Impact or relation work | `concept_map.md`, `architecture.md`, `modules.md`, `interaction-model.md` |
+| Impact or relation work | `concept_map.md`, `architecture.md`, `modules.md`, `interaction-model.md`, `patterns.md` |
 | Strategic or system-wide analysis | All files |
 
 ## Recent Learnings
 
-- `impact-horizon` added an explicit local-only `1up impact` path instead of extending daemon IPC.
-- Search results can now expose additive machine-readable `segment_id` handles for exact impact follow-up.
+- `impact` now separates relation-backed likely-impact `results` from heuristic-only `contextual_results`, and empty expansions return explicit `empty` or `empty_scoped` states instead of anchor-echo fallbacks.
+- Search results expose additive machine-readable `segment_id` handles for exact impact follow-up without changing discovery ranking.
 - Schema v8 introduces persisted `segment_relations`, with bounded expansion and refusal semantics to protect interactivity.
-- Benchmarks and black-box tests now guard against regressions to core search behavior while impact support evolves.
+- Rollout evidence now has dedicated entry points: `just impact-eval` for trust gating and `just impact-bench` for latency gating.
 
 ## How To Load
 

@@ -13,6 +13,15 @@ bench:
     cargo build --release
     @cd evals && ONEUP_BENCH_BIN=../target/release/1up bun run bench
 
+impact-eval *flags:
+    ./scripts/evaluate_impact_trust.sh {{flags}}
+
+impact-bench *flags:
+    ./scripts/benchmark_impact.sh {{flags}}
+
+impact-rollout-approve *flags:
+    ./scripts/approve_impact_rollout.sh {{flags}}
+
 bench-parallel:
     ./scripts/benchmark_parallel_indexing.sh
 

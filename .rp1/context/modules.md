@@ -5,14 +5,14 @@
 | Module | Purpose | Key Files |
 |---|---|---|
 | `src/cli` | Command surface, output formatting, and machine-readable follow-up UX. | `src/cli/mod.rs`, `src/cli/impact.rs`, `src/cli/output.rs` |
-| `src/search` | Hybrid retrieval, symbol/context/structural search, and bounded advisory impact expansion. | `src/search/hybrid.rs`, `src/search/impact.rs`, `src/search/mod.rs` |
+| `src/search` | Hybrid retrieval, symbol/context/structural search, and bounded advisory impact expansion with primary/contextual trust bucketing. | `src/search/hybrid.rs`, `src/search/impact.rs`, `src/search/mod.rs` |
 | `src/indexer` | Incremental scan/parse/embed pipeline that assigns deterministic segment IDs. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs` |
 | `src/storage` | libSQL schema, segment storage, symbol/relation tables, and transactional maintenance. | `src/storage/schema.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`, `src/storage/queries.rs` |
 | `src/daemon` | Background search/watch service with secure IPC and version-aware responses. | `src/daemon/search_service.rs`, `src/daemon/worker.rs`, `src/daemon/registry.rs` |
 | `src/shared` | Shared types, constants, config, errors, reminder/update helpers, and cross-layer contracts. | `src/shared/types.rs`, `src/shared/constants.rs`, `src/shared/update.rs` |
 | `tests` | Black-box CLI and integration coverage. | `tests/integration_tests.rs`, `tests/cli_tests.rs` |
-| `benches` | Criterion non-regression and latency guardrails. | `benches/search_bench.rs` |
-| `scripts` | Benchmark, release, and security automation helpers. | representative helpers only; unchanged by this feature |
+| `benches` | Criterion non-regression and latency guardrails, including impact outcome coverage. | `benches/search_bench.rs` |
+| `scripts` | Trust/performance gate automation plus release and security helpers, including pinned-baseline rollout approval. | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/approve_impact_rollout.sh`, `scripts/lib/impact_fixture.sh` |
 | `evals` | Search-quality evaluation suites and support scripts. | includes `evals/suites/1up-search/search-bench.ts` |
 
 ## Key Components
@@ -21,17 +21,18 @@
 |---|---|---|---|
 | `Cli` | `src/cli/mod.rs` | Top-level clap dispatch and default output-format resolution. | `src/cli/impact.rs`, `src/shared/types.rs` |
 | `ImpactArgs` | `src/cli/impact.rs` | Exact-anchor CLI for bounded likely-impact exploration. | `src/search/impact.rs`, `src/storage/db.rs`, `src/storage/schema.rs`, `src/shared/config.rs` |
-| `Formatter` | `src/cli/output.rs` | Shared rendering for search, status, update, and impact results. | `src/search/impact.rs`, `src/shared/types.rs`, `src/shared/update.rs` |
+| `Formatter` | `src/cli/output.rs` | Shared rendering for search, status, update, and impact results, including primary/contextual separation and explicit empty states. | `src/search/impact.rs`, `src/shared/types.rs`, `src/shared/update.rs` |
 | `HybridSearchEngine` | `src/search/hybrid.rs` | Candidate-first hybrid search with additive `segment_id` hydration. | `src/search/*`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
-| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded probable-impact expansion with refusal and hint semantics. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs` |
+| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded probable-impact expansion with primary/contextual bucketing, explicit empty outcomes, and refusal/hint semantics. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs` |
 | `Pipeline` | `src/indexer/pipeline.rs` | Convert repository files into deterministic segments and symbol metadata. | `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
 | `Schema` | `src/storage/schema.rs` | Schema init, validation, rebuild, and compatibility gating. | `src/storage/queries.rs`, `src/shared/constants.rs` |
 | `Relations` | `src/storage/relations.rs` | Persist and query unresolved relation rows. | `src/storage/queries.rs`, `src/shared/symbols.rs` |
 | `Segments` | `src/storage/segments.rs` | Transactional segment replacement and symbol/relation synchronization. | `src/storage/queries.rs`, `src/storage/relations.rs`, `src/shared/types.rs` |
 | `SearchService` | `src/daemon/search_service.rs` | Secure daemon-backed search IPC with optional version metadata. | `src/daemon/ipc.rs`, `src/shared/constants.rs`, `src/shared/types.rs` |
+| `ImpactEvidenceScripts` | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/approve_impact_rollout.sh` | Produce baseline-versus-candidate trust and latency summaries, then approve rollout only when both gates pass against the pinned April 14, 2026 requirements baseline and field notes contain no unresolved blockers. | `scripts/lib/impact_fixture.sh`, `justfile`, candidate/baseline binaries |
 | `SharedTypes` | `src/shared/types.rs` | Cross-layer result, config, progress, and daemon status contracts. | `src/shared/constants.rs`, `serde`, `chrono` |
 | `IntegrationTests` | `tests/integration_tests.rs` | Black-box regression coverage for CLI, impact, and search stability. | binary + real local fixtures |
-| `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery and impact paths. | `criterion`, search + storage engines |
+| `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery plus expanded, refused, empty, and empty-scoped impact paths. | `criterion`, search + storage engines |
 
 ## Internal Dependency Chains
 
@@ -56,7 +57,7 @@
 
 - Engines: `HybridSearchEngine`, `SymbolSearchEngine`, `StructuralSearchEngine`, `ImpactHorizonEngine`
 - Result contracts: `SearchResult`, `SymbolResult`, `ContextResult`, `StructuralResult`, `ImpactResultEnvelope`
-- Rule: `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, or `refused` envelopes
+- Rule: `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused` envelopes with additive optional `contextual_results`
 
 ### Storage Boundary
 
@@ -78,13 +79,14 @@
 | Deterministic segment anchors | Indexer, Search, Storage, CLI | Stable segment IDs underpin the `search -> impact` contract. |
 | Transactional relation maintenance | Indexer, Storage, Search | Prevents stale relation rows from distorting impact results. |
 | Ambiguity-aware refusal envelopes | Search, CLI, Tests | Preserves trust and keeps advisory semantics explicit. |
-| Latency guardrails | Search, Tests, Benches | Ensures impact stays additive without regressing core discovery paths. |
+| Trust bucket separation | Search, CLI, Shared | Keeps relation-backed likely impact distinct from heuristic-only contextual guidance and explicit empty outcomes. |
+| Latency guardrails | Search, Tests, Benches, Scripts | Ensures impact stays additive without regressing core discovery paths or rollout-gate measurements. |
 | Version-aware daemon search | Daemon, CLI, Shared | Supports mismatch warnings and safer upgrades without breaking transport. |
 
 ## Feature-Learning Deltas From Impact Horizon
 
 - `src/cli` gained a first-class `impact` command surface and formatter support for impact envelopes.
-- `src/search` gained `src/search/impact.rs` for bounded advisory expansion.
+- `src/search` gained `src/search/impact.rs` for bounded advisory expansion with primary/contextual bucketing and explicit empty outcomes.
 - `src/storage` gained `segment_relations` support and schema v8.
 - `src/shared` extended `SearchResult` with additive optional `segment_id`.
-- `tests` and `benches` now encode search-to-impact stability and interactive-latency expectations.
+- `tests`, `benches`, and `scripts` now encode search-to-impact stability plus trust and latency rollout gates, with `impact-rollout-approve` binding both summaries to the pinned April 14, 2026 baseline and current HEAD while honoring unresolved field-note blockers.

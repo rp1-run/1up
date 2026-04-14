@@ -15,7 +15,7 @@
 |---|---|---|
 | Developer | Find relevant code, escalate from a concrete anchor, recover from ambiguity with guidance. | Discovery CLI, Impact CLI, human output |
 | AI agent / host tool | Consume stable search results, capture `segment_id`, drive deterministic search-to-impact loops. | Plain output, JSON output, reminder surface |
-| Script / automation | Parse stable stdout contracts and distinguish `expanded`, `expanded_scoped`, and `refused` outcomes. | Plain output, JSON output |
+| Script / automation | Parse stable stdout contracts and distinguish `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, and `refused` outcomes. | Plain output, JSON output |
 | Background daemon | Keep the index warm and serve discovery-oriented search requests. | Daemon process, status surface, search IPC |
 
 ## Surfaces
@@ -36,6 +36,8 @@
 - Role: bounded probable-impact exploration from a known anchor
 - Guarantees:
   - exactly one anchor is required
+  - relation-backed likely impact stays in primary `results`; heuristic-only suggestions stay in `contextual_results`
+  - no-primary cases return explicit `empty` or `empty_scoped` states instead of anchor echoes
   - output is advisory, not exact dependency truth
   - broad symbol requests are refused with narrowing guidance
 
@@ -61,10 +63,12 @@
 |---|---|---|
 | `ImpactExpanded` | Anchor resolved and bounded candidates were returned. | `status = expanded`, resolved anchor block, ranked results |
 | `ImpactExpandedScoped` | Expansion happened under explicit or implied narrowing. | `status = expanded_scoped`, scope-aware resolved anchor |
+| `ImpactEmptyScoped` | Anchor resolved under scope, but no relation-backed likely-impact candidates survived in that scope. | `status = empty_scoped`, resolved anchor block, optional contextual guidance, no refusal |
 | `ImpactRefused` | Request was too broad or too ambiguous to expand safely. | `status = refused`, refusal reason, hint code, suggested scope or segment |
 | `ImpactEmpty` | Anchor resolved but no likely-impact candidates were found. | zero-result impact envelope, no refusal |
 | `ImpactAnchorValidationError` | User supplied zero or multiple anchors. | exact-one-anchor error mentioning accepted flags |
 | `ImpactIndexUnavailable` | Local index is missing or stale for the command contract. | explicit guidance to run `1up reindex` |
+| `ImpactContextualGuidance` | Lower-confidence same-file or test-only suggestions that support follow-up but are not primary likely impact. | `contextual_results` in JSON, `context_result*` lines in plain, `Contextual Guidance` section in human output |
 | `SearchResultWithFollowUpHandle` | Search hit is backed by an indexed segment and can feed `impact`. | `segment_id` in plain/json; omitted from concise human search output |
 
 ## Feedback Loops
@@ -99,12 +103,14 @@
 | Surface | Human | Plain | JSON |
 |---|---|---|---|
 | Search | Concise previews, no full `segment_id` dump | Line-oriented results, optional `segment=<id>` | Full structured `SearchResult`, optional `segment_id` |
-| Impact | Labeled narrative with resolved anchor, numbered candidates, and next-step prose | Parse-stable fields including hints and reason lines | Full `ImpactResultEnvelope` with status, anchor, results, hints, refusal |
+| Impact | Labeled narrative with resolved anchor, likely-impact section, optional `Contextual Guidance`, and next-step prose | Parse-stable `result*`, `context_result*`, `hint`, and `refusal` lines | Full `ImpactResultEnvelope` with `status`, `resolved_anchor`, `results`, additive optional `contextual_results`, `hint`, and `refusal` |
 | Status / lifecycle | Default mode | Available when requested | Available when requested |
 
 ## Cross-Surface Deltas
 
 - Search is ranking-oriented discovery; impact is bounded, anchor-driven, and advisory.
 - Search may expose `segment_id` only as an additive machine follow-up handle.
+- Impact separates relation-backed likely impact from lower-confidence contextual guidance instead of mixing them into one ranked list.
+- Empty impact outcomes are explicit machine-readable states, not padded success results.
 - Human search output stays glanceable; human impact output intentionally includes more orientation because the user has already opted into deeper follow-up work.
 - Impact does not depend on daemon IPC even though daemon-backed discovery remains the default warm-search path.

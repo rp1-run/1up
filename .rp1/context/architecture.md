@@ -2,7 +2,7 @@
 
 ## Summary
 
-1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact-horizon` feature adds a separate local-only read path for bounded advisory impact exploration, plus relation-backed storage and an additive `search -> segment_id -> impact` handoff.
+1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact-horizon` feature adds a separate local-only read path for bounded advisory impact exploration, relation-backed storage, a primary-versus-contextual trust split, explicit empty outcomes, and an additive `search -> segment_id -> impact` handoff.
 
 ## Key Architecture Patterns
 
@@ -13,9 +13,10 @@
 | Candidate-first retrieval | Search ranks lightweight vector, FTS, and exact-first symbol candidates before hydrating full segment data. | `src/search/hybrid.rs`, `src/storage/queries.rs` |
 | Local-only advisory impact path | `1up impact` reads the current index directly and avoids daemon IPC so discovery behavior remains unchanged. | `src/cli/impact.rs`, `src/search/impact.rs` |
 | Relation-backed expansion | Unresolved relation rows are persisted at write time and resolved against current definitions only for bounded seed sets. | `src/storage/relations.rs`, `src/search/impact.rs` |
+| Trust-bucketed impact results | Relation-backed candidates stay in primary `results`; same-file and test-only observations move to `contextual_results`. | `src/search/impact.rs`, `src/cli/output.rs` |
 | Additive search handoff | Search results expose optional `segment_id` values for exact impact follow-up without changing ranking. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
 | Schema-gated local state | Schema v8 requires `segment_relations` and fails stale indexes closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
-| Interactive guardrails | Benchmarks and black-box tests encode latency and search-stability expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs` |
+| Interactive guardrails | Benchmarks, black-box tests, and trust/perf scripts encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh` |
 
 ## Layers
 
@@ -50,8 +51,9 @@
 1. CLI requires exactly one anchor: file, symbol, or segment.
 2. `impact` opens the current index read-only and requires schema compatibility.
 3. Anchor resolution either yields bounded seed segments or a refusal envelope with hints.
-4. Expansion traverses `segment_relations` plus same-file and test heuristics.
-5. Formatter renders `expanded`, `expanded_scoped`, or `refused` output.
+4. Expansion traverses `segment_relations` plus same-file and test heuristics, then separates observations into primary likely impact and contextual guidance buckets.
+5. Outcome selection returns `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused`, and empty outcomes do not echo the anchor as a synthetic result.
+6. Formatter and rollout-evidence surfaces render and validate primary versus contextual output separately.
 
 ### Search-to-Impact Handoff
 
@@ -110,5 +112,6 @@ graph TB
 
 - Added a separate local-only `impact` command path instead of extending daemon search.
 - Added `segment_relations` and schema v8 to support bounded relation-backed expansion.
+- Added trust-bucketed impact envelopes with explicit `empty` and `empty_scoped` outcomes plus additive `contextual_results`.
 - Added additive `segment_id` exposure on machine-readable search results for exact follow-up.
-- Added benchmark and black-box test guardrails so the new workflow stays interactive and does not perturb core search behavior.
+- Added dedicated trust and performance gate entry points through `just impact-eval` and `just impact-bench`.
