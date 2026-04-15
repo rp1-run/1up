@@ -2,20 +2,20 @@
 
 ## Summary
 
-1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact` workflow remains a separate local-only read path for bounded advisory exploration, and the impact-fixes work upgrades how relation evidence is stored and promoted. `segment_relations` now persists raw, canonical, lookup-tail, qualifier-fingerprint, and normalized `edge_identity_kind` evidence behind schema v10, while `ImpactHorizonEngine` derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, and requires corroborating structural signals before ambiguous or low-signal matches can reach primary `results`.
+1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact` workflow remains a separate local-only read path for bounded advisory exploration. `segment_relations` persists raw, canonical, lookup-tail, qualifier-fingerprint, and normalized `edge_identity_kind` evidence, while `ImpactHorizonEngine` derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, and requires corroborating structural signals before ambiguous or low-signal matches can reach primary `results`. The indexing path is tuned with connection-level PRAGMAs, an `indexed_files` manifest for metadata-based file skipping, and batched multi-value writes, all behind schema v11.
 
 ## Key Architecture Patterns
 
 | Pattern | Meaning | Evidence |
 |---|---|---|
 | Layered two-process model | CLI and daemon share local state through the project index and status files, not in-process runtime state. | `src/cli/mod.rs`, `src/daemon/search_service.rs` |
-| Staged single-writer indexing | Parse work can fan out, but persisted segment, symbol, vector, and relation mutations converge through transactional storage helpers. | `src/storage/segments.rs`, `src/storage/schema.rs` |
+| Staged single-writer indexing | Parse work can fan out, but persisted segment, symbol, vector, relation, and manifest mutations converge through batched multi-value INSERTs in the transactional file-batch seam. | `src/storage/segments.rs`, `src/storage/schema.rs` |
 | Candidate-first retrieval | Search ranks lightweight vector, FTS, and exact-first symbol candidates before hydrating full segment data. | `src/search/hybrid.rs`, `src/storage/queries.rs` |
 | Local-only advisory impact path | `1up impact` reads the current index directly and avoids daemon IPC so discovery behavior remains unchanged. | `src/cli/impact.rs`, `src/search/impact.rs` |
 | Descriptor-backed relation resolution | Unresolved relation rows persist canonical, lookup-tail, qualifier, and edge-identity evidence at write time, then resolve bounded definition candidates through owner-aware shortlisting and corroboration gating only for active seeds. | `src/storage/relations.rs`, `src/search/impact.rs` |
 | Trust-bucketed impact results | Confident relation-backed candidates stay in primary `results`; ambiguous, low-signal, same-file, and test-only observations move to `contextual_results` or explicit empty outcomes. | `src/search/impact.rs`, `src/cli/output.rs` |
 | Additive search handoff | Search results expose optional `segment_id` values for exact impact follow-up without changing ranking. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
-| Schema-gated local state | Schema v10 requires lookup-target, qualifier, and `edge_identity_kind` columns on `segment_relations` and fails stale indexes closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
+| Schema-gated local state | Schema v11 requires `indexed_files` table and lookup-target, qualifier, and `edge_identity_kind` columns on `segment_relations`; stale indexes fail closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
 | Interactive guardrails | Benchmarks, black-box tests, and trust/perf scripts encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh` |
 
 ## Layers
@@ -33,10 +33,18 @@
 
 ### Index Build
 
-1. CLI or daemon resolves project-local DB/config paths.
-2. Indexer scans files and parses them into segments.
-3. Storage writes segments, vectors, canonical symbols, and relation descriptors containing raw, canonical, lookup-tail, qualifier, and `edge_identity_kind` fields.
-4. Schema validation ensures later reads only proceed against schema v10 with the required lookup-target, qualifier, and edge-identity columns.
+1. CLI or daemon resolves project-local DB/config paths and opens a tuned connection (`connect_tuned`) that applies WAL, synchronous=NORMAL, cache_size, mmap_size, and temp_store PRAGMAs.
+2. Callers capture pre-pipeline setup timing (`SetupTimings`) for DB preparation and model loading so `total_ms` reflects end-to-end wall-clock time.
+3. Indexer scans files, enriches them with filesystem metadata (size, mtime), and compares against the `indexed_files` manifest to skip metadata-unchanged files before content reads. Files that pass the metadata prefilter still go through content-hash comparison as the correctness backstop.
+4. Storage writes segments, vectors, canonical symbols, relation descriptors, and `indexed_files` manifest rows through chunked multi-value INSERTs within the existing transactional seam.
+5. Schema validation ensures later reads only proceed against schema v11 with the required `indexed_files` table and relation evidence columns.
+
+### Daemon-Backed Refresh And Scope Fallback
+
+1. Daemon worker opens tuned connections and tracks per-project `ProjectRunState` with `pending_fallback_reason` for scope promotions caused by ambiguous paths or unscoped errors.
+2. When a scoped refresh promotes to full, the daemon records the promotion reason and passes it through to the pipeline as `daemon_fallback_reason`.
+3. `IndexProgress` persists optional `scope` (requested vs executed scope, changed-path count, fallback reason) and `prefilter` (discovered, metadata-skipped, content-read, deleted) counters additively alongside existing fields.
+4. Human, plain, and JSON formatters render the new scope and prefilter fields without breaking existing output contracts.
 
 ### Daemon-Backed Search
 
@@ -69,8 +77,10 @@
 | Global runtime state | `dirs::data_dir()/1up` | Registry, PID/socket files, cache, models, update metadata. |
 | Project-local state | `<project>/.1up/` | `project_id`, `index.db`, `index_status.json`, `daemon_status.json`. |
 | Search persistence | `segments`, `segment_vectors`, `segment_symbols` | Discovery retrieval inputs. |
+| File manifest | `indexed_files` | Stores per-file path, extension, content hash, size, and mtime for metadata-based unchanged-file prefiltering. |
 | Impact persistence | `segment_relations` | Stores `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind` for bounded outbound and inbound expansion. |
-| Compatibility gate | `SCHEMA_VERSION = 10` | Validation requires lookup-target, qualifier, and edge-identity columns; stale indexes require `1up reindex`. |
+| End-to-end timing | `SetupTimings` -> `IndexStageTimings` | Callers pass pre-pipeline DB and model setup durations; pipeline tracks `input_prep_ms` and computes `total_ms` from the caller's wall-clock start. |
+| Compatibility gate | `SCHEMA_VERSION = 11` | Validation requires `indexed_files` table, lookup-target, qualifier, and edge-identity columns; stale indexes require `1up reindex`. |
 
 ## Integrations
 
@@ -106,6 +116,7 @@ graph TB
     Indexer --> Model[ONNX Embedder]
     Search --> Model
     DB --> Rels[segments, symbols, relations]
+    DB --> Manifest[indexed_files manifest]
 ```
 
 ## What Changed With Impact Horizon
@@ -116,3 +127,13 @@ graph TB
 - Kept trust-bucketed impact envelopes with explicit `empty` and `empty_scoped` outcomes plus additive `contextual_results`.
 - Added additive `segment_id` exposure on machine-readable search results for exact follow-up.
 - Added dedicated trust and performance gate entry points through `just impact-eval` and `just impact-bench`.
+
+## What Changed With Faster Indexing
+
+- Tuned project-local libSQL connections with WAL, synchronous=NORMAL, cache_size, mmap_size, and temp_store PRAGMAs via `connect_tuned`.
+- Added `indexed_files` manifest table (schema v11) for metadata-based unchanged-file prefiltering before content reads.
+- Batched segment, symbol, relation, and vector writes into chunked multi-value INSERTs within the existing transactional seam.
+- Added `SetupTimings`, `IndexScopeInfo`, and `IndexPrefilterInfo` structs for end-to-end timing and scope/prefilter visibility in status output.
+- Daemon worker tracks scope promotion reasons (`ambiguous_paths`, `has_unscoped_error`) via `pending_fallback_reason` on `ProjectRunState`.
+- Benchmark script expanded to cover daemon refresh wall-clock medians and scope evidence (fallback, scoped, full counts) in summary JSON.
+- Added release profile with LTO, single codegen unit, and symbol stripping.

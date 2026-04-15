@@ -88,6 +88,8 @@ Try a few common workflows:
 
 The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts. On macOS and Linux, the daemon keeps the index current after `1up start`.
 
+After indexing, `1up status` shows end-to-end timing (including DB, model, and input preparation), scope info (requested vs executed scope and fallback reasons), and prefilter counters (files discovered, metadata-skipped, content-read, and deleted). Use `--format json` to consume these fields programmatically.
+
 ## Choose the Right Command
 
 | If you need to... | Use | Why |
@@ -97,6 +99,7 @@ The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts.
 | Understand code at a specific file and line | `1up --format human context src/auth.rs:87` | Snaps to the enclosing function, impl, or scope |
 | Inspect likely blast radius from an exact anchor | `1up --format human impact --from-file src/auth.rs:87` | Opt-in, local likely-impact follow-up that keeps normal search behavior unchanged |
 | Match code structure instead of text | `1up --format human structural "(function_item name: (identifier) @name)"` | Tree-sitter AST search |
+| Check indexing timing and scope details | `1up --format human status` | Shows end-to-end timing, scope fallback reasons, and prefilter counters |
 
 All commands support `--format plain|json|human`. Use `--format human` for interactive terminal use and `--format json` when an agent or script needs structured output.
 
@@ -139,7 +142,7 @@ just bench
 just bench-parallel
 ```
 
-`just bench` runs the search comparison on pinned `emdash` checkouts and reports `1up` against raw `rg` command sequences for the same tasks. `just bench-parallel` runs the parallel indexing benchmark on the same pinned `emdash` corpus.
+`just bench` runs the search comparison on pinned `emdash` checkouts and reports `1up` against raw `rg` command sequences for the same tasks. `just bench-parallel` runs the parallel indexing benchmark on the same pinned `emdash` corpus and reports release-built wall-clock medians for full index, mostly unchanged incremental, write-heavy incremental, and daemon refresh scenarios. The summary includes scope evidence (fallback, scoped, and full execution counts) and per-run telemetry with timing, scope, and prefilter breakdowns.
 
 The Criterion bench suite also covers `impact_file_anchor`, `impact_symbol_anchor_narrow`, and `impact_symbol_anchor_refused` while keeping the existing search benches as the non-regression guardrail for core discovery commands.
 
