@@ -9,13 +9,14 @@ use crate::shared::symbols::{
     normalize_edge_identity_kind, normalize_symbolish, owner_fingerprint_from_components,
     split_symbol_components,
 };
-use crate::shared::types::ParsedRelation;
+use crate::shared::types::{ParsedRelation, ParsedRelationKind};
 use crate::storage::queries;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RelationKind {
     Call,
     Reference,
+    Conformance,
 }
 
 impl RelationKind {
@@ -23,6 +24,7 @@ impl RelationKind {
         match self {
             Self::Call => "call",
             Self::Reference => "reference",
+            Self::Conformance => "conformance",
         }
     }
 
@@ -30,6 +32,7 @@ impl RelationKind {
         match value {
             "call" => Ok(Self::Call),
             "reference" => Ok(Self::Reference),
+            "conformance" => Ok(Self::Conformance),
             _ => Err(StorageError::Query(format!("unknown relation kind '{value}'")).into()),
         }
     }
@@ -77,6 +80,7 @@ pub fn build_relation_inserts(
         (RelationKind::Reference, referenced_relations),
     ] {
         for relation in relation_group {
+            let relation_kind = relation_kind_for(relation, relation_kind);
             let Some(descriptor) = relation_target_descriptor(&relation.symbol) else {
                 continue;
             };
@@ -103,6 +107,15 @@ pub fn build_relation_inserts(
     }
 
     relations
+}
+
+fn relation_kind_for(relation: &ParsedRelation, default_kind: RelationKind) -> RelationKind {
+    match relation.kind {
+        Some(ParsedRelationKind::Call) => RelationKind::Call,
+        Some(ParsedRelationKind::Reference) => RelationKind::Reference,
+        Some(ParsedRelationKind::Conformance) => RelationKind::Conformance,
+        None => default_kind,
+    }
 }
 
 fn relation_target_descriptor(raw_target_symbol: &str) -> Option<RelationTargetDescriptor> {
@@ -403,11 +416,20 @@ mod tests {
         ParsedRelation {
             symbol: symbol.to_string(),
             edge_identity_kind: edge_identity_kind.to_string(),
+            kind: None,
+        }
+    }
+
+    fn conformance_relation(symbol: &str, edge_identity_kind: &str) -> ParsedRelation {
+        ParsedRelation {
+            symbol: symbol.to_string(),
+            edge_identity_kind: edge_identity_kind.to_string(),
+            kind: Some(ParsedRelationKind::Conformance),
         }
     }
 
     #[test]
-    fn build_relation_inserts_preserves_distinct_edge_identity_and_owner_fingerprint() {
+    fn build_relation_inserts_preserves_distinct_edge_identity_and_conformance_kind() {
         let called_relations = vec![
             relation(
                 "crate::auth::config::load_config",
@@ -421,6 +443,7 @@ mod tests {
         let referenced_relations = vec![
             relation("ConfigLoader", EDGE_IDENTITY_BARE_IDENTIFIER),
             relation("config_loader", EDGE_IDENTITY_BARE_IDENTIFIER),
+            conformance_relation("crate::auth::Validator", EDGE_IDENTITY_QUALIFIED_PATH),
             relation("", EDGE_IDENTITY_BARE_IDENTIFIER),
         ];
 
@@ -465,6 +488,15 @@ mod tests {
                     qualifier_fingerprint: String::new(),
                     edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
                 },
+                RelationInsert {
+                    source_segment_id: "seg-1".to_string(),
+                    relation_kind: RelationKind::Conformance,
+                    raw_target_symbol: "crate::auth::Validator".to_string(),
+                    canonical_target_symbol: "crateauthvalidator".to_string(),
+                    lookup_canonical_symbol: "validator".to_string(),
+                    qualifier_fingerprint: "auth".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                },
             ]
         );
     }
@@ -506,6 +538,16 @@ mod tests {
         ])
         .unwrap();
         segments::upsert_segment(&conn, &source_b).await.unwrap();
+
+        let mut source_c = test_segment("source_c", "src/c.rs");
+        source_c.defined_symbols = r#"["AuthStore"]"#.to_string();
+        source_c.referenced_symbols = r#"["SessionStore"]"#.to_string();
+        source_c.referenced_relations = serde_json::to_string(&vec![conformance_relation(
+            "contracts.SessionStore",
+            EDGE_IDENTITY_QUALIFIED_PATH,
+        )])
+        .unwrap();
+        segments::upsert_segment(&conn, &source_c).await.unwrap();
 
         let outbound = get_outbound_relations(&conn, "source_a", None, 2)
             .await
@@ -554,6 +596,22 @@ mod tests {
                 .map(|relation| relation.source_segment_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["source_a", "source_b"]
+        );
+
+        let conformance_inbound = get_inbound_relations_by_lookup_symbol(
+            &conn,
+            "sessionstore",
+            Some(RelationKind::Conformance),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conformance_inbound
+                .iter()
+                .map(|relation| relation.source_segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source_c"]
         );
 
         let empty = get_outbound_relations(&conn, "source_a", None, 0)

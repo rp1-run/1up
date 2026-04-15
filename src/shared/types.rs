@@ -38,10 +38,20 @@ pub struct ParsedSegment {
     pub called_relations: Vec<ParsedRelation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParsedRelationKind {
+    Call,
+    Reference,
+    Conformance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedRelation {
     pub symbol: String,
     pub edge_identity_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ParsedRelationKind>,
 }
 
 /// A search result returned by hybrid or FTS-only search.

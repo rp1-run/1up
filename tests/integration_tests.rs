@@ -437,6 +437,7 @@ fn create_impact_acceptance_fixture() -> TempDir {
         "src/app",
         "src/auth",
         "src/cache",
+        "src/contracts",
         "src/ui",
         "tests",
     ] {
@@ -512,6 +513,86 @@ pub fn build_auth_config() -> &'static str {
     .unwrap();
 
     fs::write(
+        tmp.path()
+            .join("src")
+            .join("contracts")
+            .join("auth_store.ts"),
+        r#"export interface BaseAuthStore {
+    get(key: string): string | null;
+}
+
+export interface AuthStore extends BaseAuthStore {
+    set(key: string, value: string): void;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("auth").join("auth_store.ts"),
+        r#"import type { AuthStore } from "../contracts/auth_store";
+
+export class SqlAuthStore implements AuthStore {
+    get(key: string): string | null {
+        return key;
+    }
+
+    set(key: string, value: string): void {
+        void value;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path()
+            .join("src")
+            .join("contracts")
+            .join("formatter.ts"),
+        r#"export interface Formatter {
+    format(value: string): string;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("plain_formatter.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export class PlainFormatter implements Formatter {
+    format(value: string): string {
+        return value.trim();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("render_search.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export function renderSearch(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("render_status.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export function renderStatus(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
         tmp.path().join("src").join("cache").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "cache"
@@ -554,6 +635,19 @@ pub fn warm_cache_for_request(user_key: &str) -> String {
         return warm_cache_key().to_string();
     }
     format!("{}:{}", warm_cache_key(), normalized)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("test_support.rs"),
+        r#"mod cache_tests {
+    use crate::cache::runtime::warm_cache_key;
+
+    fn inline_warm_cache_test() {
+        assert_eq!(warm_cache_key(), "cache");
+    }
 }
 "#,
     )
@@ -900,6 +994,69 @@ fn impact_symbol_anchor_qualified_relation_promotes_matching_definition_json() {
 }
 
 #[test]
+fn impact_symbol_anchor_interface_implementor_surfaces_primary_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "AuthStore"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "AuthStore");
+
+    let results = result["results"]
+        .as_array()
+        .expect("interface anchor should surface implementing classes");
+    assert!(results.iter().any(|candidate| {
+        candidate["file_path"].as_str() == Some("src/auth/auth_store.ts")
+            && candidate["block_type"].as_str() == Some("class")
+            && candidate["defined_symbols"]
+                .as_array()
+                .map(|symbols| {
+                    symbols
+                        .iter()
+                        .any(|symbol| symbol.as_str() == Some("SqlAuthStore"))
+                })
+                .unwrap_or(false)
+            && candidate["reasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason["kind"].as_str() == Some("implemented_by"))
+                })
+                .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn impact_symbol_anchor_formatter_implementor_stays_primary_under_reference_pressure_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "Formatter"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "Formatter");
+
+    let results = result["results"]
+        .as_array()
+        .expect("formatter anchor should surface implementors");
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/ui/plain_formatter.ts");
+
+    if let Some(contextual) = result["contextual_results"].as_array() {
+        assert!(contextual.iter().all(|candidate| {
+            candidate["file_path"]
+                .as_str()
+                .map(|path| path != "src/ui/plain_formatter.ts")
+                .unwrap_or(false)
+        }));
+    }
+}
+
+#[test]
 fn impact_symbol_anchor_ambiguous_helper_returns_context_only_json() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
@@ -945,6 +1102,33 @@ fn impact_symbol_anchor_prefers_stronger_primary_over_wrapper_json() {
     {
         assert!(wrapper_index > 0);
     }
+}
+
+#[test]
+fn impact_symbol_anchor_inline_test_context_stays_contextual_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+
+    assert_eq!(result["status"], "expanded");
+
+    let results = result["results"]
+        .as_array()
+        .expect("warm_cache_key should still have primary candidates");
+    assert!(results.iter().all(|candidate| {
+        candidate["file_path"]
+            .as_str()
+            .map(|path| path != "src/cache/test_support.rs")
+            .unwrap_or(false)
+    }));
+
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("inline test context should remain available as contextual guidance");
+    assert!(contextual
+        .iter()
+        .any(|candidate| { candidate["file_path"].as_str() == Some("src/cache/test_support.rs") }));
 }
 
 #[test]

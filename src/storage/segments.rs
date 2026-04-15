@@ -502,6 +502,7 @@ fn fallback_relations(symbols: &[String]) -> Vec<ParsedRelation> {
         .map(|symbol| ParsedRelation {
             symbol: symbol.clone(),
             edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: None,
         })
         .collect()
 }

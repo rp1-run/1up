@@ -35,6 +35,54 @@ build_binary() {
   impact_build_binary "$repo_dir"
 }
 
+augment_fixture() {
+  local repo_dir="$1"
+
+  mkdir -p "$repo_dir/src/ui" "$repo_dir/src/contracts"
+
+  cat > "$repo_dir/src/contracts/formatter.ts" <<'EOF'
+export interface Formatter {
+    format(value: string): string;
+}
+EOF
+
+  cat > "$repo_dir/src/ui/plain_formatter.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export class PlainFormatter implements Formatter {
+    format(value: string): string {
+        return value.trim();
+    }
+}
+EOF
+
+  cat > "$repo_dir/src/ui/render_search.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export function renderSearch(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+EOF
+
+  cat > "$repo_dir/src/ui/render_status.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export function renderStatus(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+EOF
+
+  cat > "$repo_dir/src/cache/test_support.rs" <<'EOF'
+mod cache_tests {
+    use crate::cache::runtime::warm_cache_key;
+
+    fn inline_warm_cache_test() {
+        assert_eq!(warm_cache_key(), "cache");
+    }
+}
+EOF
+}
+
 measure_case_run() {
   local variant="$1"
   local bin_path="$2"
@@ -261,6 +309,7 @@ DETAILS_JSONL="$OUT_DIR/run-results.jsonl"
 SUMMARY_PATH="$OUT_DIR/summary.json"
 
 impact_create_fixture "$TEMPLATE_REPO"
+augment_fixture "$TEMPLATE_REPO"
 impact_sync_repo "$TEMPLATE_REPO" "$BASELINE_REPO"
 impact_sync_repo "$TEMPLATE_REPO" "$CANDIDATE_REPO"
 impact_prepare_fts_only_home "$BASELINE_HOME"
@@ -289,6 +338,11 @@ CASES_JSON=$(cat <<'EOF'
     "name": "low_signal_wrapper_demoted",
     "expected_status": "expanded",
     "args": ["--from-symbol", "warm_cache_key"]
+  },
+  {
+    "name": "formatter_conformance_primary",
+    "expected_status": "expanded",
+    "args": ["--from-symbol", "Formatter"]
   },
   {
     "name": "empty_file_line",

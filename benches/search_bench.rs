@@ -532,6 +532,115 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             file_hash: "hash-cache-worker".to_string(),
         };
         segments::upsert_segment(&conn, &cache_worker).await.unwrap();
+
+        let mut cache_inline_test = SegmentInsert {
+            id: "cache-inline-test".to_string(),
+            file_path: "src/cache/test_support.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "#[cfg(test)]\nfn inline_warm_cache_test() {\n    assert_eq!(warm_cache_key(), \"cache\");\n}\n"
+                .to_string(),
+            line_start: 20,
+            line_end: 23,
+            embedding_vec: None,
+            breadcrumb: Some("cache::tests".to_string()),
+            complexity: 1,
+            role: "IMPLEMENTATION".to_string(),
+            defined_symbols: "[\"inline_warm_cache_test\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"warm_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-cache-inline-test".to_string(),
+        };
+        cache_inline_test.called_relations = serde_json::to_string(&[oneup::shared::types::ParsedRelation {
+            symbol: "warm_cache_key".to_string(),
+            edge_identity_kind: oneup::shared::symbols::EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(oneup::shared::types::ParsedRelationKind::Call),
+        }])
+        .unwrap();
+        segments::upsert_segment(&conn, &cache_inline_test)
+            .await
+            .unwrap();
+
+        let formatter_trait = SegmentInsert {
+            id: "formatter-trait".to_string(),
+            file_path: "src/ui/formatter.ts".to_string(),
+            language: "typescript".to_string(),
+            block_type: "interface".to_string(),
+            content: "export interface Formatter {\n    format(value: string): string;\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("ui".to_string()),
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"Formatter\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-formatter-trait".to_string(),
+        };
+        segments::upsert_segment(&conn, &formatter_trait)
+            .await
+            .unwrap();
+
+        let mut plain_formatter = SegmentInsert {
+            id: "plain-formatter".to_string(),
+            file_path: "src/ui/plain_formatter.ts".to_string(),
+            language: "typescript".to_string(),
+            block_type: "class".to_string(),
+            content: "export class PlainFormatter implements Formatter {\n    format(value: string): string {\n        return value.trim();\n    }\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 5,
+            embedding_vec: None,
+            breadcrumb: Some("ui".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"PlainFormatter\"]".to_string(),
+            referenced_symbols: "[\"Formatter\"]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-plain-formatter".to_string(),
+        };
+        plain_formatter.referenced_relations = serde_json::to_string(&[oneup::shared::types::ParsedRelation {
+            symbol: "Formatter".to_string(),
+            edge_identity_kind: oneup::shared::symbols::EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(oneup::shared::types::ParsedRelationKind::Conformance),
+        }])
+        .unwrap();
+        segments::upsert_segment(&conn, &plain_formatter)
+            .await
+            .unwrap();
+
+        for idx in 0..8 {
+            let consumer = SegmentInsert {
+                id: format!("formatter-reference-{idx}"),
+                file_path: format!("src/ui/render_{idx}.ts"),
+                language: "typescript".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "export function render{idx}(formatter: Formatter, value: string): string {{\n    return formatter.format(value);\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 3,
+                embedding_vec: None,
+                breadcrumb: Some("ui".to_string()),
+                complexity: 1,
+                role: "IMPLEMENTATION".to_string(),
+                defined_symbols: format!("[\"render_{idx}\"]"),
+                referenced_symbols: "[\"Formatter\"]".to_string(),
+                referenced_relations: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
+                file_hash: format!("hash-formatter-reference-{idx}"),
+            };
+            segments::upsert_segment(&conn, &consumer).await.unwrap();
+        }
     });
 
     (tmp, db_path)
@@ -772,6 +881,14 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+    let formatter_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "Formatter".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
     let empty_request = ImpactRequest {
         anchor: ImpactAnchor::Segment {
             id: "auth-runtime-parse".to_string(),
@@ -845,6 +962,27 @@ fn bench_impact_horizon(c: &mut Criterion) {
                 assert_eq!(result.status, ImpactStatus::Expanded);
                 assert!(!result.results.is_empty());
                 assert_eq!(result.results[0].file_path, "src/cache/worker.rs");
+                assert!(result
+                    .results
+                    .iter()
+                    .all(|candidate| { candidate.file_path != "src/cache/test_support.rs" }));
+                assert!(result
+                    .contextual_results
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate.file_path == "src/cache/test_support.rs"));
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_formatter_conformance", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(formatter_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/ui/plain_formatter.ts");
             });
         });
     });

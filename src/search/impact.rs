@@ -28,12 +28,14 @@ const MAX_FILE_SEEDS: usize = 5;
 const MAX_SYMBOL_SEEDS: usize = 3;
 const MAX_SYMBOL_FILES: usize = 3;
 const MAX_SYMBOL_TOP_LEVEL_DIRS: usize = 2;
-const MAX_RELATIONS_PER_HOP: usize = 8;
+const MAX_OUTBOUND_RELATIONS_PER_HOP: usize = 8;
+const MAX_INBOUND_RELATIONS_PER_HOP: usize = 8;
 const MAX_DEFINITION_TARGETS_PER_SYMBOL: usize = 3;
 const MAX_TEST_FILE_BUDGET: usize = 12;
 const TEST_FILE_QUERY_FACTOR: usize = 2;
 
 const CALL_WEIGHT: f64 = 1.0;
+const CONFORMANCE_WEIGHT: f64 = 1.05;
 const SAME_FILE_WEIGHT: f64 = 0.70;
 const REFERENCE_WEIGHT: f64 = 0.65;
 const TEST_WEIGHT: f64 = 0.55;
@@ -574,13 +576,14 @@ impl<'a> ImpactHorizonEngine<'a> {
         hop: usize,
     ) -> Result<Vec<CandidateObservation>, OneupError> {
         let mut observations = Vec::new();
-        let outbound =
-            get_outbound_relations(self.conn, &source.segment_id, None, MAX_RELATIONS_PER_HOP)
-                .await?;
+        let outbound = self
+            .collect_outbound_relations_with_budget(&source.segment_id)
+            .await?;
 
         for relation in outbound {
             let reason_kind = match relation.relation_kind {
                 RelationKind::Call => "calls",
+                RelationKind::Conformance => "conforms_to",
                 RelationKind::Reference => "references_symbol",
             };
             let weight = base_weight(relation.relation_kind);
@@ -603,7 +606,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         }
 
         let defined_symbols = source.defined_symbols.clone().unwrap_or_default();
-        let mut remaining = MAX_RELATIONS_PER_HOP;
+        let mut remaining = MAX_INBOUND_RELATIONS_PER_HOP;
         for symbol in defined_symbols {
             if remaining == 0 {
                 break;
@@ -613,50 +616,119 @@ impl<'a> ImpactHorizonEngine<'a> {
                 continue;
             };
 
-            let inbound =
-                get_inbound_relations_by_lookup_symbol(self.conn, &lookup_symbol, None, remaining)
-                    .await?;
-            remaining = remaining.saturating_sub(inbound.len());
+            let inbound = self
+                .collect_inbound_relations_with_budget(&lookup_symbol, &mut remaining)
+                .await?;
 
             for relation in inbound {
-                let Some(candidate) = self.load_candidate(&relation.source_segment_id).await?
+                let Some(source_candidate) =
+                    self.load_candidate(&relation.source_segment_id).await?
                 else {
                     continue;
                 };
-                if !scope_matches(&candidate.file_path, scope) || is_test_path(&candidate.file_path)
-                {
-                    continue;
-                }
-
                 let reason_kind = match relation.relation_kind {
                     RelationKind::Call => "called_by",
+                    RelationKind::Conformance => "implemented_by",
                     RelationKind::Reference => "references_symbol",
                 };
-                let scored = score_relation_candidate(&candidate, &relation, source, &candidate);
-                let Some(bucket) = relation_observation_bucket(&scored, None) else {
-                    continue;
-                };
+                let emitted_candidates = self
+                    .emit_inbound_relation_candidates(&relation, &source_candidate, scope)
+                    .await?;
 
-                observations.push(CandidateObservation {
-                    score: weighted_score(
-                        base_weight(relation.relation_kind) * scored.confidence,
+                for candidate in emitted_candidates {
+                    if !scope_matches(&candidate.file_path, scope)
+                        || is_test_path(&candidate.file_path)
+                    {
+                        continue;
+                    }
+
+                    let scored =
+                        score_relation_candidate(&source_candidate, &relation, source, &candidate);
+                    let Some(bucket) = relation_observation_bucket(&scored, None) else {
+                        continue;
+                    };
+
+                    observations.push(CandidateObservation {
+                        score: weighted_score(
+                            base_weight(relation.relation_kind) * scored.confidence,
+                            hop,
+                            &candidate,
+                            scope,
+                        ),
                         hop,
-                        &candidate,
-                        scope,
-                    ),
-                    hop,
-                    reason: ImpactReason {
-                        kind: reason_kind.to_string(),
-                        symbol: Some(symbol.clone()),
-                        from_segment_id: Some(source.segment_id.clone()),
-                    },
-                    candidate,
-                    bucket,
-                });
+                        reason: ImpactReason {
+                            kind: reason_kind.to_string(),
+                            symbol: Some(symbol.clone()),
+                            from_segment_id: Some(source.segment_id.clone()),
+                        },
+                        candidate,
+                        bucket,
+                    });
+                }
             }
         }
 
         Ok(observations)
+    }
+
+    async fn collect_outbound_relations_with_budget(
+        &self,
+        source_segment_id: &str,
+    ) -> Result<Vec<StoredRelation>, OneupError> {
+        let mut relations = Vec::new();
+        let mut remaining = MAX_OUTBOUND_RELATIONS_PER_HOP;
+
+        for relation_kind in [
+            RelationKind::Conformance,
+            RelationKind::Call,
+            RelationKind::Reference,
+        ] {
+            if remaining == 0 {
+                break;
+            }
+
+            let mut fetched = get_outbound_relations(
+                self.conn,
+                source_segment_id,
+                Some(relation_kind),
+                remaining,
+            )
+            .await?;
+            remaining = remaining.saturating_sub(fetched.len());
+            relations.append(&mut fetched);
+        }
+
+        Ok(relations)
+    }
+
+    async fn collect_inbound_relations_with_budget(
+        &self,
+        lookup_symbol: &str,
+        remaining: &mut usize,
+    ) -> Result<Vec<StoredRelation>, OneupError> {
+        let mut relations = Vec::new();
+
+        for relation_kind in [
+            RelationKind::Conformance,
+            RelationKind::Call,
+            RelationKind::Reference,
+        ] {
+            if *remaining == 0 {
+                break;
+            }
+
+            let mut fetched = get_inbound_relations_by_lookup_symbol(
+                self.conn,
+                lookup_symbol,
+                Some(relation_kind),
+                *remaining,
+            )
+            .await?;
+            *remaining = (*remaining).saturating_sub(fetched.len());
+            relations.append(&mut fetched);
+        }
+
+        Ok(relations)
     }
 
     async fn collect_same_file_observations(
@@ -822,7 +894,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         relation: &StoredRelation,
         scope: Option<&str>,
     ) -> Result<Option<(CandidateRow, f64, ObservationBucket)>, OneupError> {
-        let mut scored = self
+        let scored = self
             .resolve_relation_targets(relation, scope)
             .await?
             .into_iter()
@@ -833,23 +905,74 @@ impl<'a> ImpactHorizonEngine<'a> {
             })
             .collect::<Vec<_>>();
 
-        scored = shortlist_relation_candidates(scored);
+        let (preferred, deferred): (Vec<_>, Vec<_>) = scored
+            .into_iter()
+            .partition(|candidate| !is_test_context_candidate(&candidate.candidate));
 
-        let runner_up = scored.get(1).map(|candidate| candidate.confidence);
-        let Some(best) = scored.into_iter().next() else {
-            return Ok(None);
-        };
-        let Some(bucket) = relation_observation_bucket(&best, runner_up) else {
-            return Ok(None);
-        };
+        if let Some(selected) = select_best_relation_candidate(preferred) {
+            return Ok(Some(selected));
+        }
 
-        Ok(Some((best.candidate, best.confidence, bucket)))
+        Ok(select_best_relation_candidate(deferred))
     }
 
     async fn load_candidate(&self, segment_id: &str) -> Result<Option<CandidateRow>, OneupError> {
         Ok(get_segment_by_id(self.conn, segment_id)
             .await?
             .map(candidate_from_stored_segment))
+    }
+
+    async fn emit_inbound_relation_candidates(
+        &self,
+        relation: &StoredRelation,
+        source_candidate: &CandidateRow,
+        scope: Option<&str>,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        match relation.relation_kind {
+            RelationKind::Conformance => {
+                self.resolve_conformance_source_candidates(source_candidate, scope)
+                    .await
+            }
+            RelationKind::Call | RelationKind::Reference => Ok(vec![source_candidate.clone()]),
+        }
+    }
+
+    async fn resolve_conformance_source_candidates(
+        &self,
+        source_candidate: &CandidateRow,
+        scope: Option<&str>,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        if source_candidate.is_definition_like() {
+            return Ok(vec![source_candidate.clone()]);
+        }
+
+        let engine = SymbolSearchEngine::new(self.conn);
+        let mut emitted = Vec::new();
+        let mut seen = HashSet::new();
+
+        for lookup_symbol in conformance_source_lookup_symbols(source_candidate) {
+            for candidate in engine
+                .find_definition_candidates_by_canonical(&lookup_symbol)
+                .await?
+            {
+                if candidate.segment_id == source_candidate.segment_id
+                    || !scope_matches(&candidate.file_path, scope)
+                    || is_test_path(&candidate.file_path)
+                {
+                    continue;
+                }
+
+                if seen.insert(candidate.segment_id.clone()) {
+                    emitted.push(candidate);
+                }
+            }
+        }
+
+        if emitted.is_empty() {
+            Ok(vec![source_candidate.clone()])
+        } else {
+            Ok(emitted)
+        }
     }
 }
 
@@ -1211,6 +1334,7 @@ fn weighted_score(base: f64, hop: usize, candidate: &CandidateRow, scope: Option
 fn base_weight(relation_kind: RelationKind) -> f64 {
     match relation_kind {
         RelationKind::Call => CALL_WEIGHT,
+        RelationKind::Conformance => CONFORMANCE_WEIGHT,
         RelationKind::Reference => REFERENCE_WEIGHT,
     }
 }
@@ -1241,6 +1365,7 @@ fn score_relation_candidate(
     );
     let relation_kind_score = match relation.relation_kind {
         RelationKind::Call => 1.0,
+        RelationKind::Conformance => 1.05,
         RelationKind::Reference => 0.85,
     };
     let owner_gate = if relation.qualifier_fingerprint.is_empty() {
@@ -1296,7 +1421,7 @@ fn relation_observation_bucket(
     let contextual_only_role = matches!(
         candidate.candidate.role,
         Some(SegmentRole::Import | SegmentRole::Docs)
-    );
+    ) || is_test_context_candidate(&candidate.candidate);
     let ambiguity_signal =
         candidate.exact_identity || candidate.owner_alignment >= OWNER_ALIGNMENT_SIGNAL_THRESHOLD;
 
@@ -1348,6 +1473,16 @@ fn shortlist_relation_candidates(
     candidates
 }
 
+fn select_best_relation_candidate(
+    candidates: Vec<ScoredRelationCandidate>,
+) -> Option<(CandidateRow, f64, ObservationBucket)> {
+    let candidates = shortlist_relation_candidates(candidates);
+    let runner_up = candidates.get(1).map(|candidate| candidate.confidence);
+    let best = candidates.into_iter().next()?;
+    let bucket = relation_observation_bucket(&best, runner_up)?;
+    Some((best.candidate, best.confidence, bucket))
+}
+
 fn compare_scored_relation_candidates(
     left: &ScoredRelationCandidate,
     right: &ScoredRelationCandidate,
@@ -1367,6 +1502,10 @@ fn aggregate_bucket(
     anchor_symbols: &HashSet<String>,
     prefer_high_signal_paths: bool,
 ) -> Option<ObservationBucket> {
+    if is_test_context_candidate(&aggregate.candidate) {
+        return (aggregate.primary_score > 0.0 || aggregate.contextual_score > 0.0)
+            .then_some(ObservationBucket::Contextual);
+    }
     if prefer_high_signal_paths && is_low_signal_path(&aggregate.candidate.file_path) {
         return (aggregate.primary_score > 0.0 || aggregate.contextual_score > 0.0)
             .then_some(ObservationBucket::Contextual);
@@ -1529,6 +1668,10 @@ fn relation_edge_identity_score(
 }
 
 fn has_exact_structural_identity(relation: &StoredRelation, symbol_score: f64) -> bool {
+    if relation.relation_kind == RelationKind::Conformance {
+        return symbol_score >= 0.85;
+    }
+
     symbol_score >= 1.0
         && !(relation.qualifier_fingerprint.is_empty()
             && relation.edge_identity_kind == EDGE_IDENTITY_BARE_IDENTIFIER)
@@ -1630,7 +1773,10 @@ fn relation_signal_multiplier(
         multiplier *= LOW_SIGNAL_UNALIGNED_RECEIVER_PENALTY;
     }
 
-    if owner_alignment == 0.0 && is_declaration_like_candidate(candidate) {
+    if relation.relation_kind != RelationKind::Conformance
+        && owner_alignment == 0.0
+        && is_declaration_like_candidate(candidate)
+    {
         multiplier *= LOW_SIGNAL_DECLARATION_PENALTY;
     }
 
@@ -1689,6 +1835,29 @@ fn breadcrumb_components(breadcrumb: &str) -> Vec<String> {
 
 fn symbol_lookup_tail(symbol: &str) -> Option<String> {
     split_symbol_components(symbol).into_iter().last()
+}
+
+fn conformance_source_lookup_symbols(candidate: &CandidateRow) -> Vec<String> {
+    let mut lookups = Vec::new();
+    let mut seen = HashSet::new();
+
+    for symbol in candidate.defined_symbols.as_deref().unwrap_or(&[]) {
+        let trimmed = symbol
+            .split(['<', '(', '['])
+            .next()
+            .unwrap_or(symbol)
+            .trim();
+        for lookup in [
+            normalize_symbolish(trimmed),
+            symbol_lookup_tail(trimmed).unwrap_or_default(),
+        ] {
+            if !lookup.is_empty() && seen.insert(lookup.clone()) {
+                lookups.push(lookup);
+            }
+        }
+    }
+
+    lookups
 }
 
 fn reason_key(reason: &ImpactReason) -> String {
@@ -1868,6 +2037,30 @@ fn is_test_path(file_path: &str) -> bool {
         || lower.ends_with(".spec.js")
 }
 
+fn is_test_context_candidate(candidate: &CandidateRow) -> bool {
+    is_test_path(&candidate.file_path)
+        || has_test_context_token(&candidate.file_path)
+        || candidate.block_type.eq_ignore_ascii_case("test")
+        || candidate
+            .breadcrumb
+            .as_deref()
+            .is_some_and(has_test_context_token)
+        || candidate
+            .defined_symbols
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|symbol| has_test_context_token(symbol))
+}
+
+fn has_test_context_token(value: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| matches!(token.as_str(), "test" | "tests" | "spec" | "specs"))
+}
+
 fn is_low_signal_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
     is_test_path(file_path)
@@ -1922,7 +2115,7 @@ fn normalized_stem(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::types::ParsedRelation;
+    use crate::shared::types::{ParsedRelation, ParsedRelationKind};
     use crate::storage::{db::Db, schema, segments};
 
     struct SegmentFixture<'a> {
@@ -1971,6 +2164,15 @@ mod tests {
     ) -> segments::SegmentInsert {
         let mut segment = make_segment(fixture);
         segment.called_relations = serde_json::to_string(called_relations).unwrap();
+        segment
+    }
+
+    fn make_segment_with_referenced_relations(
+        fixture: SegmentFixture<'_>,
+        referenced_relations: &[ParsedRelation],
+    ) -> segments::SegmentInsert {
+        let mut segment = make_segment(fixture);
+        segment.referenced_relations = serde_json::to_string(referenced_relations).unwrap();
         segment
     }
 
@@ -2116,6 +2318,273 @@ mod tests {
         assert_eq!(resolved.scope, Some("src/auth".to_string()));
         assert_eq!(resolved.seed_segment_ids, vec!["cfg-auth".to_string()]);
         assert_eq!(result.results[0].segment_id, "cfg-auth-builder");
+    }
+
+    #[tokio::test]
+    async fn trait_anchor_surfaces_implementing_definition_from_impl_relation() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "validator-trait",
+                    file_path: "src/auth/validator.rs",
+                    line_start: 1,
+                    block_type: "trait",
+                    role: "DEFINITION",
+                    defined_symbols: &["Validator"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "config-struct",
+                    file_path: "src/auth/config.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "config-impl",
+                        file_path: "src/auth/config.rs",
+                        line_start: 10,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["Config<T>"],
+                        referenced_symbols: &["Validator"],
+                        called_symbols: &[],
+                    },
+                    &[ParsedRelation {
+                        symbol: "crate::auth::Validator".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Validator".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "config-struct");
+        assert_eq!(result.results[0].reasons[0].kind, "implemented_by");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "config-impl"));
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_prioritizes_inbound_conformance_within_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![
+            make_segment(SegmentFixture {
+                id: "formatter-trait",
+                file_path: "src/ui/formatter.rs",
+                line_start: 1,
+                block_type: "trait",
+                role: "DEFINITION",
+                defined_symbols: &["Formatter"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }),
+            make_segment_with_referenced_relations(
+                SegmentFixture {
+                    id: "plain-formatter",
+                    file_path: "src/ui/plain_formatter.rs",
+                    line_start: 1,
+                    block_type: "class",
+                    role: "DEFINITION",
+                    defined_symbols: &["PlainFormatter"],
+                    referenced_symbols: &["Formatter"],
+                    called_symbols: &[],
+                },
+                &[ParsedRelation {
+                    symbol: "Formatter".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Conformance),
+                }],
+            ),
+        ];
+
+        for idx in 0..MAX_INBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_segment_with_referenced_relations(
+                SegmentFixture {
+                    id: Box::leak(format!("formatter-reference-{idx}").into_boxed_str()),
+                    file_path: Box::leak(format!("src/ui/render_{idx}.rs").into_boxed_str()),
+                    line_start: idx + 1,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &[],
+                    referenced_symbols: &["Formatter"],
+                    called_symbols: &[],
+                },
+                &[ParsedRelation {
+                    symbol: "Formatter".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Reference),
+                }],
+            ));
+        }
+
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Formatter".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results[0].segment_id, "plain-formatter");
+        assert_eq!(result.results[0].reasons[0].kind, "implemented_by");
+        if let Some(contextual) = result.contextual_results {
+            assert!(contextual
+                .iter()
+                .all(|candidate| candidate.segment_id != "plain-formatter"));
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_anchor_retains_outbound_conformance_when_calls_fill_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![make_segment(SegmentFixture {
+            id: "formatter-trait",
+            file_path: "src/ui/formatter.rs",
+            line_start: 1,
+            block_type: "trait",
+            role: "DEFINITION",
+            defined_symbols: &["Formatter"],
+            referenced_symbols: &[],
+            called_symbols: &[],
+        })];
+
+        for idx in 0..MAX_OUTBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_segment(SegmentFixture {
+                id: Box::leak(format!("format-helper-{idx}").into_boxed_str()),
+                file_path: Box::leak(format!("src/ui/helpers_{idx}.rs").into_boxed_str()),
+                line_start: idx + 1,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &[Box::leak(format!("format_helper_{idx}").into_boxed_str())],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }));
+        }
+
+        let mut plain_formatter = make_segment(SegmentFixture {
+            id: "plain-formatter",
+            file_path: "src/ui/plain_formatter.rs",
+            line_start: 1,
+            block_type: "class",
+            role: "DEFINITION",
+            defined_symbols: &["PlainFormatter"],
+            referenced_symbols: &["Formatter"],
+            called_symbols: &[
+                "format_helper_0",
+                "format_helper_1",
+                "format_helper_2",
+                "format_helper_3",
+                "format_helper_4",
+                "format_helper_5",
+                "format_helper_6",
+                "format_helper_7",
+            ],
+        });
+        plain_formatter.called_relations = serde_json::to_string(&[
+            ParsedRelation {
+                symbol: "format_helper_0".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_1".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_2".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_3".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_4".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_5".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_6".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_7".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+        ])
+        .unwrap();
+        plain_formatter.referenced_relations = serde_json::to_string(&[ParsedRelation {
+            symbol: "Formatter".to_string(),
+            edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(ParsedRelationKind::Conformance),
+        }])
+        .unwrap();
+        fixtures.push(plain_formatter);
+
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "plain-formatter".to_string(),
+                },
+                scope: None,
+                depth: 1,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert!(result
+            .results
+            .iter()
+            .any(|candidate| candidate.segment_id == "formatter-trait"));
     }
 
     #[tokio::test]
@@ -2463,6 +2932,7 @@ mod tests {
                     &[ParsedRelation {
                         symbol: "crate::auth::config::load_config".to_string(),
                         edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                        kind: None,
                     }],
                 ),
                 make_segment(SegmentFixture {
@@ -2812,6 +3282,7 @@ mod tests {
                     &[ParsedRelation {
                         symbol: "matches".to_string(),
                         edge_identity_kind: EDGE_IDENTITY_MACRO_LIKE.to_string(),
+                        kind: None,
                     }],
                 ),
                 make_segment(SegmentFixture {
@@ -3001,6 +3472,93 @@ mod tests {
         assert_eq!(result.results.len(), 2);
         assert_eq!(result.results[0].segment_id, "warm-cache-for-request");
         assert_eq!(result.results[1].segment_id, "prime-cache");
+    }
+
+    #[tokio::test]
+    async fn inline_test_context_stays_contextual_for_symbol_anchor() {
+        let (_db, conn) = setup().await;
+        let mut inline_test = make_segment_with_called_relations(
+            SegmentFixture {
+                id: "warm-cache-inline-test",
+                file_path: "src/cache/coverage.rs",
+                line_start: 20,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &["inline_warm_cache_test"],
+                referenced_symbols: &[],
+                called_symbols: &["warm_cache_key"],
+            },
+            &[ParsedRelation {
+                symbol: "warm_cache_key".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            }],
+        );
+        inline_test.breadcrumb = Some("cache::tests".to_string());
+
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "warm-cache-key",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["warm_cache_key"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                segments::SegmentInsert {
+                    id: "warm-cache-for-request".to_string(),
+                    file_path: "src/cache/worker.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 7,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 3,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+                    referenced_symbols: "[\"user_key\"]".to_string(),
+                    referenced_relations: "[]".to_string(),
+                    called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
+                    file_hash: "hash-src/cache/worker.rs".to_string(),
+                },
+                inline_test,
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "warm_cache_key".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results[0].segment_id, "warm-cache-for-request");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "warm-cache-inline-test"));
+        let contextual = result
+            .contextual_results
+            .expect("inline test consumers should remain contextual");
+        assert!(contextual
+            .iter()
+            .any(|candidate| candidate.segment_id == "warm-cache-inline-test"));
     }
 
     #[tokio::test]
