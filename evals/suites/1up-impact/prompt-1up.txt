@@ -15,7 +15,9 @@ Examples:
 - `1up search "how does content search work"`
 - `1up symbol FTSManager -r`
 
-For impact analysis questions, prefer `1up impact` to trace dependencies. Use `1up search` and `1up symbol` for discovery when you need to find the right anchor first.
+For impact analysis questions, start with `1up impact` to trace dependencies. Use `1up search` and `1up symbol` for discovery when you need to find the right anchor first.
+
+After reviewing impact results, use `1up symbol -r`, `1up search`, or `grep` to fill in gaps — impact may not surface every downstream consumer, especially UI components or indirect callers further from the core module. Follow up on any important-looking files that impact mentions to check for additional dependents.
 
 {{TASK_PROMPT}}
 
