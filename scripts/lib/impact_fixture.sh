@@ -68,7 +68,12 @@ impact_create_fixture() {
   local repo_dir="$1"
 
   rm -rf "$repo_dir"
-  mkdir -p "$repo_dir/src/auth" "$repo_dir/src/cache" "$repo_dir/src/ui" "$repo_dir/tests"
+  mkdir -p \
+    "$repo_dir/src/app" \
+    "$repo_dir/src/auth" \
+    "$repo_dir/src/cache" \
+    "$repo_dir/src/ui" \
+    "$repo_dir/tests"
 
   cat > "$repo_dir/src/auth/runtime.rs" <<'EOF'
 pub fn load_auth_config() -> &'static str {
@@ -111,6 +116,12 @@ pub fn build_auth_config() -> &'static str {
 }
 EOF
 
+  cat > "$repo_dir/src/auth/reload.rs" <<'EOF'
+pub fn reload_auth_config() -> &'static str {
+    crate::auth::config::load_config()
+}
+EOF
+
   cat > "$repo_dir/src/cache/config.rs" <<'EOF'
 pub fn load_config() -> &'static str {
     "cache"
@@ -147,12 +158,32 @@ pub fn prime_cache() -> &'static str {
 }
 EOF
 
+  cat > "$repo_dir/src/cache/worker.rs" <<'EOF'
+use crate::cache::runtime::{normalize_cache_key, warm_cache_key};
+
+pub fn warm_cache_for_request(user_key: &str) -> String {
+    let normalized = normalize_cache_key(user_key);
+    if normalized.is_empty() {
+        return warm_cache_key().to_string();
+    }
+    format!("{}:{}", warm_cache_key(), normalized)
+}
+EOF
+
   cat > "$repo_dir/tests/cache_runtime_test.rs" <<'EOF'
 use crate::cache::runtime::warm_cache_key;
 
 #[test]
 fn warms_cache_runtime() {
     assert_eq!(warm_cache_key(), "cache");
+}
+EOF
+
+  cat > "$repo_dir/src/app/bootstrap.rs" <<'EOF'
+use crate::auth::config::load_config;
+
+pub fn boot_global_config() -> &'static str {
+    load_config()
 }
 EOF
 }

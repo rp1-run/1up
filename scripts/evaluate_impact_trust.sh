@@ -278,17 +278,17 @@ CASES_JSON=$(cat <<'EOF'
   },
   {
     "kind": "ambiguous",
-    "name": "cache_context_only_unscoped",
-    "expected_status": "empty",
-    "expected_hint": "context_only",
-    "args": ["--from-file", "src/cache/runtime.rs:5"]
-  },
-  {
-    "kind": "ambiguous",
     "name": "broad_symbol_refusal",
     "expected_status": "refused",
     "expected_hint": "narrow_with_scope",
     "args": ["--from-symbol", "load_config"]
+  },
+  {
+    "kind": "ambiguous",
+    "name": "neutral_helper_context_only",
+    "expected_status": "empty",
+    "expected_hint": "context_only",
+    "args": ["--from-symbol", "boot_global_config"]
   },
   {
     "kind": "exact",
@@ -313,10 +313,10 @@ CASES_JSON=$(cat <<'EOF'
   },
   {
     "kind": "exact",
-    "name": "cache_file_anchor",
+    "name": "cache_symbol_anchor",
     "expected_status": "expanded",
-    "expected_primary": "src/cache/priming.rs",
-    "args": ["--from-file", "src/cache/runtime.rs"]
+    "expected_primary": "src/cache/worker.rs",
+    "args": ["--from-symbol", "warm_cache_key"]
   }
 ]
 EOF

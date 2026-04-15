@@ -2218,6 +2218,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn low_signal_wrapper_yields_to_stronger_primary_candidate() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "warm-cache-key",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["warm_cache_key"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                segments::SegmentInsert {
+                    id: "prime-cache".to_string(),
+                    file_path: "src/cache/priming.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn prime_cache() -> &'static str {\n    warm_cache_key()\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 1,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"prime_cache\"]".to_string(),
+                    referenced_symbols: "[]".to_string(),
+                    called_symbols: "[\"warm_cache_key\"]".to_string(),
+                    file_hash: "hash-src/cache/priming.rs".to_string(),
+                },
+                segments::SegmentInsert {
+                    id: "warm-cache-for-request".to_string(),
+                    file_path: "src/cache/worker.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 7,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 3,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+                    referenced_symbols: "[\"user_key\"]".to_string(),
+                    called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+                    file_hash: "hash-src/cache/worker.rs".to_string(),
+                },
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "warm_cache_key".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].segment_id, "warm-cache-for-request");
+        assert_eq!(result.results[1].segment_id, "prime-cache");
+    }
+
+    #[tokio::test]
     async fn collect_test_observations_honors_file_budget() {
         let (_db, conn) = setup().await;
         let seed = make_segment(SegmentFixture {

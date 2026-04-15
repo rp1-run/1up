@@ -428,6 +428,86 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 .await
                 .unwrap();
         }
+
+        let qualified_relation = SegmentInsert {
+            id: "auth-config-reload".to_string(),
+            file_path: "src/auth/reload.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn reload_auth_config() -> &'static str {\n    crate::auth::config::load_config()\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("auth".to_string()),
+            complexity: 2,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"reload_auth_config\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[\"crate::auth::config::load_config\"]".to_string(),
+            file_hash: "hash-auth-config-reload".to_string(),
+        };
+        segments::upsert_segment(&conn, &qualified_relation)
+            .await
+            .unwrap();
+
+        let cache_runtime = SegmentInsert {
+            id: "cache-runtime-anchor".to_string(),
+            file_path: "src/cache/runtime.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn warm_cache_key() -> &'static str {\n    \"cache\"\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"warm_cache_key\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "hash-cache-runtime-anchor".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_runtime).await.unwrap();
+
+        let cache_wrapper = SegmentInsert {
+            id: "cache-priming".to_string(),
+            file_path: "src/cache/priming.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn prime_cache() -> &'static str {\n    warm_cache_key()\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 1,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"prime_cache\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[\"warm_cache_key\"]".to_string(),
+            file_hash: "hash-cache-priming".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_wrapper).await.unwrap();
+
+        let cache_worker = SegmentInsert {
+            id: "cache-worker".to_string(),
+            file_path: "src/cache/worker.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 7,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 3,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+            referenced_symbols: "[\"user_key\"]".to_string(),
+            called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+            file_hash: "hash-cache-worker".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_worker).await.unwrap();
     });
 
     (tmp, db_path)
@@ -652,6 +732,22 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+    let qualified_relation_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "load_config".to_string(),
+        },
+        scope: Some("src/auth".to_string()),
+        depth: 2,
+        limit: 20,
+    };
+    let low_signal_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "warm_cache_key".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
     let empty_request = ImpactRequest {
         anchor: ImpactAnchor::Segment {
             id: "auth-runtime-parse".to_string(),
@@ -691,6 +787,21 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("impact_symbol_anchor_qualified_relation", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine
+                    .explore(qualified_relation_request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(result.status, ImpactStatus::ExpandedScoped);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/auth/reload.rs");
+            });
+        });
+    });
+
     c.bench_function("impact_file_anchor_primary", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -698,6 +809,18 @@ fn bench_impact_horizon(c: &mut Criterion) {
                 let result = engine.explore(file_request.clone()).await.unwrap();
                 assert_eq!(result.status, ImpactStatus::Expanded);
                 assert!(!result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_low_signal_primary", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(low_signal_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/cache/worker.rs");
             });
         });
     });

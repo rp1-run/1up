@@ -432,7 +432,7 @@ message PolicyRulePreview {
 
 fn create_impact_acceptance_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    for dir in ["src/auth", "src/cache", "src/ui", "tests"] {
+    for dir in ["src/app", "src/auth", "src/cache", "src/ui", "tests"] {
         fs::create_dir_all(tmp.path().join(dir)).unwrap();
     }
 
@@ -496,6 +496,15 @@ pub fn build_auth_config() -> &'static str {
     .unwrap();
 
     fs::write(
+        tmp.path().join("src").join("auth").join("reload.rs"),
+        r#"pub fn reload_auth_config() -> &'static str {
+    crate::auth::config::load_config()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
         tmp.path().join("src").join("cache").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "cache"
@@ -505,9 +514,59 @@ pub fn build_auth_config() -> &'static str {
     .unwrap();
 
     fs::write(
+        tmp.path().join("src").join("cache").join("runtime.rs"),
+        r#"pub fn warm_cache_key() -> &'static str {
+    "cache"
+}
+
+pub fn normalize_cache_key(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("priming.rs"),
+        r#"use crate::cache::runtime::warm_cache_key;
+
+pub fn prime_cache() -> &'static str {
+    warm_cache_key()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("worker.rs"),
+        r#"use crate::cache::runtime::{normalize_cache_key, warm_cache_key};
+
+pub fn warm_cache_for_request(user_key: &str) -> String {
+    let normalized = normalize_cache_key(user_key);
+    if normalized.is_empty() {
+        return warm_cache_key().to_string();
+    }
+    format!("{}:{}", warm_cache_key(), normalized)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
         tmp.path().join("src").join("ui").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "ui"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("app").join("bootstrap.rs"),
+        r#"use crate::auth::config::load_config;
+
+pub fn boot_global_config() -> &'static str {
+    load_config()
 }
 "#,
     )
@@ -811,6 +870,73 @@ fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
     let results = result["results"].as_array().unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0]["file_path"], "src/auth/config_builder.rs");
+}
+
+#[test]
+fn impact_symbol_anchor_qualified_relation_surfaces_matching_definition_contextually_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "reload_auth_config"]);
+
+    assert_eq!(result["status"], "empty");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "reload_auth_config");
+    assert_eq!(result["hint"]["code"], "context_only");
+
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("qualified relation should surface matching context");
+    assert!(!contextual.is_empty());
+    assert_eq!(contextual[0]["file_path"], "src/auth/config.rs");
+}
+
+#[test]
+fn impact_symbol_anchor_ambiguous_helper_returns_context_only_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "boot_global_config"]);
+
+    assert_eq!(result["status"], "empty");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "boot_global_config");
+    assert_eq!(result["hint"]["code"], "context_only");
+    assert_eq!(result["results"], serde_json::json!([]));
+
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("ambiguous helper follow-up should stay contextual");
+    assert!(!contextual.is_empty());
+    assert!(contextual.iter().all(|candidate| {
+        candidate["file_path"]
+            .as_str()
+            .map(|path| matches!(path, "src/auth/config.rs" | "src/app/bootstrap.rs"))
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn impact_symbol_anchor_prefers_stronger_primary_over_wrapper_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "warm_cache_key");
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/cache/worker.rs");
+
+    if let Some(wrapper_index) = results
+        .iter()
+        .position(|candidate| candidate["file_path"].as_str() == Some("src/cache/priming.rs"))
+    {
+        assert!(wrapper_index > 0);
+    }
 }
 
 #[test]
