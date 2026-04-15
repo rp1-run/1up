@@ -4,20 +4,36 @@
 
 set -uo pipefail
 
-CONFIG="suites/1up-search/evals.yaml"
 PROMPTFOO="node_modules/.bin/promptfoo"
-TESTS=("Search Stack" "WordPress Import" "Plugin Architecture" "Live Content Query")
+
+SEARCH_CONFIG="suites/1up-search/evals.yaml"
+SEARCH_TESTS=("Search Stack" "WordPress Import" "Plugin Architecture" "Live Content Query")
+
+IMPACT_CONFIG="suites/1up-impact/evals.yaml"
+IMPACT_TESTS=("FTSManager Impact" "Schema Registry Impact" "Plugin Runner Impact")
+
 PIDS=()
+LABELS=()
 TMPDIR=$(mktemp -d)
 
-echo "Running ${#TESTS[@]} tests in parallel..."
+TOTAL=$(( ${#SEARCH_TESTS[@]} + ${#IMPACT_TESTS[@]} ))
+echo "Running $TOTAL tests in parallel (${#SEARCH_TESTS[@]} search + ${#IMPACT_TESTS[@]} impact)..."
 echo
 
-for i in "${!TESTS[@]}"; do
-  LOG="$TMPDIR/eval-$i.log"
-  $PROMPTFOO eval -c "$CONFIG" --filter-pattern "^${TESTS[$i]}$" > "$LOG" 2>&1 &
+for i in "${!SEARCH_TESTS[@]}"; do
+  LOG="$TMPDIR/search-$i.log"
+  $PROMPTFOO eval -c "$SEARCH_CONFIG" --filter-pattern "^${SEARCH_TESTS[$i]}$" > "$LOG" 2>&1 &
   PIDS+=($!)
-  echo "  Started: ${TESTS[$i]} (pid $!)"
+  LABELS+=("${SEARCH_TESTS[$i]}")
+  echo "  Started: ${SEARCH_TESTS[$i]} (pid $!)"
+done
+
+for i in "${!IMPACT_TESTS[@]}"; do
+  LOG="$TMPDIR/impact-$i.log"
+  $PROMPTFOO eval -c "$IMPACT_CONFIG" --filter-pattern "^${IMPACT_TESTS[$i]}$" > "$LOG" 2>&1 &
+  PIDS+=($!)
+  LABELS+=("${IMPACT_TESTS[$i]}")
+  echo "  Started: ${IMPACT_TESTS[$i]} (pid $!)"
 done
 
 echo
@@ -26,9 +42,9 @@ echo "Waiting for all tests to complete..."
 FAILED=0
 for i in "${!PIDS[@]}"; do
   if wait "${PIDS[$i]}" 2>/dev/null; then
-    echo "  ✓ ${TESTS[$i]}"
+    echo "  ✓ ${LABELS[$i]}"
   else
-    echo "  ✗ ${TESTS[$i]}"
+    echo "  ✗ ${LABELS[$i]}"
     FAILED=$((FAILED + 1))
   fi
 done

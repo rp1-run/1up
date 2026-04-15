@@ -1,0 +1,5 @@
+Your working directory is {{WORKSPACE_DIR}}.
+
+{{TASK_PROMPT}}
+
+Be concise. Use standard CLI tools (grep, rg, find, cat) for code exploration. Focus on listing the affected files and explaining why each would be impacted.

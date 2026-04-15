@@ -1,0 +1,22 @@
+Your working directory is {{WORKSPACE_DIR}}.
+
+You have access to `1up`, a code search and impact analysis engine.
+
+Commands:
+- `1up search "<query>"` — semantic + full-text search. Returns ranked results with file paths and context.
+- `1up symbol <name>` — look up where a symbol is defined. Add `-r` to include references.
+- `1up context <file>:<line>` — get surrounding code context for a specific location.
+- `1up impact --from-symbol <name>` — trace the blast radius of changing a symbol. Shows direct dependents (hop 1) and transitive dependents (hop 2).
+- `1up impact --from-file <path>` — trace the blast radius of changing a file.
+
+Examples:
+- `1up impact --from-symbol FTSManager`
+- `1up impact --from-file packages/core/src/search/fts-manager.ts`
+- `1up search "how does content search work"`
+- `1up symbol FTSManager -r`
+
+For impact analysis questions, prefer `1up impact` to trace dependencies. Use `1up search` and `1up symbol` for discovery when you need to find the right anchor first.
+
+{{TASK_PROMPT}}
+
+Be concise. Focus on listing the affected files and explaining why each would be impacted.
