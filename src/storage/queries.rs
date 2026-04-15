@@ -82,6 +82,17 @@ pub const CREATE_INDEX_SEGMENT_RELATIONS_TARGET: &str =
 pub const CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_relations_lookup_target ON segment_relations(lookup_canonical_symbol, relation_kind)";
 
+pub const CREATE_INDEXED_FILES_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS indexed_files (
+    file_path TEXT PRIMARY KEY,
+    extension TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
     content,
@@ -135,6 +146,7 @@ DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
 DROP TABLE IF EXISTS segments;
+DROP TABLE IF EXISTS indexed_files;
 DROP TABLE IF EXISTS meta";
 
 pub const SELECT_SCHEMA_OBJECT: &str =
@@ -451,3 +463,23 @@ ORDER BY
   LENGTH(canonical_symbol),
   canonical_symbol
 LIMIT ?3";
+
+pub const SELECT_ALL_INDEXED_FILES: &str = "
+SELECT file_path, extension, file_hash, file_size, modified_ns
+FROM indexed_files
+ORDER BY file_path";
+
+pub const SELECT_INDEXED_FILE: &str = "
+SELECT file_path, extension, file_hash, file_size, modified_ns
+FROM indexed_files
+WHERE file_path = ?1";
+
+pub const UPSERT_INDEXED_FILE: &str = "
+INSERT OR REPLACE INTO indexed_files (
+    file_path, extension, file_hash, file_size, modified_ns,
+    created_at, updated_at
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now')
+)";
+
+pub const DELETE_INDEXED_FILE: &str = "DELETE FROM indexed_files WHERE file_path = ?1";

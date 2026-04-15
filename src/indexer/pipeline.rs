@@ -144,7 +144,7 @@ use crate::shared::types::{
     ParsedSegment, RunScope,
 };
 use crate::storage::schema;
-use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
+use crate::storage::segments::{self, FileSegmentBatch, IndexedFileMeta, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 pub type ProgressSender = Sender<IndexProgress>;
@@ -217,12 +217,17 @@ struct ScannedWorkItem {
     path: PathBuf,
     extension: String,
     stored_hash: Option<String>,
+    file_size: u64,
+    modified_ns: i64,
 }
 
 #[derive(Debug)]
 struct ParsedWorkItem {
     relative_path: String,
     file_hash: String,
+    extension: String,
+    file_size: u64,
+    modified_ns: i64,
     segments: Vec<ParsedSegment>,
 }
 
@@ -259,6 +264,7 @@ fn relative_path_for(project_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 fn build_scanned_work_items(
     project_root: &Path,
     scanned: Vec<scanner::ScannedFile>,
@@ -280,6 +286,8 @@ fn build_scanned_work_items(
                 path: scanned_file.path,
                 extension: scanned_file.extension,
                 stored_hash,
+                file_size: scanned_file.file_size,
+                modified_ns: scanned_file.modified_ns,
             }
         })
         .collect()
@@ -288,6 +296,7 @@ fn build_scanned_work_items(
 struct RunInputs {
     scanned_files: Vec<ScannedWorkItem>,
     deleted_paths: Vec<String>,
+    metadata_unchanged_count: usize,
 }
 
 enum ScopePreparation {
@@ -320,22 +329,61 @@ async fn prepare_full_run_inputs(
     project_root: &Path,
 ) -> Result<RunInputs, OneupError> {
     let scanned = scanner::scan_directory(project_root)?;
+    let manifest = segments::get_all_indexed_files(conn).await?;
     let stored_hashes = segments::get_all_file_hashes(conn).await?;
-    let scanned_files = build_scanned_work_items(project_root, scanned, &stored_hashes);
 
-    let scanned_paths: HashSet<String> = scanned_files
-        .iter()
-        .map(|file| file.relative_path.clone())
-        .collect();
+    let project_root_canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let mut scanned_files = Vec::new();
+    let mut scanned_paths = HashSet::new();
+    let mut metadata_unchanged_count = 0usize;
+
+    for scanned_file in scanned {
+        let relative_path = relative_path_for(&project_root_canonical, &scanned_file.path);
+        scanned_paths.insert(relative_path.clone());
+
+        if let Some(entry) = manifest.get(&relative_path) {
+            if entry.file_size == scanned_file.file_size as i64
+                && entry.modified_ns == scanned_file.modified_ns
+            {
+                metadata_unchanged_count += 1;
+                continue;
+            }
+        }
+
+        let stored_hash = stored_hashes.get(&relative_path).cloned();
+        scanned_files.push(ScannedWorkItem {
+            sequence_id: scanned_files.len(),
+            relative_path,
+            path: scanned_file.path,
+            extension: scanned_file.extension,
+            stored_hash,
+            file_size: scanned_file.file_size,
+            modified_ns: scanned_file.modified_ns,
+        });
+    }
+
+    let manifest_paths: HashSet<&String> = manifest.keys().collect();
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
         .into_iter()
         .collect();
-    let deleted_paths = indexed_paths.difference(&scanned_paths).cloned().collect();
+    let all_known_paths: HashSet<&String> = manifest_paths
+        .into_iter()
+        .chain(indexed_paths.iter())
+        .collect();
+    let deleted_paths = all_known_paths
+        .into_iter()
+        .filter(|p| !scanned_paths.contains(*p))
+        .cloned()
+        .collect();
 
     Ok(RunInputs {
         scanned_files,
         deleted_paths,
+        metadata_unchanged_count,
     })
 }
 
@@ -348,6 +396,7 @@ async fn prepare_scoped_run_inputs(
         return Ok(ScopePreparation::Ready(RunInputs {
             scanned_files: Vec::new(),
             deleted_paths: Vec::new(),
+            metadata_unchanged_count: 0,
         }));
     }
 
@@ -359,6 +408,7 @@ async fn prepare_scoped_run_inputs(
 
     let mut scanned_files = Vec::new();
     let mut deleted_paths = Vec::new();
+    let mut metadata_unchanged_count = 0usize;
 
     for relative_path in changed_paths {
         if requires_full_scope_fallback(relative_path) {
@@ -379,14 +429,25 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
-            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
             if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
+                if let Some(entry) = segments::get_indexed_file(conn, &relative_string).await? {
+                    if entry.file_size == scanned_file.file_size as i64
+                        && entry.modified_ns == scanned_file.modified_ns
+                    {
+                        metadata_unchanged_count += 1;
+                        continue;
+                    }
+                }
+
+                let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
                 scanned_files.push(ScannedWorkItem {
                     sequence_id: scanned_files.len(),
                     relative_path: relative_string,
                     path: scanned_file.path,
                     extension: scanned_file.extension,
                     stored_hash,
+                    file_size: scanned_file.file_size,
+                    modified_ns: scanned_file.modified_ns,
                 });
                 continue;
             }
@@ -398,6 +459,7 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
+            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
             if stored_hash.is_some() {
                 return Ok(ScopePreparation::FallbackToFull(format!(
                     "path {} no longer matches scanner filters",
@@ -427,6 +489,7 @@ async fn prepare_scoped_run_inputs(
     Ok(ScopePreparation::Ready(RunInputs {
         scanned_files,
         deleted_paths,
+        metadata_unchanged_count,
     }))
 }
 
@@ -482,6 +545,9 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
     ParseResultKind::Ready(ParsedWorkItem {
         relative_path: scanned_file.relative_path,
         file_hash,
+        extension: scanned_file.extension,
+        file_size: scanned_file.file_size,
+        modified_ns: scanned_file.modified_ns,
         segments,
     })
 }
@@ -582,16 +648,29 @@ fn build_segment_batches(
     Ok(batches)
 }
 
+fn build_manifest_meta(file: &ParsedWorkItem) -> IndexedFileMeta {
+    IndexedFileMeta {
+        extension: file.extension.clone(),
+        file_hash: file.file_hash.clone(),
+        file_size: file.file_size as i64,
+        modified_ns: file.modified_ns,
+    }
+}
+
 async fn replace_file_batches(
     conn: &Connection,
     parsed_files: &[ParsedWorkItem],
     segment_batches: &[Vec<SegmentInsert>],
 ) -> Result<(), OneupError> {
+    let manifest_metas: Vec<IndexedFileMeta> =
+        parsed_files.iter().map(build_manifest_meta).collect();
+
     if parsed_files.len() == 1 {
-        return segments::replace_file_segments_tx(
+        return segments::replace_file_segments_tx_with_meta(
             conn,
             &parsed_files[0].relative_path,
             &segment_batches[0],
+            Some(&manifest_metas[0]),
         )
         .await;
     }
@@ -599,9 +678,11 @@ async fn replace_file_batches(
     let file_batches: Vec<FileSegmentBatch<'_>> = parsed_files
         .iter()
         .zip(segment_batches.iter())
-        .map(|(file, segments)| FileSegmentBatch {
+        .zip(manifest_metas.iter())
+        .map(|((file, segments), meta)| FileSegmentBatch {
             file_path: file.relative_path.as_str(),
             segments,
+            manifest_meta: Some(meta),
         })
         .collect();
 
@@ -651,6 +732,7 @@ async fn delete_removed_files(
             .map(|path| FileSegmentBatch {
                 file_path: path.as_str(),
                 segments: &[],
+                manifest_meta: None,
             })
             .collect();
         segments::replace_file_batch_tx(conn, &file_batches).await?;
@@ -945,10 +1027,12 @@ async fn execute_run_with_inputs(
     let RunInputs {
         scanned_files,
         deleted_paths,
+        metadata_unchanged_count,
     } = run_inputs;
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
+    stats.files_skipped += metadata_unchanged_count;
     let mut parallelism = Some(config.reporting_parallelism(0, has_embedder));
 
     if !has_embedder {
@@ -977,7 +1061,7 @@ async fn execute_run_with_inputs(
     );
     let scan_started_at = Instant::now();
 
-    stats.files_scanned = scanned_files.len();
+    stats.files_scanned = scanned_files.len() + metadata_unchanged_count;
     let total_files = scanned_files.len();
     progress_ui.set_state(pipeline_progress_ui_state(
         &stats,
@@ -987,9 +1071,18 @@ async fn execute_run_with_inputs(
     timings.scan_ms = scan_started_at.elapsed().as_millis();
     parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
 
+    if metadata_unchanged_count > 0 {
+        info!(
+            "metadata prefilter: {} files skipped (unchanged), {} files need processing",
+            metadata_unchanged_count, total_files,
+        );
+    }
+
     if let Some(parallelism) = &parallelism {
         info!(
-            "scan stage complete: {} files discovered in {}ms (jobs configured {}, effective {}, embed threads {})",
+            "scan stage complete: {} files discovered ({} metadata-unchanged, {} to process) in {}ms (jobs configured {}, effective {}, embed threads {})",
+            stats.files_scanned,
+            metadata_unchanged_count,
             total_files,
             timings.scan_ms,
             parallelism.jobs_configured,

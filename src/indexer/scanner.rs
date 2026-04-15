@@ -49,11 +49,13 @@ const DEFAULT_IGNORE_DIRS: &[&str] = &[
     "!coverage/",
 ];
 
-/// A scanned file entry with its path and detected extension.
+/// A scanned file entry with its path, detected extension, and filesystem metadata.
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
     pub path: PathBuf,
     pub extension: String,
+    pub file_size: u64,
+    pub modified_ns: i64,
 }
 
 fn detect_file_type(path: &Path) -> Option<String> {
@@ -108,6 +110,16 @@ fn build_walker(root: &Path, path: &Path) -> Result<WalkBuilder, OneupError> {
     Ok(builder)
 }
 
+fn file_modified_ns(metadata: &std::fs::Metadata) -> i64 {
+    use std::time::UNIX_EPOCH;
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|dur| dur.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 fn collect_scanned_files(walker: ignore::Walk) -> Result<Vec<ScannedFile>, OneupError> {
     let mut files = Vec::new();
 
@@ -123,7 +135,17 @@ fn collect_scanned_files(walker: ignore::Walk) -> Result<Vec<ScannedFile>, Oneup
             continue;
         };
 
-        files.push(ScannedFile { path, extension });
+        let (file_size, modified_ns) = match std::fs::metadata(&path) {
+            Ok(meta) => (meta.len(), file_modified_ns(&meta)),
+            Err(_) => (0, 0),
+        };
+
+        files.push(ScannedFile {
+            path,
+            extension,
+            file_size,
+            modified_ns,
+        });
     }
 
     Ok(files)

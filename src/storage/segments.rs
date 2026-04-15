@@ -81,12 +81,22 @@ pub struct SegmentInsert {
     pub file_hash: String,
 }
 
+/// Metadata for updating the indexed-files manifest alongside segment writes.
+#[derive(Debug, Clone)]
+pub struct IndexedFileMeta {
+    pub extension: String,
+    pub file_hash: String,
+    pub file_size: i64,
+    pub modified_ns: i64,
+}
+
 /// Parameters for replacing one file's indexed contents inside a batch transaction.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct FileSegmentBatch<'a> {
     pub file_path: &'a str,
     pub segments: &'a [SegmentInsert],
+    pub manifest_meta: Option<&'a IndexedFileMeta>,
 }
 
 struct SegmentSymbolInsert {
@@ -215,7 +225,17 @@ pub async fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, St
 }
 
 /// Delete all segments for a given file path.
+#[allow(dead_code)]
 pub async fn delete_segments_by_file(
+    conn: &Connection,
+    file_path: &str,
+) -> Result<u64, OneupError> {
+    let count = delete_segments_by_file_only(conn, file_path).await?;
+    delete_indexed_file(conn, file_path).await?;
+    Ok(count)
+}
+
+async fn delete_segments_by_file_only(
     conn: &Connection,
     file_path: &str,
 ) -> Result<u64, OneupError> {
@@ -262,13 +282,23 @@ pub async fn replace_file_segments_tx(
     file_path: &str,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
+    replace_file_segments_tx_with_meta(conn, file_path, segments, None).await
+}
+
+/// Replace all stored segments for a single file in one transaction, updating the manifest.
+pub async fn replace_file_segments_tx_with_meta(
+    conn: &Connection,
+    file_path: &str,
+    segments: &[SegmentInsert],
+    manifest_meta: Option<&IndexedFileMeta>,
+) -> Result<(), OneupError> {
     validate_replace_segments(file_path, segments)?;
 
     let tx = conn.transaction().await.map_err(|e| {
         StorageError::Transaction(format!("begin file replace transaction failed: {e}"))
     })?;
 
-    replace_file_segments_in_transaction(&tx, file_path, segments).await?;
+    replace_file_segments_in_transaction_with_meta(&tx, file_path, segments, manifest_meta).await?;
 
     tx.commit().await.map_err(|e| {
         StorageError::Transaction(format!("commit file replace transaction failed: {e}"))
@@ -290,7 +320,13 @@ pub async fn replace_file_batch_tx(
     })?;
 
     for batch in batches {
-        replace_file_segments_in_transaction(&tx, batch.file_path, batch.segments).await?;
+        replace_file_segments_in_transaction_with_meta(
+            &tx,
+            batch.file_path,
+            batch.segments,
+            batch.manifest_meta,
+        )
+        .await?;
     }
 
     tx.commit().await.map_err(|e| {
@@ -621,7 +657,16 @@ async fn replace_file_segments_in_transaction(
     file_path: &str,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
-    delete_segments_by_file(conn, file_path).await?;
+    replace_file_segments_in_transaction_with_meta(conn, file_path, segments, None).await
+}
+
+async fn replace_file_segments_in_transaction_with_meta(
+    conn: &Connection,
+    file_path: &str,
+    segments: &[SegmentInsert],
+    manifest_meta: Option<&IndexedFileMeta>,
+) -> Result<(), OneupError> {
+    delete_segments_by_file_only(conn, file_path).await?;
 
     let mut relation_rows = Vec::new();
     for segment in segments {
@@ -630,6 +675,20 @@ async fn replace_file_segments_in_transaction(
     }
 
     relations::insert_relations(conn, &relation_rows).await?;
+
+    if let Some(meta) = manifest_meta {
+        upsert_indexed_file(
+            conn,
+            file_path,
+            &meta.extension,
+            &meta.file_hash,
+            meta.file_size,
+            meta.modified_ns,
+        )
+        .await?;
+    } else if segments.is_empty() {
+        delete_indexed_file(conn, file_path).await?;
+    }
 
     Ok(())
 }
@@ -685,6 +744,121 @@ pub fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupEr
             .get(15)
             .map_err(|e| StorageError::Query(format!("read updated_at failed: {e}")))?,
     })
+}
+
+/// A row from the `indexed_files` manifest table.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct IndexedFileEntry {
+    pub file_path: String,
+    pub extension: String,
+    pub file_hash: String,
+    pub file_size: i64,
+    pub modified_ns: i64,
+}
+
+/// Load the full indexed-files manifest keyed by file path.
+pub async fn get_all_indexed_files(
+    conn: &Connection,
+) -> Result<HashMap<String, IndexedFileEntry>, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_ALL_INDEXED_FILES, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("query all indexed files failed: {e}")))?;
+
+    let mut entries = HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let file_path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        entries.insert(
+            file_path.clone(),
+            IndexedFileEntry {
+                file_path,
+                extension: row
+                    .get(1)
+                    .map_err(|e| StorageError::Query(format!("read extension failed: {e}")))?,
+                file_hash: row
+                    .get(2)
+                    .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
+                file_size: row
+                    .get(3)
+                    .map_err(|e| StorageError::Query(format!("read file_size failed: {e}")))?,
+                modified_ns: row
+                    .get(4)
+                    .map_err(|e| StorageError::Query(format!("read modified_ns failed: {e}")))?,
+            },
+        );
+    }
+
+    Ok(entries)
+}
+
+/// Load a single indexed-file entry by path.
+#[allow(dead_code)]
+pub async fn get_indexed_file(
+    conn: &Connection,
+    file_path: &str,
+) -> Result<Option<IndexedFileEntry>, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_INDEXED_FILE, [file_path])
+        .await
+        .map_err(|e| StorageError::Query(format!("query indexed file failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => Ok(Some(IndexedFileEntry {
+            file_path: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?,
+            extension: row
+                .get(1)
+                .map_err(|e| StorageError::Query(format!("read extension failed: {e}")))?,
+            file_hash: row
+                .get(2)
+                .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
+            file_size: row
+                .get(3)
+                .map_err(|e| StorageError::Query(format!("read file_size failed: {e}")))?,
+            modified_ns: row
+                .get(4)
+                .map_err(|e| StorageError::Query(format!("read modified_ns failed: {e}")))?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Write or update an indexed-file manifest entry.
+pub async fn upsert_indexed_file(
+    conn: &Connection,
+    file_path: &str,
+    extension: &str,
+    file_hash: &str,
+    file_size: i64,
+    modified_ns: i64,
+) -> Result<(), OneupError> {
+    conn.execute(
+        queries::UPSERT_INDEXED_FILE,
+        libsql::params![file_path, extension, file_hash, file_size, modified_ns],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("upsert indexed file failed: {e}")))?;
+    Ok(())
+}
+
+/// Remove an indexed-file manifest entry.
+pub async fn delete_indexed_file(conn: &Connection, file_path: &str) -> Result<(), OneupError> {
+    conn.execute(queries::DELETE_INDEXED_FILE, [file_path])
+        .await
+        .map_err(|e| StorageError::Query(format!("delete indexed file failed: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1203,10 +1377,12 @@ mod tests {
                 FileSegmentBatch {
                     file_path: "src/a.rs",
                     segments: &replacement_a,
+                    manifest_meta: None,
                 },
                 FileSegmentBatch {
                     file_path: "src/b.rs",
                     segments: &replacement_b,
+                    manifest_meta: None,
                 },
             ],
         )

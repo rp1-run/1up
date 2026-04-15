@@ -12,6 +12,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segment_vectors"),
     ("table", "segment_symbols"),
     ("table", "segment_relations"),
+    ("table", "indexed_files"),
     ("table", "segments_fts"),
     ("table", "meta"),
     ("index", "idx_segments_file_path"),
@@ -34,7 +35,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{}",
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
@@ -42,6 +43,7 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         queries::CREATE_SEGMENT_VECTORS_TABLE,
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
         queries::CREATE_SEGMENT_RELATIONS_TABLE,
+        queries::CREATE_INDEXED_FILES_TABLE,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
@@ -583,7 +585,7 @@ mod tests {
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v8, expected v10"));
+        assert!(msg.contains("found v8, expected v11"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
@@ -636,7 +638,7 @@ mod tests {
             .await
             .unwrap();
         conn.execute_batch(&format!(
-            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
             queries::CREATE_SEGMENTS_TABLE,
             queries::CREATE_INDEX_FILE_PATH,
             queries::CREATE_INDEX_LANGUAGE,
@@ -658,6 +660,7 @@ mod tests {
                     raw_target_symbol
                 )
             )",
+            queries::CREATE_INDEXED_FILES_TABLE,
             queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
             queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
             queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
