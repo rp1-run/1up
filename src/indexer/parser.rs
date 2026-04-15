@@ -2,6 +2,11 @@ use tree_sitter::{Language, Node, Parser};
 use tree_sitter_language::LanguageFn;
 
 use crate::shared::errors::ParserError;
+use crate::shared::symbols::{
+    normalize_edge_identity_kind, EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE,
+    EDGE_IDENTITY_MACRO_LIKE, EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER,
+    EDGE_IDENTITY_QUALIFIED_PATH,
+};
 use crate::shared::types::{ParsedSegment, SegmentRole};
 
 /// Supported language identifiers and their tree-sitter grammars.
@@ -1352,15 +1357,61 @@ fn collect_variable_names(node: &Node, source: &[u8], symbols: &mut Vec<String>)
 }
 
 fn collect_referenced_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
-    let mut refs = Vec::new();
-    let defined = collect_defined_symbols(node, source, lang);
-    walk_references(node, source, lang, &defined, &mut refs);
-    refs.sort();
+    let mut refs = collect_referenced_relations(node, source, lang)
+        .into_iter()
+        .map(|relation| relation.symbol)
+        .collect::<Vec<_>>();
     refs.dedup();
     refs
 }
 
 fn collect_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
+    let mut calls = Vec::new();
+    for relation in collect_called_relations(node, source, lang) {
+        if !calls.contains(&relation.symbol) {
+            calls.push(relation.symbol);
+        }
+    }
+    calls
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedRelation {
+    symbol: String,
+    edge_identity_kind: String,
+}
+
+impl ExtractedRelation {
+    fn new(symbol: String, edge_identity_kind: &str) -> Self {
+        Self {
+            symbol,
+            edge_identity_kind: normalize_edge_identity_kind(edge_identity_kind),
+        }
+    }
+}
+
+fn collect_referenced_relations(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Vec<ExtractedRelation> {
+    let mut refs = Vec::new();
+    let defined = collect_defined_symbols(node, source, lang);
+    walk_references(node, source, lang, &defined, &mut refs);
+    refs.sort_by(|left, right| {
+        left.symbol
+            .cmp(&right.symbol)
+            .then(left.edge_identity_kind.cmp(&right.edge_identity_kind))
+    });
+    refs.dedup();
+    refs
+}
+
+fn collect_called_relations(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Vec<ExtractedRelation> {
     let mut calls = Vec::new();
     walk_called_symbols(node, source, lang, &mut calls);
     calls
@@ -1371,7 +1422,7 @@ fn walk_references(
     source: &[u8],
     lang: SupportedLanguage,
     defined: &[String],
-    refs: &mut Vec<String>,
+    refs: &mut Vec<ExtractedRelation>,
 ) {
     let kind = node.kind();
 
@@ -1408,7 +1459,10 @@ fn walk_references(
             let name = text.to_string();
             if !defined.contains(&name) && !is_keyword(lang, &name) && !is_builtin_type(lang, &name)
             {
-                refs.push(name);
+                refs.push(ExtractedRelation::new(
+                    name,
+                    &reference_edge_identity_kind(node, source),
+                ));
             }
         }
     }
@@ -1423,10 +1477,10 @@ fn walk_called_symbols(
     node: &Node,
     source: &[u8],
     lang: SupportedLanguage,
-    calls: &mut Vec<String>,
+    calls: &mut Vec<ExtractedRelation>,
 ) {
-    if let Some(call_target) = extract_call_target(node, source, lang) {
-        if !call_target.is_empty() && !calls.contains(&call_target) {
+    if let Some(call_target) = extract_call_relation(node, source, lang) {
+        if !call_target.symbol.is_empty() && !calls.contains(&call_target) {
             calls.push(call_target);
         }
     }
@@ -1437,49 +1491,66 @@ fn walk_called_symbols(
     }
 }
 
-fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> Option<String> {
+fn extract_call_relation(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Option<ExtractedRelation> {
     match lang {
         SupportedLanguage::Rust => match node.kind() {
             "call_expression" | "method_call_expression" | "macro_invocation" => {
-                extract_rust_call_target(node, source)
+                extract_rust_call_relation(node, source)
             }
             _ => None,
         },
         SupportedLanguage::Python => match node.kind() {
-            "call" => extract_child_text(node, source, &["function"]),
+            "call" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
-            "new_expression" => extract_child_text(node, source, &["constructor", "function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
+            "new_expression" => extract_relation_from_fields(
+                node,
+                source,
+                &["constructor", "function"],
+                Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+            ),
             _ => None,
         },
         SupportedLanguage::Go => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Java => match node.kind() {
             "method_invocation" => {
                 let name = extract_child_text(node, source, &["name"])?;
                 if let Some(object) = extract_child_text(node, source, &["object"]) {
-                    Some(format!("{object}.{name}"))
+                    Some(ExtractedRelation::new(
+                        format!("{object}.{name}"),
+                        EDGE_IDENTITY_METHOD_RECEIVER,
+                    ))
                 } else {
-                    Some(name)
+                    Some(ExtractedRelation::new(name, EDGE_IDENTITY_BARE_IDENTIFIER))
                 }
             }
-            "object_creation_expression" => extract_child_text(node, source, &["type"]),
+            "object_creation_expression" => extract_relation_from_fields(
+                node,
+                source,
+                &["type"],
+                Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+            ),
             _ => None,
         },
         SupportedLanguage::C | SupportedLanguage::Cpp => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Kotlin => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Bash => match node.kind() {
-            "command" => extract_child_text(node, source, &["name"]),
+            "command" => extract_relation_from_fields(node, source, &["name"], None),
             _ => None,
         },
         SupportedLanguage::Css
@@ -1489,6 +1560,29 @@ fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> O
         | SupportedLanguage::Yaml
         | SupportedLanguage::Markdown => None,
     }
+}
+
+fn extract_relation_from_fields(
+    node: &Node,
+    source: &[u8],
+    fields: &[&str],
+    edge_identity_kind: Option<&str>,
+) -> Option<ExtractedRelation> {
+    for field in fields {
+        if let Some(child) = node.child_by_field_name(field) {
+            if let Ok(text) = child.utf8_text(source) {
+                let trimmed = sanitize_call_target(text);
+                if !trimmed.is_empty() {
+                    let edge_identity_kind = edge_identity_kind
+                        .map(str::to_string)
+                        .unwrap_or_else(|| relation_edge_identity_kind(node, &child, source));
+                    return Some(ExtractedRelation::new(trimmed, &edge_identity_kind));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn extract_child_text(node: &Node, source: &[u8], fields: &[&str]) -> Option<String> {
@@ -1522,20 +1616,29 @@ fn extract_last_named_text(node: &Node, source: &[u8]) -> Option<String> {
     last_text
 }
 
-fn extract_rust_call_target(node: &Node, source: &[u8]) -> Option<String> {
+fn extract_rust_call_relation(node: &Node, source: &[u8]) -> Option<ExtractedRelation> {
     match node.kind() {
-        "call_expression" => node
-            .child_by_field_name("function")
-            .and_then(|function| render_rust_callable(&function, source)),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let symbol = render_rust_callable(&function, source)?;
+            Some(ExtractedRelation::new(
+                symbol,
+                &relation_edge_identity_kind(node, &function, source),
+            ))
+        }
         "method_call_expression" => {
             let receiver = node
                 .child_by_field_name("receiver")
                 .and_then(|receiver| render_rust_callable(&receiver, source))?;
             let method = extract_child_text(node, source, &["method", "name"])
                 .or_else(|| extract_last_named_text(node, source))?;
-            Some(format!("{receiver}.{method}"))
+            Some(ExtractedRelation::new(
+                format!("{receiver}.{method}"),
+                EDGE_IDENTITY_METHOD_RECEIVER,
+            ))
         }
-        "macro_invocation" => extract_child_text(node, source, &["macro", "name"]),
+        "macro_invocation" => extract_child_text(node, source, &["macro", "name"])
+            .map(|symbol| ExtractedRelation::new(symbol, EDGE_IDENTITY_MACRO_LIKE)),
         _ => None,
     }
 }
@@ -1570,12 +1673,91 @@ fn render_rust_callable(node: &Node, source: &[u8]) -> Option<String> {
         "call_expression" => node
             .child_by_field_name("function")
             .and_then(|function| render_rust_callable(&function, source)),
-        "method_call_expression" => extract_rust_call_target(node, source),
+        "method_call_expression" => {
+            extract_rust_call_relation(node, source).map(|relation| relation.symbol)
+        }
         _ => node
             .utf8_text(source)
             .ok()
             .map(sanitize_call_target)
             .filter(|text| !text.is_empty()),
+    }
+}
+
+fn reference_edge_identity_kind(node: &Node, source: &[u8]) -> String {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if let Some(edge_identity_kind) = call_context_edge_identity_kind(&candidate, source) {
+            return edge_identity_kind;
+        }
+        current = candidate.parent();
+    }
+
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if let Some(edge_identity_kind) = explicit_edge_identity_kind(candidate.kind()) {
+            return normalize_edge_identity_kind(edge_identity_kind);
+        }
+        current = candidate.parent();
+    }
+
+    edge_identity_kind_for_node(node, source)
+}
+
+fn relation_edge_identity_kind(node: &Node, target: &Node, source: &[u8]) -> String {
+    call_context_edge_identity_kind(node, source)
+        .unwrap_or_else(|| edge_identity_kind_for_node(target, source))
+}
+
+fn call_context_edge_identity_kind(node: &Node, source: &[u8]) -> Option<String> {
+    let target = match node.kind() {
+        "call_expression" | "call" => node.child_by_field_name("function"),
+        "method_call_expression" | "method_invocation" => {
+            return Some(normalize_edge_identity_kind(EDGE_IDENTITY_METHOD_RECEIVER));
+        }
+        _ => None,
+    }?;
+
+    let edge_identity_kind = edge_identity_kind_for_node(&target, source);
+    Some(if edge_identity_kind == EDGE_IDENTITY_MEMBER_ACCESS {
+        normalize_edge_identity_kind(EDGE_IDENTITY_METHOD_RECEIVER)
+    } else {
+        edge_identity_kind
+    })
+}
+
+fn edge_identity_kind_for_node(node: &Node, source: &[u8]) -> String {
+    if let Some(edge_identity_kind) = explicit_edge_identity_kind(node.kind()) {
+        return normalize_edge_identity_kind(edge_identity_kind);
+    }
+
+    let text = node.utf8_text(source).unwrap_or("");
+    if text.contains("::") {
+        return normalize_edge_identity_kind(EDGE_IDENTITY_QUALIFIED_PATH);
+    }
+    if (text.contains('.') && !text.contains('/')) || text.contains("->") {
+        return normalize_edge_identity_kind(EDGE_IDENTITY_MEMBER_ACCESS);
+    }
+
+    normalize_edge_identity_kind(EDGE_IDENTITY_BARE_IDENTIFIER)
+}
+
+fn explicit_edge_identity_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "scoped_identifier"
+        | "qualified_identifier"
+        | "qualified_name"
+        | "namespace_identifier"
+        | "path_expression" => Some(EDGE_IDENTITY_QUALIFIED_PATH),
+        "field_expression"
+        | "member_expression"
+        | "field_access"
+        | "navigation_expression"
+        | "attribute" => Some(EDGE_IDENTITY_MEMBER_ACCESS),
+        "method_call_expression" | "method_invocation" => Some(EDGE_IDENTITY_METHOD_RECEIVER),
+        "new_expression" | "object_creation_expression" => Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+        "macro_invocation" => Some(EDGE_IDENTITY_MACRO_LIKE),
+        _ => None,
     }
 }
 
@@ -2187,6 +2369,29 @@ fn is_builtin_type(lang: SupportedLanguage, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::{Language, Parser as TsParser, Tree};
+
+    fn parse_tree(source: &str, lang: SupportedLanguage) -> Tree {
+        let ts_language = Language::new(lang.language_fn());
+        let mut parser = TsParser::new();
+        parser.set_language(&ts_language).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn find_first_named_node<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_first_named_node(child, kind) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
 
     #[test]
     fn test_parse_rust_functions_and_structs() {
@@ -2568,6 +2773,94 @@ fn process(data: Vec<Item>) -> Result<Output, Error> {
         assert!(func.referenced_symbols.contains(&"Config".to_string()));
         assert!(func.referenced_symbols.contains(&"Processor".to_string()));
         assert!(!func.referenced_symbols.contains(&"process".to_string()));
+    }
+
+    #[test]
+    fn test_called_relations_assign_edge_identity_kinds() {
+        let source = r#"
+fn process(config: Config, worker: Worker) {
+    load_config();
+    crate::auth::config::load_config();
+    worker.run();
+    tracing::info!("ready");
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::Rust);
+        let function = find_first_named_node(tree.root_node(), "function_item").unwrap();
+        let relations =
+            collect_called_relations(&function, source.as_bytes(), SupportedLanguage::Rust);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "load_config".to_string(),
+            EDGE_IDENTITY_BARE_IDENTIFIER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "crate::auth::config::load_config".to_string(),
+            EDGE_IDENTITY_QUALIFIED_PATH,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "worker.run".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "tracing::info".to_string(),
+            EDGE_IDENTITY_MACRO_LIKE,
+        )));
+    }
+
+    #[test]
+    fn test_constructor_and_member_call_relations_use_normalized_edge_identity() {
+        let source = r#"
+function build(service) {
+    new WidgetFactory();
+    service.client.fetch();
+    run();
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::JavaScript);
+        let function = find_first_named_node(tree.root_node(), "function_declaration").unwrap();
+        let relations =
+            collect_called_relations(&function, source.as_bytes(), SupportedLanguage::JavaScript);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "WidgetFactory".to_string(),
+            EDGE_IDENTITY_CONSTRUCTOR_LIKE,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "service.client.fetch".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "run".to_string(),
+            EDGE_IDENTITY_BARE_IDENTIFIER,
+        )));
+    }
+
+    #[test]
+    fn test_referenced_relations_assign_edge_identity_kinds() {
+        let source = r#"
+fn process(worker: Worker) {
+    let loader = crate::auth::Config::load();
+    worker.run();
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::Rust);
+        let function = find_first_named_node(tree.root_node(), "function_item").unwrap();
+        let relations =
+            collect_referenced_relations(&function, source.as_bytes(), SupportedLanguage::Rust);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "Config".to_string(),
+            EDGE_IDENTITY_QUALIFIED_PATH,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "worker".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "run".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
     }
 
     #[test]
