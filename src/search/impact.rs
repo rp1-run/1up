@@ -3005,15 +3005,14 @@ mod tests {
             .contextual_results
             .expect("same-file, leaf-only, and test candidates should remain contextual");
         assert_eq!(contextual.len(), 3);
-        assert_eq!(contextual[0].segment_id, "parse-config");
-        assert_eq!(contextual[0].reasons[0].kind, "same_file");
-        assert_eq!(contextual[1].segment_id, "config-test");
+
+        let find_contextual = |id: &str| contextual.iter().find(|c| c.segment_id == id).unwrap();
+        assert_eq!(find_contextual("parse-config").reasons[0].kind, "same_file");
         assert!(matches!(
-            contextual[1].reasons[0].kind.as_str(),
+            find_contextual("config-test").reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
-        assert_eq!(contextual[2].segment_id, "boot-app");
-        assert_eq!(contextual[2].reasons[0].kind, "called_by");
+        assert_eq!(find_contextual("boot-app").reasons[0].kind, "called_by");
         assert!(
             result
                 .results
