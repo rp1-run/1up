@@ -432,7 +432,14 @@ message PolicyRulePreview {
 
 fn create_impact_acceptance_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    for dir in ["src/app", "src/auth", "src/cache", "src/ui", "tests"] {
+    for dir in [
+        "src/admin",
+        "src/app",
+        "src/auth",
+        "src/cache",
+        "src/ui",
+        "tests",
+    ] {
         fs::create_dir_all(tmp.path().join(dir)).unwrap();
     }
 
@@ -556,6 +563,15 @@ pub fn warm_cache_for_request(user_key: &str) -> String {
         tmp.path().join("src").join("ui").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "ui"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("admin").join("config.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "admin"
 }
 "#,
     )

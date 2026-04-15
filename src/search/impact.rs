@@ -52,6 +52,7 @@ const ROLE_SIGNAL_THRESHOLD: f64 = 0.75;
 const MIN_PRIMARY_CORROBORATION_SIGNALS: usize = 2;
 const LOW_SIGNAL_WRAPPER_PENALTY: f64 = 0.82;
 const LOW_SIGNAL_DECLARATION_PENALTY: f64 = 0.68;
+const LOW_SIGNAL_UNALIGNED_RECEIVER_PENALTY: f64 = 0.35;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImpactAnchor {
@@ -161,6 +162,8 @@ struct AnchorResolution {
     resolved_anchor: ResolvedImpactAnchor,
     seeds: Vec<CandidateRow>,
     effective_scope: Option<String>,
+    anchor_symbols: HashSet<String>,
+    prefer_high_signal_paths: bool,
 }
 
 enum ResolveOutcome {
@@ -189,6 +192,7 @@ enum ObservationBucket {
     Contextual,
 }
 
+#[derive(Clone)]
 struct CandidateObservation {
     candidate: CandidateRow,
     score: f64,
@@ -258,6 +262,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         for hop in 1..=depth {
             let mut next_frontier = Vec::new();
             let mut queued = HashSet::new();
+            let mut hop_aggregates = HashMap::new();
 
             for source in &frontier {
                 let observations = self
@@ -273,18 +278,26 @@ impl<'a> ImpactHorizonEngine<'a> {
                         continue;
                     }
 
-                    let should_expand = observation.bucket == ObservationBucket::Primary;
-                    let candidate_for_frontier = observation.candidate.clone();
-                    let candidate_id = candidate_for_frontier.segment_id.clone();
-                    observe_candidate(&mut aggregates, observation);
+                    observe_candidate(&mut aggregates, observation.clone());
+                    observe_candidate(&mut hop_aggregates, observation);
+                }
+            }
 
-                    if should_expand
-                        && hop < depth
-                        && expanded.insert(candidate_id.clone())
-                        && queued.insert(candidate_id)
-                    {
-                        next_frontier.push(candidate_for_frontier);
-                    }
+            for aggregate in hop_aggregates.into_values() {
+                let should_expand = aggregate_bucket(
+                    &aggregate,
+                    &resolution.anchor_symbols,
+                    resolution.prefer_high_signal_paths,
+                ) == Some(ObservationBucket::Primary);
+                let candidate_for_frontier = aggregate.candidate.clone();
+                let candidate_id = candidate_for_frontier.segment_id.clone();
+
+                if should_expand
+                    && hop < depth
+                    && expanded.insert(candidate_id.clone())
+                    && queued.insert(candidate_id)
+                {
+                    next_frontier.push(candidate_for_frontier);
                 }
             }
 
@@ -315,7 +328,12 @@ impl<'a> ImpactHorizonEngine<'a> {
             observe_candidate(&mut aggregates, observation);
         }
 
-        let finalized = finalize_impact_results(aggregates, limit);
+        let finalized = finalize_impact_results(
+            aggregates,
+            limit,
+            &resolution.anchor_symbols,
+            resolution.prefer_high_signal_paths,
+        );
         let status = match (
             !finalized.primary.is_empty(),
             resolution.resolved_anchor.scope.is_some(),
@@ -406,8 +424,12 @@ impl<'a> ImpactHorizonEngine<'a> {
                 explicit_scope.clone(),
                 &seeds,
             ),
+            prefer_high_signal_paths: seeds
+                .iter()
+                .any(|seed| !is_low_signal_path(&seed.file_path)),
             seeds,
             effective_scope: explicit_scope,
+            anchor_symbols: HashSet::new(),
         }))
     }
 
@@ -437,6 +459,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 return Ok(ResolveOutcome::Refused(refusal));
             }
         }
+        let prefer_high_signal_paths = !is_low_signal_path(&seed.file_path);
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
                 "segment",
@@ -446,7 +469,9 @@ impl<'a> ImpactHorizonEngine<'a> {
                 std::slice::from_ref(&seed),
             ),
             seeds: vec![seed],
+            prefer_high_signal_paths,
             effective_scope: explicit_scope,
+            anchor_symbols: HashSet::new(),
         }))
     }
 
@@ -459,6 +484,12 @@ impl<'a> ImpactHorizonEngine<'a> {
         let mut seeds = engine.find_definition_candidates(name).await?;
         if let Some(scope) = explicit_scope.as_deref() {
             seeds.retain(|candidate| scope_matches(&candidate.file_path, Some(scope)));
+        }
+        if seeds
+            .iter()
+            .any(|candidate| !is_low_signal_path(&candidate.file_path))
+        {
+            seeds.retain(|candidate| !is_low_signal_path(&candidate.file_path));
         }
 
         if seeds.is_empty() {
@@ -512,6 +543,14 @@ impl<'a> ImpactHorizonEngine<'a> {
             None
         };
         let effective_scope = explicit_scope.clone().or(implicit_scope);
+        let mut anchor_symbols = HashSet::new();
+        let canonical_name = normalize_symbolish(name);
+        if !canonical_name.is_empty() {
+            anchor_symbols.insert(canonical_name);
+        }
+        let prefer_high_signal_paths = seeds
+            .iter()
+            .any(|seed| !is_low_signal_path(&seed.file_path));
 
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
@@ -523,6 +562,8 @@ impl<'a> ImpactHorizonEngine<'a> {
             ),
             seeds,
             effective_scope,
+            anchor_symbols,
+            prefer_high_signal_paths,
         }))
     }
 
@@ -750,14 +791,28 @@ impl<'a> ImpactHorizonEngine<'a> {
 
     async fn resolve_relation_targets(
         &self,
-        lookup_canonical_symbol: &str,
+        relation: &StoredRelation,
         scope: Option<&str>,
     ) -> Result<Vec<CandidateRow>, OneupError> {
         let engine = SymbolSearchEngine::new(self.conn);
         let mut candidates = engine
-            .find_definition_candidates_by_canonical(lookup_canonical_symbol)
+            .find_definition_candidates_by_canonical(&relation.lookup_canonical_symbol)
             .await?;
         candidates.retain(|candidate| scope_matches(&candidate.file_path, scope));
+
+        if relation.qualifier_fingerprint.is_empty() {
+            return Ok(candidates);
+        }
+
+        let exact_owner_matches = candidates
+            .iter()
+            .filter(|candidate| relation_exact_owner_match(relation, candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact_owner_matches.is_empty() {
+            return Ok(exact_owner_matches);
+        }
+
         Ok(candidates)
     }
 
@@ -768,11 +823,14 @@ impl<'a> ImpactHorizonEngine<'a> {
         scope: Option<&str>,
     ) -> Result<Option<(CandidateRow, f64, ObservationBucket)>, OneupError> {
         let mut scored = self
-            .resolve_relation_targets(&relation.lookup_canonical_symbol, scope)
+            .resolve_relation_targets(relation, scope)
             .await?
             .into_iter()
             .filter(|candidate| !is_test_path(&candidate.file_path))
-            .map(|candidate| score_relation_candidate(source, relation, &candidate, &candidate))
+            .filter_map(|candidate| {
+                let scored = score_relation_candidate(source, relation, &candidate, &candidate);
+                relation_candidate_edge_compatible(relation, &scored).then_some(scored)
+            })
             .collect::<Vec<_>>();
 
         scored = shortlist_relation_candidates(scored);
@@ -850,11 +908,15 @@ fn observe_candidate(
 fn finalize_impact_results(
     aggregates: HashMap<String, CandidateAggregate>,
     limit: usize,
+    anchor_symbols: &HashSet<String>,
+    prefer_high_signal_paths: bool,
 ) -> FinalizedImpactResults {
     let mut primary = Vec::new();
     let mut contextual = Vec::new();
 
     for aggregate in aggregates.into_values() {
+        let aggregate_bucket =
+            aggregate_bucket(&aggregate, anchor_symbols, prefer_high_signal_paths);
         let CandidateAggregate {
             candidate,
             primary_score,
@@ -872,17 +934,25 @@ fn finalize_impact_results(
             contextual_reasons.into_values().collect();
         contextual_reasons.sort_by(|left, right| right.score.total_cmp(&left.score));
 
-        if primary_score > 0.0 && !primary_reasons.is_empty() {
-            let reasons = primary_reasons
-                .into_iter()
-                .map(|reason| reason.reason)
-                .chain(contextual_reasons.into_iter().map(|reason| reason.reason))
-                .take(3)
-                .collect();
+        if aggregate_bucket == Some(ObservationBucket::Primary) {
+            let reasons = if primary_score > 0.0 && !primary_reasons.is_empty() {
+                primary_reasons
+                    .into_iter()
+                    .map(|reason| reason.reason)
+                    .chain(contextual_reasons.into_iter().map(|reason| reason.reason))
+                    .take(3)
+                    .collect()
+            } else {
+                contextual_reasons
+                    .into_iter()
+                    .map(|reason| reason.reason)
+                    .take(3)
+                    .collect()
+            };
             primary.push(build_impact_candidate(
                 candidate,
-                primary_score,
-                primary_hop.unwrap_or_default(),
+                primary_score.max(contextual_score),
+                primary_hop.or(contextual_hop).unwrap_or_default(),
                 reasons,
             ));
         } else if contextual_score > 0.0 && !contextual_reasons.is_empty() {
@@ -1178,8 +1248,12 @@ fn score_relation_candidate(
     } else {
         0.55 + (0.45 * owner_alignment.max(edge_identity_score))
     };
-    let signal_multiplier =
-        relation_signal_multiplier(emitted_candidate, owner_alignment, corroboration_signals);
+    let signal_multiplier = relation_signal_multiplier(
+        emitted_candidate,
+        relation,
+        owner_alignment,
+        corroboration_signals,
+    );
     let confidence = if symbol_score == 0.0 {
         0.0
     } else {
@@ -1288,6 +1362,73 @@ fn compare_scored_relation_candidates(
         .then_with(|| left.candidate.segment_id.cmp(&right.candidate.segment_id))
 }
 
+fn aggregate_bucket(
+    aggregate: &CandidateAggregate,
+    anchor_symbols: &HashSet<String>,
+    prefer_high_signal_paths: bool,
+) -> Option<ObservationBucket> {
+    if prefer_high_signal_paths && is_low_signal_path(&aggregate.candidate.file_path) {
+        return (aggregate.primary_score > 0.0 || aggregate.contextual_score > 0.0)
+            .then_some(ObservationBucket::Contextual);
+    }
+    if aggregate.primary_score > 0.0 && !aggregate.primary_reasons.is_empty() {
+        return Some(ObservationBucket::Primary);
+    }
+    if aggregate.contextual_score <= 0.0 || aggregate.contextual_reasons.is_empty() {
+        return None;
+    }
+    if repeated_anchor_relation_support(aggregate, anchor_symbols) {
+        return Some(ObservationBucket::Primary);
+    }
+
+    Some(ObservationBucket::Contextual)
+}
+
+fn repeated_anchor_relation_support(
+    aggregate: &CandidateAggregate,
+    anchor_symbols: &HashSet<String>,
+) -> bool {
+    if anchor_symbols.is_empty() {
+        return false;
+    }
+
+    let mut supporting_sources = HashSet::new();
+    let mut supporting_reasons = 0usize;
+
+    for contribution in aggregate.contextual_reasons.values() {
+        if !matches!(
+            contribution.reason.kind.as_str(),
+            "references_symbol" | "calls" | "called_by"
+        ) {
+            continue;
+        }
+        let Some(symbol) = contribution.reason.symbol.as_deref() else {
+            continue;
+        };
+        if !anchor_symbols.contains(&normalize_symbolish(symbol)) {
+            continue;
+        }
+        let Some(from_segment_id) = contribution.reason.from_segment_id.as_deref() else {
+            continue;
+        };
+
+        supporting_reasons += 1;
+        supporting_sources.insert(from_segment_id.to_string());
+    }
+
+    supporting_reasons >= 2 && supporting_sources.len() >= 2
+}
+
+fn relation_exact_owner_match(relation: &StoredRelation, candidate: &CandidateRow) -> bool {
+    let qualifier = qualifier_components(&relation.qualifier_fingerprint);
+    let definition = qualifier_components(&definition_owner_fingerprint(candidate));
+    if qualifier.is_empty() || definition.len() < qualifier.len() {
+        return false;
+    }
+
+    definition[definition.len() - qualifier.len()..] == qualifier
+}
+
 fn owner_alignment_score(qualifier_fingerprint: &str, definition_owner_fingerprint: &str) -> f64 {
     let qualifier = qualifier_components(qualifier_fingerprint);
     let definition = qualifier_components(definition_owner_fingerprint);
@@ -1362,18 +1503,18 @@ fn relation_edge_identity_score(
         EDGE_IDENTITY_CONSTRUCTOR_LIKE => {
             if matches!(
                 target.block_type.as_str(),
-                "constructor" | "class" | "struct"
+                "constructor" | "class" | "struct" | "enum"
             ) {
                 1.0
             } else {
-                0.75
+                0.0
             }
         }
         EDGE_IDENTITY_MACRO_LIKE => {
             if target.block_type == "macro" {
                 1.0
             } else {
-                0.75
+                0.0
             }
         }
         EDGE_IDENTITY_BARE_IDENTIFIER => {
@@ -1465,6 +1606,7 @@ fn relation_role_score(role: Option<SegmentRole>) -> f64 {
 
 fn relation_signal_multiplier(
     candidate: &CandidateRow,
+    relation: &StoredRelation,
     owner_alignment: f64,
     corroboration_signals: usize,
 ) -> f64 {
@@ -1478,11 +1620,35 @@ fn relation_signal_multiplier(
         multiplier *= LOW_SIGNAL_WRAPPER_PENALTY;
     }
 
+    if owner_alignment == 0.0
+        && !relation.qualifier_fingerprint.is_empty()
+        && matches!(
+            relation.edge_identity_kind.as_str(),
+            EDGE_IDENTITY_MEMBER_ACCESS | EDGE_IDENTITY_METHOD_RECEIVER
+        )
+    {
+        multiplier *= LOW_SIGNAL_UNALIGNED_RECEIVER_PENALTY;
+    }
+
     if owner_alignment == 0.0 && is_declaration_like_candidate(candidate) {
         multiplier *= LOW_SIGNAL_DECLARATION_PENALTY;
     }
 
     multiplier
+}
+
+fn relation_candidate_edge_compatible(
+    relation: &StoredRelation,
+    candidate: &ScoredRelationCandidate,
+) -> bool {
+    match relation.edge_identity_kind.as_str() {
+        EDGE_IDENTITY_MACRO_LIKE => candidate.candidate.block_type == "macro",
+        EDGE_IDENTITY_CONSTRUCTOR_LIKE => matches!(
+            candidate.candidate.block_type.as_str(),
+            "constructor" | "class" | "struct" | "enum"
+        ),
+        _ => true,
+    }
 }
 
 fn is_wrapper_like_candidate(candidate: &CandidateRow) -> bool {
@@ -1689,16 +1855,33 @@ fn out_of_scope_anchor_refusal(
 
 fn is_test_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
-    lower.contains("/tests/")
-        || lower.contains("/test/")
-        || lower.contains("/spec/")
-        || lower.contains("/__tests__/")
+    path_in_dir(&lower, "tests")
+        || path_in_dir(&lower, "test")
+        || path_in_dir(&lower, "spec")
+        || path_in_dir(&lower, "__tests__")
         || lower.ends_with("_test.rs")
+        || lower.ends_with("_tests.rs")
         || lower.ends_with("_spec.rs")
         || lower.ends_with(".test.ts")
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".test.js")
         || lower.ends_with(".spec.js")
+}
+
+fn is_low_signal_path(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    is_test_path(file_path)
+        || path_in_dir(&lower, "evals")
+        || path_in_dir(&lower, "benches")
+        || path_in_dir(&lower, "examples")
+        || path_in_dir(&lower, "vendor")
+        || lower.contains("node_modules")
+}
+
+fn path_in_dir(lower_path: &str, dir: &str) -> bool {
+    lower_path == dir
+        || lower_path.starts_with(&format!("{dir}/"))
+        || lower_path.contains(&format!("/{dir}/"))
 }
 
 fn test_file_priority(file_path: &str, anchor_files: &[String]) -> usize {
@@ -1826,6 +2009,16 @@ mod tests {
                 make_segment(SegmentFixture {
                     id: "cfg-ui",
                     file_path: "src/ui/config.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cfg-admin",
+                    file_path: "src/admin/config.rs",
                     line_start: 1,
                     block_type: "struct",
                     role: "DEFINITION",
@@ -2394,6 +2587,269 @@ mod tests {
             .expect("ambiguous helper matches should remain contextual");
         assert_eq!(contextual.len(), 1);
         assert_eq!(contextual[0].reasons[0].kind, "calls");
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_promotes_repeated_reference_support_before_expanding() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "search-result-struct",
+                    file_path: "src/shared/types.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-alias",
+                    file_path: "src/daemon/types.rs",
+                    line_start: 1,
+                    block_type: "type",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "try-daemon-search",
+                    file_path: "src/cli/search.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["try_daemon_search"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "format-search-results",
+                    file_path: "src/cli/output.rs",
+                    line_start: 20,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["format_search_results"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "exec",
+                    file_path: "src/cli/search.rs",
+                    line_start: 40,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["exec"],
+                    referenced_symbols: &[],
+                    called_symbols: &["try_daemon_search", "format_search_results"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "SearchResult".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(result_ids.contains(&"try-daemon-search"));
+        assert!(result_ids.contains(&"format-search-results"));
+        assert!(result_ids.contains(&"exec"));
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_prefers_high_signal_seeds_and_demotes_eval_paths() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "search-result-struct",
+                    file_path: "src/shared/types.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-impl",
+                    file_path: "src/shared/types.rs",
+                    line_start: 20,
+                    block_type: "impl",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-bench-type",
+                    file_path: "evals/suites/1up-search/search-bench.ts",
+                    line_start: 1,
+                    block_type: "interface",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "try-daemon-search",
+                    file_path: "src/cli/search.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["try_daemon_search"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "format-search-results",
+                    file_path: "src/cli/output.rs",
+                    line_start: 20,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["format_search_results"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "run-oneup-search",
+                    file_path: "evals/suites/1up-search/search-bench.ts",
+                    line_start: 30,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["runOneupSearch"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "exec",
+                    file_path: "src/cli/search.rs",
+                    line_start: 40,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["exec"],
+                    referenced_symbols: &[],
+                    called_symbols: &["try_daemon_search", "format_search_results"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "SearchResult".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(
+            result
+                .resolved_anchor
+                .as_ref()
+                .expect("symbol anchor should resolve")
+                .matched_files,
+            vec!["src/shared/types.rs".to_string()]
+        );
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(result_ids.contains(&"try-daemon-search"));
+        assert!(result_ids.contains(&"format-search-results"));
+        assert!(result_ids.contains(&"exec"));
+        assert!(!result_ids.contains(&"run-oneup-search"));
+        let contextual = result
+            .contextual_results
+            .expect("low-signal eval consumers should remain contextual");
+        assert!(contextual
+            .iter()
+            .any(|candidate| candidate.segment_id == "run-oneup-search"));
+    }
+
+    #[tokio::test]
+    async fn macro_like_relations_do_not_resolve_to_function_candidates() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "search-result",
+                        file_path: "src/shared/types.rs",
+                        line_start: 1,
+                        block_type: "function",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["SearchResult"],
+                        referenced_symbols: &[],
+                        called_symbols: &["matches"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "matches".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_MACRO_LIKE.to_string(),
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "expected-leaf-matches",
+                    file_path: "src/shared/fs.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["matches"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "search-result".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "expected-leaf-matches"));
+        assert!(result
+            .contextual_results
+            .unwrap_or_default()
+            .iter()
+            .all(|candidate| candidate.segment_id != "expected-leaf-matches"));
     }
 
     #[tokio::test]
