@@ -1132,9 +1132,16 @@ fn build_impact_candidate(
 
 fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec<ImpactCandidate> {
     ranked.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
+        impact_candidate_priority(right)
+            .cmp(&impact_candidate_priority(left))
+            .then_with(|| {
+                impact_candidate_reason_priority(right).cmp(&impact_candidate_reason_priority(left))
+            })
+            .then_with(|| {
+                implemented_by_reason_count(right).cmp(&implemented_by_reason_count(left))
+            })
+            .then_with(|| direct_reason_count(right).cmp(&direct_reason_count(left)))
+            .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.hop.cmp(&right.hop))
             .then_with(|| left.file_path.cmp(&right.file_path))
             .then_with(|| left.line_start.cmp(&right.line_start))
@@ -1158,6 +1165,46 @@ fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec
     }
 
     results
+}
+
+fn impact_candidate_priority(candidate: &ImpactCandidate) -> usize {
+    usize::from(implemented_by_reason_count(candidate) > 0)
+}
+
+fn impact_candidate_reason_priority(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter_map(|reason| match reason.kind.as_str() {
+            "implemented_by" => Some(4),
+            "called_by" => Some(3),
+            "calls" => Some(2),
+            "conforms_to" => Some(1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn implemented_by_reason_count(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter(|reason| reason.kind == "implemented_by")
+        .count()
+}
+
+fn direct_reason_count(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter(|reason| {
+            matches!(
+                reason.kind.as_str(),
+                "implemented_by" | "called_by" | "calls"
+            )
+        })
+        .count()
 }
 
 fn outcome_hint(
@@ -2321,7 +2368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trait_anchor_surfaces_implementing_definition_from_impl_relation() {
+    async fn trait_anchor_surfaces_impl_relation_site_for_rust_conformance() {
         let (_db, conn) = setup().await;
         insert_segments(
             &conn,
@@ -2382,12 +2429,12 @@ mod tests {
 
         assert_eq!(result.status, ImpactStatus::Expanded);
         assert_eq!(result.results.len(), 1);
-        assert_eq!(result.results[0].segment_id, "config-struct");
+        assert_eq!(result.results[0].segment_id, "config-impl");
         assert_eq!(result.results[0].reasons[0].kind, "implemented_by");
         assert!(result
             .results
             .iter()
-            .all(|candidate| candidate.segment_id != "config-impl"));
+            .all(|candidate| candidate.segment_id != "config-struct"));
     }
 
     #[tokio::test]
@@ -2466,6 +2513,133 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.segment_id != "plain-formatter"));
         }
+    }
+
+    #[tokio::test]
+    async fn trait_anchor_prioritizes_multiple_implementors_over_same_file_helpers() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "formatter-trait",
+                    file_path: "src/ui/output.rs",
+                    line_start: 1,
+                    block_type: "trait",
+                    role: "DEFINITION",
+                    defined_symbols: &["Formatter"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "json-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 20,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["JsonFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["to_json"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "human-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 60,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["HumanFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["format_message"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "plain-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 100,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["PlainFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["render_rows"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "formatter-for",
+                    file_path: "src/ui/output.rs",
+                    line_start: 140,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["formatter_for"],
+                    referenced_symbols: &[
+                        "Formatter",
+                        "JsonFormatter",
+                        "HumanFormatter",
+                        "PlainFormatter",
+                    ],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "to-json",
+                    file_path: "src/ui/output.rs",
+                    line_start: 160,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["to_json"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Formatter".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids.len(), 3);
+        assert!(result_ids.contains(&"json-formatter"));
+        assert!(result_ids.contains(&"human-formatter"));
+        assert!(result_ids.contains(&"plain-formatter"));
+        assert!(!result_ids.contains(&"formatter-for"));
+        assert!(!result_ids.contains(&"to-json"));
+        assert!(result.results.iter().all(|candidate| candidate
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == "implemented_by")));
     }
 
     #[tokio::test]

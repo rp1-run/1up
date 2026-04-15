@@ -462,8 +462,16 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
 
         if top_level.contains(&kind) {
             if containers.contains(&kind) {
-                let container_segment =
-                    extract_segment(&node, source_bytes, lang, &leading_comments, None);
+                let container_breadcrumb =
+                    matches!((lang, kind), (SupportedLanguage::Rust, "mod_item"))
+                        .then(|| node_name(&node, source_bytes, lang));
+                let container_segment = extract_segment(
+                    &node,
+                    source_bytes,
+                    lang,
+                    &leading_comments,
+                    container_breadcrumb.as_deref(),
+                );
                 segments.push(container_segment);
 
                 extract_nested(
@@ -2696,6 +2704,24 @@ fn complex(x: i32) -> i32 {
             "expected complexity >= 3, got {}",
             func.complexity
         );
+    }
+
+    #[test]
+    fn test_parse_rust_test_module_keeps_module_name_as_breadcrumb() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let module = segments
+            .iter()
+            .find(|segment| segment.block_type == "module")
+            .unwrap();
+        assert_eq!(module.breadcrumb.as_deref(), Some("tests"));
     }
 
     #[test]

@@ -44,6 +44,7 @@ impl CandidateRow {
                 self.block_type.as_str(),
                 "function"
                     | "method"
+                    | "impl"
                     | "struct"
                     | "enum"
                     | "trait"
