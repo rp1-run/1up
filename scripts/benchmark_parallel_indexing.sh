@@ -21,6 +21,22 @@ to_ms() {
   awk -v value="$1" 'BEGIN { printf "%.2f", value * 1000 }'
 }
 
+compute_median_ms() {
+  local -a sorted
+  IFS=$'\n' read -r -d '' -a sorted < <(printf '%s\n' "$@" | sort -n; printf '\0')
+  local count=${#sorted[@]}
+  if (( count == 0 )); then
+    printf '0.00'
+    return
+  fi
+  local mid=$(( count / 2 ))
+  if (( count % 2 == 1 )); then
+    printf '%s' "${sorted[$mid]}"
+  else
+    awk -v a="${sorted[$((mid - 1))]}" -v b="${sorted[$mid]}" 'BEGIN { printf "%.2f", (a + b) / 2 }'
+  fi
+}
+
 metric_value() {
   local json_path="$1"
   local result_index="$2"
@@ -90,6 +106,7 @@ run_full_case() {
   local output
   output=$("${args[@]}")
   require_index_work "full:$run_dir" "$output"
+  capture_telemetry "full:$run_dir" "$output"
 }
 
 prepare_incremental_case() {
@@ -147,6 +164,7 @@ run_incremental_case() {
   local output
   output=$("${args[@]}")
   require_index_work "incremental:$run_dir" "$output"
+  capture_telemetry "incremental:$run_dir" "$output"
 }
 
 prepare_write_heavy_case() {
@@ -210,6 +228,153 @@ run_write_heavy_case() {
   local output
   output=$("${args[@]}")
   require_index_work "write-heavy:$run_dir" "$output"
+  capture_telemetry "write-heavy:$run_dir" "$output"
+}
+
+wait_for_daemon_ready() {
+  local run_dir="$1"
+  local oneup_bin="$2"
+  local max_wait=60
+  local elapsed=0
+
+  while (( elapsed < max_wait )); do
+    local status_json
+    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    local daemon_running
+    daemon_running=$(jq -r '.daemon_running // false' <<<"$status_json" 2>/dev/null || echo "false")
+    local last_check
+    last_check=$(jq -r '.last_file_check_at // "null"' <<<"$status_json" 2>/dev/null || echo "null")
+
+    if [[ "$daemon_running" == "true" && "$last_check" != "null" ]]; then
+      return 0
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  printf 'daemon did not become ready within %ds for %s\n' "$max_wait" "$run_dir" >&2
+  return 1
+}
+
+wait_for_refresh_complete() {
+  local run_dir="$1"
+  local oneup_bin="$2"
+  local baseline_updated_at="$3"
+  local max_wait=120
+  local elapsed=0
+
+  while (( elapsed < max_wait )); do
+    local status_json
+    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    local state
+    state=$(jq -r '.index_progress.state // "idle"' <<<"$status_json" 2>/dev/null || echo "idle")
+    local updated_at
+    updated_at=$(jq -r '.index_progress.updated_at // "null"' <<<"$status_json" 2>/dev/null || echo "null")
+
+    if [[ "$state" == "complete" && "$updated_at" != "null" && "$updated_at" != "$baseline_updated_at" ]]; then
+      printf '%s' "$status_json"
+      return 0
+    fi
+
+    sleep 0.2
+    elapsed=$((elapsed + 1))
+  done
+
+  printf 'daemon refresh did not complete within %ds for %s\n' "$max_wait" "$run_dir" >&2
+  return 1
+}
+
+run_daemon_refresh_benchmark() {
+  local source_dir="$1"
+  local run_dir="$2"
+  local oneup_bin="$3"
+  local runs="$4"
+
+  log "setting up daemon refresh benchmark"
+  sync_repo "$source_dir" "$run_dir"
+
+  "$oneup_bin" start "$run_dir" >/dev/null 2>&1
+  wait_for_daemon_ready "$run_dir" "$oneup_bin"
+
+  sleep 2
+
+  local -a times_ms=()
+  local iter
+
+  for iter in $(seq 1 "$runs"); do
+    local status_json
+    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    local baseline_updated_at
+    baseline_updated_at=$(jq -r '.index_progress.updated_at // "null"' <<<"$status_json" 2>/dev/null || echo "null")
+
+    cat > "$run_dir/_1up_daemon_bench_${iter}.rs" <<EOF
+pub fn daemon_bench_marker_${iter}() -> &'static str {
+    "daemon-refresh-iteration-${iter}"
+}
+EOF
+
+    local start_ns
+    start_ns=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
+
+    local refresh_json
+    refresh_json=$(wait_for_refresh_complete "$run_dir" "$oneup_bin" "$baseline_updated_at")
+
+    local end_ns
+    end_ns=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000')
+
+    local elapsed_ms
+    elapsed_ms=$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { printf "%.2f", e - s }')
+    times_ms+=("$elapsed_ms")
+
+    log "daemon refresh iteration ${iter}/${runs}: ${elapsed_ms}ms"
+
+    if [[ -n "${TELEMETRY_DIR:-}" && -n "$refresh_json" ]]; then
+      local safe_label
+      safe_label=$(printf '%s' "daemon-refresh__iter-${iter}" | tr '/:' '__')
+      local telemetry_file="$TELEMETRY_DIR/${safe_label}.json"
+      jq -n \
+        --arg label "daemon-refresh:iter-${iter}" \
+        --argjson scope "$(jq '.index_progress.scope // null' <<<"$refresh_json")" \
+        --argjson prefilter "$(jq '.index_progress.prefilter // null' <<<"$refresh_json")" \
+        --argjson timings "$(jq '.index_progress.timings // null' <<<"$refresh_json")" \
+        '{label: $label, scope: $scope, prefilter: $prefilter, timings: $timings}' \
+        > "$telemetry_file"
+    fi
+
+    sleep 1
+  done
+
+  log "stopping daemon for benchmark cleanup"
+  "$oneup_bin" stop "$run_dir" >/dev/null 2>&1 || true
+  sleep 1
+
+  local median
+  median=$(compute_median_ms "${times_ms[@]}")
+  printf '%s' "$median"
+}
+
+TELEMETRY_DIR=""
+
+capture_telemetry() {
+  local label="$1"
+  local output_json="$2"
+
+  if [[ -z "$TELEMETRY_DIR" ]]; then
+    return 0
+  fi
+
+  local safe_label
+  safe_label=$(printf '%s' "$label" | tr '/:' '__')
+  local telemetry_file="$TELEMETRY_DIR/${safe_label}.json"
+
+  jq -n \
+    --arg label "$label" \
+    --argjson scope "$(jq '.progress.scope // null' <<<"$output_json")" \
+    --argjson prefilter "$(jq '.progress.prefilter // null' <<<"$output_json")" \
+    --argjson timings "$(jq '.progress.timings // null' <<<"$output_json")" \
+    '{label: $label, scope: $scope, prefilter: $prefilter, timings: $timings}' \
+    > "$telemetry_file"
 }
 
 if [[ "${1:-}" == "__prepare_full_case" ]]; then
@@ -254,6 +419,7 @@ require_cmd cargo
 require_cmd git
 require_cmd hyperfine
 require_cmd jq
+require_cmd perl
 require_cmd rsync
 
 if [[ "$REPO_INPUT" == "$EMDASH_CACHE_DIR" ]]; then
@@ -284,7 +450,8 @@ INCREMENTAL_JSON="$OUT_DIR/incremental-index.json"
 WRITE_HEAVY_JSON="$OUT_DIR/write-heavy-index.json"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 
-mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT"
+TELEMETRY_DIR="$OUT_DIR/telemetry"
+mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT" "$TELEMETRY_DIR"
 
 log "building release binary"
 cargo build --release --bin 1up --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null
@@ -332,6 +499,9 @@ hyperfine \
   --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
   "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
 
+log "benchmarking daemon refresh cycles"
+DAEMON_REFRESH_MEDIAN_MS=$(run_daemon_refresh_benchmark "$PRISTINE_DIR" "$RUN_DIR_ROOT/daemon-refresh" "$ONEUP_BIN" "$RUNS")
+
 SERIAL_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 0)")
 AUTO_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 1)")
 CONSTRAINED_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 2)")
@@ -341,6 +511,17 @@ CONSTRAINED_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 2)")
 SERIAL_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 0)")
 AUTO_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 1)")
 CONSTRAINED_WRITE_HEAVY_MS=$(to_ms "$(metric_value "$WRITE_HEAVY_JSON" 2)")
+
+# Collect telemetry from captured run outputs
+TELEMETRY_JSON="[]"
+if [[ -d "$TELEMETRY_DIR" ]] && compgen -G "$TELEMETRY_DIR/*.json" >/dev/null 2>&1; then
+  TELEMETRY_JSON=$(jq -s '.' "$TELEMETRY_DIR"/*.json 2>/dev/null || echo '[]')
+fi
+
+# Count scope fallbacks and executed-scope distribution from telemetry
+FALLBACK_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.fallback_reason != null)] | length')
+SCOPED_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.executed | startswith("scoped"))] | length')
+FULL_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.executed == "full")] | length')
 
 jq -n \
   --arg repo "$REPO" \
@@ -354,12 +535,17 @@ jq -n \
   --arg serial_write_heavy_ms "$SERIAL_WRITE_HEAVY_MS" \
   --arg auto_write_heavy_ms "$AUTO_WRITE_HEAVY_MS" \
   --arg constrained_write_heavy_ms "$CONSTRAINED_WRITE_HEAVY_MS" \
+  --arg daemon_refresh_ms "$DAEMON_REFRESH_MEDIAN_MS" \
   --argjson runs "$RUNS" \
   --argjson warmup "$WARMUP" \
   --argjson serial_jobs "$SERIAL_JOBS" \
   --argjson serial_embed_threads "$SERIAL_EMBED_THREADS" \
   --argjson constrained_jobs "$CONSTRAINED_JOBS" \
   --argjson constrained_embed_threads "$CONSTRAINED_EMBED_THREADS" \
+  --argjson fallback_count "$FALLBACK_COUNT" \
+  --argjson scoped_count "$SCOPED_COUNT" \
+  --argjson full_count "$FULL_COUNT" \
+  --argjson telemetry "$TELEMETRY_JSON" \
   '{
     repo: $repo,
     out_dir: $out_dir,
@@ -385,6 +571,12 @@ jq -n \
       auto: ($auto_write_heavy_ms | tonumber),
       constrained: ($constrained_write_heavy_ms | tonumber)
     },
+    daemon_refresh_median_ms: ($daemon_refresh_ms | tonumber),
+    scope_evidence: {
+      fallback_count: $fallback_count,
+      scoped_count: $scoped_count,
+      full_count: $full_count
+    },
     configs: {
       serial: {
         jobs: $serial_jobs,
@@ -398,7 +590,8 @@ jq -n \
         jobs: $constrained_jobs,
         embed_threads: $constrained_embed_threads
       }
-    }
+    },
+    telemetry: $telemetry
   }' > "$SUMMARY_JSON"
 
 printf 'Parallel indexing benchmark complete.\n'
@@ -410,3 +603,6 @@ printf 'Scoped follow-up median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_INCREMENTAL_MS" "$AUTO_INCREMENTAL_MS" "$CONSTRAINED_INCREMENTAL_MS"
 printf 'Write-heavy median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_WRITE_HEAVY_MS" "$AUTO_WRITE_HEAVY_MS" "$CONSTRAINED_WRITE_HEAVY_MS"
+printf 'Daemon refresh median ms: %s\n' "$DAEMON_REFRESH_MEDIAN_MS"
+printf 'Scope evidence: fallback=%s scoped=%s full=%s\n' \
+  "$FALLBACK_COUNT" "$SCOPED_COUNT" "$FULL_COUNT"

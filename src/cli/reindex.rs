@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use clap::Args;
 
 use crate::cli::output::{formatter_for, spawn_index_watch_renderer};
@@ -7,7 +9,7 @@ use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants::SCHEMA_VERSION;
 use crate::shared::progress::{ProgressState, ProgressUi};
-use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -180,11 +182,14 @@ async fn run_reindex_once(
     show_progress_ui: bool,
     progress_tx: Option<&pipeline::ProgressSender>,
 ) -> anyhow::Result<pipeline::PipelineStats> {
+    let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
 
+    let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
     let conn = db.connect_tuned().await?;
     schema::rebuild(&conn).await?;
+    setup.db_prepare_ms = db_start.elapsed().as_millis();
     setup_spinner.success_with(&format!("Rebuilt schema v{SCHEMA_VERSION}"));
 
     if let Some(progress_tx) = progress_tx {
@@ -202,10 +207,12 @@ async fn run_reindex_once(
 
     let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
+    let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)
         .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
     let status_message = model_status_message(&status);
     match &status {
         EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => model_spinner.success(),
@@ -217,13 +224,16 @@ async fn run_reindex_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
-    pipeline::run_with_config_and_progress_ui(
+    pipeline::run_with_scope_and_setup(
         &conn,
         project_root,
         runtime.current_embedder(),
+        &crate::shared::types::RunScope::Full,
         indexing_config,
         progress_tx.cloned(),
         show_progress_ui,
+        Some(setup),
+        None,
     )
     .await
     .map_err(Into::into)

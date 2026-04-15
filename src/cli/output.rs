@@ -489,13 +489,44 @@ impl Formatter for HumanFormatter {
             ));
         }
         if let Some(timings) = &progress.timings {
+            let mut timing_parts = Vec::new();
+            if let Some(db_ms) = timings.db_prepare_ms {
+                timing_parts.push(format!("db_prepare {}", render_duration_ms(db_ms)));
+            }
+            if let Some(model_ms) = timings.model_prepare_ms {
+                timing_parts.push(format!("model_prepare {}", render_duration_ms(model_ms)));
+            }
+            if let Some(input_ms) = timings.input_prep_ms {
+                timing_parts.push(format!("input_prep {}", render_duration_ms(input_ms)));
+            }
+            timing_parts.push(format!("scan {}", render_duration_ms(timings.scan_ms)));
+            timing_parts.push(format!("parse {}", render_duration_ms(timings.parse_ms)));
+            timing_parts.push(format!("embed {}", render_duration_ms(timings.embed_ms)));
+            timing_parts.push(format!("store {}", render_duration_ms(timings.store_ms)));
+            timing_parts.push(format!("total {}", render_duration_ms(timings.total_ms)));
+            out.push_str(&format!("Timings: {}\n", timing_parts.join(" | ")));
+        }
+        if let Some(scope) = &progress.scope {
+            let mut scope_str = format!(
+                "Scope: requested {} | executed {}",
+                scope.requested, scope.executed
+            );
+            if scope.changed_paths > 0 {
+                scope_str.push_str(&format!(" | changed_paths {}", scope.changed_paths));
+            }
+            if let Some(reason) = &scope.fallback_reason {
+                scope_str.push_str(&format!(" | fallback: {reason}"));
+            }
+            out.push_str(&scope_str);
+            out.push('\n');
+        }
+        if let Some(prefilter) = &progress.prefilter {
             out.push_str(&format!(
-                "Timings: scan {} | parse {} | embed {} | store {} | total {}\n",
-                render_duration_ms(timings.scan_ms),
-                render_duration_ms(timings.parse_ms),
-                render_duration_ms(timings.embed_ms),
-                render_duration_ms(timings.store_ms),
-                render_duration_ms(timings.total_ms),
+                "Prefilter: discovered {} | metadata_skipped {} | content_read {} | deleted {}\n",
+                prefilter.discovered,
+                prefilter.metadata_skipped,
+                prefilter.content_read,
+                prefilter.deleted,
             ));
         }
         out.push_str(&format!(
@@ -594,13 +625,41 @@ impl Formatter for HumanFormatter {
                 ));
             }
             if let Some(timings) = &progress.timings {
+                let mut timing_parts = Vec::new();
+                if let Some(db_ms) = timings.db_prepare_ms {
+                    timing_parts.push(format!("db_prepare {}", render_duration_ms(db_ms)));
+                }
+                if let Some(model_ms) = timings.model_prepare_ms {
+                    timing_parts.push(format!("model_prepare {}", render_duration_ms(model_ms)));
+                }
+                if let Some(input_ms) = timings.input_prep_ms {
+                    timing_parts.push(format!("input_prep {}", render_duration_ms(input_ms)));
+                }
+                timing_parts.push(format!("scan {}", render_duration_ms(timings.scan_ms)));
+                timing_parts.push(format!("parse {}", render_duration_ms(timings.parse_ms)));
+                timing_parts.push(format!("embed {}", render_duration_ms(timings.embed_ms)));
+                timing_parts.push(format!("store {}", render_duration_ms(timings.store_ms)));
+                timing_parts.push(format!("total {}", render_duration_ms(timings.total_ms)));
+                out.push_str(&format!("Timings: {}\n", timing_parts.join(" | ")));
+            }
+            if let Some(scope) = &progress.scope {
+                let mut scope_str = format!(
+                    "Scope: requested {} | executed {}",
+                    scope.requested, scope.executed
+                );
+                if scope.changed_paths > 0 {
+                    scope_str.push_str(&format!(" | changed_paths {}", scope.changed_paths));
+                }
+                if let Some(reason) = &scope.fallback_reason {
+                    scope_str.push_str(&format!(" | fallback: {reason}"));
+                }
+                out.push_str(&scope_str);
+                out.push('\n');
+            }
+            if let Some(prefilter) = &progress.prefilter {
                 out.push_str(&format!(
-                    "Timings: scan {} | parse {} | embed {} | store {} | total {}\n",
-                    render_duration_ms(timings.scan_ms),
-                    render_duration_ms(timings.parse_ms),
-                    render_duration_ms(timings.embed_ms),
-                    render_duration_ms(timings.store_ms),
-                    render_duration_ms(timings.total_ms),
+                    "Prefilter: discovered {} | metadata_skipped {} | content_read {} | deleted {}\n",
+                    prefilter.discovered, prefilter.metadata_skipped, prefilter.content_read, prefilter.deleted,
                 ));
             }
             out.push_str(&format!(
@@ -942,6 +1001,30 @@ impl Formatter for PlainFormatter {
                 timings.store_ms,
                 timings.total_ms,
             ));
+            if let Some(db_ms) = timings.db_prepare_ms {
+                out.push_str(&format!("\tdb_prepare_ms:{db_ms}"));
+            }
+            if let Some(model_ms) = timings.model_prepare_ms {
+                out.push_str(&format!("\tmodel_prepare_ms:{model_ms}"));
+            }
+            if let Some(input_ms) = timings.input_prep_ms {
+                out.push_str(&format!("\tinput_prep_ms:{input_ms}"));
+            }
+        }
+        if let Some(scope) = &progress.scope {
+            out.push_str(&format!(
+                "\tscope_requested:{}\tscope_executed:{}\tscope_changed_paths:{}",
+                scope.requested, scope.executed, scope.changed_paths,
+            ));
+            if let Some(reason) = &scope.fallback_reason {
+                out.push_str(&format!("\tscope_fallback_reason:{reason}"));
+            }
+        }
+        if let Some(prefilter) = &progress.prefilter {
+            out.push_str(&format!(
+                "\tprefilter_discovered:{}\tprefilter_metadata_skipped:{}\tprefilter_content_read:{}\tprefilter_deleted:{}",
+                prefilter.discovered, prefilter.metadata_skipped, prefilter.content_read, prefilter.deleted,
+            ));
         }
         out.push_str(&format!("\tupdated:{}\n", progress.updated_at.to_rfc3339()));
         out
@@ -976,6 +1059,24 @@ impl Formatter for PlainFormatter {
                 timings.store_ms,
                 timings.total_ms,
             ));
+            if let Some(db_ms) = timings.db_prepare_ms {
+                out.push_str(&format!("\tdb_prepare_ms:{db_ms}"));
+            }
+            if let Some(model_ms) = timings.model_prepare_ms {
+                out.push_str(&format!("\tmodel_prepare_ms:{model_ms}"));
+            }
+            if let Some(input_ms) = timings.input_prep_ms {
+                out.push_str(&format!("\tinput_prep_ms:{input_ms}"));
+            }
+        }
+        if let Some(scope) = &progress.scope {
+            out.push_str(&format!(
+                "\tscope_requested:{}\tscope_executed:{}",
+                scope.requested, scope.executed,
+            ));
+            if let Some(reason) = &scope.fallback_reason {
+                out.push_str(&format!("\tscope_fallback_reason:{reason}"));
+            }
         }
         out.push_str(&format!("\tupdated:{}\n", progress.updated_at.to_rfc3339()));
         out
@@ -1048,6 +1149,30 @@ impl Formatter for PlainFormatter {
                     timings.embed_ms,
                     timings.store_ms,
                     timings.total_ms,
+                ));
+                if let Some(db_ms) = timings.db_prepare_ms {
+                    out.push_str(&format!("\tdb_prepare_ms:{db_ms}"));
+                }
+                if let Some(model_ms) = timings.model_prepare_ms {
+                    out.push_str(&format!("\tmodel_prepare_ms:{model_ms}"));
+                }
+                if let Some(input_ms) = timings.input_prep_ms {
+                    out.push_str(&format!("\tinput_prep_ms:{input_ms}"));
+                }
+            }
+            if let Some(scope) = &progress.scope {
+                out.push_str(&format!(
+                    "\tscope_requested:{}\tscope_executed:{}\tscope_changed_paths:{}",
+                    scope.requested, scope.executed, scope.changed_paths,
+                ));
+                if let Some(reason) = &scope.fallback_reason {
+                    out.push_str(&format!("\tscope_fallback_reason:{reason}"));
+                }
+            }
+            if let Some(prefilter) = &progress.prefilter {
+                out.push_str(&format!(
+                    "\tprefilter_discovered:{}\tprefilter_metadata_skipped:{}\tprefilter_content_read:{}\tprefilter_deleted:{}",
+                    prefilter.discovered, prefilter.metadata_skipped, prefilter.content_read, prefilter.deleted,
                 ));
             }
             out.push_str(&format!(
@@ -1910,7 +2035,12 @@ mod tests {
                 embed_ms: 23,
                 store_ms: 5,
                 total_ms: 41,
+                db_prepare_ms: None,
+                model_prepare_ms: None,
+                input_prep_ms: None,
             }),
+            scope: None,
+            prefilter: None,
             updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:08Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
@@ -2207,6 +2337,9 @@ mod tests {
             embed_ms: 103,
             store_ms: 105,
             total_ms: 407,
+            db_prepare_ms: None,
+            model_prepare_ms: None,
+            input_prep_ms: None,
         });
         noisy.updated_at = chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:09Z")
             .unwrap()

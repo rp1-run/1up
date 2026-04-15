@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use clap::Args;
 
@@ -11,7 +12,7 @@ use crate::shared::config;
 use crate::shared::constants;
 use crate::shared::project;
 use crate::shared::reminder;
-use crate::shared::types::{IndexingConfig, OutputFormat};
+use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -157,15 +158,21 @@ async fn run_initial_index(
     project_root: &Path,
     indexing_config: &IndexingConfig,
 ) -> anyhow::Result<pipeline::PipelineStats> {
+    let mut setup = SetupTimings::new(Instant::now());
     let db_path = config::project_db_path(project_root);
+
+    let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect_tuned().await?;
     schema::prepare_for_write(&conn).await?;
+    setup.db_prepare_ms = db_start.elapsed().as_millis();
 
+    let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing(indexing_config.embed_threads)
         .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
     match &status {
         EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
         EmbeddingLoadStatus::Downloaded => {
@@ -192,11 +199,16 @@ async fn run_initial_index(
         }
     }
 
-    let stats = pipeline::run_with_config(
+    let stats = pipeline::run_with_scope_and_setup(
         &conn,
         project_root,
         runtime.current_embedder(),
+        &crate::shared::types::RunScope::Full,
         indexing_config,
+        None,
+        true,
+        Some(setup),
+        None,
     )
     .await?;
 

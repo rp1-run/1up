@@ -24,7 +24,7 @@ use crate::shared::constants::{
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
 use crate::shared::reminder::VERSION;
-use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope};
+use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope, SetupTimings};
 use crate::storage::{db::Db, schema};
 
 #[derive(Debug, Default)]
@@ -32,6 +32,7 @@ struct ProjectRunState {
     running: bool,
     dirty: bool,
     pending_scope: Option<RunScope>,
+    pending_fallback_reason: Option<String>,
 }
 
 impl ProjectRunState {
@@ -42,6 +43,11 @@ impl ProjectRunState {
         }
 
         self.dirty = true;
+    }
+
+    fn mark_dirty_with_reason(&mut self, scope: RunScope, reason: String) {
+        self.mark_dirty(scope);
+        self.pending_fallback_reason = Some(reason);
     }
 
     fn start_run(&mut self) -> RunScope {
@@ -504,20 +510,27 @@ fn mark_changed_projects(
     changes: &watcher::WatcherChanges,
 ) {
     for (root, state) in projects.iter_mut() {
-        let scope = if changes.has_unscoped_error
-            || changes
-                .ambiguous_paths
-                .iter()
-                .any(|path| path.starts_with(root))
-        {
-            Some(RunScope::Full)
+        let has_ambiguous = changes
+            .ambiguous_paths
+            .iter()
+            .any(|path| path.starts_with(root));
+        let (scope, promotion_reason) = if changes.has_unscoped_error || has_ambiguous {
+            let reason = if changes.has_unscoped_error {
+                "has_unscoped_error".to_string()
+            } else {
+                "ambiguous_paths".to_string()
+            };
+            (Some(RunScope::Full), Some(reason))
         } else {
-            RunScope::from_paths(
-                changes
-                    .file_paths
-                    .iter()
-                    .filter(|path| path.starts_with(root))
-                    .filter_map(|path| normalize_relative_path(root, path)),
+            (
+                RunScope::from_paths(
+                    changes
+                        .file_paths
+                        .iter()
+                        .filter(|path| path.starts_with(root))
+                        .filter_map(|path| normalize_relative_path(root, path)),
+                ),
+                None,
             )
         };
 
@@ -533,7 +546,13 @@ fn mark_changed_projects(
 
         let was_dirty = state.run_state.dirty;
         let was_running = state.run_state.running;
-        state.run_state.mark_dirty(scope.clone());
+        if let Some(reason) = promotion_reason {
+            state
+                .run_state
+                .mark_dirty_with_reason(scope.clone(), reason);
+        } else {
+            state.run_state.mark_dirty(scope.clone());
+        }
 
         if was_running && !was_dirty {
             debug!(
@@ -636,23 +655,27 @@ async fn run_project(
     root: &Path,
     projects: &mut HashMap<PathBuf, ProjectState>,
 ) -> Result<pipeline::PipelineStats, OneupError> {
-    let (project_root, scope, setup) = {
+    let mut setup = SetupTimings::new(std::time::Instant::now());
+    let (project_root, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects
             .get_mut(root)
             .expect("dirty project must exist while running");
+        let daemon_fallback_reason = state.run_state.pending_fallback_reason.take();
         let scope = state.run_state.start_run();
         let project_root = state.project_root.clone();
-        let setup = (|| {
+        let db_start = std::time::Instant::now();
+        let conn_setup = (|| {
             let conn = state.db.connect()?;
             let indexing_config =
                 config::resolve_indexing_config(None, None, state.indexing.as_ref())?;
             Ok((conn, indexing_config))
         })();
+        setup.db_prepare_ms = db_start.elapsed().as_millis();
 
-        (project_root, scope, setup)
+        (project_root, scope, daemon_fallback_reason, conn_setup)
     };
 
-    let (conn, indexing_config) = match setup {
+    let (conn, indexing_config) = match conn_setup {
         Ok(values) => values,
         Err(e) => {
             projects
@@ -688,17 +711,23 @@ async fn run_project(
         let state = projects
             .get_mut(root)
             .expect("dirty project must exist while preparing embeddings");
+        let model_start = std::time::Instant::now();
         let status = state
             .embedding_runtime
             .prepare_for_indexing(indexing_config.embed_threads)
             .await;
+        setup.model_prepare_ms = model_start.elapsed().as_millis();
         log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
-        pipeline::run_with_scope(
+        pipeline::run_with_scope_and_setup(
             &conn,
             &project_root,
             state.embedding_runtime.current_embedder(),
             &scope,
             &indexing_config,
+            None,
+            true,
+            Some(setup),
+            daemon_fallback_reason,
         )
         .await
     };
@@ -846,6 +875,7 @@ mod tests {
                     running: true,
                     dirty: false,
                     pending_scope: None,
+                    pending_fallback_reason: None,
                 },
                 last_file_check_persisted_at: None,
             },
@@ -995,6 +1025,7 @@ mod tests {
                     pending_scope: Some(
                         RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap(),
                     ),
+                    pending_fallback_reason: None,
                 },
                 last_file_check_persisted_at: None,
             },
@@ -1012,6 +1043,7 @@ mod tests {
                     pending_scope: Some(
                         RunScope::from_paths([PathBuf::from("src/mod.rs")]).unwrap(),
                     ),
+                    pending_fallback_reason: None,
                 },
                 last_file_check_persisted_at: None,
             },
