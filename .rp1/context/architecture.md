@@ -2,7 +2,7 @@
 
 ## Summary
 
-1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact-horizon` feature adds a separate local-only read path for bounded advisory impact exploration, relation-backed storage, a primary-versus-contextual trust split, explicit empty outcomes, and an additive `search -> segment_id -> impact` handoff.
+1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact` workflow remains a separate local-only read path for bounded advisory exploration, and the impact-fixes work upgrades how relation evidence is stored and promoted. `segment_relations` now persists raw, canonical, lookup-tail, and qualifier-fingerprint evidence behind schema v9, while `ImpactHorizonEngine` scores qualifier, path, breadcrumb, scope, relation-kind, and role signals before ambiguous or low-signal matches can reach primary `results`.
 
 ## Key Architecture Patterns
 
@@ -12,10 +12,10 @@
 | Staged single-writer indexing | Parse work can fan out, but persisted segment, symbol, vector, and relation mutations converge through transactional storage helpers. | `src/storage/segments.rs`, `src/storage/schema.rs` |
 | Candidate-first retrieval | Search ranks lightweight vector, FTS, and exact-first symbol candidates before hydrating full segment data. | `src/search/hybrid.rs`, `src/storage/queries.rs` |
 | Local-only advisory impact path | `1up impact` reads the current index directly and avoids daemon IPC so discovery behavior remains unchanged. | `src/cli/impact.rs`, `src/search/impact.rs` |
-| Relation-backed expansion | Unresolved relation rows are persisted at write time and resolved against current definitions only for bounded seed sets. | `src/storage/relations.rs`, `src/search/impact.rs` |
-| Trust-bucketed impact results | Relation-backed candidates stay in primary `results`; same-file and test-only observations move to `contextual_results`. | `src/search/impact.rs`, `src/cli/output.rs` |
+| Descriptor-backed relation resolution | Unresolved relation rows persist canonical, lookup-tail, and qualifier evidence at write time, then resolve bounded definition candidates only for active seeds. | `src/storage/relations.rs`, `src/search/impact.rs` |
+| Trust-bucketed impact results | Confident relation-backed candidates stay in primary `results`; ambiguous, low-signal, same-file, and test-only observations move to `contextual_results` or explicit empty outcomes. | `src/search/impact.rs`, `src/cli/output.rs` |
 | Additive search handoff | Search results expose optional `segment_id` values for exact impact follow-up without changing ranking. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
-| Schema-gated local state | Schema v8 requires `segment_relations` and fails stale indexes closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
+| Schema-gated local state | Schema v9 requires lookup-target and qualifier columns on `segment_relations` and fails stale indexes closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
 | Interactive guardrails | Benchmarks, black-box tests, and trust/perf scripts encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh` |
 
 ## Layers
@@ -35,8 +35,8 @@
 
 1. CLI or daemon resolves project-local DB/config paths.
 2. Indexer scans files and parses them into segments.
-3. Storage writes segments, vectors, canonical symbols, and unresolved relation rows.
-4. Schema validation ensures later reads only proceed against schema v8.
+3. Storage writes segments, vectors, canonical symbols, and relation descriptors containing raw, canonical, lookup, and qualifier fields.
+4. Schema validation ensures later reads only proceed against schema v9 with the required lookup-target and qualifier columns.
 
 ### Daemon-Backed Search
 
@@ -51,9 +51,9 @@
 1. CLI requires exactly one anchor: file, symbol, or segment.
 2. `impact` opens the current index read-only and requires schema compatibility.
 3. Anchor resolution either yields bounded seed segments or a refusal envelope with hints.
-4. Expansion traverses `segment_relations` plus same-file and test heuristics, then separates observations into primary likely impact and contextual guidance buckets.
-5. Outcome selection returns `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused`, and empty outcomes do not echo the anchor as a synthetic result.
-6. Formatter and rollout-evidence surfaces render and validate primary versus contextual output separately.
+4. Expansion traverses descriptor-backed `segment_relations`, fetches bounded definition candidates by `lookup_canonical_symbol`, scores qualifier/path/breadcrumb/scope/role evidence, and keeps same-file plus test heuristics contextual.
+5. Primary promotion only happens for confident non-ambiguous, non-`IMPORT`/`DOCS` matches; weaker relation evidence stays contextual or falls through to `empty` / `empty_scoped` without anchor echoes.
+6. Formatter and rollout-evidence surfaces keep the existing envelope shape while rendering and validating primary versus contextual output separately.
 
 ### Search-to-Impact Handoff
 
@@ -69,8 +69,8 @@
 | Global runtime state | `dirs::data_dir()/1up` | Registry, PID/socket files, cache, models, update metadata. |
 | Project-local state | `<project>/.1up/` | `project_id`, `index.db`, `index_status.json`, `daemon_status.json`. |
 | Search persistence | `segments`, `segment_vectors`, `segment_symbols` | Discovery retrieval inputs. |
-| Impact persistence | `segment_relations` | Unresolved call/reference rows resolved at query time for bounded seeds. |
-| Compatibility gate | `SCHEMA_VERSION = 8` | Stale indexes require `1up reindex`. |
+| Impact persistence | `segment_relations` | Stores `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, and `qualifier_fingerprint` for bounded outbound and inbound expansion. |
+| Compatibility gate | `SCHEMA_VERSION = 9` | Validation requires lookup-target and qualifier columns; stale indexes require `1up reindex`. |
 
 ## Integrations
 
@@ -111,7 +111,8 @@ graph TB
 ## What Changed With Impact Horizon
 
 - Added a separate local-only `impact` command path instead of extending daemon search.
-- Added `segment_relations` and schema v8 to support bounded relation-backed expansion.
-- Added trust-bucketed impact envelopes with explicit `empty` and `empty_scoped` outcomes plus additive `contextual_results`.
+- Upgraded `segment_relations` to schema v9 with lookup-tail and qualifier-fingerprint evidence for relation resolution.
+- Added qualifier/path/breadcrumb/scope/role confidence scoring plus ambiguity gating before relation candidates reach primary results.
+- Kept trust-bucketed impact envelopes with explicit `empty` and `empty_scoped` outcomes plus additive `contextual_results`.
 - Added additive `segment_id` exposure on machine-readable search results for exact follow-up.
 - Added dedicated trust and performance gate entry points through `just impact-eval` and `just impact-bench`.
