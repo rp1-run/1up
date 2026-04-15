@@ -63,7 +63,6 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         StorageError::Migration(format!("failed to create symbol and relation indexes: {e}"))
     })?;
 
-    // FTS5 virtual table and sync triggers
     conn.execute_batch(queries::CREATE_FTS_TABLE)
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create FTS table: {e}")))?;
@@ -380,7 +379,6 @@ mod tests {
         let (_db, conn) = setup().await;
         prepare_for_write(&conn).await.unwrap();
 
-        // No model recorded yet — should write and succeed.
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
@@ -399,7 +397,6 @@ mod tests {
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
-        // Second call with same model should also succeed.
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
@@ -414,7 +411,6 @@ mod tests {
             .await
             .unwrap();
 
-        // No vectors stored yet — switching model should succeed and update metadata.
         check_embedding_model_compatible(&conn, "org/model-v2", 768)
             .await
             .unwrap();
@@ -434,7 +430,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate stored embeddings.
         conn.execute(
             "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
             (),
@@ -462,7 +457,6 @@ mod tests {
         let (_db, conn) = setup().await;
         prepare_for_write(&conn).await.unwrap();
 
-        // Simulate a legacy index: has vectors but no model metadata.
         conn.execute(
             "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
             (),

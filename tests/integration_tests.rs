@@ -583,9 +583,6 @@ pub fn boot_global_config() -> &'static str {
 
     tmp
 }
-
-// ---------- Test fixture: index a small multi-language repository ----------
-
 #[test]
 fn index_multi_language_repository() {
     let tmp = create_multi_lang_fixture();
@@ -597,8 +594,6 @@ fn index_multi_language_repository() {
         "index.db should be created after indexing"
     );
 }
-
-// ---------- Verify symbol lookup returns correct definitions ----------
 
 #[test]
 fn symbol_lookup_returns_definitions_json() {
@@ -708,8 +703,6 @@ fn symbol_lookup_acceptance_queries_cover_exact_canonical_and_references() {
         result["reference_kind"] == "usage" && result["file_path"] == "src/runner.rs"
     }));
 }
-
-// ---------- Verify hybrid search returns ranked results ----------
 
 #[test]
 fn fts_search_returns_ranked_results_json() {
@@ -1154,8 +1147,6 @@ fn search_segment_id_handoff_keeps_search_top_hits_stable() {
     assert_eq!(before_ranked, after_ranked);
 }
 
-// ---------- Verify context retrieval returns enclosing scope ----------
-
 #[test]
 fn context_retrieval_returns_enclosing_scope_json() {
     let tmp = create_multi_lang_fixture();
@@ -1345,8 +1336,6 @@ fn context_allows_outside_root_with_explicit_override() {
     assert!(result["content"].as_str().unwrap().contains("fn leaked"));
 }
 
-// ---------- Verify JSON output conforms to schema ----------
-
 #[test]
 fn json_output_search_schema_conformance() {
     let tmp = create_multi_lang_fixture();
@@ -1454,8 +1443,6 @@ fn json_output_context_schema_conformance() {
     assert!(result["scope_type"].is_string());
     assert!(result["access_scope"].is_string());
 }
-
-// ---------- Verify incremental indexing ----------
 
 #[test]
 fn incremental_indexing_detects_changes() {
@@ -1632,8 +1619,6 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
     );
 }
 
-// ---------- Daemon lifecycle test ----------
-
 #[cfg(unix)]
 #[test]
 fn daemon_pid_file_lifecycle() {
@@ -1681,8 +1666,6 @@ fn daemon_stale_pid_detection() {
     fs::remove_file(&pid_path).unwrap();
     assert!(!pid_path.exists(), "stale PID file should be cleaned up");
 }
-
-// ---------- CLI integration tests ----------
 
 #[test]
 fn cli_init_then_index_then_search_workflow() {
