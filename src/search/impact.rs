@@ -40,6 +40,8 @@ const RELATION_SOLO_PRIMARY_THRESHOLD: f64 = 0.45;
 const RELATION_PRIMARY_THRESHOLD: f64 = 0.55;
 const RELATION_CONTEXTUAL_THRESHOLD: f64 = 0.35;
 const RELATION_AMBIGUITY_MARGIN: f64 = 0.08;
+const LOW_SIGNAL_WRAPPER_PENALTY: f64 = 0.82;
+const LOW_SIGNAL_DECLARATION_PENALTY: f64 = 0.68;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImpactAnchor {
@@ -1167,6 +1169,7 @@ fn relation_candidate_confidence(
     } else {
         0.45 + (0.55 * qualifier_score)
     };
+    let signal_multiplier = relation_signal_multiplier(emitted_candidate, qualifier_score);
 
     ((0.45 * symbol_score)
         + (0.25 * qualifier_score)
@@ -1174,6 +1177,7 @@ fn relation_candidate_confidence(
         + (0.10 * role_score)
         + (0.05 * relation_kind_score))
         * qualifier_gate
+        * signal_multiplier
 }
 
 fn relation_observation_bucket(
@@ -1294,6 +1298,44 @@ fn relation_role_score(role: Option<SegmentRole>) -> f64 {
     }
 }
 
+fn relation_signal_multiplier(candidate: &CandidateRow, qualifier_score: f64) -> f64 {
+    let mut multiplier = 1.0;
+
+    if is_wrapper_like_candidate(candidate) {
+        multiplier *= LOW_SIGNAL_WRAPPER_PENALTY;
+    }
+
+    if qualifier_score == 0.0 && is_declaration_like_candidate(candidate) {
+        multiplier *= LOW_SIGNAL_DECLARATION_PENALTY;
+    }
+
+    multiplier
+}
+
+fn is_wrapper_like_candidate(candidate: &CandidateRow) -> bool {
+    let complexity = candidate.complexity.unwrap_or_default();
+    let call_count = candidate
+        .called_symbols
+        .as_ref()
+        .map(|symbols| symbols.len())
+        .unwrap_or_default();
+
+    matches!(
+        candidate.role,
+        Some(SegmentRole::Implementation | SegmentRole::Orchestration)
+    ) && candidate.line_count() <= 4
+        && complexity <= 1
+        && call_count <= 1
+}
+
+fn is_declaration_like_candidate(candidate: &CandidateRow) -> bool {
+    matches!(candidate.role, Some(SegmentRole::Definition))
+        && matches!(
+            candidate.block_type.as_str(),
+            "struct" | "enum" | "trait" | "type" | "class" | "interface" | "module"
+        )
+}
+
 fn qualifier_components(qualifier_fingerprint: &str) -> Vec<String> {
     qualifier_fingerprint
         .split('/')
@@ -1305,7 +1347,7 @@ fn qualifier_components(qualifier_fingerprint: &str) -> Vec<String> {
 }
 
 fn path_components(path: &str) -> Vec<String> {
-    path.split(|ch| ch == '/' || ch == '.')
+    path.split(['/', '.'])
         .map(normalize_symbolish)
         .filter(|component| {
             !component.is_empty() && !matches!(component.as_str(), "src" | "tests" | "test")
@@ -1325,8 +1367,7 @@ fn symbol_lookup_tail(symbol: &str) -> Option<String> {
     symbol
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .map(normalize_symbolish)
-        .filter(|component| !component.is_empty())
-        .next_back()
+        .rfind(|component| !component.is_empty())
 }
 
 fn reason_key(reason: &ImpactReason) -> String {
