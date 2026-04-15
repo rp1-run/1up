@@ -8,6 +8,7 @@ use crate::shared::config;
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
 use crate::storage::db::Db;
+use crate::shared::constants::SCHEMA_VERSION;
 use crate::storage::schema;
 
 #[derive(Args)]
@@ -184,10 +185,10 @@ async fn run_reindex_once(
     let db = Db::open_rw(db_path).await?;
     let conn = db.connect()?;
     schema::rebuild(&conn).await?;
-    setup_spinner.success_with("Rebuilt schema v5");
+    setup_spinner.success_with(&format!("Rebuilt schema v{SCHEMA_VERSION}"));
 
     if let Some(progress_tx) = progress_tx {
-        send_watch_progress(progress_tx, IndexPhase::Rebuilding, "Rebuilt schema v5");
+        send_watch_progress(progress_tx, IndexPhase::Rebuilding, &format!("Rebuilt schema v{SCHEMA_VERSION}"));
         send_watch_progress(
             progress_tx,
             IndexPhase::LoadingModel,
