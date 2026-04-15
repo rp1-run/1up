@@ -483,3 +483,24 @@ INSERT OR REPLACE INTO indexed_files (
 )";
 
 pub const DELETE_INDEXED_FILE: &str = "DELETE FROM indexed_files WHERE file_path = ?1";
+
+/// Maximum number of SQL parameters per statement to stay below SQLite limits.
+pub const SQLITE_MAX_PARAMS: usize = 999;
+
+/// Number of columns in a segment INSERT (positional params only, excludes datetime('now') literals).
+pub const SEGMENT_INSERT_COLS: usize = 14;
+
+/// Number of columns in a segment_symbols INSERT (positional params only).
+pub const SYMBOL_INSERT_COLS: usize = 4;
+
+/// Number of columns in a segment_relations INSERT (positional params only).
+pub const RELATION_INSERT_COLS: usize = 7;
+
+/// Number of columns in a segment_vectors INSERT (positional params only).
+pub const VECTOR_INSERT_COLS: usize = 2;
+
+/// Maximum rows per chunk for each table, derived from `SQLITE_MAX_PARAMS`.
+pub const SEGMENT_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SEGMENT_INSERT_COLS;
+pub const SYMBOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SYMBOL_INSERT_COLS;
+pub const RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / RELATION_INSERT_COLS;
+pub const VECTOR_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / VECTOR_INSERT_COLS;

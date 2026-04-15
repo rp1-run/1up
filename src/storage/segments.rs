@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 use libsql::Connection;
 
@@ -668,12 +669,23 @@ async fn replace_file_segments_in_transaction_with_meta(
 ) -> Result<(), OneupError> {
     delete_segments_by_file_only(conn, file_path).await?;
 
-    let mut relation_rows = Vec::new();
-    for segment in segments {
-        upsert_segment_record(conn, segment).await?;
-        relation_rows.extend(build_segment_relation_rows(segment));
-    }
+    batch_upsert_segments(conn, segments).await?;
+    batch_upsert_vectors(conn, segments).await?;
 
+    let symbol_rows: Vec<(String, SegmentSymbolInsert)> = segments
+        .iter()
+        .flat_map(|seg| {
+            build_segment_symbol_rows(seg)
+                .into_iter()
+                .map(|sym| (seg.id.clone(), sym))
+        })
+        .collect();
+    batch_insert_symbols(conn, &symbol_rows).await?;
+
+    let relation_rows: Vec<RelationInsert> = segments
+        .iter()
+        .flat_map(build_segment_relation_rows)
+        .collect();
     relations::insert_relations(conn, &relation_rows).await?;
 
     if let Some(meta) = manifest_meta {
@@ -688,6 +700,154 @@ async fn replace_file_segments_in_transaction_with_meta(
         .await?;
     } else if segments.is_empty() {
         delete_indexed_file(conn, file_path).await?;
+    }
+
+    Ok(())
+}
+
+async fn batch_upsert_segments(
+    conn: &Connection,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in segments.chunks(queries::SEGMENT_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT OR REPLACE INTO segments (\
+             id, file_path, language, block_type, content, \
+             line_start, line_end, breadcrumb, complexity, role, \
+             defined_symbols, referenced_symbols, called_symbols, \
+             file_hash, created_at, updated_at\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::SEGMENT_INSERT_COLS);
+
+        for (i, seg) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let b = i * queries::SEGMENT_INSERT_COLS;
+            write!(
+                sql,
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'), datetime('now'))",
+                b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12, b+13, b+14,
+            ).expect("write to String cannot fail");
+
+            params.push(seg.id.clone().into());
+            params.push(seg.file_path.clone().into());
+            params.push(seg.language.clone().into());
+            params.push(seg.block_type.clone().into());
+            params.push(seg.content.clone().into());
+            params.push(seg.line_start.into());
+            params.push(seg.line_end.into());
+            params.push(seg.breadcrumb.clone().into());
+            params.push(seg.complexity.into());
+            params.push(seg.role.clone().into());
+            params.push(seg.defined_symbols.clone().into());
+            params.push(seg.referenced_symbols.clone().into());
+            params.push(seg.called_symbols.clone().into());
+            params.push(seg.file_hash.clone().into());
+        }
+
+        conn.execute(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("batch upsert segments failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+async fn batch_upsert_vectors(
+    conn: &Connection,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    let vec_segments: Vec<&SegmentInsert> = segments
+        .iter()
+        .filter(|seg| seg.embedding_vec.is_some())
+        .collect();
+
+    if vec_segments.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in vec_segments.chunks(queries::VECTOR_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT OR REPLACE INTO segment_vectors (\
+             segment_id, embedding_vec, created_at, updated_at\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::VECTOR_INSERT_COLS);
+
+        for (i, seg) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let b = i * queries::VECTOR_INSERT_COLS;
+            write!(
+                sql,
+                "(?{}, vector(?{}), datetime('now'), datetime('now'))",
+                b + 1,
+                b + 2
+            )
+            .expect("write to String cannot fail");
+
+            params.push(seg.id.clone().into());
+            params.push(seg.embedding_vec.clone().unwrap().into());
+        }
+
+        conn.execute(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("batch upsert vectors failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+async fn batch_insert_symbols(
+    conn: &Connection,
+    symbols: &[(String, SegmentSymbolInsert)],
+) -> Result<(), OneupError> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in symbols.chunks(queries::SYMBOL_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT OR REPLACE INTO segment_symbols (\
+             segment_id, symbol, canonical_symbol, reference_kind, created_at\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::SYMBOL_INSERT_COLS);
+
+        for (i, (segment_id, sym)) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let b = i * queries::SYMBOL_INSERT_COLS;
+            write!(
+                sql,
+                "(?{}, ?{}, ?{}, ?{}, datetime('now'))",
+                b + 1,
+                b + 2,
+                b + 3,
+                b + 4
+            )
+            .expect("write to String cannot fail");
+
+            params.push(segment_id.clone().into());
+            params.push(sym.symbol.clone().into());
+            params.push(sym.canonical_symbol.clone().into());
+            params.push(reference_kind_label(sym.reference_kind).to_string().into());
+        }
+
+        conn.execute(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("batch insert symbols failed: {e}")))?;
     }
 
     Ok(())
@@ -1464,5 +1624,155 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(relation_rows(&conn, "old_a_1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn indexed_files_rows_stay_transactionally_aligned_with_segments() {
+        let (_db, conn) = setup().await;
+
+        let mut seg_a1 = test_segment("a1", "src/a.rs", "hash-a");
+        seg_a1.called_symbols = r#"["call_a"]"#.to_string();
+        seg_a1.defined_symbols = r#"["SymA"]"#.to_string();
+        let seg_a2 = test_segment("a2", "src/a.rs", "hash-a");
+        let seg_b1 = test_segment("b1", "src/b.rs", "hash-b");
+
+        let meta_a = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "hash-a".to_string(),
+            file_size: 100,
+            modified_ns: 1_000_000,
+        };
+        let meta_b = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "hash-b".to_string(),
+            file_size: 200,
+            modified_ns: 2_000_000,
+        };
+
+        replace_file_batch_tx(
+            &conn,
+            &[
+                FileSegmentBatch {
+                    file_path: "src/a.rs",
+                    segments: &[seg_a1, seg_a2],
+                    manifest_meta: Some(&meta_a),
+                },
+                FileSegmentBatch {
+                    file_path: "src/b.rs",
+                    segments: &[seg_b1],
+                    manifest_meta: Some(&meta_b),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let manifest = get_all_indexed_files(&conn).await.unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest["src/a.rs"].file_hash, "hash-a");
+        assert_eq!(manifest["src/a.rs"].file_size, 100);
+        assert_eq!(manifest["src/b.rs"].file_hash, "hash-b");
+        assert_eq!(manifest["src/b.rs"].file_size, 200);
+
+        let seg_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
+        assert_eq!(seg_a.len(), 2);
+        assert!(!relation_rows(&conn, "a1").await.is_empty());
+        assert!(!symbol_rows(&conn, "a1").await.is_empty());
+
+        let new_a1 = test_segment("a1_v2", "src/a.rs", "hash-a-v2");
+        let meta_a_v2 = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "hash-a-v2".to_string(),
+            file_size: 150,
+            modified_ns: 3_000_000,
+        };
+
+        replace_file_segments_tx_with_meta(&conn, "src/a.rs", &[new_a1], Some(&meta_a_v2))
+            .await
+            .unwrap();
+
+        let manifest = get_all_indexed_files(&conn).await.unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest["src/a.rs"].file_hash, "hash-a-v2");
+        assert_eq!(manifest["src/a.rs"].file_size, 150);
+        assert_eq!(manifest["src/b.rs"].file_hash, "hash-b");
+
+        let seg_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
+        assert_eq!(seg_a.len(), 1);
+        assert_eq!(seg_a[0].id, "a1_v2");
+        assert!(relation_rows(&conn, "a1").await.is_empty());
+        assert!(symbol_rows(&conn, "a1").await.is_empty());
+
+        replace_file_segments_tx(&conn, "src/b.rs", &[])
+            .await
+            .unwrap();
+
+        let manifest = get_all_indexed_files(&conn).await.unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert!(manifest.contains_key("src/a.rs"));
+        assert!(!manifest.contains_key("src/b.rs"));
+        assert!(get_segments_by_file(&conn, "src/b.rs")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_rollback_keeps_indexed_files_aligned() {
+        let (_db, conn) = setup().await;
+
+        let seg_a = test_segment("old_a", "src/a.rs", "old-hash");
+        let meta_a = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "old-hash".to_string(),
+            file_size: 50,
+            modified_ns: 1_000_000,
+        };
+        replace_file_segments_tx_with_meta(&conn, "src/a.rs", &[seg_a], Some(&meta_a))
+            .await
+            .unwrap();
+
+        let new_a = test_segment("new_a", "src/a.rs", "new-hash");
+        let mut bad_b = test_segment("bad_b", "src/b.rs", "b-hash");
+        bad_b.embedding_vec = Some("not-a-vector".to_string());
+
+        let result = replace_file_batch_tx(
+            &conn,
+            &[
+                FileSegmentBatch {
+                    file_path: "src/a.rs",
+                    segments: &[new_a],
+                    manifest_meta: Some(&IndexedFileMeta {
+                        extension: "rs".to_string(),
+                        file_hash: "new-hash".to_string(),
+                        file_size: 100,
+                        modified_ns: 2_000_000,
+                    }),
+                },
+                FileSegmentBatch {
+                    file_path: "src/b.rs",
+                    segments: &[bad_b],
+                    manifest_meta: Some(&IndexedFileMeta {
+                        extension: "rs".to_string(),
+                        file_hash: "b-hash".to_string(),
+                        file_size: 200,
+                        modified_ns: 3_000_000,
+                    }),
+                },
+            ],
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let manifest = get_all_indexed_files(&conn).await.unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest["src/a.rs"].file_hash, "old-hash");
+        assert_eq!(manifest["src/a.rs"].file_size, 50);
+        assert!(!manifest.contains_key("src/b.rs"));
+
+        let seg_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
+        assert_eq!(seg_a.len(), 1);
+        assert_eq!(seg_a[0].id, "old_a");
     }
 }
