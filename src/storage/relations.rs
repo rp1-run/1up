@@ -37,6 +37,8 @@ pub struct RelationInsert {
     pub relation_kind: RelationKind,
     pub raw_target_symbol: String,
     pub canonical_target_symbol: String,
+    pub lookup_canonical_symbol: String,
+    pub qualifier_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,15 @@ pub struct StoredRelation {
     pub relation_kind: RelationKind,
     pub raw_target_symbol: String,
     pub canonical_target_symbol: String,
+    pub lookup_canonical_symbol: String,
+    pub qualifier_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelationTargetDescriptor {
+    canonical_target_symbol: String,
+    lookup_canonical_symbol: String,
+    qualifier_fingerprint: String,
 }
 
 pub fn build_relation_inserts(
@@ -60,24 +71,59 @@ pub fn build_relation_inserts(
         (RelationKind::Reference, referenced_symbols),
     ] {
         for symbol in symbols {
-            let canonical_target_symbol = normalize_symbolish(symbol);
-            if canonical_target_symbol.is_empty() {
+            let Some(descriptor) = relation_target_descriptor(symbol) else {
                 continue;
-            }
+            };
 
-            let dedupe_key = (relation_kind, canonical_target_symbol.clone());
+            let dedupe_key = (relation_kind, descriptor.canonical_target_symbol.clone());
             if seen.insert(dedupe_key) {
                 relations.push(RelationInsert {
                     source_segment_id: source_segment_id.to_string(),
                     relation_kind,
                     raw_target_symbol: symbol.clone(),
-                    canonical_target_symbol,
+                    canonical_target_symbol: descriptor.canonical_target_symbol,
+                    lookup_canonical_symbol: descriptor.lookup_canonical_symbol,
+                    qualifier_fingerprint: descriptor.qualifier_fingerprint,
                 });
             }
         }
     }
 
     relations
+}
+
+fn relation_target_descriptor(raw_target_symbol: &str) -> Option<RelationTargetDescriptor> {
+    let canonical_target_symbol = normalize_symbolish(raw_target_symbol);
+    if canonical_target_symbol.is_empty() {
+        return None;
+    }
+
+    let components: Vec<String> = raw_target_symbol
+        .split(is_symbol_component_separator)
+        .map(normalize_symbolish)
+        .filter(|component| !component.is_empty())
+        .collect();
+
+    let lookup_canonical_symbol = components
+        .last()
+        .cloned()
+        .unwrap_or_else(|| canonical_target_symbol.clone());
+    let qualifier_fingerprint = components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("/");
+
+    Some(RelationTargetDescriptor {
+        canonical_target_symbol,
+        lookup_canonical_symbol,
+        qualifier_fingerprint,
+    })
+}
+
+fn is_symbol_component_separator(ch: char) -> bool {
+    !ch.is_alphanumeric() && ch != '_'
 }
 
 pub async fn get_outbound_relations(
@@ -158,6 +204,48 @@ pub async fn get_inbound_relations(
     Ok(results)
 }
 
+#[allow(dead_code)]
+pub async fn get_inbound_relations_by_lookup_symbol(
+    conn: &Connection,
+    lookup_canonical_symbol: &str,
+    relation_kind: Option<RelationKind>,
+    limit: usize,
+) -> Result<Vec<StoredRelation>, OneupError> {
+    let Some(limit) = relation_limit(limit)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut rows = match relation_kind {
+        Some(relation_kind) => conn
+            .query(
+                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND,
+                libsql::params![lookup_canonical_symbol, relation_kind.as_str(), limit],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Query(format!("inbound lookup relation lookup failed: {e}"))
+            })?,
+        None => conn
+            .query(
+                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL,
+                libsql::params![lookup_canonical_symbol, limit],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Query(format!("inbound lookup relation lookup failed: {e}"))
+            })?,
+    };
+
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| {
+        StorageError::Query(format!("inbound lookup relation row iteration failed: {e}"))
+    })? {
+        results.push(row_to_stored_relation(&row)?);
+    }
+
+    Ok(results)
+}
+
 pub(crate) async fn insert_relations(
     conn: &Connection,
     relations: &[RelationInsert],
@@ -170,6 +258,8 @@ pub(crate) async fn insert_relations(
                 relation.relation_kind.as_str(),
                 relation.raw_target_symbol.clone(),
                 relation.canonical_target_symbol.clone(),
+                relation.lookup_canonical_symbol.clone(),
+                relation.qualifier_fingerprint.clone(),
             ],
         )
         .await
@@ -255,6 +345,12 @@ fn row_to_stored_relation(row: &libsql::Row) -> Result<StoredRelation, OneupErro
         canonical_target_symbol: row.get(3).map_err(|e| {
             StorageError::Query(format!("read canonical_target_symbol failed: {e}"))
         })?,
+        lookup_canonical_symbol: row.get(4).map_err(|e| {
+            StorageError::Query(format!("read lookup_canonical_symbol failed: {e}"))
+        })?,
+        qualifier_fingerprint: row
+            .get(5)
+            .map_err(|e| StorageError::Query(format!("read qualifier_fingerprint failed: {e}")))?,
     })
 }
 
@@ -317,12 +413,16 @@ mod tests {
                     relation_kind: RelationKind::Call,
                     raw_target_symbol: "load_config".to_string(),
                     canonical_target_symbol: "loadconfig".to_string(),
+                    lookup_canonical_symbol: "loadconfig".to_string(),
+                    qualifier_fingerprint: String::new(),
                 },
                 RelationInsert {
                     source_segment_id: "seg-1".to_string(),
                     relation_kind: RelationKind::Reference,
                     raw_target_symbol: "ConfigLoader".to_string(),
                     canonical_target_symbol: "configloader".to_string(),
+                    lookup_canonical_symbol: "configloader".to_string(),
+                    qualifier_fingerprint: String::new(),
                 },
             ]
         );
@@ -333,12 +433,13 @@ mod tests {
         let (_db, conn) = setup().await;
 
         let mut source_a = test_segment("source_a", "src/a.rs");
-        source_a.called_symbols = r#"["load_config","write_config"]"#.to_string();
+        source_a.called_symbols =
+            r#"["crate::auth::config::load_config","write_config"]"#.to_string();
         source_a.referenced_symbols = r#"["ConfigLoader"]"#.to_string();
         segments::upsert_segment(&conn, &source_a).await.unwrap();
 
         let mut source_b = test_segment("source_b", "src/b.rs");
-        source_b.called_symbols = r#"["load_config"]"#.to_string();
+        source_b.called_symbols = r#"["auth.config.load_config"]"#.to_string();
         source_b.referenced_symbols = r#"["ConfigLoader","Settings"]"#.to_string();
         segments::upsert_segment(&conn, &source_b).await.unwrap();
 
@@ -347,9 +448,16 @@ mod tests {
             .unwrap();
         assert_eq!(outbound.len(), 2);
         assert_eq!(outbound[0].relation_kind, RelationKind::Call);
-        assert_eq!(outbound[0].canonical_target_symbol, "loadconfig");
+        assert_eq!(
+            outbound[0].canonical_target_symbol,
+            "crateauthconfigloadconfig"
+        );
+        assert_eq!(outbound[0].lookup_canonical_symbol, "loadconfig");
+        assert_eq!(outbound[0].qualifier_fingerprint, "crate/auth/config");
         assert_eq!(outbound[1].relation_kind, RelationKind::Call);
         assert_eq!(outbound[1].canonical_target_symbol, "writeconfig");
+        assert_eq!(outbound[1].lookup_canonical_symbol, "writeconfig");
+        assert!(outbound[1].qualifier_fingerprint.is_empty());
 
         let inbound =
             get_inbound_relations(&conn, "configloader", Some(RelationKind::Reference), 8)
@@ -357,6 +465,22 @@ mod tests {
                 .unwrap();
         assert_eq!(
             inbound
+                .iter()
+                .map(|relation| relation.source_segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source_a", "source_b"]
+        );
+
+        let lookup_inbound = get_inbound_relations_by_lookup_symbol(
+            &conn,
+            "loadconfig",
+            Some(RelationKind::Call),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lookup_inbound
                 .iter()
                 .map(|relation| relation.source_segment_id.as_str())
                 .collect::<Vec<_>>(),

@@ -22,6 +22,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segment_symbols_prefix"),
     ("index", "idx_segment_relations_source"),
     ("index", "idx_segment_relations_target"),
+    ("index", "idx_segment_relations_lookup_target"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
@@ -50,11 +51,12 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
 
     conn.execute_batch(&format!(
-        "{};{};{};{}",
+        "{};{};{};{};{}",
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
         queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
         queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
+        queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
     ))
     .await
     .map_err(|e| {
@@ -201,22 +203,30 @@ async fn schema_object_exists(
     }
 }
 
-async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
-    let mut rows = conn
-        .query(queries::SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN, ())
-        .await
-        .map_err(|e| {
-            StorageError::Query(format!("failed to inspect segment_vectors columns: {e}"))
-        })?;
+async fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, OneupError> {
+    let query = format!("SELECT 1 FROM pragma_table_info('{table_name}') WHERE name = ?1 LIMIT 1");
+    let mut rows = conn.query(&query, [column_name]).await.map_err(|e| {
+        StorageError::Query(format!(
+            "failed to inspect table column {table_name}.{column_name}: {e}"
+        ))
+    })?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
         Err(e) => Err(StorageError::Query(format!(
-            "segment_vectors column inspection failed: {e}"
+            "table column inspection failed for {table_name}.{column_name}: {e}"
         ))
         .into()),
     }
+}
+
+async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
+    table_has_column(conn, "segment_vectors", "embedding_vec").await
 }
 
 async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> {
@@ -231,6 +241,18 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
     if !segment_vectors_has_embedding_vec(conn).await? {
         return Err(reindex_required(format!(
             "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.embedding_vec`)"
+        )));
+    }
+
+    if !table_has_column(conn, "segment_relations", "lookup_canonical_symbol").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.lookup_canonical_symbol`)"
+        )));
+    }
+
+    if !table_has_column(conn, "segment_relations", "qualifier_fingerprint").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.qualifier_fingerprint`)"
         )));
     }
 
@@ -508,10 +530,25 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_relations_lookup_target")
+                .await
+                .unwrap()
+        );
         assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
             .await
             .unwrap());
         assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
+        assert!(
+            table_has_column(&conn, "segment_relations", "lookup_canonical_symbol")
+                .await
+                .unwrap()
+        );
+        assert!(
+            table_has_column(&conn, "segment_relations", "qualifier_fingerprint")
+                .await
+                .unwrap()
+        );
         ensure_current(&conn).await.unwrap();
     }
 
@@ -531,22 +568,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v8_schema() {
+    async fn prepare_for_write_rejects_pre_v9_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "7"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "8"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v7, expected v8"));
+        assert!(msg.contains("found v8, expected v9"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v8_schema() {
+    async fn ensure_current_rejects_partial_v9_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(

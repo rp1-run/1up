@@ -711,10 +711,14 @@ mod tests {
         results
     }
 
-    async fn relation_rows(conn: &Connection, segment_id: &str) -> Vec<(String, String, String)> {
+    async fn relation_rows(
+        conn: &Connection,
+        segment_id: &str,
+    ) -> Vec<(String, String, String, String, String)> {
         let mut rows = conn
             .query(
-                "SELECT relation_kind, raw_target_symbol, canonical_target_symbol
+                "SELECT relation_kind, raw_target_symbol, canonical_target_symbol,
+                        lookup_canonical_symbol, qualifier_fingerprint
                  FROM segment_relations
                  WHERE source_segment_id = ?1
                  ORDER BY relation_kind, canonical_target_symbol",
@@ -729,6 +733,8 @@ mod tests {
                 row.get(0).unwrap(),
                 row.get(1).unwrap(),
                 row.get(2).unwrap(),
+                row.get(3).unwrap(),
+                row.get(4).unwrap(),
             ));
         }
 
@@ -812,6 +818,8 @@ mod tests {
                 "reference".to_string(),
                 "ConfigLoader".to_string(),
                 "configloader".to_string(),
+                "configloader".to_string(),
+                String::new(),
             )]
         );
     }
@@ -1054,7 +1062,7 @@ mod tests {
         upsert_segment(&conn, &old_b_1).await.unwrap();
 
         let mut new_a_1 = test_segment("new_a_1", "src/a.rs", "new-a");
-        new_a_1.called_symbols = r#"["new_call"]"#.to_string();
+        new_a_1.called_symbols = r#"["crate::new::new_call"]"#.to_string();
         new_a_1.referenced_symbols = r#"["NewType"]"#.to_string();
         let replacement = [new_a_1, test_segment("new_a_2", "src/a.rs", "new-a")];
 
@@ -1104,13 +1112,17 @@ mod tests {
             vec![
                 (
                     "call".to_string(),
-                    "new_call".to_string(),
+                    "crate::new::new_call".to_string(),
+                    "cratenewnewcall".to_string(),
                     "newcall".to_string(),
+                    "crate/new".to_string(),
                 ),
                 (
                     "reference".to_string(),
                     "NewType".to_string(),
                     "newtype".to_string(),
+                    "newtype".to_string(),
+                    String::new(),
                 ),
             ]
         );
@@ -1121,6 +1133,8 @@ mod tests {
                 "call".to_string(),
                 "keep_b".to_string(),
                 "keepb".to_string(),
+                "keepb".to_string(),
+                String::new(),
             )]
         );
     }
@@ -1199,6 +1213,8 @@ mod tests {
                 "call".to_string(),
                 "legacy_a".to_string(),
                 "legacya".to_string(),
+                "legacya".to_string(),
+                String::new(),
             )]
         );
         assert_eq!(
@@ -1207,6 +1223,8 @@ mod tests {
                 "reference".to_string(),
                 "LegacyB".to_string(),
                 "legacyb".to_string(),
+                "legacyb".to_string(),
+                String::new(),
             )]
         );
         assert!(relation_rows(&conn, "new_a_1").await.is_empty());
