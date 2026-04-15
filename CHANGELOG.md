@@ -8,6 +8,16 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.6](https://github.com/rp1-run/1up/compare/v0.1.5...v0.1.6) (2026-04-15)
+
+
+### Features
+
+* add impact horizon command and search handoff ([#23](https://github.com/rp1-run/1up/issues/23)) ([3100970](https://github.com/rp1-run/1up/commit/310097091d6dc3666563ee4ca4b8755a3e6e2934))
+* **impact:** improve precision with edge identity, conformance, and eval suite ([#25](https://github.com/rp1-run/1up/issues/25)) ([48221c3](https://github.com/rp1-run/1up/commit/48221c3ba7589deba1c549940e70bb5a0d85bb96))
+* improve impact trust and rollout gating ([#24](https://github.com/rp1-run/1up/issues/24)) ([f7cbaf1](https://github.com/rp1-run/1up/commit/f7cbaf108e3cb2bc32c10c33ff78b49901f30f96))
+* improve indexing watch mode and CLI lifecycle defaults ([#21](https://github.com/rp1-run/1up/issues/21)) ([725839d](https://github.com/rp1-run/1up/commit/725839d0934411480e970c24b0b1106924696010))
+
 ## [0.1.5](https://github.com/rp1-run/1up/compare/v0.1.4...v0.1.5) (2026-04-11)
 
 
