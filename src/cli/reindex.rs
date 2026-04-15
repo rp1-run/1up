@@ -190,13 +190,13 @@ async fn run_reindex_once(
     let conn = db.connect_tuned().await?;
     schema::rebuild(&conn).await?;
     setup.db_prepare_ms = db_start.elapsed().as_millis();
-    setup_spinner.success_with(&format!("Rebuilt schema v{SCHEMA_VERSION}"));
+    setup_spinner.success_with(format!("Rebuilt schema v{SCHEMA_VERSION}"));
 
     if let Some(progress_tx) = progress_tx {
         send_watch_progress(
             progress_tx,
             IndexPhase::Rebuilding,
-            &format!("Rebuilt schema v{SCHEMA_VERSION}"),
+            format!("Rebuilt schema v{SCHEMA_VERSION}"),
         );
         send_watch_progress(
             progress_tx,

@@ -356,22 +356,16 @@ async fn prepare_full_run_inputs(
 
     let mut scanned_files = Vec::new();
     let mut scanned_paths = HashSet::new();
-    let mut metadata_unchanged_count = 0usize;
-
     for scanned_file in scanned {
         let relative_path = relative_path_for(&project_root_canonical, &scanned_file.path);
         scanned_paths.insert(relative_path.clone());
 
-        if let Some(entry) = manifest.get(&relative_path) {
-            if entry.file_size == scanned_file.file_size as i64
-                && entry.modified_ns == scanned_file.modified_ns
-            {
-                metadata_unchanged_count += 1;
-                continue;
-            }
-        }
+        let stored_hash = if let Some(entry) = manifest.get(&relative_path) {
+            Some(entry.file_hash.clone())
+        } else {
+            stored_hashes.get(&relative_path).cloned()
+        };
 
-        let stored_hash = stored_hashes.get(&relative_path).cloned();
         scanned_files.push(ScannedWorkItem {
             sequence_id: scanned_files.len(),
             relative_path,
@@ -382,6 +376,8 @@ async fn prepare_full_run_inputs(
             modified_ns: scanned_file.modified_ns,
         });
     }
+
+    let metadata_unchanged_count = 0usize;
 
     let manifest_paths: HashSet<&String> = manifest.keys().collect();
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
@@ -964,6 +960,7 @@ pub async fn run_with_config_and_progress_ui(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn run_with_scope(
     conn: &Connection,
     project_root: &Path,

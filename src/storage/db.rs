@@ -85,19 +85,19 @@ impl Db {
 ///
 /// These settings optimize the local write-heavy indexing workload without
 /// changing user-visible behavior or introducing new flags.
+///
+/// Uses `execute_batch` because `PRAGMA journal_mode=WAL` returns a result
+/// row and libSQL's `execute()` rejects statements that produce rows.
 pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> {
-    const PRAGMAS: &[&str] = &[
-        "PRAGMA journal_mode=WAL",
-        "PRAGMA synchronous=NORMAL",
-        "PRAGMA cache_size=-32768",
-        "PRAGMA mmap_size=268435456",
-        "PRAGMA temp_store=MEMORY",
-    ];
-    for pragma in PRAGMAS {
-        conn.execute(pragma, ())
-            .await
-            .map_err(|e| StorageError::Connection(format!("failed to set {pragma}: {e}")))?;
-    }
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA cache_size=-32768;
+         PRAGMA mmap_size=268435456;
+         PRAGMA temp_store=MEMORY;",
+    )
+    .await
+    .map_err(|e| StorageError::Connection(format!("failed to apply project PRAGMAs: {e}")))?;
     Ok(())
 }
 
