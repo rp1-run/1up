@@ -219,8 +219,8 @@ fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
                 eprintln!(
                     "{}",
                     fmt.format_message(&format!(
-                        "Created {filename} with 1up agent reminder (v{}).",
-                        reminder::VERSION
+                        "Created {filename} with 1up agent reminder (fence v{}).",
+                        reminder::FENCE_VERSION
                     ))
                 );
             }
@@ -233,7 +233,7 @@ fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
                     "{}",
                     fmt.format_message(&format!(
                         "Updated 1up reminder in {filename} ({old_version} -> {}).",
-                        reminder::VERSION
+                        reminder::FENCE_VERSION
                     ))
                 );
             }
