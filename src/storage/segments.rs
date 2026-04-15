@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use libsql::Connection;
 
 use crate::shared::errors::{OneupError, StorageError};
-use crate::shared::symbols::normalize_symbolish;
-use crate::shared::types::{ReferenceKind, SegmentRole};
+use crate::shared::symbols::{normalize_symbolish, EDGE_IDENTITY_BARE_IDENTIFIER};
+use crate::shared::types::{ParsedRelation, ReferenceKind, SegmentRole};
 use crate::storage::queries;
 use crate::storage::relations::{self, RelationInsert};
 
@@ -75,7 +75,9 @@ pub struct SegmentInsert {
     pub role: String,
     pub defined_symbols: String,
     pub referenced_symbols: String,
+    pub referenced_relations: String,
     pub called_symbols: String,
+    pub called_relations: String,
     pub file_hash: String,
 }
 
@@ -490,6 +492,20 @@ fn parse_symbols(value: &str) -> Vec<String> {
     serde_json::from_str(value).unwrap_or_default()
 }
 
+fn parse_relations(value: &str) -> Vec<ParsedRelation> {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+fn fallback_relations(symbols: &[String]) -> Vec<ParsedRelation> {
+    symbols
+        .iter()
+        .map(|symbol| ParsedRelation {
+            symbol: symbol.clone(),
+            edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+        })
+        .collect()
+}
+
 fn reference_kind_label(reference_kind: ReferenceKind) -> &'static str {
     match reference_kind {
         ReferenceKind::Definition => "definition",
@@ -532,11 +548,26 @@ fn build_segment_symbol_rows(seg: &SegmentInsert) -> Vec<SegmentSymbolInsert> {
 }
 
 fn build_segment_relation_rows(seg: &SegmentInsert) -> Vec<RelationInsert> {
-    relations::build_relation_inserts(
-        &seg.id,
-        &parse_symbols(&seg.called_symbols),
-        &parse_symbols(&seg.referenced_symbols),
-    )
+    let called_symbols = parse_symbols(&seg.called_symbols);
+    let called_relations = {
+        let parsed = parse_relations(&seg.called_relations);
+        if parsed.is_empty() && !called_symbols.is_empty() {
+            fallback_relations(&called_symbols)
+        } else {
+            parsed
+        }
+    };
+    let referenced_symbols = parse_symbols(&seg.referenced_symbols);
+    let referenced_relations = {
+        let parsed = parse_relations(&seg.referenced_relations);
+        if parsed.is_empty() && !referenced_symbols.is_empty() {
+            fallback_relations(&referenced_symbols)
+        } else {
+            parsed
+        }
+    };
+
+    relations::build_relation_inserts(&seg.id, &called_relations, &referenced_relations)
 }
 
 async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
@@ -682,7 +713,9 @@ mod tests {
             role: "DEFINITION".to_string(),
             defined_symbols: format!("[\"{id}\"]"),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: file_hash.to_string(),
         }
     }
@@ -714,14 +747,14 @@ mod tests {
     async fn relation_rows(
         conn: &Connection,
         segment_id: &str,
-    ) -> Vec<(String, String, String, String, String)> {
+    ) -> Vec<(String, String, String, String, String, String)> {
         let mut rows = conn
             .query(
                 "SELECT relation_kind, raw_target_symbol, canonical_target_symbol,
-                        lookup_canonical_symbol, qualifier_fingerprint
+                        lookup_canonical_symbol, qualifier_fingerprint, edge_identity_kind
                  FROM segment_relations
                  WHERE source_segment_id = ?1
-                 ORDER BY relation_kind, canonical_target_symbol",
+                 ORDER BY relation_kind, canonical_target_symbol, edge_identity_kind",
                 [segment_id],
             )
             .await
@@ -735,6 +768,7 @@ mod tests {
                 row.get(2).unwrap(),
                 row.get(3).unwrap(),
                 row.get(4).unwrap(),
+                row.get(5).unwrap(),
             ));
         }
 
@@ -820,6 +854,7 @@ mod tests {
                 "configloader".to_string(),
                 "configloader".to_string(),
                 String::new(),
+                "bare_identifier".to_string(),
             )]
         );
     }
@@ -1115,7 +1150,8 @@ mod tests {
                     "crate::new::new_call".to_string(),
                     "cratenewnewcall".to_string(),
                     "newcall".to_string(),
-                    "crate/new".to_string(),
+                    "new".to_string(),
+                    "bare_identifier".to_string(),
                 ),
                 (
                     "reference".to_string(),
@@ -1123,6 +1159,7 @@ mod tests {
                     "newtype".to_string(),
                     "newtype".to_string(),
                     String::new(),
+                    "bare_identifier".to_string(),
                 ),
             ]
         );
@@ -1135,6 +1172,7 @@ mod tests {
                 "keepb".to_string(),
                 "keepb".to_string(),
                 String::new(),
+                "bare_identifier".to_string(),
             )]
         );
     }
@@ -1215,6 +1253,7 @@ mod tests {
                 "legacya".to_string(),
                 "legacya".to_string(),
                 String::new(),
+                "bare_identifier".to_string(),
             )]
         );
         assert_eq!(
@@ -1225,6 +1264,7 @@ mod tests {
                 "legacyb".to_string(),
                 "legacyb".to_string(),
                 String::new(),
+                "bare_identifier".to_string(),
             )]
         );
         assert!(relation_rows(&conn, "new_a_1").await.is_empty());

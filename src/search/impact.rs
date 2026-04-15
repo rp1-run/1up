@@ -1619,7 +1619,9 @@ mod tests {
             role: fixture.role.to_string(),
             defined_symbols: serde_json::to_string(fixture.defined_symbols).unwrap(),
             referenced_symbols: serde_json::to_string(fixture.referenced_symbols).unwrap(),
+            referenced_relations: "[]".to_string(),
             called_symbols: serde_json::to_string(fixture.called_symbols).unwrap(),
+            called_relations: "[]".to_string(),
             file_hash: format!("hash-{}", fixture.file_path),
         }
     }
@@ -2248,7 +2250,9 @@ mod tests {
                     role: "ORCHESTRATION".to_string(),
                     defined_symbols: "[\"prime_cache\"]".to_string(),
                     referenced_symbols: "[]".to_string(),
+                    referenced_relations: "[]".to_string(),
                     called_symbols: "[\"warm_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
                     file_hash: "hash-src/cache/priming.rs".to_string(),
                 },
                 segments::SegmentInsert {
@@ -2266,7 +2270,9 @@ mod tests {
                     role: "ORCHESTRATION".to_string(),
                     defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
                     referenced_symbols: "[\"user_key\"]".to_string(),
+                    referenced_relations: "[]".to_string(),
                     called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
                     file_hash: "hash-src/cache/worker.rs".to_string(),
                 },
             ],

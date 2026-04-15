@@ -256,6 +256,12 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
         )));
     }
 
+    if !table_has_column(conn, "segment_relations", "edge_identity_kind").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.edge_identity_kind`)"
+        )));
+    }
+
     Ok(())
 }
 
@@ -549,6 +555,11 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            table_has_column(&conn, "segment_relations", "edge_identity_kind")
+                .await
+                .unwrap()
+        );
         ensure_current(&conn).await.unwrap();
     }
 
@@ -568,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v9_schema() {
+    async fn prepare_for_write_rejects_pre_v10_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
@@ -578,12 +589,12 @@ mod tests {
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v8, expected v9"));
+        assert!(msg.contains("found v8, expected v10"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v9_schema() {
+    async fn ensure_current_rejects_partial_v10_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(
@@ -620,6 +631,64 @@ mod tests {
         let err = ensure_current(&conn).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("incomplete"));
+        assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_rejects_schema_missing_edge_identity_kind() {
+        let (_db, conn) = setup().await;
+
+        conn.execute_batch(queries::DROP_SEARCH_SCHEMA)
+            .await
+            .unwrap();
+        conn.execute_batch(&format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
+            queries::CREATE_SEGMENTS_TABLE,
+            queries::CREATE_INDEX_FILE_PATH,
+            queries::CREATE_INDEX_LANGUAGE,
+            queries::CREATE_INDEX_FILE_HASH,
+            queries::CREATE_SEGMENT_VECTORS_TABLE,
+            queries::CREATE_SEGMENT_SYMBOLS_TABLE,
+            "CREATE TABLE segment_relations (
+                source_segment_id TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                raw_target_symbol TEXT NOT NULL,
+                canonical_target_symbol TEXT NOT NULL,
+                lookup_canonical_symbol TEXT NOT NULL,
+                qualifier_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (
+                    source_segment_id,
+                    relation_kind,
+                    canonical_target_symbol,
+                    raw_target_symbol
+                )
+            )",
+            queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
+            queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
+            queries::CREATE_FTS_TABLE,
+            queries::CREATE_FTS_TRIGGERS,
+            queries::CREATE_SEGMENT_SYMBOLS_TRIGGER,
+            queries::CREATE_META_TABLE,
+        ))
+        .await
+        .unwrap();
+        conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
+            .await
+            .unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            [META_KEY_SCHEMA_VERSION, &SCHEMA_VERSION.to_string()],
+        )
+        .await
+        .unwrap();
+
+        let err = ensure_current(&conn).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("segment_relations.edge_identity_kind"));
         assert!(msg.contains("run `1up reindex`"));
     }
 

@@ -7,7 +7,7 @@ use crate::shared::symbols::{
     EDGE_IDENTITY_MACRO_LIKE, EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER,
     EDGE_IDENTITY_QUALIFIED_PATH,
 };
-use crate::shared::types::{ParsedSegment, SegmentRole};
+use crate::shared::types::{ParsedRelation, ParsedSegment, SegmentRole};
 
 /// Supported language identifiers and their tree-sitter grammars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,8 +657,10 @@ fn extract_segment(
     let role = classify_role(node, lang);
     let complexity = compute_complexity(node, lang);
     let defined_symbols = collect_defined_symbols(node, source, lang);
-    let referenced_symbols = collect_referenced_symbols(node, source, lang);
-    let called_symbols = collect_called_symbols(node, source, lang);
+    let referenced_relations = collect_referenced_relations(node, source, lang);
+    let referenced_symbols = relation_symbols(&referenced_relations);
+    let called_relations = collect_called_relations(node, source, lang);
+    let called_symbols = relation_symbols(&called_relations);
 
     ParsedSegment {
         content: full_content,
@@ -671,7 +673,15 @@ fn extract_segment(
         role,
         defined_symbols,
         referenced_symbols,
+        referenced_relations: referenced_relations
+            .into_iter()
+            .map(ExtractedRelation::into_parsed_relation)
+            .collect(),
         called_symbols,
+        called_relations: called_relations
+            .into_iter()
+            .map(ExtractedRelation::into_parsed_relation)
+            .collect(),
     }
 }
 
@@ -1356,25 +1366,6 @@ fn collect_variable_names(node: &Node, source: &[u8], symbols: &mut Vec<String>)
     }
 }
 
-fn collect_referenced_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
-    let mut refs = collect_referenced_relations(node, source, lang)
-        .into_iter()
-        .map(|relation| relation.symbol)
-        .collect::<Vec<_>>();
-    refs.dedup();
-    refs
-}
-
-fn collect_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
-    let mut calls = Vec::new();
-    for relation in collect_called_relations(node, source, lang) {
-        if !calls.contains(&relation.symbol) {
-            calls.push(relation.symbol);
-        }
-    }
-    calls
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtractedRelation {
     symbol: String,
@@ -1386,6 +1377,13 @@ impl ExtractedRelation {
         Self {
             symbol,
             edge_identity_kind: normalize_edge_identity_kind(edge_identity_kind),
+        }
+    }
+
+    fn into_parsed_relation(self) -> ParsedRelation {
+        ParsedRelation {
+            symbol: self.symbol,
+            edge_identity_kind: self.edge_identity_kind,
         }
     }
 }
@@ -1415,6 +1413,16 @@ fn collect_called_relations(
     let mut calls = Vec::new();
     walk_called_symbols(node, source, lang, &mut calls);
     calls
+}
+
+fn relation_symbols(relations: &[ExtractedRelation]) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for relation in relations {
+        if !symbols.contains(&relation.symbol) {
+            symbols.push(relation.symbol.clone());
+        }
+    }
+    symbols
 }
 
 fn walk_references(

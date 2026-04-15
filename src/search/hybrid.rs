@@ -282,7 +282,9 @@ mod tests {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"ConfigLoader\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "symbol123".to_string(),
         };
         crate::storage::segments::upsert_segment(&conn, &insert)
@@ -318,7 +320,9 @@ mod tests {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"handle_error\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "abc123".to_string(),
         };
         crate::storage::segments::upsert_segment(&conn, &insert)
@@ -355,7 +359,9 @@ mod tests {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"validate_input\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "def456".to_string(),
         };
         crate::storage::segments::upsert_segment(&conn, &insert)

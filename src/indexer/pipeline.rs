@@ -508,7 +508,11 @@ fn build_segment_insert(
             .unwrap_or_else(|_| "[]".into()),
         referenced_symbols: serde_json::to_string(&segment.referenced_symbols)
             .unwrap_or_else(|_| "[]".into()),
+        referenced_relations: serde_json::to_string(&segment.referenced_relations)
+            .unwrap_or_else(|_| "[]".into()),
         called_symbols: serde_json::to_string(&segment.called_symbols)
+            .unwrap_or_else(|_| "[]".into()),
+        called_relations: serde_json::to_string(&segment.called_relations)
             .unwrap_or_else(|_| "[]".into()),
         file_hash: file_hash.to_string(),
     }
@@ -1727,7 +1731,9 @@ mod tests {
             role: crate::shared::types::SegmentRole::Definition,
             defined_symbols: vec!["hello".into()],
             referenced_symbols: Vec::new(),
+            referenced_relations: Vec::new(),
             called_symbols: Vec::new(),
+            called_relations: Vec::new(),
         };
         assert!(should_embed_segment(&code_chunk));
 

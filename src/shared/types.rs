@@ -33,7 +33,15 @@ pub struct ParsedSegment {
     pub role: SegmentRole,
     pub defined_symbols: Vec<String>,
     pub referenced_symbols: Vec<String>,
+    pub referenced_relations: Vec<ParsedRelation>,
     pub called_symbols: Vec<String>,
+    pub called_relations: Vec<ParsedRelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedRelation {
+    pub symbol: String,
+    pub edge_identity_kind: String,
 }
 
 /// A search result returned by hybrid or FTS-only search.

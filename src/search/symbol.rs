@@ -399,7 +399,9 @@ mod tests {
             role: "DEFINITION".to_string(),
             defined_symbols: defined.to_string(),
             referenced_symbols: referenced.to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "abc123".to_string(),
         }
     }

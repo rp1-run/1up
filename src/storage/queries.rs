@@ -53,12 +53,14 @@ CREATE TABLE IF NOT EXISTS segment_relations (
     canonical_target_symbol TEXT NOT NULL,
     lookup_canonical_symbol TEXT NOT NULL,
     qualifier_fingerprint TEXT NOT NULL,
+    edge_identity_kind TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (
         source_segment_id,
         relation_kind,
         canonical_target_symbol,
-        raw_target_symbol
+        raw_target_symbol,
+        edge_identity_kind
     )
 )";
 
@@ -200,9 +202,10 @@ INSERT OR REPLACE INTO segment_relations (
     canonical_target_symbol,
     lookup_canonical_symbol,
     qualifier_fingerprint,
+    edge_identity_kind,
     created_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5, ?6, datetime('now')
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')
 )";
 
 #[allow(dead_code)]
@@ -226,12 +229,14 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE source_segment_id = ?1
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   canonical_target_symbol,
+  edge_identity_kind,
   raw_target_symbol
 LIMIT ?2";
 
@@ -243,11 +248,12 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE source_segment_id = ?1
   AND relation_kind = ?2
-ORDER BY canonical_target_symbol, raw_target_symbol
+ORDER BY canonical_target_symbol, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
 #[allow(dead_code)]
@@ -258,12 +264,14 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE canonical_target_symbol = ?1
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   source_segment_id,
+  edge_identity_kind,
   raw_target_symbol
 LIMIT ?2";
 
@@ -275,11 +283,12 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE canonical_target_symbol = ?1
   AND relation_kind = ?2
-ORDER BY source_segment_id, raw_target_symbol
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
 #[allow(dead_code)]
@@ -290,12 +299,14 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE lookup_canonical_symbol = ?1
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   source_segment_id,
+  edge_identity_kind,
   raw_target_symbol
 LIMIT ?2";
 
@@ -307,11 +318,12 @@ SELECT
     raw_target_symbol,
     canonical_target_symbol,
     lookup_canonical_symbol,
-    qualifier_fingerprint
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE lookup_canonical_symbol = ?1
   AND relation_kind = ?2
-ORDER BY source_segment_id, raw_target_symbol
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
 #[allow(dead_code)]
