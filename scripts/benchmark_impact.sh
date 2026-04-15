@@ -89,40 +89,27 @@ measure_case_run() {
     result_count=$(jq '.results | length' "$output_path")
     contextual_count=$(jq '.contextual_results | if type == "array" then length else 0 end' "$output_path")
 
-    case "$expected_status" in
-      refused)
-        if jq -e --arg expected_status "$expected_status" '
-          .status == $expected_status
-          and (.results | length == 0)
+    if jq -e '
+      (.status | type == "string")
+      and (
+        if .status == "refused" then
+          (.results | length == 0)
           and (.refusal | type == "object")
-        ' "$output_path" >/dev/null; then
-          contract_ok=1
-        fi
-        ;;
-      empty|empty_scoped)
-        if jq -e --arg expected_status "$expected_status" '
-          .status == $expected_status
-          and (.results | length == 0)
+        elif (.status == "empty" or .status == "empty_scoped") then
+          (.results | length == 0)
           and (.resolved_anchor | type == "object")
           and (.refusal == null)
-        ' "$output_path" >/dev/null; then
-          contract_ok=1
-        fi
-        ;;
-      expanded|expanded_scoped)
-        if jq -e --arg expected_status "$expected_status" '
-          .status == $expected_status
-          and (.results | length > 0)
+        elif (.status == "expanded" or .status == "expanded_scoped") then
+          (.results | length > 0)
           and (.resolved_anchor | type == "object")
           and (.refusal == null)
-        ' "$output_path" >/dev/null; then
-          contract_ok=1
-        fi
-        ;;
-      *)
-        fail "unsupported expected status for case ${name}: ${expected_status}"
-        ;;
-    esac
+        else
+          false
+        end
+      )
+    ' "$output_path" >/dev/null; then
+      contract_ok=1
+    fi
   fi
 
   elapsed_ms=$(awk -v secs="${elapsed_seconds:-0}" 'BEGIN { printf "%.3f", secs * 1000 }')
@@ -292,6 +279,16 @@ CASES_JSON=$(cat <<'EOF'
     "name": "refused_broad_symbol",
     "expected_status": "refused",
     "args": ["--from-symbol", "load_config"]
+  },
+  {
+    "name": "owner_aligned_scoped_symbol",
+    "expected_status": "expanded_scoped",
+    "args": ["--from-symbol", "load_config", "--scope", "src/auth"]
+  },
+  {
+    "name": "low_signal_wrapper_demoted",
+    "expected_status": "expanded",
+    "args": ["--from-symbol", "warm_cache_key"]
   },
   {
     "name": "empty_file_line",

@@ -228,7 +228,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "IMPLEMENTATION".to_string(),
                 defined_symbols: format!("[\"validate_token_{idx}\"]"),
                 referenced_symbols: "[\"request\",\"token\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"validate\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -258,7 +260,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "DEFINITION".to_string(),
                 defined_symbols: format!("[\"load_config_{idx}\"]"),
                 referenced_symbols: "[\"host\",\"port\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-config-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -288,7 +292,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "IMPLEMENTATION".to_string(),
                 defined_symbols: format!("[\"invoice_total_{idx}\"]"),
                 referenced_symbols: "[\"invoice\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"total\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-billing-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -324,7 +330,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"load_auth_config\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-auth-runtime-anchor".to_string(),
         };
         segments::upsert_segment(&conn, &anchor).await.unwrap();
@@ -344,7 +352,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "IMPLEMENTATION".to_string(),
             defined_symbols: "[\"parse_auth_config\"]".to_string(),
             referenced_symbols: "[\"raw\"]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-auth-runtime-parse".to_string(),
         };
         segments::upsert_segment(&conn, &sibling).await.unwrap();
@@ -366,7 +376,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "ORCHESTRATION".to_string(),
                 defined_symbols: format!("[\"boot_auth_{idx}\"]"),
                 referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"load_auth_config\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-caller-{idx}"),
             };
             segments::upsert_segment(&conn, &caller).await.unwrap();
@@ -389,7 +401,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "DEFINITION".to_string(),
                 defined_symbols: format!("[\"runtime_test_{idx}\"]"),
                 referenced_symbols: "[\"load_auth_config\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-test-{idx}"),
             };
             segments::upsert_segment(&conn, &test_segment).await.unwrap();
@@ -421,7 +435,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "DEFINITION".to_string(),
                 defined_symbols: "[\"load_config\"]".to_string(),
                 referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-broad-config-{idx}"),
             };
             segments::upsert_segment(&conn, &broad_definition)
@@ -444,7 +460,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "ORCHESTRATION".to_string(),
             defined_symbols: "[\"reload_auth_config\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[\"crate::auth::config::load_config\"]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-auth-config-reload".to_string(),
         };
         segments::upsert_segment(&conn, &qualified_relation)
@@ -465,7 +483,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"warm_cache_key\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-cache-runtime-anchor".to_string(),
         };
         segments::upsert_segment(&conn, &cache_runtime).await.unwrap();
@@ -484,7 +504,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "ORCHESTRATION".to_string(),
             defined_symbols: "[\"prime_cache\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[\"warm_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-cache-priming".to_string(),
         };
         segments::upsert_segment(&conn, &cache_wrapper).await.unwrap();
@@ -504,7 +526,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "ORCHESTRATION".to_string(),
             defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
             referenced_symbols: "[\"user_key\"]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-cache-worker".to_string(),
         };
         segments::upsert_segment(&conn, &cache_worker).await.unwrap();

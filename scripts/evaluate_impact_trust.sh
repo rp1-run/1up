@@ -52,6 +52,7 @@ evaluate_case() {
   local contextual_count
   local hint_code
   local contract_ok=0
+  local expected_primary_is_top=0
   local expected_primary_present=0
   local false_positive_count=0
   local exact_regression=0
@@ -125,11 +126,17 @@ evaluate_case() {
     expected_primary_present=1
   fi
 
+  if [[ -n "$expected_primary" ]] && jq -e --arg expected_primary "$expected_primary" '
+    (.results[0]?.file_path // "") == $expected_primary
+  ' "$output_path" >/dev/null; then
+    expected_primary_is_top=1
+  fi
+
   if [[ "$kind" == "ambiguous" ]]; then
     false_positive_count="$result_count"
   fi
 
-  if [[ "$kind" == "exact" && ( $contract_ok -eq 0 || $expected_primary_present -eq 0 ) ]]; then
+  if [[ "$kind" == "exact" && ( $contract_ok -eq 0 || $expected_primary_is_top -eq 0 ) ]]; then
     exact_regression=1
   fi
 
@@ -151,6 +158,7 @@ evaluate_case() {
     --argjson result_count "$result_count" \
     --argjson contextual_count "$contextual_count" \
     --argjson contract_ok "$contract_ok" \
+    --argjson expected_primary_is_top "$expected_primary_is_top" \
     --argjson expected_primary_present "$expected_primary_present" \
     --argjson false_positive_count "$false_positive_count" \
     --argjson exact_regression "$exact_regression" \
@@ -169,6 +177,7 @@ evaluate_case() {
       result_count: $result_count,
       contextual_result_count: $contextual_count,
       contract_ok: ($contract_ok == 1),
+      expected_primary_is_top: ($expected_primary_is_top == 1),
       expected_primary_present: ($expected_primary_present == 1),
       false_positive_count: $false_positive_count,
       exact_regression: ($exact_regression == 1),
@@ -308,8 +317,15 @@ CASES_JSON=$(cat <<'EOF'
     "kind": "exact",
     "name": "auth_scoped_symbol",
     "expected_status": "expanded_scoped",
-    "expected_primary": "src/auth/config_builder.rs",
+    "expected_primary": "src/auth/reload.rs",
     "args": ["--from-symbol", "load_config", "--scope", "src/auth"]
+  },
+  {
+    "kind": "exact",
+    "name": "qualified_relation_primary",
+    "expected_status": "expanded",
+    "expected_primary": "src/auth/config.rs",
+    "args": ["--from-symbol", "reload_auth_config"]
   },
   {
     "kind": "exact",
