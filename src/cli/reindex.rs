@@ -183,7 +183,7 @@ async fn run_reindex_once(
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
 
     let db = Db::open_rw(db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::rebuild(&conn).await?;
     setup_spinner.success_with(&format!("Rebuilt schema v{SCHEMA_VERSION}"));
 

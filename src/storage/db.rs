@@ -72,6 +72,33 @@ impl Db {
             .connect()
             .map_err(|e| StorageError::Connection(e.to_string()).into())
     }
+
+    /// Create a new connection and apply project-local performance PRAGMAs.
+    pub async fn connect_tuned(&self) -> Result<Connection, OneupError> {
+        let conn = self.connect()?;
+        apply_project_pragmas(&conn).await?;
+        Ok(conn)
+    }
+}
+
+/// Apply performance-tuned PRAGMAs to a project-local libSQL connection.
+///
+/// These settings optimize the local write-heavy indexing workload without
+/// changing user-visible behavior or introducing new flags.
+pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> {
+    const PRAGMAS: &[&str] = &[
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA cache_size=-32768",
+        "PRAGMA mmap_size=268435456",
+        "PRAGMA temp_store=MEMORY",
+    ];
+    for pragma in PRAGMAS {
+        conn.execute(pragma, ())
+            .await
+            .map_err(|e| StorageError::Connection(format!("failed to set {pragma}: {e}")))?;
+    }
+    Ok(())
 }
 
 fn validate_project_db_path_for_write(path: &Path) -> Result<std::path::PathBuf, OneupError> {

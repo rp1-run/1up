@@ -159,7 +159,7 @@ async fn run_initial_index(
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let db_path = config::project_db_path(project_root);
     let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::prepare_for_write(&conn).await?;
 
     let mut runtime = EmbeddingRuntime::default();

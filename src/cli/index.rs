@@ -194,7 +194,7 @@ async fn run_index_once(
     let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
     let db = Db::open_rw(db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::prepare_for_write(&conn).await?;
 
     setup_spinner.success();
