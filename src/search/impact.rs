@@ -9,7 +9,11 @@ use crate::search::retrieval::CandidateRow;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS};
 use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::symbols::normalize_symbolish;
+use crate::shared::symbols::{
+    clean_owner_components, normalize_symbolish, split_symbol_components,
+    EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE,
+    EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
+};
 use crate::shared::types::SegmentRole;
 use crate::storage::relations::{
     get_inbound_relations_by_lookup_symbol, get_outbound_relations, RelationKind, StoredRelation,
@@ -40,6 +44,12 @@ const RELATION_SOLO_PRIMARY_THRESHOLD: f64 = 0.45;
 const RELATION_PRIMARY_THRESHOLD: f64 = 0.55;
 const RELATION_CONTEXTUAL_THRESHOLD: f64 = 0.35;
 const RELATION_AMBIGUITY_MARGIN: f64 = 0.08;
+const OWNER_ALIGNMENT_SHORTLIST_THRESHOLD: f64 = 0.60;
+const OWNER_ALIGNMENT_SIGNAL_THRESHOLD: f64 = 0.60;
+const EDGE_IDENTITY_SIGNAL_THRESHOLD: f64 = 0.65;
+const PATH_AFFINITY_SIGNAL_THRESHOLD: f64 = 0.30;
+const ROLE_SIGNAL_THRESHOLD: f64 = 0.75;
+const MIN_PRIMARY_CORROBORATION_SIGNALS: usize = 2;
 const LOW_SIGNAL_WRAPPER_PENALTY: f64 = 0.82;
 const LOW_SIGNAL_DECLARATION_PENALTY: f64 = 0.68;
 
@@ -190,6 +200,10 @@ struct CandidateObservation {
 struct ScoredRelationCandidate {
     candidate: CandidateRow,
     confidence: f64,
+    definition_owner_fingerprint: String,
+    owner_alignment: f64,
+    exact_identity: bool,
+    corroboration_signals: usize,
 }
 
 struct FinalizedImpactResults {
@@ -577,16 +591,14 @@ impl<'a> ImpactHorizonEngine<'a> {
                     RelationKind::Call => "called_by",
                     RelationKind::Reference => "references_symbol",
                 };
-                let confidence =
-                    relation_candidate_confidence(&candidate, &relation, source, &candidate);
-                let Some(bucket) = relation_observation_bucket(confidence, None, candidate.role)
-                else {
+                let scored = score_relation_candidate(&candidate, &relation, source, &candidate);
+                let Some(bucket) = relation_observation_bucket(&scored, None) else {
                     continue;
                 };
 
                 observations.push(CandidateObservation {
                     score: weighted_score(
-                        base_weight(relation.relation_kind) * confidence,
+                        base_weight(relation.relation_kind) * scored.confidence,
                         hop,
                         &candidate,
                         scope,
@@ -746,7 +758,6 @@ impl<'a> ImpactHorizonEngine<'a> {
             .find_definition_candidates_by_canonical(lookup_canonical_symbol)
             .await?;
         candidates.retain(|candidate| scope_matches(&candidate.file_path, scope));
-        candidates.truncate(MAX_DEFINITION_TARGETS_PER_SYMBOL);
         Ok(candidates)
     }
 
@@ -761,28 +772,16 @@ impl<'a> ImpactHorizonEngine<'a> {
             .await?
             .into_iter()
             .filter(|candidate| !is_test_path(&candidate.file_path))
-            .map(|candidate| ScoredRelationCandidate {
-                confidence: relation_candidate_confidence(source, relation, &candidate, &candidate),
-                candidate,
-            })
+            .map(|candidate| score_relation_candidate(source, relation, &candidate, &candidate))
             .collect::<Vec<_>>();
 
-        scored.sort_by(|left, right| {
-            right
-                .confidence
-                .total_cmp(&left.confidence)
-                .then_with(|| left.candidate.file_path.cmp(&right.candidate.file_path))
-                .then_with(|| left.candidate.line_number.cmp(&right.candidate.line_number))
-                .then_with(|| left.candidate.segment_id.cmp(&right.candidate.segment_id))
-        });
+        scored = shortlist_relation_candidates(scored);
 
         let runner_up = scored.get(1).map(|candidate| candidate.confidence);
         let Some(best) = scored.into_iter().next() else {
             return Ok(None);
         };
-        let Some(bucket) =
-            relation_observation_bucket(best.confidence, runner_up, best.candidate.role)
-        else {
+        let Some(bucket) = relation_observation_bucket(&best, runner_up) else {
             return Ok(None);
         };
 
@@ -1146,46 +1145,69 @@ fn base_weight(relation_kind: RelationKind) -> f64 {
     }
 }
 
-fn relation_candidate_confidence(
+fn score_relation_candidate(
     source: &CandidateRow,
     relation: &StoredRelation,
     target: &CandidateRow,
     emitted_candidate: &CandidateRow,
-) -> f64 {
+) -> ScoredRelationCandidate {
     let symbol_score = relation_symbol_score(relation, target);
-    if symbol_score == 0.0 {
-        return 0.0;
-    }
-
-    let qualifier_score = qualifier_alignment_score(&relation.qualifier_fingerprint, target);
+    let definition_owner_fingerprint = definition_owner_fingerprint(target);
+    let owner_alignment = owner_alignment_score(
+        &relation.qualifier_fingerprint,
+        &definition_owner_fingerprint,
+    );
     let scope_affinity = path_affinity_score(&source.file_path, &target.file_path);
     let role_score = relation_role_score(emitted_candidate.role);
+    let edge_identity_score =
+        relation_edge_identity_score(relation, target, owner_alignment, symbol_score);
+    let exact_identity = has_exact_structural_identity(relation, symbol_score);
+    let corroboration_signals = relation_corroboration_signal_count(
+        exact_identity,
+        owner_alignment,
+        edge_identity_score,
+        scope_affinity,
+        role_score,
+    );
     let relation_kind_score = match relation.relation_kind {
         RelationKind::Call => 1.0,
         RelationKind::Reference => 0.85,
     };
-    let qualifier_gate = if relation.qualifier_fingerprint.is_empty() {
+    let owner_gate = if relation.qualifier_fingerprint.is_empty() {
         1.0
     } else {
-        0.45 + (0.55 * qualifier_score)
+        0.55 + (0.45 * owner_alignment.max(edge_identity_score))
     };
-    let signal_multiplier = relation_signal_multiplier(emitted_candidate, qualifier_score);
+    let signal_multiplier =
+        relation_signal_multiplier(emitted_candidate, owner_alignment, corroboration_signals);
+    let confidence = if symbol_score == 0.0 {
+        0.0
+    } else {
+        ((0.30 * symbol_score)
+            + (0.25 * owner_alignment)
+            + (0.15 * edge_identity_score)
+            + (0.15 * scope_affinity)
+            + (0.10 * role_score)
+            + (0.05 * relation_kind_score))
+            * owner_gate
+            * signal_multiplier
+    };
 
-    ((0.45 * symbol_score)
-        + (0.25 * qualifier_score)
-        + (0.15 * scope_affinity)
-        + (0.10 * role_score)
-        + (0.05 * relation_kind_score))
-        * qualifier_gate
-        * signal_multiplier
+    ScoredRelationCandidate {
+        candidate: emitted_candidate.clone(),
+        confidence,
+        definition_owner_fingerprint,
+        owner_alignment,
+        exact_identity,
+        corroboration_signals,
+    }
 }
 
 fn relation_observation_bucket(
-    confidence: f64,
+    candidate: &ScoredRelationCandidate,
     runner_up: Option<f64>,
-    role: Option<SegmentRole>,
 ) -> Option<ObservationBucket> {
-    if confidence < RELATION_CONTEXTUAL_THRESHOLD {
+    if candidate.confidence < RELATION_CONTEXTUAL_THRESHOLD {
         return None;
     }
 
@@ -1195,11 +1217,20 @@ fn relation_observation_bucket(
         RELATION_SOLO_PRIMARY_THRESHOLD
     };
     let ambiguous = runner_up
-        .map(|next| confidence - next < RELATION_AMBIGUITY_MARGIN)
+        .map(|next| candidate.confidence - next < RELATION_AMBIGUITY_MARGIN)
         .unwrap_or(false);
-    let contextual_only_role = matches!(role, Some(SegmentRole::Import | SegmentRole::Docs));
+    let contextual_only_role = matches!(
+        candidate.candidate.role,
+        Some(SegmentRole::Import | SegmentRole::Docs)
+    );
+    let ambiguity_signal =
+        candidate.exact_identity || candidate.owner_alignment >= OWNER_ALIGNMENT_SIGNAL_THRESHOLD;
 
-    if !contextual_only_role && !ambiguous && confidence >= primary_threshold {
+    if !contextual_only_role
+        && candidate.corroboration_signals >= MIN_PRIMARY_CORROBORATION_SIGNALS
+        && (!ambiguous || ambiguity_signal)
+        && candidate.confidence >= primary_threshold
+    {
         Some(ObservationBucket::Primary)
     } else {
         Some(ObservationBucket::Contextual)
@@ -1225,21 +1256,155 @@ fn relation_symbol_score(relation: &StoredRelation, candidate: &CandidateRow) ->
         })
 }
 
-fn qualifier_alignment_score(qualifier_fingerprint: &str, candidate: &CandidateRow) -> f64 {
+fn shortlist_relation_candidates(
+    mut candidates: Vec<ScoredRelationCandidate>,
+) -> Vec<ScoredRelationCandidate> {
+    candidates.sort_by(compare_scored_relation_candidates);
+
+    let owner_shortlist = candidates.iter().any(|candidate| {
+        candidate.owner_alignment >= OWNER_ALIGNMENT_SHORTLIST_THRESHOLD
+            && !candidate.definition_owner_fingerprint.is_empty()
+    });
+    if owner_shortlist {
+        candidates
+            .retain(|candidate| candidate.owner_alignment >= OWNER_ALIGNMENT_SHORTLIST_THRESHOLD);
+    }
+
+    candidates.truncate(MAX_DEFINITION_TARGETS_PER_SYMBOL);
+    candidates
+}
+
+fn compare_scored_relation_candidates(
+    left: &ScoredRelationCandidate,
+    right: &ScoredRelationCandidate,
+) -> std::cmp::Ordering {
+    right
+        .confidence
+        .total_cmp(&left.confidence)
+        .then_with(|| right.corroboration_signals.cmp(&left.corroboration_signals))
+        .then_with(|| right.owner_alignment.total_cmp(&left.owner_alignment))
+        .then_with(|| left.candidate.file_path.cmp(&right.candidate.file_path))
+        .then_with(|| left.candidate.line_number.cmp(&right.candidate.line_number))
+        .then_with(|| left.candidate.segment_id.cmp(&right.candidate.segment_id))
+}
+
+fn owner_alignment_score(qualifier_fingerprint: &str, definition_owner_fingerprint: &str) -> f64 {
     let qualifier = qualifier_components(qualifier_fingerprint);
-    if qualifier.is_empty() {
+    let definition = qualifier_components(definition_owner_fingerprint);
+    if qualifier.is_empty() || definition.is_empty() {
         return 0.0;
     }
 
-    let file_alignment =
-        component_alignment_score(&qualifier, &path_components(&candidate.file_path));
-    let breadcrumb_alignment = candidate
-        .breadcrumb
-        .as_deref()
-        .map(|breadcrumb| component_alignment_score(&qualifier, &breadcrumb_components(breadcrumb)))
-        .unwrap_or(0.0);
+    component_alignment_score(&qualifier, &definition)
+}
 
-    file_alignment.max(breadcrumb_alignment)
+fn definition_owner_fingerprint(candidate: &CandidateRow) -> String {
+    let mut components = path_components(&candidate.file_path);
+
+    if let Some(breadcrumb) = candidate.breadcrumb.as_deref() {
+        extend_unique_components(&mut components, breadcrumb_components(breadcrumb));
+    }
+    if let Some(defined_symbols) = candidate.defined_symbols.as_deref() {
+        for symbol in defined_symbols {
+            extend_unique_components(&mut components, symbol_owner_components(symbol));
+        }
+    }
+
+    components.join("/")
+}
+
+fn extend_unique_components(into: &mut Vec<String>, components: Vec<String>) {
+    for component in components {
+        if !into.contains(&component) {
+            into.push(component);
+        }
+    }
+}
+
+fn symbol_owner_components(symbol: &str) -> Vec<String> {
+    let mut components = clean_owner_components(&split_symbol_components(symbol));
+    if components.len() <= 1 {
+        return Vec::new();
+    }
+    components.pop();
+    components
+}
+
+fn relation_edge_identity_score(
+    relation: &StoredRelation,
+    target: &CandidateRow,
+    owner_alignment: f64,
+    symbol_score: f64,
+) -> f64 {
+    let structural_alignment = if relation.qualifier_fingerprint.is_empty() {
+        symbol_score
+    } else {
+        owner_alignment
+    };
+
+    match relation.edge_identity_kind.as_str() {
+        EDGE_IDENTITY_QUALIFIED_PATH => 0.35 + (0.65 * owner_alignment),
+        EDGE_IDENTITY_MEMBER_ACCESS | EDGE_IDENTITY_METHOD_RECEIVER => {
+            let role_bonus = if matches!(
+                target.role,
+                Some(
+                    SegmentRole::Definition
+                        | SegmentRole::Implementation
+                        | SegmentRole::Orchestration
+                )
+            ) {
+                1.0
+            } else {
+                0.8
+            };
+            (0.40 + (0.60 * structural_alignment)) * role_bonus
+        }
+        EDGE_IDENTITY_CONSTRUCTOR_LIKE => {
+            if matches!(
+                target.block_type.as_str(),
+                "constructor" | "class" | "struct"
+            ) {
+                1.0
+            } else {
+                0.75
+            }
+        }
+        EDGE_IDENTITY_MACRO_LIKE => {
+            if target.block_type == "macro" {
+                1.0
+            } else {
+                0.75
+            }
+        }
+        EDGE_IDENTITY_BARE_IDENTIFIER => {
+            if relation.qualifier_fingerprint.is_empty() {
+                0.30
+            } else {
+                0.45 + (0.40 * owner_alignment)
+            }
+        }
+        _ => 0.35 + (0.50 * structural_alignment),
+    }
+}
+
+fn has_exact_structural_identity(relation: &StoredRelation, symbol_score: f64) -> bool {
+    symbol_score >= 1.0
+        && !(relation.qualifier_fingerprint.is_empty()
+            && relation.edge_identity_kind == EDGE_IDENTITY_BARE_IDENTIFIER)
+}
+
+fn relation_corroboration_signal_count(
+    exact_identity: bool,
+    owner_alignment: f64,
+    edge_identity_score: f64,
+    scope_affinity: f64,
+    role_score: f64,
+) -> usize {
+    usize::from(exact_identity)
+        + usize::from(owner_alignment >= OWNER_ALIGNMENT_SIGNAL_THRESHOLD)
+        + usize::from(edge_identity_score >= EDGE_IDENTITY_SIGNAL_THRESHOLD)
+        + usize::from(scope_affinity >= PATH_AFFINITY_SIGNAL_THRESHOLD)
+        + usize::from(role_score >= ROLE_SIGNAL_THRESHOLD)
 }
 
 fn component_alignment_score(needle: &[String], haystack: &[String]) -> f64 {
@@ -1298,14 +1463,22 @@ fn relation_role_score(role: Option<SegmentRole>) -> f64 {
     }
 }
 
-fn relation_signal_multiplier(candidate: &CandidateRow, qualifier_score: f64) -> f64 {
+fn relation_signal_multiplier(
+    candidate: &CandidateRow,
+    owner_alignment: f64,
+    corroboration_signals: usize,
+) -> f64 {
     let mut multiplier = 1.0;
+
+    if corroboration_signals < MIN_PRIMARY_CORROBORATION_SIGNALS {
+        multiplier *= 0.85;
+    }
 
     if is_wrapper_like_candidate(candidate) {
         multiplier *= LOW_SIGNAL_WRAPPER_PENALTY;
     }
 
-    if qualifier_score == 0.0 && is_declaration_like_candidate(candidate) {
+    if owner_alignment == 0.0 && is_declaration_like_candidate(candidate) {
         multiplier *= LOW_SIGNAL_DECLARATION_PENALTY;
     }
 
@@ -1337,37 +1510,19 @@ fn is_declaration_like_candidate(candidate: &CandidateRow) -> bool {
 }
 
 fn qualifier_components(qualifier_fingerprint: &str) -> Vec<String> {
-    qualifier_fingerprint
-        .split('/')
-        .map(normalize_symbolish)
-        .filter(|component| {
-            !component.is_empty() && !matches!(component.as_str(), "crate" | "self" | "super")
-        })
-        .collect()
+    clean_owner_components(&split_symbol_components(qualifier_fingerprint))
 }
 
 fn path_components(path: &str) -> Vec<String> {
-    path.split(['/', '.'])
-        .map(normalize_symbolish)
-        .filter(|component| {
-            !component.is_empty() && !matches!(component.as_str(), "src" | "tests" | "test")
-        })
-        .collect()
+    clean_owner_components(&split_symbol_components(path))
 }
 
 fn breadcrumb_components(breadcrumb: &str) -> Vec<String> {
-    breadcrumb
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .map(normalize_symbolish)
-        .filter(|component| !component.is_empty())
-        .collect()
+    clean_owner_components(&split_symbol_components(breadcrumb))
 }
 
 fn symbol_lookup_tail(symbol: &str) -> Option<String> {
-    symbol
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .map(normalize_symbolish)
-        .rfind(|component| !component.is_empty())
+    split_symbol_components(symbol).into_iter().last()
 }
 
 fn reason_key(reason: &ImpactReason) -> String {
@@ -1584,6 +1739,7 @@ fn normalized_stem(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::types::ParsedRelation;
     use crate::storage::{db::Db, schema, segments};
 
     struct SegmentFixture<'a> {
@@ -1624,6 +1780,15 @@ mod tests {
             called_relations: "[]".to_string(),
             file_hash: format!("hash-{}", fixture.file_path),
         }
+    }
+
+    fn make_segment_with_called_relations(
+        fixture: SegmentFixture<'_>,
+        called_relations: &[ParsedRelation],
+    ) -> segments::SegmentInsert {
+        let mut segment = make_segment(fixture);
+        segment.called_relations = serde_json::to_string(called_relations).unwrap();
+        segment
     }
 
     async fn insert_segments(conn: &Connection, segments_to_insert: Vec<segments::SegmentInsert>) {
@@ -1936,7 +2101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_anchor_ranks_relation_same_file_and_test_candidates() {
+    async fn segment_anchor_demotes_leaf_only_relation_but_keeps_contextual_guidance() {
         let (_db, conn) = setup().await;
         insert_segments(
             &conn,
@@ -1998,14 +2163,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.status, ImpactStatus::Expanded);
-        assert_eq!(result.results.len(), 1);
-        assert_eq!(result.results[0].segment_id, "boot-app");
-        assert_eq!(result.results[0].reasons[0].kind, "called_by");
+        assert_eq!(result.status, ImpactStatus::Empty);
+        assert!(result.results.is_empty());
         let contextual = result
             .contextual_results
-            .expect("same-file and test candidates should remain contextual");
-        assert_eq!(contextual.len(), 2);
+            .expect("same-file, leaf-only, and test candidates should remain contextual");
+        assert_eq!(contextual.len(), 3);
         assert_eq!(contextual[0].segment_id, "parse-config");
         assert_eq!(contextual[0].reasons[0].kind, "same_file");
         assert_eq!(contextual[1].segment_id, "config-test");
@@ -2013,6 +2176,8 @@ mod tests {
             contextual[1].reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
+        assert_eq!(contextual[2].segment_id, "boot-app");
+        assert_eq!(contextual[2].reasons[0].kind, "called_by");
         assert!(
             result
                 .results
@@ -2083,6 +2248,90 @@ mod tests {
             .results
             .iter()
             .all(|candidate| candidate.segment_id != "cache-load-config"));
+    }
+
+    #[tokio::test]
+    async fn owner_aligned_target_shortlist_happens_before_truncation() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "boot-auth",
+                        file_path: "src/bootstrap.rs",
+                        line_start: 1,
+                        block_type: "function",
+                        role: "ORCHESTRATION",
+                        defined_symbols: &["boot_auth"],
+                        referenced_symbols: &[],
+                        called_symbols: &["crate::auth::config::load_config"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "crate::auth::config::load_config".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "accounts-load-config",
+                    file_path: "src/accounts/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "adapter-load-config",
+                    file_path: "src/adapter/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "admin-load-config",
+                    file_path: "src/admin/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "boot-auth".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-load-config");
     }
 
     #[tokio::test]

@@ -869,26 +869,25 @@ fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
 
     let results = result["results"].as_array().unwrap();
     assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/auth/config_builder.rs");
+    assert_eq!(results[0]["file_path"], "src/auth/reload.rs");
 }
 
 #[test]
-fn impact_symbol_anchor_qualified_relation_surfaces_matching_definition_contextually_json() {
+fn impact_symbol_anchor_qualified_relation_promotes_matching_definition_json() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
     let result = impact_json(tmp.path(), &["--from-symbol", "reload_auth_config"]);
 
-    assert_eq!(result["status"], "empty");
+    assert_eq!(result["status"], "expanded");
     assert_eq!(result["resolved_anchor"]["kind"], "symbol");
     assert_eq!(result["resolved_anchor"]["value"], "reload_auth_config");
-    assert_eq!(result["hint"]["code"], "context_only");
 
-    let contextual = result["contextual_results"]
+    let results = result["results"]
         .as_array()
-        .expect("qualified relation should surface matching context");
-    assert!(!contextual.is_empty());
-    assert_eq!(contextual[0]["file_path"], "src/auth/config.rs");
+        .expect("qualified relation should surface a primary definition");
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/auth/config.rs");
 }
 
 #[test]
