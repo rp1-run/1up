@@ -12,7 +12,8 @@
 
 - Public contracts use owned structs and enums with serde derives.
 - Additive compatibility fields are `Option<T>` with `skip_serializing_if`.
-- Internal relation rows keep both stable identity and disambiguation evidence: `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, and `qualifier_fingerprint`.
+- Internal relation rows keep both stable identity and disambiguation evidence: `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind`.
+- Impact-side identity stays additive: definition-owner fingerprints are derived from candidate path, breadcrumb, and defined symbols at evaluation time instead of changing symbol-search contracts.
 - New user-facing flows prefer stable envelopes over ad hoc maps: `SearchResult` adds optional `segment_id`, and impact uses `status + resolved_anchor + results + contextual_results + hint + refusal`.
 - Strong enums and typed request structs keep CLI, storage, and output boundaries explicit.
 
@@ -28,10 +29,11 @@
 
 - Validation happens at CLI parse boundaries, daemon IPC boundaries, schema gates, and transaction seams.
 - Exact-one-anchor validation is explicit for `impact`.
-- Schema readiness for impact now requires schema v9 plus `segment_relations.lookup_canonical_symbol` and `segment_relations.qualifier_fingerprint`.
+- Schema readiness for impact now requires schema v10 plus `segment_relations.lookup_canonical_symbol`, `segment_relations.qualifier_fingerprint`, and `segment_relations.edge_identity_kind`.
 - Paths and scopes are normalized to repo-style slashes before use.
 - Symbols are canonicalized before writing symbol and relation rows.
-- Relation expansion validates structural confidence and ambiguity before a candidate can become a primary result.
+- Relation expansion validates owner alignment, edge compatibility, corroboration count, and ambiguity before a candidate can become a primary result.
+- A bare leaf-name match with no second corroborating structural signal is contextual-only or absent rather than primary.
 - `IMPORT` and `DOCS` relation matches remain contextual-only even when they clear lookup resolution.
 - Broad symbol anchors are rejected early with narrowing hints.
 
@@ -46,7 +48,7 @@
 ## Storage And I/O
 
 - SQL lives in centralized named constants.
-- Schema v9 extends `segment_relations` with lookup-target and qualifier-fingerprint columns plus a lookup-target index.
+- Schema v10 extends `segment_relations` with lookup-target, qualifier-fingerprint, and edge-identity columns plus a lookup-target index.
 - Relation rows store unresolved canonical targets alongside lookup/disambiguation evidence and are resolved at query time for bounded seeds.
 - Segment, symbol, and relation maintenance shares one transactional seam.
 - Daemon IPC uses tagged serde frames, same-UID authorization, bounded sizes, and read/write deadlines.
@@ -70,7 +72,7 @@
 
 ## Feature-Learning Novelty
 
-- Impact relation resolution now combines lookup-symbol retrieval with qualifier/path/breadcrumb evidence, role weighting, and ambiguity margins before primary promotion.
+- Impact relation resolution now combines lookup-symbol retrieval with definition-owner fingerprints, owner-aware shortlisting, edge-identity scoring, role weighting, and ambiguity margins before primary promotion.
 - Search-to-impact handoff remains additive and backward-compatible: `SearchResult.segment_id` is optional, and stronger relation modeling does not perturb search ranking or the impact envelope shape.
-- Low-signal wrappers, declaration-only matches without qualifier support, and `IMPORT`/`DOCS` segments are demoted out of primary results while same-file/test observations stay contextual.
+- Low-signal wrappers, declaration-only matches without corroborating owner or structural support, and `IMPORT`/`DOCS` segments are demoted out of primary results while same-file/test observations stay contextual.
 - Performance and trust remain contractual through targeted integration coverage, rollout scripts, and Criterion workloads for qualified-relation, low-signal, expanded, refused, and empty impact requests.

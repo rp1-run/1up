@@ -5,8 +5,8 @@
 | Module | Purpose | Key Files |
 |---|---|---|
 | `src/cli` | Command surface, output formatting, and machine-readable follow-up UX. | `src/cli/mod.rs`, `src/cli/impact.rs`, `src/cli/output.rs` |
-| `src/search` | Hybrid retrieval, symbol/context/structural search, and bounded advisory impact expansion with primary/contextual trust bucketing. | `src/search/hybrid.rs`, `src/search/impact.rs`, `src/search/mod.rs` |
-| `src/indexer` | Incremental scan/parse/embed pipeline that assigns deterministic segment IDs. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs` |
+| `src/search` | Hybrid retrieval, symbol/context/structural search, and bounded advisory impact expansion with owner-aware corroboration and primary/contextual trust bucketing. | `src/search/hybrid.rs`, `src/search/impact.rs`, `src/search/mod.rs` |
+| `src/indexer` | Incremental scan/parse/embed pipeline that assigns deterministic segment IDs and parser-derived relation edge identities. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs` |
 | `src/storage` | libSQL schema, segment storage, symbol/relation tables, and transactional maintenance. | `src/storage/schema.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`, `src/storage/queries.rs` |
 | `src/daemon` | Background search/watch service with secure IPC and version-aware responses. | `src/daemon/search_service.rs`, `src/daemon/worker.rs`, `src/daemon/registry.rs` |
 | `src/shared` | Shared types, constants, config, errors, reminder/update helpers, and cross-layer contracts. | `src/shared/types.rs`, `src/shared/constants.rs`, `src/shared/update.rs` |
@@ -23,16 +23,16 @@
 | `ImpactArgs` | `src/cli/impact.rs` | Exact-anchor CLI for bounded likely-impact exploration. | `src/search/impact.rs`, `src/storage/db.rs`, `src/storage/schema.rs`, `src/shared/config.rs` |
 | `Formatter` | `src/cli/output.rs` | Shared rendering for search, status, update, and impact results, including primary/contextual separation and explicit empty states. | `src/search/impact.rs`, `src/shared/types.rs`, `src/shared/update.rs` |
 | `HybridSearchEngine` | `src/search/hybrid.rs` | Candidate-first hybrid search with additive `segment_id` hydration. | `src/search/*`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
-| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded probable-impact expansion that resolves lookup-symbol relation targets, scores qualifier/path/breadcrumb/scope/role evidence, demotes ambiguous or low-signal matches, and preserves primary/contextual bucketing plus explicit empty outcomes. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs` |
-| `Pipeline` | `src/indexer/pipeline.rs` | Convert repository files into deterministic segments and symbol metadata. | `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
+| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded probable-impact expansion that resolves lookup-symbol relation targets, derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, requires corroborating structural signals for primary promotion, and preserves primary/contextual bucketing plus explicit empty outcomes. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs` |
+| `Pipeline` | `src/indexer/pipeline.rs` | Convert repository files into deterministic segments, parser-derived relation edge identities, and symbol metadata. | `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
 | `Schema` | `src/storage/schema.rs` | Schema init, validation, rebuild, and compatibility gating. | `src/storage/queries.rs`, `src/shared/constants.rs` |
-| `Relations` | `src/storage/relations.rs` | Persist and query relation descriptors with canonical, lookup-tail, and qualifier evidence for outbound and inbound expansion. | `src/storage/queries.rs`, `src/shared/symbols.rs` |
+| `Relations` | `src/storage/relations.rs` | Persist and query relation descriptors with canonical, lookup-tail, qualifier, and edge-identity evidence for outbound and inbound expansion. | `src/storage/queries.rs`, `src/shared/symbols.rs` |
 | `Segments` | `src/storage/segments.rs` | Transactional segment replacement and symbol/relation synchronization. | `src/storage/queries.rs`, `src/storage/relations.rs`, `src/shared/types.rs` |
 | `SearchService` | `src/daemon/search_service.rs` | Secure daemon-backed search IPC with optional version metadata. | `src/daemon/ipc.rs`, `src/shared/constants.rs`, `src/shared/types.rs` |
 | `ImpactEvidenceScripts` | `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh`, `scripts/approve_impact_rollout.sh` | Produce baseline-versus-candidate trust and latency summaries, then approve rollout only when both gates pass against the pinned April 14, 2026 requirements baseline and field notes contain no unresolved blockers. | `scripts/lib/impact_fixture.sh`, `justfile`, candidate/baseline binaries |
 | `SharedTypes` | `src/shared/types.rs` | Cross-layer result, config, progress, and daemon status contracts. | `src/shared/constants.rs`, `serde`, `chrono` |
 | `IntegrationTests` | `tests/integration_tests.rs` | Black-box regression coverage for CLI, impact, and search stability. | binary + real local fixtures |
-| `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery plus expanded, refused, empty, and empty-scoped impact paths. | `criterion`, search + storage engines |
+| `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery plus owner-aligned, low-signal, expanded, refused, empty, and empty-scoped impact paths. | `criterion`, search + storage engines |
 
 ## Internal Dependency Chains
 
@@ -57,12 +57,12 @@
 
 - Engines: `HybridSearchEngine`, `SymbolSearchEngine`, `StructuralSearchEngine`, `ImpactHorizonEngine`
 - Result contracts: `SearchResult`, `SymbolResult`, `ContextResult`, `StructuralResult`, `ImpactResultEnvelope`
-- Rule: `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused` envelopes where only confident non-ambiguous relation matches become primary `results` and additive `contextual_results` carries demoted relation, same-file, and test guidance
+- Rule: `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused` envelopes where only corroborated, non-ambiguous, owner-consistent relation matches become primary `results` and additive `contextual_results` carries demoted relation, same-file, and test guidance
 
 ### Storage Boundary
 
 - Components: `Db`, `schema`, `segments`, `relations`, `queries`
-- Rule: schema v9 extends `segment_relations` with `lookup_canonical_symbol` and `qualifier_fingerprint`; replace/delete flows must keep segments, symbols, and relation descriptors aligned transactionally
+- Rule: schema v10 extends `segment_relations` with `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind`; replace/delete flows must keep segments, symbols, and relation descriptors aligned transactionally
 
 ### Daemon Boundary
 
@@ -86,7 +86,7 @@
 ## Feature-Learning Deltas From Impact Horizon
 
 - `src/cli` gained a first-class `impact` command surface and formatter support for impact envelopes.
-- `src/search` now resolves relation targets through lookup-symbol fetches plus qualifier/path/breadcrumb/scope/role scoring, ambiguity margins, and low-signal demotion inside `src/search/impact.rs`.
-- `src/storage` now persists relation descriptors in schema v9, including `lookup_canonical_symbol` and `qualifier_fingerprint`, and exposes lookup-target relation queries.
+- `src/search` now resolves relation targets through lookup-symbol fetches plus definition-side owner-fingerprint derivation, owner-aware shortlisting, corroboration scoring, ambiguity margins, and low-signal demotion inside `src/search/impact.rs`.
+- `src/storage` now persists relation descriptors in schema v10, including `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind`, and exposes lookup-target relation queries.
 - `src/cli` and `src/cli/output.rs` keep the existing impact envelope stable while surfacing primary-versus-contextual trust buckets for richer relation scoring.
 - `tests`, `benches`, and `scripts` now encode qualified-relation, ambiguous-helper, and stronger-candidate-wins regressions, with `impact-rollout-approve` binding both summaries to the pinned April 14, 2026 baseline and current HEAD while honoring unresolved field-note blockers.
