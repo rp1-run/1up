@@ -1,19 +1,16 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-You have access to `1up`, a code search engine that understands code meaning and relationships. It searches across an indexed codebase and returns the most relevant files, functions, and code snippets.
+You have access to `1up`, a code search engine. Prefer it over grep/rg for code exploration.
 
-Commands:
-- `1up search "<query>"` — semantic + full-text search. Returns ranked results with file paths and context.
-- `1up symbol <name>` — look up where a symbol (function, class, type) is defined. Add `-r` to include references.
-- `1up context <file>:<line>` — get surrounding code context for a specific location.
+```
+1up search "<query>" -n 5          # hybrid semantic + keyword search
+1up symbol <name> [-r]             # definition lookup; -r includes references
+1up context <file>:<line>          # enclosing scope at location
+```
 
-Examples:
-- `1up search "how does content search work"`
-- `1up symbol FTSManager`
-- `1up symbol searchSingleCollection -r`
-- `1up context packages/core/src/search/query.ts:53`
+After discovering a symbol via `search`, verify all locations with `1up symbol -r <name>`.
 
-Prefer 1up for code exploration. You may fall back to grep, rg, or find if 1up is not the right tool for a specific lookup.
+You may fall back to grep/rg if 1up is not the right tool for a specific lookup.
 
 {{TASK_PROMPT}}
 
