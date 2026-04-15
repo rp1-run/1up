@@ -36,9 +36,9 @@
 
 ## Recent Learnings
 
-- `impact` now separates relation-backed likely-impact `results` from heuristic-only `contextual_results`, and empty expansions return explicit `empty` or `empty_scoped` states instead of anchor-echo fallbacks.
+- `impact` now separates confident relation-backed likely-impact `results` from heuristic-only or demoted-relation `contextual_results`, and empty expansions return explicit `empty` or `empty_scoped` states instead of anchor-echo fallbacks.
 - Search results expose additive machine-readable `segment_id` handles for exact impact follow-up without changing discovery ranking.
-- Schema v8 introduces persisted `segment_relations`, with bounded expansion and refusal semantics to protect interactivity.
+- Schema v9 persists relation lookup-target and qualifier-fingerprint evidence in `segment_relations`, enabling bounded structural-confidence scoring without changing the impact envelope.
 - Rollout evidence now has dedicated entry points: `just impact-eval` for trust gating and `just impact-bench` for latency gating.
 
 ## How To Load

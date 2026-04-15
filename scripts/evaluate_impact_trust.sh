@@ -32,6 +32,54 @@ build_binary() {
   impact_build_binary "$repo_dir"
 }
 
+augment_fixture() {
+  local repo_dir="$1"
+
+  mkdir -p "$repo_dir/src/ui" "$repo_dir/src/contracts"
+
+  cat > "$repo_dir/src/contracts/formatter.ts" <<'EOF'
+export interface Formatter {
+    format(value: string): string;
+}
+EOF
+
+  cat > "$repo_dir/src/ui/plain_formatter.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export class PlainFormatter implements Formatter {
+    format(value: string): string {
+        return value.trim();
+    }
+}
+EOF
+
+  cat > "$repo_dir/src/ui/render_search.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export function renderSearch(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+EOF
+
+  cat > "$repo_dir/src/ui/render_status.ts" <<'EOF'
+import type { Formatter } from "../contracts/formatter";
+
+export function renderStatus(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+EOF
+
+  cat > "$repo_dir/src/cache/test_support.rs" <<'EOF'
+mod cache_tests {
+    use crate::cache::runtime::warm_cache_key;
+
+    fn inline_warm_cache_test() {
+        assert_eq!(warm_cache_key(), "cache");
+    }
+}
+EOF
+}
+
 evaluate_case() {
   local variant="$1"
   local bin_path="$2"
@@ -52,6 +100,7 @@ evaluate_case() {
   local contextual_count
   local hint_code
   local contract_ok=0
+  local expected_primary_is_top=0
   local expected_primary_present=0
   local false_positive_count=0
   local exact_regression=0
@@ -125,11 +174,17 @@ evaluate_case() {
     expected_primary_present=1
   fi
 
+  if [[ -n "$expected_primary" ]] && jq -e --arg expected_primary "$expected_primary" '
+    (.results[0]?.file_path // "") == $expected_primary
+  ' "$output_path" >/dev/null; then
+    expected_primary_is_top=1
+  fi
+
   if [[ "$kind" == "ambiguous" ]]; then
     false_positive_count="$result_count"
   fi
 
-  if [[ "$kind" == "exact" && ( $contract_ok -eq 0 || $expected_primary_present -eq 0 ) ]]; then
+  if [[ "$kind" == "exact" && ( $contract_ok -eq 0 || $expected_primary_is_top -eq 0 ) ]]; then
     exact_regression=1
   fi
 
@@ -151,6 +206,7 @@ evaluate_case() {
     --argjson result_count "$result_count" \
     --argjson contextual_count "$contextual_count" \
     --argjson contract_ok "$contract_ok" \
+    --argjson expected_primary_is_top "$expected_primary_is_top" \
     --argjson expected_primary_present "$expected_primary_present" \
     --argjson false_positive_count "$false_positive_count" \
     --argjson exact_regression "$exact_regression" \
@@ -169,6 +225,7 @@ evaluate_case() {
       result_count: $result_count,
       contextual_result_count: $contextual_count,
       contract_ok: ($contract_ok == 1),
+      expected_primary_is_top: ($expected_primary_is_top == 1),
       expected_primary_present: ($expected_primary_present == 1),
       false_positive_count: $false_positive_count,
       exact_regression: ($exact_regression == 1),
@@ -253,6 +310,7 @@ DETAILS_JSONL="$OUT_DIR/case-results.jsonl"
 SUMMARY_PATH="$OUT_DIR/summary.json"
 
 impact_create_fixture "$TEMPLATE_REPO"
+augment_fixture "$TEMPLATE_REPO"
 impact_sync_repo "$TEMPLATE_REPO" "$BASELINE_REPO"
 impact_sync_repo "$TEMPLATE_REPO" "$CANDIDATE_REPO"
 impact_prepare_fts_only_home "$BASELINE_HOME"
@@ -278,17 +336,17 @@ CASES_JSON=$(cat <<'EOF'
   },
   {
     "kind": "ambiguous",
-    "name": "cache_context_only_unscoped",
-    "expected_status": "empty",
-    "expected_hint": "context_only",
-    "args": ["--from-file", "src/cache/runtime.rs:5"]
-  },
-  {
-    "kind": "ambiguous",
     "name": "broad_symbol_refusal",
     "expected_status": "refused",
     "expected_hint": "narrow_with_scope",
     "args": ["--from-symbol", "load_config"]
+  },
+  {
+    "kind": "ambiguous",
+    "name": "neutral_helper_context_only",
+    "expected_status": "empty",
+    "expected_hint": "context_only",
+    "args": ["--from-symbol", "boot_global_config"]
   },
   {
     "kind": "exact",
@@ -308,15 +366,29 @@ CASES_JSON=$(cat <<'EOF'
     "kind": "exact",
     "name": "auth_scoped_symbol",
     "expected_status": "expanded_scoped",
-    "expected_primary": "src/auth/config_builder.rs",
+    "expected_primary": "src/auth/reload.rs",
     "args": ["--from-symbol", "load_config", "--scope", "src/auth"]
   },
   {
     "kind": "exact",
-    "name": "cache_file_anchor",
+    "name": "qualified_relation_primary",
     "expected_status": "expanded",
-    "expected_primary": "src/cache/priming.rs",
-    "args": ["--from-file", "src/cache/runtime.rs"]
+    "expected_primary": "src/auth/config.rs",
+    "args": ["--from-symbol", "reload_auth_config"]
+  },
+  {
+    "kind": "exact",
+    "name": "cache_symbol_anchor",
+    "expected_status": "expanded",
+    "expected_primary": "src/cache/worker.rs",
+    "args": ["--from-symbol", "warm_cache_key"]
+  },
+  {
+    "kind": "exact",
+    "name": "formatter_conformance_primary",
+    "expected_status": "expanded",
+    "expected_primary": "src/ui/plain_formatter.ts",
+    "args": ["--from-symbol", "Formatter"]
   }
 ]
 EOF

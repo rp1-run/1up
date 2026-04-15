@@ -36,7 +36,10 @@ else
   fail "missing required command: sha256sum or shasum"
 fi
 
-mapfile -t ASSET_PATHS < <(find "$ASSETS_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+declare -a ASSET_PATHS=()
+while IFS= read -r asset_path; do
+  ASSET_PATHS+=("$asset_path")
+done < <(find "$ASSETS_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
 
 if [[ ${#ASSET_PATHS[@]} -eq 0 ]]; then
   fail "no release archives found in $(relative_path "$ASSETS_DIR")"

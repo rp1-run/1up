@@ -51,12 +51,16 @@ CREATE TABLE IF NOT EXISTS segment_relations (
     relation_kind TEXT NOT NULL,
     raw_target_symbol TEXT NOT NULL,
     canonical_target_symbol TEXT NOT NULL,
+    lookup_canonical_symbol TEXT NOT NULL,
+    qualifier_fingerprint TEXT NOT NULL,
+    edge_identity_kind TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (
         source_segment_id,
         relation_kind,
         canonical_target_symbol,
-        raw_target_symbol
+        raw_target_symbol,
+        edge_identity_kind
     )
 )";
 
@@ -74,6 +78,9 @@ pub const CREATE_INDEX_SEGMENT_RELATIONS_SOURCE: &str =
 
 pub const CREATE_INDEX_SEGMENT_RELATIONS_TARGET: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_relations_target ON segment_relations(canonical_target_symbol, relation_kind)";
+
+pub const CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_lookup_target ON segment_relations(lookup_canonical_symbol, relation_kind)";
 
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -120,6 +127,7 @@ DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP INDEX IF EXISTS idx_segment_relations_source;
 DROP INDEX IF EXISTS idx_segment_relations_target;
+DROP INDEX IF EXISTS idx_segment_relations_lookup_target;
 DROP TABLE IF EXISTS segment_vectors;
 DROP TABLE IF EXISTS segment_symbols;
 DROP TABLE IF EXISTS segment_relations;
@@ -134,9 +142,6 @@ pub const SELECT_SCHEMA_OBJECT: &str =
 
 pub const SELECT_HAS_USER_TABLES: &str =
     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1";
-
-pub const SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN: &str =
-    "SELECT 1 FROM pragma_table_info('segment_vectors') WHERE name = 'embedding_vec' LIMIT 1";
 
 pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str = "SELECT 1 FROM segment_vectors LIMIT 1";
 
@@ -191,9 +196,16 @@ pub const DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID: &str =
 #[allow(dead_code)]
 pub const INSERT_SEGMENT_RELATION: &str = "
 INSERT OR REPLACE INTO segment_relations (
-    source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol, created_at
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind,
+    created_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, datetime('now')
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')
 )";
 
 #[allow(dead_code)]
@@ -211,42 +223,107 @@ WHERE source_segment_id IN (
 
 #[allow(dead_code)]
 pub const SELECT_OUTBOUND_RELATIONS: &str = "
-SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE source_segment_id = ?1
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   canonical_target_symbol,
+  edge_identity_kind,
   raw_target_symbol
 LIMIT ?2";
 
 #[allow(dead_code)]
 pub const SELECT_OUTBOUND_RELATIONS_BY_KIND: &str = "
-SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE source_segment_id = ?1
   AND relation_kind = ?2
-ORDER BY canonical_target_symbol, raw_target_symbol
+ORDER BY canonical_target_symbol, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS: &str = "
-SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE canonical_target_symbol = ?1
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   source_segment_id,
+  edge_identity_kind,
   raw_target_symbol
 LIMIT ?2";
 
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS_BY_KIND: &str = "
-SELECT source_segment_id, relation_kind, raw_target_symbol, canonical_target_symbol
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
 FROM segment_relations
 WHERE canonical_target_symbol = ?1
   AND relation_kind = ?2
-ORDER BY source_segment_id, raw_target_symbol
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
+LIMIT ?3";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE lookup_canonical_symbol = ?1
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  source_segment_id,
+  edge_identity_kind,
+  raw_target_symbol
+LIMIT ?2";
+
+#[allow(dead_code)]
+pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE lookup_canonical_symbol = ?1
+  AND relation_kind = ?2
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
 #[allow(dead_code)]

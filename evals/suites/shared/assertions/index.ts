@@ -54,7 +54,8 @@ function getBashCommands(context: EvalContext): string[] {
     .filter((cmd) => cmd.length > 0);
 }
 
-const ONEUP_PATTERN = /\b1up\s+(?:search|symbol|context)\b/;
+const ONEUP_PATTERN = /\b1up\s+(?:search|symbol|context|impact)\b/;
+const ONEUP_IMPACT_PATTERN = /\b1up\s+impact\b/;
 
 const FALLBACK_PATTERNS = [
   /(?:^|\s|&&|\|\||;)rg\s/,
@@ -75,6 +76,22 @@ export function assert1upUsed(
     reason: found
       ? "Agent invoked at least one 1up command (search, symbol, or context)"
       : `Agent did not invoke any 1up commands. Bash commands seen: ${bashCommands.length === 0 ? "(none)" : bashCommands.map((c) => c.slice(0, 60)).join("; ")}`,
+  };
+}
+
+export function assert1upImpactUsed(
+  _output: string,
+  context: EvalContext,
+): GradingResult {
+  const bashCommands = getBashCommands(context);
+  const found = bashCommands.some((cmd) => ONEUP_IMPACT_PATTERN.test(cmd));
+
+  return {
+    pass: found,
+    score: found ? 1 : 0,
+    reason: found
+      ? "Agent invoked 1up impact command"
+      : `Agent did not invoke 1up impact. Bash commands seen: ${bashCommands.length === 0 ? "(none)" : bashCommands.map((c) => c.slice(0, 60)).join("; ")}`,
   };
 }
 

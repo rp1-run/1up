@@ -432,7 +432,15 @@ message PolicyRulePreview {
 
 fn create_impact_acceptance_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    for dir in ["src/auth", "src/cache", "src/ui", "tests"] {
+    for dir in [
+        "src/admin",
+        "src/app",
+        "src/auth",
+        "src/cache",
+        "src/contracts",
+        "src/ui",
+        "tests",
+    ] {
         fs::create_dir_all(tmp.path().join(dir)).unwrap();
     }
 
@@ -496,6 +504,95 @@ pub fn build_auth_config() -> &'static str {
     .unwrap();
 
     fs::write(
+        tmp.path().join("src").join("auth").join("reload.rs"),
+        r#"pub fn reload_auth_config() -> &'static str {
+    crate::auth::config::load_config()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path()
+            .join("src")
+            .join("contracts")
+            .join("auth_store.ts"),
+        r#"export interface BaseAuthStore {
+    get(key: string): string | null;
+}
+
+export interface AuthStore extends BaseAuthStore {
+    set(key: string, value: string): void;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("auth").join("auth_store.ts"),
+        r#"import type { AuthStore } from "../contracts/auth_store";
+
+export class SqlAuthStore implements AuthStore {
+    get(key: string): string | null {
+        return key;
+    }
+
+    set(key: string, value: string): void {
+        void value;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path()
+            .join("src")
+            .join("contracts")
+            .join("formatter.ts"),
+        r#"export interface Formatter {
+    format(value: string): string;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("plain_formatter.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export class PlainFormatter implements Formatter {
+    format(value: string): string {
+        return value.trim();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("render_search.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export function renderSearch(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("ui").join("render_status.ts"),
+        r#"import type { Formatter } from "../contracts/formatter";
+
+export function renderStatus(formatter: Formatter, value: string): string {
+    return formatter.format(value);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
         tmp.path().join("src").join("cache").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "cache"
@@ -505,9 +602,81 @@ pub fn build_auth_config() -> &'static str {
     .unwrap();
 
     fs::write(
+        tmp.path().join("src").join("cache").join("runtime.rs"),
+        r#"pub fn warm_cache_key() -> &'static str {
+    "cache"
+}
+
+pub fn normalize_cache_key(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("priming.rs"),
+        r#"use crate::cache::runtime::warm_cache_key;
+
+pub fn prime_cache() -> &'static str {
+    warm_cache_key()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("worker.rs"),
+        r#"use crate::cache::runtime::{normalize_cache_key, warm_cache_key};
+
+pub fn warm_cache_for_request(user_key: &str) -> String {
+    let normalized = normalize_cache_key(user_key);
+    if normalized.is_empty() {
+        return warm_cache_key().to_string();
+    }
+    format!("{}:{}", warm_cache_key(), normalized)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cache").join("test_support.rs"),
+        r#"mod cache_tests {
+    use crate::cache::runtime::warm_cache_key;
+
+    fn inline_warm_cache_test() {
+        assert_eq!(warm_cache_key(), "cache");
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
         tmp.path().join("src").join("ui").join("config.rs"),
         r#"pub fn load_config() -> &'static str {
     "ui"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("admin").join("config.rs"),
+        r#"pub fn load_config() -> &'static str {
+    "admin"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("app").join("bootstrap.rs"),
+        r#"use crate::auth::config::load_config;
+
+pub fn boot_global_config() -> &'static str {
+    load_config()
 }
 "#,
     )
@@ -524,9 +693,6 @@ pub fn build_auth_config() -> &'static str {
 
     tmp
 }
-
-// ---------- Test fixture: index a small multi-language repository ----------
-
 #[test]
 fn index_multi_language_repository() {
     let tmp = create_multi_lang_fixture();
@@ -538,8 +704,6 @@ fn index_multi_language_repository() {
         "index.db should be created after indexing"
     );
 }
-
-// ---------- Verify symbol lookup returns correct definitions ----------
 
 #[test]
 fn symbol_lookup_returns_definitions_json() {
@@ -649,8 +813,6 @@ fn symbol_lookup_acceptance_queries_cover_exact_canonical_and_references() {
         result["reference_kind"] == "usage" && result["file_path"] == "src/runner.rs"
     }));
 }
-
-// ---------- Verify hybrid search returns ranked results ----------
 
 #[test]
 fn fts_search_returns_ranked_results_json() {
@@ -810,7 +972,172 @@ fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
 
     let results = result["results"].as_array().unwrap();
     assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/auth/config_builder.rs");
+    assert_eq!(results[0]["file_path"], "src/auth/reload.rs");
+}
+
+#[test]
+fn impact_symbol_anchor_qualified_relation_promotes_matching_definition_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "reload_auth_config"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "reload_auth_config");
+
+    let results = result["results"]
+        .as_array()
+        .expect("qualified relation should surface a primary definition");
+    assert!(!results.is_empty());
+    assert!(
+        results
+            .iter()
+            .any(|r| r["file_path"] == "src/auth/config.rs"),
+        "config.rs should appear in results, got: {:?}",
+        results
+            .iter()
+            .map(|r| r["file_path"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn impact_symbol_anchor_interface_implementor_surfaces_primary_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "AuthStore"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "AuthStore");
+
+    let results = result["results"]
+        .as_array()
+        .expect("interface anchor should surface implementing classes");
+    assert!(results.iter().any(|candidate| {
+        candidate["file_path"].as_str() == Some("src/auth/auth_store.ts")
+            && candidate["block_type"].as_str() == Some("class")
+            && candidate["defined_symbols"]
+                .as_array()
+                .map(|symbols| {
+                    symbols
+                        .iter()
+                        .any(|symbol| symbol.as_str() == Some("SqlAuthStore"))
+                })
+                .unwrap_or(false)
+            && candidate["reasons"]
+                .as_array()
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason["kind"].as_str() == Some("implemented_by"))
+                })
+                .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn impact_symbol_anchor_formatter_implementor_stays_primary_under_reference_pressure_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "Formatter"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "Formatter");
+
+    let results = result["results"]
+        .as_array()
+        .expect("formatter anchor should surface implementors");
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/ui/plain_formatter.ts");
+
+    if let Some(contextual) = result["contextual_results"].as_array() {
+        assert!(contextual.iter().all(|candidate| {
+            candidate["file_path"]
+                .as_str()
+                .map(|path| path != "src/ui/plain_formatter.ts")
+                .unwrap_or(false)
+        }));
+    }
+}
+
+#[test]
+fn impact_symbol_anchor_ambiguous_helper_returns_context_only_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "boot_global_config"]);
+
+    assert_eq!(result["status"], "empty");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "boot_global_config");
+    assert_eq!(result["hint"]["code"], "context_only");
+    assert_eq!(result["results"], serde_json::json!([]));
+
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("ambiguous helper follow-up should stay contextual");
+    assert!(!contextual.is_empty());
+    assert!(contextual.iter().all(|candidate| {
+        candidate["file_path"]
+            .as_str()
+            .map(|path| matches!(path, "src/auth/config.rs" | "src/app/bootstrap.rs"))
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn impact_symbol_anchor_prefers_stronger_primary_over_wrapper_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+
+    assert_eq!(result["status"], "expanded");
+    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
+    assert_eq!(result["resolved_anchor"]["value"], "warm_cache_key");
+
+    let results = result["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["file_path"], "src/cache/worker.rs");
+
+    if let Some(wrapper_index) = results
+        .iter()
+        .position(|candidate| candidate["file_path"].as_str() == Some("src/cache/priming.rs"))
+    {
+        assert!(wrapper_index > 0);
+    }
+}
+
+#[test]
+fn impact_symbol_anchor_inline_test_context_stays_contextual_json() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+
+    assert_eq!(result["status"], "expanded");
+
+    let results = result["results"]
+        .as_array()
+        .expect("warm_cache_key should still have primary candidates");
+    assert!(results.iter().all(|candidate| {
+        candidate["file_path"]
+            .as_str()
+            .map(|path| path != "src/cache/test_support.rs")
+            .unwrap_or(false)
+    }));
+
+    let contextual = result["contextual_results"]
+        .as_array()
+        .expect("inline test context should remain available as contextual guidance");
+    assert!(contextual
+        .iter()
+        .any(|candidate| { candidate["file_path"].as_str() == Some("src/cache/test_support.rs") }));
 }
 
 #[test]
@@ -1029,8 +1356,6 @@ fn search_segment_id_handoff_keeps_search_top_hits_stable() {
     assert_eq!(before_ranked, after_ranked);
 }
 
-// ---------- Verify context retrieval returns enclosing scope ----------
-
 #[test]
 fn context_retrieval_returns_enclosing_scope_json() {
     let tmp = create_multi_lang_fixture();
@@ -1220,8 +1545,6 @@ fn context_allows_outside_root_with_explicit_override() {
     assert!(result["content"].as_str().unwrap().contains("fn leaked"));
 }
 
-// ---------- Verify JSON output conforms to schema ----------
-
 #[test]
 fn json_output_search_schema_conformance() {
     let tmp = create_multi_lang_fixture();
@@ -1329,8 +1652,6 @@ fn json_output_context_schema_conformance() {
     assert!(result["scope_type"].is_string());
     assert!(result["access_scope"].is_string());
 }
-
-// ---------- Verify incremental indexing ----------
 
 #[test]
 fn incremental_indexing_detects_changes() {
@@ -1507,8 +1828,6 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
     );
 }
 
-// ---------- Daemon lifecycle test ----------
-
 #[cfg(unix)]
 #[test]
 fn daemon_pid_file_lifecycle() {
@@ -1556,8 +1875,6 @@ fn daemon_stale_pid_detection() {
     fs::remove_file(&pid_path).unwrap();
     assert!(!pid_path.exists(), "stale PID file should be cleaned up");
 }
-
-// ---------- CLI integration tests ----------
 
 #[test]
 fn cli_init_then_index_then_search_workflow() {

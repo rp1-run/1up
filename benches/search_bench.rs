@@ -228,7 +228,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "IMPLEMENTATION".to_string(),
                 defined_symbols: format!("[\"validate_token_{idx}\"]"),
                 referenced_symbols: "[\"request\",\"token\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"validate\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -258,7 +260,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "DEFINITION".to_string(),
                 defined_symbols: format!("[\"load_config_{idx}\"]"),
                 referenced_symbols: "[\"host\",\"port\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-config-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -288,7 +292,9 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 role: "IMPLEMENTATION".to_string(),
                 defined_symbols: format!("[\"invoice_total_{idx}\"]"),
                 referenced_symbols: "[\"invoice\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"total\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-billing-{idx}"),
             };
             segments::upsert_segment(&conn, &insert).await.unwrap();
@@ -324,7 +330,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "DEFINITION".to_string(),
             defined_symbols: "[\"load_auth_config\"]".to_string(),
             referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-auth-runtime-anchor".to_string(),
         };
         segments::upsert_segment(&conn, &anchor).await.unwrap();
@@ -344,7 +352,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             role: "IMPLEMENTATION".to_string(),
             defined_symbols: "[\"parse_auth_config\"]".to_string(),
             referenced_symbols: "[\"raw\"]".to_string(),
+            referenced_relations: "[]".to_string(),
             called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
             file_hash: "hash-auth-runtime-parse".to_string(),
         };
         segments::upsert_segment(&conn, &sibling).await.unwrap();
@@ -366,7 +376,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "ORCHESTRATION".to_string(),
                 defined_symbols: format!("[\"boot_auth_{idx}\"]"),
                 referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[\"load_auth_config\"]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-caller-{idx}"),
             };
             segments::upsert_segment(&conn, &caller).await.unwrap();
@@ -389,7 +401,9 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "DEFINITION".to_string(),
                 defined_symbols: format!("[\"runtime_test_{idx}\"]"),
                 referenced_symbols: "[\"load_auth_config\"]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-auth-test-{idx}"),
             };
             segments::upsert_segment(&conn, &test_segment).await.unwrap();
@@ -421,12 +435,211 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
                 role: "DEFINITION".to_string(),
                 defined_symbols: "[\"load_config\"]".to_string(),
                 referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
                 called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
                 file_hash: format!("hash-broad-config-{idx}"),
             };
             segments::upsert_segment(&conn, &broad_definition)
                 .await
                 .unwrap();
+        }
+
+        let qualified_relation = SegmentInsert {
+            id: "auth-config-reload".to_string(),
+            file_path: "src/auth/reload.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn reload_auth_config() -> &'static str {\n    crate::auth::config::load_config()\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("auth".to_string()),
+            complexity: 2,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"reload_auth_config\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"crate::auth::config::load_config\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-auth-config-reload".to_string(),
+        };
+        segments::upsert_segment(&conn, &qualified_relation)
+            .await
+            .unwrap();
+
+        let cache_runtime = SegmentInsert {
+            id: "cache-runtime-anchor".to_string(),
+            file_path: "src/cache/runtime.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn warm_cache_key() -> &'static str {\n    \"cache\"\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"warm_cache_key\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-cache-runtime-anchor".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_runtime).await.unwrap();
+
+        let cache_wrapper = SegmentInsert {
+            id: "cache-priming".to_string(),
+            file_path: "src/cache/priming.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn prime_cache() -> &'static str {\n    warm_cache_key()\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 1,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"prime_cache\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"warm_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-cache-priming".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_wrapper).await.unwrap();
+
+        let cache_worker = SegmentInsert {
+            id: "cache-worker".to_string(),
+            file_path: "src/cache/worker.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 7,
+            embedding_vec: None,
+            breadcrumb: Some("cache".to_string()),
+            complexity: 3,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+            referenced_symbols: "[\"user_key\"]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-cache-worker".to_string(),
+        };
+        segments::upsert_segment(&conn, &cache_worker).await.unwrap();
+
+        let mut cache_inline_test = SegmentInsert {
+            id: "cache-inline-test".to_string(),
+            file_path: "src/cache/test_support.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "#[cfg(test)]\nfn inline_warm_cache_test() {\n    assert_eq!(warm_cache_key(), \"cache\");\n}\n"
+                .to_string(),
+            line_start: 20,
+            line_end: 23,
+            embedding_vec: None,
+            breadcrumb: Some("cache::tests".to_string()),
+            complexity: 1,
+            role: "IMPLEMENTATION".to_string(),
+            defined_symbols: "[\"inline_warm_cache_test\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"warm_cache_key\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-cache-inline-test".to_string(),
+        };
+        cache_inline_test.called_relations = serde_json::to_string(&[oneup::shared::types::ParsedRelation {
+            symbol: "warm_cache_key".to_string(),
+            edge_identity_kind: oneup::shared::symbols::EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(oneup::shared::types::ParsedRelationKind::Call),
+        }])
+        .unwrap();
+        segments::upsert_segment(&conn, &cache_inline_test)
+            .await
+            .unwrap();
+
+        let formatter_trait = SegmentInsert {
+            id: "formatter-trait".to_string(),
+            file_path: "src/ui/formatter.ts".to_string(),
+            language: "typescript".to_string(),
+            block_type: "interface".to_string(),
+            content: "export interface Formatter {\n    format(value: string): string;\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: Some("ui".to_string()),
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"Formatter\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-formatter-trait".to_string(),
+        };
+        segments::upsert_segment(&conn, &formatter_trait)
+            .await
+            .unwrap();
+
+        let mut plain_formatter = SegmentInsert {
+            id: "plain-formatter".to_string(),
+            file_path: "src/ui/plain_formatter.ts".to_string(),
+            language: "typescript".to_string(),
+            block_type: "class".to_string(),
+            content: "export class PlainFormatter implements Formatter {\n    format(value: string): string {\n        return value.trim();\n    }\n}\n"
+                .to_string(),
+            line_start: 1,
+            line_end: 5,
+            embedding_vec: None,
+            breadcrumb: Some("ui".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"PlainFormatter\"]".to_string(),
+            referenced_symbols: "[\"Formatter\"]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-plain-formatter".to_string(),
+        };
+        plain_formatter.referenced_relations = serde_json::to_string(&[oneup::shared::types::ParsedRelation {
+            symbol: "Formatter".to_string(),
+            edge_identity_kind: oneup::shared::symbols::EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(oneup::shared::types::ParsedRelationKind::Conformance),
+        }])
+        .unwrap();
+        segments::upsert_segment(&conn, &plain_formatter)
+            .await
+            .unwrap();
+
+        for idx in 0..8 {
+            let consumer = SegmentInsert {
+                id: format!("formatter-reference-{idx}"),
+                file_path: format!("src/ui/render_{idx}.ts"),
+                language: "typescript".to_string(),
+                block_type: "function".to_string(),
+                content: format!(
+                    "export function render{idx}(formatter: Formatter, value: string): string {{\n    return formatter.format(value);\n}}\n"
+                ),
+                line_start: 1,
+                line_end: 3,
+                embedding_vec: None,
+                breadcrumb: Some("ui".to_string()),
+                complexity: 1,
+                role: "IMPLEMENTATION".to_string(),
+                defined_symbols: format!("[\"render_{idx}\"]"),
+                referenced_symbols: "[\"Formatter\"]".to_string(),
+                referenced_relations: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
+                file_hash: format!("hash-formatter-reference-{idx}"),
+            };
+            segments::upsert_segment(&conn, &consumer).await.unwrap();
         }
     });
 
@@ -652,6 +865,30 @@ fn bench_impact_horizon(c: &mut Criterion) {
         depth: 2,
         limit: 20,
     };
+    let qualified_relation_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "load_config".to_string(),
+        },
+        scope: Some("src/auth".to_string()),
+        depth: 2,
+        limit: 20,
+    };
+    let low_signal_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "warm_cache_key".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
+    let formatter_request = ImpactRequest {
+        anchor: ImpactAnchor::Symbol {
+            name: "Formatter".to_string(),
+        },
+        scope: None,
+        depth: 2,
+        limit: 20,
+    };
     let empty_request = ImpactRequest {
         anchor: ImpactAnchor::Segment {
             id: "auth-runtime-parse".to_string(),
@@ -691,6 +928,21 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("impact_symbol_anchor_qualified_relation", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine
+                    .explore(qualified_relation_request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(result.status, ImpactStatus::ExpandedScoped);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/auth/reload.rs");
+            });
+        });
+    });
+
     c.bench_function("impact_file_anchor_primary", |b| {
         b.iter(|| {
             rt.block_on(async {
@@ -698,6 +950,39 @@ fn bench_impact_horizon(c: &mut Criterion) {
                 let result = engine.explore(file_request.clone()).await.unwrap();
                 assert_eq!(result.status, ImpactStatus::Expanded);
                 assert!(!result.results.is_empty());
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_low_signal_primary", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(low_signal_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/cache/worker.rs");
+                assert!(result
+                    .results
+                    .iter()
+                    .all(|candidate| { candidate.file_path != "src/cache/test_support.rs" }));
+                assert!(result
+                    .contextual_results
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate.file_path == "src/cache/test_support.rs"));
+            });
+        });
+    });
+
+    c.bench_function("impact_symbol_anchor_formatter_conformance", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let engine = ImpactHorizonEngine::new(&conn);
+                let result = engine.explore(formatter_request.clone()).await.unwrap();
+                assert_eq!(result.status, ImpactStatus::Expanded);
+                assert!(!result.results.is_empty());
+                assert_eq!(result.results[0].file_path, "src/ui/plain_formatter.ts");
             });
         });
     });

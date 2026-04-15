@@ -239,7 +239,10 @@ if [[ "$accuracy_candidate_commit" != "$performance_candidate_commit" ]]; then
   blocking_reasons+=("impact-eval and impact-bench candidate commits do not match")
 fi
 if [[ -n "$FIELD_NOTES_PATH" ]]; then
-  mapfile -t field_note_blockers < <(collect_unresolved_field_note_blockers "$FIELD_NOTES_PATH")
+  declare -a field_note_blockers=()
+  while IFS= read -r blocker; do
+    field_note_blockers+=("$blocker")
+  done < <(collect_unresolved_field_note_blockers "$FIELD_NOTES_PATH")
   if (( ${#field_note_blockers[@]} > 0 )); then
     field_note_blockers_json=$(printf '%s\n' "${field_note_blockers[@]}" | jq -R . | jq -s .)
     for blocker in "${field_note_blockers[@]}"; do

@@ -15,8 +15,11 @@ python3 - $RECENT_LOGS << 'PYEOF'
 import json, re, sys
 
 kw_map = [("search is enabled", "Search Stack"), ("WordPress import", "WordPress Import"),
-          ("sandboxed", "Plugin Arch"), ("schema in the database", "Live Content")]
-tasks_order = ["Search Stack", "WordPress Import", "Plugin Arch", "Live Content"]
+          ("sandboxed emdash plugin", "Plugin Arch"), ("schema in the database", "Live Content"),
+          ("FTSManager class interface", "FTS Impact"), ("schema definitions are stored", "Registry Impact"),
+          ("sandbox runner API", "Runner Impact")]
+tasks_order = ["Search Stack", "WordPress Import", "Plugin Arch", "Live Content",
+               "FTS Impact", "Registry Impact", "Runner Impact"]
 
 from collections import defaultdict
 by_task = defaultdict(dict)

@@ -99,7 +99,7 @@ pub const EMBED_THREADS_ENV_VAR: &str = "ONEUP_EMBED_THREADS";
 pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES";
 
 /// Schema version for database layout.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// ONNX model filename.
 pub const MODEL_FILENAME: &str = "model.onnx";

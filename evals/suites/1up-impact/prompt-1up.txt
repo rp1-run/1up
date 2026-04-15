@@ -1,0 +1,19 @@
+Your working directory is {{WORKSPACE_DIR}}.
+
+You have access to `1up`, a code search and impact analysis engine. Prefer it over grep/rg for code exploration.
+
+```
+1up search "<query>" -n 5          # hybrid semantic + keyword search
+1up symbol <name> [-r]             # definition lookup; -r includes references
+1up context <file>:<line>          # enclosing scope at location
+1up impact --from-symbol <name>    # blast radius from symbol
+1up impact --from-file <path>      # blast radius from file
+```
+
+For impact questions, start with `1up impact` to trace dependencies. Use `search`/`symbol` to find the right anchor first.
+
+After reviewing impact results, use `1up symbol -r`, `1up search`, or `grep` to fill gaps — impact may not surface every downstream consumer, especially UI components or indirect callers. Follow up on important files to check for additional dependents.
+
+{{TASK_PROMPT}}
+
+Be concise. List affected files and explain why each would be impacted.

@@ -1,0 +1,152 @@
+description: "1up impact evaluation: 1up impact vs baseline comparison"
+
+evaluateOptions:
+  maxConcurrency: 1
+
+prompts:
+  - id: file://prompt-1up.txt
+    label: 1up
+  - id: file://prompt-baseline.txt
+    label: baseline
+
+providers:
+  - id: anthropic:claude-agent-sdk
+    label: 1up-agent
+    prompts: [1up]
+    config:
+      model: haiku
+      betas:
+        - fast-mode-2026-02-01
+      permission_mode: bypassPermissions
+      allow_dangerously_skip_permissions: true
+      max_turns: 100
+      custom_allowed_tools: [Bash, Read]
+
+  - id: anthropic:claude-agent-sdk
+    label: baseline-agent
+    prompts: [baseline]
+    config:
+      model: haiku
+      betas:
+        - fast-mode-2026-02-01
+      permission_mode: bypassPermissions
+      allow_dangerously_skip_permissions: true
+      max_turns: 100
+      custom_allowed_tools: [Bash, Read, Glob, Grep]
+
+defaultTest:
+  options:
+    provider:
+      id: anthropic:claude-haiku-4-5-20251001
+      config:
+        temperature: 0
+
+extensions:
+  - file://../shared/extension.ts:default
+
+tests:
+  - description: FTSManager Impact
+    vars:
+      TASK_PROMPT: >
+        What files and functions would be affected if you changed the
+        FTSManager class interface in emdash? Identify each affected file
+        and explain why it would need to change.
+      EXPECTED_FILES: query.ts,AdminCommandPalette.tsx
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: FTSManager in fts-manager.ts creates FTS5 virtual tables
+          and triggers for content search. The correct impact is: (1) query.ts
+          depends on the FTS5 tables FTSManager creates, so changing the class
+          interface would break search queries via searchSingleCollection(),
+          (2) AdminCommandPalette.tsx is the admin search UI that consumes
+          search results. Score 1.0 if both downstream dependencies are
+          correctly identified with reasoning. Score 0.5 if only one is
+          found or reasoning is weak. Score 0.0 if fundamentally wrong.
+          Judge the quality of impact analysis, not format.
+      - type: llm-rubric
+        value: >
+          Completeness: A thorough impact analysis should identify: (a) direct
+          consumers of the FTSManager API, (b) transitive dependents through
+          the query layer, (c) UI components that surface search results.
+          Score 1.0 if all three levels are covered, 0.66 if two, 0.33 if
+          one. Judge only coverage of the dependency chain.
+
+  - description: Schema Registry Impact
+    vars:
+      TASK_PROMPT: >
+        What would break if you changed how schema definitions are stored
+        in registry.ts in the emdash codebase? Trace the blast radius
+        through all dependent files.
+      EXPECTED_FILES: loader.ts,query.ts,live.config.ts
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: registry.ts stores schema definitions in the database.
+          The correct impact chain is: (1) loader.ts loads stored schema at
+          runtime and would break if the storage format changed, (2) query.ts
+          executes typed content queries against the loaded schema, (3)
+          live.config.ts integrates with Astro for live queries using the
+          schema types. Score 1.0 if the full dependency chain is correctly
+          traced. Score 0.5 if partially correct. Score 0.0 if fundamentally
+          wrong. Judge the quality of impact reasoning.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should trace impact through: (a) schema
+          storage layer, (b) schema loading/runtime layer, (c) query
+          execution layer, (d) framework integration layer. Score 1.0 if
+          all four layers are covered, 0.75 if three, 0.5 if two, 0.25 if
+          one. Judge only depth of the dependency trace.
+
+  - description: Plugin Runner Impact
+    vars:
+      TASK_PROMPT: >
+        What is the blast radius of changing the plugin sandbox runner API
+        in runner.ts in the emdash codebase? Identify all files that would
+        need to change and explain the dependency chain.
+      EXPECTED_FILES: wrapper.ts,bridge.ts,manager.ts,hooks.ts
+    assert:
+      - type: javascript
+        value: |
+          const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
+          const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
+          const found = expected.length - missing.length;
+          const score = found / expected.length;
+          return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
+      - type: javascript
+        value: file://../shared/assertions/index.ts:reportEfficiency
+      - type: llm-rubric
+        value: >
+          Accuracy: runner.ts loads plugins into Cloudflare Worker isolation.
+          The correct blast radius includes: (1) wrapper.ts provides the
+          sandbox wrapping layer that runner.ts uses, (2) bridge.ts controls
+          plugin access to content, storage, and network through the runner,
+          (3) manager.ts handles plugin registration and coordinates with the
+          runner, (4) hooks.ts provides capability hooks that gate what plugins
+          can do. Score 1.0 if all four dependencies are correctly identified
+          with reasoning. Score 0.5 if at least two are found. Score 0.0 if
+          fundamentally wrong.
+      - type: llm-rubric
+        value: >
+          Completeness: The answer should cover: (a) sandbox/isolation layer,
+          (b) resource access control, (c) plugin lifecycle management,
+          (d) capability gating. Score 1.0 if all four, 0.75 if three,
+          0.5 if two, 0.25 if one.

@@ -86,7 +86,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Unix process/signal management
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "fs"] }
 
 # Chrono for timestamps
 chrono = { version = "0.4", features = ["serde"] }

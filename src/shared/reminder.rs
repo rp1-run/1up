@@ -6,6 +6,12 @@ pub const CONDENSED_REMINDER: &str = include_str!("../reminder.md");
 /// 1up version from Cargo.toml, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Fence content version, tracked independently from the software version.
+/// Bump this only when `src/reminder.md` or fence formatting changes.
+/// This prevents unnecessary git noise in user repos when 1up updates
+/// without any fence content changes.
+pub const FENCE_VERSION: &str = "0.1.6";
+
 /// Fence marker prefix used to identify 1up-managed sections.
 pub const FENCE_PREFIX: &str = "<!-- 1up:start:";
 
@@ -33,11 +39,11 @@ pub fn fenced_reminder() -> String {
     format!(
         "{}{}{}\n{}\n{}{}{}",
         FENCE_PREFIX,
-        VERSION,
+        FENCE_VERSION,
         MARKER_CLOSE,
         CONDENSED_REMINDER.trim_end(),
         FENCE_SUFFIX,
-        VERSION,
+        FENCE_VERSION,
         MARKER_CLOSE,
     )
 }
@@ -110,7 +116,7 @@ pub fn apply_fence(existing_content: Option<&str>) -> (String, FenceAction) {
                 let existing_fenced: String =
                     lines[existing.start_line..=existing.end_line].join("\n");
 
-                if existing.version == VERSION && existing_fenced == new_fence {
+                if existing.version == FENCE_VERSION && existing_fenced == new_fence {
                     return (content.to_string(), FenceAction::AlreadyCurrent);
                 }
 
@@ -160,8 +166,8 @@ mod tests {
     #[test]
     fn fenced_reminder_contains_version_markers() {
         let fenced = fenced_reminder();
-        let expected_start = format!("{FENCE_PREFIX}{VERSION}{MARKER_CLOSE}");
-        let expected_end = format!("{FENCE_SUFFIX}{VERSION}{MARKER_CLOSE}");
+        let expected_start = format!("{FENCE_PREFIX}{FENCE_VERSION}{MARKER_CLOSE}");
+        let expected_end = format!("{FENCE_SUFFIX}{FENCE_VERSION}{MARKER_CLOSE}");
 
         assert!(
             fenced.starts_with(&expected_start),
@@ -240,7 +246,7 @@ mod tests {
     #[test]
     fn apply_fence_creates_new_content() {
         let (content, action) = apply_fence(None);
-        let expected_start = format!("{FENCE_PREFIX}{VERSION}{MARKER_CLOSE}");
+        let expected_start = format!("{FENCE_PREFIX}{FENCE_VERSION}{MARKER_CLOSE}");
 
         assert_eq!(action, FenceAction::Created);
         assert!(content.contains(&expected_start));
@@ -262,7 +268,7 @@ mod tests {
             content.contains(CONDENSED_REMINDER.trim_end()),
             "should contain the reminder"
         );
-        let fence_start = format!("{FENCE_PREFIX}{VERSION}{MARKER_CLOSE}");
+        let fence_start = format!("{FENCE_PREFIX}{FENCE_VERSION}{MARKER_CLOSE}");
         assert!(content.contains(&fence_start));
     }
 
@@ -289,7 +295,7 @@ mod tests {
             "should remove old fence content"
         );
 
-        let new_start = format!("{FENCE_PREFIX}{VERSION}{MARKER_CLOSE}");
+        let new_start = format!("{FENCE_PREFIX}{FENCE_VERSION}{MARKER_CLOSE}");
         assert!(
             content.contains(&new_start),
             "should have new version marker"

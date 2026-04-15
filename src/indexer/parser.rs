@@ -2,7 +2,12 @@ use tree_sitter::{Language, Node, Parser};
 use tree_sitter_language::LanguageFn;
 
 use crate::shared::errors::ParserError;
-use crate::shared::types::{ParsedSegment, SegmentRole};
+use crate::shared::symbols::{
+    normalize_edge_identity_kind, EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE,
+    EDGE_IDENTITY_MACRO_LIKE, EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER,
+    EDGE_IDENTITY_QUALIFIED_PATH,
+};
+use crate::shared::types::{ParsedRelation, ParsedRelationKind, ParsedSegment, SegmentRole};
 
 /// Supported language identifiers and their tree-sitter grammars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,8 +462,16 @@ pub fn parse_file(source: &str, language: &str) -> Result<Vec<ParsedSegment>, Pa
 
         if top_level.contains(&kind) {
             if containers.contains(&kind) {
-                let container_segment =
-                    extract_segment(&node, source_bytes, lang, &leading_comments, None);
+                let container_breadcrumb =
+                    matches!((lang, kind), (SupportedLanguage::Rust, "mod_item"))
+                        .then(|| node_name(&node, source_bytes, lang));
+                let container_segment = extract_segment(
+                    &node,
+                    source_bytes,
+                    lang,
+                    &leading_comments,
+                    container_breadcrumb.as_deref(),
+                );
                 segments.push(container_segment);
 
                 extract_nested(
@@ -652,8 +665,12 @@ fn extract_segment(
     let role = classify_role(node, lang);
     let complexity = compute_complexity(node, lang);
     let defined_symbols = collect_defined_symbols(node, source, lang);
-    let referenced_symbols = collect_referenced_symbols(node, source, lang);
-    let called_symbols = collect_called_symbols(node, source, lang);
+    let mut referenced_relations = collect_referenced_relations(node, source, lang);
+    referenced_relations.extend(collect_conformance_relations(node, source, lang));
+    sort_and_dedup_relations(&mut referenced_relations);
+    let referenced_symbols = relation_symbols(&referenced_relations);
+    let called_relations = collect_called_relations(node, source, lang);
+    let called_symbols = relation_symbols(&called_relations);
 
     ParsedSegment {
         content: full_content,
@@ -666,7 +683,15 @@ fn extract_segment(
         role,
         defined_symbols,
         referenced_symbols,
+        referenced_relations: referenced_relations
+            .into_iter()
+            .map(ExtractedRelation::into_parsed_relation)
+            .collect(),
         called_symbols,
+        called_relations: called_relations
+            .into_iter()
+            .map(ExtractedRelation::into_parsed_relation)
+            .collect(),
     }
 }
 
@@ -1351,19 +1376,237 @@ fn collect_variable_names(node: &Node, source: &[u8], symbols: &mut Vec<String>)
     }
 }
 
-fn collect_referenced_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedRelation {
+    symbol: String,
+    edge_identity_kind: String,
+    kind: Option<ParsedRelationKind>,
+}
+
+impl ExtractedRelation {
+    fn new(symbol: String, edge_identity_kind: &str) -> Self {
+        Self::with_kind(symbol, edge_identity_kind, None)
+    }
+
+    fn conformance(symbol: String, edge_identity_kind: &str) -> Self {
+        Self::with_kind(
+            symbol,
+            edge_identity_kind,
+            Some(ParsedRelationKind::Conformance),
+        )
+    }
+
+    fn with_kind(
+        symbol: String,
+        edge_identity_kind: &str,
+        kind: Option<ParsedRelationKind>,
+    ) -> Self {
+        Self {
+            symbol,
+            edge_identity_kind: normalize_edge_identity_kind(edge_identity_kind),
+            kind,
+        }
+    }
+
+    fn into_parsed_relation(self) -> ParsedRelation {
+        ParsedRelation {
+            symbol: self.symbol,
+            edge_identity_kind: self.edge_identity_kind,
+            kind: self.kind,
+        }
+    }
+}
+
+fn collect_referenced_relations(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Vec<ExtractedRelation> {
     let mut refs = Vec::new();
     let defined = collect_defined_symbols(node, source, lang);
     walk_references(node, source, lang, &defined, &mut refs);
-    refs.sort();
-    refs.dedup();
+    sort_and_dedup_relations(&mut refs);
     refs
 }
 
-fn collect_called_symbols(node: &Node, source: &[u8], lang: SupportedLanguage) -> Vec<String> {
+fn collect_called_relations(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Vec<ExtractedRelation> {
     let mut calls = Vec::new();
     walk_called_symbols(node, source, lang, &mut calls);
     calls
+}
+
+fn sort_and_dedup_relations(relations: &mut Vec<ExtractedRelation>) {
+    relations.sort_by(|left, right| {
+        left.symbol
+            .cmp(&right.symbol)
+            .then(left.edge_identity_kind.cmp(&right.edge_identity_kind))
+            .then(left.kind.cmp(&right.kind))
+    });
+    relations.dedup();
+}
+
+fn collect_conformance_relations(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Vec<ExtractedRelation> {
+    match lang {
+        SupportedLanguage::Rust => collect_rust_conformance_relations(node, source),
+        SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
+            collect_typescript_conformance_relations(node, source)
+        }
+        SupportedLanguage::Java => collect_java_conformance_relations(node, source),
+        SupportedLanguage::Python
+        | SupportedLanguage::Go
+        | SupportedLanguage::C
+        | SupportedLanguage::Cpp
+        | SupportedLanguage::Kotlin
+        | SupportedLanguage::Css
+        | SupportedLanguage::Html
+        | SupportedLanguage::Json
+        | SupportedLanguage::Bash
+        | SupportedLanguage::Toml
+        | SupportedLanguage::Yaml
+        | SupportedLanguage::Markdown => Vec::new(),
+    }
+}
+
+fn collect_rust_conformance_relations(node: &Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    if node.kind() != "impl_item" {
+        return Vec::new();
+    }
+
+    let Some(target) = node.child_by_field_name("trait") else {
+        return Vec::new();
+    };
+    let Some(symbol) = type_relation_target_text(&target, source) else {
+        return Vec::new();
+    };
+
+    vec![ExtractedRelation::conformance(
+        symbol,
+        &relation_edge_identity_kind(node, &target, source),
+    )]
+}
+
+fn collect_typescript_conformance_relations(node: &Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    match node.kind() {
+        "export_statement" => node
+            .child_by_field_name("declaration")
+            .map(|declaration| collect_typescript_conformance_relations(&declaration, source))
+            .unwrap_or_default(),
+        "class_declaration" => {
+            let Some(heritage) = find_named_child_by_kind(node, "class_heritage") else {
+                return Vec::new();
+            };
+            let mut relations = Vec::new();
+            let mut cursor = heritage.walk();
+            for child in heritage.named_children(&mut cursor) {
+                match child.kind() {
+                    "extends_clause" => {
+                        if let Some(target) = child.child_by_field_name("value") {
+                            if let Some(symbol) = type_relation_target_text(&target, source) {
+                                relations.push(ExtractedRelation::conformance(
+                                    symbol,
+                                    &relation_edge_identity_kind(&child, &target, source),
+                                ));
+                            }
+                        }
+                    }
+                    "implements_clause" => relations.extend(
+                        named_child_relation_texts(&child, source).into_iter().map(
+                            |(symbol, edge_identity_kind)| {
+                                ExtractedRelation::conformance(symbol, &edge_identity_kind)
+                            },
+                        ),
+                    ),
+                    _ => {}
+                }
+            }
+            relations
+        }
+        "interface_declaration" => find_named_child_by_kind(node, "extends_type_clause")
+            .map(|clause| {
+                named_child_relation_texts(&clause, source)
+                    .into_iter()
+                    .map(|(symbol, edge_identity_kind)| {
+                        ExtractedRelation::conformance(symbol, &edge_identity_kind)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_java_conformance_relations(node: &Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    match node.kind() {
+        "class_declaration" => {
+            let mut relations = Vec::new();
+            if let Some(superclass) = node.child_by_field_name("superclass") {
+                relations.extend(
+                    named_child_relation_texts(&superclass, source)
+                        .into_iter()
+                        .map(|(symbol, edge_identity_kind)| {
+                            ExtractedRelation::conformance(symbol, &edge_identity_kind)
+                        }),
+                );
+            }
+            if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                relations.extend(collect_java_type_list_relations(&interfaces, source));
+            }
+            relations
+        }
+        "interface_declaration" => find_named_child_by_kind(node, "extends_interfaces")
+            .map(|extends| collect_java_type_list_relations(&extends, source))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_java_type_list_relations(node: &Node, source: &[u8]) -> Vec<ExtractedRelation> {
+    let Some(type_list) = find_named_child_by_kind(node, "type_list") else {
+        return Vec::new();
+    };
+
+    named_child_relation_texts(&type_list, source)
+        .into_iter()
+        .map(|(symbol, edge_identity_kind)| {
+            ExtractedRelation::conformance(symbol, &edge_identity_kind)
+        })
+        .collect()
+}
+
+fn find_named_child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == kind);
+    found
+}
+
+fn named_child_relation_texts(node: &Node, source: &[u8]) -> Vec<(String, String)> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter_map(|child| {
+            type_relation_target_text(&child, source)
+                .map(|symbol| (symbol, relation_edge_identity_kind(node, &child, source)))
+        })
+        .collect()
+}
+
+fn relation_symbols(relations: &[ExtractedRelation]) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for relation in relations {
+        if !symbols.contains(&relation.symbol) {
+            symbols.push(relation.symbol.clone());
+        }
+    }
+    symbols
 }
 
 fn walk_references(
@@ -1371,7 +1614,7 @@ fn walk_references(
     source: &[u8],
     lang: SupportedLanguage,
     defined: &[String],
-    refs: &mut Vec<String>,
+    refs: &mut Vec<ExtractedRelation>,
 ) {
     let kind = node.kind();
 
@@ -1408,7 +1651,10 @@ fn walk_references(
             let name = text.to_string();
             if !defined.contains(&name) && !is_keyword(lang, &name) && !is_builtin_type(lang, &name)
             {
-                refs.push(name);
+                refs.push(ExtractedRelation::new(
+                    name,
+                    &reference_edge_identity_kind(node, source),
+                ));
             }
         }
     }
@@ -1423,10 +1669,10 @@ fn walk_called_symbols(
     node: &Node,
     source: &[u8],
     lang: SupportedLanguage,
-    calls: &mut Vec<String>,
+    calls: &mut Vec<ExtractedRelation>,
 ) {
-    if let Some(call_target) = extract_call_target(node, source, lang) {
-        if !call_target.is_empty() && !calls.contains(&call_target) {
+    if let Some(call_target) = extract_call_relation(node, source, lang) {
+        if !call_target.symbol.is_empty() && !calls.contains(&call_target) {
             calls.push(call_target);
         }
     }
@@ -1437,49 +1683,66 @@ fn walk_called_symbols(
     }
 }
 
-fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> Option<String> {
+fn extract_call_relation(
+    node: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+) -> Option<ExtractedRelation> {
     match lang {
         SupportedLanguage::Rust => match node.kind() {
             "call_expression" | "method_call_expression" | "macro_invocation" => {
-                extract_rust_call_target(node, source)
+                extract_rust_call_relation(node, source)
             }
             _ => None,
         },
         SupportedLanguage::Python => match node.kind() {
-            "call" => extract_child_text(node, source, &["function"]),
+            "call" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
-            "new_expression" => extract_child_text(node, source, &["constructor", "function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
+            "new_expression" => extract_relation_from_fields(
+                node,
+                source,
+                &["constructor", "function"],
+                Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+            ),
             _ => None,
         },
         SupportedLanguage::Go => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Java => match node.kind() {
             "method_invocation" => {
                 let name = extract_child_text(node, source, &["name"])?;
                 if let Some(object) = extract_child_text(node, source, &["object"]) {
-                    Some(format!("{object}.{name}"))
+                    Some(ExtractedRelation::new(
+                        format!("{object}.{name}"),
+                        EDGE_IDENTITY_METHOD_RECEIVER,
+                    ))
                 } else {
-                    Some(name)
+                    Some(ExtractedRelation::new(name, EDGE_IDENTITY_BARE_IDENTIFIER))
                 }
             }
-            "object_creation_expression" => extract_child_text(node, source, &["type"]),
+            "object_creation_expression" => extract_relation_from_fields(
+                node,
+                source,
+                &["type"],
+                Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+            ),
             _ => None,
         },
         SupportedLanguage::C | SupportedLanguage::Cpp => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Kotlin => match node.kind() {
-            "call_expression" => extract_child_text(node, source, &["function"]),
+            "call_expression" => extract_relation_from_fields(node, source, &["function"], None),
             _ => None,
         },
         SupportedLanguage::Bash => match node.kind() {
-            "command" => extract_child_text(node, source, &["name"]),
+            "command" => extract_relation_from_fields(node, source, &["name"], None),
             _ => None,
         },
         SupportedLanguage::Css
@@ -1491,14 +1754,34 @@ fn extract_call_target(node: &Node, source: &[u8], lang: SupportedLanguage) -> O
     }
 }
 
-fn extract_child_text(node: &Node, source: &[u8], fields: &[&str]) -> Option<String> {
+fn extract_relation_from_fields(
+    node: &Node,
+    source: &[u8],
+    fields: &[&str],
+    edge_identity_kind: Option<&str>,
+) -> Option<ExtractedRelation> {
     for field in fields {
         if let Some(child) = node.child_by_field_name(field) {
             if let Ok(text) = child.utf8_text(source) {
                 let trimmed = sanitize_call_target(text);
                 if !trimmed.is_empty() {
-                    return Some(trimmed);
+                    let edge_identity_kind = edge_identity_kind
+                        .map(str::to_string)
+                        .unwrap_or_else(|| relation_edge_identity_kind(node, &child, source));
+                    return Some(ExtractedRelation::new(trimmed, &edge_identity_kind));
                 }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_child_text(node: &Node, source: &[u8], fields: &[&str]) -> Option<String> {
+    for field in fields {
+        if let Some(child) = node.child_by_field_name(field) {
+            if let Some(text) = type_relation_target_text(&child, source) {
+                return Some(text);
             }
         }
     }
@@ -1511,31 +1794,37 @@ fn extract_last_named_text(node: &Node, source: &[u8]) -> Option<String> {
     let mut last_text = None;
 
     for child in node.named_children(&mut cursor) {
-        if let Ok(text) = child.utf8_text(source) {
-            let trimmed = sanitize_call_target(text);
-            if !trimmed.is_empty() {
-                last_text = Some(trimmed);
-            }
+        if let Some(text) = type_relation_target_text(&child, source) {
+            last_text = Some(text);
         }
     }
 
     last_text
 }
 
-fn extract_rust_call_target(node: &Node, source: &[u8]) -> Option<String> {
+fn extract_rust_call_relation(node: &Node, source: &[u8]) -> Option<ExtractedRelation> {
     match node.kind() {
-        "call_expression" => node
-            .child_by_field_name("function")
-            .and_then(|function| render_rust_callable(&function, source)),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let symbol = render_rust_callable(&function, source)?;
+            Some(ExtractedRelation::new(
+                symbol,
+                &relation_edge_identity_kind(node, &function, source),
+            ))
+        }
         "method_call_expression" => {
             let receiver = node
                 .child_by_field_name("receiver")
                 .and_then(|receiver| render_rust_callable(&receiver, source))?;
             let method = extract_child_text(node, source, &["method", "name"])
                 .or_else(|| extract_last_named_text(node, source))?;
-            Some(format!("{receiver}.{method}"))
+            Some(ExtractedRelation::new(
+                format!("{receiver}.{method}"),
+                EDGE_IDENTITY_METHOD_RECEIVER,
+            ))
         }
-        "macro_invocation" => extract_child_text(node, source, &["macro", "name"]),
+        "macro_invocation" => extract_child_text(node, source, &["macro", "name"])
+            .map(|symbol| ExtractedRelation::new(symbol, EDGE_IDENTITY_MACRO_LIKE)),
         _ => None,
     }
 }
@@ -1570,12 +1859,91 @@ fn render_rust_callable(node: &Node, source: &[u8]) -> Option<String> {
         "call_expression" => node
             .child_by_field_name("function")
             .and_then(|function| render_rust_callable(&function, source)),
-        "method_call_expression" => extract_rust_call_target(node, source),
+        "method_call_expression" => {
+            extract_rust_call_relation(node, source).map(|relation| relation.symbol)
+        }
         _ => node
             .utf8_text(source)
             .ok()
             .map(sanitize_call_target)
             .filter(|text| !text.is_empty()),
+    }
+}
+
+fn reference_edge_identity_kind(node: &Node, source: &[u8]) -> String {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if let Some(edge_identity_kind) = call_context_edge_identity_kind(&candidate, source) {
+            return edge_identity_kind;
+        }
+        current = candidate.parent();
+    }
+
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if let Some(edge_identity_kind) = explicit_edge_identity_kind(candidate.kind()) {
+            return normalize_edge_identity_kind(edge_identity_kind);
+        }
+        current = candidate.parent();
+    }
+
+    edge_identity_kind_for_node(node, source)
+}
+
+fn relation_edge_identity_kind(node: &Node, target: &Node, source: &[u8]) -> String {
+    call_context_edge_identity_kind(node, source)
+        .unwrap_or_else(|| edge_identity_kind_for_node(target, source))
+}
+
+fn call_context_edge_identity_kind(node: &Node, source: &[u8]) -> Option<String> {
+    let target = match node.kind() {
+        "call_expression" | "call" => node.child_by_field_name("function"),
+        "method_call_expression" | "method_invocation" => {
+            return Some(normalize_edge_identity_kind(EDGE_IDENTITY_METHOD_RECEIVER));
+        }
+        _ => None,
+    }?;
+
+    let edge_identity_kind = edge_identity_kind_for_node(&target, source);
+    Some(if edge_identity_kind == EDGE_IDENTITY_MEMBER_ACCESS {
+        normalize_edge_identity_kind(EDGE_IDENTITY_METHOD_RECEIVER)
+    } else {
+        edge_identity_kind
+    })
+}
+
+fn edge_identity_kind_for_node(node: &Node, source: &[u8]) -> String {
+    if let Some(edge_identity_kind) = explicit_edge_identity_kind(node.kind()) {
+        return normalize_edge_identity_kind(edge_identity_kind);
+    }
+
+    let text = node.utf8_text(source).unwrap_or("");
+    if text.contains("::") {
+        return normalize_edge_identity_kind(EDGE_IDENTITY_QUALIFIED_PATH);
+    }
+    if (text.contains('.') && !text.contains('/')) || text.contains("->") {
+        return normalize_edge_identity_kind(EDGE_IDENTITY_MEMBER_ACCESS);
+    }
+
+    normalize_edge_identity_kind(EDGE_IDENTITY_BARE_IDENTIFIER)
+}
+
+fn explicit_edge_identity_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "scoped_identifier"
+        | "qualified_identifier"
+        | "qualified_name"
+        | "namespace_identifier"
+        | "path_expression" => Some(EDGE_IDENTITY_QUALIFIED_PATH),
+        "field_expression"
+        | "member_expression"
+        | "field_access"
+        | "navigation_expression"
+        | "attribute" => Some(EDGE_IDENTITY_MEMBER_ACCESS),
+        "method_call_expression" | "method_invocation" => Some(EDGE_IDENTITY_METHOD_RECEIVER),
+        "new_expression" | "object_creation_expression" => Some(EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+        "macro_invocation" => Some(EDGE_IDENTITY_MACRO_LIKE),
+        _ => None,
     }
 }
 
@@ -1589,6 +1957,33 @@ fn sanitize_call_target(text: &str) -> String {
         .replace(":: ", "::")
         .replace("( ", "(")
         .replace(" )", ")")
+}
+
+fn type_relation_target_text(node: &Node, source: &[u8]) -> Option<String> {
+    node.utf8_text(source).ok().and_then(|text| {
+        let trimmed = sanitize_type_relation_target(text);
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn sanitize_type_relation_target(text: &str) -> String {
+    let mut stripped = String::new();
+    let mut generic_depth = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '<' => generic_depth += 1,
+            '>' => generic_depth = generic_depth.saturating_sub(1),
+            _ if generic_depth == 0 => stripped.push(ch),
+            _ => {}
+        }
+    }
+
+    sanitize_call_target(&stripped)
+        .split_whitespace()
+        .filter(|token| !matches!(*token, "dyn" | "impl" | "const" | "mut"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_keyword(lang: SupportedLanguage, name: &str) -> bool {
@@ -2187,6 +2582,43 @@ fn is_builtin_type(lang: SupportedLanguage, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter::{Language, Parser as TsParser, Tree};
+
+    fn parse_tree(source: &str, lang: SupportedLanguage) -> Tree {
+        let ts_language = Language::new(lang.language_fn());
+        let mut parser = TsParser::new();
+        parser.set_language(&ts_language).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn find_first_named_node<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_first_named_node(child, kind) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
+    fn find_named_nodes<'a>(node: Node<'a>, kind: &str) -> Vec<Node<'a>> {
+        let mut found = Vec::new();
+        if node.kind() == kind {
+            found.push(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            found.extend(find_named_nodes(child, kind));
+        }
+
+        found
+    }
 
     #[test]
     fn test_parse_rust_functions_and_structs() {
@@ -2272,6 +2704,24 @@ fn complex(x: i32) -> i32 {
             "expected complexity >= 3, got {}",
             func.complexity
         );
+    }
+
+    #[test]
+    fn test_parse_rust_test_module_keeps_module_name_as_breadcrumb() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let module = segments
+            .iter()
+            .find(|segment| segment.block_type == "module")
+            .unwrap();
+        assert_eq!(module.breadcrumb.as_deref(), Some("tests"));
     }
 
     #[test]
@@ -2568,6 +3018,180 @@ fn process(data: Vec<Item>) -> Result<Output, Error> {
         assert!(func.referenced_symbols.contains(&"Config".to_string()));
         assert!(func.referenced_symbols.contains(&"Processor".to_string()));
         assert!(!func.referenced_symbols.contains(&"process".to_string()));
+    }
+
+    #[test]
+    fn test_called_relations_assign_edge_identity_kinds() {
+        let source = r#"
+fn process(config: Config, worker: Worker) {
+    load_config();
+    crate::auth::config::load_config();
+    worker.run();
+    tracing::info!("ready");
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::Rust);
+        let function = find_first_named_node(tree.root_node(), "function_item").unwrap();
+        let relations =
+            collect_called_relations(&function, source.as_bytes(), SupportedLanguage::Rust);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "load_config".to_string(),
+            EDGE_IDENTITY_BARE_IDENTIFIER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "crate::auth::config::load_config".to_string(),
+            EDGE_IDENTITY_QUALIFIED_PATH,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "worker.run".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "tracing::info".to_string(),
+            EDGE_IDENTITY_MACRO_LIKE,
+        )));
+    }
+
+    #[test]
+    fn test_constructor_and_member_call_relations_use_normalized_edge_identity() {
+        let source = r#"
+function build(service) {
+    new WidgetFactory();
+    service.client.fetch();
+    run();
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::JavaScript);
+        let function = find_first_named_node(tree.root_node(), "function_declaration").unwrap();
+        let relations =
+            collect_called_relations(&function, source.as_bytes(), SupportedLanguage::JavaScript);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "WidgetFactory".to_string(),
+            EDGE_IDENTITY_CONSTRUCTOR_LIKE,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "service.client.fetch".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "run".to_string(),
+            EDGE_IDENTITY_BARE_IDENTIFIER,
+        )));
+    }
+
+    #[test]
+    fn test_referenced_relations_assign_edge_identity_kinds() {
+        let source = r#"
+fn process(worker: Worker) {
+    let loader = crate::auth::Config::load();
+    worker.run();
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::Rust);
+        let function = find_first_named_node(tree.root_node(), "function_item").unwrap();
+        let relations =
+            collect_referenced_relations(&function, source.as_bytes(), SupportedLanguage::Rust);
+
+        assert!(relations.contains(&ExtractedRelation::new(
+            "Config".to_string(),
+            EDGE_IDENTITY_QUALIFIED_PATH,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "worker".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+        assert!(relations.contains(&ExtractedRelation::new(
+            "run".to_string(),
+            EDGE_IDENTITY_METHOD_RECEIVER,
+        )));
+    }
+
+    #[test]
+    fn test_rust_impl_relations_capture_trait_conformance() {
+        let source = r#"
+trait Validator<T> {
+    fn validate(&self, value: T) -> bool;
+}
+
+struct Config;
+
+impl<T> crate::auth::Validator<T> for Config<T> {
+    fn validate(&self, value: T) -> bool {
+        true
+    }
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::Rust);
+        let implementation = find_first_named_node(tree.root_node(), "impl_item").unwrap();
+        let relations = collect_conformance_relations(
+            &implementation,
+            source.as_bytes(),
+            SupportedLanguage::Rust,
+        );
+
+        assert_eq!(
+            relations,
+            vec![ExtractedRelation::conformance(
+                "crate::auth::Validator".to_string(),
+                EDGE_IDENTITY_QUALIFIED_PATH,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_typescript_conformance_relations_capture_extends_and_implements() {
+        let source = r#"
+export interface BaseAuthStore {}
+
+export interface AuthStore extends BaseAuthStore {}
+
+export class SqlAuthStore extends StoreBase implements AuthStore, Auditable {
+    read() {}
+}
+"#;
+        let tree = parse_tree(source, SupportedLanguage::TypeScript);
+        let root = tree.root_node();
+        let interfaces = find_named_nodes(root, "interface_declaration");
+        let classes = find_named_nodes(root, "class_declaration");
+
+        let interface_relations = collect_conformance_relations(
+            &interfaces[1],
+            source.as_bytes(),
+            SupportedLanguage::TypeScript,
+        );
+        assert_eq!(
+            interface_relations,
+            vec![ExtractedRelation::conformance(
+                "BaseAuthStore".to_string(),
+                EDGE_IDENTITY_BARE_IDENTIFIER,
+            )]
+        );
+
+        let mut class_relations = collect_conformance_relations(
+            &classes[0],
+            source.as_bytes(),
+            SupportedLanguage::TypeScript,
+        );
+        sort_and_dedup_relations(&mut class_relations);
+        assert_eq!(
+            class_relations,
+            vec![
+                ExtractedRelation::conformance(
+                    "Auditable".to_string(),
+                    EDGE_IDENTITY_BARE_IDENTIFIER,
+                ),
+                ExtractedRelation::conformance(
+                    "AuthStore".to_string(),
+                    EDGE_IDENTITY_BARE_IDENTIFIER,
+                ),
+                ExtractedRelation::conformance(
+                    "StoreBase".to_string(),
+                    EDGE_IDENTITY_BARE_IDENTIFIER,
+                ),
+            ]
+        );
     }
 
     #[test]

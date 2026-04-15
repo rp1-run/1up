@@ -36,7 +36,7 @@
 - Role: bounded probable-impact exploration from a known anchor
 - Guarantees:
   - exactly one anchor is required
-  - relation-backed likely impact stays in primary `results`; heuristic-only suggestions stay in `contextual_results`
+  - only confident non-ambiguous relation-backed likely impact stays in primary `results`; heuristic-only or demoted relation suggestions stay in `contextual_results`
   - no-primary cases return explicit `empty` or `empty_scoped` states instead of anchor echoes
   - output is advisory, not exact dependency truth
   - broad symbol requests are refused with narrowing guidance
@@ -45,7 +45,7 @@
 
 - Entry points: `1up status`, `1up start`, `1up index`, `1up reindex`
 - Role: check daemon heartbeat, index freshness, and schema readiness before discovery or impact work
-- Impact-specific behavior: stale or missing schema v8 indexes fail early and direct the caller to `1up reindex`
+- Impact-specific behavior: stale or missing schema v9 indexes fail early and direct the caller to `1up reindex`
 
 ### Agent Reminder Surface
 
@@ -68,7 +68,7 @@
 | `ImpactEmpty` | Anchor resolved but no likely-impact candidates were found. | zero-result impact envelope, no refusal |
 | `ImpactAnchorValidationError` | User supplied zero or multiple anchors. | exact-one-anchor error mentioning accepted flags |
 | `ImpactIndexUnavailable` | Local index is missing or stale for the command contract. | explicit guidance to run `1up reindex` |
-| `ImpactContextualGuidance` | Lower-confidence same-file or test-only suggestions that support follow-up but are not primary likely impact. | `contextual_results` in JSON, `context_result*` lines in plain, `Contextual Guidance` section in human output |
+| `ImpactContextualGuidance` | Lower-confidence same-file, test-only, or demoted relation suggestions that support follow-up but are not primary likely impact. | `contextual_results` in JSON, `context_result*` lines in plain, `Contextual Guidance` section in human output |
 | `SearchResultWithFollowUpHandle` | Search hit is backed by an indexed segment and can feed `impact`. | `segment_id` in plain/json; omitted from concise human search output |
 
 ## Feedback Loops

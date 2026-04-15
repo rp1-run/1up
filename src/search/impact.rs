@@ -9,9 +9,15 @@ use crate::search::retrieval::CandidateRow;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS};
 use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::symbols::normalize_symbolish;
+use crate::shared::symbols::{
+    clean_owner_components, normalize_symbolish, split_symbol_components,
+    EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE,
+    EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
+};
 use crate::shared::types::SegmentRole;
-use crate::storage::relations::{get_inbound_relations, get_outbound_relations, RelationKind};
+use crate::storage::relations::{
+    get_inbound_relations_by_lookup_symbol, get_outbound_relations, RelationKind, StoredRelation,
+};
 use crate::storage::segments::{
     get_segment_by_id, get_segments_by_file, get_test_file_paths, StoredSegment,
 };
@@ -22,18 +28,33 @@ const MAX_FILE_SEEDS: usize = 5;
 const MAX_SYMBOL_SEEDS: usize = 3;
 const MAX_SYMBOL_FILES: usize = 3;
 const MAX_SYMBOL_TOP_LEVEL_DIRS: usize = 2;
-const MAX_RELATIONS_PER_HOP: usize = 8;
+const MAX_OUTBOUND_RELATIONS_PER_HOP: usize = 8;
+const MAX_INBOUND_RELATIONS_PER_HOP: usize = 8;
 const MAX_DEFINITION_TARGETS_PER_SYMBOL: usize = 3;
 const MAX_TEST_FILE_BUDGET: usize = 12;
 const TEST_FILE_QUERY_FACTOR: usize = 2;
 
 const CALL_WEIGHT: f64 = 1.0;
+const CONFORMANCE_WEIGHT: f64 = 1.05;
 const SAME_FILE_WEIGHT: f64 = 0.70;
 const REFERENCE_WEIGHT: f64 = 0.65;
 const TEST_WEIGHT: f64 = 0.55;
 const HOP_DECAY: f64 = 0.70;
 const SCOPE_BOOST: f64 = 1.10;
 const ROLE_BOOST: f64 = 1.05;
+const RELATION_SOLO_PRIMARY_THRESHOLD: f64 = 0.45;
+const RELATION_PRIMARY_THRESHOLD: f64 = 0.55;
+const RELATION_CONTEXTUAL_THRESHOLD: f64 = 0.35;
+const RELATION_AMBIGUITY_MARGIN: f64 = 0.08;
+const OWNER_ALIGNMENT_SHORTLIST_THRESHOLD: f64 = 0.60;
+const OWNER_ALIGNMENT_SIGNAL_THRESHOLD: f64 = 0.60;
+const EDGE_IDENTITY_SIGNAL_THRESHOLD: f64 = 0.65;
+const PATH_AFFINITY_SIGNAL_THRESHOLD: f64 = 0.30;
+const ROLE_SIGNAL_THRESHOLD: f64 = 0.75;
+const MIN_PRIMARY_CORROBORATION_SIGNALS: usize = 2;
+const LOW_SIGNAL_WRAPPER_PENALTY: f64 = 0.82;
+const LOW_SIGNAL_DECLARATION_PENALTY: f64 = 0.68;
+const LOW_SIGNAL_UNALIGNED_RECEIVER_PENALTY: f64 = 0.35;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImpactAnchor {
@@ -143,6 +164,8 @@ struct AnchorResolution {
     resolved_anchor: ResolvedImpactAnchor,
     seeds: Vec<CandidateRow>,
     effective_scope: Option<String>,
+    anchor_symbols: HashSet<String>,
+    prefer_high_signal_paths: bool,
 }
 
 enum ResolveOutcome {
@@ -171,12 +194,22 @@ enum ObservationBucket {
     Contextual,
 }
 
+#[derive(Clone)]
 struct CandidateObservation {
     candidate: CandidateRow,
     score: f64,
     hop: usize,
     reason: ImpactReason,
     bucket: ObservationBucket,
+}
+
+struct ScoredRelationCandidate {
+    candidate: CandidateRow,
+    confidence: f64,
+    definition_owner_fingerprint: String,
+    owner_alignment: f64,
+    exact_identity: bool,
+    corroboration_signals: usize,
 }
 
 struct FinalizedImpactResults {
@@ -231,6 +264,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         for hop in 1..=depth {
             let mut next_frontier = Vec::new();
             let mut queued = HashSet::new();
+            let mut hop_aggregates = HashMap::new();
 
             for source in &frontier {
                 let observations = self
@@ -246,16 +280,26 @@ impl<'a> ImpactHorizonEngine<'a> {
                         continue;
                     }
 
-                    let candidate_for_frontier = observation.candidate.clone();
-                    let candidate_id = candidate_for_frontier.segment_id.clone();
-                    observe_candidate(&mut aggregates, observation);
+                    observe_candidate(&mut aggregates, observation.clone());
+                    observe_candidate(&mut hop_aggregates, observation);
+                }
+            }
 
-                    if hop < depth
-                        && expanded.insert(candidate_id.clone())
-                        && queued.insert(candidate_id)
-                    {
-                        next_frontier.push(candidate_for_frontier);
-                    }
+            for aggregate in hop_aggregates.into_values() {
+                let should_expand = aggregate_bucket(
+                    &aggregate,
+                    &resolution.anchor_symbols,
+                    resolution.prefer_high_signal_paths,
+                ) == Some(ObservationBucket::Primary);
+                let candidate_for_frontier = aggregate.candidate.clone();
+                let candidate_id = candidate_for_frontier.segment_id.clone();
+
+                if should_expand
+                    && hop < depth
+                    && expanded.insert(candidate_id.clone())
+                    && queued.insert(candidate_id)
+                {
+                    next_frontier.push(candidate_for_frontier);
                 }
             }
 
@@ -286,7 +330,12 @@ impl<'a> ImpactHorizonEngine<'a> {
             observe_candidate(&mut aggregates, observation);
         }
 
-        let finalized = finalize_impact_results(aggregates, limit);
+        let finalized = finalize_impact_results(
+            aggregates,
+            limit,
+            &resolution.anchor_symbols,
+            resolution.prefer_high_signal_paths,
+        );
         let status = match (
             !finalized.primary.is_empty(),
             resolution.resolved_anchor.scope.is_some(),
@@ -377,8 +426,12 @@ impl<'a> ImpactHorizonEngine<'a> {
                 explicit_scope.clone(),
                 &seeds,
             ),
+            prefer_high_signal_paths: seeds
+                .iter()
+                .any(|seed| !is_low_signal_path(&seed.file_path)),
             seeds,
             effective_scope: explicit_scope,
+            anchor_symbols: HashSet::new(),
         }))
     }
 
@@ -408,6 +461,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 return Ok(ResolveOutcome::Refused(refusal));
             }
         }
+        let prefer_high_signal_paths = !is_low_signal_path(&seed.file_path);
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
                 "segment",
@@ -417,7 +471,9 @@ impl<'a> ImpactHorizonEngine<'a> {
                 std::slice::from_ref(&seed),
             ),
             seeds: vec![seed],
+            prefer_high_signal_paths,
             effective_scope: explicit_scope,
+            anchor_symbols: HashSet::new(),
         }))
     }
 
@@ -430,6 +486,12 @@ impl<'a> ImpactHorizonEngine<'a> {
         let mut seeds = engine.find_definition_candidates(name).await?;
         if let Some(scope) = explicit_scope.as_deref() {
             seeds.retain(|candidate| scope_matches(&candidate.file_path, Some(scope)));
+        }
+        if seeds
+            .iter()
+            .any(|candidate| !is_low_signal_path(&candidate.file_path))
+        {
+            seeds.retain(|candidate| !is_low_signal_path(&candidate.file_path));
         }
 
         if seeds.is_empty() {
@@ -483,6 +545,14 @@ impl<'a> ImpactHorizonEngine<'a> {
             None
         };
         let effective_scope = explicit_scope.clone().or(implicit_scope);
+        let mut anchor_symbols = HashSet::new();
+        let canonical_name = normalize_symbolish(name);
+        if !canonical_name.is_empty() {
+            anchor_symbols.insert(canonical_name);
+        }
+        let prefer_high_signal_paths = seeds
+            .iter()
+            .any(|seed| !is_low_signal_path(&seed.file_path));
 
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
@@ -494,6 +564,8 @@ impl<'a> ImpactHorizonEngine<'a> {
             ),
             seeds,
             effective_scope,
+            anchor_symbols,
+            prefer_high_signal_paths,
         }))
     }
 
@@ -504,26 +576,23 @@ impl<'a> ImpactHorizonEngine<'a> {
         hop: usize,
     ) -> Result<Vec<CandidateObservation>, OneupError> {
         let mut observations = Vec::new();
-        let outbound =
-            get_outbound_relations(self.conn, &source.segment_id, None, MAX_RELATIONS_PER_HOP)
-                .await?;
+        let outbound = self
+            .collect_outbound_relations_with_budget(&source.segment_id)
+            .await?;
 
         for relation in outbound {
             let reason_kind = match relation.relation_kind {
                 RelationKind::Call => "calls",
+                RelationKind::Conformance => "conforms_to",
                 RelationKind::Reference => "references_symbol",
             };
             let weight = base_weight(relation.relation_kind);
-            let targets = self
-                .resolve_relation_targets(&relation.canonical_target_symbol, scope)
-                .await?;
-
-            for target in targets {
-                if is_test_path(&target.file_path) {
-                    continue;
-                }
+            if let Some((target, confidence, bucket)) = self
+                .select_relation_target(source, &relation, scope)
+                .await?
+            {
                 observations.push(CandidateObservation {
-                    score: weighted_score(weight, hop, &target, scope),
+                    score: weighted_score(weight * confidence, hop, &target, scope),
                     hop,
                     reason: ImpactReason {
                         kind: reason_kind.to_string(),
@@ -531,61 +600,135 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(source.segment_id.clone()),
                     },
                     candidate: target,
-                    bucket: ObservationBucket::Primary,
+                    bucket,
                 });
             }
         }
 
         let defined_symbols = source.defined_symbols.clone().unwrap_or_default();
-        let mut remaining = MAX_RELATIONS_PER_HOP;
+        let mut remaining = MAX_INBOUND_RELATIONS_PER_HOP;
         for symbol in defined_symbols {
             if remaining == 0 {
                 break;
             }
 
-            let canonical = normalize_symbolish(&symbol);
-            if canonical.is_empty() {
+            let Some(lookup_symbol) = symbol_lookup_tail(&symbol) else {
                 continue;
-            }
+            };
 
-            let inbound = get_inbound_relations(self.conn, &canonical, None, remaining).await?;
-            remaining = remaining.saturating_sub(inbound.len());
+            let inbound = self
+                .collect_inbound_relations_with_budget(&lookup_symbol, &mut remaining)
+                .await?;
 
             for relation in inbound {
-                let Some(candidate) = self.load_candidate(&relation.source_segment_id).await?
+                let Some(source_candidate) =
+                    self.load_candidate(&relation.source_segment_id).await?
                 else {
                     continue;
                 };
-                if !scope_matches(&candidate.file_path, scope) || is_test_path(&candidate.file_path)
-                {
-                    continue;
-                }
-
                 let reason_kind = match relation.relation_kind {
                     RelationKind::Call => "called_by",
+                    RelationKind::Conformance => "implemented_by",
                     RelationKind::Reference => "references_symbol",
                 };
+                let emitted_candidates = self
+                    .emit_inbound_relation_candidates(&relation, &source_candidate, scope)
+                    .await?;
 
-                observations.push(CandidateObservation {
-                    score: weighted_score(
-                        base_weight(relation.relation_kind),
+                for candidate in emitted_candidates {
+                    if !scope_matches(&candidate.file_path, scope)
+                        || is_test_path(&candidate.file_path)
+                    {
+                        continue;
+                    }
+
+                    let scored =
+                        score_relation_candidate(&source_candidate, &relation, source, &candidate);
+                    let Some(bucket) = relation_observation_bucket(&scored, None) else {
+                        continue;
+                    };
+
+                    observations.push(CandidateObservation {
+                        score: weighted_score(
+                            base_weight(relation.relation_kind) * scored.confidence,
+                            hop,
+                            &candidate,
+                            scope,
+                        ),
                         hop,
-                        &candidate,
-                        scope,
-                    ),
-                    hop,
-                    reason: ImpactReason {
-                        kind: reason_kind.to_string(),
-                        symbol: Some(symbol.clone()),
-                        from_segment_id: Some(source.segment_id.clone()),
-                    },
-                    candidate,
-                    bucket: ObservationBucket::Primary,
-                });
+                        reason: ImpactReason {
+                            kind: reason_kind.to_string(),
+                            symbol: Some(symbol.clone()),
+                            from_segment_id: Some(source.segment_id.clone()),
+                        },
+                        candidate,
+                        bucket,
+                    });
+                }
             }
         }
 
         Ok(observations)
+    }
+
+    async fn collect_outbound_relations_with_budget(
+        &self,
+        source_segment_id: &str,
+    ) -> Result<Vec<StoredRelation>, OneupError> {
+        let mut relations = Vec::new();
+        let mut remaining = MAX_OUTBOUND_RELATIONS_PER_HOP;
+
+        for relation_kind in [
+            RelationKind::Conformance,
+            RelationKind::Call,
+            RelationKind::Reference,
+        ] {
+            if remaining == 0 {
+                break;
+            }
+
+            let mut fetched = get_outbound_relations(
+                self.conn,
+                source_segment_id,
+                Some(relation_kind),
+                remaining,
+            )
+            .await?;
+            remaining = remaining.saturating_sub(fetched.len());
+            relations.append(&mut fetched);
+        }
+
+        Ok(relations)
+    }
+
+    async fn collect_inbound_relations_with_budget(
+        &self,
+        lookup_symbol: &str,
+        remaining: &mut usize,
+    ) -> Result<Vec<StoredRelation>, OneupError> {
+        let mut relations = Vec::new();
+
+        for relation_kind in [
+            RelationKind::Conformance,
+            RelationKind::Call,
+            RelationKind::Reference,
+        ] {
+            if *remaining == 0 {
+                break;
+            }
+
+            let mut fetched = get_inbound_relations_by_lookup_symbol(
+                self.conn,
+                lookup_symbol,
+                Some(relation_kind),
+                *remaining,
+            )
+            .await?;
+            *remaining = (*remaining).saturating_sub(fetched.len());
+            relations.append(&mut fetched);
+        }
+
+        Ok(relations)
     }
 
     async fn collect_same_file_observations(
@@ -720,31 +863,116 @@ impl<'a> ImpactHorizonEngine<'a> {
 
     async fn resolve_relation_targets(
         &self,
-        canonical_symbol: &str,
+        relation: &StoredRelation,
         scope: Option<&str>,
     ) -> Result<Vec<CandidateRow>, OneupError> {
         let engine = SymbolSearchEngine::new(self.conn);
-        let mut candidates = engine.find_definition_candidates(canonical_symbol).await?;
-        candidates.retain(|candidate| {
-            scope_matches(&candidate.file_path, scope)
-                && candidate
-                    .defined_symbols
-                    .as_ref()
-                    .map(|symbols| {
-                        symbols
-                            .iter()
-                            .any(|symbol| normalize_symbolish(symbol) == canonical_symbol)
-                    })
-                    .unwrap_or(false)
-        });
-        candidates.truncate(MAX_DEFINITION_TARGETS_PER_SYMBOL);
+        let mut candidates = engine
+            .find_definition_candidates_by_canonical(&relation.lookup_canonical_symbol)
+            .await?;
+        candidates.retain(|candidate| scope_matches(&candidate.file_path, scope));
+
+        if relation.qualifier_fingerprint.is_empty() {
+            return Ok(candidates);
+        }
+
+        let exact_owner_matches = candidates
+            .iter()
+            .filter(|candidate| relation_exact_owner_match(relation, candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact_owner_matches.is_empty() {
+            return Ok(exact_owner_matches);
+        }
+
         Ok(candidates)
+    }
+
+    async fn select_relation_target(
+        &self,
+        source: &CandidateRow,
+        relation: &StoredRelation,
+        scope: Option<&str>,
+    ) -> Result<Option<(CandidateRow, f64, ObservationBucket)>, OneupError> {
+        let scored = self
+            .resolve_relation_targets(relation, scope)
+            .await?
+            .into_iter()
+            .filter(|candidate| !is_test_path(&candidate.file_path))
+            .filter_map(|candidate| {
+                let scored = score_relation_candidate(source, relation, &candidate, &candidate);
+                relation_candidate_edge_compatible(relation, &scored).then_some(scored)
+            })
+            .collect::<Vec<_>>();
+
+        let (preferred, deferred): (Vec<_>, Vec<_>) = scored
+            .into_iter()
+            .partition(|candidate| !is_test_context_candidate(&candidate.candidate));
+
+        if let Some(selected) = select_best_relation_candidate(preferred) {
+            return Ok(Some(selected));
+        }
+
+        Ok(select_best_relation_candidate(deferred))
     }
 
     async fn load_candidate(&self, segment_id: &str) -> Result<Option<CandidateRow>, OneupError> {
         Ok(get_segment_by_id(self.conn, segment_id)
             .await?
             .map(candidate_from_stored_segment))
+    }
+
+    async fn emit_inbound_relation_candidates(
+        &self,
+        relation: &StoredRelation,
+        source_candidate: &CandidateRow,
+        scope: Option<&str>,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        match relation.relation_kind {
+            RelationKind::Conformance => {
+                self.resolve_conformance_source_candidates(source_candidate, scope)
+                    .await
+            }
+            RelationKind::Call | RelationKind::Reference => Ok(vec![source_candidate.clone()]),
+        }
+    }
+
+    async fn resolve_conformance_source_candidates(
+        &self,
+        source_candidate: &CandidateRow,
+        scope: Option<&str>,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        if source_candidate.is_definition_like() {
+            return Ok(vec![source_candidate.clone()]);
+        }
+
+        let engine = SymbolSearchEngine::new(self.conn);
+        let mut emitted = Vec::new();
+        let mut seen = HashSet::new();
+
+        for lookup_symbol in conformance_source_lookup_symbols(source_candidate) {
+            for candidate in engine
+                .find_definition_candidates_by_canonical(&lookup_symbol)
+                .await?
+            {
+                if candidate.segment_id == source_candidate.segment_id
+                    || !scope_matches(&candidate.file_path, scope)
+                    || is_test_path(&candidate.file_path)
+                {
+                    continue;
+                }
+
+                if seen.insert(candidate.segment_id.clone()) {
+                    emitted.push(candidate);
+                }
+            }
+        }
+
+        if emitted.is_empty() {
+            Ok(vec![source_candidate.clone()])
+        } else {
+            Ok(emitted)
+        }
     }
 }
 
@@ -803,11 +1031,15 @@ fn observe_candidate(
 fn finalize_impact_results(
     aggregates: HashMap<String, CandidateAggregate>,
     limit: usize,
+    anchor_symbols: &HashSet<String>,
+    prefer_high_signal_paths: bool,
 ) -> FinalizedImpactResults {
     let mut primary = Vec::new();
     let mut contextual = Vec::new();
 
     for aggregate in aggregates.into_values() {
+        let aggregate_bucket =
+            aggregate_bucket(&aggregate, anchor_symbols, prefer_high_signal_paths);
         let CandidateAggregate {
             candidate,
             primary_score,
@@ -825,17 +1057,25 @@ fn finalize_impact_results(
             contextual_reasons.into_values().collect();
         contextual_reasons.sort_by(|left, right| right.score.total_cmp(&left.score));
 
-        if primary_score > 0.0 && !primary_reasons.is_empty() {
-            let reasons = primary_reasons
-                .into_iter()
-                .map(|reason| reason.reason)
-                .chain(contextual_reasons.into_iter().map(|reason| reason.reason))
-                .take(3)
-                .collect();
+        if aggregate_bucket == Some(ObservationBucket::Primary) {
+            let reasons = if primary_score > 0.0 && !primary_reasons.is_empty() {
+                primary_reasons
+                    .into_iter()
+                    .map(|reason| reason.reason)
+                    .chain(contextual_reasons.into_iter().map(|reason| reason.reason))
+                    .take(3)
+                    .collect()
+            } else {
+                contextual_reasons
+                    .into_iter()
+                    .map(|reason| reason.reason)
+                    .take(3)
+                    .collect()
+            };
             primary.push(build_impact_candidate(
                 candidate,
-                primary_score,
-                primary_hop.unwrap_or_default(),
+                primary_score.max(contextual_score),
+                primary_hop.or(contextual_hop).unwrap_or_default(),
                 reasons,
             ));
         } else if contextual_score > 0.0 && !contextual_reasons.is_empty() {
@@ -892,9 +1132,16 @@ fn build_impact_candidate(
 
 fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec<ImpactCandidate> {
     ranked.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
+        impact_candidate_priority(right)
+            .cmp(&impact_candidate_priority(left))
+            .then_with(|| {
+                impact_candidate_reason_priority(right).cmp(&impact_candidate_reason_priority(left))
+            })
+            .then_with(|| {
+                implemented_by_reason_count(right).cmp(&implemented_by_reason_count(left))
+            })
+            .then_with(|| direct_reason_count(right).cmp(&direct_reason_count(left)))
+            .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.hop.cmp(&right.hop))
             .then_with(|| left.file_path.cmp(&right.file_path))
             .then_with(|| left.line_start.cmp(&right.line_start))
@@ -918,6 +1165,46 @@ fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec
     }
 
     results
+}
+
+fn impact_candidate_priority(candidate: &ImpactCandidate) -> usize {
+    usize::from(implemented_by_reason_count(candidate) > 0)
+}
+
+fn impact_candidate_reason_priority(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter_map(|reason| match reason.kind.as_str() {
+            "implemented_by" => Some(4),
+            "called_by" => Some(3),
+            "calls" => Some(2),
+            "conforms_to" => Some(1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn implemented_by_reason_count(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter(|reason| reason.kind == "implemented_by")
+        .count()
+}
+
+fn direct_reason_count(candidate: &ImpactCandidate) -> usize {
+    candidate
+        .reasons
+        .iter()
+        .filter(|reason| {
+            matches!(
+                reason.kind.as_str(),
+                "implemented_by" | "called_by" | "calls"
+            )
+        })
+        .count()
 }
 
 fn outcome_hint(
@@ -1094,8 +1381,530 @@ fn weighted_score(base: f64, hop: usize, candidate: &CandidateRow, scope: Option
 fn base_weight(relation_kind: RelationKind) -> f64 {
     match relation_kind {
         RelationKind::Call => CALL_WEIGHT,
+        RelationKind::Conformance => CONFORMANCE_WEIGHT,
         RelationKind::Reference => REFERENCE_WEIGHT,
     }
+}
+
+fn score_relation_candidate(
+    source: &CandidateRow,
+    relation: &StoredRelation,
+    target: &CandidateRow,
+    emitted_candidate: &CandidateRow,
+) -> ScoredRelationCandidate {
+    let symbol_score = relation_symbol_score(relation, target);
+    let definition_owner_fingerprint = definition_owner_fingerprint(target);
+    let owner_alignment = owner_alignment_score(
+        &relation.qualifier_fingerprint,
+        &definition_owner_fingerprint,
+    );
+    let scope_affinity = path_affinity_score(&source.file_path, &target.file_path);
+    let role_score = relation_role_score(emitted_candidate.role);
+    let edge_identity_score =
+        relation_edge_identity_score(relation, target, owner_alignment, symbol_score);
+    let exact_identity = has_exact_structural_identity(relation, symbol_score);
+    let corroboration_signals = relation_corroboration_signal_count(
+        exact_identity,
+        owner_alignment,
+        edge_identity_score,
+        scope_affinity,
+        role_score,
+    );
+    let relation_kind_score = match relation.relation_kind {
+        RelationKind::Call => 1.0,
+        RelationKind::Conformance => 1.05,
+        RelationKind::Reference => 0.85,
+    };
+    let owner_gate = if relation.qualifier_fingerprint.is_empty() {
+        1.0
+    } else {
+        0.55 + (0.45 * owner_alignment.max(edge_identity_score))
+    };
+    let signal_multiplier = relation_signal_multiplier(
+        emitted_candidate,
+        relation,
+        owner_alignment,
+        corroboration_signals,
+    );
+    let confidence = if symbol_score == 0.0 {
+        0.0
+    } else {
+        ((0.30 * symbol_score)
+            + (0.25 * owner_alignment)
+            + (0.15 * edge_identity_score)
+            + (0.15 * scope_affinity)
+            + (0.10 * role_score)
+            + (0.05 * relation_kind_score))
+            * owner_gate
+            * signal_multiplier
+    };
+
+    ScoredRelationCandidate {
+        candidate: emitted_candidate.clone(),
+        confidence,
+        definition_owner_fingerprint,
+        owner_alignment,
+        exact_identity,
+        corroboration_signals,
+    }
+}
+
+fn relation_observation_bucket(
+    candidate: &ScoredRelationCandidate,
+    runner_up: Option<f64>,
+) -> Option<ObservationBucket> {
+    if candidate.confidence < RELATION_CONTEXTUAL_THRESHOLD {
+        return None;
+    }
+
+    let primary_threshold = if runner_up.is_some() {
+        RELATION_PRIMARY_THRESHOLD
+    } else {
+        RELATION_SOLO_PRIMARY_THRESHOLD
+    };
+    let ambiguous = runner_up
+        .map(|next| candidate.confidence - next < RELATION_AMBIGUITY_MARGIN)
+        .unwrap_or(false);
+    let contextual_only_role = matches!(
+        candidate.candidate.role,
+        Some(SegmentRole::Import | SegmentRole::Docs)
+    ) || is_test_context_candidate(&candidate.candidate);
+    let ambiguity_signal =
+        candidate.exact_identity || candidate.owner_alignment >= OWNER_ALIGNMENT_SIGNAL_THRESHOLD;
+
+    if !contextual_only_role
+        && candidate.corroboration_signals >= MIN_PRIMARY_CORROBORATION_SIGNALS
+        && (!ambiguous || ambiguity_signal)
+        && candidate.confidence >= primary_threshold
+    {
+        Some(ObservationBucket::Primary)
+    } else {
+        Some(ObservationBucket::Contextual)
+    }
+}
+
+fn relation_symbol_score(relation: &StoredRelation, candidate: &CandidateRow) -> f64 {
+    candidate
+        .defined_symbols
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .fold(0.0, |best, symbol| {
+            let canonical = normalize_symbolish(symbol);
+            let tail = symbol_lookup_tail(symbol);
+            best.max(if canonical == relation.canonical_target_symbol {
+                1.0
+            } else if tail.as_deref() == Some(relation.lookup_canonical_symbol.as_str()) {
+                0.85
+            } else {
+                0.0
+            })
+        })
+}
+
+fn shortlist_relation_candidates(
+    mut candidates: Vec<ScoredRelationCandidate>,
+) -> Vec<ScoredRelationCandidate> {
+    candidates.sort_by(compare_scored_relation_candidates);
+
+    let owner_shortlist = candidates.iter().any(|candidate| {
+        candidate.owner_alignment >= OWNER_ALIGNMENT_SHORTLIST_THRESHOLD
+            && !candidate.definition_owner_fingerprint.is_empty()
+    });
+    if owner_shortlist {
+        candidates
+            .retain(|candidate| candidate.owner_alignment >= OWNER_ALIGNMENT_SHORTLIST_THRESHOLD);
+    }
+
+    candidates.truncate(MAX_DEFINITION_TARGETS_PER_SYMBOL);
+    candidates
+}
+
+fn select_best_relation_candidate(
+    candidates: Vec<ScoredRelationCandidate>,
+) -> Option<(CandidateRow, f64, ObservationBucket)> {
+    let candidates = shortlist_relation_candidates(candidates);
+    let runner_up = candidates.get(1).map(|candidate| candidate.confidence);
+    let best = candidates.into_iter().next()?;
+    let bucket = relation_observation_bucket(&best, runner_up)?;
+    Some((best.candidate, best.confidence, bucket))
+}
+
+fn compare_scored_relation_candidates(
+    left: &ScoredRelationCandidate,
+    right: &ScoredRelationCandidate,
+) -> std::cmp::Ordering {
+    right
+        .confidence
+        .total_cmp(&left.confidence)
+        .then_with(|| right.corroboration_signals.cmp(&left.corroboration_signals))
+        .then_with(|| right.owner_alignment.total_cmp(&left.owner_alignment))
+        .then_with(|| left.candidate.file_path.cmp(&right.candidate.file_path))
+        .then_with(|| left.candidate.line_number.cmp(&right.candidate.line_number))
+        .then_with(|| left.candidate.segment_id.cmp(&right.candidate.segment_id))
+}
+
+fn aggregate_bucket(
+    aggregate: &CandidateAggregate,
+    anchor_symbols: &HashSet<String>,
+    prefer_high_signal_paths: bool,
+) -> Option<ObservationBucket> {
+    if is_test_context_candidate(&aggregate.candidate) {
+        return (aggregate.primary_score > 0.0 || aggregate.contextual_score > 0.0)
+            .then_some(ObservationBucket::Contextual);
+    }
+    if prefer_high_signal_paths && is_low_signal_path(&aggregate.candidate.file_path) {
+        return (aggregate.primary_score > 0.0 || aggregate.contextual_score > 0.0)
+            .then_some(ObservationBucket::Contextual);
+    }
+    if aggregate.primary_score > 0.0 && !aggregate.primary_reasons.is_empty() {
+        return Some(ObservationBucket::Primary);
+    }
+    if aggregate.contextual_score <= 0.0 || aggregate.contextual_reasons.is_empty() {
+        return None;
+    }
+    if repeated_anchor_relation_support(aggregate, anchor_symbols) {
+        return Some(ObservationBucket::Primary);
+    }
+
+    Some(ObservationBucket::Contextual)
+}
+
+fn repeated_anchor_relation_support(
+    aggregate: &CandidateAggregate,
+    anchor_symbols: &HashSet<String>,
+) -> bool {
+    if anchor_symbols.is_empty() {
+        return false;
+    }
+
+    let mut supporting_sources = HashSet::new();
+    let mut supporting_reasons = 0usize;
+
+    for contribution in aggregate.contextual_reasons.values() {
+        if !matches!(
+            contribution.reason.kind.as_str(),
+            "references_symbol" | "calls" | "called_by"
+        ) {
+            continue;
+        }
+        let Some(symbol) = contribution.reason.symbol.as_deref() else {
+            continue;
+        };
+        if !anchor_symbols.contains(&normalize_symbolish(symbol)) {
+            continue;
+        }
+        let Some(from_segment_id) = contribution.reason.from_segment_id.as_deref() else {
+            continue;
+        };
+
+        supporting_reasons += 1;
+        supporting_sources.insert(from_segment_id.to_string());
+    }
+
+    supporting_reasons >= 2 && supporting_sources.len() >= 2
+}
+
+fn relation_exact_owner_match(relation: &StoredRelation, candidate: &CandidateRow) -> bool {
+    let qualifier = qualifier_components(&relation.qualifier_fingerprint);
+    let definition = qualifier_components(&definition_owner_fingerprint(candidate));
+    if qualifier.is_empty() || definition.len() < qualifier.len() {
+        return false;
+    }
+
+    definition[definition.len() - qualifier.len()..] == qualifier
+}
+
+fn owner_alignment_score(qualifier_fingerprint: &str, definition_owner_fingerprint: &str) -> f64 {
+    let qualifier = qualifier_components(qualifier_fingerprint);
+    let definition = qualifier_components(definition_owner_fingerprint);
+    if qualifier.is_empty() || definition.is_empty() {
+        return 0.0;
+    }
+
+    component_alignment_score(&qualifier, &definition)
+}
+
+fn definition_owner_fingerprint(candidate: &CandidateRow) -> String {
+    let mut components = path_components(&candidate.file_path);
+
+    if let Some(breadcrumb) = candidate.breadcrumb.as_deref() {
+        extend_unique_components(&mut components, breadcrumb_components(breadcrumb));
+    }
+    if let Some(defined_symbols) = candidate.defined_symbols.as_deref() {
+        for symbol in defined_symbols {
+            extend_unique_components(&mut components, symbol_owner_components(symbol));
+        }
+    }
+
+    components.join("/")
+}
+
+fn extend_unique_components(into: &mut Vec<String>, components: Vec<String>) {
+    for component in components {
+        if !into.contains(&component) {
+            into.push(component);
+        }
+    }
+}
+
+fn symbol_owner_components(symbol: &str) -> Vec<String> {
+    let mut components = clean_owner_components(&split_symbol_components(symbol));
+    if components.len() <= 1 {
+        return Vec::new();
+    }
+    components.pop();
+    components
+}
+
+fn relation_edge_identity_score(
+    relation: &StoredRelation,
+    target: &CandidateRow,
+    owner_alignment: f64,
+    symbol_score: f64,
+) -> f64 {
+    let structural_alignment = if relation.qualifier_fingerprint.is_empty() {
+        symbol_score
+    } else {
+        owner_alignment
+    };
+
+    match relation.edge_identity_kind.as_str() {
+        EDGE_IDENTITY_QUALIFIED_PATH => 0.35 + (0.65 * owner_alignment),
+        EDGE_IDENTITY_MEMBER_ACCESS | EDGE_IDENTITY_METHOD_RECEIVER => {
+            let role_bonus = if matches!(
+                target.role,
+                Some(
+                    SegmentRole::Definition
+                        | SegmentRole::Implementation
+                        | SegmentRole::Orchestration
+                )
+            ) {
+                1.0
+            } else {
+                0.8
+            };
+            (0.40 + (0.60 * structural_alignment)) * role_bonus
+        }
+        EDGE_IDENTITY_CONSTRUCTOR_LIKE => {
+            if matches!(
+                target.block_type.as_str(),
+                "constructor" | "class" | "struct" | "enum"
+            ) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        EDGE_IDENTITY_MACRO_LIKE => {
+            if target.block_type == "macro" {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        EDGE_IDENTITY_BARE_IDENTIFIER => {
+            if relation.qualifier_fingerprint.is_empty() {
+                0.30
+            } else {
+                0.45 + (0.40 * owner_alignment)
+            }
+        }
+        _ => 0.35 + (0.50 * structural_alignment),
+    }
+}
+
+fn has_exact_structural_identity(relation: &StoredRelation, symbol_score: f64) -> bool {
+    if relation.relation_kind == RelationKind::Conformance {
+        return symbol_score >= 0.85;
+    }
+
+    symbol_score >= 1.0
+        && !(relation.qualifier_fingerprint.is_empty()
+            && relation.edge_identity_kind == EDGE_IDENTITY_BARE_IDENTIFIER)
+}
+
+fn relation_corroboration_signal_count(
+    exact_identity: bool,
+    owner_alignment: f64,
+    edge_identity_score: f64,
+    scope_affinity: f64,
+    role_score: f64,
+) -> usize {
+    usize::from(exact_identity)
+        + usize::from(owner_alignment >= OWNER_ALIGNMENT_SIGNAL_THRESHOLD)
+        + usize::from(edge_identity_score >= EDGE_IDENTITY_SIGNAL_THRESHOLD)
+        + usize::from(scope_affinity >= PATH_AFFINITY_SIGNAL_THRESHOLD)
+        + usize::from(role_score >= ROLE_SIGNAL_THRESHOLD)
+}
+
+fn component_alignment_score(needle: &[String], haystack: &[String]) -> f64 {
+    if needle.is_empty() || haystack.is_empty() {
+        return 0.0;
+    }
+
+    let mut matched = 0usize;
+    for token in haystack {
+        if matched < needle.len() && *token == needle[matched] {
+            matched += 1;
+        }
+    }
+
+    let subsequence = matched as f64 / needle.len() as f64;
+    let mut suffix = 0usize;
+    for (left, right) in needle.iter().rev().zip(haystack.iter().rev()) {
+        if left == right {
+            suffix += 1;
+        } else {
+            break;
+        }
+    }
+
+    let suffix = suffix as f64 / needle.len() as f64;
+    (0.65 * subsequence) + (0.35 * suffix)
+}
+
+fn path_affinity_score(left: &str, right: &str) -> f64 {
+    let left = path_components(left);
+    let right = path_components(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    let shared = left
+        .iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if shared == 0 {
+        0.0
+    } else {
+        shared as f64 / left.len().max(right.len()) as f64
+    }
+}
+
+fn relation_role_score(role: Option<SegmentRole>) -> f64 {
+    match role {
+        Some(SegmentRole::Implementation) => 1.0,
+        Some(SegmentRole::Orchestration) => 0.95,
+        Some(SegmentRole::Definition) => 0.75,
+        Some(SegmentRole::Import) => 0.10,
+        Some(SegmentRole::Docs) => 0.05,
+        None => 0.60,
+    }
+}
+
+fn relation_signal_multiplier(
+    candidate: &CandidateRow,
+    relation: &StoredRelation,
+    owner_alignment: f64,
+    corroboration_signals: usize,
+) -> f64 {
+    let mut multiplier = 1.0;
+
+    if corroboration_signals < MIN_PRIMARY_CORROBORATION_SIGNALS {
+        multiplier *= 0.85;
+    }
+
+    if is_wrapper_like_candidate(candidate) {
+        multiplier *= LOW_SIGNAL_WRAPPER_PENALTY;
+    }
+
+    if owner_alignment == 0.0
+        && !relation.qualifier_fingerprint.is_empty()
+        && matches!(
+            relation.edge_identity_kind.as_str(),
+            EDGE_IDENTITY_MEMBER_ACCESS | EDGE_IDENTITY_METHOD_RECEIVER
+        )
+    {
+        multiplier *= LOW_SIGNAL_UNALIGNED_RECEIVER_PENALTY;
+    }
+
+    if relation.relation_kind != RelationKind::Conformance
+        && owner_alignment == 0.0
+        && is_declaration_like_candidate(candidate)
+    {
+        multiplier *= LOW_SIGNAL_DECLARATION_PENALTY;
+    }
+
+    multiplier
+}
+
+fn relation_candidate_edge_compatible(
+    relation: &StoredRelation,
+    candidate: &ScoredRelationCandidate,
+) -> bool {
+    match relation.edge_identity_kind.as_str() {
+        EDGE_IDENTITY_MACRO_LIKE => candidate.candidate.block_type == "macro",
+        EDGE_IDENTITY_CONSTRUCTOR_LIKE => matches!(
+            candidate.candidate.block_type.as_str(),
+            "constructor" | "class" | "struct" | "enum"
+        ),
+        _ => true,
+    }
+}
+
+fn is_wrapper_like_candidate(candidate: &CandidateRow) -> bool {
+    let complexity = candidate.complexity.unwrap_or_default();
+    let call_count = candidate
+        .called_symbols
+        .as_ref()
+        .map(|symbols| symbols.len())
+        .unwrap_or_default();
+
+    matches!(
+        candidate.role,
+        Some(SegmentRole::Implementation | SegmentRole::Orchestration)
+    ) && candidate.line_count() <= 4
+        && complexity <= 1
+        && call_count <= 1
+}
+
+fn is_declaration_like_candidate(candidate: &CandidateRow) -> bool {
+    matches!(candidate.role, Some(SegmentRole::Definition))
+        && matches!(
+            candidate.block_type.as_str(),
+            "struct" | "enum" | "trait" | "type" | "class" | "interface" | "module"
+        )
+}
+
+fn qualifier_components(qualifier_fingerprint: &str) -> Vec<String> {
+    clean_owner_components(&split_symbol_components(qualifier_fingerprint))
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    clean_owner_components(&split_symbol_components(path))
+}
+
+fn breadcrumb_components(breadcrumb: &str) -> Vec<String> {
+    clean_owner_components(&split_symbol_components(breadcrumb))
+}
+
+fn symbol_lookup_tail(symbol: &str) -> Option<String> {
+    split_symbol_components(symbol).into_iter().last()
+}
+
+fn conformance_source_lookup_symbols(candidate: &CandidateRow) -> Vec<String> {
+    let mut lookups = Vec::new();
+    let mut seen = HashSet::new();
+
+    for symbol in candidate.defined_symbols.as_deref().unwrap_or(&[]) {
+        let trimmed = symbol
+            .split(['<', '(', '['])
+            .next()
+            .unwrap_or(symbol)
+            .trim();
+        for lookup in [
+            normalize_symbolish(trimmed),
+            symbol_lookup_tail(trimmed).unwrap_or_default(),
+        ] {
+            if !lookup.is_empty() && seen.insert(lookup.clone()) {
+                lookups.push(lookup);
+            }
+        }
+    }
+
+    lookups
 }
 
 fn reason_key(reason: &ImpactReason) -> String {
@@ -1262,16 +2071,57 @@ fn out_of_scope_anchor_refusal(
 
 fn is_test_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
-    lower.contains("/tests/")
-        || lower.contains("/test/")
-        || lower.contains("/spec/")
-        || lower.contains("/__tests__/")
+    path_in_dir(&lower, "tests")
+        || path_in_dir(&lower, "test")
+        || path_in_dir(&lower, "spec")
+        || path_in_dir(&lower, "__tests__")
         || lower.ends_with("_test.rs")
+        || lower.ends_with("_tests.rs")
         || lower.ends_with("_spec.rs")
         || lower.ends_with(".test.ts")
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".test.js")
         || lower.ends_with(".spec.js")
+}
+
+fn is_test_context_candidate(candidate: &CandidateRow) -> bool {
+    is_test_path(&candidate.file_path)
+        || has_test_context_token(&candidate.file_path)
+        || candidate.block_type.eq_ignore_ascii_case("test")
+        || candidate
+            .breadcrumb
+            .as_deref()
+            .is_some_and(has_test_context_token)
+        || candidate
+            .defined_symbols
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|symbol| has_test_context_token(symbol))
+}
+
+fn has_test_context_token(value: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| matches!(token.as_str(), "test" | "tests" | "spec" | "specs"))
+}
+
+fn is_low_signal_path(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    is_test_path(file_path)
+        || path_in_dir(&lower, "evals")
+        || path_in_dir(&lower, "benches")
+        || path_in_dir(&lower, "examples")
+        || path_in_dir(&lower, "vendor")
+        || lower.contains("node_modules")
+}
+
+fn path_in_dir(lower_path: &str, dir: &str) -> bool {
+    lower_path == dir
+        || lower_path.starts_with(&format!("{dir}/"))
+        || lower_path.contains(&format!("/{dir}/"))
 }
 
 fn test_file_priority(file_path: &str, anchor_files: &[String]) -> usize {
@@ -1312,6 +2162,7 @@ fn normalized_stem(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::types::{ParsedRelation, ParsedRelationKind};
     use crate::storage::{db::Db, schema, segments};
 
     struct SegmentFixture<'a> {
@@ -1347,9 +2198,29 @@ mod tests {
             role: fixture.role.to_string(),
             defined_symbols: serde_json::to_string(fixture.defined_symbols).unwrap(),
             referenced_symbols: serde_json::to_string(fixture.referenced_symbols).unwrap(),
+            referenced_relations: "[]".to_string(),
             called_symbols: serde_json::to_string(fixture.called_symbols).unwrap(),
+            called_relations: "[]".to_string(),
             file_hash: format!("hash-{}", fixture.file_path),
         }
+    }
+
+    fn make_segment_with_called_relations(
+        fixture: SegmentFixture<'_>,
+        called_relations: &[ParsedRelation],
+    ) -> segments::SegmentInsert {
+        let mut segment = make_segment(fixture);
+        segment.called_relations = serde_json::to_string(called_relations).unwrap();
+        segment
+    }
+
+    fn make_segment_with_referenced_relations(
+        fixture: SegmentFixture<'_>,
+        referenced_relations: &[ParsedRelation],
+    ) -> segments::SegmentInsert {
+        let mut segment = make_segment(fixture);
+        segment.referenced_relations = serde_json::to_string(referenced_relations).unwrap();
+        segment
     }
 
     async fn insert_segments(conn: &Connection, segments_to_insert: Vec<segments::SegmentInsert>) {
@@ -1387,6 +2258,16 @@ mod tests {
                 make_segment(SegmentFixture {
                     id: "cfg-ui",
                     file_path: "src/ui/config.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cfg-admin",
+                    file_path: "src/admin/config.rs",
                     line_start: 1,
                     block_type: "struct",
                     role: "DEFINITION",
@@ -1484,6 +2365,400 @@ mod tests {
         assert_eq!(resolved.scope, Some("src/auth".to_string()));
         assert_eq!(resolved.seed_segment_ids, vec!["cfg-auth".to_string()]);
         assert_eq!(result.results[0].segment_id, "cfg-auth-builder");
+    }
+
+    #[tokio::test]
+    async fn trait_anchor_surfaces_impl_relation_site_for_rust_conformance() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "validator-trait",
+                    file_path: "src/auth/validator.rs",
+                    line_start: 1,
+                    block_type: "trait",
+                    role: "DEFINITION",
+                    defined_symbols: &["Validator"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "config-struct",
+                    file_path: "src/auth/config.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "config-impl",
+                        file_path: "src/auth/config.rs",
+                        line_start: 10,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["Config<T>"],
+                        referenced_symbols: &["Validator"],
+                        called_symbols: &[],
+                    },
+                    &[ParsedRelation {
+                        symbol: "crate::auth::Validator".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Validator".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "config-impl");
+        assert_eq!(result.results[0].reasons[0].kind, "implemented_by");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "config-struct"));
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_prioritizes_inbound_conformance_within_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![
+            make_segment(SegmentFixture {
+                id: "formatter-trait",
+                file_path: "src/ui/formatter.rs",
+                line_start: 1,
+                block_type: "trait",
+                role: "DEFINITION",
+                defined_symbols: &["Formatter"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }),
+            make_segment_with_referenced_relations(
+                SegmentFixture {
+                    id: "plain-formatter",
+                    file_path: "src/ui/plain_formatter.rs",
+                    line_start: 1,
+                    block_type: "class",
+                    role: "DEFINITION",
+                    defined_symbols: &["PlainFormatter"],
+                    referenced_symbols: &["Formatter"],
+                    called_symbols: &[],
+                },
+                &[ParsedRelation {
+                    symbol: "Formatter".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Conformance),
+                }],
+            ),
+        ];
+
+        for idx in 0..MAX_INBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_segment_with_referenced_relations(
+                SegmentFixture {
+                    id: Box::leak(format!("formatter-reference-{idx}").into_boxed_str()),
+                    file_path: Box::leak(format!("src/ui/render_{idx}.rs").into_boxed_str()),
+                    line_start: idx + 1,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &[],
+                    referenced_symbols: &["Formatter"],
+                    called_symbols: &[],
+                },
+                &[ParsedRelation {
+                    symbol: "Formatter".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Reference),
+                }],
+            ));
+        }
+
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Formatter".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results[0].segment_id, "plain-formatter");
+        assert_eq!(result.results[0].reasons[0].kind, "implemented_by");
+        if let Some(contextual) = result.contextual_results {
+            assert!(contextual
+                .iter()
+                .all(|candidate| candidate.segment_id != "plain-formatter"));
+        }
+    }
+
+    #[tokio::test]
+    async fn trait_anchor_prioritizes_multiple_implementors_over_same_file_helpers() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "formatter-trait",
+                    file_path: "src/ui/output.rs",
+                    line_start: 1,
+                    block_type: "trait",
+                    role: "DEFINITION",
+                    defined_symbols: &["Formatter"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "json-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 20,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["JsonFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["to_json"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "human-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 60,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["HumanFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["format_message"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "plain-formatter",
+                        file_path: "src/ui/output.rs",
+                        line_start: 100,
+                        block_type: "impl",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["PlainFormatter"],
+                        referenced_symbols: &["Formatter"],
+                        called_symbols: &["render_rows"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Formatter".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Conformance),
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "formatter-for",
+                    file_path: "src/ui/output.rs",
+                    line_start: 140,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["formatter_for"],
+                    referenced_symbols: &[
+                        "Formatter",
+                        "JsonFormatter",
+                        "HumanFormatter",
+                        "PlainFormatter",
+                    ],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "to-json",
+                    file_path: "src/ui/output.rs",
+                    line_start: 160,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["to_json"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Formatter".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids.len(), 3);
+        assert!(result_ids.contains(&"json-formatter"));
+        assert!(result_ids.contains(&"human-formatter"));
+        assert!(result_ids.contains(&"plain-formatter"));
+        assert!(!result_ids.contains(&"formatter-for"));
+        assert!(!result_ids.contains(&"to-json"));
+        assert!(result.results.iter().all(|candidate| candidate
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == "implemented_by")));
+    }
+
+    #[tokio::test]
+    async fn segment_anchor_retains_outbound_conformance_when_calls_fill_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![make_segment(SegmentFixture {
+            id: "formatter-trait",
+            file_path: "src/ui/formatter.rs",
+            line_start: 1,
+            block_type: "trait",
+            role: "DEFINITION",
+            defined_symbols: &["Formatter"],
+            referenced_symbols: &[],
+            called_symbols: &[],
+        })];
+
+        for idx in 0..MAX_OUTBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_segment(SegmentFixture {
+                id: Box::leak(format!("format-helper-{idx}").into_boxed_str()),
+                file_path: Box::leak(format!("src/ui/helpers_{idx}.rs").into_boxed_str()),
+                line_start: idx + 1,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &[Box::leak(format!("format_helper_{idx}").into_boxed_str())],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }));
+        }
+
+        let mut plain_formatter = make_segment(SegmentFixture {
+            id: "plain-formatter",
+            file_path: "src/ui/plain_formatter.rs",
+            line_start: 1,
+            block_type: "class",
+            role: "DEFINITION",
+            defined_symbols: &["PlainFormatter"],
+            referenced_symbols: &["Formatter"],
+            called_symbols: &[
+                "format_helper_0",
+                "format_helper_1",
+                "format_helper_2",
+                "format_helper_3",
+                "format_helper_4",
+                "format_helper_5",
+                "format_helper_6",
+                "format_helper_7",
+            ],
+        });
+        plain_formatter.called_relations = serde_json::to_string(&[
+            ParsedRelation {
+                symbol: "format_helper_0".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_1".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_2".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_3".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_4".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_5".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_6".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+            ParsedRelation {
+                symbol: "format_helper_7".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            },
+        ])
+        .unwrap();
+        plain_formatter.referenced_relations = serde_json::to_string(&[ParsedRelation {
+            symbol: "Formatter".to_string(),
+            edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            kind: Some(ParsedRelationKind::Conformance),
+        }])
+        .unwrap();
+        fixtures.push(plain_formatter);
+
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "plain-formatter".to_string(),
+                },
+                scope: None,
+                depth: 1,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert!(result
+            .results
+            .iter()
+            .any(|candidate| candidate.segment_id == "formatter-trait"));
     }
 
     #[tokio::test]
@@ -1662,7 +2937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_anchor_ranks_relation_same_file_and_test_candidates() {
+    async fn segment_anchor_demotes_leaf_only_relation_but_keeps_contextual_guidance() {
         let (_db, conn) = setup().await;
         insert_segments(
             &conn,
@@ -1724,21 +2999,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.status, ImpactStatus::Expanded);
-        assert_eq!(result.results.len(), 1);
-        assert_eq!(result.results[0].segment_id, "boot-app");
-        assert_eq!(result.results[0].reasons[0].kind, "called_by");
+        assert_eq!(result.status, ImpactStatus::Empty);
+        assert!(result.results.is_empty());
         let contextual = result
             .contextual_results
-            .expect("same-file and test candidates should remain contextual");
-        assert_eq!(contextual.len(), 2);
-        assert_eq!(contextual[0].segment_id, "parse-config");
-        assert_eq!(contextual[0].reasons[0].kind, "same_file");
-        assert_eq!(contextual[1].segment_id, "config-test");
+            .expect("same-file, leaf-only, and test candidates should remain contextual");
+        assert_eq!(contextual.len(), 3);
+
+        let find_contextual = |id: &str| contextual.iter().find(|c| c.segment_id == id).unwrap();
+        assert_eq!(find_contextual("parse-config").reasons[0].kind, "same_file");
         assert!(matches!(
-            contextual[1].reasons[0].kind.as_str(),
+            find_contextual("config-test").reasons[0].kind.as_str(),
             "test_for_file" | "test_for_symbol"
         ));
+        assert_eq!(find_contextual("boot-app").reasons[0].kind, "called_by");
         assert!(
             result
                 .results
@@ -1747,6 +3021,717 @@ mod tests {
                 .all(|candidate| candidate.segment_id != "load-config"),
             "resolved anchor seed should never echo back as an impact candidate"
         );
+    }
+
+    #[tokio::test]
+    async fn qualified_relation_target_prefers_matching_scope() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "reload-auth",
+                    file_path: "src/auth/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["reload_auth"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::auth::config::load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "reload-auth".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-load-config");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "cache-load-config"));
+    }
+
+    #[tokio::test]
+    async fn owner_aligned_target_shortlist_happens_before_truncation() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "boot-auth",
+                        file_path: "src/bootstrap.rs",
+                        line_start: 1,
+                        block_type: "function",
+                        role: "ORCHESTRATION",
+                        defined_symbols: &["boot_auth"],
+                        referenced_symbols: &[],
+                        called_symbols: &["crate::auth::config::load_config"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "crate::auth::config::load_config".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_QUALIFIED_PATH.to_string(),
+                        kind: None,
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "accounts-load-config",
+                    file_path: "src/accounts/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "adapter-load-config",
+                    file_path: "src/adapter/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "admin-load-config",
+                    file_path: "src/admin/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "boot-auth".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-load-config");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_helper_relation_stays_out_of_primary_results() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "boot-app",
+                    file_path: "src/app.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["boot_app"],
+                    referenced_symbols: &[],
+                    called_symbols: &["load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "boot-app".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Empty);
+        assert!(result.results.is_empty());
+        let contextual = result
+            .contextual_results
+            .expect("ambiguous helper matches should remain contextual");
+        assert_eq!(contextual.len(), 1);
+        assert_eq!(contextual[0].reasons[0].kind, "calls");
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_promotes_repeated_reference_support_before_expanding() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "search-result-struct",
+                    file_path: "src/shared/types.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-alias",
+                    file_path: "src/daemon/types.rs",
+                    line_start: 1,
+                    block_type: "type",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "try-daemon-search",
+                    file_path: "src/cli/search.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["try_daemon_search"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "format-search-results",
+                    file_path: "src/cli/output.rs",
+                    line_start: 20,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["format_search_results"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "exec",
+                    file_path: "src/cli/search.rs",
+                    line_start: 40,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["exec"],
+                    referenced_symbols: &[],
+                    called_symbols: &["try_daemon_search", "format_search_results"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "SearchResult".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(result_ids.contains(&"try-daemon-search"));
+        assert!(result_ids.contains(&"format-search-results"));
+        assert!(result_ids.contains(&"exec"));
+    }
+
+    #[tokio::test]
+    async fn symbol_anchor_prefers_high_signal_seeds_and_demotes_eval_paths() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "search-result-struct",
+                    file_path: "src/shared/types.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-impl",
+                    file_path: "src/shared/types.rs",
+                    line_start: 20,
+                    block_type: "impl",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "search-result-bench-type",
+                    file_path: "evals/suites/1up-search/search-bench.ts",
+                    line_start: 1,
+                    block_type: "interface",
+                    role: "DEFINITION",
+                    defined_symbols: &["SearchResult"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "try-daemon-search",
+                    file_path: "src/cli/search.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["try_daemon_search"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "format-search-results",
+                    file_path: "src/cli/output.rs",
+                    line_start: 20,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["format_search_results"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "run-oneup-search",
+                    file_path: "evals/suites/1up-search/search-bench.ts",
+                    line_start: 30,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["runOneupSearch"],
+                    referenced_symbols: &["SearchResult"],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "exec",
+                    file_path: "src/cli/search.rs",
+                    line_start: 40,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["exec"],
+                    referenced_symbols: &[],
+                    called_symbols: &["try_daemon_search", "format_search_results"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "SearchResult".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(
+            result
+                .resolved_anchor
+                .as_ref()
+                .expect("symbol anchor should resolve")
+                .matched_files,
+            vec!["src/shared/types.rs".to_string()]
+        );
+        let result_ids = result
+            .results
+            .iter()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(result_ids.contains(&"try-daemon-search"));
+        assert!(result_ids.contains(&"format-search-results"));
+        assert!(result_ids.contains(&"exec"));
+        assert!(!result_ids.contains(&"run-oneup-search"));
+        let contextual = result
+            .contextual_results
+            .expect("low-signal eval consumers should remain contextual");
+        assert!(contextual
+            .iter()
+            .any(|candidate| candidate.segment_id == "run-oneup-search"));
+    }
+
+    #[tokio::test]
+    async fn macro_like_relations_do_not_resolve_to_function_candidates() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "search-result",
+                        file_path: "src/shared/types.rs",
+                        line_start: 1,
+                        block_type: "function",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["SearchResult"],
+                        referenced_symbols: &[],
+                        called_symbols: &["matches"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "matches".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_MACRO_LIKE.to_string(),
+                        kind: None,
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "expected-leaf-matches",
+                    file_path: "src/shared/fs.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["matches"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "search-result".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "expected-leaf-matches"));
+        assert!(result
+            .contextual_results
+            .unwrap_or_default()
+            .iter()
+            .all(|candidate| candidate.segment_id != "expected-leaf-matches"));
+    }
+
+    #[tokio::test]
+    async fn qualified_inbound_relation_prefers_matching_seed() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-runtime",
+                    file_path: "src/auth/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["auth_runtime"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::auth::config::load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-runtime",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["cache_runtime"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::cache::config::load_config"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "auth-load-config".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-runtime");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "cache-runtime"));
+    }
+
+    #[tokio::test]
+    async fn low_signal_wrapper_yields_to_stronger_primary_candidate() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "warm-cache-key",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["warm_cache_key"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                segments::SegmentInsert {
+                    id: "prime-cache".to_string(),
+                    file_path: "src/cache/priming.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn prime_cache() -> &'static str {\n    warm_cache_key()\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 1,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"prime_cache\"]".to_string(),
+                    referenced_symbols: "[]".to_string(),
+                    referenced_relations: "[]".to_string(),
+                    called_symbols: "[\"warm_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
+                    file_hash: "hash-src/cache/priming.rs".to_string(),
+                },
+                segments::SegmentInsert {
+                    id: "warm-cache-for-request".to_string(),
+                    file_path: "src/cache/worker.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 7,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 3,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+                    referenced_symbols: "[\"user_key\"]".to_string(),
+                    referenced_relations: "[]".to_string(),
+                    called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
+                    file_hash: "hash-src/cache/worker.rs".to_string(),
+                },
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "warm_cache_key".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].segment_id, "warm-cache-for-request");
+        assert_eq!(result.results[1].segment_id, "prime-cache");
+    }
+
+    #[tokio::test]
+    async fn inline_test_context_stays_contextual_for_symbol_anchor() {
+        let (_db, conn) = setup().await;
+        let mut inline_test = make_segment_with_called_relations(
+            SegmentFixture {
+                id: "warm-cache-inline-test",
+                file_path: "src/cache/coverage.rs",
+                line_start: 20,
+                block_type: "function",
+                role: "IMPLEMENTATION",
+                defined_symbols: &["inline_warm_cache_test"],
+                referenced_symbols: &[],
+                called_symbols: &["warm_cache_key"],
+            },
+            &[ParsedRelation {
+                symbol: "warm_cache_key".to_string(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                kind: Some(ParsedRelationKind::Call),
+            }],
+        );
+        inline_test.breadcrumb = Some("cache::tests".to_string());
+
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "warm-cache-key",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["warm_cache_key"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                segments::SegmentInsert {
+                    id: "warm-cache-for-request".to_string(),
+                    file_path: "src/cache/worker.rs".to_string(),
+                    language: "rust".to_string(),
+                    block_type: "function".to_string(),
+                    content: "pub fn warm_cache_for_request(user_key: &str) -> String {\n    let normalized = user_key.trim().to_lowercase();\n    if normalized.is_empty() {\n        return warm_cache_key().to_string();\n    }\n    format!(\"{}:{}\", warm_cache_key(), normalized)\n}\n"
+                        .to_string(),
+                    line_start: 1,
+                    line_end: 7,
+                    embedding_vec: None,
+                    breadcrumb: Some("cache".to_string()),
+                    complexity: 3,
+                    role: "ORCHESTRATION".to_string(),
+                    defined_symbols: "[\"warm_cache_for_request\"]".to_string(),
+                    referenced_symbols: "[\"user_key\"]".to_string(),
+                    referenced_relations: "[]".to_string(),
+                    called_symbols: "[\"warm_cache_key\",\"normalize_cache_key\"]".to_string(),
+                    called_relations: "[]".to_string(),
+                    file_hash: "hash-src/cache/worker.rs".to_string(),
+                },
+                inline_test,
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "warm_cache_key".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results[0].segment_id, "warm-cache-for-request");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "warm-cache-inline-test"));
+        let contextual = result
+            .contextual_results
+            .expect("inline test consumers should remain contextual");
+        assert!(contextual
+            .iter()
+            .any(|candidate| candidate.segment_id == "warm-cache-inline-test"));
     }
 
     #[tokio::test]

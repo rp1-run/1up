@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assert1upUsed,
+  assert1upImpactUsed,
   assertExpectedFiles,
   assertNoFallbackTools,
   reportEfficiency,
@@ -34,6 +35,28 @@ describe("assert1upUsed", () => {
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("rg daemon src");
+  });
+});
+
+describe("assert1upImpactUsed", () => {
+  test("passes when 1up impact is present", () => {
+    const result = assert1upImpactUsed(
+      "",
+      makeContext(["1up impact --from-symbol FTSManager"]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
+  test("fails when 1up impact is not present", () => {
+    const result = assert1upImpactUsed(
+      "",
+      makeContext(['1up search "FTSManager"']),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("did not invoke 1up impact");
   });
 });
 

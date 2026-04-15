@@ -22,6 +22,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segment_symbols_prefix"),
     ("index", "idx_segment_relations_source"),
     ("index", "idx_segment_relations_target"),
+    ("index", "idx_segment_relations_lookup_target"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
@@ -50,18 +51,18 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
 
     conn.execute_batch(&format!(
-        "{};{};{};{}",
+        "{};{};{};{};{}",
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
         queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
         queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
+        queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
     ))
     .await
     .map_err(|e| {
         StorageError::Migration(format!("failed to create symbol and relation indexes: {e}"))
     })?;
 
-    // FTS5 virtual table and sync triggers
     conn.execute_batch(queries::CREATE_FTS_TABLE)
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create FTS table: {e}")))?;
@@ -201,22 +202,30 @@ async fn schema_object_exists(
     }
 }
 
-async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
-    let mut rows = conn
-        .query(queries::SELECT_SEGMENT_VECTORS_EMBEDDING_VEC_COLUMN, ())
-        .await
-        .map_err(|e| {
-            StorageError::Query(format!("failed to inspect segment_vectors columns: {e}"))
-        })?;
+async fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, OneupError> {
+    let query = format!("SELECT 1 FROM pragma_table_info('{table_name}') WHERE name = ?1 LIMIT 1");
+    let mut rows = conn.query(&query, [column_name]).await.map_err(|e| {
+        StorageError::Query(format!(
+            "failed to inspect table column {table_name}.{column_name}: {e}"
+        ))
+    })?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
         Err(e) => Err(StorageError::Query(format!(
-            "segment_vectors column inspection failed: {e}"
+            "table column inspection failed for {table_name}.{column_name}: {e}"
         ))
         .into()),
     }
+}
+
+async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
+    table_has_column(conn, "segment_vectors", "embedding_vec").await
 }
 
 async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> {
@@ -231,6 +240,24 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
     if !segment_vectors_has_embedding_vec(conn).await? {
         return Err(reindex_required(format!(
             "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.embedding_vec`)"
+        )));
+    }
+
+    if !table_has_column(conn, "segment_relations", "lookup_canonical_symbol").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.lookup_canonical_symbol`)"
+        )));
+    }
+
+    if !table_has_column(conn, "segment_relations", "qualifier_fingerprint").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.qualifier_fingerprint`)"
+        )));
+    }
+
+    if !table_has_column(conn, "segment_relations", "edge_identity_kind").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_relations.edge_identity_kind`)"
         )));
     }
 
@@ -352,7 +379,6 @@ mod tests {
         let (_db, conn) = setup().await;
         prepare_for_write(&conn).await.unwrap();
 
-        // No model recorded yet — should write and succeed.
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
@@ -371,7 +397,6 @@ mod tests {
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
-        // Second call with same model should also succeed.
         check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
             .unwrap();
@@ -386,7 +411,6 @@ mod tests {
             .await
             .unwrap();
 
-        // No vectors stored yet — switching model should succeed and update metadata.
         check_embedding_model_compatible(&conn, "org/model-v2", 768)
             .await
             .unwrap();
@@ -406,7 +430,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate stored embeddings.
         conn.execute(
             "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
             (),
@@ -434,7 +457,6 @@ mod tests {
         let (_db, conn) = setup().await;
         prepare_for_write(&conn).await.unwrap();
 
-        // Simulate a legacy index: has vectors but no model metadata.
         conn.execute(
             "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) VALUES ('s1', 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
             (),
@@ -508,10 +530,30 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_relations_lookup_target")
+                .await
+                .unwrap()
+        );
         assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
             .await
             .unwrap());
         assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
+        assert!(
+            table_has_column(&conn, "segment_relations", "lookup_canonical_symbol")
+                .await
+                .unwrap()
+        );
+        assert!(
+            table_has_column(&conn, "segment_relations", "qualifier_fingerprint")
+                .await
+                .unwrap()
+        );
+        assert!(
+            table_has_column(&conn, "segment_relations", "edge_identity_kind")
+                .await
+                .unwrap()
+        );
         ensure_current(&conn).await.unwrap();
     }
 
@@ -531,22 +573,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v8_schema() {
+    async fn prepare_for_write_rejects_pre_v10_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "7"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "8"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v7, expected v8"));
+        assert!(msg.contains("found v8, expected v10"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
     #[tokio::test]
-    async fn ensure_current_rejects_partial_v8_schema() {
+    async fn ensure_current_rejects_partial_v10_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(
@@ -583,6 +625,64 @@ mod tests {
         let err = ensure_current(&conn).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("incomplete"));
+        assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_rejects_schema_missing_edge_identity_kind() {
+        let (_db, conn) = setup().await;
+
+        conn.execute_batch(queries::DROP_SEARCH_SCHEMA)
+            .await
+            .unwrap();
+        conn.execute_batch(&format!(
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
+            queries::CREATE_SEGMENTS_TABLE,
+            queries::CREATE_INDEX_FILE_PATH,
+            queries::CREATE_INDEX_LANGUAGE,
+            queries::CREATE_INDEX_FILE_HASH,
+            queries::CREATE_SEGMENT_VECTORS_TABLE,
+            queries::CREATE_SEGMENT_SYMBOLS_TABLE,
+            "CREATE TABLE segment_relations (
+                source_segment_id TEXT NOT NULL,
+                relation_kind TEXT NOT NULL,
+                raw_target_symbol TEXT NOT NULL,
+                canonical_target_symbol TEXT NOT NULL,
+                lookup_canonical_symbol TEXT NOT NULL,
+                qualifier_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (
+                    source_segment_id,
+                    relation_kind,
+                    canonical_target_symbol,
+                    raw_target_symbol
+                )
+            )",
+            queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
+            queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
+            queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
+            queries::CREATE_FTS_TABLE,
+            queries::CREATE_FTS_TRIGGERS,
+            queries::CREATE_SEGMENT_SYMBOLS_TRIGGER,
+            queries::CREATE_META_TABLE,
+        ))
+        .await
+        .unwrap();
+        conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
+            .await
+            .unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            [META_KEY_SCHEMA_VERSION, &SCHEMA_VERSION.to_string()],
+        )
+        .await
+        .unwrap();
+
+        let err = ensure_current(&conn).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("segment_relations.edge_identity_kind"));
         assert!(msg.contains("run `1up reindex`"));
     }
 

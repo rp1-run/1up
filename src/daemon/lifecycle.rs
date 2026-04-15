@@ -1,8 +1,13 @@
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::shared::config;
 use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
@@ -11,10 +16,136 @@ use crate::shared::fs::{
     atomic_replace, ensure_secure_xdg_root, remove_regular_file, validate_regular_file_path,
 };
 
+const CONTENTION_RETRY_INTERVAL_MS: u64 = 200;
+const CONTENTION_TIMEOUT_MS: u64 = 5000;
+const SIGKILL_WAIT_MS: u64 = 1000;
+
 pub const fn supports_daemon() -> bool {
     true
 }
 
+pub struct DaemonLock {
+    _lock: Flock<File>,
+    pid_path: PathBuf,
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.pid_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("failed to remove pid file on drop: {e}");
+            }
+        }
+        debug!("daemon lock released: {}", self.pid_path.display());
+    }
+}
+
+pub fn acquire_daemon_lock() -> Result<DaemonLock, OneupError> {
+    let xdg_root = ensure_secure_xdg_root()
+        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
+    let pid_path = config::pid_file_path()?;
+    let validated_path = validate_regular_file_path(&pid_path, &xdg_root)
+        .map_err(|err| DaemonError::PidFileError(format!("failed to validate pid file: {err}")))?;
+
+    let file = open_pid_file(&validated_path)?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => write_pid_and_wrap(lock, validated_path),
+        Err((_, Errno::EWOULDBLOCK)) => handle_lock_contention(&validated_path, &xdg_root),
+        Err((_, errno)) => {
+            Err(DaemonError::PidFileError(format!("failed to lock pid file: {errno}")).into())
+        }
+    }
+}
+
+fn open_pid_file(path: &Path) -> Result<File, OneupError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(SECURE_STATE_FILE_MODE)
+        .open(path)
+        .map_err(|e| DaemonError::PidFileError(format!("failed to open pid file: {e}")).into())
+}
+
+fn write_pid_and_wrap(mut lock: Flock<File>, pid_path: PathBuf) -> Result<DaemonLock, OneupError> {
+    let pid = std::process::id();
+    lock.set_len(0)
+        .map_err(|e| DaemonError::PidFileError(format!("failed to truncate pid file: {e}")))?;
+    lock.seek(SeekFrom::Start(0))
+        .map_err(|e| DaemonError::PidFileError(format!("failed to seek pid file: {e}")))?;
+    write!(lock, "{pid}")
+        .map_err(|e| DaemonError::PidFileError(format!("failed to write pid: {e}")))?;
+    lock.sync_data()
+        .map_err(|e| DaemonError::PidFileError(format!("failed to sync pid file: {e}")))?;
+    debug!("acquired daemon lock: {} (pid={pid})", pid_path.display());
+    Ok(DaemonLock {
+        _lock: lock,
+        pid_path,
+    })
+}
+
+fn handle_lock_contention(pid_path: &Path, _xdg_root: &Path) -> Result<DaemonLock, OneupError> {
+    let contending_pid = read_pid_from_path(pid_path);
+
+    if let Some(pid) = contending_pid {
+        info!("daemon lock contention: sending SIGTERM to pid={pid}");
+        let _ = send_sigterm(pid);
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(CONTENTION_TIMEOUT_MS);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(
+                CONTENTION_RETRY_INTERVAL_MS,
+            ));
+            let file = open_pid_file(pid_path)?;
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return write_pid_and_wrap(lock, pid_path.to_path_buf()),
+                Err((_, Errno::EWOULDBLOCK)) => continue,
+                Err((_, errno)) => {
+                    return Err(DaemonError::PidFileError(format!(
+                        "failed to lock pid file after SIGTERM: {errno}"
+                    ))
+                    .into())
+                }
+            }
+        }
+
+        warn!("SIGTERM timeout; sending SIGKILL to pid={pid}");
+        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        std::thread::sleep(std::time::Duration::from_millis(SIGKILL_WAIT_MS));
+
+        let file = open_pid_file(pid_path)?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => write_pid_and_wrap(lock, pid_path.to_path_buf()),
+            Err((_, errno)) => Err(DaemonError::PidFileError(format!(
+                "failed to acquire daemon lock after SIGKILL: {errno}"
+            ))
+            .into()),
+        }
+    } else {
+        warn!("lock contention but no readable PID; retrying lock");
+        std::thread::sleep(std::time::Duration::from_millis(
+            CONTENTION_RETRY_INTERVAL_MS,
+        ));
+        let file = open_pid_file(pid_path)?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => write_pid_and_wrap(lock, pid_path.to_path_buf()),
+            Err((_, errno)) => Err(DaemonError::PidFileError(format!(
+                "failed to acquire daemon lock: {errno}"
+            ))
+            .into()),
+        }
+    }
+}
+
+fn read_pid_from_path(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+#[allow(dead_code)]
 pub fn write_pid_file() -> Result<(), OneupError> {
     let xdg_root = ensure_secure_xdg_root()
         .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
@@ -22,6 +153,7 @@ pub fn write_pid_file() -> Result<(), OneupError> {
     write_pid_file_at(&config::pid_file_path()?, &xdg_root, pid)
 }
 
+#[allow(dead_code)]
 fn write_pid_file_at(path: &Path, approved_root: &Path, pid: u32) -> Result<(), OneupError> {
     let pid_text = pid.to_string();
     atomic_replace(
@@ -37,12 +169,14 @@ fn write_pid_file_at(path: &Path, approved_root: &Path, pid: u32) -> Result<(), 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn read_pid_file() -> Result<Option<u32>, OneupError> {
     let xdg_root = ensure_secure_xdg_root()
         .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
     read_pid_file_at(&config::pid_file_path()?, &xdg_root)
 }
 
+#[allow(dead_code)]
 fn read_pid_file_at(path: &Path, approved_root: &Path) -> Result<Option<u32>, OneupError> {
     let path = validate_regular_file_path(path, approved_root)
         .map_err(|err| DaemonError::PidFileError(format!("failed to validate pid file: {err}")))?;
@@ -61,6 +195,7 @@ fn read_pid_file_at(path: &Path, approved_root: &Path) -> Result<Option<u32>, On
     Ok(Some(pid))
 }
 
+#[allow(dead_code)]
 pub fn remove_pid_file() -> Result<(), OneupError> {
     let xdg_root = ensure_secure_xdg_root()
         .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
@@ -86,17 +221,42 @@ pub fn is_process_alive(pid: u32) -> bool {
 }
 
 pub fn is_daemon_running() -> Result<Option<u32>, OneupError> {
-    match read_pid_file()? {
-        Some(pid) => {
-            if is_process_alive(pid) {
-                Ok(Some(pid))
-            } else {
-                warn!("stale pid file detected (pid={pid}), cleaning up");
-                remove_pid_file()?;
-                Ok(None)
-            }
+    let xdg_root = ensure_secure_xdg_root()
+        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
+    let pid_path = config::pid_file_path()?;
+
+    let file = match File::open(&pid_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(DaemonError::PidFileError(format!("failed to open pid file: {e}")).into())
         }
-        None => Ok(None),
+    };
+
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            warn!("stale pid file detected, cleaning up");
+            let _ = remove_pid_file_at(&pid_path, &xdg_root);
+            Ok(None)
+        }
+        Err((mut file, Errno::EWOULDBLOCK)) => {
+            let mut content = String::new();
+            file.read_to_string(&mut content)
+                .map_err(|e| DaemonError::PidFileError(format!("failed to read pid: {e}")))?;
+            let pid: u32 = content
+                .trim()
+                .parse()
+                .map_err(|e| DaemonError::PidFileError(format!("invalid pid in file: {e}")))?;
+            debug!(
+                "flock held by pid={pid}, is_process_alive={}",
+                is_process_alive(pid)
+            );
+            Ok(Some(pid))
+        }
+        Err((_, errno)) => {
+            Err(DaemonError::PidFileError(format!("failed to probe pid file lock: {errno}")).into())
+        }
     }
 }
 
@@ -185,6 +345,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+
     #[test]
     fn current_process_is_alive() {
         let pid = std::process::id();
@@ -226,5 +389,42 @@ mod tests {
         fs::create_dir_all(&xdg_root).unwrap();
 
         assert_eq!(read_pid_file_at(&pid_path, &xdg_root).unwrap(), None);
+    }
+
+    #[test]
+    fn flock_probe_detects_stale_pid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+
+        fs::write(&pid_path, "99999").unwrap();
+
+        let file = File::open(&pid_path).unwrap();
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                drop(lock);
+            }
+            Err(_) => panic!("expected to acquire lock on stale pid file"),
+        }
+    }
+
+    #[test]
+    fn flock_probe_detects_held_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+
+        let pid = std::process::id();
+        fs::write(&pid_path, pid.to_string()).unwrap();
+
+        let holder = File::open(&pid_path).unwrap();
+        let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock)
+            .expect("should acquire lock as holder");
+
+        let probe = File::open(&pid_path).unwrap();
+        match Flock::lock(probe, FlockArg::LockExclusiveNonblock) {
+            Ok(_) => panic!("expected EWOULDBLOCK when lock is held"),
+            Err((_, errno)) => {
+                assert_eq!(errno, Errno::EWOULDBLOCK);
+            }
+        }
     }
 }
