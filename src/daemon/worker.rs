@@ -408,7 +408,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
 
     let db_path = config::project_db_path(&entry.project_root);
     let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     if let Err(e) = schema::prepare_for_write(&conn).await {
         warn!(
             "skipping project {} until a clean rebuild succeeds: {e}",
@@ -664,12 +664,13 @@ async fn run_project(
         let scope = state.run_state.start_run();
         let project_root = state.project_root.clone();
         let db_start = std::time::Instant::now();
-        let conn_setup = (|| {
-            let conn = state.db.connect()?;
+        let conn_setup = async {
+            let conn = state.db.connect_tuned().await?;
             let indexing_config =
                 config::resolve_indexing_config(None, None, state.indexing.as_ref())?;
-            Ok((conn, indexing_config))
-        })();
+            Ok::<_, OneupError>((conn, indexing_config))
+        }
+        .await;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
 
         (project_root, scope, daemon_fallback_reason, conn_setup)
