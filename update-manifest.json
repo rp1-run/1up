@@ -1,36 +1,36 @@
 {
-  "version": "0.1.5",
-  "git_tag": "v0.1.5",
-  "published_at": "2026-04-11T11:42:12Z",
-  "notes_url": "https://github.com/rp1-run/1up/releases/tag/v0.1.5",
+  "version": "0.1.6",
+  "git_tag": "v0.1.6",
+  "published_at": "2026-04-15T09:51:33Z",
+  "notes_url": "https://github.com/rp1-run/1up/releases/tag/v0.1.6",
   "artifacts": [
     {
       "target": "aarch64-apple-darwin",
-      "archive": "1up-v0.1.5-aarch64-apple-darwin.tar.gz",
-      "sha256": "fc40c130f72407cd1bb4a2bdd4ce65b7bb40934955e6f10752ceb967c8c9edc3",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.5/1up-v0.1.5-aarch64-apple-darwin.tar.gz"
+      "archive": "1up-v0.1.6-aarch64-apple-darwin.tar.gz",
+      "sha256": "afbfe36fca6962ea05595aeca0b85dd4626a7fffdb7363aaa039647163c87915",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.6/1up-v0.1.6-aarch64-apple-darwin.tar.gz"
     },
     {
       "target": "aarch64-unknown-linux-gnu",
-      "archive": "1up-v0.1.5-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "6707119f9fb65bf69619563e5b999cf628cebabb4a74b09ba9ea93b64ba26c84",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.5/1up-v0.1.5-aarch64-unknown-linux-gnu.tar.gz"
+      "archive": "1up-v0.1.6-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "77f04758e21786ee34a1bf00d3bdcc5b4879a17eb55bb4db78fd82b54232765e",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.6/1up-v0.1.6-aarch64-unknown-linux-gnu.tar.gz"
     },
     {
       "target": "x86_64-pc-windows-msvc",
-      "archive": "1up-v0.1.5-x86_64-pc-windows-msvc.zip",
-      "sha256": "39788b71419556fbeba1773c8f2cffdca4c638b472a93374e5ed92397a963cfe",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.5/1up-v0.1.5-x86_64-pc-windows-msvc.zip"
+      "archive": "1up-v0.1.6-x86_64-pc-windows-msvc.zip",
+      "sha256": "457374d1e64f02b1caf2f2727eb2e05dcb8abe3009825d3493fba1723c7767fd",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.6/1up-v0.1.6-x86_64-pc-windows-msvc.zip"
     },
     {
       "target": "x86_64-unknown-linux-gnu",
-      "archive": "1up-v0.1.5-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "6527cf0ea5328f4d40667766299af5fb7a0e9705e1d2148afa252421f5c19425",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.5/1up-v0.1.5-x86_64-unknown-linux-gnu.tar.gz"
+      "archive": "1up-v0.1.6-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "21b8704de1658e811ed3f6c5e591c446beaea2ef948eae0bbbde7b4c8e273e75",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.6/1up-v0.1.6-x86_64-unknown-linux-gnu.tar.gz"
     }
   ],
   "channels": {
-    "github_release": "https://github.com/rp1-run/1up/releases/tag/v0.1.5",
+    "github_release": "https://github.com/rp1-run/1up/releases/tag/v0.1.6",
     "homebrew_tap": "rp1-run/homebrew-tap",
     "homebrew_formula": "brew install rp1-run/tap/1up",
     "scoop_bucket": "rp1-run/scoop-bucket",
