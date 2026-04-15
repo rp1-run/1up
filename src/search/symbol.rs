@@ -56,6 +56,27 @@ impl<'a> SymbolSearchEngine<'a> {
             .collect())
     }
 
+    pub(crate) async fn find_definition_candidates_by_canonical(
+        &self,
+        canonical_symbol: &str,
+    ) -> Result<Vec<CandidateRow>, OneupError> {
+        let canonical_symbol = normalize_symbolish(canonical_symbol);
+        if canonical_symbol.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        Ok(self
+            .load_matches(ReferenceKind::Definition, &canonical_symbol)
+            .await?
+            .into_iter()
+            .filter_map(|symbol_match| {
+                seen.insert(symbol_match.segment_id.clone())
+                    .then(|| candidate_from_symbol_match(symbol_match))
+            })
+            .collect())
+    }
+
     pub(crate) async fn find_reference_candidates(
         &self,
         name: &str,
@@ -523,6 +544,31 @@ mod tests {
         let results = engine.find_definitions("process_dat").await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "process_data");
+    }
+
+    #[tokio::test]
+    async fn canonical_definition_candidates_skip_fuzzy_fallback() {
+        let (_db, conn) = setup().await;
+
+        let exact = make_segment("s1", "src/auth.rs", "function", r#"["load_config"]"#, "[]");
+        let partial = make_segment(
+            "s2",
+            "src/cache.rs",
+            "function",
+            r#"["load_configuration"]"#,
+            "[]",
+        );
+        segments::upsert_segment(&conn, &exact).await.unwrap();
+        segments::upsert_segment(&conn, &partial).await.unwrap();
+
+        let engine = SymbolSearchEngine::new(&conn);
+        let results = engine
+            .find_definition_candidates_by_canonical("loadconfig")
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].segment_id, "s1");
     }
 
     #[test]

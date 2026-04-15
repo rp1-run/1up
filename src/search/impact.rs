@@ -11,7 +11,9 @@ use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::SegmentRole;
-use crate::storage::relations::{get_inbound_relations, get_outbound_relations, RelationKind};
+use crate::storage::relations::{
+    get_inbound_relations_by_lookup_symbol, get_outbound_relations, RelationKind, StoredRelation,
+};
 use crate::storage::segments::{
     get_segment_by_id, get_segments_by_file, get_test_file_paths, StoredSegment,
 };
@@ -34,6 +36,10 @@ const TEST_WEIGHT: f64 = 0.55;
 const HOP_DECAY: f64 = 0.70;
 const SCOPE_BOOST: f64 = 1.10;
 const ROLE_BOOST: f64 = 1.05;
+const RELATION_SOLO_PRIMARY_THRESHOLD: f64 = 0.45;
+const RELATION_PRIMARY_THRESHOLD: f64 = 0.55;
+const RELATION_CONTEXTUAL_THRESHOLD: f64 = 0.35;
+const RELATION_AMBIGUITY_MARGIN: f64 = 0.08;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImpactAnchor {
@@ -179,6 +185,11 @@ struct CandidateObservation {
     bucket: ObservationBucket,
 }
 
+struct ScoredRelationCandidate {
+    candidate: CandidateRow,
+    confidence: f64,
+}
+
 struct FinalizedImpactResults {
     primary: Vec<ImpactCandidate>,
     contextual: Vec<ImpactCandidate>,
@@ -246,11 +257,13 @@ impl<'a> ImpactHorizonEngine<'a> {
                         continue;
                     }
 
+                    let should_expand = observation.bucket == ObservationBucket::Primary;
                     let candidate_for_frontier = observation.candidate.clone();
                     let candidate_id = candidate_for_frontier.segment_id.clone();
                     observe_candidate(&mut aggregates, observation);
 
-                    if hop < depth
+                    if should_expand
+                        && hop < depth
                         && expanded.insert(candidate_id.clone())
                         && queued.insert(candidate_id)
                     {
@@ -514,16 +527,12 @@ impl<'a> ImpactHorizonEngine<'a> {
                 RelationKind::Reference => "references_symbol",
             };
             let weight = base_weight(relation.relation_kind);
-            let targets = self
-                .resolve_relation_targets(&relation.canonical_target_symbol, scope)
-                .await?;
-
-            for target in targets {
-                if is_test_path(&target.file_path) {
-                    continue;
-                }
+            if let Some((target, confidence, bucket)) = self
+                .select_relation_target(source, &relation, scope)
+                .await?
+            {
                 observations.push(CandidateObservation {
-                    score: weighted_score(weight, hop, &target, scope),
+                    score: weighted_score(weight * confidence, hop, &target, scope),
                     hop,
                     reason: ImpactReason {
                         kind: reason_kind.to_string(),
@@ -531,7 +540,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(source.segment_id.clone()),
                     },
                     candidate: target,
-                    bucket: ObservationBucket::Primary,
+                    bucket,
                 });
             }
         }
@@ -543,12 +552,13 @@ impl<'a> ImpactHorizonEngine<'a> {
                 break;
             }
 
-            let canonical = normalize_symbolish(&symbol);
-            if canonical.is_empty() {
+            let Some(lookup_symbol) = symbol_lookup_tail(&symbol) else {
                 continue;
-            }
+            };
 
-            let inbound = get_inbound_relations(self.conn, &canonical, None, remaining).await?;
+            let inbound =
+                get_inbound_relations_by_lookup_symbol(self.conn, &lookup_symbol, None, remaining)
+                    .await?;
             remaining = remaining.saturating_sub(inbound.len());
 
             for relation in inbound {
@@ -565,10 +575,16 @@ impl<'a> ImpactHorizonEngine<'a> {
                     RelationKind::Call => "called_by",
                     RelationKind::Reference => "references_symbol",
                 };
+                let confidence =
+                    relation_candidate_confidence(&candidate, &relation, source, &candidate);
+                let Some(bucket) = relation_observation_bucket(confidence, None, candidate.role)
+                else {
+                    continue;
+                };
 
                 observations.push(CandidateObservation {
                     score: weighted_score(
-                        base_weight(relation.relation_kind),
+                        base_weight(relation.relation_kind) * confidence,
                         hop,
                         &candidate,
                         scope,
@@ -580,7 +596,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                         from_segment_id: Some(source.segment_id.clone()),
                     },
                     candidate,
-                    bucket: ObservationBucket::Primary,
+                    bucket,
                 });
             }
         }
@@ -720,25 +736,55 @@ impl<'a> ImpactHorizonEngine<'a> {
 
     async fn resolve_relation_targets(
         &self,
-        canonical_symbol: &str,
+        lookup_canonical_symbol: &str,
         scope: Option<&str>,
     ) -> Result<Vec<CandidateRow>, OneupError> {
         let engine = SymbolSearchEngine::new(self.conn);
-        let mut candidates = engine.find_definition_candidates(canonical_symbol).await?;
-        candidates.retain(|candidate| {
-            scope_matches(&candidate.file_path, scope)
-                && candidate
-                    .defined_symbols
-                    .as_ref()
-                    .map(|symbols| {
-                        symbols
-                            .iter()
-                            .any(|symbol| normalize_symbolish(symbol) == canonical_symbol)
-                    })
-                    .unwrap_or(false)
-        });
+        let mut candidates = engine
+            .find_definition_candidates_by_canonical(lookup_canonical_symbol)
+            .await?;
+        candidates.retain(|candidate| scope_matches(&candidate.file_path, scope));
         candidates.truncate(MAX_DEFINITION_TARGETS_PER_SYMBOL);
         Ok(candidates)
+    }
+
+    async fn select_relation_target(
+        &self,
+        source: &CandidateRow,
+        relation: &StoredRelation,
+        scope: Option<&str>,
+    ) -> Result<Option<(CandidateRow, f64, ObservationBucket)>, OneupError> {
+        let mut scored = self
+            .resolve_relation_targets(&relation.lookup_canonical_symbol, scope)
+            .await?
+            .into_iter()
+            .filter(|candidate| !is_test_path(&candidate.file_path))
+            .map(|candidate| ScoredRelationCandidate {
+                confidence: relation_candidate_confidence(source, relation, &candidate, &candidate),
+                candidate,
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.candidate.file_path.cmp(&right.candidate.file_path))
+                .then_with(|| left.candidate.line_number.cmp(&right.candidate.line_number))
+                .then_with(|| left.candidate.segment_id.cmp(&right.candidate.segment_id))
+        });
+
+        let runner_up = scored.get(1).map(|candidate| candidate.confidence);
+        let Some(best) = scored.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(bucket) =
+            relation_observation_bucket(best.confidence, runner_up, best.candidate.role)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some((best.candidate, best.confidence, bucket)))
     }
 
     async fn load_candidate(&self, segment_id: &str) -> Result<Option<CandidateRow>, OneupError> {
@@ -1096,6 +1142,191 @@ fn base_weight(relation_kind: RelationKind) -> f64 {
         RelationKind::Call => CALL_WEIGHT,
         RelationKind::Reference => REFERENCE_WEIGHT,
     }
+}
+
+fn relation_candidate_confidence(
+    source: &CandidateRow,
+    relation: &StoredRelation,
+    target: &CandidateRow,
+    emitted_candidate: &CandidateRow,
+) -> f64 {
+    let symbol_score = relation_symbol_score(relation, target);
+    if symbol_score == 0.0 {
+        return 0.0;
+    }
+
+    let qualifier_score = qualifier_alignment_score(&relation.qualifier_fingerprint, target);
+    let scope_affinity = path_affinity_score(&source.file_path, &target.file_path);
+    let role_score = relation_role_score(emitted_candidate.role);
+    let relation_kind_score = match relation.relation_kind {
+        RelationKind::Call => 1.0,
+        RelationKind::Reference => 0.85,
+    };
+    let qualifier_gate = if relation.qualifier_fingerprint.is_empty() {
+        1.0
+    } else {
+        0.45 + (0.55 * qualifier_score)
+    };
+
+    ((0.45 * symbol_score)
+        + (0.25 * qualifier_score)
+        + (0.15 * scope_affinity)
+        + (0.10 * role_score)
+        + (0.05 * relation_kind_score))
+        * qualifier_gate
+}
+
+fn relation_observation_bucket(
+    confidence: f64,
+    runner_up: Option<f64>,
+    role: Option<SegmentRole>,
+) -> Option<ObservationBucket> {
+    if confidence < RELATION_CONTEXTUAL_THRESHOLD {
+        return None;
+    }
+
+    let primary_threshold = if runner_up.is_some() {
+        RELATION_PRIMARY_THRESHOLD
+    } else {
+        RELATION_SOLO_PRIMARY_THRESHOLD
+    };
+    let ambiguous = runner_up
+        .map(|next| confidence - next < RELATION_AMBIGUITY_MARGIN)
+        .unwrap_or(false);
+    let contextual_only_role = matches!(role, Some(SegmentRole::Import | SegmentRole::Docs));
+
+    if !contextual_only_role && !ambiguous && confidence >= primary_threshold {
+        Some(ObservationBucket::Primary)
+    } else {
+        Some(ObservationBucket::Contextual)
+    }
+}
+
+fn relation_symbol_score(relation: &StoredRelation, candidate: &CandidateRow) -> f64 {
+    candidate
+        .defined_symbols
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .fold(0.0, |best, symbol| {
+            let canonical = normalize_symbolish(symbol);
+            let tail = symbol_lookup_tail(symbol);
+            best.max(if canonical == relation.canonical_target_symbol {
+                1.0
+            } else if tail.as_deref() == Some(relation.lookup_canonical_symbol.as_str()) {
+                0.85
+            } else {
+                0.0
+            })
+        })
+}
+
+fn qualifier_alignment_score(qualifier_fingerprint: &str, candidate: &CandidateRow) -> f64 {
+    let qualifier = qualifier_components(qualifier_fingerprint);
+    if qualifier.is_empty() {
+        return 0.0;
+    }
+
+    let file_alignment =
+        component_alignment_score(&qualifier, &path_components(&candidate.file_path));
+    let breadcrumb_alignment = candidate
+        .breadcrumb
+        .as_deref()
+        .map(|breadcrumb| component_alignment_score(&qualifier, &breadcrumb_components(breadcrumb)))
+        .unwrap_or(0.0);
+
+    file_alignment.max(breadcrumb_alignment)
+}
+
+fn component_alignment_score(needle: &[String], haystack: &[String]) -> f64 {
+    if needle.is_empty() || haystack.is_empty() {
+        return 0.0;
+    }
+
+    let mut matched = 0usize;
+    for token in haystack {
+        if matched < needle.len() && *token == needle[matched] {
+            matched += 1;
+        }
+    }
+
+    let subsequence = matched as f64 / needle.len() as f64;
+    let mut suffix = 0usize;
+    for (left, right) in needle.iter().rev().zip(haystack.iter().rev()) {
+        if left == right {
+            suffix += 1;
+        } else {
+            break;
+        }
+    }
+
+    let suffix = suffix as f64 / needle.len() as f64;
+    (0.65 * subsequence) + (0.35 * suffix)
+}
+
+fn path_affinity_score(left: &str, right: &str) -> f64 {
+    let left = path_components(left);
+    let right = path_components(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    let shared = left
+        .iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if shared == 0 {
+        0.0
+    } else {
+        shared as f64 / left.len().max(right.len()) as f64
+    }
+}
+
+fn relation_role_score(role: Option<SegmentRole>) -> f64 {
+    match role {
+        Some(SegmentRole::Implementation) => 1.0,
+        Some(SegmentRole::Orchestration) => 0.95,
+        Some(SegmentRole::Definition) => 0.75,
+        Some(SegmentRole::Import) => 0.10,
+        Some(SegmentRole::Docs) => 0.05,
+        None => 0.60,
+    }
+}
+
+fn qualifier_components(qualifier_fingerprint: &str) -> Vec<String> {
+    qualifier_fingerprint
+        .split('/')
+        .map(normalize_symbolish)
+        .filter(|component| {
+            !component.is_empty() && !matches!(component.as_str(), "crate" | "self" | "super")
+        })
+        .collect()
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    path.split(|ch| ch == '/' || ch == '.')
+        .map(normalize_symbolish)
+        .filter(|component| {
+            !component.is_empty() && !matches!(component.as_str(), "src" | "tests" | "test")
+        })
+        .collect()
+}
+
+fn breadcrumb_components(breadcrumb: &str) -> Vec<String> {
+    breadcrumb
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .map(normalize_symbolish)
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn symbol_lookup_tail(symbol: &str) -> Option<String> {
+    symbol
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .map(normalize_symbolish)
+        .filter(|component| !component.is_empty())
+        .next_back()
 }
 
 fn reason_key(reason: &ImpactReason) -> String {
@@ -1747,6 +1978,202 @@ mod tests {
                 .all(|candidate| candidate.segment_id != "load-config"),
             "resolved anchor seed should never echo back as an impact candidate"
         );
+    }
+
+    #[tokio::test]
+    async fn qualified_relation_target_prefers_matching_scope() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "reload-auth",
+                    file_path: "src/auth/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["reload_auth"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::auth::config::load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "reload-auth".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-load-config");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "cache-load-config"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_helper_relation_stays_out_of_primary_results() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "boot-app",
+                    file_path: "src/app.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["boot_app"],
+                    referenced_symbols: &[],
+                    called_symbols: &["load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "boot-app".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Empty);
+        assert!(result.results.is_empty());
+        let contextual = result
+            .contextual_results
+            .expect("ambiguous helper matches should remain contextual");
+        assert_eq!(contextual.len(), 1);
+        assert_eq!(contextual[0].reasons[0].kind, "calls");
+    }
+
+    #[tokio::test]
+    async fn qualified_inbound_relation_prefers_matching_seed() {
+        let (_db, conn) = setup().await;
+        insert_segments(
+            &conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "auth-load-config",
+                    file_path: "src/auth/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-load-config",
+                    file_path: "src/cache/config.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "DEFINITION",
+                    defined_symbols: &["load_config"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "auth-runtime",
+                    file_path: "src/auth/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["auth_runtime"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::auth::config::load_config"],
+                }),
+                make_segment(SegmentFixture {
+                    id: "cache-runtime",
+                    file_path: "src/cache/runtime.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "ORCHESTRATION",
+                    defined_symbols: &["cache_runtime"],
+                    referenced_symbols: &[],
+                    called_symbols: &["crate::cache::config::load_config"],
+                }),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "auth-load-config".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].segment_id, "auth-runtime");
+        assert!(result
+            .results
+            .iter()
+            .all(|candidate| candidate.segment_id != "cache-runtime"));
     }
 
     #[tokio::test]
