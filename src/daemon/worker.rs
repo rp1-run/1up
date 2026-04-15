@@ -73,15 +73,9 @@ struct QueuedSearchRequest {
 }
 
 pub async fn run() -> Result<(), OneupError> {
-    lifecycle::write_pid_file()?;
+    let _daemon_lock = lifecycle::acquire_daemon_lock()?;
 
-    let result = run_inner().await;
-
-    if let Err(e) = lifecycle::remove_pid_file() {
-        warn!("failed to clean up pid file: {e}");
-    }
-
-    result
+    run_inner().await
 }
 
 async fn run_inner() -> Result<(), OneupError> {
