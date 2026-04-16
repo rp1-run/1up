@@ -24,7 +24,8 @@ pub struct SymbolArgs {
 }
 
 pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let project_root =
+        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let db_path = project_db_path(&project_root);
     let fmt = formatter_for(format);
 

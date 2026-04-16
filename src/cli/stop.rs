@@ -13,7 +13,8 @@ pub struct StopArgs {
 }
 
 pub async fn exec(args: StopArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let project_root =
+        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let fmt = formatter_for(format);
 
     if !lifecycle::supports_daemon() {

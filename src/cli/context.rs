@@ -30,7 +30,7 @@ pub struct ContextArgs {
 }
 
 pub async fn exec(args: ContextArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = Path::new(&args.path).canonicalize()?;
+    let project_root = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let fmt = formatter_for(format);
 
     if let Ok(pid) = project::read_project_id(&project_root) {

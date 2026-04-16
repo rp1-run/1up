@@ -31,7 +31,8 @@ fn read_daemon_status(project_root: &std::path::Path) -> Option<DaemonProjectSta
 }
 
 pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let project_root =
+        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let fmt = formatter_for(format);
 
     let (daemon_running, pid) = match lifecycle::is_daemon_running()? {

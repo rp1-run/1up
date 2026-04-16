@@ -2165,3 +2165,98 @@ fn cli_symbol_empty_results_returns_empty_array_json() {
     let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
     assert!(results.is_empty());
 }
+
+#[test]
+fn cli_worktree_resolves_to_main_repo_index() {
+    let _guard = HideModelGuard::new();
+
+    let tmp = TempDir::new().unwrap();
+    let tmp_root = tmp.path().canonicalize().unwrap();
+    let main_repo = tmp_root.join("main");
+    fs::create_dir_all(&main_repo).unwrap();
+
+    std::process::Command::new("git")
+        .args(["init", main_repo.to_str().unwrap()])
+        .output()
+        .expect("git init failed");
+
+    fs::write(
+        main_repo.join("hello.rs"),
+        "fn greet() -> &'static str { \"hello\" }\n",
+    )
+    .unwrap();
+
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git add failed");
+
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git commit failed");
+
+    cmd()
+        .args(["--format", "json", "init", main_repo.to_str().unwrap()])
+        .assert()
+        .success();
+
+    cmd()
+        .args(["--format", "json", "index", main_repo.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let worktree_path = tmp_root.join("wt-feature");
+    std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            "feature-branch",
+        ])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git worktree add failed");
+
+    assert!(worktree_path.join(".git").is_file());
+
+    let status_output = cmd()
+        .args([
+            "--format",
+            "json",
+            "status",
+            worktree_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        status_output.status.success(),
+        "status from worktree failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+
+    let status_json: serde_json::Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status_json["project_initialized"], true);
+
+    let search_output = cmd()
+        .args([
+            "--format",
+            "json",
+            "search",
+            "greet",
+            "--path",
+            worktree_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        search_output.status.success(),
+        "search from worktree failed: {}",
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+}
