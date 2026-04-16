@@ -14,7 +14,7 @@ providers:
     label: 1up-agent
     prompts: [1up]
     config:
-      model: haiku
+      model: sonnet
       betas:
         - fast-mode-2026-02-01
       permission_mode: bypassPermissions
@@ -26,7 +26,7 @@ providers:
     label: baseline-agent
     prompts: [baseline]
     config:
-      model: haiku
+      model: sonnet
       betas:
         - fast-mode-2026-02-01
       permission_mode: bypassPermissions
@@ -51,7 +51,7 @@ tests:
         What files and functions would be affected if you changed the
         FTSManager class interface in emdash? Identify each affected file
         and explain why it would need to change.
-      EXPECTED_FILES: query.ts,AdminCommandPalette.tsx
+      EXPECTED_FILES: query.ts,registry.ts,emdash-runtime.ts
     assert:
       - type: javascript
         value: |
@@ -65,21 +65,23 @@ tests:
       - type: llm-rubric
         value: >
           Accuracy: FTSManager in fts-manager.ts creates FTS5 virtual tables
-          and triggers for content search. The correct impact is: (1) query.ts
-          depends on the FTS5 tables FTSManager creates, so changing the class
-          interface would break search queries via searchSingleCollection(),
-          (2) AdminCommandPalette.tsx is the admin search UI that consumes
-          search results. Score 1.0 if both downstream dependencies are
-          correctly identified with reasoning. Score 0.5 if only one is
-          found or reasoning is weak. Score 0.0 if fundamentally wrong.
-          Judge the quality of impact analysis, not format.
+          and triggers for content search. Key downstream dependencies
+          include: (1) query.ts instantiates FTSManager and calls its
+          methods for search queries, (2) registry.ts calls FTSManager
+          during rebuildSearchIndex, (3) emdash-runtime.ts instantiates
+          FTSManager at startup. Score 1.0 if at least three direct
+          consumers are correctly identified with reasoning about why
+          they break. Score 0.5 if one or two are found. Score 0.0 if
+          fundamentally wrong. Judge the quality of impact analysis,
+          not format.
       - type: llm-rubric
         value: >
           Completeness: A thorough impact analysis should identify: (a) direct
-          consumers of the FTSManager API, (b) transitive dependents through
-          the query layer, (c) UI components that surface search results.
-          Score 1.0 if all three levels are covered, 0.66 if two, 0.33 if
-          one. Judge only coverage of the dependency chain.
+          consumers that instantiate or call FTSManager methods, (b) API
+          routes that use search functionality, (c) data import/seed paths
+          that enable search. Score 1.0 if all three levels are covered,
+          0.66 if two, 0.33 if one. Judge only coverage of the dependency
+          chain.
 
   - description: Schema Registry Impact
     vars:
@@ -87,7 +89,7 @@ tests:
         What would break if you changed how schema definitions are stored
         in registry.ts in the emdash codebase? Trace the blast radius
         through all dependent files.
-      EXPECTED_FILES: loader.ts,query.ts,live.config.ts
+      EXPECTED_FILES: emdash-runtime.ts,schema.ts,typegen.ts
     assert:
       - type: javascript
         value: |
@@ -101,20 +103,22 @@ tests:
       - type: llm-rubric
         value: >
           Accuracy: registry.ts stores schema definitions in the database.
-          The correct impact chain is: (1) loader.ts loads stored schema at
-          runtime and would break if the storage format changed, (2) query.ts
-          executes typed content queries against the loaded schema, (3)
-          live.config.ts integrates with Astro for live queries using the
-          schema types. Score 1.0 if the full dependency chain is correctly
-          traced. Score 0.5 if partially correct. Score 0.0 if fundamentally
-          wrong. Judge the quality of impact reasoning.
+          Key dependents include: (1) emdash-runtime.ts creates a
+          SchemaRegistry instance at startup, (2) api/handlers/schema.ts
+          calls CRUD methods on the registry, (3) typegen.ts generates
+          TypeScript types from schema definitions. Score 1.0 if at least
+          three direct dependents are correctly identified with reasoning
+          about why they break. Score 0.5 if one or two are found.
+          Score 0.0 if fundamentally wrong. Judge the quality of impact
+          reasoning.
       - type: llm-rubric
         value: >
           Completeness: The answer should trace impact through: (a) schema
           storage layer, (b) schema loading/runtime layer, (c) query
-          execution layer, (d) framework integration layer. Score 1.0 if
-          all four layers are covered, 0.75 if three, 0.5 if two, 0.25 if
-          one. Judge only depth of the dependency trace.
+          execution layer, (d) API handlers or import/export paths.
+          Score 1.0 if all four layers are covered, 0.75 if three,
+          0.5 if two, 0.25 if one. Judge only depth of the dependency
+          trace.
 
   - description: Plugin Runner Impact
     vars:
@@ -122,7 +126,7 @@ tests:
         What is the blast radius of changing the plugin sandbox runner API
         in runner.ts in the emdash codebase? Identify all files that would
         need to change and explain the dependency chain.
-      EXPECTED_FILES: wrapper.ts,bridge.ts,manager.ts,hooks.ts
+      EXPECTED_FILES: emdash-runtime.ts,types.ts
     assert:
       - type: javascript
         value: |
@@ -136,17 +140,18 @@ tests:
       - type: llm-rubric
         value: >
           Accuracy: runner.ts loads plugins into Cloudflare Worker isolation.
-          The correct blast radius includes: (1) wrapper.ts provides the
-          sandbox wrapping layer that runner.ts uses, (2) bridge.ts controls
-          plugin access to content, storage, and network through the runner,
-          (3) manager.ts handles plugin registration and coordinates with the
-          runner, (4) hooks.ts provides capability hooks that gate what plugins
-          can do. Score 1.0 if all four dependencies are correctly identified
-          with reasoning. Score 0.5 if at least two are found. Score 0.0 if
-          fundamentally wrong.
+          Key dependencies include: (1) emdash-runtime.ts calls
+          sandboxRunner.load() and plugin invoke methods like invokeHook()
+          and invokeRoute(), (2) sandbox/types.ts defines the SandboxRunner
+          and SandboxedPlugin interfaces that runner.ts implements,
+          (3) virtual-modules.ts generates the sandbox runner import.
+          Score 1.0 if at least two direct code dependencies are correctly
+          identified with reasoning. Score 0.5 if one is found. Score 0.0
+          if fundamentally wrong.
       - type: llm-rubric
         value: >
-          Completeness: The answer should cover: (a) sandbox/isolation layer,
-          (b) resource access control, (c) plugin lifecycle management,
-          (d) capability gating. Score 1.0 if all four, 0.75 if three,
+          Completeness: The answer should cover: (a) sandbox runtime and
+          plugin loading, (b) type definitions and interface contracts,
+          (c) runtime call sites that invoke sandbox methods, (d) module
+          wiring or re-exports. Score 1.0 if all four, 0.75 if three,
           0.5 if two, 0.25 if one.

@@ -1,17 +1,25 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-You have access to `1up`, a code search engine. Prefer it over grep/rg for code exploration.
+You have access to `1up`, a code search engine. Pick by what you know:
+
+| You know... | Use | Reason |
+|---|---|---|
+| Concept, not files/keywords | `1up search` | Semantic search needs no vocabulary |
+| Symbol/keyword name | `1up symbol -r` or `grep` | Literal match = precise, low noise |
+| Keyword, need ALL instances | `grep` | Guaranteed-complete, best signal:noise |
+| Nothing (new codebase) | `1up search` | Works w/o prior knowledge |
 
 ```
-1up search "<query>" -n 5          # hybrid semantic + keyword search
-1up symbol <name> [-r]             # definition lookup; -r includes references
+1up search "<query>" -n 5          # semantic + keyword hybrid
+1up symbol <name> [-r]             # exact def lookup; -r = all references
+1up symbol --fuzzy <name> [-r]     # approximate matching when exact fails
 1up context <file>:<line>          # enclosing scope at location
 ```
 
-After discovering a symbol via `search`, verify all locations with `1up symbol -r <name>`.
+After discovering a symbol via `search`, verify all locations with `1up symbol -r <name>` or `grep`.
 
-You may fall back to grep/rg if 1up is not the right tool for a specific lookup.
+Do not stop after a single search. Use multiple searches to trace the full flow — follow imports, verify call sites, and read key files to confirm your understanding before answering.
 
 {{TASK_PROMPT}}
 
-Be concise.
+List the key files and their roles. Be factual.

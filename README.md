@@ -146,6 +146,29 @@ just bench-parallel
 
 The Criterion bench suite also covers `impact_file_anchor`, `impact_symbol_anchor_narrow`, and `impact_symbol_anchor_refused` while keeping the existing search benches as the non-regression guardrail for core discovery commands.
 
+## Agent Eval Results
+
+The eval suite runs Claude agents with and without `1up` on traced-flow tasks across the pinned [emdash](https://github.com/emdash-cms/emdash) monorepo (1,362 files). Each task asks the agent to trace a multi-file flow or identify blast radius — the kind of exploration where semantic search should outperform keyword matching.
+
+```sh
+just eval-parallel --summary
+```
+
+Latest results (Sonnet, 2026-04-16):
+
+| Task | 1up | baseline | Winner |
+|------|:---:|:--------:|:------:|
+| Search Stack | 79s / $0.27 | 137s / $0.54 | 1up |
+| WordPress Import | 112s / $0.37 | 118s / $0.34 | 1up |
+| Plugin Architecture | 116s / $0.40 | 125s / $0.46 | 1up |
+| Live Content Query | 131s / $0.40 | 175s / $0.85 | 1up |
+| FTS Impact | 152s / $0.40 | 91s / $0.37 | baseline |
+| Registry Impact | 98s / $0.28 | 112s / $0.36 | 1up |
+| Runner Impact | 145s / $0.42 | 191s / $0.80 | 1up |
+| **Total** | **833s / $2.54** | **949s / $3.72** | **1up** |
+
+**1up vs baseline: -12% time, -32% cost.** 6/7 wins for 1up. FTS Impact is the one baseline win — the task names a specific class, so grep is competitive. Full results: [`evals/results/`](evals/results/).
+
 ## Upgrade
 
 Use the same channel you installed from:

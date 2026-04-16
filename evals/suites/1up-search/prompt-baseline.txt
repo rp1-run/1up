@@ -2,4 +2,4 @@ Your working directory is {{WORKSPACE_DIR}}.
 
 {{TASK_PROMPT}}
 
-Be concise. Use standard CLI tools (grep, rg, find, cat) for code exploration.
+Use standard CLI tools (grep, rg, find, cat) for code exploration. Trace the full flow — follow imports, verify call sites, and read key files. List the key files and their roles. Be factual.

@@ -14,7 +14,7 @@ providers:
     label: 1up-agent
     prompts: [1up]
     config:
-      model: haiku
+      model: sonnet
       betas:
         - fast-mode-2026-02-01
       permission_mode: bypassPermissions
@@ -26,7 +26,7 @@ providers:
     label: baseline-agent
     prompts: [baseline]
     config:
-      model: haiku
+      model: sonnet
       betas:
         - fast-mode-2026-02-01
       permission_mode: bypassPermissions

@@ -1,5 +1,12 @@
 import { execSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  unlinkSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +16,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = join(__dirname, "../../.cache/emdash");
 const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
 const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
+const CACHE_LOCK_PATH = join(__dirname, "../../.cache/.lock");
 const TEMP_BASE = "/tmp/1up-evals";
 
 interface CacheStatus {
@@ -58,23 +66,70 @@ function cacheNeedsRefresh(): boolean {
 export function ensureFixtureCache(): void {
   mkdirSync(CACHE_DIR, { recursive: true });
 
-  if (!existsSync(join(CACHE_DIR, ".git"))) {
-    execSync(
-      `git clone --single-branch --branch main ${EMDASH_REPO} "${CACHE_DIR}"`,
-      { stdio: "pipe" },
-    );
-    execSync(`git -C "${CACHE_DIR}" checkout ${EMDASH_COMMIT}`, {
-      stdio: "pipe",
-    });
+  // Simple lock to prevent parallel processes from cloning/indexing simultaneously.
+  // If the lock exists, another process is setting up the cache — wait for it.
+  if (existsSync(CACHE_LOCK_PATH)) {
+    const maxWaitMs = 120_000;
+    const startMs = Date.now();
+    while (existsSync(CACHE_LOCK_PATH)) {
+      if (Date.now() - startMs > maxWaitMs) {
+        // Stale lock — remove and proceed
+        try {
+          unlinkSync(CACHE_LOCK_PATH);
+        } catch {
+          /* ignore */
+        }
+        break;
+      }
+      execSync("sleep 1", { stdio: "pipe" });
+    }
+    return;
   }
 
-  if (cacheNeedsRefresh()) {
-    const command = existsSync(INDEX_DB_PATH) ? "1up reindex" : "1up index";
-    execSync(command, { cwd: CACHE_DIR, stdio: "pipe" });
+  const needsWork =
+    !existsSync(join(CACHE_DIR, ".git")) || cacheNeedsRefresh();
+  if (!needsWork) {
+    if (existsSync(PROJECT_ID_PATH)) {
+      rmSync(PROJECT_ID_PATH);
+    }
+    return;
   }
 
-  if (existsSync(PROJECT_ID_PATH)) {
-    rmSync(PROJECT_ID_PATH);
+  // Acquire lock
+  try {
+    writeFileSync(CACHE_LOCK_PATH, String(process.pid), { flag: "wx" });
+  } catch {
+    // Another process beat us — wait for it
+    ensureFixtureCache();
+    return;
+  }
+
+  try {
+    if (!existsSync(join(CACHE_DIR, ".git"))) {
+      execSync(
+        `git clone --single-branch --branch main ${EMDASH_REPO} "${CACHE_DIR}"`,
+        { stdio: "pipe" },
+      );
+      execSync(`git -C "${CACHE_DIR}" checkout ${EMDASH_COMMIT}`, {
+        stdio: "pipe",
+      });
+    }
+
+    if (cacheNeedsRefresh()) {
+      const command = existsSync(INDEX_DB_PATH) ? "1up reindex" : "1up index";
+      execSync(command, { cwd: CACHE_DIR, stdio: "pipe" });
+    }
+
+    if (existsSync(PROJECT_ID_PATH)) {
+      rmSync(PROJECT_ID_PATH);
+    }
+  } finally {
+    // Release lock
+    try {
+      unlinkSync(CACHE_LOCK_PATH);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
