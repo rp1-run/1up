@@ -77,8 +77,9 @@ fn send_watch_progress(
 }
 
 async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root =
-        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
@@ -91,7 +92,15 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
     ensure_secure_project_root(&project_root)?;
 
     if should_use_direct_watch_progress_ui(format) {
-        let stats = run_index_once(&db_path, &project_root, &indexing_config, true, None).await?;
+        let stats = run_index_once(
+            &db_path,
+            &source_root,
+            Some(&project_root),
+            &indexing_config,
+            true,
+            None,
+        )
+        .await?;
 
         let msg = format!(
             "Indexed {} files ({} segments). {} skipped, {} deleted.{}",
@@ -114,7 +123,8 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
 
     let result = run_index_once(
         &db_path,
-        &project_root,
+        &source_root,
+        Some(&project_root),
         &indexing_config,
         false,
         Some(&progress_tx),
@@ -149,8 +159,9 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         return exec_watch(args, format).await;
     }
 
-    let project_root =
-        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
@@ -165,7 +176,8 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let stats = run_index_once(
         &db_path,
-        &project_root,
+        &source_root,
+        Some(&project_root),
         &indexing_config,
         show_progress_ui,
         None,
@@ -191,6 +203,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 async fn run_index_once(
     db_path: &std::path::Path,
     project_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
     indexing_config: &crate::shared::types::IndexingConfig,
     show_progress_ui: bool,
     progress_tx: Option<&pipeline::ProgressSender>,
@@ -233,7 +246,7 @@ async fn run_index_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
-    pipeline::run_with_scope_and_setup(
+    pipeline::run_with_scope_setup_and_progress_root(
         &conn,
         project_root,
         runtime.current_embedder(),
@@ -243,6 +256,7 @@ async fn run_index_once(
         show_progress_ui,
         Some(setup),
         None,
+        state_root,
     )
     .await
     .map_err(Into::into)

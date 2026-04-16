@@ -2259,4 +2259,54 @@ fn cli_worktree_resolves_to_main_repo_index() {
         "search from worktree failed: {}",
         String::from_utf8_lossy(&search_output.stderr)
     );
+
+    // Write a worktree-only file and re-index from the worktree.
+    // The indexer should scan the worktree's files, not the main repo's.
+    fs::write(
+        worktree_path.join("worktree_only.rs"),
+        "fn worktree_exclusive() -> bool { true }\n",
+    )
+    .unwrap();
+
+    let reindex_output = cmd()
+        .args([
+            "--format",
+            "json",
+            "reindex",
+            worktree_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        reindex_output.status.success(),
+        "reindex from worktree failed: {}",
+        String::from_utf8_lossy(&reindex_output.stderr)
+    );
+
+    // Search for the worktree-only symbol — it should appear in the index.
+    let wt_search_output = cmd()
+        .args([
+            "--format",
+            "json",
+            "search",
+            "worktree_exclusive",
+            "--path",
+            worktree_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        wt_search_output.status.success(),
+        "search for worktree-only symbol failed: {}",
+        String::from_utf8_lossy(&wt_search_output.stderr)
+    );
+
+    let wt_results: Vec<serde_json::Value> =
+        serde_json::from_slice(&wt_search_output.stdout).unwrap();
+    assert!(
+        !wt_results.is_empty(),
+        "worktree-only symbol should appear after reindex from worktree"
+    );
 }

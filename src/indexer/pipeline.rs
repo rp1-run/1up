@@ -1027,6 +1027,41 @@ pub async fn run_with_scope_and_setup(
     setup_timings: Option<SetupTimings>,
     daemon_fallback_reason: Option<String>,
 ) -> Result<PipelineStats, OneupError> {
+    run_with_scope_setup_and_progress_root(
+        conn,
+        project_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        show_progress_ui,
+        setup_timings,
+        daemon_fallback_reason,
+        None,
+    )
+    .await
+}
+
+/// Like [`run_with_scope_and_setup`], but accepts a separate
+/// `progress_root` where `.1up/` state (progress files) should be
+/// written. When `None`, `project_root` is used for both scanning
+/// and progress (the default for daemon callers where they are the
+/// same). CLI callers running from a git worktree pass the main
+/// repo root here so that progress is written beside the index.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_scope_setup_and_progress_root(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
+    daemon_fallback_reason: Option<String>,
+    progress_root: Option<&Path>,
+) -> Result<PipelineStats, OneupError> {
+    let progress_root = progress_root.unwrap_or(project_root);
     let input_prep_start = Instant::now();
     let resolution = match scope {
         RunScope::Full => {
@@ -1076,7 +1111,7 @@ pub async fn run_with_scope_and_setup(
 
     execute_run_with_inputs(
         conn,
-        project_root,
+        progress_root,
         embedder,
         config,
         resolution,
@@ -1165,7 +1200,7 @@ async fn execute_run_with_inputs(
     );
     let scan_started_at = Instant::now();
 
-    stats.files_scanned = scanned_files.len() + metadata_unchanged_count;
+    stats.files_scanned = scanned_files.len();
     let total_files = scanned_files.len();
     progress_ui.set_state(pipeline_progress_ui_state(
         &stats,

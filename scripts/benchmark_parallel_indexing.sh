@@ -277,7 +277,7 @@ wait_for_refresh_complete() {
       return 0
     fi
 
-    sleep 0.2
+    sleep 1
     elapsed=$((elapsed + 1))
   done
 
@@ -366,7 +366,9 @@ capture_telemetry() {
 
   local safe_label
   safe_label=$(printf '%s' "$label" | tr '/:' '__')
-  local telemetry_file="$TELEMETRY_DIR/${safe_label}.json"
+  local ts
+  ts=$(date +%s%N 2>/dev/null || perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1e9')
+  local telemetry_file="$TELEMETRY_DIR/${safe_label}_${ts}.json"
 
   jq -n \
     --arg label "$label" \

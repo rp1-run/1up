@@ -32,11 +32,12 @@ pub struct StartArgs {
 }
 
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root =
-        crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let fmt = formatter_for(format);
 
-    install_fences(&project_root, &*fmt);
+    install_fences(&source_root, &*fmt);
 
     if !lifecycle::supports_daemon() {
         println!(
@@ -100,7 +101,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        let stats = run_initial_index(&project_root, &indexing_config).await?;
+        let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
         registry.register(&project_id, &project_root, Some(indexing_config))?;
         lifecycle::send_sighup(pid)?;
         let msg = format!(
@@ -111,7 +112,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let stats = run_initial_index(&project_root, &indexing_config).await?;
+    let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
 
     registry.register(&project_id, &project_root, Some(indexing_config))?;
 
@@ -157,6 +158,7 @@ async fn project_has_usable_index(project_root: &Path) -> anyhow::Result<bool> {
 
 async fn run_initial_index(
     project_root: &Path,
+    source_root: &Path,
     indexing_config: &IndexingConfig,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let mut setup = SetupTimings::new(Instant::now());
@@ -200,9 +202,9 @@ async fn run_initial_index(
         }
     }
 
-    let stats = pipeline::run_with_scope_and_setup(
+    let stats = pipeline::run_with_scope_setup_and_progress_root(
         &conn,
-        project_root,
+        source_root,
         runtime.current_embedder(),
         &crate::shared::types::RunScope::Full,
         indexing_config,
@@ -210,6 +212,7 @@ async fn run_initial_index(
         true,
         Some(setup),
         None,
+        Some(project_root),
     )
     .await?;
 
