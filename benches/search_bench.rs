@@ -657,7 +657,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
                 let conn = db.connect().unwrap();
                 let engine = oneup::search::SymbolSearchEngine::new(&conn);
-                let results = engine.find_definitions("Config").await.unwrap();
+                let results = engine.find_definitions("Config", false).await.unwrap();
                 assert!(!results.is_empty());
             });
         });
@@ -669,7 +669,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
                 let conn = db.connect().unwrap();
                 let engine = oneup::search::SymbolSearchEngine::new(&conn);
-                let _results = engine.find_definitions("handle").await.unwrap();
+                let _results = engine.find_definitions("handle", true).await.unwrap();
             });
         });
     });
@@ -680,7 +680,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
                 let conn = db.connect().unwrap();
                 let engine = oneup::search::SymbolSearchEngine::new(&conn);
-                let _results = engine.find_references("Config").await.unwrap();
+                let _results = engine.find_references("Config", false).await.unwrap();
             });
         });
     });
