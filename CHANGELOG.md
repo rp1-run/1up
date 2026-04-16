@@ -8,6 +8,13 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.7](https://github.com/rp1-run/1up/compare/v0.1.6...v0.1.7) (2026-04-16)
+
+
+### Features
+
+* resolve project root through git worktrees ([#27](https://github.com/rp1-run/1up/issues/27)) ([5e26a4a](https://github.com/rp1-run/1up/commit/5e26a4ad7524c2cf84566305133b7918e8f9abac))
+
 ## [0.1.6](https://github.com/rp1-run/1up/compare/v0.1.5...v0.1.6) (2026-04-15)
 
 
