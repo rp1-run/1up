@@ -18,6 +18,10 @@ pub struct SymbolArgs {
     #[arg(long, short)]
     pub references: bool,
 
+    /// Use fuzzy matching (substring, prefix, edit distance) when exact match fails
+    #[arg(long)]
+    pub fuzzy: bool,
+
     /// Project root directory (defaults to current directory)
     #[arg(long, default_value = ".")]
     pub path: String,
@@ -48,10 +52,14 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
 
     let engine = SymbolSearchEngine::new(&conn);
     let results = if args.references {
-        engine.find_references(&args.name).await?
+        engine.find_references(&args.name, args.fuzzy).await?
     } else {
-        engine.find_definitions(&args.name).await?
+        engine.find_definitions(&args.name, args.fuzzy).await?
     };
+
+    if results.is_empty() && !args.fuzzy {
+        eprintln!("No exact match found. Use --fuzzy for approximate matching.");
+    }
 
     println!("{}", fmt.format_symbol_results(&results));
     Ok(())

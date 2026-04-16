@@ -338,8 +338,9 @@ Execution rules:
 - For each checkpoint, find only the minimal evidence needed to resolve it.
 - Do not inspect tests, docs, benchmarks, or unrelated features unless a checkpoint directly requires them.
 - After any optional index check, your first exploration command must use `1up`.
-- Prefer `1up search`, `1up symbol`, and `1up context`.
-- Use fallback tools only for exact file inspection or exact string verification.
+- Pick tools by what you know: `1up search` for conceptual exploration, `1up symbol -r` or `grep` for known symbol/keyword lookup, `grep` when you need all instances of a keyword.
+- `1up symbol` uses exact matching by default. Use `1up symbol --fuzzy` only if exact match returns nothing and you want approximate results.
+- Use `grep` freely for exhaustive keyword searches — it is not a fallback, it is the right tool when you know the keyword.
 - Every shell command must start with `cd {{repo_path}} && ...`.
 - Keep an incremental command log and return it exactly as `shell_commands` in execution order.
 - Before emitting final JSON, recount your final `shell_commands` list and set `tool_calls_estimated` to that exact integer.

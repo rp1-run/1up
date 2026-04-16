@@ -483,7 +483,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         explicit_scope: Option<String>,
     ) -> Result<ResolveOutcome, OneupError> {
         let engine = SymbolSearchEngine::new(self.conn);
-        let mut seeds = engine.find_definition_candidates(name).await?;
+        let mut seeds = engine.find_definition_candidates(name, true).await?;
         if let Some(scope) = explicit_scope.as_deref() {
             seeds.retain(|candidate| scope_matches(&candidate.file_path, Some(scope)));
         }

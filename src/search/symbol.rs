@@ -26,18 +26,26 @@ impl<'a> SymbolSearchEngine<'a> {
         Self { conn }
     }
 
-    pub async fn find_definitions(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
+    pub async fn find_definitions(
+        &self,
+        name: &str,
+        fuzzy: bool,
+    ) -> Result<Vec<SymbolResult>, OneupError> {
         Ok(self
-            .find_matches(name, ReferenceKind::Definition)
+            .find_matches(name, ReferenceKind::Definition, fuzzy)
             .await?
             .into_iter()
             .map(|symbol_match| symbol_match.result)
             .collect())
     }
 
-    pub async fn find_references(&self, name: &str) -> Result<Vec<SymbolResult>, OneupError> {
+    pub async fn find_references(
+        &self,
+        name: &str,
+        fuzzy: bool,
+    ) -> Result<Vec<SymbolResult>, OneupError> {
         Ok(self
-            .find_reference_matches(name)
+            .find_reference_matches(name, fuzzy)
             .await?
             .into_iter()
             .map(|symbol_match| symbol_match.result)
@@ -47,9 +55,10 @@ impl<'a> SymbolSearchEngine<'a> {
     pub(crate) async fn find_definition_candidates(
         &self,
         name: &str,
+        fuzzy: bool,
     ) -> Result<Vec<CandidateRow>, OneupError> {
         Ok(self
-            .find_matches(name, ReferenceKind::Definition)
+            .find_matches(name, ReferenceKind::Definition, fuzzy)
             .await?
             .into_iter()
             .map(candidate_from_symbol_match)
@@ -80,9 +89,10 @@ impl<'a> SymbolSearchEngine<'a> {
     pub(crate) async fn find_reference_candidates(
         &self,
         name: &str,
+        fuzzy: bool,
     ) -> Result<Vec<CandidateRow>, OneupError> {
         Ok(self
-            .find_reference_matches(name)
+            .find_reference_matches(name, fuzzy)
             .await?
             .into_iter()
             .map(candidate_from_symbol_match)
@@ -93,6 +103,7 @@ impl<'a> SymbolSearchEngine<'a> {
         &self,
         query: &str,
         reference_kind: ReferenceKind,
+        fuzzy: bool,
     ) -> Result<Vec<SymbolMatch>, OneupError> {
         let canonical_query = normalize_symbolish(query);
         if canonical_query.is_empty() {
@@ -102,6 +113,10 @@ impl<'a> SymbolSearchEngine<'a> {
         let exact = self.load_matches(reference_kind, &canonical_query).await?;
         if !exact.is_empty() {
             return Ok(exact);
+        }
+
+        if !fuzzy {
+            return Ok(Vec::new());
         }
 
         let fallback_canonicals = self
@@ -244,15 +259,21 @@ impl<'a> SymbolSearchEngine<'a> {
         Ok(results)
     }
 
-    async fn find_reference_matches(&self, name: &str) -> Result<Vec<SymbolMatch>, OneupError> {
-        let definitions = self.find_matches(name, ReferenceKind::Definition).await?;
+    async fn find_reference_matches(
+        &self,
+        name: &str,
+        fuzzy: bool,
+    ) -> Result<Vec<SymbolMatch>, OneupError> {
+        let definitions = self
+            .find_matches(name, ReferenceKind::Definition, fuzzy)
+            .await?;
         let definition_ids: HashSet<String> = definitions
             .iter()
             .map(|symbol_match| symbol_match.segment_id.clone())
             .collect();
 
         let mut results = definitions;
-        let usages = self.find_matches(name, ReferenceKind::Usage).await?;
+        let usages = self.find_matches(name, ReferenceKind::Usage, fuzzy).await?;
         for usage in usages {
             if !definition_ids.contains(&usage.segment_id) {
                 results.push(usage);
@@ -295,7 +316,8 @@ fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
         if canonical_symbol == canonical_query {
             exact.push(symbol.clone());
         } else if canonical_symbol.contains(&canonical_query)
-            || canonical_query.contains(&canonical_symbol)
+            || (canonical_query.contains(&canonical_symbol)
+                && canonical_symbol.len() * 2 >= canonical_query.len())
             || levenshtein(&canonical_symbol, &canonical_query)
                 <= max_edit_distance(&canonical_query)
         {
@@ -414,7 +436,7 @@ mod tests {
         segments::upsert_segment(&conn, &seg).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("my_func").await.unwrap();
+        let results = engine.find_definitions("my_func", false).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "my_func");
         assert_eq!(results[0].kind, "function");
@@ -429,7 +451,10 @@ mod tests {
         segments::upsert_segment(&conn, &seg).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("config_loader").await.unwrap();
+        let results = engine
+            .find_definitions("config_loader", false)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "ConfigLoader");
     }
@@ -448,7 +473,7 @@ mod tests {
         segments::upsert_segment(&conn, &seg).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("total").await.unwrap();
+        let results = engine.find_definitions("total", true).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "calculate_total");
     }
@@ -463,7 +488,7 @@ mod tests {
         segments::upsert_segment(&conn, &s2).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("Config").await.unwrap();
+        let results = engine.find_definitions("Config", false).await.unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].kind, "struct");
         assert_eq!(results[1].kind, "module");
@@ -479,7 +504,7 @@ mod tests {
         segments::upsert_segment(&conn, &s2).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_references("MyType").await.unwrap();
+        let results = engine.find_references("MyType", false).await.unwrap();
         assert_eq!(results.len(), 2);
 
         let defs: Vec<_> = results
@@ -510,7 +535,7 @@ mod tests {
         segments::upsert_segment(&conn, &s1).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_references("process").await.unwrap();
+        let results = engine.find_references("process", false).await.unwrap();
         let defs: Vec<_> = results
             .iter()
             .filter(|r| r.reference_kind == ReferenceKind::Definition)
@@ -531,7 +556,7 @@ mod tests {
         segments::upsert_segment(&conn, &seg).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("unknown").await.unwrap();
+        let results = engine.find_definitions("unknown", false).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -543,7 +568,7 @@ mod tests {
         segments::upsert_segment(&conn, &seg).await.unwrap();
 
         let engine = SymbolSearchEngine::new(&conn);
-        let results = engine.find_definitions("process_dat").await.unwrap();
+        let results = engine.find_definitions("process_dat", true).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "process_data");
     }
@@ -594,5 +619,57 @@ mod tests {
         let symbols = vec!["foobar".to_string(), "bazfoo".to_string()];
         let result = find_matching_symbols(&symbols, "foo");
         assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exact_only_returns_empty_when_no_exact_match() {
+        let (_db, conn) = setup().await;
+
+        let seg = make_segment(
+            "s1",
+            "src/lib.rs",
+            "function",
+            r#"["calculate_total"]"#,
+            "[]",
+        );
+        segments::upsert_segment(&conn, &seg).await.unwrap();
+
+        let engine = SymbolSearchEngine::new(&conn);
+        let results = engine.find_definitions("total", false).await.unwrap();
+        assert!(results.is_empty(), "exact-only should not fuzzy-match");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_flag_returns_results_when_exact_fails() {
+        let (_db, conn) = setup().await;
+
+        let seg = make_segment(
+            "s1",
+            "src/lib.rs",
+            "function",
+            r#"["calculate_total"]"#,
+            "[]",
+        );
+        segments::upsert_segment(&conn, &seg).await.unwrap();
+
+        let engine = SymbolSearchEngine::new(&conn);
+        let results = engine.find_definitions("total", true).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "calculate_total");
+    }
+
+    #[test]
+    fn reverse_containment_rejects_short_candidates() {
+        // "create" (6 chars) is contained in "createhandler" (13 chars)
+        // but 6*2=12 < 13, so the 50% length guard rejects it
+        let symbols = vec!["create".to_string()];
+        let result = find_matching_symbols(&symbols, "createhandler");
+        assert!(result.is_empty(), "short substring should be rejected");
+
+        // "createh" (7 chars) is contained in "createhandler" (13 chars)
+        // and 7*2=14 >= 13, so it passes the guard
+        let symbols = vec!["createh".to_string()];
+        let result = find_matching_symbols(&symbols, "createhandler");
+        assert_eq!(result, vec!["createh"]);
     }
 }

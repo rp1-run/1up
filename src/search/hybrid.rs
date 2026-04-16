@@ -115,9 +115,9 @@ async fn symbol_search(
 
     for variant in variants {
         let symbol_matches: Vec<CandidateRow> = if include_usages {
-            engine.find_reference_candidates(&variant).await?
+            engine.find_reference_candidates(&variant, true).await?
         } else {
-            engine.find_definition_candidates(&variant).await?
+            engine.find_definition_candidates(&variant, true).await?
         };
         matches.extend(symbol_matches);
     }
