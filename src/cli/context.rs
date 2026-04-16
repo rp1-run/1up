@@ -30,18 +30,20 @@ pub struct ContextArgs {
 }
 
 pub async fn exec(args: ContextArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = Path::new(&args.path).canonicalize()?;
+    let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
+    let state_root = &resolved.state_root;
+    let source_root = &resolved.source_root;
     let fmt = formatter_for(format);
 
-    if let Ok(pid) = project::read_project_id(&project_root) {
-        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
+    if let Ok(pid) = project::read_project_id(state_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, state_root) {
             tracing::debug!("auto-start daemon skipped: {e}");
         }
     }
 
     let (file_str, line) = parse_location(&args.location)?;
     let (file_path, access_scope) =
-        resolve_context_target(&project_root, &file_str, args.allow_outside_root)?;
+        resolve_context_target(source_root, &file_str, args.allow_outside_root)?;
 
     let result = match access_scope {
         ContextAccessScope::ProjectRoot => {

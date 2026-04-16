@@ -124,3 +124,8 @@ tokio = { version = "1", features = ["full"] }
 [[bench]]
 name = "search_bench"
 harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

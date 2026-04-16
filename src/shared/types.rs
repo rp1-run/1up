@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -359,6 +360,27 @@ pub struct IndexParallelism {
     pub embed_threads: usize,
 }
 
+/// Pre-pipeline setup timing collected by CLI and daemon callers.
+///
+/// Captures the wall-clock start and per-stage setup durations that occur
+/// before the pipeline runs, so `total_ms` reflects what the user waited for.
+#[derive(Debug, Clone)]
+pub struct SetupTimings {
+    pub run_started_at: Instant,
+    pub db_prepare_ms: u128,
+    pub model_prepare_ms: u128,
+}
+
+impl SetupTimings {
+    pub fn new(run_started_at: Instant) -> Self {
+        Self {
+            run_started_at,
+            db_prepare_ms: 0,
+            model_prepare_ms: 0,
+        }
+    }
+}
+
 /// Stage-level timing data for an indexing run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStageTimings {
@@ -367,6 +389,32 @@ pub struct IndexStageTimings {
     pub embed_ms: u128,
     pub store_ms: u128,
     pub total_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_prepare_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_prepare_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_prep_ms: Option<u128>,
+}
+
+/// Scope metadata for an indexing run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexScopeInfo {
+    pub requested: String,
+    pub executed: String,
+    #[serde(default)]
+    pub changed_paths: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// Prefilter counters for an indexing run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPrefilterInfo {
+    pub discovered: usize,
+    pub metadata_skipped: usize,
+    pub content_read: usize,
+    pub deleted: usize,
 }
 
 /// High-level state for the latest indexing run.
@@ -412,6 +460,10 @@ pub struct IndexProgress {
     pub parallelism: Option<IndexParallelism>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IndexStageTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<IndexScopeInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilter: Option<IndexPrefilterInfo>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -431,6 +483,8 @@ impl IndexProgress {
             message: None,
             parallelism: None,
             timings: None,
+            scope: None,
+            prefilter: None,
             updated_at: Utc::now(),
         }
     }

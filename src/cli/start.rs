@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use clap::Args;
 
@@ -11,7 +12,7 @@ use crate::shared::config;
 use crate::shared::constants;
 use crate::shared::project;
 use crate::shared::reminder;
-use crate::shared::types::{IndexingConfig, OutputFormat};
+use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -31,10 +32,12 @@ pub struct StartArgs {
 }
 
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let fmt = formatter_for(format);
 
-    install_fences(&project_root, &*fmt);
+    install_fences(&source_root, &*fmt);
 
     if !lifecycle::supports_daemon() {
         println!(
@@ -98,7 +101,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        let stats = run_initial_index(&project_root, &indexing_config).await?;
+        let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
         registry.register(&project_id, &project_root, Some(indexing_config))?;
         lifecycle::send_sighup(pid)?;
         let msg = format!(
@@ -109,7 +112,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let stats = run_initial_index(&project_root, &indexing_config).await?;
+    let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
 
     registry.register(&project_id, &project_root, Some(indexing_config))?;
 
@@ -155,17 +158,24 @@ async fn project_has_usable_index(project_root: &Path) -> anyhow::Result<bool> {
 
 async fn run_initial_index(
     project_root: &Path,
+    source_root: &Path,
     indexing_config: &IndexingConfig,
 ) -> anyhow::Result<pipeline::PipelineStats> {
+    let mut setup = SetupTimings::new(Instant::now());
     let db_path = config::project_db_path(project_root);
-    let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect()?;
-    schema::prepare_for_write(&conn).await?;
 
+    let db_start = Instant::now();
+    let db = Db::open_rw(&db_path).await?;
+    let conn = db.connect_tuned().await?;
+    schema::prepare_for_write(&conn).await?;
+    setup.db_prepare_ms = db_start.elapsed().as_millis();
+
+    let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing(indexing_config.embed_threads)
         .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
     match &status {
         EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
         EmbeddingLoadStatus::Downloaded => {
@@ -192,11 +202,17 @@ async fn run_initial_index(
         }
     }
 
-    let stats = pipeline::run_with_config(
+    let stats = pipeline::run_with_scope_setup_and_progress_root(
         &conn,
-        project_root,
+        source_root,
         runtime.current_embedder(),
+        &crate::shared::types::RunScope::Full,
         indexing_config,
+        None,
+        true,
+        Some(setup),
+        None,
+        Some(project_root),
     )
     .await?;
 

@@ -24,12 +24,14 @@ pub struct StructuralArgs {
 }
 
 pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
-    let db_path = project_db_path(&project_root);
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let state_root = &resolved.state_root;
+    let source_root = &resolved.source_root;
+    let db_path = project_db_path(state_root);
     let fmt = formatter_for(format);
 
-    if let Ok(pid) = project::read_project_id(&project_root) {
-        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
+    if let Ok(pid) = project::read_project_id(state_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, state_root) {
             tracing::debug!("auto-start daemon skipped: {e}");
         }
     }
@@ -41,7 +43,7 @@ pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<
         let conn = db.connect()?;
         schema::ensure_current(&conn).await?;
 
-        let engine = StructuralSearchEngine::new(&project_root, Some(&conn));
+        let engine = StructuralSearchEngine::new(source_root, Some(&conn));
         let results = engine.search(&args.pattern, lang_filter).await?;
         println!("{}", fmt.format_structural_results(&results));
     } else {
@@ -49,7 +51,7 @@ pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<
             "warning: no index found at {}. Scanning files directly.",
             db_path.display()
         );
-        let engine = StructuralSearchEngine::new(&project_root, None);
+        let engine = StructuralSearchEngine::new(source_root, None);
         let results = engine.search(&args.pattern, lang_filter).await?;
         println!("{}", fmt.format_structural_results(&results));
     }

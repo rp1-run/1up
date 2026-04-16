@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::fmt::Write;
 
 use libsql::Connection;
 
@@ -263,21 +264,51 @@ pub(crate) async fn insert_relations(
     conn: &Connection,
     relations: &[RelationInsert],
 ) -> Result<(), OneupError> {
-    for relation in relations {
-        conn.execute(
-            queries::INSERT_SEGMENT_RELATION,
-            libsql::params![
-                relation.source_segment_id.clone(),
-                relation.relation_kind.as_str(),
-                relation.raw_target_symbol.clone(),
-                relation.canonical_target_symbol.clone(),
-                relation.lookup_canonical_symbol.clone(),
-                relation.qualifier_fingerprint.clone(),
-                relation.edge_identity_kind.clone(),
-            ],
-        )
-        .await
-        .map_err(|e| StorageError::Query(format!("insert segment relation failed: {e}")))?;
+    if relations.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in relations.chunks(queries::RELATION_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT OR REPLACE INTO segment_relations (\
+             source_segment_id, relation_kind, raw_target_symbol, \
+             canonical_target_symbol, lookup_canonical_symbol, \
+             qualifier_fingerprint, edge_identity_kind, created_at\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::RELATION_INSERT_COLS);
+
+        for (i, relation) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let base = i * queries::RELATION_INSERT_COLS;
+            write!(
+                sql,
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'))",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+            )
+            .expect("write to String cannot fail");
+
+            params.push(relation.source_segment_id.clone().into());
+            params.push(relation.relation_kind.as_str().to_string().into());
+            params.push(relation.raw_target_symbol.clone().into());
+            params.push(relation.canonical_target_symbol.clone().into());
+            params.push(relation.lookup_canonical_symbol.clone().into());
+            params.push(relation.qualifier_fingerprint.clone().into());
+            params.push(relation.edge_identity_kind.clone().into());
+        }
+
+        conn.execute(&sql, params).await.map_err(|e| {
+            StorageError::Query(format!("batch insert segment relations failed: {e}"))
+        })?;
     }
 
     Ok(())

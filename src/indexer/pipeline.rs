@@ -100,6 +100,8 @@ struct ProgressUpdate {
     files_total: usize,
     parallelism: Option<IndexParallelism>,
     timings: Option<IndexStageTimings>,
+    scope: Option<IndexScopeInfo>,
+    prefilter: Option<IndexPrefilterInfo>,
     persist: bool,
 }
 
@@ -123,6 +125,8 @@ fn refresh_progress(
         message: pipeline_progress_message(stats, update.phase, update.files_total),
         parallelism: update.parallelism,
         timings: update.timings,
+        scope: update.scope,
+        prefilter: update.prefilter,
         updated_at: chrono::Utc::now(),
     };
     if update.persist {
@@ -140,11 +144,11 @@ use crate::shared::constants::{EMBEDDING_DIM, HF_MODEL_REPO};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
-    IndexParallelism, IndexPhase, IndexProgress, IndexStageTimings, IndexState, IndexingConfig,
-    ParsedSegment, RunScope,
+    IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexScopeInfo,
+    IndexStageTimings, IndexState, IndexingConfig, ParsedSegment, RunScope, SetupTimings,
 };
 use crate::storage::schema;
-use crate::storage::segments::{self, FileSegmentBatch, SegmentInsert};
+use crate::storage::segments::{self, FileSegmentBatch, IndexedFileMeta, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 pub type ProgressSender = Sender<IndexProgress>;
@@ -155,6 +159,9 @@ struct TimingAccumulator {
     parse_ms: u128,
     embed_ms: u128,
     store_ms: u128,
+    db_prepare_ms: Option<u128>,
+    model_prepare_ms: Option<u128>,
+    input_prep_ms: Option<u128>,
 }
 
 impl TimingAccumulator {
@@ -165,6 +172,9 @@ impl TimingAccumulator {
             embed_ms: self.embed_ms,
             store_ms: self.store_ms,
             total_ms: run_started_at.elapsed().as_millis(),
+            db_prepare_ms: self.db_prepare_ms,
+            model_prepare_ms: self.model_prepare_ms,
+            input_prep_ms: self.input_prep_ms,
         }
     }
 }
@@ -217,12 +227,17 @@ struct ScannedWorkItem {
     path: PathBuf,
     extension: String,
     stored_hash: Option<String>,
+    file_size: u64,
+    modified_ns: i64,
 }
 
 #[derive(Debug)]
 struct ParsedWorkItem {
     relative_path: String,
     file_hash: String,
+    extension: String,
+    file_size: u64,
+    modified_ns: i64,
     segments: Vec<ParsedSegment>,
 }
 
@@ -259,6 +274,7 @@ fn relative_path_for(project_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 fn build_scanned_work_items(
     project_root: &Path,
     scanned: Vec<scanner::ScannedFile>,
@@ -280,6 +296,8 @@ fn build_scanned_work_items(
                 path: scanned_file.path,
                 extension: scanned_file.extension,
                 stored_hash,
+                file_size: scanned_file.file_size,
+                modified_ns: scanned_file.modified_ns,
             }
         })
         .collect()
@@ -288,11 +306,20 @@ fn build_scanned_work_items(
 struct RunInputs {
     scanned_files: Vec<ScannedWorkItem>,
     deleted_paths: Vec<String>,
+    metadata_unchanged_count: usize,
 }
 
 enum ScopePreparation {
     Ready(RunInputs),
     FallbackToFull(String),
+}
+
+struct ScopeResolution {
+    inputs: RunInputs,
+    requested_scope: String,
+    executed_scope: String,
+    changed_path_count: usize,
+    fallback_reason: Option<String>,
 }
 
 fn requires_full_scope_fallback(relative_path: &Path) -> bool {
@@ -320,22 +347,57 @@ async fn prepare_full_run_inputs(
     project_root: &Path,
 ) -> Result<RunInputs, OneupError> {
     let scanned = scanner::scan_directory(project_root)?;
+    let manifest = segments::get_all_indexed_files(conn).await?;
     let stored_hashes = segments::get_all_file_hashes(conn).await?;
-    let scanned_files = build_scanned_work_items(project_root, scanned, &stored_hashes);
 
-    let scanned_paths: HashSet<String> = scanned_files
-        .iter()
-        .map(|file| file.relative_path.clone())
-        .collect();
+    let project_root_canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let mut scanned_files = Vec::new();
+    let mut scanned_paths = HashSet::new();
+    for scanned_file in scanned {
+        let relative_path = relative_path_for(&project_root_canonical, &scanned_file.path);
+        scanned_paths.insert(relative_path.clone());
+
+        let stored_hash = if let Some(entry) = manifest.get(&relative_path) {
+            Some(entry.file_hash.clone())
+        } else {
+            stored_hashes.get(&relative_path).cloned()
+        };
+
+        scanned_files.push(ScannedWorkItem {
+            sequence_id: scanned_files.len(),
+            relative_path,
+            path: scanned_file.path,
+            extension: scanned_file.extension,
+            stored_hash,
+            file_size: scanned_file.file_size,
+            modified_ns: scanned_file.modified_ns,
+        });
+    }
+
+    let metadata_unchanged_count = 0usize;
+
+    let manifest_paths: HashSet<&String> = manifest.keys().collect();
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
         .await?
         .into_iter()
         .collect();
-    let deleted_paths = indexed_paths.difference(&scanned_paths).cloned().collect();
+    let all_known_paths: HashSet<&String> = manifest_paths
+        .into_iter()
+        .chain(indexed_paths.iter())
+        .collect();
+    let deleted_paths = all_known_paths
+        .into_iter()
+        .filter(|p| !scanned_paths.contains(*p))
+        .cloned()
+        .collect();
 
     Ok(RunInputs {
         scanned_files,
         deleted_paths,
+        metadata_unchanged_count,
     })
 }
 
@@ -348,6 +410,7 @@ async fn prepare_scoped_run_inputs(
         return Ok(ScopePreparation::Ready(RunInputs {
             scanned_files: Vec::new(),
             deleted_paths: Vec::new(),
+            metadata_unchanged_count: 0,
         }));
     }
 
@@ -359,6 +422,7 @@ async fn prepare_scoped_run_inputs(
 
     let mut scanned_files = Vec::new();
     let mut deleted_paths = Vec::new();
+    let mut metadata_unchanged_count = 0usize;
 
     for relative_path in changed_paths {
         if requires_full_scope_fallback(relative_path) {
@@ -379,14 +443,25 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
-            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
             if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
+                if let Some(entry) = segments::get_indexed_file(conn, &relative_string).await? {
+                    if entry.file_size == scanned_file.file_size as i64
+                        && entry.modified_ns == scanned_file.modified_ns
+                    {
+                        metadata_unchanged_count += 1;
+                        continue;
+                    }
+                }
+
+                let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
                 scanned_files.push(ScannedWorkItem {
                     sequence_id: scanned_files.len(),
                     relative_path: relative_string,
                     path: scanned_file.path,
                     extension: scanned_file.extension,
                     stored_hash,
+                    file_size: scanned_file.file_size,
+                    modified_ns: scanned_file.modified_ns,
                 });
                 continue;
             }
@@ -398,6 +473,7 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
+            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
             if stored_hash.is_some() {
                 return Ok(ScopePreparation::FallbackToFull(format!(
                     "path {} no longer matches scanner filters",
@@ -427,6 +503,7 @@ async fn prepare_scoped_run_inputs(
     Ok(ScopePreparation::Ready(RunInputs {
         scanned_files,
         deleted_paths,
+        metadata_unchanged_count,
     }))
 }
 
@@ -482,6 +559,9 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
     ParseResultKind::Ready(ParsedWorkItem {
         relative_path: scanned_file.relative_path,
         file_hash,
+        extension: scanned_file.extension,
+        file_size: scanned_file.file_size,
+        modified_ns: scanned_file.modified_ns,
         segments,
     })
 }
@@ -582,16 +662,29 @@ fn build_segment_batches(
     Ok(batches)
 }
 
+fn build_manifest_meta(file: &ParsedWorkItem) -> IndexedFileMeta {
+    IndexedFileMeta {
+        extension: file.extension.clone(),
+        file_hash: file.file_hash.clone(),
+        file_size: file.file_size as i64,
+        modified_ns: file.modified_ns,
+    }
+}
+
 async fn replace_file_batches(
     conn: &Connection,
     parsed_files: &[ParsedWorkItem],
     segment_batches: &[Vec<SegmentInsert>],
 ) -> Result<(), OneupError> {
+    let manifest_metas: Vec<IndexedFileMeta> =
+        parsed_files.iter().map(build_manifest_meta).collect();
+
     if parsed_files.len() == 1 {
-        return segments::replace_file_segments_tx(
+        return segments::replace_file_segments_tx_with_meta(
             conn,
             &parsed_files[0].relative_path,
             &segment_batches[0],
+            Some(&manifest_metas[0]),
         )
         .await;
     }
@@ -599,9 +692,11 @@ async fn replace_file_batches(
     let file_batches: Vec<FileSegmentBatch<'_>> = parsed_files
         .iter()
         .zip(segment_batches.iter())
-        .map(|(file, segments)| FileSegmentBatch {
+        .zip(manifest_metas.iter())
+        .map(|((file, segments), meta)| FileSegmentBatch {
             file_path: file.relative_path.as_str(),
             segments,
+            manifest_meta: Some(meta),
         })
         .collect();
 
@@ -651,6 +746,7 @@ async fn delete_removed_files(
             .map(|path| FileSegmentBatch {
                 file_path: path.as_str(),
                 segments: &[],
+                manifest_meta: None,
             })
             .collect();
         segments::replace_file_batch_tx(conn, &file_batches).await?;
@@ -677,6 +773,8 @@ struct FlushState<'a> {
     run_started_at: Instant,
     unsupported_extensions: &'a mut HashSet<String>,
     progress_tx: Option<ProgressSender>,
+    scope: Option<IndexScopeInfo>,
+    prefilter: Option<IndexPrefilterInfo>,
 }
 
 impl FlushState<'_> {
@@ -691,6 +789,8 @@ impl FlushState<'_> {
                 files_total: self.files_total,
                 parallelism: self.parallelism.clone(),
                 timings: Some(self.timings.snapshot(self.run_started_at)),
+                scope: self.scope.clone(),
+                prefilter: self.prefilter.clone(),
                 persist,
             },
         );
@@ -860,6 +960,7 @@ pub async fn run_with_config_and_progress_ui(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn run_with_scope(
     conn: &Connection,
     project_root: &Path,
@@ -900,55 +1001,168 @@ pub async fn run_with_scope_and_progress_ui(
     progress_tx: Option<ProgressSender>,
     show_progress_ui: bool,
 ) -> Result<PipelineStats, OneupError> {
-    let run_inputs = match scope {
-        RunScope::Full => prepare_full_run_inputs(conn, project_root).await?,
+    run_with_scope_and_setup(
+        conn,
+        project_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        show_progress_ui,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_scope_and_setup(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
+    daemon_fallback_reason: Option<String>,
+) -> Result<PipelineStats, OneupError> {
+    run_with_scope_setup_and_progress_root(
+        conn,
+        project_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        show_progress_ui,
+        setup_timings,
+        daemon_fallback_reason,
+        None,
+    )
+    .await
+}
+
+/// Like [`run_with_scope_and_setup`], but accepts a separate
+/// `progress_root` where `.1up/` state (progress files) should be
+/// written. When `None`, `project_root` is used for both scanning
+/// and progress (the default for daemon callers where they are the
+/// same). CLI callers running from a git worktree pass the main
+/// repo root here so that progress is written beside the index.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_scope_setup_and_progress_root(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
+    daemon_fallback_reason: Option<String>,
+    progress_root: Option<&Path>,
+) -> Result<PipelineStats, OneupError> {
+    let progress_root = progress_root.unwrap_or(project_root);
+    let input_prep_start = Instant::now();
+    let resolution = match scope {
+        RunScope::Full => {
+            let run_inputs = prepare_full_run_inputs(conn, project_root).await?;
+            let changed_count = run_inputs.scanned_files.len();
+            ScopeResolution {
+                inputs: run_inputs,
+                requested_scope: "full".to_string(),
+                executed_scope: "full".to_string(),
+                changed_path_count: changed_count,
+                fallback_reason: daemon_fallback_reason,
+            }
+        }
         RunScope::Paths(changed_paths) => {
+            let requested_count = changed_paths.len();
             match prepare_scoped_run_inputs(conn, project_root, changed_paths).await? {
-                ScopePreparation::Ready(run_inputs) => run_inputs,
+                ScopePreparation::Ready(run_inputs) => {
+                    let changed_count = run_inputs.scanned_files.len();
+                    ScopeResolution {
+                        inputs: run_inputs,
+                        requested_scope: format!("scoped:{requested_count}"),
+                        executed_scope: format!("scoped:{changed_count}"),
+                        changed_path_count: changed_count,
+                        fallback_reason: None,
+                    }
+                }
                 ScopePreparation::FallbackToFull(reason) => {
                     info!(
                         "scoped run for {} fell back to a full scan: {}",
                         project_root.display(),
                         reason
                     );
-                    prepare_full_run_inputs(conn, project_root).await?
+                    let run_inputs = prepare_full_run_inputs(conn, project_root).await?;
+                    let changed_count = run_inputs.scanned_files.len();
+                    ScopeResolution {
+                        inputs: run_inputs,
+                        requested_scope: format!("scoped:{requested_count}"),
+                        executed_scope: "full".to_string(),
+                        changed_path_count: changed_count,
+                        fallback_reason: Some(reason),
+                    }
                 }
             }
         }
     };
+    let input_prep_ms = input_prep_start.elapsed().as_millis();
 
     execute_run_with_inputs(
         conn,
-        project_root,
+        progress_root,
         embedder,
         config,
-        run_inputs,
+        resolution,
+        input_prep_ms,
         progress_tx,
         show_progress_ui,
+        setup_timings,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_run_with_inputs(
     conn: &Connection,
     project_root: &Path,
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
-    run_inputs: RunInputs,
+    resolution: ScopeResolution,
+    input_prep_ms: u128,
     progress_tx: Option<ProgressSender>,
     show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
 ) -> Result<PipelineStats, OneupError> {
-    let run_started_at = Instant::now();
+    let run_started_at = setup_timings
+        .as_ref()
+        .map(|st| st.run_started_at)
+        .unwrap_or_else(Instant::now);
     let mut stats = PipelineStats::default();
-    let mut timings = TimingAccumulator::default();
+    let mut timings = TimingAccumulator {
+        input_prep_ms: Some(input_prep_ms),
+        db_prepare_ms: setup_timings.as_ref().map(|st| st.db_prepare_ms),
+        model_prepare_ms: setup_timings.as_ref().map(|st| st.model_prepare_ms),
+        ..Default::default()
+    };
     let mut embedder = embedder;
+    let ScopeResolution {
+        inputs,
+        requested_scope,
+        executed_scope,
+        changed_path_count,
+        fallback_reason,
+    } = resolution;
     let RunInputs {
         scanned_files,
         deleted_paths,
-    } = run_inputs;
+        metadata_unchanged_count,
+    } = inputs;
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
+    stats.files_skipped += metadata_unchanged_count;
     let mut parallelism = Some(config.reporting_parallelism(0, has_embedder));
 
     if !has_embedder {
@@ -956,6 +1170,13 @@ async fn execute_run_with_inputs(
     } else {
         schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
     }
+
+    let scope_info = Some(IndexScopeInfo {
+        requested: requested_scope,
+        executed: executed_scope,
+        changed_paths: changed_path_count,
+        fallback_reason,
+    });
 
     refresh_progress(
         &mut stats,
@@ -967,6 +1188,8 @@ async fn execute_run_with_inputs(
             files_total: 0,
             parallelism: parallelism.clone(),
             timings: Some(timings.snapshot(run_started_at)),
+            scope: scope_info.clone(),
+            prefilter: None,
             persist: true,
         },
     );
@@ -987,9 +1210,25 @@ async fn execute_run_with_inputs(
     timings.scan_ms = scan_started_at.elapsed().as_millis();
     parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
 
+    let prefilter_info = Some(IndexPrefilterInfo {
+        discovered: stats.files_scanned,
+        metadata_skipped: metadata_unchanged_count,
+        content_read: total_files,
+        deleted: deleted_paths.len(),
+    });
+
+    if metadata_unchanged_count > 0 {
+        info!(
+            "metadata prefilter: {} files skipped (unchanged), {} files need processing",
+            metadata_unchanged_count, total_files,
+        );
+    }
+
     if let Some(parallelism) = &parallelism {
         info!(
-            "scan stage complete: {} files discovered in {}ms (jobs configured {}, effective {}, embed threads {})",
+            "scan stage complete: {} files discovered ({} metadata-unchanged, {} to process) in {}ms (jobs configured {}, effective {}, embed threads {})",
+            stats.files_scanned,
+            metadata_unchanged_count,
             total_files,
             timings.scan_ms,
             parallelism.jobs_configured,
@@ -1028,6 +1267,8 @@ async fn execute_run_with_inputs(
             files_total: total_files,
             parallelism: parallelism.clone(),
             timings: Some(timings.snapshot(run_started_at)),
+            scope: scope_info.clone(),
+            prefilter: prefilter_info.clone(),
             persist: true,
         },
     );
@@ -1054,6 +1295,8 @@ async fn execute_run_with_inputs(
             run_started_at,
             unsupported_extensions: &mut unsupported_extensions,
             progress_tx: progress_tx.clone(),
+            scope: scope_info.clone(),
+            prefilter: prefilter_info.clone(),
         };
 
         while next_to_dispatch < total_files || !parse_workers.is_empty() {
@@ -1166,6 +1409,8 @@ async fn execute_run_with_inputs(
             files_total: total_files,
             parallelism,
             timings: Some(final_timings),
+            scope: scope_info,
+            prefilter: prefilter_info,
             persist: true,
         },
     );

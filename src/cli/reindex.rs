@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use clap::Args;
 
 use crate::cli::output::{formatter_for, spawn_index_watch_renderer};
@@ -5,8 +7,9 @@ use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
+use crate::shared::constants::SCHEMA_VERSION;
 use crate::shared::progress::{ProgressState, ProgressUi};
-use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -74,7 +77,9 @@ fn send_watch_progress(
 }
 
 async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
@@ -85,7 +90,15 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
     )?;
 
     if should_use_direct_watch_progress_ui(format) {
-        let stats = run_reindex_once(&db_path, &project_root, &indexing_config, true, None).await?;
+        let stats = run_reindex_once(
+            &db_path,
+            &source_root,
+            Some(&project_root),
+            &indexing_config,
+            true,
+            None,
+        )
+        .await?;
 
         let msg = format!(
             "Re-indexed {} files ({} segments). Clean rebuild complete.{}",
@@ -106,7 +119,8 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
 
     let result = run_reindex_once(
         &db_path,
-        &project_root,
+        &source_root,
+        Some(&project_root),
         &indexing_config,
         false,
         Some(&progress_tx),
@@ -139,7 +153,9 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         return exec_watch(args, format).await;
     }
 
-    let project_root = std::path::Path::new(&args.path).canonicalize()?;
+    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
@@ -151,7 +167,8 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let show_progress_ui = format == OutputFormat::Human;
     let stats = run_reindex_once(
         &db_path,
-        &project_root,
+        &source_root,
+        Some(&project_root),
         &indexing_config,
         show_progress_ui,
         None,
@@ -175,19 +192,27 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
 async fn run_reindex_once(
     db_path: &std::path::Path,
     project_root: &std::path::Path,
+    state_root: Option<&std::path::Path>,
     indexing_config: &crate::shared::types::IndexingConfig,
     show_progress_ui: bool,
     progress_tx: Option<&pipeline::ProgressSender>,
 ) -> anyhow::Result<pipeline::PipelineStats> {
+    let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
 
+    let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::rebuild(&conn).await?;
-    setup_spinner.success_with("Rebuilt schema v5");
+    setup.db_prepare_ms = db_start.elapsed().as_millis();
+    setup_spinner.success_with(format!("Rebuilt schema v{SCHEMA_VERSION}"));
 
     if let Some(progress_tx) = progress_tx {
-        send_watch_progress(progress_tx, IndexPhase::Rebuilding, "Rebuilt schema v5");
+        send_watch_progress(
+            progress_tx,
+            IndexPhase::Rebuilding,
+            format!("Rebuilt schema v{SCHEMA_VERSION}"),
+        );
         send_watch_progress(
             progress_tx,
             IndexPhase::LoadingModel,
@@ -197,10 +222,12 @@ async fn run_reindex_once(
 
     let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
+    let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)
         .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
     let status_message = model_status_message(&status);
     match &status {
         EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => model_spinner.success(),
@@ -212,13 +239,17 @@ async fn run_reindex_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
-    pipeline::run_with_config_and_progress_ui(
+    pipeline::run_with_scope_setup_and_progress_root(
         &conn,
         project_root,
         runtime.current_embedder(),
+        &crate::shared::types::RunScope::Full,
         indexing_config,
         progress_tx.cloned(),
         show_progress_ui,
+        Some(setup),
+        None,
+        state_root,
     )
     .await
     .map_err(Into::into)

@@ -40,6 +40,9 @@
 - Search results expose additive machine-readable `segment_id` handles for exact impact follow-up without changing discovery ranking.
 - Schema v9 persists relation lookup-target and qualifier-fingerprint evidence in `segment_relations`, enabling bounded structural-confidence scoring without changing the impact envelope.
 - Rollout evidence now has dedicated entry points: `just impact-eval` for trust gating and `just impact-bench` for latency gating.
+- Schema v11 adds `indexed_files` manifest table for metadata-based unchanged-file prefiltering; indexing path uses tuned connections, batched multi-value INSERTs, and end-to-end timing propagation via `SetupTimings`.
+- `IndexProgress` exposes additive `scope` and `prefilter` fields; daemon tracks scope fallback reasons via `pending_fallback_reason`.
+- Benchmark script expanded with daemon refresh and scope evidence in summary JSON.
 
 ## How To Load
 

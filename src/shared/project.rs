@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -56,6 +56,88 @@ pub fn is_initialized(project_root: &Path) -> bool {
     read_project_id(project_root).is_ok()
 }
 
+/// A resolved project with separate state and source roots.
+///
+/// When running from a git worktree, `state_root` points to the main
+/// repository (where `.1up/` lives) while `source_root` points to the
+/// worktree (where the user's files are). Outside a worktree, both are
+/// identical.
+pub struct ResolvedProject {
+    /// Root where `.1up/` state directory lives — use for DB path, project ID,
+    /// daemon communication, and registry operations.
+    pub state_root: PathBuf,
+    /// Root where source files should be read — use for scanning, indexing,
+    /// file resolution, and fence installation.
+    pub source_root: PathBuf,
+}
+
+/// Resolves the project roots for a given path by searching for an existing
+/// `.1up/` directory. Checks the canonicalized path and its ancestors first,
+/// then falls back to git worktree detection. Returns separate state and
+/// source roots to avoid conflating where `.1up/` lives with where the
+/// user's files are.
+pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
+    let canonical = path.canonicalize()?;
+
+    let mut current = Some(canonical.as_path());
+    while let Some(dir) = current {
+        if dir.join(".1up").is_dir() {
+            return Ok(ResolvedProject {
+                state_root: dir.to_path_buf(),
+                source_root: canonical,
+            });
+        }
+        current = dir.parent();
+    }
+
+    if let Some(main_root) = resolve_worktree_main_root(&canonical) {
+        if main_root.join(".1up").is_dir() {
+            return Ok(ResolvedProject {
+                state_root: main_root,
+                source_root: canonical,
+            });
+        }
+    }
+
+    Ok(ResolvedProject {
+        state_root: canonical.clone(),
+        source_root: canonical,
+    })
+}
+
+/// Detects if the given path is inside a git worktree and returns the main
+/// worktree root. A git worktree has a `.git` file (not directory) containing
+/// `gitdir: <path>`. The referenced gitdir contains a `commondir` file
+/// pointing to the main repository's `.git` directory.
+fn resolve_worktree_main_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        let dot_git = dir.join(".git");
+        if dot_git.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let gitdir_path = content.trim().strip_prefix("gitdir: ")?;
+            let gitdir = if Path::new(gitdir_path).is_absolute() {
+                PathBuf::from(gitdir_path)
+            } else {
+                dir.join(gitdir_path)
+            };
+
+            let commondir_content = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+            let commondir_ref = commondir_content.trim();
+            let common_git_dir = if Path::new(commondir_ref).is_absolute() {
+                PathBuf::from(commondir_ref)
+            } else {
+                gitdir.join(commondir_ref)
+            };
+
+            let main_root = common_git_dir.canonicalize().ok()?.parent()?.to_path_buf();
+            return Some(main_root);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +185,67 @@ mod tests {
 
         let err = write_project_id(&project_root).unwrap_err();
         assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn resolve_project_root_finds_dot_1up_at_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let resolved = resolve_project_root(&root).unwrap();
+        assert_eq!(resolved.state_root, root);
+        assert_eq!(resolved.source_root, root);
+    }
+
+    #[test]
+    fn resolve_project_root_finds_dot_1up_in_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        let subdir = root.join("deep").join("nested").join("dir");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let resolved = resolve_project_root(&subdir).unwrap();
+        assert_eq!(resolved.state_root, root);
+        assert_eq!(resolved.source_root, subdir);
+    }
+
+    #[test]
+    fn resolve_project_root_follows_worktree_git_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        let main_repo = tmp_root.join("main");
+        fs::create_dir_all(main_repo.join(".git")).unwrap();
+        fs::create_dir_all(main_repo.join(".1up")).unwrap();
+
+        let wt_gitdir = main_repo.join(".git").join("worktrees").join("feature");
+        fs::create_dir_all(&wt_gitdir).unwrap();
+        fs::write(wt_gitdir.join("commondir"), "../..").unwrap();
+
+        let worktree = tmp_root.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let resolved = resolve_project_root(&worktree).unwrap();
+        assert_eq!(resolved.state_root, main_repo);
+        assert_eq!(resolved.source_root, worktree);
+    }
+
+    #[test]
+    fn resolve_project_root_returns_canonical_when_no_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let subdir = root.join("empty");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let resolved = resolve_project_root(&subdir).unwrap();
+        assert_eq!(resolved.state_root, subdir);
+        assert_eq!(resolved.source_root, subdir);
     }
 }
