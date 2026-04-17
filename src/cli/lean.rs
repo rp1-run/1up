@@ -14,13 +14,6 @@
 //! Fields are separated by two ASCII spaces (design D2). The `:<segment_id>`
 //! suffix is the 12-char display handle (design D3). `~P`/`~C` channel
 //! suffixes are exclusive to `impact` rows (design D5).
-//!
-//! Call sites wire these renderers in T6 (core command `exec` rewiring). Until
-//! then the module is exercised only through its unit tests, so the public
-//! helpers and internal row writers are marked dead-code-tolerant at the
-//! module level.
-
-#![allow(dead_code)]
 
 use std::io::Write;
 

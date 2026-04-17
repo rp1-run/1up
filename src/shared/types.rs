@@ -143,15 +143,6 @@ pub enum ContextAccessScope {
     OutsideRoot,
 }
 
-impl ContextAccessScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ProjectRoot => "project_root",
-            Self::OutsideRoot => "outside_root",
-        }
-    }
-}
-
 /// A context retrieval result with the enclosing scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextResult {

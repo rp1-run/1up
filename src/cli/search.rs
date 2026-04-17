@@ -1,8 +1,9 @@
 use clap::Args;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cli::output::formatter_for;
+use crate::cli::lean;
 use crate::daemon::{lifecycle, search_service};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::search::HybridSearchEngine;
@@ -29,11 +30,10 @@ pub struct SearchArgs {
 
 const DAEMON_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
 
-pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: SearchArgs, _format: OutputFormat) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);
-    let fmt = formatter_for(format);
 
     if let Ok(pid) = project::read_project_id(&project_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
@@ -44,9 +44,9 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
     if let Some((results, daemon_version)) =
         try_daemon_search(&project_root, &args.query, args.limit).await
     {
-        println!("{}", fmt.format_search_results(&results));
+        write_results(&results)?;
         if let Some(ref dv) = daemon_version {
-            if dv != VERSION && format != OutputFormat::Json {
+            if dv != VERSION {
                 eprintln!(
                     "warning: CLI version ({VERSION}) differs from daemon version ({dv}). Run `1up stop` and re-run your command to restart the daemon under the current binary."
                 );
@@ -96,7 +96,16 @@ pub async fn exec(args: SearchArgs, format: OutputFormat) -> anyhow::Result<()> 
         engine.fts_only_search(&args.query, args.limit).await?
     };
 
-    println!("{}", fmt.format_search_results(&results));
+    write_results(&results)?;
+    Ok(())
+}
+
+/// Emit lean search rows through a locked stdout handle so the renderer writes
+/// once per call without buffering the entire result set into a `String`.
+fn write_results(results: &[SearchResult]) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    lean::render_search(&mut stdout, results)?;
+    stdout.flush()?;
     Ok(())
 }
 

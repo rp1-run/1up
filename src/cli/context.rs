@@ -1,9 +1,9 @@
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use crate::cli::output::formatter_for;
+use crate::cli::lean;
 use crate::daemon::lifecycle;
 use crate::search::context::{parse_location, ContextEngine};
 use crate::shared::errors::{FilesystemError, OneupError};
@@ -29,11 +29,10 @@ pub struct ContextArgs {
     pub allow_outside_root: bool,
 }
 
-pub async fn exec(args: ContextArgs, format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: ContextArgs, _format: OutputFormat) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let state_root = &resolved.state_root;
     let source_root = &resolved.source_root;
-    let fmt = formatter_for(format);
 
     if let Ok(pid) = project::read_project_id(state_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, state_root) {
@@ -53,7 +52,9 @@ pub async fn exec(args: ContextArgs, format: OutputFormat) -> anyhow::Result<()>
             ContextEngine::retrieve_with_scope(&file_path, line, args.expansion, access_scope)?
         }
     };
-    println!("{}", fmt.format_context_result(&result));
+    let mut stdout = io::stdout().lock();
+    lean::render_context(&mut stdout, &result)?;
+    stdout.flush()?;
     Ok(())
 }
 

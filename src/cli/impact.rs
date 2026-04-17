@@ -1,9 +1,10 @@
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::bail;
 use clap::Args;
 
-use crate::cli::output::formatter_for;
+use crate::cli::lean;
 use crate::search::context::parse_location;
 use crate::search::impact::{ImpactAnchor, ImpactHorizonEngine, ImpactRequest};
 use crate::shared::config::project_db_path;
@@ -86,11 +87,10 @@ impl ImpactArgs {
     }
 }
 
-pub async fn exec(args: ImpactArgs, format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: ImpactArgs, _format: OutputFormat) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);
-    let fmt = formatter_for(format);
 
     if !db_path.exists() {
         bail!(
@@ -106,7 +106,9 @@ pub async fn exec(args: ImpactArgs, format: OutputFormat) -> anyhow::Result<()> 
     let engine = ImpactHorizonEngine::new(&conn);
     let result = engine.explore(args.to_request()?).await?;
 
-    println!("{}", fmt.format_impact_result(&result));
+    let mut stdout = io::stdout().lock();
+    lean::render_impact(&mut stdout, &result)?;
+    stdout.flush()?;
     Ok(())
 }
 

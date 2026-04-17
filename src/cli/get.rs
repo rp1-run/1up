@@ -3,6 +3,7 @@ use std::path::Path;
 
 use clap::Args;
 
+use crate::cli::lean;
 use crate::shared::config::project_db_path;
 use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
@@ -55,6 +56,7 @@ pub async fn exec(args: GetArgs, _format: OutputFormat) -> anyhow::Result<()> {
         write_outcome(&mut stdout, &mut stderr, raw_handle, &handle, &outcome)?;
     }
 
+    stdout.flush()?;
     Ok(())
 }
 
@@ -99,14 +101,10 @@ fn write_outcome<W: Write, E: Write>(
     outcome: &HandleOutcome,
 ) -> anyhow::Result<()> {
     match outcome {
-        HandleOutcome::Found(segment) => write_segment(out, segment)?,
-        HandleOutcome::NotFound => {
-            writeln!(out, "not_found\t{raw_handle}")?;
-            writeln!(out, "---")?;
-        }
+        HandleOutcome::Found(segment) => lean::render_get_found(out, segment)?,
+        HandleOutcome::NotFound => lean::render_get_not_found(out, raw_handle)?,
         HandleOutcome::Ambiguous(ids) => {
-            writeln!(out, "not_found\t{raw_handle}")?;
-            writeln!(out, "---")?;
+            lean::render_get_not_found(out, raw_handle)?;
             writeln!(
                 err,
                 "handle `{handle}` matched {} segments: {}. Provide a longer prefix.",
@@ -116,40 +114,6 @@ fn write_outcome<W: Write, E: Write>(
         }
     }
     Ok(())
-}
-
-fn write_segment<W: Write>(out: &mut W, segment: &StoredSegment) -> anyhow::Result<()> {
-    writeln!(out, "segment {}", segment.id)?;
-
-    let defined = segment.parsed_defined_symbols().join(",");
-    let referenced = segment.parsed_referenced_symbols().join(",");
-    let called = segment.parsed_called_symbols().join(",");
-    let breadcrumb = segment.breadcrumb.as_deref().unwrap_or("-");
-
-    writeln!(
-        out,
-        "path\t{}\tlines\t{}-{}\tkind\t{}\tlanguage\t{}\tbreadcrumb\t{}\trole\t{}\tcomplexity\t{}\tdefines\t{}\treferences\t{}\tcalls\t{}",
-        segment.file_path,
-        segment.line_start,
-        segment.line_end,
-        segment.block_type,
-        segment.language,
-        breadcrumb,
-        role_label(&segment.role),
-        segment.complexity,
-        defined,
-        referenced,
-        called,
-    )?;
-    writeln!(out)?;
-    writeln!(out, "{}", segment.content)?;
-    writeln!(out)?;
-    writeln!(out, "---")?;
-    Ok(())
-}
-
-fn role_label(role: &str) -> String {
-    role.to_ascii_lowercase()
 }
 
 #[cfg(test)]
