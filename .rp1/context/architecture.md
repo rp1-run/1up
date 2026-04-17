@@ -76,11 +76,11 @@
 |---|---|---|
 | Global runtime state | `dirs::data_dir()/1up` | Registry, PID/socket files, cache, models, update metadata. |
 | Project-local state | `<project>/.1up/` | `project_id`, `index.db`, `index_status.json`, `daemon_status.json`. |
-| Search persistence | `segments`, `segment_vectors`, `segment_symbols` | Discovery retrieval inputs. |
+| Search persistence | `segments`, `segment_vectors`, `segment_symbols` | Discovery retrieval inputs. `segment_vectors.embedding_vec` is declared `FLOAT8(384)` (schema v12); the HNSW index `idx_segment_vectors_embedding` is created via `libsql_vector_idx(..., 'metric=cosine', 'compress_neighbors=float8')`. Writes go through the typed `vector8(?)` constructor so libSQL quantizes server-side. |
 | File manifest | `indexed_files` | Stores per-file path, extension, content hash, size, and mtime for metadata-based unchanged-file prefiltering. |
 | Impact persistence | `segment_relations` | Stores `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind` for bounded outbound and inbound expansion. |
 | End-to-end timing | `SetupTimings` -> `IndexStageTimings` | Callers pass pre-pipeline DB and model setup durations; pipeline tracks `input_prep_ms` and computes `total_ms` from the caller's wall-clock start. |
-| Compatibility gate | `SCHEMA_VERSION = 11` | Validation requires `indexed_files` table, lookup-target, qualifier, and edge-identity columns; stale indexes require `1up reindex`. |
+| Compatibility gate | `SCHEMA_VERSION = 12` | Validation requires `indexed_files` table, lookup-target, qualifier, and edge-identity columns, plus the `FLOAT8(384)` vector column and `compress_neighbors=float8` HNSW index; stale indexes require `1up reindex`. |
 
 ## Integrations
 
@@ -137,3 +137,11 @@ graph TB
 - Daemon worker tracks scope promotion reasons (`ambiguous_paths`, `has_unscoped_error`) via `pending_fallback_reason` on `ProjectRunState`.
 - Benchmark script expanded to cover daemon refresh wall-clock medians and scope evidence (fallback, scoped, full counts) in summary JSON.
 - Added release profile with LTO, single codegen unit, and symbol stripping.
+
+## What Changed With Shrunk Vector Index
+
+- Switched `segment_vectors.embedding_vec` from `FLOAT32(384)` to `FLOAT8(384)` and enabled `'compress_neighbors=float8'` on the `idx_segment_vectors_embedding` HNSW index, both declared in `src/storage/queries.rs`.
+- Bumped `SCHEMA_VERSION` 11 -> 12 (`src/shared/constants.rs`) so existing indexes fail closed with the standard reindex hint instead of silently reading a format-mismatched column.
+- Switched the write and query SQL sites (`UPSERT_SEGMENT_VECTOR`, `SELECT_VECTOR_CANDIDATES`, and the chunked multi-value INSERT in `segments::batch_upsert_vectors`) from `vector(?)` to the typed `vector8(?)` constructor because libSQL rejects element-type mismatches at insert time ("vector type differs from column type"). Embedder output, batching, and call-site Rust remain unchanged; libSQL quantizes server-side.
+- Measured on the 1up repo: `index.db` 281 MB -> ~94.9 MB (~3x shrink) and cold indexing ~81 s -> ~37 s. Recall envelope is pinned by a deterministic harness (`evals/suites/1up-search/recall.ts`, `just eval-recall`) against REQ-002's 2 pt gate; v11 baseline is recall@10 = 0.889, recall@20 = 0.978.
+- Added `scripts/benchmark_vector_index_size.sh` plus `scripts/baselines/vector_index_size_baseline.json` as a REQ-001/REQ-003/REQ-005 gate that reports `db_size_bytes`, `indexing_ms`, and `schema_version` after a fresh reindex.

@@ -43,6 +43,7 @@
 - Schema v11 adds `indexed_files` manifest table for metadata-based unchanged-file prefiltering; indexing path uses tuned connections, batched multi-value INSERTs, and end-to-end timing propagation via `SetupTimings`.
 - `IndexProgress` exposes additive `scope` and `prefilter` fields; daemon tracks scope fallback reasons via `pending_fallback_reason`.
 - Benchmark script expanded with daemon refresh and scope evidence in summary JSON.
+- Schema v12 migrates `segment_vectors.embedding_vec` from `FLOAT32(384)` to `FLOAT8(384)` and enables `compress_neighbors=float8` on the HNSW index, shrinking `index.db` on the 1up repo from 281 MB to ~94.9 MB (~3x) and cutting cold indexing time from ~81 s to ~37 s. The schema bump forces reindex on upgrade; the write path now uses the typed `vector8(?)` constructor (libSQL rejects `vector(?)` against a `FLOAT8` column). A deterministic recall harness at `evals/suites/1up-search/recall.ts` with a `just eval-recall` recipe pins the recall envelope (v11 baseline: recall@10 = 0.889, recall@20 = 0.978) against REQ-002's 2 pt gate.
 
 ## How To Load
 

@@ -377,7 +377,7 @@ mod tests {
                 .unwrap();
                 conn.execute(
                     "INSERT INTO segment_vectors (segment_id, embedding_vec, created_at, updated_at)
-                     VALUES (?1, vector(?2), datetime('now'), datetime('now'))",
+                     VALUES (?1, vector8(?2), datetime('now'), datetime('now'))",
                     libsql::params![id, embedding],
                 )
                 .await
@@ -558,5 +558,32 @@ mod tests {
             .fts_results
             .iter()
             .any(|result| result.file_path == "config/settings.ini"));
+    }
+
+    #[tokio::test]
+    async fn vector_top_k_roundtrip_at_new_element_type() {
+        let conn = setup().await;
+
+        // Ten one-hot segments in distinct dimensions so cosine similarity can separate them.
+        for i in 0..10 {
+            let embedding = embedding_with(&[(i, 1.0)]);
+            insert_segment(
+                &conn,
+                &format!("seg-{i}"),
+                &format!("src/file_{i}.rs"),
+                &format!("fn item_{i}() {{ }}"),
+                Some(&embedding),
+            )
+            .await;
+        }
+
+        // Query close to seg-3's dimension. seg-3 must rank top-1 through vector_top_k.
+        let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
+        let candidates = fetch_vector_candidates(&conn, &query_embedding)
+            .await
+            .unwrap();
+
+        assert!(!candidates.is_empty(), "vector_top_k returned no rows");
+        assert_eq!(candidates[0].segment_id, "seg-3");
     }
 }

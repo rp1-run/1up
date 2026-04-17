@@ -30,7 +30,7 @@ pub const CREATE_INDEX_FILE_HASH: &str =
 pub const CREATE_SEGMENT_VECTORS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_vectors (
     segment_id TEXT PRIMARY KEY,
-    embedding_vec FLOAT32(384) NOT NULL,
+    embedding_vec FLOAT8(384) NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 )";
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS segment_relations (
 )";
 
 pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec))";
+    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(canonical_symbol, reference_kind)";
@@ -161,7 +161,7 @@ pub const SELECT_VECTOR_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
-FROM vector_top_k('idx_segment_vectors_embedding', vector(?1), ?2) AS v
+FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2) AS v
 JOIN segment_vectors AS sv ON sv.rowid = v.id
 JOIN segments AS s ON s.id = sv.segment_id";
 
@@ -190,7 +190,7 @@ pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT OR REPLACE INTO segment_vectors (
     segment_id, embedding_vec, created_at, updated_at
 ) VALUES (
-    ?1, vector(?2), datetime('now'), datetime('now')
+    ?1, vector8(?2), datetime('now'), datetime('now')
 )";
 
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";

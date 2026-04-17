@@ -789,7 +789,7 @@ async fn batch_upsert_vectors(
             let b = i * queries::VECTOR_INSERT_COLS;
             write!(
                 sql,
-                "(?{}, vector(?{}), datetime('now'), datetime('now'))",
+                "(?{}, vector8(?{}), datetime('now'), datetime('now'))",
                 b + 1,
                 b + 2
             )
@@ -1414,6 +1414,32 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let vector_count: i64 = row.get(0).unwrap();
         assert_eq!(vector_count, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_vectors_at_new_element_type() {
+        let (_db, conn) = setup().await;
+
+        let mut segments: Vec<SegmentInsert> = Vec::with_capacity(100);
+        for i in 0..100 {
+            let id = format!("seg-{i:03}");
+            let mut seg = test_segment(&id, &format!("src/file_{i:03}.rs"), &format!("hash-{i}"));
+            let mut embedding = vec![0.0f32; 384];
+            embedding[i % 384] = 1.0;
+            seg.embedding_vec = Some(serde_json::to_string(&embedding).unwrap());
+            segments.push(seg);
+        }
+
+        batch_upsert_segments(&conn, &segments).await.unwrap();
+        batch_upsert_vectors(&conn, &segments).await.unwrap();
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM segment_vectors", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let stored: i64 = row.get(0).unwrap();
+        assert_eq!(stored, 100);
     }
 
     #[tokio::test]
