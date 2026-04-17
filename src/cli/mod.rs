@@ -1,4 +1,5 @@
 pub mod context;
+pub mod get;
 pub mod hello_agent;
 pub mod impact;
 pub mod index;
@@ -57,6 +58,9 @@ pub enum Command {
     /// Hybrid semantic + full-text search
     Search(search::SearchArgs),
 
+    /// Hydrate one or more segment handles to their full indexed record
+    Get(get::GetArgs),
+
     /// Retrieve code context around a file location
     Context(context::ContextArgs),
 
@@ -99,6 +103,7 @@ impl Command {
             | Command::Update(_) => OutputFormat::Human,
             Command::Init(_)
             | Command::Search(_)
+            | Command::Get(_)
             | Command::Symbol(_)
             | Command::Context(_)
             | Command::Impact(_)
@@ -119,6 +124,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Status(args) => status::exec(args, format).await,
         Command::Symbol(args) => symbol::exec(args, format).await,
         Command::Search(args) => search::exec(args, format).await,
+        Command::Get(args) => get::exec(args, format).await,
         Command::Context(args) => context::exec(args, format).await,
         Command::Impact(args) => impact::exec(args, format).await,
         Command::Structural(args) => structural::exec(args, format).await,
