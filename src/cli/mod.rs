@@ -4,6 +4,7 @@ pub mod hello_agent;
 pub mod impact;
 pub mod index;
 pub mod init;
+pub mod lean;
 pub mod output;
 pub mod reindex;
 pub mod search;
