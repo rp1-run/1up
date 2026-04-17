@@ -5,8 +5,13 @@
  * - Reads a curated gold corpus from `recall-corpus.jsonl` (one JSON object per line).
  *   Each row: { query: string, expected_anchors?: Anchor[], expected_segment_ids?: string[],
  *               expected_files?: string[] }.
- * - For each row, executes `1up search <query> -f json -n <max_k>` against the target
- *   repo, then scores each returned result against the gold list. Recall@k = |matched_gold| /
+ * - For each row, executes `1up search <query> -n <max_k>` against the target repo. The
+ *   core `search` command emits the lean row grammar
+ *   `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>` on stdout
+ *   (no more `-f json`). The harness parses rows into a lightweight result shape and
+ *   lazily hydrates full segment bodies through `1up get <handle>` when an anchor
+ *   requires content-based matching (line_contains or Rust-definition content heuristic).
+ * - Scores each retrieved result against the gold list. Recall@k = |matched_gold| /
  *   |gold| per query, averaged across queries.
  * - Writes `recall-results.json` next to this file with per-k entries { k, recall, per_query }.
  *
@@ -72,10 +77,15 @@ interface CorpusRow {
   expected_files?: string[];
 }
 
+/**
+ * Lean discovery row reshaped into an object so the rest of the harness can
+ * score against named fields. `content` and full `defined_symbols` are
+ * populated lazily through `hydrateSegment` only when an anchor requires
+ * content-based matching.
+ */
 interface SearchResultJson {
   segment_id?: string;
   file_path?: string;
-  content?: string;
   breadcrumb?: string;
   defined_symbols?: string[];
   line_number?: number;
@@ -180,6 +190,48 @@ function readCorpus(): CorpusRow[] {
   return rows;
 }
 
+/**
+ * Parse one lean discovery row into a search result object. Grammar:
+ *   `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`.
+ * Fields are separated by two ASCII spaces; we split on the fixed separator
+ * to keep single spaces inside breadcrumbs from being misread.
+ */
+function parseLeanRow(line: string): SearchResultJson | null {
+  if (line.length === 0) {
+    return null;
+  }
+  const parts = line.split("  ");
+  if (parts.length < 5) {
+    return null;
+  }
+  const pathAndLines = parts[1];
+  const lastColon = pathAndLines.lastIndexOf(":");
+  if (lastColon <= 0) {
+    return null;
+  }
+  const filePath = pathAndLines.slice(0, lastColon);
+  const lineSpan = pathAndLines.slice(lastColon + 1);
+  const dash = lineSpan.indexOf("-");
+  const lineNumber = dash > 0 ? Number(lineSpan.slice(0, dash)) : undefined;
+  const lineEnd = dash > 0 ? Number(lineSpan.slice(dash + 1)) : undefined;
+  const breadcrumbSymbol = parts[3];
+  const sep = breadcrumbSymbol.indexOf("::");
+  const breadcrumb = sep >= 0 ? breadcrumbSymbol.slice(0, sep) : undefined;
+  const symbol = sep >= 0 ? breadcrumbSymbol.slice(sep + 2) : undefined;
+  const segmentToken = parts[4];
+  const segmentId = segmentToken.startsWith(":")
+    ? segmentToken.slice(1)
+    : segmentToken;
+  return {
+    segment_id: segmentId,
+    file_path: filePath,
+    breadcrumb: breadcrumb === "-" ? undefined : breadcrumb,
+    defined_symbols: symbol && symbol !== "-" ? [symbol] : undefined,
+    line_number: Number.isFinite(lineNumber) ? lineNumber : undefined,
+    line_end: Number.isFinite(lineEnd) ? lineEnd : undefined,
+  };
+}
+
 function runSearch(
   binary: string,
   query: string,
@@ -188,30 +240,90 @@ function runSearch(
 ): SearchResultJson[] {
   const rawOutput = execFileSync(
     binary,
-    ["search", "-n", String(k), "--path", repoDir, "-f", "json", query],
+    ["search", "-n", String(k), "--path", repoDir, query],
     {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       cwd: repoDir,
     },
   );
-  const parsed = JSON.parse(rawOutput) as unknown;
-  if (!Array.isArray(parsed)) {
-    throw new Error(
-      `1up search did not return a JSON array for query: ${query}`,
-    );
+  const rows: SearchResultJson[] = [];
+  for (const rawLine of rawOutput.split("\n")) {
+    const parsed = parseLeanRow(rawLine);
+    if (parsed !== null) {
+      rows.push(parsed);
+    }
   }
-  return parsed as SearchResultJson[];
+  return rows;
+}
+
+/**
+ * Hydrate a segment handle through `1up get <handle>` and return the body plus
+ * `defined_symbols` parsed from the tab-delimited metadata line. The `get`
+ * record shape is `segment <id>\n<tab-meta>\n\n<body>\n\n---\n` (design §2.3);
+ * `not_found\t<raw>\n---\n` signals an unresolved handle.
+ *
+ * Returns `null` when the handle does not resolve, so callers can treat
+ * content-based matching as a miss without throwing.
+ */
+function hydrateSegment(
+  binary: string,
+  handle: string,
+  repoDir: string,
+): { content: string; defined_symbols: string[]; breadcrumb?: string } | null {
+  if (!handle) {
+    return null;
+  }
+  const raw = execFileSync(binary, ["get", handle, "--path", repoDir], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd: repoDir,
+  });
+  const lines = raw.split("\n");
+  if (lines[0] === undefined || !lines[0].startsWith("segment ")) {
+    return null;
+  }
+  const metaLine = lines[1] ?? "";
+  const metaTokens = metaLine.split("\t");
+  const meta = new Map<string, string>();
+  for (let i = 0; i + 1 < metaTokens.length; i += 2) {
+    meta.set(metaTokens[i], metaTokens[i + 1]);
+  }
+  // The blank line after metadata precedes the body; find it and collect body
+  // until the `---` sentinel (or previous blank line).
+  let idx = 2;
+  if (lines[idx] === "") {
+    idx += 1;
+  }
+  const bodyLines: string[] = [];
+  for (; idx < lines.length; idx += 1) {
+    const current = lines[idx];
+    if (current === "---") {
+      break;
+    }
+    if (current === "" && lines[idx + 1] === "---") {
+      idx += 1;
+      break;
+    }
+    bodyLines.push(current);
+  }
+  const defines = (meta.get("defines") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const breadcrumb = meta.get("breadcrumb");
+  return {
+    content: bodyLines.join("\n"),
+    defined_symbols: defines,
+    breadcrumb: breadcrumb && breadcrumb !== "-" ? breadcrumb : undefined,
+  };
 }
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function contentHasSymbolDefinition(
-  content: string,
-  symbol: string,
-): boolean {
+function contentHasSymbolDefinition(content: string, symbol: string): boolean {
   const symbolPattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
   for (const rawLine of content.split("\n")) {
     if (!symbolPattern.test(rawLine)) {
@@ -238,24 +350,99 @@ function breadcrumbContainsSymbol(
   return parts.includes(symbol);
 }
 
+/**
+ * Lazy content hydrator: calls `1up get` once per segment handle and memoizes
+ * the body + defined_symbols + breadcrumb so each scored query pays at most
+ * one hydration per unique retrieved result. Misses (unresolved handles, empty
+ * id) are cached as `null` to avoid repeat-on-miss.
+ */
+type HydrateFn = (
+  handle: string | undefined,
+) => ReturnType<typeof hydrateSegment>;
+
+function makeHydrator(binary: string, repoDir: string): HydrateFn {
+  const cache = new Map<string, ReturnType<typeof hydrateSegment>>();
+  return (handle: string | undefined) => {
+    if (!handle) {
+      return null;
+    }
+    if (cache.has(handle)) {
+      return cache.get(handle) ?? null;
+    }
+    let hydrated: ReturnType<typeof hydrateSegment> = null;
+    try {
+      hydrated = hydrateSegment(binary, handle, repoDir);
+    } catch {
+      hydrated = null;
+    }
+    cache.set(handle, hydrated);
+    return hydrated;
+  };
+}
+
+interface HydratedView {
+  content: string;
+  defined_symbols: string[];
+  breadcrumb?: string;
+}
+
+function hydrateOrEmpty(
+  result: SearchResultJson,
+  hydrate: HydrateFn,
+): HydratedView {
+  const hit = hydrate(result.segment_id);
+  if (hit === null) {
+    return {
+      content: "",
+      defined_symbols: result.defined_symbols ?? [],
+      breadcrumb: result.breadcrumb,
+    };
+  }
+  return {
+    content: hit.content,
+    defined_symbols: hit.defined_symbols,
+    breadcrumb: hit.breadcrumb ?? result.breadcrumb,
+  };
+}
+
 function resultMatchesAnchor(
   result: SearchResultJson,
   anchor: Anchor,
+  hydrate: HydrateFn,
 ): boolean {
   if ((result.file_path ?? "") !== anchor.file) {
     return false;
   }
-  const content = result.content ?? "";
+  const needsContent =
+    anchor.line_contains !== undefined && anchor.line_contains.length > 0;
+  const leanSymbolsHit =
+    anchor.symbol !== undefined &&
+    anchor.symbol.length > 0 &&
+    ((result.defined_symbols ?? []).includes(anchor.symbol) ||
+      breadcrumbContainsSymbol(result.breadcrumb, anchor.symbol));
+  const needsHydration =
+    needsContent ||
+    (anchor.symbol !== undefined &&
+      anchor.symbol.length > 0 &&
+      !leanSymbolsHit);
+  const hydrated: HydratedView | null = needsHydration
+    ? hydrateOrEmpty(result, hydrate)
+    : null;
   if (anchor.symbol !== undefined && anchor.symbol.length > 0) {
     const symbol = anchor.symbol;
-    const definedHit = (result.defined_symbols ?? []).includes(symbol);
-    const breadcrumbHit = breadcrumbContainsSymbol(result.breadcrumb, symbol);
-    const contentHit = contentHasSymbolDefinition(content, symbol);
-    if (!definedHit && !breadcrumbHit && !contentHit) {
+    const defined = hydrated?.defined_symbols ?? result.defined_symbols ?? [];
+    const content = hydrated?.content ?? "";
+    const breadcrumb = hydrated?.breadcrumb ?? result.breadcrumb;
+    const matched =
+      defined.includes(symbol) ||
+      breadcrumbContainsSymbol(breadcrumb, symbol) ||
+      (content.length > 0 && contentHasSymbolDefinition(content, symbol));
+    if (!matched) {
       return false;
     }
   }
   if (anchor.line_contains !== undefined && anchor.line_contains.length > 0) {
+    const content = hydrated?.content ?? "";
     if (!content.includes(anchor.line_contains)) {
       return false;
     }
@@ -279,6 +466,7 @@ function collectSegmentIds(results: SearchResultJson[], k: number): string[] {
 function scoreAnchorRow(
   topK: SearchResultJson[],
   anchors: Anchor[],
+  hydrate: HydrateFn,
 ): { matched_indices: number[]; hit_count: number; recall: number } {
   if (anchors.length === 0) {
     return { matched_indices: [], hit_count: 0, recall: 0 };
@@ -286,7 +474,7 @@ function scoreAnchorRow(
   const matched: number[] = [];
   for (let i = 0; i < anchors.length; i += 1) {
     const anchor = anchors[i];
-    if (topK.some((r) => resultMatchesAnchor(r, anchor))) {
+    if (topK.some((r) => resultMatchesAnchor(r, anchor, hydrate))) {
       matched.push(i);
     }
   }
@@ -319,6 +507,9 @@ function scoreSegmentIdRow(
 }
 
 function readSchemaVersion(repoDir: string, binary: string): number | null {
+  // `status` remains a maintenance command that keeps the `-f json` envelope,
+  // so we still parse it with JSON here (the lean grammar is scoped to core
+  // commands only — design §2.1).
   try {
     const raw = execFileSync(binary, ["status", repoDir, "-f", "json"], {
       encoding: "utf8",
@@ -352,6 +543,7 @@ function runHarness(): HarnessOutput {
   const targetRepo = resolveTargetRepo();
   const corpus = readCorpus();
   const schemaVersion = readSchemaVersion(targetRepo, binary);
+  const hydrate = makeHydrator(binary, targetRepo);
 
   const modeCounts: Record<MatchMode | "none", number> = {
     anchor: 0,
@@ -414,7 +606,7 @@ function runHarness(): HarnessOutput {
       if (mode === "anchor") {
         const anchors = row.expected_anchors ?? [];
         goldSize = anchors.length;
-        score = scoreAnchorRow(topK, anchors);
+        score = scoreAnchorRow(topK, anchors, hydrate);
       } else {
         const gold = row.expected_segment_ids ?? [];
         goldSize = gold.length;

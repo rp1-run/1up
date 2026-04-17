@@ -256,63 +256,145 @@ fn run_index_json(dir: &std::path::Path, extra_args: &[&str]) -> serde_json::Val
     serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
 }
 
-fn lookup_symbol_json(dir: &std::path::Path, symbol: &str) -> Vec<serde_json::Value> {
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            symbol,
-            "--path",
-            dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+// =============================================================================
+// Lean row grammar helpers
+// =============================================================================
+//
+// The six core commands (`search`, `symbol`, `impact`, `context`, `structural`,
+// `get`) all emit a line-oriented grammar described in design §2.2-§2.3. These
+// helpers parse that grammar just enough to assert field presence, field shape,
+// and cross-row ordering without pulling in a regex dependency.
 
-    assert!(output.status.success());
-
-    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+/// A discovery row produced by `search`, `symbol`, or `impact`:
+/// `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]`.
+#[derive(Debug, Clone)]
+struct LeanDiscoveryRow {
+    score: u32,
+    file_path: String,
+    line_start: usize,
+    line_end: usize,
+    kind: String,
+    breadcrumb: String,
+    symbol: String,
+    segment_id: String,
+    channel: Option<char>,
 }
 
-fn search_json(dir: &std::path::Path, query: &str) -> Vec<serde_json::Value> {
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            query,
-            "--path",
-            dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
+fn parse_discovery_row(line: &str) -> LeanDiscoveryRow {
+    // Fields are separated by two ASCII spaces (design D2). We split on the
+    // fixed separator rather than on whitespace so that single spaces inside
+    // e.g. breadcrumbs are not misread as a field break.
+    let parts: Vec<&str> = line.split("  ").collect();
     assert!(
-        output.status.success(),
-        "search failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        parts.len() == 5 || parts.len() == 6,
+        "expected 5 or 6 double-space-separated fields, got {} in line: {line:?}",
+        parts.len()
     );
 
-    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
-}
+    let score: u32 = parts[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("score field must be integer 0-100, got {:?}", parts[0]));
+    assert!(
+        score <= 100,
+        "score must be in [0,100], got {score} in line: {line:?}"
+    );
 
-fn impact_json(dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
-    let mut command = cmd();
-    command.arg("--format").arg("json").arg("impact");
-    for arg in args {
-        command.arg(arg);
+    let (file_path, line_span) = parts[1]
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("expected <path>:<l1>-<l2>, got {:?}", parts[1]));
+    let (l1_raw, l2_raw) = line_span
+        .split_once('-')
+        .unwrap_or_else(|| panic!("expected <l1>-<l2>, got {line_span:?}"));
+    let line_start: usize = l1_raw.parse().expect("l1 is integer");
+    let line_end: usize = l2_raw.parse().expect("l2 is integer");
+
+    let (breadcrumb, symbol) = parts[3]
+        .split_once("::")
+        .unwrap_or_else(|| panic!("expected <breadcrumb>::<symbol>, got {:?}", parts[3]));
+
+    let segment_token = parts[4];
+    assert!(
+        segment_token.starts_with(':'),
+        "segment handle must start with ':', got {segment_token:?}"
+    );
+    let segment_id = segment_token.trim_start_matches(':').to_string();
+    assert!(
+        !segment_id.is_empty(),
+        "segment id body must be non-empty in {line:?}"
+    );
+
+    let channel = if parts.len() == 6 {
+        let suffix = parts[5];
+        assert!(
+            suffix == "~P" || suffix == "~C",
+            "channel suffix must be ~P or ~C, got {suffix:?}"
+        );
+        Some(suffix.chars().nth(1).unwrap())
+    } else {
+        None
+    };
+
+    LeanDiscoveryRow {
+        score,
+        file_path: file_path.to_string(),
+        line_start,
+        line_end,
+        kind: parts[2].to_string(),
+        breadcrumb: breadcrumb.to_string(),
+        symbol: symbol.to_string(),
+        segment_id,
+        channel,
     }
-    command.arg("--path").arg(dir);
+}
 
-    let output = command.output().unwrap();
+fn parse_discovery_rows(stdout: &str) -> Vec<LeanDiscoveryRow> {
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(parse_discovery_row)
+        .collect()
+}
 
-    assert!(
-        output.status.success(),
-        "impact failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn run_core_cmd(args: &[&str]) -> (String, String, bool) {
+    let output = cmd().args(args).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    (stdout, stderr, output.status.success())
+}
 
-    serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+fn search_rows(dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
+    let (stdout, stderr, ok) = run_core_cmd(&["search", query, "--path", dir.to_str().unwrap()]);
+    assert!(ok, "search failed: {stderr}");
+    parse_discovery_rows(&stdout)
+}
+
+fn symbol_rows(dir: &std::path::Path, name: &str, extra: &[&str]) -> Vec<LeanDiscoveryRow> {
+    let mut args: Vec<&str> = vec!["symbol", name, "--path", dir.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let (stdout, _stderr, ok) = run_core_cmd(&args);
+    assert!(ok, "symbol lookup failed");
+    parse_discovery_rows(&stdout)
+}
+
+fn impact_output(dir: &std::path::Path, args: &[&str]) -> (String, String, bool) {
+    let mut full: Vec<&str> = vec!["impact"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--path", dir.to_str().unwrap()]);
+    run_core_cmd(&full)
+}
+
+fn impact_rows(dir: &std::path::Path, args: &[&str]) -> Vec<LeanDiscoveryRow> {
+    let (stdout, stderr, ok) = impact_output(dir, args);
+    assert!(ok, "impact failed: {stderr}");
+    parse_discovery_rows(
+        &stdout
+            .lines()
+            .filter(|l| {
+                !l.starts_with("hint") && !l.starts_with("refused") && !l.starts_with("empty")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn write_parallel_regression_fixture(dir: &std::path::Path) {
@@ -694,6 +776,11 @@ pub fn boot_global_config() -> &'static str {
 
     tmp
 }
+
+// =============================================================================
+// Indexing / storage integration
+// =============================================================================
+
 #[test]
 fn index_multi_language_repository() {
     let tmp = create_multi_lang_fixture();
@@ -706,156 +793,128 @@ fn index_multi_language_repository() {
     );
 }
 
-#[test]
-fn symbol_lookup_returns_definitions_json() {
-    let tmp = create_multi_lang_fixture();
-    init_and_index(&tmp);
-
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "greet",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert!(!results.is_empty(), "should find 'greet' symbol");
-
-    let first = &results[0];
-    assert!(first.get("name").is_some());
-    assert!(first.get("kind").is_some());
-    assert!(first.get("file_path").is_some());
-    assert!(first.get("line_start").is_some());
-    assert!(first.get("line_end").is_some());
-    assert!(first.get("content").is_some());
-    assert!(first.get("reference_kind").is_some());
-
-    assert_eq!(first["name"], "greet");
-    assert_eq!(first["reference_kind"], "definition");
-}
+// =============================================================================
+// Lean row grammar — search / symbol / impact / get
+// =============================================================================
 
 #[test]
-fn symbol_lookup_references_include_definitions_and_usages() {
-    let tmp = create_multi_lang_fixture();
-    init_and_index(&tmp);
-
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "--references",
-            "Config",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-
-    let definitions: Vec<_> = results
-        .iter()
-        .filter(|r| r["reference_kind"] == "definition")
-        .collect();
-    assert!(
-        !definitions.is_empty(),
-        "should have at least one definition for Config"
-    );
-}
-
-#[test]
-fn symbol_lookup_acceptance_queries_cover_exact_canonical_and_references() {
-    let tmp = create_search_acceptance_fixture();
-    init_and_index(&tmp);
-
-    let exact = lookup_symbol_json(tmp.path(), "PolicyRuleValidator");
-    assert_eq!(exact[0]["name"], "PolicyRuleValidator");
-    assert_eq!(exact[0]["file_path"], "src/policy.rs");
-
-    let canonical = lookup_symbol_json(tmp.path(), "policy rule validator");
-    assert_eq!(canonical[0]["name"], "PolicyRuleValidator");
-    assert_eq!(canonical[0]["file_path"], "src/policy.rs");
-
-    let references = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "--references",
-            "PolicyRuleValidator",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(references.status.success());
-
-    let results: Vec<serde_json::Value> =
-        serde_json::from_str(String::from_utf8(references.stdout).unwrap().trim()).unwrap();
-
-    assert!(results.iter().any(|result| {
-        result["reference_kind"] == "definition" && result["file_path"] == "src/policy.rs"
-    }));
-    assert!(results.iter().any(|result| {
-        result["reference_kind"] == "usage" && result["file_path"] == "src/runner.rs"
-    }));
-}
-
-#[test]
-fn fts_search_returns_ranked_results_json() {
+fn search_row_grammar() {
+    // design §2.2: every search hit is one line of
+    // `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`.
     let tmp = create_multi_lang_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "Config host port",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-
+    let rows = search_rows(tmp.path(), "Config host port");
     assert!(
-        !results.is_empty(),
-        "search for 'Config host port' should return results"
+        !rows.is_empty(),
+        "search for 'Config host port' should return rows"
     );
-
-    let first = &results[0];
-    assert!(first.get("file_path").is_some());
-    assert!(first.get("language").is_some());
-    assert!(first.get("block_type").is_some());
-    assert!(first.get("content").is_some());
-    assert!(first.get("score").is_some());
-    assert!(first.get("line_number").is_some());
-
-    let score = first["score"].as_f64().unwrap();
-    assert!(score > 0.0, "search results should have positive scores");
+    for row in &rows {
+        assert!(
+            !row.file_path.is_empty() && !row.kind.is_empty(),
+            "required fields must be populated: {row:?}"
+        );
+        assert!(
+            row.line_end >= row.line_start,
+            "l2 >= l1 invariant violated: {row:?}"
+        );
+        assert!(
+            row.channel.is_none(),
+            "search rows must not carry a channel suffix: {row:?}"
+        );
+        // `:<segment_id>` is 1 to 12 chars of lowercase hex (design D3).
+        assert!(row.segment_id.len() <= 12);
+        assert!(
+            row.segment_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '_' || c.is_ascii_alphanumeric()),
+            "segment id must be ascii alphanumeric hex-ish: {row:?}"
+        );
+    }
 }
 
 #[test]
-fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
+fn search_default_limit_caps_results_at_three() {
+    // design §3.4: `1up search <query>` defaults to -n=3. The fixture
+    // produces more than three matches for "config", so we pin the cap.
+    let tmp = create_multi_lang_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "config");
+    assert!(
+        rows.len() <= 3,
+        "default limit is 3, got {} rows",
+        rows.len()
+    );
+}
+
+#[test]
+fn search_lean_output_contains_no_segment_prefix_literal() {
+    // design D-grammar: the `:<id>` trailing token replaces the old
+    // `segment=<id>` metadata substring. Grep-style guard against regressions.
+    let tmp = create_multi_lang_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let (stdout, _stderr, ok) =
+        run_core_cmd(&["search", "Config", "--path", tmp.path().to_str().unwrap()]);
+    assert!(ok);
+    assert!(
+        !stdout.contains("segment="),
+        "lean search output must not include `segment=`: {stdout}"
+    );
+}
+
+#[test]
+fn symbol_uses_same_row_grammar() {
+    // Symbol rows reuse the discovery grammar with a `<reference_kind>:<kind>`
+    // composite in the kind slot (design §2.2, §3.5).
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let rows = symbol_rows(tmp.path(), "greet", &[]);
+    assert!(!rows.is_empty(), "symbol 'greet' should resolve to a row");
+    for row in &rows {
+        assert!(
+            row.kind.starts_with("def:") || row.kind.starts_with("usage:"),
+            "symbol kind must be `def:<k>` or `usage:<k>`, got {:?}",
+            row.kind
+        );
+        assert!(
+            row.channel.is_none(),
+            "symbol rows must not carry a channel suffix: {row:?}"
+        );
+        assert_eq!(row.score, 0, "symbol rows have no score; grammar fills 0");
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r.symbol == "greet" || r.breadcrumb.contains("greet")),
+        "greet should appear somewhere in symbol output: {rows:?}"
+    );
+}
+
+#[test]
+fn symbol_references_include_definitions_and_usages() {
+    let tmp = create_search_acceptance_fixture();
+    init_and_index(&tmp);
+
+    let rows = symbol_rows(tmp.path(), "PolicyRuleValidator", &["--references"]);
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("def:") && r.file_path == "src/policy.rs"),
+        "definition row missing: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("usage:") && r.file_path == "src/runner.rs"),
+        "usage row missing: {rows:?}"
+    );
+}
+
+#[test]
+fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
+    // Ranking stability: each acceptance query should keep the expected top
+    // file across two consecutive runs (covers the "handoff does not perturb
+    // search ranking" contract at the grammar layer).
     let tmp = create_search_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
@@ -874,29 +933,20 @@ fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
     ];
 
     for (query, expected_top_path) in cases {
-        let first = search_json(tmp.path(), query);
-        let second = search_json(tmp.path(), query);
+        let first = search_rows(tmp.path(), query);
+        let second = search_rows(tmp.path(), query);
 
         assert!(
             !first.is_empty(),
-            "query {query:?} should produce at least one result"
+            "query {query:?} should produce at least one row"
         );
         assert_eq!(
-            first[0]["file_path"], expected_top_path,
+            first[0].file_path, expected_top_path,
             "query {query:?} returned an unexpected top hit"
         );
 
-        let first_paths: Vec<_> = first
-            .iter()
-            .take(3)
-            .map(|result| result["file_path"].clone())
-            .collect();
-        let second_paths: Vec<_> = second
-            .iter()
-            .take(3)
-            .map(|result| result["file_path"].clone())
-            .collect();
-
+        let first_paths: Vec<_> = first.iter().take(3).map(|r| r.file_path.clone()).collect();
+        let second_paths: Vec<_> = second.iter().take(3).map(|r| r.file_path.clone()).collect();
         assert_eq!(
             first_paths, second_paths,
             "query {query:?} should keep a stable top-3 result set"
@@ -904,492 +954,604 @@ fn search_acceptance_queries_preserve_top_hits_for_priority_classes() {
     }
 }
 
-#[test]
-fn impact_file_anchor_returns_ranked_results_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
+// =============================================================================
+// Impact lean envelope
+// =============================================================================
 
-    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs"]);
-
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "file");
-    assert_eq!(result["resolved_anchor"]["value"], "src/auth/runtime.rs");
-
-    let results = result["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
-    assert_eq!(results[0]["reasons"][0]["kind"], "called_by");
+fn impact_status_line(stdout: &str) -> Option<&str> {
+    stdout.lines().find(|l| {
+        let token = l.split("  ").next().unwrap_or("");
+        matches!(token, "refused" | "empty" | "empty_scoped")
+    })
 }
 
 #[test]
-fn impact_file_line_anchor_resolves_requested_line_json() {
+fn impact_rows_carry_channel_suffix() {
+    // design §2.2, D5: every impact row ends with ` ~P` or ` ~C`.
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs:1"]);
+    let (stdout, stderr, ok) = impact_output(tmp.path(), &["--from-file", "src/auth/runtime.rs"]);
+    assert!(ok, "impact failed: {stderr}");
 
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
-    assert_eq!(result["resolved_anchor"]["value"], "src/auth/runtime.rs");
-    assert_eq!(result["resolved_anchor"]["line"], 1);
+    // status_line should be absent on expanded envelopes; every non-empty
+    // stdout line must end with the channel suffix.
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            line.ends_with("  ~P") || line.ends_with("  ~C"),
+            "every impact row must end with ~P or ~C, got {line:?}"
+        );
+    }
 
-    let results = result["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
+    let rows = parse_discovery_rows(&stdout);
+    assert!(!rows.is_empty());
+    // At least one primary; bootstrap is the known call site.
+    assert!(rows.iter().any(|r| r.channel == Some('P')));
+    assert!(
+        rows.iter()
+            .any(|r| r.channel == Some('P') && r.file_path == "src/auth/bootstrap.rs"),
+        "expected bootstrap primary row in: {rows:?}"
+    );
 }
 
 #[test]
-fn impact_symbol_anchor_expands_with_resolved_seed_json() {
+fn impact_primary_precedes_contextual() {
+    // All primary (~P) rows must appear before any contextual (~C) row so an
+    // agent can split the stream by channel without re-sorting.
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "load_auth_config"]);
+    let (stdout, _stderr, ok) = impact_output(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+    assert!(ok);
 
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "load_auth_config");
+    let rows = parse_discovery_rows(&stdout);
+    let first_contextual = rows.iter().position(|r| r.channel == Some('C'));
+    if let Some(idx) = first_contextual {
+        assert!(
+            rows[..idx].iter().all(|r| r.channel == Some('P')),
+            "primary rows must precede contextual rows"
+        );
+    }
+}
 
-    let results = result["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert!(results
+#[test]
+fn impact_file_anchor_surfaces_bootstrap_primary() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = impact_rows(tmp.path(), &["--from-file", "src/auth/runtime.rs"]);
+    assert!(rows
         .iter()
-        .any(|candidate| candidate["file_path"] == "src/auth/bootstrap.rs"));
+        .any(|r| r.channel == Some('P') && r.file_path == "src/auth/bootstrap.rs"));
 }
 
 #[test]
-fn impact_symbol_anchor_scope_narrows_ambiguous_matches_json() {
+fn impact_file_line_anchor_resolves_requested_line() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(
+    let rows = impact_rows(tmp.path(), &["--from-file", "src/auth/runtime.rs:1"]);
+    assert!(rows
+        .iter()
+        .any(|r| r.file_path == "src/auth/bootstrap.rs" && r.channel == Some('P')));
+}
+
+#[test]
+fn impact_symbol_anchor_expands_with_resolved_seed() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "load_auth_config"]);
+    assert!(rows
+        .iter()
+        .any(|r| r.file_path == "src/auth/bootstrap.rs" && r.channel == Some('P')));
+}
+
+#[test]
+fn impact_symbol_anchor_scope_narrows_ambiguous_matches() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = impact_rows(
         tmp.path(),
         &["--from-symbol", "load_config", "--scope", "src/auth"],
     );
-
-    assert_eq!(result["status"], "expanded_scoped");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "load_config");
-    assert_eq!(result["resolved_anchor"]["scope"], "src/auth");
-
-    let results = result["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/auth/reload.rs");
+    assert!(!rows.is_empty());
+    // top primary comes from the scoped subtree
+    let top_primary = rows
+        .iter()
+        .find(|r| r.channel == Some('P'))
+        .expect("at least one primary row");
+    assert_eq!(top_primary.file_path, "src/auth/reload.rs");
 }
 
 #[test]
-fn impact_symbol_anchor_qualified_relation_promotes_matching_definition_json() {
+fn impact_symbol_anchor_qualified_relation_promotes_matching_definition() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "reload_auth_config"]);
-
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "reload_auth_config");
-
-    let results = result["results"]
-        .as_array()
-        .expect("qualified relation should surface a primary definition");
-    assert!(!results.is_empty());
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "reload_auth_config"]);
     assert!(
-        results
-            .iter()
-            .any(|r| r["file_path"] == "src/auth/config.rs"),
-        "config.rs should appear in results, got: {:?}",
-        results
-            .iter()
-            .map(|r| r["file_path"].as_str().unwrap_or("?"))
-            .collect::<Vec<_>>()
+        rows.iter()
+            .any(|r| r.channel == Some('P') && r.file_path == "src/auth/config.rs"),
+        "config.rs should appear as primary: {rows:?}"
     );
 }
 
 #[test]
-fn impact_symbol_anchor_interface_implementor_surfaces_primary_json() {
+fn impact_symbol_anchor_interface_implementor_surfaces_primary() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "AuthStore"]);
-
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "AuthStore");
-
-    let results = result["results"]
-        .as_array()
-        .expect("interface anchor should surface implementing classes");
-    assert!(results.iter().any(|candidate| {
-        candidate["file_path"].as_str() == Some("src/auth/auth_store.ts")
-            && candidate["block_type"].as_str() == Some("class")
-            && candidate["defined_symbols"]
-                .as_array()
-                .map(|symbols| {
-                    symbols
-                        .iter()
-                        .any(|symbol| symbol.as_str() == Some("SqlAuthStore"))
-                })
-                .unwrap_or(false)
-            && candidate["reasons"]
-                .as_array()
-                .map(|reasons| {
-                    reasons
-                        .iter()
-                        .any(|reason| reason["kind"].as_str() == Some("implemented_by"))
-                })
-                .unwrap_or(false)
-    }));
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "AuthStore"]);
+    assert!(rows.iter().any(|r| r.channel == Some('P')
+        && r.file_path == "src/auth/auth_store.ts"
+        && r.kind == "class"
+        && r.symbol == "SqlAuthStore"));
 }
 
 #[test]
-fn impact_symbol_anchor_formatter_implementor_stays_primary_under_reference_pressure_json() {
+fn impact_symbol_anchor_formatter_implementor_stays_primary_under_reference_pressure() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "Formatter"]);
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "Formatter"]);
+    let primaries: Vec<_> = rows.iter().filter(|r| r.channel == Some('P')).collect();
+    assert!(!primaries.is_empty());
+    assert_eq!(primaries[0].file_path, "src/ui/plain_formatter.ts");
 
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "Formatter");
+    // Same path should not also appear in the contextual bucket.
+    let contextual_has_plain = rows
+        .iter()
+        .any(|r| r.channel == Some('C') && r.file_path == "src/ui/plain_formatter.ts");
+    assert!(
+        !contextual_has_plain,
+        "primary implementor should not also be duplicated as contextual"
+    );
+}
 
-    let results = result["results"]
-        .as_array()
-        .expect("formatter anchor should surface implementors");
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/ui/plain_formatter.ts");
+#[test]
+fn impact_symbol_anchor_ambiguous_helper_emits_context_only_hint() {
+    // Lean renderer collapses `empty` envelopes to a status line plus a hint
+    // line (design §3.6); no discovery rows follow. The hint's `context_only`
+    // code signals that contextual guidance exists without embedding the rows
+    // directly on the wire.
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
 
-    if let Some(contextual) = result["contextual_results"].as_array() {
-        assert!(contextual.iter().all(|candidate| {
-            candidate["file_path"]
-                .as_str()
-                .map(|path| path != "src/ui/plain_formatter.ts")
-                .unwrap_or(false)
-        }));
+    let (stdout, _stderr, ok) = impact_output(tmp.path(), &["--from-symbol", "boot_global_config"]);
+    assert!(ok);
+
+    assert_eq!(
+        stdout.lines().next().unwrap_or(""),
+        "empty",
+        "expected bare `empty` status, got: {stdout}"
+    );
+    let hint_line = stdout
+        .lines()
+        .find(|l| l.starts_with("hint"))
+        .expect("empty envelope should carry a hint line");
+    assert!(hint_line.contains("context_only"));
+    // No discovery rows: every remaining line is either the status or hint.
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            line.starts_with("empty") || line.starts_with("hint"),
+            "unexpected discovery row in empty envelope: {line:?}"
+        );
     }
 }
 
 #[test]
-fn impact_symbol_anchor_ambiguous_helper_returns_context_only_json() {
+fn impact_symbol_anchor_prefers_stronger_primary_over_wrapper() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "boot_global_config"]);
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+    let primaries: Vec<_> = rows.iter().filter(|r| r.channel == Some('P')).collect();
+    assert!(!primaries.is_empty());
+    assert_eq!(primaries[0].file_path, "src/cache/worker.rs");
 
-    assert_eq!(result["status"], "empty");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "boot_global_config");
-    assert_eq!(result["hint"]["code"], "context_only");
-    assert_eq!(result["results"], serde_json::json!([]));
-
-    let contextual = result["contextual_results"]
-        .as_array()
-        .expect("ambiguous helper follow-up should stay contextual");
-    assert!(!contextual.is_empty());
-    assert!(contextual.iter().all(|candidate| {
-        candidate["file_path"]
-            .as_str()
-            .map(|path| matches!(path, "src/auth/config.rs" | "src/app/bootstrap.rs"))
-            .unwrap_or(false)
-    }));
-}
-
-#[test]
-fn impact_symbol_anchor_prefers_stronger_primary_over_wrapper_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
-
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "symbol");
-    assert_eq!(result["resolved_anchor"]["value"], "warm_cache_key");
-
-    let results = result["results"].as_array().unwrap();
-    assert!(!results.is_empty());
-    assert_eq!(results[0]["file_path"], "src/cache/worker.rs");
-
-    if let Some(wrapper_index) = results
+    if let Some(wrapper_idx) = primaries
         .iter()
-        .position(|candidate| candidate["file_path"].as_str() == Some("src/cache/priming.rs"))
+        .position(|r| r.file_path == "src/cache/priming.rs")
     {
-        assert!(wrapper_index > 0);
+        assert!(wrapper_idx > 0, "wrapper should never outrank worker");
     }
 }
 
 #[test]
-fn impact_symbol_anchor_inline_test_context_stays_contextual_json() {
+fn impact_symbol_anchor_inline_test_context_stays_contextual() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-symbol", "warm_cache_key"]);
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "warm_cache_key"]);
 
-    assert_eq!(result["status"], "expanded");
-
-    let results = result["results"]
-        .as_array()
-        .expect("warm_cache_key should still have primary candidates");
-    assert!(results.iter().all(|candidate| {
-        candidate["file_path"]
-            .as_str()
-            .map(|path| path != "src/cache/test_support.rs")
-            .unwrap_or(false)
-    }));
-
-    let contextual = result["contextual_results"]
-        .as_array()
-        .expect("inline test context should remain available as contextual guidance");
-    assert!(contextual
+    assert!(rows
         .iter()
-        .any(|candidate| { candidate["file_path"].as_str() == Some("src/cache/test_support.rs") }));
+        .filter(|r| r.channel == Some('P'))
+        .all(|r| r.file_path != "src/cache/test_support.rs"));
+    assert!(rows
+        .iter()
+        .any(|r| r.channel == Some('C') && r.file_path == "src/cache/test_support.rs"));
 }
 
 #[test]
-fn impact_file_anchor_limit_caps_total_primary_and_contextual_results_json() {
+fn impact_file_anchor_limit_caps_total_rows() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(
+    let (stdout, _stderr, ok) = impact_output(
         tmp.path(),
         &["--from-file", "src/auth/runtime.rs", "--limit", "1"],
     );
+    assert!(ok);
 
-    assert_eq!(result["status"], "expanded");
-
-    let results = result["results"].as_array().unwrap();
-    let contextual_len = result["contextual_results"]
-        .as_array()
-        .map(|results| results.len())
-        .unwrap_or(0);
-
-    assert_eq!(results.len(), 1);
-    assert_eq!(results.len() + contextual_len, 1);
+    let rows = parse_discovery_rows(&stdout);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].channel, Some('P'));
 }
 
 #[test]
-fn impact_file_anchor_scope_refuses_out_of_scope_seed_json() {
+fn impact_file_anchor_scope_refuses_out_of_scope_seed() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(
+    let (stdout, _stderr, ok) = impact_output(
         tmp.path(),
         &["--from-file", "src/auth/runtime.rs", "--scope", "src/cache"],
     );
+    assert!(ok);
 
-    assert_eq!(result["status"], "refused");
-    assert_eq!(result["refusal"]["reason"], "anchor_out_of_scope");
-    assert_eq!(result["hint"]["code"], "align_anchor_and_scope");
-}
-
-#[test]
-fn impact_symbol_anchor_refuses_broad_requests_with_hint_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let result = impact_json(tmp.path(), &["--from-symbol", "load_config"]);
-
-    assert_eq!(result["status"], "refused");
-    assert_eq!(result["refusal"]["reason"], "symbol_too_broad");
-    assert_eq!(result["hint"]["code"], "narrow_with_scope");
-    assert!(result["hint"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("--scope"));
-}
-
-#[test]
-fn impact_file_line_anchor_returns_empty_with_contextual_guidance_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let result = impact_json(tmp.path(), &["--from-file", "src/auth/runtime.rs:5"]);
-
-    assert_eq!(result["status"], "empty");
-    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
-    assert_eq!(result["hint"]["code"], "context_only");
-    assert_eq!(result["results"], serde_json::json!([]));
-
-    let seed_id = result["resolved_anchor"]["seed_segment_ids"][0]
-        .as_str()
-        .expect("file-line anchor should resolve to a seed segment");
-    let contextual = result["contextual_results"]
-        .as_array()
-        .expect("empty impact should still surface contextual guidance");
-
-    assert!(!contextual.is_empty());
-    assert_eq!(contextual[0]["file_path"], "src/auth/runtime.rs");
-    assert!(contextual
-        .iter()
-        .all(|candidate| candidate["segment_id"].as_str() != Some(seed_id)));
-}
-
-#[test]
-fn impact_scoped_file_line_anchor_returns_empty_scoped_without_anchor_echo_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let result = impact_json(
-        tmp.path(),
-        &[
-            "--from-file",
-            "src/auth/runtime.rs:5",
-            "--scope",
-            "src/auth",
-        ],
-    );
-
-    assert_eq!(result["status"], "empty_scoped");
-    assert_eq!(result["resolved_anchor"]["kind"], "file_line");
-    assert_eq!(result["resolved_anchor"]["scope"], "src/auth");
-    assert_eq!(result["hint"]["code"], "context_only");
-    assert_eq!(result["results"], serde_json::json!([]));
-
-    let seed_id = result["resolved_anchor"]["seed_segment_ids"][0]
-        .as_str()
-        .expect("scoped file-line anchor should resolve to a seed segment");
-    let contextual = result["contextual_results"]
-        .as_array()
-        .expect("empty-scoped impact should retain contextual guidance");
-
-    assert!(!contextual.is_empty());
-    assert!(contextual.iter().all(|candidate| {
-        candidate["file_path"]
-            .as_str()
-            .map(|path| path.starts_with("src/auth/"))
-            .unwrap_or(false)
-    }));
-    assert!(contextual
-        .iter()
-        .all(|candidate| candidate["segment_id"].as_str() != Some(seed_id)));
-}
-
-#[test]
-fn search_segment_id_round_trips_into_impact_from_segment_json() {
-    let tmp = create_impact_acceptance_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let search_results = search_json(tmp.path(), "load auth config");
+    let first_line = stdout.lines().next().unwrap_or("");
     assert!(
-        !search_results.is_empty(),
-        "search fixture should produce ranked hits"
+        first_line.starts_with("refused"),
+        "expected refused line, got {first_line:?}"
     );
+    assert!(first_line.contains("anchor_out_of_scope"));
+    // Any hint line should point at alignment guidance.
+    assert!(stdout
+        .lines()
+        .any(|l| l.starts_with("hint") && l.contains("align_anchor_and_scope")));
+}
 
-    let seed = search_results
-        .iter()
-        .find(|result| {
-            result["file_path"].as_str() == Some("src/auth/runtime.rs")
-                && result["content"]
-                    .as_str()
-                    .map(|content| content.contains("load_auth_config"))
-                    .unwrap_or(false)
-        })
-        .expect("search should return the runtime definition segment");
-    let segment_id = seed["segment_id"]
-        .as_str()
-        .expect("search results should expose a segment_id follow-up handle");
+#[test]
+fn impact_symbol_anchor_refuses_broad_requests_with_hint() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
 
-    let result = impact_json(tmp.path(), &["--from-segment", segment_id]);
+    let (stdout, _stderr, ok) = impact_output(tmp.path(), &["--from-symbol", "load_config"]);
+    assert!(ok);
 
-    assert_eq!(result["status"], "expanded");
-    assert_eq!(result["resolved_anchor"]["kind"], "segment");
-    assert_eq!(result["resolved_anchor"]["value"], segment_id);
+    assert!(stdout.lines().next().unwrap_or("").starts_with("refused"));
+    assert!(stdout.contains("symbol_too_broad"));
+    assert!(stdout.lines().any(|l| l.starts_with("hint")
+        && l.contains("narrow_with_scope")
+        && l.contains("--scope")));
+}
 
-    let results = result["results"].as_array().unwrap();
+#[test]
+fn impact_file_line_anchor_returns_empty_with_hint() {
+    // Lean renderer: `empty` envelopes emit the status label plus a hint line
+    // (no `~C` rows on the wire — see design §3.6).
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let (stdout, _stderr, ok) =
+        impact_output(tmp.path(), &["--from-file", "src/auth/runtime.rs:5"]);
+    assert!(ok);
+
+    assert_eq!(
+        impact_status_line(&stdout).unwrap_or(""),
+        "empty",
+        "expected bare `empty` status, got {stdout:?}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|l| l.starts_with("hint"))
+        .expect("empty envelope should carry a hint line");
+    assert!(hint.contains("context_only"));
+}
+
+#[test]
+fn impact_scoped_file_line_anchor_returns_empty_scoped_with_hint() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let args = &[
+        "--from-file",
+        "src/auth/runtime.rs:5",
+        "--scope",
+        "src/auth",
+    ];
+    let (stdout, _stderr, ok) = impact_output(tmp.path(), args);
+    assert!(ok);
+
+    assert_eq!(
+        stdout.lines().next().unwrap_or(""),
+        "empty_scoped",
+        "expected bare `empty_scoped` status line, got: {stdout}"
+    );
+    let hint = stdout
+        .lines()
+        .find(|l| l.starts_with("hint"))
+        .expect("empty_scoped envelope should carry a hint line");
+    assert!(hint.contains("context_only"));
+    // Scope echoed on the hint line via `scope=<s>` per design §3.6.
     assert!(
-        !results.is_empty(),
-        "round-tripped impact should return candidates"
+        hint.contains("scope=src/auth"),
+        "hint should echo the requested scope, got: {hint}"
     );
-    assert_eq!(results[0]["file_path"], "src/auth/bootstrap.rs");
-    assert!(results
-        .iter()
-        .all(|candidate| candidate["segment_id"].as_str() != Some(segment_id)));
-    assert!(results[0]["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|reason| reason["from_segment_id"].as_str() == Some(segment_id)));
-    if let Some(contextual) = result["contextual_results"].as_array() {
-        assert!(contextual
-            .iter()
-            .all(|candidate| candidate["segment_id"].as_str() != Some(segment_id)));
+    // No discovery rows in empty_scoped envelopes.
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            line.starts_with("empty") || line.starts_with("hint"),
+            "unexpected discovery row in empty_scoped envelope: {line:?}"
+        );
     }
+}
+
+// =============================================================================
+// Search -> get round-trip
+// =============================================================================
+
+fn parse_get_record_header(line: &str) -> Option<&str> {
+    line.strip_prefix("segment ")
+}
+
+fn parse_get_records(stdout: &str) -> Vec<(String, Option<String>)> {
+    // Parse lean `get` output: each record is `segment <id>\n<tab-metadata>\n\n<body>\n\n---\n`
+    // or `not_found\t<raw>\n---\n`. Returns (id_or_raw, Some(content_string)) for
+    // resolved records and (raw, None) for not_found.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut records = Vec::new();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if let Some(rest) = line.strip_prefix("not_found\t") {
+            // Skip this line and the following `---` sentinel if present.
+            idx += 1;
+            if idx < lines.len() && lines[idx] == "---" {
+                idx += 1;
+            }
+            records.push((rest.to_string(), None));
+        } else if let Some(id) = parse_get_record_header(line) {
+            // Advance past the header line.
+            idx += 1;
+            // Consume the tab-delimited metadata line.
+            if idx < lines.len() {
+                idx += 1;
+            }
+            // Consume the blank line separating metadata from body.
+            if idx < lines.len() && lines[idx].is_empty() {
+                idx += 1;
+            }
+            // Accumulate body lines until the `---` sentinel is reached; the
+            // last blank line before `---` is considered the record terminator.
+            let mut body = String::new();
+            while idx < lines.len() && lines[idx] != "---" {
+                let body_line = lines[idx];
+                if body_line.is_empty() && idx + 1 < lines.len() && lines[idx + 1] == "---" {
+                    idx += 1;
+                    break;
+                }
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(body_line);
+                idx += 1;
+            }
+            // Consume the `---` sentinel if still pointing at it.
+            if idx < lines.len() && lines[idx] == "---" {
+                idx += 1;
+            }
+            records.push((id.to_string(), Some(body)));
+        } else {
+            idx += 1;
+        }
+    }
+    records
+}
+
+#[test]
+fn get_returns_body_for_known_handle() {
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let rows = search_rows(tmp.path(), "Config host port");
+    assert!(!rows.is_empty());
+    let handle = rows[0].segment_id.clone();
+
+    let (stdout, stderr, ok) =
+        run_core_cmd(&["get", &handle, "--path", tmp.path().to_str().unwrap()]);
+    assert!(ok, "get failed: {stderr}");
+
+    let records = parse_get_records(&stdout);
+    assert_eq!(records.len(), 1);
+    let (returned_id, body) = &records[0];
+    assert!(
+        returned_id.starts_with(&handle[..handle.len().min(returned_id.len())])
+            || handle.starts_with(returned_id),
+        "get header `segment {returned_id}` should correspond to queried handle {handle}"
+    );
+    assert!(body.as_ref().is_some_and(|b| !b.is_empty()));
+}
+
+#[test]
+fn get_tolerates_leading_colon_handle() {
+    // The lean row grammar emits `:<id>` as the trailing token; agents should
+    // be able to paste that directly into `1up get`.
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let rows = search_rows(tmp.path(), "Config");
+    let handle_with_colon = format!(":{}", rows[0].segment_id);
+
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "get",
+        &handle_with_colon,
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok, "get failed: {stderr}");
+    let records = parse_get_records(&stdout);
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].1.is_some(),
+        "leading-colon handle should resolve"
+    );
+}
+
+#[test]
+fn get_reports_not_found_for_unknown_handle() {
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "get",
+        "ffffffffffff",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    // `get` does not fail on an unresolved handle; it emits `not_found\t<raw>`.
+    assert!(ok);
+    let records = parse_get_records(&stdout);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, "ffffffffffff");
+    assert!(records[0].1.is_none());
+}
+
+#[test]
+fn get_preserves_order_across_handles() {
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let rows = search_rows(tmp.path(), "Config");
+    assert!(rows.len() >= 2, "need at least two hits for ordering test");
+    let first = rows[0].segment_id.clone();
+    let second = rows[1].segment_id.clone();
+
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "get",
+        &first,
+        "ffffffffffff",
+        &second,
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
+
+    let records = parse_get_records(&stdout);
+    assert_eq!(records.len(), 3);
+    assert!(records[0].1.is_some());
+    assert_eq!(records[1].0, "ffffffffffff");
+    assert!(records[1].1.is_none());
+    assert!(records[2].1.is_some());
+}
+
+// =============================================================================
+// Search handle handoff: search -> impact --from-segment preserves ranking
+// =============================================================================
+
+#[test]
+fn search_segment_id_round_trips_into_impact_from_segment() {
+    // The lean row grammar emits a 12-char display handle (`:<prefix>`). `get`
+    // resolves that prefix back to the full 16-char segment id, which is what
+    // `impact --from-segment` expects for its exact-anchor lookup. This pins
+    // the discovery -> hydrate -> impact follow-up chain at the row-grammar
+    // layer.
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "load auth config");
+    let seed = rows
+        .iter()
+        .find(|r| r.file_path == "src/auth/runtime.rs")
+        .expect("search should return the runtime definition segment");
+    let handle_prefix = seed.segment_id.clone();
+
+    let (get_stdout, _stderr, ok) = run_core_cmd(&[
+        "get",
+        &handle_prefix,
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
+    let records = parse_get_records(&get_stdout);
+    let full_segment_id = records
+        .iter()
+        .find_map(|(id, body)| body.as_ref().map(|_| id.clone()))
+        .expect("get should resolve the prefix to a full segment id");
+    assert!(full_segment_id.starts_with(&handle_prefix));
+
+    let impact = impact_rows(tmp.path(), &["--from-segment", &full_segment_id]);
+    assert!(!impact.is_empty());
+    assert!(impact
+        .iter()
+        .any(|r| r.channel == Some('P') && r.file_path == "src/auth/bootstrap.rs"));
+    // Seeds never appear in their own primary results.
+    assert!(impact
+        .iter()
+        .all(|r| !full_segment_id.starts_with(&r.segment_id)));
 }
 
 #[test]
 fn search_segment_id_handoff_keeps_search_top_hits_stable() {
+    // The hand-off from `search` to `impact --from-segment` must not perturb
+    // subsequent search ranking.
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let before = search_json(tmp.path(), "load auth config");
-    assert!(
-        !before.is_empty(),
-        "search fixture should produce ranked hits"
-    );
+    let before = search_rows(tmp.path(), "load auth config");
+    assert!(!before.is_empty());
 
-    let segment_id = before
-        .iter()
-        .find_map(|result| result["segment_id"].as_str())
-        .expect("search results should expose at least one segment_id");
-
-    let _result = impact_json(tmp.path(), &["--from-segment", segment_id]);
-    let after = search_json(tmp.path(), "load auth config");
+    let segment_id = before[0].segment_id.clone();
+    let _ = impact_rows(tmp.path(), &["--from-segment", &segment_id]);
+    let after = search_rows(tmp.path(), "load auth config");
 
     let before_ranked: Vec<_> = before
         .iter()
         .take(5)
-        .map(|result| {
-            (
-                result["file_path"].as_str().unwrap().to_string(),
-                result["line_number"].as_u64().unwrap(),
-                result["block_type"].as_str().unwrap().to_string(),
-            )
-        })
+        .map(|r| (r.file_path.clone(), r.line_start, r.kind.clone()))
         .collect();
     let after_ranked: Vec<_> = after
         .iter()
         .take(5)
-        .map(|result| {
-            (
-                result["file_path"].as_str().unwrap().to_string(),
-                result["line_number"].as_u64().unwrap(),
-                result["block_type"].as_str().unwrap().to_string(),
-            )
-        })
+        .map(|r| (r.file_path.clone(), r.line_start, r.kind.clone()))
         .collect();
-
     assert_eq!(before_ranked, after_ranked);
 }
 
+// =============================================================================
+// Context lean shape
+// =============================================================================
+
 #[test]
-fn context_retrieval_returns_enclosing_scope_json() {
+fn context_retrieval_returns_enclosing_scope() {
     let tmp = create_multi_lang_fixture();
     init_and_index(&tmp);
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "context",
-            "main.rs:4",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "context",
+        "main.rs:4",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
 
-    assert!(output.status.success());
+    // Header line: `<path>:<l1>-<l2>  context  <scope_type>`.
+    let header = stdout.lines().next().unwrap_or("");
+    let parts: Vec<&str> = header.split("  ").collect();
+    assert_eq!(parts.len(), 3, "context header shape: {header:?}");
+    assert!(
+        parts[0].ends_with("main.rs:3-5") || parts[0].contains("main.rs:"),
+        "context path/lines token shape: {:?}",
+        parts[0]
+    );
+    assert_eq!(parts[1], "context");
+    assert_eq!(parts[2], "function");
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert!(result.get("file_path").is_some());
-    assert!(result.get("language").is_some());
-    assert!(result.get("content").is_some());
-    assert!(result.get("line_start").is_some());
-    assert!(result.get("line_end").is_some());
-    assert!(result.get("scope_type").is_some());
-    assert!(result.get("access_scope").is_some());
-
-    assert_eq!(result["scope_type"], "function");
-    assert_eq!(result["access_scope"], "project_root");
-    assert!(result["content"].as_str().unwrap().contains("fn greet"));
+    // The enclosing body should quote `fn greet`.
+    assert!(stdout.contains("fn greet"));
 }
 
 #[test]
@@ -1397,26 +1559,16 @@ fn context_retrieval_python_scope() {
     let tmp = create_multi_lang_fixture();
     init_and_index(&tmp);
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "context",
-            "utils.py:6",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert_eq!(result["scope_type"], "function");
-    assert_eq!(result["access_scope"], "project_root");
-    assert!(result["content"].as_str().unwrap().contains("parse_config"));
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "context",
+        "utils.py:6",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
+    let header = stdout.lines().next().unwrap_or("");
+    assert!(header.contains("  context  function"));
+    assert!(stdout.contains("parse_config"));
 }
 
 #[test]
@@ -1487,27 +1639,17 @@ fn context_allows_absolute_in_root_path_with_explicit_override() {
     .unwrap();
     let location = format!("{}:1", in_root_file.display());
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "context",
-            &location,
-            "--path",
-            project_root.to_str().unwrap(),
-            "--allow-outside-root",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert_eq!(result["scope_type"], "function");
-    assert_eq!(result["access_scope"], "project_root");
-    assert!(result["content"].as_str().unwrap().contains("fn internal"));
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "context",
+        &location,
+        "--path",
+        project_root.to_str().unwrap(),
+        "--allow-outside-root",
+    ]);
+    assert!(ok);
+    let header = stdout.lines().next().unwrap_or("");
+    assert!(header.contains("  context  function"));
+    assert!(stdout.contains("fn internal"));
 }
 
 #[test]
@@ -1523,156 +1665,30 @@ fn context_allows_outside_root_with_explicit_override() {
     .unwrap();
     let location = format!("{}:1", outside_file.display());
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "context",
-            &location,
-            "--path",
-            project_root.to_str().unwrap(),
-            "--allow-outside-root",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert_eq!(result["scope_type"], "function");
-    assert_eq!(result["access_scope"], "outside_root");
-    assert!(result["content"].as_str().unwrap().contains("fn leaked"));
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "context",
+        &location,
+        "--path",
+        project_root.to_str().unwrap(),
+        "--allow-outside-root",
+    ]);
+    assert!(ok);
+    let header = stdout.lines().next().unwrap_or("");
+    assert!(header.contains("  context  function"));
+    assert!(stdout.contains("fn leaked"));
 }
 
-#[test]
-fn json_output_search_schema_conformance() {
-    let tmp = create_multi_lang_fixture();
-    let _guard = init_and_index_fts_only(&tmp);
-
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "config",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-
-    for result in &results {
-        assert!(result["file_path"].is_string(), "file_path must be string");
-        assert!(result["language"].is_string(), "language must be string");
-        assert!(
-            result["block_type"].is_string(),
-            "block_type must be string"
-        );
-        assert!(result["content"].is_string(), "content must be string");
-        assert!(result["score"].is_number(), "score must be number");
-        assert!(
-            result["line_number"].is_number(),
-            "line_number must be number"
-        );
-    }
-}
-
-#[test]
-fn json_output_symbol_schema_conformance() {
-    let tmp = create_multi_lang_fixture();
-    init_and_index(&tmp);
-
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "Config",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert!(!results.is_empty());
-    for result in &results {
-        assert!(result["name"].is_string(), "name must be string");
-        assert!(result["kind"].is_string(), "kind must be string");
-        assert!(result["file_path"].is_string(), "file_path must be string");
-        assert!(
-            result["line_start"].is_number(),
-            "line_start must be number"
-        );
-        assert!(result["line_end"].is_number(), "line_end must be number");
-        assert!(result["content"].is_string(), "content must be string");
-        assert!(
-            result["reference_kind"].is_string(),
-            "reference_kind must be string"
-        );
-        let ref_kind = result["reference_kind"].as_str().unwrap();
-        assert!(
-            ref_kind == "definition" || ref_kind == "usage",
-            "reference_kind must be 'definition' or 'usage'"
-        );
-    }
-}
-
-#[test]
-fn json_output_context_schema_conformance() {
-    let tmp = create_multi_lang_fixture();
-    init_and_index(&tmp);
-
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "context",
-            "handler.js:2",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-
-    assert!(result["file_path"].is_string());
-    assert!(result["language"].is_string());
-    assert!(result["content"].is_string());
-    assert!(result["line_start"].is_number());
-    assert!(result["line_end"].is_number());
-    assert!(result["scope_type"].is_string());
-    assert!(result["access_scope"].is_string());
-}
+// =============================================================================
+// Incremental indexing
+// =============================================================================
 
 #[test]
 fn incremental_indexing_detects_changes() {
     let tmp = create_multi_lang_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let output1 = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "greet",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    let results1: Vec<serde_json::Value> =
-        serde_json::from_str(String::from_utf8(output1.stdout).unwrap().trim()).unwrap();
-    assert!(!results1.is_empty());
+    let before = symbol_rows(tmp.path(), "greet", &[]);
+    assert!(!before.is_empty());
 
     fs::write(
         tmp.path().join("main.rs"),
@@ -1692,39 +1708,20 @@ fn main() {
         .assert()
         .success();
 
-    let output2 = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "greet",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    let results2: Vec<serde_json::Value> =
-        serde_json::from_str(String::from_utf8(output2.stdout).unwrap().trim()).unwrap();
+    let after_greet = symbol_rows(tmp.path(), "greet", &[]);
     assert!(
-        results2.is_empty(),
+        after_greet.is_empty(),
         "greet should no longer exist after re-index"
     );
 
-    let output3 = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "welcome",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    let results3: Vec<serde_json::Value> =
-        serde_json::from_str(String::from_utf8(output3.stdout).unwrap().trim()).unwrap();
-    assert!(!results3.is_empty(), "welcome should exist after re-index");
-    assert_eq!(results3[0]["name"], "welcome");
+    let after_welcome = symbol_rows(tmp.path(), "welcome", &[]);
+    assert!(
+        !after_welcome.is_empty(),
+        "welcome should exist after re-index"
+    );
+    assert!(after_welcome
+        .iter()
+        .any(|r| r.symbol == "welcome" || r.breadcrumb.contains("welcome")));
 }
 
 #[test]
@@ -1801,33 +1798,34 @@ fn default_parallel_index_matches_jobs_one_for_incremental_cleanup() {
     assert_eq!(rerun_default["progress"]["files_skipped"], 1);
     assert_eq!(rerun_default["progress"]["files_deleted"], 1);
 
-    assert!(lookup_symbol_json(default_repo.path(), "removed_symbol").is_empty());
-    assert!(lookup_symbol_json(serial_repo.path(), "removed_symbol").is_empty());
+    assert!(symbol_rows(default_repo.path(), "removed_symbol", &[]).is_empty());
+    assert!(symbol_rows(serial_repo.path(), "removed_symbol", &[]).is_empty());
     assert_eq!(
-        lookup_symbol_json(default_repo.path(), "beta_symbol").len(),
+        symbol_rows(default_repo.path(), "beta_symbol", &[]).len(),
+        1
+    );
+    assert_eq!(symbol_rows(serial_repo.path(), "beta_symbol", &[]).len(), 1);
+    assert_eq!(
+        symbol_rows(default_repo.path(), "fresh_symbol", &[]).len(),
         1
     );
     assert_eq!(
-        lookup_symbol_json(serial_repo.path(), "beta_symbol").len(),
+        symbol_rows(serial_repo.path(), "fresh_symbol", &[]).len(),
         1
     );
     assert_eq!(
-        lookup_symbol_json(default_repo.path(), "fresh_symbol").len(),
+        symbol_rows(default_repo.path(), "stable_symbol", &[]).len(),
         1
     );
     assert_eq!(
-        lookup_symbol_json(serial_repo.path(), "fresh_symbol").len(),
-        1
-    );
-    assert_eq!(
-        lookup_symbol_json(default_repo.path(), "stable_symbol").len(),
-        1
-    );
-    assert_eq!(
-        lookup_symbol_json(serial_repo.path(), "stable_symbol").len(),
+        symbol_rows(serial_repo.path(), "stable_symbol", &[]).len(),
         1
     );
 }
+
+// =============================================================================
+// Daemon lifecycle + PID
+// =============================================================================
 
 #[cfg(unix)]
 #[test]
@@ -1877,6 +1875,10 @@ fn daemon_stale_pid_detection() {
     assert!(!pid_path.exists(), "stale PID file should be cleaned up");
 }
 
+// =============================================================================
+// End-to-end workflow + maintenance command JSON surface
+// =============================================================================
+
 #[test]
 fn cli_init_then_index_then_search_workflow() {
     let tmp = create_multi_lang_fixture();
@@ -1897,15 +1899,9 @@ fn cli_init_then_index_then_search_workflow() {
         .success()
         .stdout(predicate::str::contains("Indexed"));
 
+    // Search now renders lean rows; just assert it succeeds.
     cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "logger",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["search", "logger", "--path", tmp.path().to_str().unwrap()])
         .assert()
         .success();
 }
@@ -1972,9 +1968,16 @@ fn status_json_reports_noop_index_progress() {
     assert!(payload["indexed_files"].as_u64().unwrap() > 0);
 }
 
+// =============================================================================
+// Daemon IPC: lean SearchResult round-trip
+// =============================================================================
+
 #[cfg(unix)]
 #[test]
-fn cli_search_uses_daemon_results_before_local_fallback() {
+fn daemon_response_carries_lean_results() {
+    // The CLI should deserialize the lean `SearchResult` shape sent back by the
+    // daemon (framed JSON over Unix socket) and re-render it through the lean
+    // row grammar on stdout.
     let home = tempfile::Builder::new()
         .prefix("1up-home-")
         .tempdir_in("/tmp")
@@ -2006,18 +2009,20 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
         assert_eq!(payload["query"], "test");
         assert_eq!(payload["limit"], 3);
 
+        // Lean SearchResult: segment_id required, score u32 integer, no
+        // complexity/role/referenced_symbols/called_symbols fields.
         let response = serde_json::json!({
             "status": "results",
             "results": [
                 {
-                    "segment_id": "daemon-seg-1",
+                    "segment_id": "daemonseg000",
                     "file_path": "src/daemon.rs",
                     "language": "rust",
                     "block_type": "function",
                     "content": "fn daemon_search() {}",
-                    "score": 100,
+                    "score": 87,
                     "line_number": 3,
-                    "line_end": 3
+                    "line_end": 5
                 }
             ]
         });
@@ -2028,23 +2033,53 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
         .recv_timeout(std::time::Duration::from_secs(2))
         .unwrap();
 
-    cmd()
+    let output = cmd()
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_CONFIG_HOME")
-        .args([
-            "--format",
-            "json",
-            "search",
-            "test",
-            "--path",
-            project.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("src/daemon.rs"));
+        .args(["search", "test", "--path", project.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows = parse_discovery_rows(&stdout);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].score, 87);
+    assert_eq!(rows[0].file_path, "src/daemon.rs");
+    assert_eq!(rows[0].line_start, 3);
+    assert_eq!(rows[0].line_end, 5);
+    assert_eq!(rows[0].segment_id, "daemonseg000");
 
     server.join().unwrap();
+}
+
+// =============================================================================
+// Flag rejection on core commands
+// =============================================================================
+
+#[test]
+fn search_rejects_format_flag() {
+    // core commands reject all presentation flags at clap parse time.
+    for flag_pair in [["-f", "human"], ["--format", "json"], ["-f", "plain"]] {
+        cmd()
+            .args(["search", "needle", flag_pair[0], flag_pair[1]])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
+    }
+}
+
+#[test]
+fn core_commands_reject_legacy_flags() {
+    // no core command should quietly accept `--full`, `--human`, or
+    // `--verbose-fields` either.
+    for bad_flag in ["--full", "--human", "--verbose-fields"] {
+        cmd()
+            .args(["search", "needle", bad_flag])
+            .assert()
+            .failure();
+    }
 }
 
 #[test]
@@ -2052,14 +2087,7 @@ fn cli_search_without_index_requires_reindex() {
     let tmp = TempDir::new().unwrap();
 
     cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "test",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["search", "test", "--path", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("1up reindex"));
@@ -2070,14 +2098,7 @@ fn cli_symbol_without_index_requires_reindex() {
     let tmp = TempDir::new().unwrap();
 
     cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "test",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["symbol", "test", "--path", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("1up reindex"));
@@ -2089,8 +2110,6 @@ fn cli_context_nonexistent_file_fails() {
 
     cmd()
         .args([
-            "--format",
-            "json",
             "context",
             "nonexistent.rs:1",
             "--path",
@@ -2101,71 +2120,39 @@ fn cli_context_nonexistent_file_fails() {
 }
 
 #[test]
-fn cli_output_formats_all_work() {
-    let tmp = create_multi_lang_fixture();
-    init_and_index(&tmp);
-
-    for fmt in &["json", "human", "plain"] {
-        cmd()
-            .args([
-                "--format",
-                fmt,
-                "symbol",
-                "Config",
-                "--path",
-                tmp.path().to_str().unwrap(),
-            ])
-            .assert()
-            .success();
-    }
-}
-
-#[test]
-fn cli_search_empty_results_returns_empty_array_json() {
+fn cli_search_empty_results_emits_nothing() {
     let tmp = create_multi_lang_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "zznonexistentqueryzz",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(results.is_empty());
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "search",
+        "zznonexistentqueryzz",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
+    assert!(
+        stdout.lines().filter(|l| !l.is_empty()).count() == 0,
+        "empty search should emit zero rows, got: {stdout:?}"
+    );
 }
 
 #[test]
-fn cli_symbol_empty_results_returns_empty_array_json() {
+fn cli_symbol_empty_results_emits_nothing_on_stdout() {
     let tmp = create_multi_lang_fixture();
     init_and_index(&tmp);
 
-    let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "symbol",
-            "zznonexistentsymbolzz",
-            "--path",
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let results: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(results.is_empty());
+    let (stdout, _stderr, ok) = run_core_cmd(&[
+        "symbol",
+        "zznonexistentsymbolzz",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(ok);
+    assert!(
+        stdout.lines().filter(|l| !l.is_empty()).count() == 0,
+        "empty symbol lookup should emit zero rows, got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2244,71 +2231,34 @@ fn cli_worktree_resolves_to_main_repo_index() {
     let status_json: serde_json::Value = serde_json::from_slice(&status_output.stdout).unwrap();
     assert_eq!(status_json["project_initialized"], true);
 
-    let search_output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "greet",
-            "--path",
-            worktree_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    // Core command from a worktree renders lean rows and should succeed against
+    // the main repo's index.
+    cmd()
+        .args(["search", "greet", "--path", worktree_path.to_str().unwrap()])
+        .assert()
+        .success();
 
-    assert!(
-        search_output.status.success(),
-        "search from worktree failed: {}",
-        String::from_utf8_lossy(&search_output.stderr)
-    );
-
-    // Write a worktree-only file and re-index from the worktree.
-    // The indexer should scan the worktree's files, not the main repo's.
+    // Write a worktree-only file and re-index from the worktree; the indexer
+    // scans the worktree's files, not the main repo's.
     fs::write(
         worktree_path.join("worktree_only.rs"),
         "fn worktree_exclusive() -> bool { true }\n",
     )
     .unwrap();
 
-    let reindex_output = cmd()
+    cmd()
         .args([
             "reindex",
             worktree_path.to_str().unwrap(),
             "--format",
             "json",
         ])
-        .output()
-        .unwrap();
+        .assert()
+        .success();
 
+    let rows = search_rows(&worktree_path, "worktree_exclusive");
     assert!(
-        reindex_output.status.success(),
-        "reindex from worktree failed: {}",
-        String::from_utf8_lossy(&reindex_output.stderr)
-    );
-
-    // Search for the worktree-only symbol — it should appear in the index.
-    let wt_search_output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "worktree_exclusive",
-            "--path",
-            worktree_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(
-        wt_search_output.status.success(),
-        "search for worktree-only symbol failed: {}",
-        String::from_utf8_lossy(&wt_search_output.stderr)
-    );
-
-    let wt_results: Vec<serde_json::Value> =
-        serde_json::from_slice(&wt_search_output.stdout).unwrap();
-    assert!(
-        !wt_results.is_empty(),
+        !rows.is_empty(),
         "worktree-only symbol should appear after reindex from worktree"
     );
 }

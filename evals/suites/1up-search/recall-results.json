@@ -1,8 +1,8 @@
 {
   "schema_version": null,
   "target_repo": "/Users/prem/Development/1up",
-  "binary": "/Users/prem/Development/1up/target/release/1up",
-  "captured_at": "2026-04-17T03:07:54.132Z",
+  "binary": "/Users/prem/Development/1up/target/debug/1up",
+  "captured_at": "2026-04-17T11:21:53.915Z",
   "corpus_size": 15,
   "corpus_match_mode_counts": {
     "anchor": 15,
@@ -12,7 +12,7 @@
   "reports": [
     {
       "k": 10,
-      "recall": 0.4666666666666666,
+      "recall": 0.4611111111111111,
       "scored_queries": 15,
       "total_queries": 15,
       "per_query": [
@@ -22,46 +22,44 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "d011c8a929156ad9",
+              "segment_id": "d011c8a92915",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "46ad9cec88f203b1",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "3d33b9087388332c",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "7e1ac92e03773367",
+              "segment_id": "7e1ac92e0377",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c05fcb",
+              "segment_id": "c9854e0f32c0",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "076945e5e1c3d22c",
+              "segment_id": "076945e5e1c3",
               "file_path": "src/shared/errors.rs"
+            },
+            {
+              "segment_id": "7c2b5e8f19ef",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "4f0d8b58b9ce",
+              "file_path": "src/shared/update.rs"
+            },
+            {
+              "segment_id": "0ca26bf20131",
+              "file_path": "src/shared/update.rs"
             }
           ],
           "gold_size": 3,
@@ -78,46 +76,46 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f3769f012e9b93ba",
+              "segment_id": "f3769f012e9b",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "cb2cb8e9516fac9b",
+              "segment_id": "cb2cb8e9516f",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "RetrievalBackend<'a>"
             },
             {
-              "segment_id": "dd69682e22593ac2",
+              "segment_id": "dd69682e2259",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "b8bc560fffde2a06",
+              "segment_id": "b8bc560fffde",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "FtsOnly<'a>"
             },
             {
-              "segment_id": "dcc0fe34c1f13da5",
+              "segment_id": "dcc0fe34c1f1",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9f6a38b1b371994b",
+              "segment_id": "9f6a38b1b371",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "3b4fe06cdf6cd102",
+              "segment_id": "3b4fe06cdf6c",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf192a",
+              "segment_id": "cc2a910dbcaf",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "0ed3cbcc8113594b",
+              "segment_id": "0ed3cbcc8113",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "0a4dc7a4feb04af3",
-              "file_path": "src/search/symbol.rs"
+              "segment_id": "1b35f771c000",
+              "file_path": "src/search/impact.rs"
             }
           ],
           "gold_size": 4,
@@ -135,45 +133,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "fb934c198d291f9d",
+              "segment_id": "e0e25f6beafb",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "8d078f9c4800f208",
+              "segment_id": "e6ad0151c7fa",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "be82820acff2b06f",
+              "segment_id": "be82820acff2",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5bcd6303180fe63a",
+              "segment_id": "5bcd6303180f",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "1a8fdd457eaf7fd0",
+              "segment_id": "3722a5b72b55",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "62a6b06d15543a62",
+              "segment_id": "62a6b06d1554",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "76d0af841e573cc0",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d80410c6445d4100",
+              "segment_id": "d80410c6445d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "39d78a1ed1d1f292",
+              "segment_id": "ae1e8edf8e52",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "39d78a1ed1d1",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbec6a0",
+              "segment_id": "082c7e64bfbe",
               "file_path": "src/indexer/pipeline.rs"
             }
           ],
@@ -191,45 +189,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e4f7da9830a3a31a",
+              "segment_id": "e4f7da9830a3",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "97f90c9e6f6cca8c",
+              "segment_id": "97f90c9e6f6c",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9779b23d917b8beb",
+              "segment_id": "9779b23d917b",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "9a4ea46c811f7c27",
+              "segment_id": "cc2a910dbcaf",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "9a4ea46c811f",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf192a",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "23c9c5f85405a051",
+              "segment_id": "23c9c5f85405",
               "file_path": "src/search/ranking.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "9f6a38b1b371994b",
+              "segment_id": "9f6a38b1b371",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "09738eb7df4ea5df",
+              "segment_id": "09738eb7df4e",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "cf171f6ff7677e76",
+              "segment_id": "cf171f6ff767",
               "file_path": "src/search/impact.rs"
             }
           ],
@@ -246,45 +244,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "6d9f74cc76fa0654",
+              "segment_id": "6d9f74cc76fa",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "f3769f012e9b93ba",
+              "segment_id": "f3769f012e9b",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "072fbae0c6311afb",
+              "segment_id": "072fbae0c631",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "9a4ea46c811f7c27",
+              "segment_id": "9a4ea46c811f",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5619d3841e9e8ac9",
+              "segment_id": "5619d3841e9e",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "1ed80e3e5f66fe93",
+              "segment_id": "1ed80e3e5f66",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "264a58c9c46e0fc5",
+              "segment_id": "264a58c9c46e",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "3d66cf3ef37c1c20",
-              "file_path": "src/storage/segments.rs"
+              "segment_id": "5cd7bd8c161f",
+              "file_path": "src/storage/db.rs"
             }
           ],
           "gold_size": 2,
@@ -298,48 +296,48 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "8049f2946f342a0d",
+              "segment_id": "8049f2946f34",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "5c0289cf68093118",
+              "segment_id": "5c0289cf6809",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "6a3b09e8423634bc",
+              "segment_id": "d25734271d22",
               "file_path": "tests/rewrite_sql_verification.rs"
             },
             {
-              "segment_id": "7b282d72f1c3dfa5",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "46ad9cec88f203b1",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c05fcb",
+              "segment_id": "c9854e0f32c0",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "3d33b9087388332c",
-              "file_path": "src/storage/segments.rs",
+              "segment_id": "2272522c3b6e",
+              "file_path": "src/shared/update.rs",
               "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "e42cdfa38591",
+              "file_path": "src/shared/update.rs"
+            },
+            {
+              "segment_id": "efd6ac3b7199",
+              "file_path": "src/shared/update.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "7c2b5e8f19ef",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             }
           ],
           "gold_size": 3,
@@ -356,45 +354,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "7fcb139f87ff92e3",
+              "segment_id": "7fcb139f87ff",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "5bcd6303180fe63a",
+              "segment_id": "5bcd6303180f",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "7a90fc8fb82ec199",
+              "segment_id": "7a90fc8fb82e",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "59603cddb1cb15eb",
+              "segment_id": "59603cddb1cb",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "98f6a6ee88d4a15b",
+              "segment_id": "98f6a6ee88d4",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "bf61430a2138ebf2",
+              "segment_id": "bf61430a2138",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "0397aed30272c536",
+              "segment_id": "0397aed30272",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "d80410c6445d4100",
+              "segment_id": "d80410c6445d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a0b35e0ca120a68b",
+              "segment_id": "a0b35e0ca120",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "be82820acff2b06f",
+              "segment_id": "be82820acff2",
               "file_path": "src/storage/queries.rs"
             }
           ],
@@ -411,44 +409,44 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "ec7087ceaac80923",
+              "segment_id": "f19435271bcc",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "3620c9fb3092b474",
+              "segment_id": "3620c9fb3092",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "b149994b43d9b8c5",
+              "segment_id": "b149994b43d9",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "3122cedc4d46e1f8",
+              "segment_id": "c4d918cc24ad",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "5c7bd94e3b03",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b6bc5cb5a769",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "5f7b22036469265d",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "efdcf0b30582e628",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d13c50be90fae3e2",
+              "segment_id": "d13c50be90fa",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "VerifiedArtifactManifest"
             },
             {
-              "segment_id": "25764d90abdc4492",
+              "segment_id": "9c02990f9ea2",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "c7222d17707a5aca",
+              "segment_id": "e3cdcf269692",
               "file_path": "src/shared/types.rs"
             },
             {
-              "segment_id": "d7f475db3c101577",
+              "segment_id": "b9b86875b68d",
               "file_path": "src/cli/output.rs"
             }
           ],
@@ -467,48 +465,48 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "a521511b1b9e5a01",
+              "segment_id": "a521511b1b9e",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbec6a0",
+              "segment_id": "082c7e64bfbe",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "8b246cb22ff714bb",
+              "segment_id": "8b246cb22ff7",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "31fba475b2e65dc0",
+              "segment_id": "31fba475b2e6",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "a0a13332bacf52b1",
+              "segment_id": "a0a13332bacf",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "44938f3491ad9f6b",
+              "segment_id": "44938f3491ad",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "91c2d4bb27ae2864",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "66858b4a12ca0e95",
+              "segment_id": "66858b4a12ca",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "85ea5604e40612c1",
-              "file_path": "src/storage/segments.rs",
+              "segment_id": "2f0e7a89485c",
+              "file_path": "src/search/symbol.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "23dbf910fc3893db",
-              "file_path": "src/search/symbol.rs",
+              "segment_id": "64bf0663876f",
+              "file_path": "src/cli/lean.rs"
+            },
+            {
+              "segment_id": "d43b8da1b757",
+              "file_path": "src/search/hybrid.rs",
               "breadcrumb": "tests"
             }
           ],
@@ -525,46 +523,46 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "27f1de9c103e3a56",
+              "segment_id": "27f1de9c103e",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "d23f2ee0a0f226da",
+              "segment_id": "d23f2ee0a0f2",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "259f9b6f6ac8b5ec",
+              "segment_id": "047671b8e90e",
+              "file_path": "src/cli/lean.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "259f9b6f6ac8",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "cf171f6ff7677e76",
+              "segment_id": "cf171f6ff767",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "a0a13332bacf52b1",
-              "file_path": "src/cli/impact.rs"
-            },
-            {
-              "segment_id": "930b330cacb75be3",
+              "segment_id": "f7645ae8e9ef",
               "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "5b42da26f21aa067",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "9c46f322569e7e11",
+              "segment_id": "9c46f322569e",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "18ba753cc35cd2e8",
-              "file_path": "src/cli/output.rs",
+              "segment_id": "89798f2e3259",
+              "file_path": "scripts/lib/impact_fixture.sh"
+            },
+            {
+              "segment_id": "a44304e575a2",
+              "file_path": "src/cli/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "89798f2e325955af",
-              "file_path": "scripts/lib/impact_fixture.sh"
+              "segment_id": "58565437542c",
+              "file_path": "tests/integration_tests.rs"
             }
           ],
           "gold_size": 3,
@@ -578,45 +576,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0174007e22791d4b",
+              "segment_id": "0174007e2279",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "ff1e7701d3a8f8c5",
+              "segment_id": "32e460838e7e",
               "file_path": "src/daemon/search_service.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "8e18b791cc342c9e",
+              "segment_id": "8e18b791cc34",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "fb041d0f2b0ee156",
+              "segment_id": "fb041d0f2b0e",
               "file_path": "src/daemon/ipc.rs"
             },
             {
-              "segment_id": "3c9c85eda52ec8d8",
+              "segment_id": "3c9c85eda52e",
               "file_path": "src/shared/config.rs"
             },
             {
-              "segment_id": "e07bae0a15981a90",
+              "segment_id": "e07bae0a1598",
               "file_path": "src/daemon/worker.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "ed7fdf5bf3b61ed9",
+              "segment_id": "ed7fdf5bf3b6",
               "file_path": "src/daemon/worker.rs"
             },
             {
-              "segment_id": "ec121226761d200a",
+              "segment_id": "ec121226761d",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "def488b045c8614d",
+              "segment_id": "def488b045c8",
               "file_path": "src/shared/fs.rs"
             },
             {
-              "segment_id": "de100dc1e5437b26",
+              "segment_id": "de100dc1e543",
               "file_path": "src/shared/constants.rs"
             }
           ],
@@ -633,44 +631,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "658383704be65681",
+              "segment_id": "13d855abb806",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "7e28df94fb5a964e",
+              "segment_id": "265d355e9966",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "299a3bbee2d8d522",
+              "segment_id": "181f258d7123",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "12a66deb219f0534",
-              "file_path": "evals/suites/1up-impact/prompt-1up.txt"
+              "segment_id": "1b02103c5f1d",
+              "file_path": "src/main.rs"
             },
             {
-              "segment_id": "5b9a730ca8db586b",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
+              "segment_id": "b9b76211f73a",
+              "file_path": "src/cli/lean.rs"
             },
             {
-              "segment_id": "ccc33a8385e0482e",
-              "file_path": "evals/run-parallel.sh"
-            },
-            {
-              "segment_id": "051b5ad747a35f36",
+              "segment_id": "61db91bc4d53",
               "file_path": "evals/suites/1up-search/recall.ts"
             },
             {
-              "segment_id": "192b598eca8e96bc",
-              "file_path": "evals/run-parallel.sh"
-            },
-            {
-              "segment_id": "0bd458095d418f9d",
+              "segment_id": "d718a10991ca",
               "file_path": "src/cli/output.rs"
             },
             {
-              "segment_id": "ad17fc2a516bc38b",
-              "file_path": "evals/suites/shared/assertions/index.ts"
+              "segment_id": "cf6df22bcd51",
+              "file_path": "src/cli/search.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "12a66deb219f",
+              "file_path": "evals/suites/1up-impact/prompt-1up.txt"
+            },
+            {
+              "segment_id": "5b9a730ca8db",
+              "file_path": "evals/suites/1up-search/search-bench.ts"
             }
           ],
           "gold_size": 3,
@@ -688,55 +687,53 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "5c0289cf68093118",
+              "segment_id": "5c0289cf6809",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
+              "segment_id": "e5782e135c57",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e57c21b9033f3e8d",
-              "file_path": "src/cli/reindex.rs"
-            },
-            {
-              "segment_id": "7b282d72f1c3dfa5",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "6a3b09e8423634bc",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "3d33b9087388332c",
+              "segment_id": "883b458ef54a",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "7c2b5e8f19ef686f",
+              "segment_id": "d25734271d22",
+              "file_path": "tests/rewrite_sql_verification.rs"
+            },
+            {
+              "segment_id": "7c2b5e8f19ef",
               "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "a1f842b74a7c",
+              "file_path": "src/cli/impact.rs"
+            },
+            {
+              "segment_id": "264a58c9c46e",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            1
-          ],
-          "hit_count": 1,
-          "recall": 0.3333333333333333
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "relation descriptor with lookup canonical symbol and qualifier fingerprint",
@@ -744,56 +741,56 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e5eb43f99145a8a9",
+              "segment_id": "e5eb43f99145",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "3f388627238b5e9d",
+              "segment_id": "3f388627238b",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "1cc921f20d9c54b3",
+              "segment_id": "1cc921f20d9c",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "479072c5c4e4b411",
+              "segment_id": "479072c5c4e4",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "ImpactHorizonEngine<'a>"
             },
             {
-              "segment_id": "390fbc5e7cb1a892",
+              "segment_id": "390fbc5e7cb1",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "a232654fae27b167",
+              "segment_id": "1deba4b78526",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "13bb8054d1a37d5b",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "410b5d7a9b1c0259",
+              "segment_id": "27af091fe68d",
               "file_path": "src/search/symbol.rs"
             },
             {
-              "segment_id": "897ff11bd066b9a2",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "13bb8054d1a3",
+              "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "2f687e13797b687b",
+              "segment_id": "2f687e13797b",
               "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "7df7b14f6d34",
+              "file_path": "src/indexer/parser.rs"
             }
           ],
           "gold_size": 4,
           "matched_indices": [
             0,
             1,
-            2
+            2,
+            3
           ],
-          "hit_count": 3,
-          "recall": 0.75
+          "hit_count": 4,
+          "recall": 1
         },
         {
           "query": "benchmark parallel indexing script emitting JSON summary",
@@ -801,48 +798,48 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "3f341ac5939d8080",
-              "file_path": "scripts/release/generate_release_evidence.sh"
-            },
-            {
-              "segment_id": "cffb2b0f4db5aa92",
+              "segment_id": "cffb2b0f4db5",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "68877eec795c2c9a",
+              "segment_id": "3f341ac5939d",
+              "file_path": "scripts/release/generate_release_evidence.sh"
+            },
+            {
+              "segment_id": "68877eec795c",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "c0aed2a626e5168f",
+              "segment_id": "58975ec3a1a9",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "de1a46b30c1e5217",
+              "segment_id": "97acda07efb3",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "Formatter for JsonFormatter"
             },
             {
-              "segment_id": "b88ada34b00869dd",
+              "segment_id": "b88ada34b008",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "ec445a8d4ccd73c0",
+              "segment_id": "ec445a8d4ccd",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "9c74d36e7f58d7ea",
+              "segment_id": "9c74d36e7f58",
               "file_path": "evals/suites/1up-search/search-bench.ts"
             },
             {
-              "segment_id": "ff51fdbbc4da61d7",
-              "file_path": "DEVELOPMENT.md"
-            },
-            {
-              "segment_id": "4dccd1d202e54218",
+              "segment_id": "13657e94b291",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "ff51fdbbc4da",
+              "file_path": "DEVELOPMENT.md"
             }
           ],
           "gold_size": 3,
@@ -854,7 +851,7 @@
     },
     {
       "k": 20,
-      "recall": 0.5888888888888888,
+      "recall": 0.5666666666666667,
       "scored_queries": 15,
       "total_queries": 15,
       "per_query": [
@@ -864,87 +861,86 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "d011c8a929156ad9",
+              "segment_id": "d011c8a92915",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "46ad9cec88f203b1",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "3d33b9087388332c",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "7e1ac92e03773367",
+              "segment_id": "7e1ac92e0377",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c05fcb",
+              "segment_id": "c9854e0f32c0",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "076945e5e1c3d22c",
+              "segment_id": "076945e5e1c3",
               "file_path": "src/shared/errors.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef686f",
+              "segment_id": "7c2b5e8f19ef",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "4f0d8b58b9ce4fa5",
+              "segment_id": "4f0d8b58b9ce",
               "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "0ca26bf20131816a",
+              "segment_id": "0ca26bf20131",
               "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "c030904b5e814eb1",
+              "segment_id": "c030904b5e81",
               "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "db19bb8bd5753dbd",
+              "segment_id": "c9d899bb9827",
               "file_path": "evals/suites/1up-search/recall.ts"
             },
             {
-              "segment_id": "1a32bc673272569b",
+              "segment_id": "1a32bc673272",
               "file_path": "scripts/release/common.sh"
             },
             {
-              "segment_id": "3c1968a5da7a3e57",
+              "segment_id": "3c1968a5da7a",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "ActiveArtifactPointer"
             },
             {
-              "segment_id": "6db0593ea1e5d1fb",
+              "segment_id": "1c76bd7d8bbf",
               "file_path": "src/cli/output.rs"
             },
             {
-              "segment_id": "385ef6647a6e7adf",
+              "segment_id": "d481e523dc16",
               "file_path": "src/cli/update.rs"
             },
             {
-              "segment_id": "64fc93ba7bc54306",
-              "file_path": "src/cli/reindex.rs"
+              "segment_id": "d25734271d22",
+              "file_path": "tests/rewrite_sql_verification.rs"
+            },
+            {
+              "segment_id": "8b20783b23ef",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "0ff43270242a",
+              "file_path": "src/shared/reminder.rs"
+            },
+            {
+              "segment_id": "883b458ef54a",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
             }
           ],
           "gold_size": 3,
@@ -961,86 +957,86 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f3769f012e9b93ba",
+              "segment_id": "f3769f012e9b",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "cb2cb8e9516fac9b",
+              "segment_id": "cb2cb8e9516f",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "RetrievalBackend<'a>"
             },
             {
-              "segment_id": "dd69682e22593ac2",
+              "segment_id": "dd69682e2259",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "b8bc560fffde2a06",
+              "segment_id": "b8bc560fffde",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "FtsOnly<'a>"
             },
             {
-              "segment_id": "dcc0fe34c1f13da5",
+              "segment_id": "dcc0fe34c1f1",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9f6a38b1b371994b",
+              "segment_id": "9f6a38b1b371",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "3b4fe06cdf6cd102",
+              "segment_id": "3b4fe06cdf6c",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf192a",
+              "segment_id": "cc2a910dbcaf",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "0ed3cbcc8113594b",
+              "segment_id": "0ed3cbcc8113",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "0a4dc7a4feb04af3",
-              "file_path": "src/search/symbol.rs"
-            },
-            {
-              "segment_id": "1b35f771c000a80a",
+              "segment_id": "1b35f771c000",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "45eb807d92f66649",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "2ff1ccc2811a5aca",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "9dde4c871854e41b",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "9779b23d917b8beb",
+              "segment_id": "fce8611d9139",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "31c7f3b805e62811",
+              "segment_id": "0a4dc7a4feb0",
+              "file_path": "src/search/symbol.rs"
+            },
+            {
+              "segment_id": "45eb807d92f6",
+              "file_path": "benches/search_bench.rs"
+            },
+            {
+              "segment_id": "9dde4c871854",
+              "file_path": "src/shared/constants.rs"
+            },
+            {
+              "segment_id": "2ff1ccc2811a",
+              "file_path": "benches/search_bench.rs"
+            },
+            {
+              "segment_id": "31c7f3b805e6",
               "file_path": "src/search/mod.rs"
             },
             {
-              "segment_id": "d0cdf25c4f1d1732",
+              "segment_id": "61db91bc4d53",
+              "file_path": "evals/suites/1up-search/recall.ts"
+            },
+            {
+              "segment_id": "d0cdf25c4f1d",
               "file_path": "src/search/formatter.rs"
             },
             {
-              "segment_id": "00904fd4fa8f83c9",
+              "segment_id": "00904fd4fa8f",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "Embedder"
             },
             {
-              "segment_id": "051b5ad747a35f36",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "d84a2c3e5e3f445c",
+              "segment_id": "d84a2c3e5e3f",
               "file_path": "evals/suites/1up-search/prompt-1up.txt"
             }
           ],
@@ -1048,11 +1044,10 @@
           "matched_indices": [
             0,
             1,
-            2,
-            3
+            2
           ],
-          "hit_count": 4,
-          "recall": 1
+          "hit_count": 3,
+          "recall": 0.75
         },
         {
           "query": "batch insert vectors into segment_vectors table",
@@ -1060,90 +1055,90 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "fb934c198d291f9d",
+              "segment_id": "e0e25f6beafb",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "8d078f9c4800f208",
+              "segment_id": "e6ad0151c7fa",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "be82820acff2b06f",
+              "segment_id": "be82820acff2",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5bcd6303180fe63a",
+              "segment_id": "5bcd6303180f",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "1a8fdd457eaf7fd0",
+              "segment_id": "3722a5b72b55",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "62a6b06d15543a62",
+              "segment_id": "62a6b06d1554",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "76d0af841e573cc0",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d80410c6445d4100",
+              "segment_id": "d80410c6445d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "39d78a1ed1d1f292",
+              "segment_id": "ae1e8edf8e52",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "39d78a1ed1d1",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbec6a0",
+              "segment_id": "082c7e64bfbe",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "64c626f08dc236e7",
+              "segment_id": "64c626f08dc2",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "Embedder"
             },
             {
-              "segment_id": "f8f2aa05ba4e4d9a",
+              "segment_id": "f8f2aa05ba4e",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "0929c94184ed8523",
+              "segment_id": "0929c94184ed",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "7fcb139f87ff92e3",
+              "segment_id": "7fcb139f87ff",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "4c10adff7f705efc",
+              "segment_id": "4c10adff7f70",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "09738eb7df4ea5df",
+              "segment_id": "09738eb7df4e",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "0386709eeeeef5e7",
+              "segment_id": "5619d3841e9e",
+              "file_path": "src/search/retrieval.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "a4f1a07cf29f",
               "file_path": "src/shared/types.rs",
               "breadcrumb": "IndexingConfig"
             },
             {
-              "segment_id": "5619d3841e9e8ac9",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "e23a0b4fff58e356",
+              "segment_id": "e23a0b4fff58",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "a292e26683671355",
+              "segment_id": "a292e2668367",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "tests"
             }
@@ -1162,89 +1157,88 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e4f7da9830a3a31a",
+              "segment_id": "e4f7da9830a3",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "97f90c9e6f6cca8c",
+              "segment_id": "97f90c9e6f6c",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9779b23d917b8beb",
+              "segment_id": "9779b23d917b",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "9a4ea46c811f7c27",
+              "segment_id": "cc2a910dbcaf",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "9a4ea46c811f",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf192a",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "23c9c5f85405a051",
+              "segment_id": "23c9c5f85405",
               "file_path": "src/search/ranking.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "9f6a38b1b371994b",
+              "segment_id": "9f6a38b1b371",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "09738eb7df4ea5df",
+              "segment_id": "09738eb7df4e",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "cf171f6ff7677e76",
+              "segment_id": "cf171f6ff767",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "f3769f012e9b93ba",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "3c0f808617ee27bc",
+              "segment_id": "a92c95fa00fd",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "0a4dc7a4feb04af3",
+              "segment_id": "7172d06e6c5e",
+              "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "f3769f012e9b",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "1b35f771c000",
+              "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "0a4dc7a4feb0",
               "file_path": "src/search/symbol.rs"
             },
             {
-              "segment_id": "7172d06e6c5e5a21",
-              "file_path": "src/search/impact.rs"
+              "segment_id": "6d9f74cc76fa",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "1b35f771c000a80a",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "19380c64c5e5621d",
+              "segment_id": "9e069ba89c08",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "6d9f74cc76fa0654",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "0ed3cbcc8113594b",
+              "segment_id": "0ed3cbcc8113",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9dde4c871854e41b",
+              "segment_id": "9dde4c871854",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "3296e70980c013bf",
-              "file_path": "src/cli/mod.rs",
-              "breadcrumb": "tests"
+              "segment_id": "81e5c5c86469",
+              "file_path": "scripts/baselines/vector_index_size_baseline.json"
             }
           ],
           "gold_size": 3,
@@ -1261,87 +1255,87 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "6d9f74cc76fa0654",
+              "segment_id": "6d9f74cc76fa",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "f3769f012e9b93ba",
+              "segment_id": "f3769f012e9b",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "072fbae0c6311afb",
+              "segment_id": "072fbae0c631",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "9a4ea46c811f7c27",
+              "segment_id": "9a4ea46c811f",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5619d3841e9e8ac9",
+              "segment_id": "5619d3841e9e",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "1ed80e3e5f66fe93",
+              "segment_id": "1ed80e3e5f66",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "264a58c9c46e0fc5",
+              "segment_id": "264a58c9c46e",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "3d66cf3ef37c1c20",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "5cd7bd8c161fa989",
+              "segment_id": "5cd7bd8c161f",
               "file_path": "src/storage/db.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf192a",
+              "segment_id": "cc2a910dbcaf",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "9cfa6396d8226751",
+              "segment_id": "f09015ad4b8f",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "4bfb2b4c4cf3808e",
+              "segment_id": "4bfb2b4c4cf3",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "dbfcec33d4a5dc8a",
+              "segment_id": "dbfcec33d4a5",
               "file_path": "src/shared/config.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "fb934c198d291f9d",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "3122cedc4d46e1f8",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "81e5c5c8646967d5",
-              "file_path": "scripts/baselines/vector_index_size_baseline.json"
-            },
-            {
-              "segment_id": "e265d1aa7882e444",
+              "segment_id": "e265d1aa7882",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "e6e24947316b50ad",
+              "segment_id": "81e5c5c86469",
+              "file_path": "scripts/baselines/vector_index_size_baseline.json"
+            },
+            {
+              "segment_id": "ff946c554f3b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "e6e24947316b",
               "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "5b88ecec9b36",
+              "file_path": "src/search/structural.rs"
+            },
+            {
+              "segment_id": "f5b92d1df682",
+              "file_path": "src/storage/relations.rs"
             }
           ],
           "gold_size": 2,
@@ -1358,91 +1352,89 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "8049f2946f342a0d",
+              "segment_id": "8049f2946f34",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "5c0289cf68093118",
+              "segment_id": "5c0289cf6809",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "6a3b09e8423634bc",
+              "segment_id": "d25734271d22",
               "file_path": "tests/rewrite_sql_verification.rs"
             },
             {
-              "segment_id": "7b282d72f1c3dfa5",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "46ad9cec88f203b1",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c05fcb",
+              "segment_id": "c9854e0f32c0",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "3d33b9087388332c",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "2272522c3b6e16c9",
+              "segment_id": "2272522c3b6e",
               "file_path": "src/shared/update.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e42cdfa38591bc2e",
+              "segment_id": "e42cdfa38591",
               "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "efd6ac3b7199a5ac",
+              "segment_id": "efd6ac3b7199",
               "file_path": "src/shared/update.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "fce21cb068f757c2",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "7c2b5e8f19ef686f",
+              "segment_id": "7c2b5e8f19ef",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "7e1ac92e03773367",
+              "segment_id": "7e1ac92e0377",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "076945e5e1c3d22c",
+              "segment_id": "076945e5e1c3",
               "file_path": "src/shared/errors.rs"
             },
             {
-              "segment_id": "e57c21b9033f3e8d",
+              "segment_id": "7e606224b83d",
               "file_path": "src/cli/reindex.rs"
             },
             {
-              "segment_id": "ee56cf8be36858aa",
+              "segment_id": "67598198e9f8",
+              "file_path": "evals/suites/1up-search/recall.ts"
+            },
+            {
+              "segment_id": "ee56cf8be368",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "4391ff8c3eab0786",
+              "segment_id": "8cfc1f673b10",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "6f3cf0fc5bda",
+              "file_path": "src/indexer/embedder.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "0b03e0feb3d7",
               "file_path": "src/main.rs"
+            },
+            {
+              "segment_id": "133a61514216",
+              "file_path": "src/indexer/embedder.rs"
+            },
+            {
+              "segment_id": "07413a83a629",
+              "file_path": "evals/suites/1up-search/recall.ts"
             }
           ],
           "gold_size": 3,
@@ -1459,89 +1451,89 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "7fcb139f87ff92e3",
+              "segment_id": "7fcb139f87ff",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "5bcd6303180fe63a",
+              "segment_id": "5bcd6303180f",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "7a90fc8fb82ec199",
+              "segment_id": "7a90fc8fb82e",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "59603cddb1cb15eb",
+              "segment_id": "59603cddb1cb",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "98f6a6ee88d4a15b",
+              "segment_id": "98f6a6ee88d4",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "bf61430a2138ebf2",
+              "segment_id": "bf61430a2138",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "0397aed30272c536",
+              "segment_id": "0397aed30272",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "d80410c6445d4100",
+              "segment_id": "d80410c6445d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a0b35e0ca120a68b",
+              "segment_id": "a0b35e0ca120",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "be82820acff2b06f",
+              "segment_id": "be82820acff2",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "016255ee3136068a",
+              "segment_id": "016255ee3136",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "fb934c198d291f9d",
+              "segment_id": "e0e25f6beafb",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "92d0d240a600b3a6",
+              "segment_id": "92d0d240a600",
               "file_path": "src/search/hybrid.rs",
               "breadcrumb": "HybridSearchEngine<'a>"
             },
             {
-              "segment_id": "657539be27ff6c38",
+              "segment_id": "70b2eb5446a0",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "de0d51df9ea98037",
+              "segment_id": "de0d51df9ea9",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "ac8f4beed5d86590",
+              "segment_id": "f7b3ffa9f131",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "76d0af841e573cc0",
+              "segment_id": "ae1e8edf8e52",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "375792c359c06c06",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "c36b574ccbb3d3de",
+              "segment_id": "c36b574ccbb3",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "3ab3050586ee9f12",
+              "segment_id": "375792c359c0",
+              "file_path": "benches/search_bench.rs"
+            },
+            {
+              "segment_id": "3ab3050586ee",
               "file_path": "src/search/hybrid.rs",
               "breadcrumb": "HybridSearchEngine<'a>"
             }
@@ -1559,86 +1551,86 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "ec7087ceaac80923",
+              "segment_id": "f19435271bcc",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "3620c9fb3092b474",
+              "segment_id": "3620c9fb3092",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "b149994b43d9b8c5",
+              "segment_id": "b149994b43d9",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "3122cedc4d46e1f8",
+              "segment_id": "c4d918cc24ad",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "5c7bd94e3b03",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b6bc5cb5a769",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "5f7b22036469265d",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "efdcf0b30582e628",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d13c50be90fae3e2",
+              "segment_id": "d13c50be90fa",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "VerifiedArtifactManifest"
             },
             {
-              "segment_id": "25764d90abdc4492",
+              "segment_id": "9c02990f9ea2",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "c7222d17707a5aca",
+              "segment_id": "e3cdcf269692",
               "file_path": "src/shared/types.rs"
             },
             {
-              "segment_id": "d7f475db3c101577",
+              "segment_id": "b9b86875b68d",
               "file_path": "src/cli/output.rs"
             },
             {
-              "segment_id": "4d8f7e5659eca811",
+              "segment_id": "4d8f7e5659ec",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "90690dc4b3211141",
+              "segment_id": "90690dc4b321",
               "file_path": "evals/suites/shared/extension.ts"
             },
             {
-              "segment_id": "9ed54e43ec882489",
+              "segment_id": "9ed54e43ec88",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "e8ddc6f075d8c901",
+              "segment_id": "e8ddc6f075d8",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "VerifiedArtifactManifest"
             },
             {
-              "segment_id": "644851af2351ea49",
+              "segment_id": "644851af2351",
               "file_path": "src/shared/config.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "7213c5cedec2f630",
+              "segment_id": "7213c5cedec2",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "c50398d591784887",
+              "segment_id": "afc6f7360878",
               "file_path": "src/shared/types.rs"
             },
             {
-              "segment_id": "36cc86d84e9f6c19",
+              "segment_id": "3afbfa2ffb6f",
               "file_path": "src/shared/types.rs"
             },
             {
-              "segment_id": "58bdb0eadcb982cf",
+              "segment_id": "58bdb0eadcb9",
               "file_path": "src/indexer/scanner.rs"
             },
             {
-              "segment_id": "938019b3527e1fbf",
+              "segment_id": "938019b3527e",
               "file_path": "src/indexer/scanner.rs"
             }
           ],
@@ -1657,92 +1649,94 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "a521511b1b9e5a01",
+              "segment_id": "a521511b1b9e",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbec6a0",
+              "segment_id": "082c7e64bfbe",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "8b246cb22ff714bb",
+              "segment_id": "8b246cb22ff7",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "31fba475b2e65dc0",
+              "segment_id": "31fba475b2e6",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "a0a13332bacf52b1",
+              "segment_id": "a0a13332bacf",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "44938f3491ad9f6b",
+              "segment_id": "44938f3491ad",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "91c2d4bb27ae2864",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "66858b4a12ca0e95",
+              "segment_id": "66858b4a12ca",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "85ea5604e40612c1",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "23dbf910fc3893db",
+              "segment_id": "2f0e7a89485c",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "cde0208d92ce6196",
-              "file_path": "src/storage/segments.rs"
+              "segment_id": "64bf0663876f",
+              "file_path": "src/cli/lean.rs"
             },
             {
-              "segment_id": "ee7ed4f2c091e039",
-              "file_path": "src/storage/relations.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "ae8f950d3a99efa6",
+              "segment_id": "d43b8da1b757",
               "file_path": "src/search/hybrid.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "bc1699c353533c52",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "731ea64d63db6999",
-              "file_path": "src/search/hybrid.rs"
-            },
-            {
-              "segment_id": "9b1c61e2a18199d6",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "801d2c085d3077eb",
-              "file_path": "src/indexer/parser.rs"
-            },
-            {
-              "segment_id": "5f6f766d8fed527b",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "4638a8022b0638be",
+              "segment_id": "ee7ed4f2c091",
               "file_path": "src/storage/relations.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "6172493f6dcf89e6",
+              "segment_id": "4195f575d8ec",
+              "file_path": "src/cli/lean.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "9b1c61e2a181",
               "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "801d2c085d30",
+              "file_path": "src/indexer/parser.rs"
+            },
+            {
+              "segment_id": "5f6f766d8fed",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "e26f0446d653",
+              "file_path": "src/cli/output.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "c61b0226fd37",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "6172493f6dcf",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "7071903dbfb8",
+              "file_path": "src/shared/symbols.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "f6ffb87c72bd",
+              "file_path": "src/cli/get.rs"
             }
           ],
           "gold_size": 2,
@@ -1758,89 +1752,90 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "27f1de9c103e3a56",
+              "segment_id": "27f1de9c103e",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "d23f2ee0a0f226da",
+              "segment_id": "d23f2ee0a0f2",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "259f9b6f6ac8b5ec",
+              "segment_id": "047671b8e90e",
+              "file_path": "src/cli/lean.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "259f9b6f6ac8",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "cf171f6ff7677e76",
+              "segment_id": "cf171f6ff767",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "a0a13332bacf52b1",
-              "file_path": "src/cli/impact.rs"
-            },
-            {
-              "segment_id": "930b330cacb75be3",
+              "segment_id": "f7645ae8e9ef",
               "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "5b42da26f21aa067",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "9c46f322569e7e11",
+              "segment_id": "9c46f322569e",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "18ba753cc35cd2e8",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "89798f2e325955af",
+              "segment_id": "89798f2e3259",
               "file_path": "scripts/lib/impact_fixture.sh"
             },
             {
-              "segment_id": "2a6a65aa37efa8b9",
-              "file_path": "scripts/lib/impact_fixture.sh"
-            },
-            {
-              "segment_id": "e5c86923a27aedc5",
+              "segment_id": "a44304e575a2",
               "file_path": "src/cli/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "0df5ece1a77efdea",
+              "segment_id": "58565437542c",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "2a6a65aa37ef",
               "file_path": "scripts/lib/impact_fixture.sh"
             },
             {
-              "segment_id": "ce864c3169007f91",
-              "file_path": "scripts/approve_impact_rollout.sh"
+              "segment_id": "c051eb30792f",
+              "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "7c78226a8e4478e2",
-              "file_path": "src/cli/output.rs",
+              "segment_id": "0df5ece1a77e",
+              "file_path": "scripts/lib/impact_fixture.sh"
+            },
+            {
+              "segment_id": "f4c3c02b1e64",
+              "file_path": "src/cli/lean.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "5012cfb00dc71cb8",
+              "segment_id": "ce864c316900",
+              "file_path": "scripts/approve_impact_rollout.sh"
+            },
+            {
+              "segment_id": "8e3d0d24f1ee",
+              "file_path": "src/cli/impact.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "69cfc9b2021b",
+              "file_path": "src/cli/lean.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "5012cfb00dc7",
               "file_path": "src/search/context.rs",
               "breadcrumb": "ContextEngine"
             },
             {
-              "segment_id": "59cdd7894f04846f",
+              "segment_id": "59cdd7894f04",
               "file_path": "scripts/benchmark_impact.sh"
             },
             {
-              "segment_id": "e4f7da9830a3a31a",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "a5abc621f24f272c",
+              "segment_id": "a5abc621f24f",
               "file_path": "scripts/evaluate_impact_trust.sh"
-            },
-            {
-              "segment_id": "2b02144636952729",
-              "file_path": "tests/integration_tests.rs"
             }
           ],
           "gold_size": 3,
@@ -1854,89 +1849,89 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0174007e22791d4b",
+              "segment_id": "0174007e2279",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "ff1e7701d3a8f8c5",
+              "segment_id": "32e460838e7e",
               "file_path": "src/daemon/search_service.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "8e18b791cc342c9e",
+              "segment_id": "8e18b791cc34",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "fb041d0f2b0ee156",
+              "segment_id": "fb041d0f2b0e",
               "file_path": "src/daemon/ipc.rs"
             },
             {
-              "segment_id": "3c9c85eda52ec8d8",
+              "segment_id": "3c9c85eda52e",
               "file_path": "src/shared/config.rs"
             },
             {
-              "segment_id": "e07bae0a15981a90",
+              "segment_id": "e07bae0a1598",
               "file_path": "src/daemon/worker.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "ed7fdf5bf3b61ed9",
+              "segment_id": "ed7fdf5bf3b6",
               "file_path": "src/daemon/worker.rs"
             },
             {
-              "segment_id": "ec121226761d200a",
+              "segment_id": "ec121226761d",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "def488b045c8614d",
+              "segment_id": "def488b045c8",
               "file_path": "src/shared/fs.rs"
             },
             {
-              "segment_id": "de100dc1e5437b26",
+              "segment_id": "de100dc1e543",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "8d34fec38c350791",
+              "segment_id": "e61d494aacdd",
               "file_path": "src/cli/search.rs"
             },
             {
-              "segment_id": "56e8485cd39bfc50",
+              "segment_id": "56e8485cd39b",
               "file_path": "src/shared/fs.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "2cd7b184ca4825da",
-              "file_path": "tests/integration_tests.rs"
-            },
-            {
-              "segment_id": "8c8b6a12b8c7df51",
+              "segment_id": "8c8b6a12b8c7",
               "file_path": "src/daemon/worker.rs"
             },
             {
-              "segment_id": "c1c21784e808b241",
+              "segment_id": "8a19eb3df8ae",
+              "file_path": "src/daemon/ipc.rs"
+            },
+            {
+              "segment_id": "c1c21784e808",
               "file_path": "src/daemon/lifecycle.rs"
             },
             {
-              "segment_id": "50ff37b3ce9c183b",
+              "segment_id": "50ff37b3ce9c",
               "file_path": "src/shared/fs.rs",
               "breadcrumb": "ExpectedLeaf"
             },
             {
-              "segment_id": "8a19eb3df8aea629",
-              "file_path": "src/daemon/ipc.rs"
-            },
-            {
-              "segment_id": "4f17f9bd6a9a2856",
+              "segment_id": "4f17f9bd6a9a",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "8c64cd8fdd1024d7",
+              "segment_id": "8c64cd8fdd10",
               "file_path": "src/shared/errors.rs"
             },
             {
-              "segment_id": "4a4fbd72cacf0ced",
+              "segment_id": "4a4fbd72cacf",
               "file_path": "src/daemon/mod.rs",
               "breadcrumb": "ipc"
+            },
+            {
+              "segment_id": "d3f4cebcaa48",
+              "file_path": "src/daemon/lifecycle_stub.rs"
             }
           ],
           "gold_size": 4,
@@ -1953,84 +1948,86 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "658383704be65681",
+              "segment_id": "13d855abb806",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "7e28df94fb5a964e",
+              "segment_id": "265d355e9966",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "299a3bbee2d8d522",
+              "segment_id": "181f258d7123",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "12a66deb219f0534",
-              "file_path": "evals/suites/1up-impact/prompt-1up.txt"
-            },
-            {
-              "segment_id": "5b9a730ca8db586b",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
-            },
-            {
-              "segment_id": "ccc33a8385e0482e",
-              "file_path": "evals/run-parallel.sh"
-            },
-            {
-              "segment_id": "051b5ad747a35f36",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "192b598eca8e96bc",
-              "file_path": "evals/run-parallel.sh"
-            },
-            {
-              "segment_id": "0bd458095d418f9d",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "ad17fc2a516bc38b",
-              "file_path": "evals/suites/shared/assertions/index.ts"
-            },
-            {
-              "segment_id": "1773fbe3bd4eb52a",
+              "segment_id": "1b02103c5f1d",
               "file_path": "src/main.rs"
             },
             {
-              "segment_id": "9c74d36e7f58d7ea",
+              "segment_id": "b9b76211f73a",
+              "file_path": "src/cli/lean.rs"
+            },
+            {
+              "segment_id": "61db91bc4d53",
+              "file_path": "evals/suites/1up-search/recall.ts"
+            },
+            {
+              "segment_id": "d718a10991ca",
+              "file_path": "src/cli/output.rs"
+            },
+            {
+              "segment_id": "cf6df22bcd51",
+              "file_path": "src/cli/search.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "12a66deb219f",
+              "file_path": "evals/suites/1up-impact/prompt-1up.txt"
+            },
+            {
+              "segment_id": "5b9a730ca8db",
               "file_path": "evals/suites/1up-search/search-bench.ts"
             },
             {
-              "segment_id": "4b2759a644066cfa",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
+              "segment_id": "118cb98916d0",
+              "file_path": "src/cli/lean.rs",
+              "breadcrumb": "tests"
             },
             {
-              "segment_id": "b8055226ac40030c",
+              "segment_id": "ccc33a8385e0",
+              "file_path": "evals/run-parallel.sh"
+            },
+            {
+              "segment_id": "192b598eca8e",
+              "file_path": "evals/run-parallel.sh"
+            },
+            {
+              "segment_id": "f2d172fc8468",
+              "file_path": "src/cli/lean.rs"
+            },
+            {
+              "segment_id": "1f94c0ec1809",
               "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "15e09b3f687dab89",
-              "file_path": "src/search/impact.rs"
+              "segment_id": "4d02d87d0a1b",
+              "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "b040b6134117f967",
-              "file_path": "evals/suites/1up-impact/prompt-baseline.txt"
-            },
-            {
-              "segment_id": "d2def532f94434fa",
+              "segment_id": "ad17fc2a516b",
               "file_path": "evals/suites/shared/assertions/index.ts"
             },
             {
-              "segment_id": "f444e42c60d6e50e",
-              "file_path": "skills/1up-search/SKILL.md"
+              "segment_id": "9c74d36e7f58",
+              "file_path": "evals/suites/1up-search/search-bench.ts"
             },
             {
-              "segment_id": "285fa18c2d4b31e7",
-              "file_path": "src/cli/index.rs"
+              "segment_id": "15e09b3f687d",
+              "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "a0a13332bacf52b1",
-              "file_path": "src/cli/impact.rs"
+              "segment_id": "4b2759a64406",
+              "file_path": "evals/suites/1up-search/search-bench.ts"
             }
           ],
           "gold_size": 3,
@@ -2048,97 +2045,96 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "5c0289cf68093118",
+              "segment_id": "5c0289cf6809",
               "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "841b14e0056ac4dd",
+              "segment_id": "841b14e0056a",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20be8b5",
+              "segment_id": "a2a6023ed20b",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "c5c9d4afd3144682",
+              "segment_id": "e5782e135c57",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e57c21b9033f3e8d",
-              "file_path": "src/cli/reindex.rs"
-            },
-            {
-              "segment_id": "7b282d72f1c3dfa5",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "76cf30b9beccdc6f",
+              "segment_id": "76cf30b9becc",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "6a3b09e8423634bc",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "3d33b9087388332c",
+              "segment_id": "883b458ef54a",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "7c2b5e8f19ef686f",
+              "segment_id": "d25734271d22",
+              "file_path": "tests/rewrite_sql_verification.rs"
+            },
+            {
+              "segment_id": "7c2b5e8f19ef",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "264a58c9c46e0fc5",
+              "segment_id": "a1f842b74a7c",
+              "file_path": "src/cli/impact.rs"
+            },
+            {
+              "segment_id": "264a58c9c46e",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "f9af7bea18c11f6f",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "7e1ac92e03773367",
+              "segment_id": "7e1ac92e0377",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "21a5c754cd02",
+              "file_path": "tests/rewrite_sql_verification.rs"
+            },
+            {
+              "segment_id": "22e6e3cf9975",
+              "file_path": "src/cli/get.rs"
+            },
+            {
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "46ad9cec88f203b1",
-              "file_path": "evals/suites/1up-search/recall.ts"
+              "segment_id": "9de4f46e9f58",
+              "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "3c1968a5da7a3e57",
+              "segment_id": "3c1968a5da7a",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "ActiveArtifactPointer"
             },
             {
-              "segment_id": "3075703c29eaecb8",
+              "segment_id": "3075703c29ea",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "TimingAccumulator"
             },
             {
-              "segment_id": "031b2df042dc98f8",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "84bee24dc679",
+              "file_path": "src/shared/update.rs",
+              "breadcrumb": "tests"
             },
             {
-              "segment_id": "b587c5325cd7811e",
+              "segment_id": "11e8645f32cf",
               "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "3620c9fb3092b474",
-              "file_path": "src/indexer/pipeline.rs"
+              "segment_id": "031b2df042dc",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            1
-          ],
-          "hit_count": 1,
-          "recall": 0.3333333333333333
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "relation descriptor with lookup canonical symbol and qualifier fingerprint",
@@ -2146,99 +2142,101 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e5eb43f99145a8a9",
+              "segment_id": "e5eb43f99145",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "3f388627238b5e9d",
+              "segment_id": "3f388627238b",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "1cc921f20d9c54b3",
+              "segment_id": "1cc921f20d9c",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "479072c5c4e4b411",
+              "segment_id": "479072c5c4e4",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "ImpactHorizonEngine<'a>"
             },
             {
-              "segment_id": "390fbc5e7cb1a892",
+              "segment_id": "390fbc5e7cb1",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "a232654fae27b167",
+              "segment_id": "1deba4b78526",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "13bb8054d1a37d5b",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "410b5d7a9b1c0259",
+              "segment_id": "27af091fe68d",
               "file_path": "src/search/symbol.rs"
             },
             {
-              "segment_id": "897ff11bd066b9a2",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "2f687e13797b687b",
+              "segment_id": "13bb8054d1a3",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "7df7b14f6d34d071",
+              "segment_id": "2f687e13797b",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "7df7b14f6d34",
               "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "3c0f808617ee27bc",
+              "segment_id": "a92c95fa00fd",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "e9c7e6f0cb9c178f",
+              "segment_id": "ec1b69853398",
+              "file_path": "src/indexer/parser.rs"
+            },
+            {
+              "segment_id": "73708a21f3bb",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "ec1b69853398ab3c",
+              "segment_id": "864abe0d96e3",
               "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "864abe0d96e37b10",
-              "file_path": "src/indexer/parser.rs"
-            },
-            {
-              "segment_id": "0fc814a3402c06e8",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "ca1fd7728b4eb141",
+              "segment_id": "ca1fd7728b4e",
               "file_path": "src/shared/symbols.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "96e780a761d65350",
+              "segment_id": "96e780a761d6",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "9daf89ee6a1ce779",
-              "file_path": "tests/integration_tests.rs"
+              "segment_id": "59fa636ab1c9",
+              "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "cde0208d92ce6196",
-              "file_path": "src/storage/segments.rs"
+              "segment_id": "0845b98e4b22",
+              "file_path": "src/shared/symbols.rs"
+            },
+            {
+              "segment_id": "9b2a1d78ddee",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "b448c5405343",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
             }
           ],
           "gold_size": 4,
           "matched_indices": [
             0,
             1,
-            2
+            2,
+            3
           ],
-          "hit_count": 3,
-          "recall": 0.75
+          "hit_count": 4,
+          "recall": 1
         },
         {
           "query": "benchmark parallel indexing script emitting JSON summary",
@@ -2246,88 +2244,89 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "3f341ac5939d8080",
-              "file_path": "scripts/release/generate_release_evidence.sh"
-            },
-            {
-              "segment_id": "cffb2b0f4db5aa92",
+              "segment_id": "cffb2b0f4db5",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "68877eec795c2c9a",
+              "segment_id": "3f341ac5939d",
+              "file_path": "scripts/release/generate_release_evidence.sh"
+            },
+            {
+              "segment_id": "68877eec795c",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "c0aed2a626e5168f",
+              "segment_id": "58975ec3a1a9",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "de1a46b30c1e5217",
+              "segment_id": "97acda07efb3",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "Formatter for JsonFormatter"
             },
             {
-              "segment_id": "b88ada34b00869dd",
+              "segment_id": "b88ada34b008",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "ec445a8d4ccd73c0",
+              "segment_id": "ec445a8d4ccd",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "9c74d36e7f58d7ea",
+              "segment_id": "9c74d36e7f58",
               "file_path": "evals/suites/1up-search/search-bench.ts"
             },
             {
-              "segment_id": "ff51fdbbc4da61d7",
-              "file_path": "DEVELOPMENT.md"
-            },
-            {
-              "segment_id": "4dccd1d202e54218",
+              "segment_id": "13657e94b291",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e8b09cea3f2e50c6",
+              "segment_id": "ff51fdbbc4da",
+              "file_path": "DEVELOPMENT.md"
+            },
+            {
+              "segment_id": "e8b09cea3f2e",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "646e7e4a1099eb7f",
+              "segment_id": "646e7e4a1099",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "e6a84f7da2e24200",
+              "segment_id": "e6a84f7da2e2",
               "file_path": "scripts/release/generate_release_evidence.sh"
             },
             {
-              "segment_id": "40acc1468b8e02a6",
+              "segment_id": "40acc1468b8e",
               "file_path": "scripts/approve_impact_rollout.sh"
             },
             {
-              "segment_id": "ef85b57be92d1505",
+              "segment_id": "ef85b57be92d",
               "file_path": "scripts/benchmark_rewrite_sql.sh"
             },
             {
-              "segment_id": "41149ad6922f293d",
+              "segment_id": "41149ad6922f",
               "file_path": "tests/cli_tests.rs"
             },
             {
-              "segment_id": "a04d2c0761b6b841",
+              "segment_id": "a04d2c0761b6",
               "file_path": "scripts/release/generate_release_evidence.sh"
             },
             {
-              "segment_id": "fa2faf80a0467648",
+              "segment_id": "fa2faf80a046",
               "file_path": "tests/cli_tests.rs"
             },
             {
-              "segment_id": "1ec87940cee67e6f",
+              "segment_id": "1ec87940cee6",
               "file_path": "evals/suites/1up-search/search-bench.ts"
             },
             {
-              "segment_id": "1ac66b121d81174c",
-              "file_path": "tests/integration_tests.rs"
+              "segment_id": "7965a7c7c29c",
+              "file_path": "src/shared/types.rs",
+              "breadcrumb": "IndexingConfig"
             }
           ],
           "gold_size": 3,
