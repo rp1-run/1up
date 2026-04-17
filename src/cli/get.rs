@@ -17,11 +17,18 @@ use crate::storage::segments::{
 /// and `context` emit compact handles (`:<id>`) and `get` resolves those handles to the
 /// body + metadata previously embedded in fat search output. Handles may be full 16-char
 /// segment ids or the 12-char display prefix; both resolve through the same storage path.
+///
+/// Output per handle, in request order: `segment <id>` header, tab-separated metadata
+/// line, blank line, body content, blank line, `---` sentinel terminator. Unknown
+/// handles emit `not_found\t<id>` followed by `---`. Ambiguous prefixes render
+/// `not_found` on stdout plus a disambiguation hint on stderr.
 #[derive(Args)]
 pub struct GetArgs {
-    /// One or more segment handles to hydrate, in the order they should be emitted.
-    /// Accepts bare ids (`a0f1e2c3d4b5`) or handles with the leading colon produced by
-    /// the lean row grammar (`:a0f1e2c3d4b5`).
+    /// One or more segment handles to hydrate. Emission preserves argument order so
+    /// callers can pipeline multi-hit follow-ups from a single `search`. Accepts
+    /// either bare ids (`a0f1e2c3d4b5`) or lean-grammar handles with the leading
+    /// colon (`:a0f1e2c3d4b5`); the 12-char display prefix is resolved against the
+    /// full 16-char segment id via a storage-side prefix lookup.
     #[arg(required = true, num_args = 1..)]
     pub handles: Vec<String>,
 

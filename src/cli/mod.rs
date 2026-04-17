@@ -49,22 +49,33 @@ pub enum Command {
     /// Show daemon and index status
     Status(status::StatusArgs),
 
-    /// Look up symbol definitions and references
+    /// Look up symbol definitions and references. Emits one lean row per hit
+    /// (`<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`).
     Symbol(symbol::SymbolArgs),
 
-    /// Hybrid semantic + full-text search
+    /// Hybrid semantic + full-text search. Emits one lean row per hit
+    /// (`<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`);
+    /// defaults to top-3. Pair with `1up get <id>` to hydrate bodies.
     Search(search::SearchArgs),
 
-    /// Hydrate one or more segment handles to their full indexed record
+    /// Hydrate one or more segment handles to their full indexed record. Emits
+    /// `segment <id>` header, tab-separated metadata, blank line, body, `---`
+    /// sentinel per handle in request order; unknown handles emit `not_found`.
     Get(get::GetArgs),
 
-    /// Retrieve code context around a file location
+    /// Retrieve code context around a file location. Emits
+    /// `<path>:<l1>-<l2>  context  <scope_type>` header followed by numbered
+    /// body lines; no `:<segment_id>` suffix because context is read-after-pick.
     Context(context::ContextArgs),
 
-    /// Explore probable impact from a known anchor
+    /// Explore probable impact from a known anchor. Emits lean rows with a
+    /// trailing `~P` (primary) or `~C` (contextual) channel tag; `refused`,
+    /// `empty`, and `empty_scoped` envelopes render as terminal status lines.
     Impact(impact::ImpactArgs),
 
-    /// Structural AST-pattern search using tree-sitter queries
+    /// Structural AST-pattern search using tree-sitter queries. Emits one lean
+    /// row per match (`<path>:<l1>-<l2>  structural  <language>::<pattern_name>`)
+    /// followed by the indented snippet.
     Structural(structural::StructuralArgs),
 
     /// Index a repository
