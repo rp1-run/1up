@@ -313,7 +313,7 @@ impl Formatter for HumanFormatter {
             }
             out.push_str(&format!(
                 "{} {}\n",
-                r.display_kind().bold(),
+                r.block_type.to_uppercase().bold(),
                 format!("{}:{}", r.file_path, r.line_number).cyan(),
             ));
             out.push_str(&format!("{}\n\n", render_search_metadata(r).dimmed()));
@@ -835,12 +835,9 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for r in results {
             out.push_str(&format!(
-                "{}:{}-{}\t{}\t{:.4}",
-                r.file_path, r.line_number, r.line_end, r.block_type, r.score
+                "{}:{}-{}\t{}\t{}\tsegment={}",
+                r.file_path, r.line_number, r.line_end, r.block_type, r.score, r.segment_id
             ));
-            if let Some(segment_id) = r.segment_id.as_deref() {
-                out.push_str(&format!("\tsegment={segment_id}"));
-            }
             out.push('\n');
             out.push_str(&format!("{}\n", render_search_metadata(r)));
             out.push_str(&r.content);
@@ -1575,18 +1572,8 @@ fn render_search_metadata(result: &SearchResult) -> String {
             parts.push(format!("Defines: {}", truncate_items(defined, 5)));
         }
     }
-    if let Some(calls) = &result.called_symbols {
-        if !calls.is_empty() {
-            parts.push(format!("Calls: {}", truncate_items(calls, 5)));
-        }
-    }
-    if let Some(complexity) = result.complexity {
-        if complexity > 0 {
-            parts.push(format!("Complexity: {complexity}"));
-        }
-    }
 
-    parts.push(format!("Score: {:.4}", result.score));
+    parts.push(format!("Score: {}", result.score));
     parts.join(" | ")
 }
 
@@ -1595,21 +1582,6 @@ fn render_symbol_metadata(result: &SymbolResult) -> String {
 
     if let Some(breadcrumb) = &result.breadcrumb {
         parts.push(format!("Scope: {breadcrumb}"));
-    }
-    if let Some(defined) = &result.defined_symbols {
-        if !defined.is_empty() {
-            parts.push(format!("Defines: {}", truncate_items(defined, 5)));
-        }
-    }
-    if let Some(calls) = &result.called_symbols {
-        if !calls.is_empty() {
-            parts.push(format!("Calls: {}", truncate_items(calls, 5)));
-        }
-    }
-    if let Some(complexity) = result.complexity {
-        if complexity > 0 {
-            parts.push(format!("Complexity: {complexity}"));
-        }
     }
 
     parts.join(" | ")
@@ -1843,20 +1815,16 @@ mod tests {
 
     fn sample_search_result() -> SearchResult {
         SearchResult {
+            segment_id: "candidate-segment-abcdef123456".to_string(),
             file_path: "src/auth/builder.rs".to_string(),
             language: "rust".to_string(),
             block_type: "function".to_string(),
             content: "fn build_auth() {\n    apply_config();\n}".to_string(),
-            score: 0.945,
+            score: 95,
             line_number: 21,
             line_end: 23,
-            segment_id: Some("candidate-segment-abcdef123456".to_string()),
             breadcrumb: Some("AuthConfig::build".to_string()),
-            complexity: Some(4),
-            role: Some(SegmentRole::Orchestration),
             defined_symbols: Some(vec!["build_auth".to_string()]),
-            referenced_symbols: None,
-            called_symbols: Some(vec!["apply_config".to_string()]),
         }
     }
 
@@ -2080,7 +2048,7 @@ mod tests {
 
         assert_eq!(
             first_line,
-            "src/auth/builder.rs:21-23\tfunction\t0.9450\tsegment=candidate-segment-abcdef123456"
+            "src/auth/builder.rs:21-23\tfunction\t95\tsegment=candidate-segment-abcdef123456"
         );
     }
 
@@ -2088,12 +2056,15 @@ mod tests {
     fn plain_search_results_preserve_legacy_shape_without_segment_field() {
         let formatter = PlainFormatter;
         let mut result = sample_search_result();
-        result.segment_id = None;
+        result.segment_id = String::new();
 
         let rendered = formatter.format_search_results(&[result]);
         let first_line = rendered.lines().next().unwrap();
 
-        assert_eq!(first_line, "src/auth/builder.rs:21-23\tfunction\t0.9450");
+        assert_eq!(
+            first_line,
+            "src/auth/builder.rs:21-23\tfunction\t95\tsegment="
+        );
     }
 
     #[test]

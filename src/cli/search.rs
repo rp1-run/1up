@@ -19,7 +19,7 @@ pub struct SearchArgs {
     pub query: String,
 
     /// Maximum number of results
-    #[arg(long, short = 'n', default_value = "20")]
+    #[arg(long, short = 'n', default_value = "3")]
     pub limit: usize,
 
     /// Project root directory (defaults to current directory)
@@ -125,5 +125,29 @@ async fn try_daemon_search(
             tracing::debug!("daemon search timed out; falling back to local runtime");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchArgs;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: SearchArgs,
+    }
+
+    #[test]
+    fn search_default_limit_is_three() {
+        let cli = TestCli::parse_from(["test", "needle"]);
+        assert_eq!(cli.args.limit, 3);
+    }
+
+    #[test]
+    fn search_limit_override_is_respected() {
+        let cli = TestCli::parse_from(["test", "needle", "-n", "7"]);
+        assert_eq!(cli.args.limit, 7);
     }
 }

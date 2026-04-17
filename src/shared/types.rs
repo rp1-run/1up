@@ -56,74 +56,35 @@ pub struct ParsedRelation {
 }
 
 /// A search result returned by hybrid or FTS-only search.
+///
+/// The struct carries only the discovery-side fields that the lean row
+/// grammar renders (score, path, line span, kind, breadcrumb, defined
+/// symbols, segment handle). `content` is retained in memory so that the
+/// `get` command can reuse the hydrated body without a second query, but
+/// the lean renderer never emits it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
+    pub segment_id: String,
     pub file_path: String,
     pub language: String,
     pub block_type: String,
     pub content: String,
-    pub score: f64,
+    pub score: u32,
     pub line_number: usize,
     pub line_end: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breadcrumb: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<SegmentRole>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub defined_symbols: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub referenced_symbols: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub called_symbols: Option<Vec<String>>,
 }
 
-impl SearchResult {
-    pub fn is_definition_like(&self) -> bool {
-        if matches!(self.role, Some(SegmentRole::Definition)) {
-            return true;
-        }
-
-        let has_symbols = self
-            .defined_symbols
-            .as_ref()
-            .map(|symbols| !symbols.is_empty())
-            .unwrap_or(false);
-
-        has_symbols
-            && matches!(
-                self.block_type.as_str(),
-                "function"
-                    | "method"
-                    | "struct"
-                    | "enum"
-                    | "trait"
-                    | "type"
-                    | "class"
-                    | "interface"
-                    | "module"
-                    | "macro"
-                    | "constructor"
-            )
-    }
-
-    pub fn display_kind(&self) -> &'static str {
-        if self.is_definition_like() {
-            "DEFINITION"
-        } else {
-            match self.role {
-                Some(SegmentRole::Docs) => "DOCS",
-                Some(SegmentRole::Import) => "IMPORT",
-                Some(SegmentRole::Orchestration) => "FLOW",
-                Some(SegmentRole::Implementation) => "IMPLEMENTATION",
-                Some(SegmentRole::Definition) => "DEFINITION",
-                None => "RESULT",
-            }
-        }
-    }
+/// Normalize a raw RRF score in `[0, ~1]` to an integer in `[0, 100]`.
+///
+/// The mapping is monotonic, so ordering is preserved. Ties within one
+/// integer point are acceptable (already within ranking noise on the
+/// corpora we evaluate against).
+pub fn normalize_score(rrf: f64) -> u32 {
+    (rrf * 100.0).round().clamp(0.0, 100.0) as u32
 }
 
 /// Distinguishes between a symbol definition and a usage reference.
@@ -144,6 +105,12 @@ impl std::fmt::Display for ReferenceKind {
 }
 
 /// A symbol lookup result.
+///
+/// Like `SearchResult`, this is the lean discovery-side shape: the fat
+/// hydrated fields (complexity, role, defined/referenced/called symbols)
+/// live on the stored segment and are served by `get`, not discovery.
+/// `content` stays on the struct so that in-process callers that already
+/// hydrate a full segment can still reuse the body without re-querying.
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolResult {
     pub name: String,
@@ -156,16 +123,6 @@ pub struct SymbolResult {
     pub reference_kind: ReferenceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breadcrumb: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<SegmentRole>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub defined_symbols: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub referenced_symbols: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub called_symbols: Option<Vec<String>>,
 }
 
 /// A structural search result from AST pattern matching.
@@ -571,6 +528,31 @@ mod tests {
         assert_eq!(config.effective_write_batch_files(1), 1);
         assert_eq!(config.effective_write_batch_files(3), 3);
         assert_eq!(config.effective_write_batch_files(12), 8);
+    }
+
+    #[test]
+    fn score_normalization_monotonic() {
+        let samples = [0.0_f64, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0];
+        for window in samples.windows(2) {
+            let lo = normalize_score(window[0]);
+            let hi = normalize_score(window[1]);
+            assert!(
+                hi >= lo,
+                "normalize_score must be monotonic: {} -> {}, {} -> {}",
+                window[0],
+                lo,
+                window[1],
+                hi
+            );
+        }
+    }
+
+    #[test]
+    fn score_normalization_clamps_to_0_100() {
+        assert_eq!(normalize_score(-1.0), 0);
+        assert_eq!(normalize_score(0.0), 0);
+        assert_eq!(normalize_score(1.0), 100);
+        assert_eq!(normalize_score(2.0), 100);
     }
 
     #[test]

@@ -2003,17 +2003,18 @@ fn cli_search_uses_daemon_results_before_local_fallback() {
             server_expected_root.to_str().unwrap()
         );
         assert_eq!(payload["query"], "test");
-        assert_eq!(payload["limit"], 20);
+        assert_eq!(payload["limit"], 3);
 
         let response = serde_json::json!({
             "status": "results",
             "results": [
                 {
+                    "segment_id": "daemon-seg-1",
                     "file_path": "src/daemon.rs",
                     "language": "rust",
                     "block_type": "function",
                     "content": "fn daemon_search() {}",
-                    "score": 1.0,
+                    "score": 100,
                     "line_number": 3,
                     "line_end": 3
                 }
