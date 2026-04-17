@@ -8,6 +8,10 @@ pub struct InitArgs {
     /// Project root directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Output format override (defaults to plain)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
 }
 
 pub async fn exec(args: InitArgs, format: OutputFormat) -> anyhow::Result<()> {

@@ -23,6 +23,10 @@ pub struct UpdateArgs {
     /// Display cached update status
     #[arg(long)]
     pub status: bool,
+
+    /// Output format override (defaults to human)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
 }
 
 pub async fn exec(args: UpdateArgs, format: OutputFormat) -> anyhow::Result<()> {

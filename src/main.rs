@@ -26,8 +26,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let format = cli.resolved_format();
-    let show_notification = should_show_notification(format, &cli.command);
+    let show_notification = should_show_notification(&cli.command);
 
     let refresh_handle = if show_notification {
         Some(tokio::spawn(shared::update::refresh_cache_if_stale()))
@@ -54,12 +53,33 @@ async fn main() {
 /// command completes.
 ///
 /// Notifications are suppressed for:
-/// - JSON output mode (AC-02c)
+/// - Maintenance commands explicitly selecting JSON output (AC-02c). The
+///   format moved off the global `Cli` onto each maintenance Args struct, so
+///   we read it from the selected command's args rather than a global field.
 /// - The internal Worker command (AC-02d)
 /// - The Update command (it handles its own update output)
-fn should_show_notification(format: OutputFormat, command: &cli::Command) -> bool {
-    if format == OutputFormat::Json {
-        return false;
+fn should_show_notification(command: &cli::Command) -> bool {
+    if let Some(format) = maintenance_format(command) {
+        if format == OutputFormat::Json {
+            return false;
+        }
     }
     !matches!(command, cli::Command::Worker | cli::Command::Update(_))
+}
+
+/// Extract the explicit maintenance `--format`/`-f` selection, if any. Returns
+/// `None` for core commands (which have no format flag) and for maintenance
+/// commands where the user did not pass the flag.
+fn maintenance_format(command: &cli::Command) -> Option<OutputFormat> {
+    match command {
+        cli::Command::Start(args) => args.format,
+        cli::Command::Stop(args) => args.format,
+        cli::Command::Status(args) => args.format,
+        cli::Command::Init(args) => args.format,
+        cli::Command::Index(args) => args.format,
+        cli::Command::Reindex(args) => args.format,
+        cli::Command::HelloAgent(args) => args.format,
+        cli::Command::Update(args) => args.format,
+        _ => None,
+    }
 }

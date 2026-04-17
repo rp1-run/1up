@@ -115,7 +115,7 @@ fn index_fts_only(dir: &Path) -> HideModelGuard {
     let guard = HideModelGuard::new();
 
     cmd()
-        .args(["--format", "json", "index", dir.to_str().unwrap()])
+        .args(["index", dir.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -248,7 +248,7 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -267,7 +267,7 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -282,7 +282,7 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     fs::remove_file(tmp.path().join("auth.rs")).unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 

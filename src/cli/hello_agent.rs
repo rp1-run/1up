@@ -6,7 +6,11 @@ use crate::shared::reminder::CONDENSED_REMINDER;
 use crate::shared::types::OutputFormat;
 
 #[derive(Args)]
-pub struct HelloAgentArgs {}
+pub struct HelloAgentArgs {
+    /// Output format override (defaults to human)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
+}
 
 #[derive(Debug, Serialize)]
 struct HelloAgentOutput {

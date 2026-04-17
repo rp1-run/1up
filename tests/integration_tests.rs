@@ -208,12 +208,12 @@ module.exports = { handleRequest, handleGet, handlePost };
 
 fn init_and_index(dir: &TempDir) {
     cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     cmd()
-        .args(["--format", "json", "index", dir.path().to_str().unwrap()])
+        .args(["index", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 }
@@ -222,12 +222,12 @@ fn init_and_index_fts_only(dir: &TempDir) -> HideModelGuard {
     let guard = HideModelGuard::new();
 
     cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     cmd()
-        .args(["--format", "json", "index", dir.path().to_str().unwrap()])
+        .args(["index", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -236,18 +236,19 @@ fn init_and_index_fts_only(dir: &TempDir) -> HideModelGuard {
 
 fn init_project(dir: &std::path::Path) {
     cmd()
-        .args(["--format", "json", "init", dir.to_str().unwrap()])
+        .args(["init", dir.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 }
 
 fn run_index_json(dir: &std::path::Path, extra_args: &[&str]) -> serde_json::Value {
     let mut command = cmd();
-    command.arg("--format").arg("json").arg("index");
+    command.arg("index");
     for arg in extra_args {
         command.arg(arg);
     }
     command.arg(dir);
+    command.arg("--format").arg("json");
 
     let output = command.output().unwrap();
     assert!(output.status.success());
@@ -1687,7 +1688,7 @@ fn main() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -1882,7 +1883,7 @@ fn cli_init_then_index_then_search_workflow() {
     let _guard = HideModelGuard::new();
 
     cmd()
-        .args(["--format", "json", "init", tmp.path().to_str().unwrap()])
+        .args(["init", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Initialized"));
@@ -1891,7 +1892,7 @@ fn cli_init_then_index_then_search_workflow() {
     assert!(id_path.exists());
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Indexed"));
@@ -1915,12 +1916,12 @@ fn index_json_output_includes_progress_summary() {
     let _guard = HideModelGuard::new();
 
     cmd()
-        .args(["--format", "json", "init", tmp.path().to_str().unwrap()])
+        .args(["init", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     let output = cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
 
@@ -1945,13 +1946,13 @@ fn status_json_reports_noop_index_progress() {
     let _guard = init_and_index_fts_only(&tmp);
 
     let second_index = cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
     assert!(second_index.status.success());
 
     let output = cmd()
-        .args(["--format", "json", "status", tmp.path().to_str().unwrap()])
+        .args(["status", tmp.path().to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
 
@@ -2200,12 +2201,12 @@ fn cli_worktree_resolves_to_main_repo_index() {
         .expect("git commit failed");
 
     cmd()
-        .args(["--format", "json", "init", main_repo.to_str().unwrap()])
+        .args(["init", main_repo.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     cmd()
-        .args(["--format", "json", "index", main_repo.to_str().unwrap()])
+        .args(["index", main_repo.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
@@ -2226,10 +2227,10 @@ fn cli_worktree_resolves_to_main_repo_index() {
 
     let status_output = cmd()
         .args([
-            "--format",
-            "json",
             "status",
             worktree_path.to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .output()
         .unwrap();
@@ -2271,10 +2272,10 @@ fn cli_worktree_resolves_to_main_repo_index() {
 
     let reindex_output = cmd()
         .args([
-            "--format",
-            "json",
             "reindex",
             worktree_path.to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .output()
         .unwrap();
