@@ -8,7 +8,6 @@ use crate::cli::lean;
 use crate::search::context::parse_location;
 use crate::search::impact::{ImpactAnchor, ImpactHorizonEngine, ImpactRequest};
 use crate::shared::config::project_db_path;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -87,7 +86,7 @@ impl ImpactArgs {
     }
 }
 
-pub async fn exec(args: ImpactArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: ImpactArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);

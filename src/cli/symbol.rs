@@ -7,7 +7,6 @@ use crate::daemon::lifecycle;
 use crate::search::SymbolSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -29,7 +28,7 @@ pub struct SymbolArgs {
     pub path: String,
 }
 
-pub async fn exec(args: SymbolArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);

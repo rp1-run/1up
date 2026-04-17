@@ -10,7 +10,7 @@ use crate::search::HybridSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
 use crate::shared::reminder::VERSION;
-use crate::shared::types::{OutputFormat, SearchResult};
+use crate::shared::types::SearchResult;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -30,7 +30,7 @@ pub struct SearchArgs {
 
 const DAEMON_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
 
-pub async fn exec(args: SearchArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);

@@ -7,7 +7,6 @@ use crate::daemon::lifecycle;
 use crate::search::StructuralSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -25,7 +24,7 @@ pub struct StructuralArgs {
     pub path: String,
 }
 
-pub async fn exec(args: StructuralArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: StructuralArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let state_root = &resolved.state_root;
     let source_root = &resolved.source_root;

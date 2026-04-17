@@ -86,80 +86,88 @@ pub enum Command {
 
 impl Command {
     /// Default output format for maintenance commands when `--format`/`-f` is
-    /// not supplied. Only called from maintenance dispatch arms; core commands
-    /// render through the lean grammar and do not consult a format.
-    pub fn default_maintenance_format(&self) -> OutputFormat {
+    /// not supplied. Returns `None` for core commands and the internal worker,
+    /// which render through the lean grammar (or do not render at all) and
+    /// never consult a format.
+    pub fn default_maintenance_format(&self) -> Option<OutputFormat> {
         match self {
             Command::Start(_)
             | Command::Stop(_)
             | Command::Status(_)
             | Command::HelloAgent(_)
-            | Command::Update(_) => OutputFormat::Human,
-            Command::Init(_) | Command::Index(_) | Command::Reindex(_) => OutputFormat::Plain,
-            // Core commands never consult this path; return Plain as a
-            // defensive default so any accidental call is still a valid
-            // OutputFormat rather than a panic.
+            | Command::Update(_) => Some(OutputFormat::Human),
+            Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::Search(_)
             | Command::Get(_)
             | Command::Symbol(_)
             | Command::Context(_)
             | Command::Impact(_)
             | Command::Structural(_)
-            | Command::Worker => OutputFormat::Plain,
+            | Command::Worker => None,
         }
     }
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Resolve the maintenance format (if any) before moving out of `cli.command`.
-    // Core commands never consult this value; the dispatch below passes
-    // `OutputFormat::Plain` to their existing `_format` parameter, which T6
-    // drops alongside the signature change.
+    // Core commands render through the lean grammar directly and never consult
+    // a format; their dispatch arms below take no format argument.
     let maintenance_format = cli.command.default_maintenance_format();
     match cli.command {
         Command::Init(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             init::exec(args, format).await
         }
         Command::Start(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             start::exec(args, format).await
         }
         Command::Stop(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             stop::exec(args, format).await
         }
         Command::Status(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             status::exec(args, format).await
         }
-        // Core commands render through the lean grammar and do not consult a
-        // format. The `_format` parameter on each `exec` signature is a
-        // T5-era placeholder that T6 drops alongside the signature change.
-        Command::Symbol(args) => symbol::exec(args, OutputFormat::Plain).await,
-        Command::Search(args) => search::exec(args, OutputFormat::Plain).await,
-        Command::Get(args) => get::exec(args, OutputFormat::Plain).await,
-        Command::Context(args) => context::exec(args, OutputFormat::Plain).await,
-        Command::Impact(args) => impact::exec(args, OutputFormat::Plain).await,
-        Command::Structural(args) => structural::exec(args, OutputFormat::Plain).await,
+        Command::Symbol(args) => symbol::exec(args).await,
+        Command::Search(args) => search::exec(args).await,
+        Command::Get(args) => get::exec(args).await,
+        Command::Context(args) => context::exec(args).await,
+        Command::Impact(args) => impact::exec(args).await,
+        Command::Structural(args) => structural::exec(args).await,
         Command::Index(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             index::exec(args, format).await
         }
         Command::Reindex(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             reindex::exec(args, format).await
         }
         Command::HelloAgent(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             hello_agent::exec(args, format).await
         }
         Command::Update(args) => {
-            let format = args.format.unwrap_or(maintenance_format);
+            let format = resolve_maintenance_format(args.format, maintenance_format);
             update::exec(args, format).await
         }
         Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
+}
+
+/// Collapse the user-selected `--format` (if any) against the maintenance
+/// default resolved from the command enum. Maintenance arms always have a
+/// concrete default; the `.expect` documents that invariant so a future
+/// refactor that accidentally classifies a core command as maintenance fails
+/// loudly instead of silently picking `Plain`.
+fn resolve_maintenance_format(
+    explicit: Option<OutputFormat>,
+    default: Option<OutputFormat>,
+) -> OutputFormat {
+    explicit
+        .or(default)
+        .expect("maintenance dispatch arms always resolve a default format")
 }
 
 pub(crate) fn parse_positive_usize(raw: &str) -> Result<usize, String> {
@@ -254,7 +262,7 @@ mod tests {
             let cli = Cli::parse_from(argv.iter().copied());
             assert_eq!(
                 cli.command.default_maintenance_format(),
-                OutputFormat::Human,
+                Some(OutputFormat::Human),
                 "expected Human default for {argv:?}"
             );
         }
@@ -268,8 +276,32 @@ mod tests {
             let cli = Cli::parse_from(argv.iter().copied());
             assert_eq!(
                 cli.command.default_maintenance_format(),
-                OutputFormat::Plain,
+                Some(OutputFormat::Plain),
                 "expected Plain default for {argv:?}"
+            );
+        }
+    }
+
+    /// Core commands no longer resolve a maintenance format; the helper
+    /// returns `None` so a refactor that accidentally routes a core command
+    /// through maintenance dispatch panics via the `.expect` in
+    /// `resolve_maintenance_format`.
+    #[test]
+    fn core_commands_have_no_maintenance_format_default() {
+        let core_cases: &[&[&str]] = &[
+            &["1up", "search", "needle"],
+            &["1up", "symbol", "Config"],
+            &["1up", "get", "abc123def456"],
+            &["1up", "context", "src/main.rs:1"],
+            &["1up", "impact", "--from-symbol", "Config"],
+            &["1up", "structural", "(identifier) @id"],
+        ];
+        for argv in core_cases {
+            let cli = Cli::parse_from(argv.iter().copied());
+            assert_eq!(
+                cli.command.default_maintenance_format(),
+                None,
+                "expected no maintenance default for {argv:?}"
             );
         }
     }

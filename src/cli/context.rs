@@ -9,7 +9,7 @@ use crate::search::context::{parse_location, ContextEngine};
 use crate::shared::errors::{FilesystemError, OneupError};
 use crate::shared::fs::clamp_canonical_path_to_root;
 use crate::shared::project;
-use crate::shared::types::{ContextAccessScope, OutputFormat};
+use crate::shared::types::ContextAccessScope;
 
 #[derive(Args)]
 pub struct ContextArgs {
@@ -29,7 +29,7 @@ pub struct ContextArgs {
     pub allow_outside_root: bool,
 }
 
-pub async fn exec(args: ContextArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: ContextArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let state_root = &resolved.state_root;
     let source_root = &resolved.source_root;

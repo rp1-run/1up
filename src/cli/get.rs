@@ -5,7 +5,6 @@ use clap::Args;
 
 use crate::cli::lean;
 use crate::shared::config::project_db_path;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments::{
@@ -31,7 +30,7 @@ pub struct GetArgs {
     pub path: String,
 }
 
-pub async fn exec(args: GetArgs, _format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: GetArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);
