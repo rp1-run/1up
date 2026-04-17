@@ -531,12 +531,123 @@ mod tests {
         assert_eq!(out, "not_found\t:deadbeefcafe\n---\n");
     }
 
+    fn sample_stored_segment() -> StoredSegment {
+        StoredSegment {
+            id: "abcdef0123456789".to_string(),
+            file_path: "src/auth/builder.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn build() {}".to_string(),
+            line_start: 21,
+            line_end: 38,
+            breadcrumb: Some("AuthConfig::build".to_string()),
+            complexity: 4,
+            role: "ORCHESTRATION".to_string(),
+            defined_symbols: "[\"build_auth\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "h".to_string(),
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+        }
+    }
+
     #[test]
     fn lean_row_no_segment_prefix_literal() {
-        let out = capture(|sink| render_search(sink, &[sample_search_result()]));
+        // Capture every lean renderer's output in a single buffer and assert the
+        // literal `segment=` substring never appears. This is the T9 grep-style
+        // guard that pins the grammar's suffix convention (`:<id>`) across
+        // search, symbol, impact (both buckets, empty, refused), context,
+        // structural, and get rendering paths.
+        let search_out = capture(|sink| render_search(sink, &[sample_search_result()]));
+
+        let sym = SymbolResult {
+            name: "Config".to_string(),
+            kind: "struct".to_string(),
+            file_path: "src/config.rs".to_string(),
+            language: "rust".to_string(),
+            line_start: 10,
+            line_end: 20,
+            content: String::new(),
+            reference_kind: ReferenceKind::Definition,
+            breadcrumb: Some("mod config".to_string()),
+        };
+        let symbol_out = capture(|sink| render_symbol(sink, &[sym]));
+
+        let expanded_envelope = ImpactResultEnvelope {
+            status: ImpactStatus::Expanded,
+            resolved_anchor: None,
+            results: vec![sample_impact_candidate("primary000000001", 0.9)],
+            contextual_results: Some(vec![sample_impact_candidate("context000000001", 0.3)]),
+            hint: None,
+            refusal: None,
+        };
+        let impact_expanded_out = capture(|sink| render_impact(sink, &expanded_envelope));
+
+        let refused_envelope = ImpactResultEnvelope {
+            status: ImpactStatus::Refused,
+            resolved_anchor: None,
+            results: Vec::new(),
+            contextual_results: None,
+            hint: None,
+            refusal: Some(ImpactRefusal {
+                reason: "symbol_too_broad".to_string(),
+                message: "m".to_string(),
+            }),
+        };
+        let impact_refused_out = capture(|sink| render_impact(sink, &refused_envelope));
+
+        let ctx = ContextResult {
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            content: "fn a() {}".to_string(),
+            line_start: 12,
+            line_end: 12,
+            scope_type: "function".to_string(),
+            access_scope: None,
+        };
+        let context_out = capture(|sink| render_context(sink, &ctx));
+
+        let struc = StructuralResult {
+            file_path: "src/parse.rs".to_string(),
+            language: "rust".to_string(),
+            pattern_name: Some("fn_decl".to_string()),
+            content: "fn parse() {}".to_string(),
+            line_start: 30,
+            line_end: 30,
+        };
+        let structural_out = capture(|sink| render_structural(sink, &[struc]));
+
+        let get_found_out = capture(|sink| render_get_found(sink, &sample_stored_segment()));
+        let get_not_found_out = capture(|sink| render_get_not_found(sink, ":deadbeefcafe"));
+
+        let combined = [
+            search_out,
+            symbol_out,
+            impact_expanded_out,
+            impact_refused_out,
+            context_out,
+            structural_out,
+            get_found_out,
+            get_not_found_out,
+        ]
+        .concat();
+
         assert!(
-            !out.contains("segment="),
-            "lean output must not contain `segment=`: {out}"
+            !combined.contains("segment="),
+            "lean output must not contain `segment=`: {combined}"
         );
+    }
+
+    #[test]
+    fn get_handle_tolerates_leading_colon() {
+        // Mirrors the lean grammar: agents paste `:<id>` tokens straight out of
+        // search rows into `1up get`. This pin keeps the suffix helper and the
+        // get-side normalization on the same shape.
+        assert_eq!(segment_suffix("abcdef0123456789"), ":abcdef012345");
+        // segment_suffix produces the exact token `get` must accept back.
+        let suffix = segment_suffix("abcdef0123456789");
+        assert!(suffix.starts_with(':'));
+        assert_eq!(&suffix[1..], "abcdef012345");
     }
 }
