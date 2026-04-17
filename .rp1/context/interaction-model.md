@@ -57,6 +57,13 @@
   - escalate to impact only from an anchor
   - verify exhaustiveness with `symbol -r`
 
+### Developer Harness (justfile)
+
+- Entry points: `just eval-recall`, `just bench-vector-index-size`
+- Role: local-only developer evaluation and benchmarking for retrieval quality and index size
+- Not part of the shipped CLI contract; does not appear in `1up --help` or the reminder surface
+- Purpose: lets storage-format or ranker changes be validated cold against anchor-based gold and pinned size baselines before shipping
+
 ## User-Visible States
 
 | State | Meaning | Signals |
@@ -98,6 +105,13 @@
 2. Reminder guidance warns that ranked search may omit lower-scored matches.
 3. Caller uses `symbol -r` to verify all locations before acting.
 
+### Retrieval-Quality Evaluation Loop
+
+1. Developer changes a storage/index/retrieval parameter (e.g. vector quantization, prefilter K).
+2. `just eval-recall` reindexes cold and reports recall@k against the anchor-based gold corpus.
+3. `just bench-vector-index-size` reports on-disk footprint and median indexing time.
+4. Developer weighs size vs recall vs REQ absolutes before shipping; gates fail the run on regression.
+
 ## Output Semantics
 
 | Surface | Human | Plain | JSON |
@@ -114,3 +128,4 @@
 - Empty impact outcomes are explicit machine-readable states, not padded success results.
 - Human search output stays glanceable; human impact output intentionally includes more orientation because the user has already opted into deeper follow-up work.
 - Impact does not depend on daemon IPC even though daemon-backed discovery remains the default warm-search path.
+- Retrieval-quality and index-size measurement live in the justfile (developer-facing), not in the shipped `1up` CLI — storage-format changes like FLOAT32 -> FLOAT8 quantization can be validated without expanding the public surface.

@@ -14,6 +14,11 @@
 | `SegmentRelation` | Entity | Persisted unresolved call/reference edge keyed by source segment plus canonical, lookup-tail, qualifier, and edge-identity evidence. | `src/storage/relations.rs`, `src/storage/queries.rs`, `src/storage/schema.rs` |
 | `RelationTargetDescriptor` | Value object | Normalized lookup/disambiguation fields derived from a raw target symbol before relation rows are stored. | `src/storage/relations.rs` |
 | `Daemon Search IPC` | Interface | Unix-socket discovery protocol for daemon-backed search. Responses now optionally carry `daemon_version`. | `src/daemon/search_service.rs`, `src/cli/search.rs` |
+| `Segment Vector` | Entity | Quantized embedding row in `segment_vectors.embedding_vec` as `FLOAT8(384)` under schema v12. Written via the typed `vector8(?)` constructor; generic `vector(?)` does not auto-cast. | `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/schema.rs` |
+| `Vector Index` | Entity | libSQL `libsql_vector_idx` on `segment_vectors.embedding_vec` with `metric=cosine`, `compress_neighbors=float8`, `max_neighbors=32`. Delivers ~4x on-disk shrink vs FLOAT32 while staying in a sub-80 MiB DiskANN page tier at repo scale. | `src/storage/queries.rs`, `src/storage/schema.rs` |
+| `Schema Version` | Value object | Monotonic integer (currently 12) stamped in `meta`. `ensure_current` rejects older or newer layouts with an explicit `1up reindex` hint. v12 gates the FLOAT32 -> FLOAT8 migration. | `src/shared/constants.rs`, `src/storage/schema.rs` |
+| `Recall Eval Harness` | Process | Deterministic anchor-based recall@k measurement run via `just eval-recall`. Decision gate for quantization and prefilter tuning; requires cold state (daemon stopped, index wiped) to avoid contamination. | `evals/suites/1up-search/recall.ts`, `evals/suites/1up-search/recall-corpus.jsonl`, `evals/suites/1up-search/recall-baseline.json` |
+| `Anchor-based Gold Corpus` | Value object | Recall gold keyed by durable anchors (`{file, symbol}` or `{file, line_contains}`), not segment IDs or a specific index's top-k output. Survives line drift and avoids version-bias. | `evals/suites/1up-search/recall-corpus.jsonl` |
 
 ## Terminology
 
@@ -38,7 +43,16 @@
 | `daemon_version` | Optional search-response metadata used to warn about CLI/daemon version skew. |
 | `context_only` | Hint code used when the anchor resolved but only contextual guidance remains after trust-bucket selection. |
 | `schema v10` | Index schema version that requires relation lookup-target, qualifier-fingerprint, and edge-identity columns and reindexing from older layouts. |
+| `schema v12` | Current schema version. Migrates `segment_vectors.embedding_vec` from `FLOAT32(384)` to `FLOAT8(384)` with `compress_neighbors=float8` and `max_neighbors=32`. Version bump forces reindex; no in-place migration. |
 | `advisory impact` | Likely-impact guidance derived from relations and heuristics, not exact dependency truth. |
+| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used for `segment_vectors.embedding_vec` in schema v12. ~4x smaller than FLOAT32 with no recall impact under an anchor-based corpus. |
+| `vector8(?)` | libSQL typed vector constructor required to insert/query `FLOAT8` columns. Generic `vector(?)` raises `InputValidationError: vector type differs from column type`. |
+| `libsql_vector_idx` | libSQL 0.9.30 vector index — a DiskANN graph (not classic HNSW) accepting `type`, `metric`, `compress_neighbors`, `max_neighbors`, `alpha`, `search_l`, `insert_l`. |
+| `compress_neighbors` | `libsql_vector_idx` option selecting neighbor-list element quantization (`float1bit`, `float8`, `float16`, `float32`). |
+| `max_neighbors` | DiskANN fanout cap (32 in v12). Graph size quantizes by discrete page tier, not linearly — observed boundaries at max_n=38 (~71–80 MiB) and 40 (~81 MiB). |
+| `VECTOR_PREFILTER_K` | Vector-search prefilter candidate count. Raised 200 -> 400 in v12 to absorb FLOAT8's noisier top-k ranking with no measurable latency hit. Correct lever for FLOAT8 recall, not RRF weights. |
+| `gold corpus` | Hand-curated recall ground truth. Must be version-neutral (never seeded from a specific index's top-k) and keyed by durable anchors, not segment IDs. |
+| `cold-state measurement` | Required eval protocol: stop the watch daemon, wipe `.1up/index.db`, reindex cold, then run the harness to avoid daemon-induced segment drift (~3 pt bias otherwise). |
 
 ## Relationships
 
@@ -51,6 +65,10 @@
 - `edge_identity_kind` and `qualifier_fingerprint` together decide whether a leaf-symbol match has enough corroboration to compete for primary promotion.
 - `SegmentInsert` materializes `SegmentRelation` rows during storage writes.
 - `Daemon Search IPC` returns `SearchResult` values but remains a separate surface from Impact Horizon.
+- Each `Segment` has at most one `Segment Vector` row; `segment_vectors.embedding_vec` is indexed by `Vector Index`.
+- `Schema Version` gates the `Vector Index` DDL — v12 mismatch forces reindex rather than in-place migration.
+- `Vector Index` pairs `FLOAT8` quantization with widened `VECTOR_PREFILTER_K=400` so the RRF reranker recovers displaced gold neighbors.
+- `Recall Eval Harness` consumes `Anchor-based Gold Corpus` and gates schema bumps against REQ-002's 2 pt envelope.
 
 ## Recurrent Patterns
 
@@ -64,6 +82,12 @@
 | Transactional relation maintenance | Storage writes | Segment upsert, replace, and delete flows keep `segment_relations` aligned with `segments` and `segment_symbols`. |
 | Backward-compatible surface evolution | CLI output and daemon IPC | New fields such as `segment_id` and `daemon_version` stay optional to preserve compatibility. |
 | Latency guarding | Verification | Benchmarks and integration tests protect interactive latency and search-stability expectations. |
+| Force-reindex schema evolution | Storage schema | Breaking column changes (e.g. FLOAT32 -> FLOAT8) bump `SCHEMA_VERSION` and rely on `ensure_current` to reject stale layouts. No in-place migration code is written. |
+| Quantization with prefilter widening | Vector search | When element-type quantization degrades top-k ranking, widen `VECTOR_PREFILTER_K` rather than reweighting RRF. RRF recovers displaced gold neighbors. |
+| Typed vector constructor discipline | libSQL write/read | Every INSERT/SELECT on a `FLOAT8` column uses `vector8(?)`. Generic `vector()` does not auto-cast. Enforced uniformly across query constants and batch-insert format strings. |
+| Cold-state eval protocol | Recall measurement | Stop daemon, wipe index, reindex cold, then run harness. Prevents daemon-induced transient segment IDs from biasing recall. |
+| Anchor-based gold curation | Eval corpus design | Gold entries key by `{file, symbol}` or `{file, line_contains}` — durable across line shifts and version-neutral. |
+| Hypothesis-validated schema change | Storage evolution | Non-obvious libSQL behaviors (e.g. `vector()` auto-cast, DiskANN page-tier quantization) are confirmed via HYP experiments before DDL lands. |
 
 ## Bounded Contexts
 
@@ -79,14 +103,23 @@
 
 ### Index Graph Storage
 
-- Owns persisted segments, symbol rows, and unresolved relation rows in the local libSQL index.
+- Owns persisted segments, symbol rows, unresolved relation rows, and quantized vector rows in the local libSQL index (schema v12: FLOAT8(384) embeddings + compressed DiskANN graph).
 - Query-time code resolves targets rather than storing an exact dependency graph.
+- Schema changes evolve via force-reindex rather than in-place migration.
+
+### Eval And Benchmarks
+
+- Owns recall@k and on-disk size measurement under `evals/` and `scripts/`.
+- Requires cold-state measurement (daemon stopped, index wiped) for deterministic numbers.
+- Gates production schema bumps against REQ-001 (size) and REQ-002 (recall) absolutes.
 
 ## Cross-Cutting Concerns
 
 - Ambiguity management: broad symbol anchors are refused with narrowing hints instead of widened into noisy output.
 - Advisory semantics: scores are framed as likely/probable guidance, not guaranteed blast radius.
 - Empty-state trust: resolved anchors without relation-backed evidence stay empty instead of being echoed back as synthetic success results.
-- Interactive latency: budgets and benchmarks keep impact additive without regressing core discovery commands.
-- Compatibility: search and IPC surfaces stay additive and optional while relation-row schema changes remain local to the index and guarded by reindex checks.
-- Reindex safety: schema mismatches fail early with explicit `1up reindex` guidance.
+- Interactive latency: budgets and benchmarks keep impact and vector changes additive without regressing core discovery commands; FLOAT8 + `VECTOR_PREFILTER_K=400` verified latency-neutral at repo scale.
+- Compatibility: search and IPC surfaces stay additive and optional while relation-row and vector-column schema changes remain local to the index and guarded by reindex checks.
+- Reindex safety: schema mismatches fail early with explicit `1up reindex` guidance. Force-reindex is the only migration path for breaking column changes.
+- Measurement integrity: eval runs require cold state and version-neutral anchor-based gold to avoid daemon contamination and version-bias regressions.
+- Typed libSQL surfaces: `FLOAT8` columns require `vector8(?)` at every write/read site; generic `vector()` does not auto-cast.
