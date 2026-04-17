@@ -1,0 +1,22 @@
+// ARCHIVED: This corpus was captured by taking the top-10 results of `1up search` under the
+// schema v11 (FLOAT32) build and hand-curating which of those hits were relevant. Because gold
+// was sourced from a single index version's output, any downstream quantization noise reads as
+// a recall regression rather than a true quality loss. Do not use this file as ground truth.
+// The current corpus is recall-corpus.jsonl, which was hand-curated by reading the source code
+// (not by seeding from any single index).
+// Kept for historical diff only; regenerate baselines against recall-corpus.jsonl.
+{"query": "schema version constant used for migration gating", "expected_segment_ids": ["047c80d0dbeba724", "d011c8a929156ad9", "a2a6023ed20be8b5"], "expected_files": ["src/shared/constants.rs", "src/storage/schema.rs"]}
+{"query": "hybrid search combining vector and full-text retrieval", "expected_segment_ids": ["dd69682e22593ac2", "dcc0fe34c1f13da5", "0ed3cbcc8113594b"], "expected_files": ["src/search/hybrid.rs"]}
+{"query": "batch insert vectors into segment_vectors table", "expected_segment_ids": ["fb934c198d291f9d", "1a8fdd457eaf7fd0", "80023f4db057e802"], "expected_files": ["src/storage/segments.rs", "src/storage/queries.rs"]}
+{"query": "vector_top_k candidate retrieval from HNSW index", "expected_segment_ids": ["9a4ea46c811f7c27", "f3769f012e9b93ba", "6d9f74cc76fa0654"], "expected_files": ["src/search/retrieval.rs", "src/storage/queries.rs"]}
+{"query": "libsql vector index DDL with compress_neighbors", "expected_segment_ids": ["9a4ea46c811f7c27", "4bfb2b4c4cf3808e"], "expected_files": ["src/storage/queries.rs"]}
+{"query": "reject databases with stale schema versions", "expected_segment_ids": ["fa6b528353228503", "924a21b358e89526", "a2a6023ed20be8b5"], "expected_files": ["src/storage/schema.rs"]}
+{"query": "ONNX embedder producing 384-dimensional float32 vectors", "expected_segment_ids": ["7fcb139f87ff92e3", "59603cddb1cb15eb", "98f6a6ee88d4a15b"], "expected_files": ["src/indexer/embedder.rs"]}
+{"query": "indexed_files manifest for metadata-based file prefilter", "expected_segment_ids": ["3620c9fb3092b474", "3122cedc4d46e1f8", "4d8f7e5659eca811"], "expected_files": ["src/storage/segments.rs", "src/indexer/pipeline.rs"]}
+{"query": "deterministic segment identifier generation", "expected_segment_ids": ["a521511b1b9e5a01", "082c7e64bfbec6a0", "66858b4a12ca0e95"], "expected_files": ["src/indexer/pipeline.rs"]}
+{"query": "impact horizon expansion with owner-aware corroboration", "expected_segment_ids": ["27f1de9c103e3a56", "d23f2ee0a0f226da", "cf171f6ff7677e76"], "expected_files": ["src/search/impact.rs"]}
+{"query": "daemon search IPC over Unix domain socket", "expected_segment_ids": ["0174007e22791d4b", "ff1e7701d3a8f8c5", "8e18b791cc342c9e", "fb041d0f2b0ee156"], "expected_files": ["src/daemon/search_service.rs", "src/daemon/ipc.rs"]}
+{"query": "CLI command dispatch for search and impact", "expected_segment_ids": ["658383704be65681", "7e28df94fb5a964e", "299a3bbee2d8d522"], "expected_files": ["src/cli/mod.rs"]}
+{"query": "rebuild index after schema version bump", "expected_segment_ids": ["924a21b358e89526", "e57c21b9033f3e8d", "a2a6023ed20be8b5"], "expected_files": ["src/cli/reindex.rs", "src/storage/schema.rs"]}
+{"query": "relation descriptor with lookup canonical symbol and qualifier fingerprint", "expected_segment_ids": ["e5eb43f99145a8a9", "390fbc5e7cb1a892", "a232654fae27b167"], "expected_files": ["src/storage/relations.rs"]}
+{"query": "benchmark parallel indexing script emitting JSON summary", "expected_segment_ids": ["cffb2b0f4db5aa92", "b88ada34b00869dd", "ec445a8d4ccd73c0"], "expected_files": ["scripts/benchmark_parallel_indexing.sh"]}

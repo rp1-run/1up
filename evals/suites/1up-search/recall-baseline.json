@@ -1,0 +1,35 @@
+{
+  "schema_version": 11,
+  "corpus_version": "v3-anchor-based",
+  "corpus_path": "evals/suites/1up-search/recall-corpus.jsonl",
+  "recall_at_10": 0.4666666666666667,
+  "recall_at_20": 0.5888888888888889,
+  "captured_at": "2026-04-17T03:05:30.000Z",
+  "target_repo": "/Users/prem/Development/1up",
+  "binary": "target/release/1up (schema v11, FLOAT32(384), libsql_vector_idx w/o compress_neighbors)",
+  "note": "Baseline re-measured under anchor-based gold (v3 corpus). Anchors bind to (file, symbol) or (file, line_contains) semantic identity rather than segment-hash IDs, so unrelated line-number drift in referenced files no longer invalidates gold entries. Same hand-curated 15 queries as v2 corpus (archived at recall-corpus.hash-based.jsonl); gold re-expressed as canonical definitions/DDL constants/top-level functions at each seam. Under this methodology v11 FLOAT32 and v12 FLOAT8+max_neighbors=32 produce identical per-query recall (delta=0 on every query), confirming that FLOAT8 quantization + DiskANN compress_neighbors=float8 + max_neighbors=32 have zero measurable retrieval-quality impact on this corpus. Recall@10 of ~47% and recall@20 of ~59% reflect genuine gaps in the ranker (e.g. large structs like ImpactHorizonEngine not surfacing in top-20 for conceptual queries) rather than storage-format loss.",
+  "methodology": "For each of 15 queries, gold expected_anchors were selected by reading the canonical implementation of each topic (primary struct/enum, top-level function, DDL constant, or invariant text fragment at the relevant seam) and picking 2-5 anchors whose identity does not depend on line numbers. An anchor {file, symbol} matches a search result r when r.file_path == anchor.file AND (r.defined_symbols contains the symbol, OR r.breadcrumb contains it, OR r.content has a definition-keyword line with the symbol). An anchor {file, line_contains} matches when r.file_path == anchor.file AND r.content substring-contains the text. Recall = matched-anchor-count / gold-size per query, averaged across queries. The harness was run against a freshly rebuilt schema-v11 index (SCHEMA_VERSION=11, embedding_vec FLOAT32(384), libsql_vector_idx with no compress_neighbors or max_neighbors tuning) via `target/release/1up` to isolate storage-format effects.",
+  "reports": [
+    {
+      "k": 10,
+      "recall": 0.4666666666666667,
+      "scored_queries": 15,
+      "total_queries": 15
+    },
+    {
+      "k": 20,
+      "recall": 0.5888888888888889,
+      "scored_queries": 15,
+      "total_queries": 15
+    }
+  ],
+  "v12_comparison": {
+    "binary": "target/release/1up (schema v12, FLOAT8(384), libsql_vector_idx compress_neighbors=float8 max_neighbors=32)",
+    "recall_at_10": 0.4666666666666667,
+    "recall_at_20": 0.5888888888888889,
+    "delta_at_10": 0.0,
+    "delta_at_20": 0.0,
+    "determinism": "3 back-to-back runs on each build produced byte-identical recall numbers under the anchor corpus",
+    "verdict": "FLOAT8 + compress_neighbors=float8 + max_neighbors=32 produce zero quality delta relative to v11 FLOAT32 under this corpus at both k=10 and k=20, well within the REQ-002 2pt gate"
+  }
+}

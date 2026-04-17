@@ -1,0 +1,65 @@
+# 1up evals
+
+Deterministic quality harnesses for 1up search. The recall harness is the REQ-002 gate for vector-index changes (schema bumps, element-type flips, HNSW option changes) and must produce a single comparable recall number across baseline and post-change runs.
+
+## Recall harness
+
+**Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts)
+**Corpus**: [`suites/1up-search/recall-corpus.jsonl`](suites/1up-search/recall-corpus.jsonl)
+**Baseline**: [`suites/1up-search/recall-baseline.json`](suites/1up-search/recall-baseline.json)
+
+The harness reads a JSONL corpus of `{ query, expected_segment_ids, expected_files? }` rows, runs `1up search --format json -n 20 --path <repo> <q>` once per query against the 1up repo itself, slices top-10 and top-20 `segment_id` lists, and computes:
+
+```
+recall@k = mean_over_scored_queries(|retrieved_top_k ∩ gold| / |gold|)
+```
+
+Rows with missing or empty `expected_segment_ids` are recorded as `skipped_no_gold` and excluded from the mean so the output is always numeric. An empty corpus yields `recall = 0` rather than `NaN`.
+
+Output JSON envelope (`suites/1up-search/recall-results.json`):
+
+```json
+{
+  "schema_version": 12,
+  "k": [10, 20],
+  "recall": { "10": 0.889, "20": 0.978 },
+  "per_query": [ ... ]
+}
+```
+
+### Run it
+
+```sh
+just eval-recall
+```
+
+The recipe runs `1up index .` to ensure the index is current, then invokes the harness under Bun. Recall numbers are printed to stdout and written to `suites/1up-search/recall-results.json`.
+
+### Baseline and the 2 pt gate
+
+The pinned baseline at `suites/1up-search/recall-baseline.json` was captured against schema v11 on the 1up repo:
+
+| k | recall |
+|---|---|
+| 10 | 0.889 |
+| 20 | 0.978 |
+
+Three back-to-back runs produced identical numbers (0 pt variance), well inside HYP-003's 0.5 pt envelope.
+
+REQ-002 requires post-change recall to stay within **2 percentage points absolute** of the baseline at both k=10 and k=20. Compare `recall-results.json` (post-change) against `recall-baseline.json` after any change that touches vector storage, the HNSW index, the embedder, or retrieval ranking.
+
+### Regenerate the baseline
+
+Only regenerate when the comparison contract itself needs to move (e.g. the corpus expands or the repo layout changes enough that prior segment IDs no longer map). Do not regenerate to "make the gate pass".
+
+```sh
+just eval-recall
+cp evals/suites/1up-search/recall-results.json evals/suites/1up-search/recall-baseline.json
+```
+
+Record why the baseline moved in the commit message and, when relevant, in the KB `Recent Learnings` entry.
+
+## Related scripts
+
+- `scripts/benchmark_vector_index_size.sh` - REQ-001/REQ-003/REQ-005 gate. Fresh-reindexes the 1up repo and reports `db_size_bytes`, `indexing_ms`, and `schema_version`; pinned baseline at `scripts/baselines/vector_index_size_baseline.json`. Invoked via `just bench-vector-index-size`.
+- `evals/suites/1up-search/search-bench.ts` - latency-oriented search harness; not part of the REQ-002 recall gate.

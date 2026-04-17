@@ -230,6 +230,39 @@ async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, On
     table_has_column(conn, "segment_vectors", "embedding_vec").await
 }
 
+#[cfg(test)]
+async fn segment_vectors_embedding_vec_type(
+    conn: &Connection,
+) -> Result<Option<String>, OneupError> {
+    let mut rows = conn
+        .query(
+            "SELECT type FROM pragma_table_info('segment_vectors') WHERE name = ?1 LIMIT 1",
+            ["embedding_vec"],
+        )
+        .await
+        .map_err(|e| {
+            StorageError::Query(format!(
+                "failed to read segment_vectors.embedding_vec type: {e}"
+            ))
+        })?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let ty: String = row.get(0).map_err(|e| {
+                StorageError::Query(format!(
+                    "failed to read segment_vectors.embedding_vec type value: {e}"
+                ))
+            })?;
+            Ok(Some(ty))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(StorageError::Query(format!(
+            "segment_vectors.embedding_vec type inspection failed: {e}"
+        ))
+        .into()),
+    }
+}
+
 async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> {
     for (object_type, name) in REQUIRED_SCHEMA_OBJECTS {
         if !schema_object_exists(conn, object_type, name).await? {
@@ -376,6 +409,21 @@ mod tests {
         (db, conn)
     }
 
+    /// Build a 384-dimension zero-valued JSON vector literal for test fixtures.
+    /// Format-agnostic: matches the production write path (`vector8(?)` takes JSON text)
+    /// so the fixture does not encode a specific element byte size.
+    fn zero_vector_json(dim: usize) -> String {
+        let mut s = String::from("[");
+        for i in 0..dim {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('0');
+        }
+        s.push(']');
+        s
+    }
+
     #[tokio::test]
     async fn check_embedding_model_compatible_records_on_first_run() {
         let (_db, conn) = setup().await;
@@ -439,8 +487,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector32(zeroblob(1536)))",
-            (),
+            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector8(?1))",
+            [zero_vector_json(384)],
         )
         .await
         .unwrap();
@@ -466,8 +514,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector32(zeroblob(1536)))",
-            (),
+            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector8(?1))",
+            [zero_vector_json(384)],
         )
         .await
         .unwrap();
@@ -492,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_empty_database() {
+    async fn prepare_for_write_initializes_v12() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -501,10 +549,19 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
+        assert_eq!(SCHEMA_VERSION, 12);
         assert!(
             schema_object_exists(&conn, "index", "idx_segment_vectors_embedding")
                 .await
                 .unwrap()
+        );
+        let declared_type = segment_vectors_embedding_vec_type(&conn)
+            .await
+            .unwrap()
+            .expect("embedding_vec column should be present");
+        assert!(
+            declared_type.contains("FLOAT8") || declared_type.contains("F1BIT"),
+            "expected embedding_vec declared type to contain FLOAT8 or F1BIT, got `{declared_type}`"
         );
         assert!(schema_object_exists(&conn, "table", "segment_symbols")
             .await
@@ -575,17 +632,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v10_schema() {
+    async fn prepare_for_write_rejects_pre_v12_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "8"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "11"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v8, expected v11"));
+        assert!(msg.contains("found v11, expected v12"));
         assert!(msg.contains("run `1up reindex`"));
     }
 

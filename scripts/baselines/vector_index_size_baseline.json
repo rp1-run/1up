@@ -1,0 +1,20 @@
+{
+  "_comment": "Pinned baseline for scripts/benchmark_vector_index_size.sh (shrink-hnsw-vector-index T5). Records the v12 index.db size and indexing wall-clock on the 1up repository captured on the build machine, for delta reporting. The script's pass/fail thresholds are REQ-derived absolutes (80 MiB limit, [72900, 89100] ms window) kept in the script itself, not in this file - regenerate this snapshot with `just bench-vector-index-size` and update it when machine class or corpus meaningfully changes.",
+  "feature_id": "shrink-hnsw-vector-index",
+  "schema_version": 12,
+  "repo": "1up",
+  "captured_at": "2026-04-17",
+  "runs": 3,
+  "db_size_bytes": 74584064,
+  "indexing_ms": 36335,
+  "per_run": {
+    "db_size_bytes": [74584064, 74584064, 74584064],
+    "indexing_ms": [36045, 36275, 36684]
+  },
+  "gates_at_capture": {
+    "size_pass": true,
+    "time_pass": false,
+    "schema_pass": true,
+    "notes": "REQ-001 size gate (<= 80 MiB / 83886080 B) met with 8.88 MiB headroom after adding `max_neighbors=32` to the HNSW DDL in src/storage/queries.rs. Dropping graph fanout from the implicit default (~62 for 384d) to 32 moves the DiskANN node block down one page tier, shrinking index.db from ~95 MiB to 71.13 MiB with no recall regression on the hand-curated corpus (R@10=0.689, R@20=0.733 at both max_neighbors=32 and the implicit default, measured deterministically after stopping the watch daemon and wiping index.db). REQ-003 time gate ([72900, 89100] ms, +/-10% of 81 s baseline) still fails below the lower bound because this machine is faster than the baseline capture; guard correctly flags drift direction. See the TX-20260417115635 ad-hoc task notes in .rp1/work/features/shrink-hnsw-vector-index/ for the full matrix (max_neighbors=32, 36, 38, 40, 48 tested; also search_l=400, insert_l=140, alpha=1.5 - all recall-neutral at this corpus scale)."
+  }
+}

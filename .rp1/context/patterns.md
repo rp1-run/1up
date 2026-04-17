@@ -53,6 +53,9 @@
 
 - SQL lives in centralized named constants.
 - Schema v11 adds the `indexed_files` manifest table and extends `segment_relations` with lookup-target, qualifier-fingerprint, and edge-identity columns plus a lookup-target index.
+- Schema v12 declares `segment_vectors.embedding_vec` as `FLOAT8(384)` and creates `idx_segment_vectors_embedding` via `libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8')` to shrink the HNSW graph alongside the column.
+- Storage-format shifts follow the schema-bump-forces-reindex pattern: when an on-disk element type, index option, or table definition changes incompatibly, bump `SCHEMA_VERSION` in `src/shared/constants.rs` so existing indexes fail closed with the standard reindex hint instead of silently reading a format-mismatched column. No in-place migration is attempted; `1up reindex` rebuilds to the new format.
+- libSQL vector writes and reads must use the element-typed constructor that matches the column: a `FLOAT8` column requires `vector8(?)` in `UPSERT_SEGMENT_VECTOR`, `SELECT_VECTOR_CANDIDATES`, and the chunked multi-value INSERT inside `segments::batch_upsert_vectors`. The untyped `vector(?)` form raises `InputValidationError: vector type differs from column type` at insert. Embedder output stays as JSON-text `Vec<f32>`; the server quantizes on insert.
 - Relation rows store unresolved canonical targets alongside lookup/disambiguation evidence and are resolved at query time for bounded seeds.
 - Segment, symbol, relation, vector, and `indexed_files` maintenance shares one transactional seam with chunked multi-value INSERTs (SQLITE_MAX_PARAMS=999, per-table chunk sizes derived from column counts).
 - Project-local connections apply performance PRAGMAs (WAL, synchronous=NORMAL, cache_size=-32768, mmap_size=268435456, temp_store=MEMORY) via `connect_tuned` at open time.

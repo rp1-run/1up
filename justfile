@@ -25,6 +25,13 @@ impact-rollout-approve *flags:
 bench-parallel:
     ./scripts/benchmark_parallel_indexing.sh
 
+# Size + throughput guard for schema v12 HNSW index (shrink-hnsw-vector-index).
+# Fresh-reindexes the 1up repo and gates against REQ-001 (index.db <= 80 MiB)
+# and REQ-003 (indexing_ms in [72900, 89100]). Pinned baseline for delta
+# reporting lives at scripts/baselines/vector_index_size_baseline.json.
+bench-vector-index-size *flags:
+    ./scripts/benchmark_vector_index_size.sh {{flags}}
+
 security-check:
     ./scripts/security_check.sh
 
@@ -37,6 +44,13 @@ eval-parallel *flags:
 
 eval-summary:
     @cd evals && ./summary.sh
+
+# Run the deterministic recall@k harness against the current index.
+# Ensures the index is current, then executes 1up search --format json per
+# corpus row and writes evals/suites/1up-search/recall-results.json.
+eval-recall:
+    1up index .
+    @cd evals && bun run suites/1up-search/recall.ts
 
 # Exercise the local binary against a manifest URL.
 update-test url="":
