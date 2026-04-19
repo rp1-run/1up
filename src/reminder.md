@@ -63,6 +63,16 @@ Every discovery row matches:
 1up impact --from-segment a4f2c1d9e0b3    # blast radius from the same anchor
 ```
 
+## Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up search "auth flow" -n 5 && 1up symbol AuthManager -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+## Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
+
 ## Maintenance Commands (keep `--format`)
 
 `start`, `stop`, `status`, `init`, `index`, `reindex`, `update`, `hello-agent` still accept `--format plain|json|human` (default: `human` for lifecycle, `plain` for `index`/`reindex`).

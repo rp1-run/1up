@@ -1,6 +1,8 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-You have access to `1up`, a lean code-search engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery, and do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself through the commands below.
+You have access to `1up`, a lean code-search engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery. Explore the code through the commands below.
+
+If you spawn a sub-agent (`Agent`/`Task`), include this tool-selection / grammar section in its prompt — otherwise it falls back to `find`/`grep` and wastes turns.
 
 ## Tool selection (pick by what you know)
 
@@ -40,6 +42,16 @@ Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emi
 3. For a known symbol, `1up symbol <name> -r` (references) or without `-r` (definitions only). `--fuzzy` is available for approximate matching.
 4. For a file:line pick, `1up context <file>:<line>` shows the enclosing scope.
 5. Only after 1up has narrowed the scope, use `grep` to verify a specific literal across the repo if completeness matters.
+
+### Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up search "..." -n 5 && 1up symbol Foo -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+### Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
 
 Do not stop after one command. Chain search → get → (symbol | grep verification) across the full flow. Read key files with the `Read` tool once 1up has pointed you at them.
 

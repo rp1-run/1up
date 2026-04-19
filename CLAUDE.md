@@ -46,7 +46,7 @@ that an rp1 skill addresses, briefly suggest it.
 - For deeper questions about rp1, suggest the user invoke /guide.
 <!-- rp1:end:v0.7.1 -->
 
-<!-- 1up:start:0.1.10 -->
+<!-- 1up:start:0.1.11 -->
 # 1up — Agent Quick Reference
 
 `1up` is a lean, agent-first code-search CLI. Prefer it over `find`, `grep`, `rg`, or `ls` for discovery. Only reach for those tools once 1up has narrowed the scope to one or two files.
@@ -112,6 +112,16 @@ Every discovery row matches:
 1up impact --from-segment a4f2c1d9e0b3    # blast radius from the same anchor
 ```
 
+## Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up search "auth flow" -n 5 && 1up symbol AuthManager -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+## Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
+
 ## Maintenance Commands (keep `--format`)
 
 `start`, `stop`, `status`, `init`, `index`, `reindex`, `update`, `hello-agent` still accept `--format plain|json|human` (default: `human` for lifecycle, `plain` for `index`/`reindex`).
@@ -128,4 +138,4 @@ Every discovery row matches:
 ## Search-then-Verify
 
 Semantic search ranks by relevance; may omit matches. Never conclude "only N callers" from search alone. Verify completeness with `1up symbol -r <name>` or `grep` **after** 1up has pointed at the files.
-<!-- 1up:end:0.1.10 -->
+<!-- 1up:end:0.1.11 -->
