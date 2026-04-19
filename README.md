@@ -164,7 +164,7 @@ Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-
 | Plugin Runner Impact | 62s / $0.31 | 155s / $0.62 | 1up |
 | **Total** | **515s / $2.93** | **768s / $3.91** | **1up** |
 
-**1up vs baseline: -33% time, -25% cost.** 1up wins time on all 7 tasks. Quality (LLM rubric average): 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline — baseline fails Search Stack and Plugin Architecture when it cannot delegate to a sub-agent. Full results and cross-run history: [`evals/results/`](evals/results/).
+**1up vs baseline: -33% time, -25% cost.** 1up wins time on 6 of 7 tasks and ties the 7th (FTSManager Impact, where baseline is cheaper by $0.08). Quality (LLM rubric average): 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline — baseline fails Search Stack and Plugin Architecture when it cannot delegate to a sub-agent. Full results and cross-run history: [`evals/results/`](evals/results/).
 
 ## Upgrade
 
