@@ -151,20 +151,20 @@ The eval suite runs Claude agents with and without `1up` on traced-flow tasks ac
 just eval-parallel --summary
 ```
 
-Latest results (Sonnet, 2026-04-16):
+Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-agent delegation for apples-to-apples comparison):
 
-| Task | 1up | baseline | Winner |
+| Task | 1up | baseline | Winner (time) |
 |------|:---:|:--------:|:------:|
-| Search Stack | 79s / $0.27 | 137s / $0.54 | 1up |
-| WordPress Import | 112s / $0.37 | 118s / $0.34 | 1up |
-| Plugin Architecture | 116s / $0.40 | 125s / $0.46 | 1up |
-| Live Content Query | 131s / $0.40 | 175s / $0.85 | 1up |
-| FTS Impact | 152s / $0.40 | 91s / $0.37 | baseline |
-| Registry Impact | 98s / $0.28 | 112s / $0.36 | 1up |
-| Runner Impact | 145s / $0.42 | 191s / $0.80 | 1up |
-| **Total** | **833s / $2.54** | **949s / $3.72** | **1up** |
+| Search Stack | 61s / $0.37 | 108s / $0.55 | 1up |
+| WordPress Import | 90s / $0.48 | 130s / $0.70 | 1up |
+| Plugin Architecture | 82s / $0.41 | 126s / $0.73 | 1up |
+| Live Content Query | 70s / $0.44 | 81s / $0.60 | 1up |
+| FTSManager Impact | 54s / $0.36 | 54s / $0.28 | 1up (tie) |
+| Schema Registry Impact | 96s / $0.55 | 113s / $0.43 | 1up |
+| Plugin Runner Impact | 62s / $0.31 | 155s / $0.62 | 1up |
+| **Total** | **515s / $2.93** | **768s / $3.91** | **1up** |
 
-**1up vs baseline: -12% time, -32% cost.** 6/7 wins for 1up. FTS Impact is the one baseline win — the task names a specific class, so grep is competitive. Full results: [`evals/results/`](evals/results/).
+**1up vs baseline: -33% time, -25% cost.** 1up wins time on all 7 tasks. Quality (LLM rubric average): 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline — baseline fails Search Stack and Plugin Architecture when it cannot delegate to a sub-agent. Full results and cross-run history: [`evals/results/`](evals/results/).
 
 ## Upgrade
 
