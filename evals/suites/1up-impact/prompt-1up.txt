@@ -1,28 +1,44 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-You have access to `1up`, a code search and impact analysis engine. Pick by what you know:
+You have access to `1up`, a lean code-search and impact-analysis engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery, and do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself through the commands below.
 
-| You know... | Use | Reason |
-|---|---|---|
-| Concept, not files/keywords | `1up search` | Semantic search needs no vocabulary |
-| Symbol/keyword name | `1up symbol -r` or `grep` | Literal match = precise, low noise |
-| Keyword, need ALL instances | `grep` | Guaranteed-complete, best signal:noise |
-| Blast radius from a symbol/file | `1up impact` | Finds transitive dependencies |
+## Tool selection (pick by what you know)
+
+| You know… | Use |
+|---|---|
+| Concept or feature area | `1up search "<query>" -n 3` |
+| Exact symbol name | `1up symbol <name> [-r]` |
+| A segment handle from a prior hit | `1up get <handle>` to hydrate the body, or `1up impact --from-segment <handle>` for blast radius |
+| A symbol whose blast radius you need | `1up impact --from-symbol <name>` |
+| A file whose blast radius you need | `1up impact --from-file <path>[:<line>]` |
+| A file:line pick | `1up context <file>:<line>` |
+
+`grep` is only allowed as a final verification pass once `1up` has narrowed the scope.
+
+## Lean row grammar
+
+Every `search` / `symbol` / `impact` row matches:
 
 ```
-1up search "<query>" -n 5          # semantic + keyword hybrid
-1up symbol <name> [-r]             # exact def lookup; -r = all references
-1up symbol --fuzzy <name> [-r]     # approximate matching when exact fails
-1up context <file>:<line>          # enclosing scope at location
-1up impact --from-symbol <name>    # blast radius from symbol
-1up impact --from-file <path>      # blast radius from file
+<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]
 ```
 
-For impact questions, start with `1up impact` to trace dependencies. Use `search`/`symbol` to find the right anchor first.
+- `:<segment_id>` is a 12-char handle. Feed it into `1up get` to read the body or `1up impact --from-segment <handle>` to expand from that exact anchor.
+- `impact` rows carry a trailing `~P` (primary) or `~C` (contextual) tag. Primary rows are confident relation-backed callers; contextual rows are lower-signal and must be verified before acting on them.
 
-After reviewing impact results, use `1up symbol -r`, `1up search`, or `grep` to fill gaps — impact may not surface every downstream consumer, especially UI components or indirect callers.
+Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emit one machine-parseable shape and do not accept `--format`, `-f`, `--full`, `--brief`, `--human`, or `--verbose-fields`.
 
-Do not stop after a single command. Use `1up impact` for the initial blast radius, then follow up with `1up symbol -r` or `grep` to verify each dependency and discover what impact missed.
+## Impact workflow
+
+1. Find the anchor. If you already know the symbol or file, skip straight to step 2. Otherwise run `1up search "<intent>" -n 3` and pick the 1-2 most relevant handles.
+2. Expand blast radius:
+   - `1up impact --from-segment <handle>` from a search/symbol row.
+   - `1up impact --from-symbol <name>` from a known symbol.
+   - `1up impact --from-file <path>` when the anchor is a file.
+3. Read primary (`~P`) rows first; hydrate bodies with `1up get :<handle>` when you need more than the header.
+4. Cover the known misses: `impact` may not surface UI callers, dynamic dispatch, or indirect consumers. Follow up with `1up symbol -r <name>` for reference lists, and only then reach for `grep` to confirm a specific literal.
+
+Do not stop after one command. Chain impact → get → (symbol -r | grep verification) and read the key files via the `Read` tool once 1up has pointed you at them.
 
 {{TASK_PROMPT}}
 
