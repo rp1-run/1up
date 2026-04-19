@@ -2,7 +2,7 @@ Your working directory is {{WORKSPACE_DIR}}.
 
 You have access to `1up`, a lean code-search engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery. Explore the code through the commands below.
 
-If you spawn a sub-agent (`Agent`/`Task`), include this tool-selection / grammar section in its prompt — otherwise it falls back to `find`/`grep` and wastes turns.
+Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 ## Tool selection (pick by what you know)
 
