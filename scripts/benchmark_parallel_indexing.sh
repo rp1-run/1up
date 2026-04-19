@@ -95,7 +95,7 @@ run_full_case() {
   local jobs="$3"
   local embed_threads="$4"
 
-  local args=("$oneup_bin" "--format" "json" reindex "$run_dir")
+  local args=("$oneup_bin" reindex "$run_dir" --format json)
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -124,7 +124,7 @@ pub fn bench_marker() -> &'static str {
 }
 EOF
 
-  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  local args=("$oneup_bin" index "$run_dir" --format json)
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -153,7 +153,7 @@ run_incremental_case() {
   local jobs="$3"
   local embed_threads="$4"
 
-  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  local args=("$oneup_bin" index "$run_dir" --format json)
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -186,7 +186,7 @@ pub fn write_heavy_marker_${idx}() -> &'static str {
 EOF
   done
 
-  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  local args=("$oneup_bin" index "$run_dir" --format json)
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -217,7 +217,7 @@ run_write_heavy_case() {
   local jobs="$3"
   local embed_threads="$4"
 
-  local args=("$oneup_bin" "--format" "json" index "$run_dir")
+  local args=("$oneup_bin" index "$run_dir" --format json)
   if [[ -n "$jobs" ]]; then
     args+=(--jobs "$jobs")
   fi
@@ -239,7 +239,7 @@ wait_for_daemon_ready() {
 
   while (( elapsed < max_wait )); do
     local status_json
-    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    status_json=$("$oneup_bin" status "$run_dir" --format json 2>/dev/null || true)
     local daemon_running
     daemon_running=$(jq -r '.daemon_running // false' <<<"$status_json" 2>/dev/null || echo "false")
     local last_check
@@ -266,7 +266,7 @@ wait_for_refresh_complete() {
 
   while (( elapsed < max_wait )); do
     local status_json
-    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    status_json=$("$oneup_bin" status "$run_dir" --format json 2>/dev/null || true)
     local state
     state=$(jq -r '.index_progress.state // "idle"' <<<"$status_json" 2>/dev/null || echo "idle")
     local updated_at
@@ -304,7 +304,7 @@ run_daemon_refresh_benchmark() {
 
   for iter in $(seq 1 "$runs"); do
     local status_json
-    status_json=$("$oneup_bin" --format json status "$run_dir" 2>/dev/null || true)
+    status_json=$("$oneup_bin" status "$run_dir" --format json 2>/dev/null || true)
     local baseline_updated_at
     baseline_updated_at=$(jq -r '.index_progress.updated_at // "null"' <<<"$status_json" 2>/dev/null || echo "null")
 

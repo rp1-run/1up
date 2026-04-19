@@ -57,6 +57,13 @@
   - escalate to impact only from an anchor
   - verify exhaustiveness with `symbol -r`
 
+### Developer Harness (justfile)
+
+- Entry points: `just eval-recall`, `just bench-vector-index-size`
+- Role: local-only developer evaluation and benchmarking for retrieval quality and index size
+- Not part of the shipped CLI contract; does not appear in `1up --help` or the reminder surface
+- Purpose: lets storage-format or ranker changes be validated cold against anchor-based gold and pinned size baselines before shipping
+
 ## User-Visible States
 
 | State | Meaning | Signals |
@@ -98,13 +105,27 @@
 2. Reminder guidance warns that ranked search may omit lower-scored matches.
 3. Caller uses `symbol -r` to verify all locations before acting.
 
+### Retrieval-Quality Evaluation Loop
+
+1. Developer changes a storage/index/retrieval parameter (e.g. vector quantization, prefilter K).
+2. `just eval-recall` reindexes cold and reports recall@k against the anchor-based gold corpus.
+3. `just bench-vector-index-size` reports on-disk footprint and median indexing time.
+4. Developer weighs size vs recall vs REQ absolutes before shipping; gates fail the run on regression.
+
 ## Output Semantics
 
-| Surface | Human | Plain | JSON |
-|---|---|---|---|
-| Search | Concise previews, no full `segment_id` dump | Line-oriented results, optional `segment=<id>` | Full structured `SearchResult`, optional `segment_id` |
-| Impact | Labeled narrative with resolved anchor, likely-impact section, optional `Contextual Guidance`, and next-step prose | Parse-stable `result*`, `context_result*`, `hint`, and `refusal` lines | Full `ImpactResultEnvelope` with `status`, `resolved_anchor`, `results`, additive optional `contextual_results`, `hint`, and `refusal` |
-| Status / lifecycle | Default mode | Available when requested | Available when requested |
+Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emit a single lean line-oriented shape. They do not accept `--format`. Maintenance commands (`start`, `stop`, `status`, `init`, `index`, `reindex`, `update`) keep the three-renderer contract.
+
+| Surface | Lean | Human | Plain | JSON |
+|---|---|---|---|---|
+| Search | `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>` rows; default `-n 3` | n/a | n/a | n/a |
+| Get | Segment header line + body, records separated by `---` | n/a | n/a | n/a |
+| Symbol | Same row grammar as search; `<kind>` reflects reference vs definition | n/a | n/a | n/a |
+| Impact | Primary rows (`~P`) then contextual rows (`~C`) under the same grammar; `empty`, `empty_scoped`, and `refused` envelopes emit a single status/hint line each | n/a | n/a | n/a |
+| Context | Header line `<path>:<l1>-<l2>  context  <scope_type>` then numbered content lines | n/a | n/a | n/a |
+| Structural | One row per match: `<path>:<l1>-<l2>  structural  <language>::<pattern_name>` + indented snippet | n/a | n/a | n/a |
+| Status / lifecycle | n/a | Default mode | Available when requested | Available when requested |
+| Index / reindex | n/a | Available when requested | Default mode | Available when requested |
 
 ## Cross-Surface Deltas
 
@@ -114,3 +135,4 @@
 - Empty impact outcomes are explicit machine-readable states, not padded success results.
 - Human search output stays glanceable; human impact output intentionally includes more orientation because the user has already opted into deeper follow-up work.
 - Impact does not depend on daemon IPC even though daemon-backed discovery remains the default warm-search path.
+- Retrieval-quality and index-size measurement live in the justfile (developer-facing), not in the shipped `1up` CLI — storage-format changes like FLOAT32 -> FLOAT8 quantization can be validated without expanding the public surface.

@@ -16,7 +16,7 @@
 | Trust-bucketed impact results | Confident relation-backed candidates stay in primary `results`; ambiguous, low-signal, same-file, and test-only observations move to `contextual_results` or explicit empty outcomes. | `src/search/impact.rs`, `src/cli/output.rs` |
 | Additive search handoff | Search results expose optional `segment_id` values for exact impact follow-up without changing ranking. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
 | Schema-gated local state | Schema v11 requires `indexed_files` table and lookup-target, qualifier, and `edge_identity_kind` columns on `segment_relations`; stale indexes fail closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
-| Interactive guardrails | Benchmarks, black-box tests, and trust/perf scripts encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/evaluate_impact_trust.sh`, `scripts/benchmark_impact.sh` |
+| Interactive guardrails | Benchmarks and black-box tests encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_vector_index_size.sh` |
 
 ## Layers
 

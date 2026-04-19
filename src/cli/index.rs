@@ -30,6 +30,10 @@ pub struct IndexArgs {
     /// Stream live index progress updates until the run completes
     #[arg(long)]
     pub watch: bool,
+
+    /// Output format override (defaults to plain)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
 }
 
 fn spin(msg: impl Into<String>, show_progress_ui: bool) -> ProgressUi {

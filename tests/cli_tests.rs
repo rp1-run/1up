@@ -167,20 +167,40 @@ fn indexing_subcommands_reject_zero_parallel_values() {
 
 #[test]
 fn format_flag_accepts_all_variants() {
+    // `--format`/`-f` lives on each maintenance Args struct post-T7, so it is
+    // parsed after the subcommand rather than before it.
     for fmt in &["json", "human", "plain"] {
-        cmd().args(["--format", fmt, "--help"]).assert().success();
+        cmd()
+            .args(["status", "--format", fmt, "--help"])
+            .assert()
+            .success();
     }
 }
 
 #[test]
-fn help_describes_command_specific_output_defaults() {
-    cmd().arg("--help").assert().success().stdout(
-        predicate::str::contains("Output format override.")
-            .and(predicate::str::contains(
-                "Defaults to human for start/status/stop/update/hello-agent; plain otherwise",
-            ))
-            .and(predicate::str::contains("[default:").not()),
-    );
+fn help_describes_maintenance_format_flag() {
+    // Global `--help` no longer advertises `--format` because the flag moved
+    // onto maintenance command Args structs. Per-command help still documents
+    // it (exercised by the `_maintenance_command_help_documents_format` test
+    // below).
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Output format override").not());
+}
+
+#[test]
+fn maintenance_command_help_documents_format_flag() {
+    for sub in &[
+        "status", "start", "stop", "init", "index", "reindex", "update",
+    ] {
+        cmd()
+            .args([sub, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Output format override"));
+    }
 }
 
 #[test]
@@ -202,7 +222,7 @@ fn status_defaults_to_human_output() {
 fn status_reports_uninitialized_project_and_missing_index() {
     let dir = tempfile::tempdir().unwrap();
     let output = cmd()
-        .args(["--format", "json", "status", dir.path().to_str().unwrap()])
+        .args(["status", dir.path().to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
 
@@ -221,7 +241,7 @@ fn status_reports_uninitialized_project_and_missing_index() {
 fn update_status_reports_disabled_when_manifest_is_unconfigured() {
     let output = cmd()
         .env("ONEUP_UPDATE_MANIFEST_URL", "")
-        .args(["--format", "human", "update", "--status"])
+        .args(["update", "--status", "--format", "human"])
         .output()
         .unwrap();
 
@@ -257,7 +277,7 @@ fn update_status_ignores_cache_from_different_binary_version() {
             "ONEUP_UPDATE_MANIFEST_URL",
             "https://example.com/update-manifest.json",
         )
-        .args(["--format", "human", "update", "--status"])
+        .args(["update", "--status", "--format", "human"])
         .output()
         .unwrap();
 
@@ -282,8 +302,11 @@ fn update_check_fails_when_manifest_is_unconfigured() {
 
 #[test]
 fn invalid_format_flag_rejected() {
+    // `--format` is rejected on core commands (like `search`) entirely, so we
+    // verify the maintenance-command path still surfaces the value-parser
+    // error for unknown formats.
     cmd()
-        .args(["--format", "xml", "search", "test"])
+        .args(["status", "--format", "xml"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown output format"));
@@ -293,7 +316,7 @@ fn invalid_format_flag_rejected() {
 fn init_creates_project_id() {
     let dir = tempfile::tempdir().unwrap();
     cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Initialized project"));
@@ -312,7 +335,7 @@ fn init_warns_if_already_initialized() {
     std::fs::write(dot_dir.join("project_id"), "existing-id").unwrap();
 
     cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success()
         .stderr(predicate::str::contains("already initialized"));
@@ -338,7 +361,7 @@ fn start_auto_initializes_project_if_needed() {
         .env("HOME", &canonical_home)
         .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
         .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-        .args(["--format", "json", "start", canonical_dir.to_str().unwrap()])
+        .args(["start", canonical_dir.to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -367,10 +390,10 @@ fn start_auto_initializes_project_if_needed() {
             .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
             .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
             .args([
-                "--format",
-                "json",
                 "status",
                 canonical_dir.to_str().unwrap(),
+                "--format",
+                "json",
             ])
             .output()
             .unwrap();
@@ -393,7 +416,7 @@ fn start_auto_initializes_project_if_needed() {
             .env("HOME", &canonical_home)
             .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
             .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-            .args(["--format", "json", "stop", canonical_dir.to_str().unwrap()])
+            .args(["stop", canonical_dir.to_str().unwrap(), "--format", "json"])
             .assert()
             .success();
     }
@@ -427,10 +450,10 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
         .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
         .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
         .args([
-            "--format",
-            "json",
             "start",
             canonical_project_a.to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .assert()
         .success();
@@ -450,10 +473,10 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
         .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
         .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
         .args([
-            "--format",
-            "json",
             "start",
             canonical_project_b.to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .output()
         .unwrap();
@@ -473,10 +496,10 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
         .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
         .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
         .args([
-            "--format",
-            "json",
             "stop",
             canonical_project_a.to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .assert()
         .success();
@@ -486,7 +509,7 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
 fn json_output_is_valid_json() {
     let dir = tempfile::tempdir().unwrap();
     let output = cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
 
@@ -504,15 +527,9 @@ fn verbose_flag_accepted() {
 fn search_without_index_requires_reindex() {
     let dir = tempfile::tempdir().unwrap();
 
+    // Core commands (like `search`) do not accept `--format` post-T7.
     cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            "needle",
-            "--path",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["search", "needle", "--path", dir.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("1up reindex"));
@@ -529,17 +546,17 @@ fn status_human_output_includes_last_index_progress() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "init", dir.path().to_str().unwrap()])
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     cmd()
-        .args(["--format", "json", "index", dir.path().to_str().unwrap()])
+        .args(["index", dir.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     cmd()
-        .args(["--format", "human", "status", dir.path().to_str().unwrap()])
+        .args(["status", dir.path().to_str().unwrap(), "--format", "human"])
         .assert()
         .success()
         .stdout(
@@ -562,11 +579,11 @@ fn index_watch_plain_output_streams_progress_updates() {
 
     cmd()
         .args([
-            "--format",
-            "plain",
             "index",
             "--watch",
             dir.path().to_str().unwrap(),
+            "--format",
+            "plain",
         ])
         .assert()
         .success()
@@ -590,11 +607,11 @@ fn index_watch_json_output_streams_progress_updates() {
 
     cmd()
         .args([
-            "--format",
-            "json",
             "index",
             "--watch",
             dir.path().to_str().unwrap(),
+            "--format",
+            "json",
         ])
         .assert()
         .success()
@@ -618,11 +635,11 @@ fn index_watch_human_output_keeps_progress_off_stdout() {
 
     cmd()
         .args([
-            "--format",
-            "human",
             "index",
             "--watch",
             dir.path().to_str().unwrap(),
+            "--format",
+            "human",
         ])
         .assert()
         .success()
@@ -644,11 +661,11 @@ fn reindex_watch_plain_output_streams_rebuild_and_completion() {
 
     cmd()
         .args([
-            "--format",
-            "plain",
             "reindex",
             "--watch",
             dir.path().to_str().unwrap(),
+            "--format",
+            "plain",
         ])
         .assert()
         .success()
@@ -672,7 +689,7 @@ fn hello_agent_plain_output_contains_key_commands() {
 #[test]
 fn hello_agent_json_output_is_valid_json() {
     let output = cmd()
-        .args(["--format", "json", "hello-agent"])
+        .args(["hello-agent", "--format", "json"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -688,7 +705,7 @@ fn hello_agent_json_output_is_valid_json() {
 #[test]
 fn hello_agent_human_output_has_header() {
     cmd()
-        .args(["--format", "human", "hello-agent"])
+        .args(["hello-agent", "--format", "human"])
         .assert()
         .success()
         .stdout(

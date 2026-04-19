@@ -16,6 +16,10 @@ pub struct StatusArgs {
     /// Project root directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Output format override (defaults to human)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
 }
 
 fn read_index_progress(project_root: &std::path::Path) -> Option<IndexProgress> {

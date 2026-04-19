@@ -1,24 +1,59 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-You have access to `1up`, a code search engine. Pick by what you know:
+You have access to `1up`, a lean code-search engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery. Explore the code through the commands below.
 
-| You know... | Use | Reason |
-|---|---|---|
-| Concept, not files/keywords | `1up search` | Semantic search needs no vocabulary |
-| Symbol/keyword name | `1up symbol -r` or `grep` | Literal match = precise, low noise |
-| Keyword, need ALL instances | `grep` | Guaranteed-complete, best signal:noise |
-| Nothing (new codebase) | `1up search` | Works w/o prior knowledge |
+Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
+
+## Tool selection (pick by what you know)
+
+| You know… | Use |
+|---|---|
+| Concept, not files/keywords | `1up search "<query>" -n 3` |
+| Exact symbol name | `1up symbol <name> [-r]` (add `-r` to include references) |
+| A promising hit from search/symbol | `1up get <handle>` to pull the full body |
+| A specific file:line | `1up context <file>:<line>` |
+| Nothing (new codebase) | start with `1up search` |
+
+`grep` is only allowed as a final verification step once `1up` has narrowed the scope to one or two files.
+
+## Lean row grammar
+
+Every `search` / `symbol` / `impact` row matches:
 
 ```
-1up search "<query>" -n 5          # semantic + keyword hybrid
-1up symbol <name> [-r]             # exact def lookup; -r = all references
-1up symbol --fuzzy <name> [-r]     # approximate matching when exact fails
-1up context <file>:<line>          # enclosing scope at location
+<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>
 ```
 
-After discovering a symbol via `search`, verify all locations with `1up symbol -r <name>` or `grep`.
+The trailing `:<segment_id>` is a 12-char handle. Feed it straight back into `1up`:
 
-Do not stop after a single search. Use multiple searches to trace the full flow — follow imports, verify call sites, and read key files to confirm your understanding before answering.
+```
+1up search "authentication middleware" -n 3
+# => 92  src/auth/middleware.ts:10-48  function  Auth::verify  :a4f2c1d9e0b3
+1up get :a4f2c1d9e0b3       # full body of that segment
+1up get a4f2c1d9e0b3 b8c4…  # hydrate several handles at once (space-separated)
+```
+
+Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emit one machine-parseable shape and do not accept `--format`, `-f`, `--full`, `--brief`, `--human`, or `--verbose-fields`.
+
+## Workflow
+
+1. `1up search "<intent>" -n 3` — one line per hit, default top-3.
+2. Pick the 1-2 most promising handles; hydrate with `1up get :<handle>`.
+3. For a known symbol, `1up symbol <name> -r` (references) or without `-r` (definitions only). `--fuzzy` is available for approximate matching.
+4. For a file:line pick, `1up context <file>:<line>` shows the enclosing scope.
+5. Only after 1up has narrowed the scope, use `grep` to verify a specific literal across the repo if completeness matters.
+
+### Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up search "..." -n 5 && 1up symbol Foo -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+### Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
+
+Do not stop after one command. Chain search → get → (symbol | grep verification) across the full flow. Read key files with the `Read` tool once 1up has pointed you at them.
 
 {{TASK_PROMPT}}
 

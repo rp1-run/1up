@@ -1,5 +1,7 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
+Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
+
 {{TASK_PROMPT}}
 
 Use standard CLI tools (grep, rg, find, cat) for code exploration. Trace the full flow — follow imports, verify call sites, and read key files. List the key files and their roles. Be factual.

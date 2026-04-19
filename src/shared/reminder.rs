@@ -10,7 +10,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bump this only when `src/reminder.md` or fence formatting changes.
 /// This prevents unnecessary git noise in user repos when 1up updates
 /// without any fence content changes.
-pub const FENCE_VERSION: &str = "0.1.7";
+pub const FENCE_VERSION: &str = "0.1.11";
 
 /// Fence marker prefix used to identify 1up-managed sections.
 pub const FENCE_PREFIX: &str = "<!-- 1up:start:";
@@ -200,6 +200,20 @@ mod tests {
         assert!(
             CONDENSED_REMINDER.contains("30s"),
             "condensed reminder should describe the heartbeat cadence"
+        );
+    }
+
+    #[test]
+    fn reminder_md_documents_row_grammar() {
+        assert!(
+            CONDENSED_REMINDER.contains("1up get"),
+            "reminder should document the new `get` command"
+        );
+        assert!(
+            CONDENSED_REMINDER.contains(
+                "<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>"
+            ),
+            "reminder should include the lean row grammar skeleton"
         );
     }
 

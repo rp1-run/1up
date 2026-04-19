@@ -53,7 +53,7 @@ This teaches supported agents when to use `1up search`, `1up symbol`, `1up conte
 On macOS and Linux, `1up start` also creates or updates versioned 1up reminder fences in `AGENTS.md` and `CLAUDE.md` inside the repo. You can preview the injected reminder with:
 
 ```sh
-1up --format human hello-agent
+1up hello-agent --format human
 ```
 
 ## Get Started
@@ -64,66 +64,63 @@ From the root of the repository you want to search:
 
 ```sh
 cd /path/to/repo
-1up --format human start
+1up start --format human
 ```
 
 ### Windows
 
 ```powershell
 cd C:\path\to\repo
-1up --format human init
-1up --format human index .
+1up init --format human
+1up index . --format human
 ```
 
-For interactive use in a terminal, the examples below use `--format human` so results render nicely instead of the default agent-friendly `plain` format.
+Core agent-facing commands (`search`, `symbol`, `impact`, `context`, `structural`, `get`) emit a single lean row grammar and do not accept `--format`. Maintenance commands (`start`, `stop`, `status`, `init`, `index`, `reindex`, `update`, `hello-agent`) still accept `--format plain|json|human` — use `--format human` for interactive terminal output.
 
 Try a few common workflows:
 
 ```sh
-1up --format human search "authentication flow" -n 5
-1up --format human symbol -r AuthManager
-1up --format human context src/auth/manager.rs:84
-1up --format human structural "(function_item name: (identifier) @name)"
+1up search "authentication flow" -n 5
+1up symbol -r AuthManager
+1up context src/auth/manager.rs:84
+1up structural "(function_item name: (identifier) @name)"
 ```
 
 The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts. On macOS and Linux, the daemon keeps the index current after `1up start`.
 
-After indexing, `1up status` shows end-to-end timing (including DB, model, and input preparation), scope info (requested vs executed scope and fallback reasons), and prefilter counters (files discovered, metadata-skipped, content-read, and deleted). Use `--format json` to consume these fields programmatically.
+After indexing, `1up status` shows end-to-end timing (including DB, model, and input preparation), scope info (requested vs executed scope and fallback reasons), and prefilter counters (files discovered, metadata-skipped, content-read, and deleted). Use `1up status --format json` to consume these fields programmatically.
 
 ## Choose the Right Command
 
 | If you need to... | Use | Why |
 |---|---|---|
-| Explore unfamiliar code by meaning | `1up --format human search "retry logic with backoff" -n 5` | Ranked semantic and keyword search for discovery |
-| Jump to a definition and all callers | `1up --format human symbol -r validate_token` | Exact-first symbol lookup with reference search |
-| Understand code at a specific file and line | `1up --format human context src/auth.rs:87` | Snaps to the enclosing function, impl, or scope |
-| Inspect likely blast radius from an exact anchor | `1up --format human impact --from-file src/auth.rs:87` | Opt-in, local likely-impact follow-up that keeps normal search behavior unchanged |
-| Match code structure instead of text | `1up --format human structural "(function_item name: (identifier) @name)"` | Tree-sitter AST search |
-| Check indexing timing and scope details | `1up --format human status` | Shows end-to-end timing, scope fallback reasons, and prefilter counters |
+| Explore unfamiliar code by meaning | `1up search "retry logic with backoff" -n 5` | Ranked semantic and keyword search for discovery |
+| Hydrate a segment body from a handle | `1up get :<segment_id>` | Full content + metadata for the picked handle |
+| Jump to a definition and all callers | `1up symbol -r validate_token` | Exact-first symbol lookup with reference search |
+| Understand code at a specific file and line | `1up context src/auth.rs:87` | Snaps to the enclosing function, impl, or scope |
+| Inspect likely blast radius from an exact anchor | `1up impact --from-file src/auth.rs:87` | Opt-in, local likely-impact follow-up that keeps normal search behavior unchanged |
+| Match code structure instead of text | `1up structural "(function_item name: (identifier) @name)"` | Tree-sitter AST search |
+| Check indexing timing and scope details | `1up status --format human` | Shows end-to-end timing, scope fallback reasons, and prefilter counters |
 
-All commands support `--format plain|json|human`. Use `--format human` for interactive terminal use and `--format json` when an agent or script needs structured output.
-
-For agent handoff loops, `1up --format json search ...` exposes `segment_id` on segment-backed hits. Reuse that exact handle with `1up --format json impact --from-segment <segment_id>` when you want bounded likely-impact follow-up without reconstructing a `file:line` anchor.
-
-That handoff is additive. Reusing `segment_id` moves you into the explicit `impact` workflow, but it does not change `search` ranking, candidate selection, or the default discovery loop.
+Each discovery row emitted by the core commands ends with a `:<segment_id>` handle (12 hex chars). Pass that handle back to `1up get` to pull the full body, or to `1up impact --from-segment <handle>` for bounded likely-impact follow-up — no `file:line` reconstruction required.
 
 ## Recommended Workflow
 
 Use semantic search for discovery, then switch to symbol lookup for completeness:
 
 ```sh
-1up --format human search "rate limit handling" -n 5
-1up --format human symbol -r RateLimiter
-1up --format human context src/rate_limit.rs:87
+1up search "rate limit handling" -n 5
+1up symbol -r RateLimiter
+1up context src/rate_limit.rs:87
 ```
 
 That pattern is important. Semantic search is ranked and intentionally selective. It is excellent for finding the right place to look, but `1up symbol -r` is the safer follow-up when you need all definitions and references for a symbol.
 
-When an agent needs the next likely inspection targets after discovery, prefer the explicit handoff:
+When an agent needs the next likely inspection targets after discovery, capture a handle from `search` and hand it off directly:
 
 ```sh
-1up --format json search "load auth config" -n 5
-1up --format json impact --from-segment <segment_id>
+1up search "load auth config" -n 5
+1up impact --from-segment <segment_id>
 ```
 
 ## A Few Honest Notes
@@ -154,20 +151,20 @@ The eval suite runs Claude agents with and without `1up` on traced-flow tasks ac
 just eval-parallel --summary
 ```
 
-Latest results (Sonnet, 2026-04-16):
+Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-agent delegation for apples-to-apples comparison):
 
-| Task | 1up | baseline | Winner |
+| Task | 1up | baseline | Winner (time) |
 |------|:---:|:--------:|:------:|
-| Search Stack | 79s / $0.27 | 137s / $0.54 | 1up |
-| WordPress Import | 112s / $0.37 | 118s / $0.34 | 1up |
-| Plugin Architecture | 116s / $0.40 | 125s / $0.46 | 1up |
-| Live Content Query | 131s / $0.40 | 175s / $0.85 | 1up |
-| FTS Impact | 152s / $0.40 | 91s / $0.37 | baseline |
-| Registry Impact | 98s / $0.28 | 112s / $0.36 | 1up |
-| Runner Impact | 145s / $0.42 | 191s / $0.80 | 1up |
-| **Total** | **833s / $2.54** | **949s / $3.72** | **1up** |
+| Search Stack | 61s / $0.37 | 108s / $0.55 | 1up |
+| WordPress Import | 90s / $0.48 | 130s / $0.70 | 1up |
+| Plugin Architecture | 82s / $0.41 | 126s / $0.73 | 1up |
+| Live Content Query | 70s / $0.44 | 81s / $0.60 | 1up |
+| FTSManager Impact | 54s / $0.36 | 54s / $0.28 | 1up (tie) |
+| Schema Registry Impact | 96s / $0.55 | 113s / $0.43 | 1up |
+| Plugin Runner Impact | 62s / $0.31 | 155s / $0.62 | 1up |
+| **Total** | **515s / $2.93** | **768s / $3.91** | **1up** |
 
-**1up vs baseline: -12% time, -32% cost.** 6/7 wins for 1up. FTS Impact is the one baseline win — the task names a specific class, so grep is competitive. Full results: [`evals/results/`](evals/results/).
+**1up vs baseline: -33% time, -25% cost.** 1up wins time on 6 of 7 tasks and ties the 7th (FTSManager Impact, where baseline is cheaper by $0.08). Quality (LLM rubric average): 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline — baseline fails Search Stack and Plugin Architecture when it cannot delegate to a sub-agent. Full results and cross-run history: [`evals/results/`](evals/results/).
 
 ## Upgrade
 

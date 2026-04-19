@@ -13,15 +13,6 @@ bench:
     cargo build --release
     @cd evals && ONEUP_BENCH_BIN=../target/release/1up bun run bench
 
-impact-eval *flags:
-    ./scripts/evaluate_impact_trust.sh {{flags}}
-
-impact-bench *flags:
-    ./scripts/benchmark_impact.sh {{flags}}
-
-impact-rollout-approve *flags:
-    ./scripts/approve_impact_rollout.sh {{flags}}
-
 bench-parallel:
     ./scripts/benchmark_parallel_indexing.sh
 
@@ -46,11 +37,13 @@ eval-summary:
     @cd evals && ./summary.sh
 
 # Run the deterministic recall@k harness against the current index.
-# Ensures the index is current, then executes 1up search --format json per
-# corpus row and writes evals/suites/1up-search/recall-results.json.
+# Builds the repo-local `1up` binary, indexes the repo with it, then runs the
+# harness against that same binary so PATH-installed versions cannot mask
+# regressions. Writes evals/suites/1up-search/recall-results.json.
 eval-recall:
-    1up index .
-    @cd evals && bun run suites/1up-search/recall.ts
+    cargo build --bin 1up
+    ./target/debug/1up index .
+    @cd evals && ONEUP_BENCH_BIN="$PWD/../target/debug/1up" bun run suites/1up-search/recall.ts
 
 # Exercise the local binary against a manifest URL.
 update-test url="":

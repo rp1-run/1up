@@ -7,7 +7,7 @@ use crate::search::ranking::{rank_candidates, RankedCandidate};
 use crate::search::retrieval::{CandidateRow, RetrievalBackend, RetrievalMode};
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
-use crate::shared::types::SearchResult;
+use crate::shared::types::{normalize_score, SearchResult};
 use crate::storage::segments::{get_segment_by_id, StoredSegment};
 
 pub struct HybridSearchEngine<'a> {
@@ -177,7 +177,7 @@ async fn hydrate_ranked_candidates(
                 ))
             })?;
         let mut result = search_result_from_segment(segment);
-        result.score = ranked_candidate.score;
+        result.score = normalize_score(ranked_candidate.score);
         results.push(result);
     }
 
@@ -185,26 +185,19 @@ async fn hydrate_ranked_candidates(
 }
 
 fn search_result_from_segment(segment: StoredSegment) -> SearchResult {
-    let role = Some(segment.parsed_role());
     let defined_symbols = some_if_not_empty(segment.parsed_defined_symbols());
-    let referenced_symbols = some_if_not_empty(segment.parsed_referenced_symbols());
-    let called_symbols = some_if_not_empty(segment.parsed_called_symbols());
 
     SearchResult {
+        segment_id: segment.id,
         file_path: segment.file_path,
         language: segment.language,
         block_type: segment.block_type,
         content: segment.content,
-        score: 0.0,
+        score: 0,
         line_number: segment.line_start as usize,
         line_end: segment.line_end as usize,
-        segment_id: Some(segment.id),
         breadcrumb: segment.breadcrumb,
-        complexity: Some(segment.complexity as u32),
-        role,
         defined_symbols,
-        referenced_symbols,
-        called_symbols,
     }
 }
 
@@ -259,7 +252,7 @@ mod tests {
             updated_at: "2026-04-13T00:00:00Z".to_string(),
         });
 
-        assert_eq!(result.segment_id.as_deref(), Some("seg-123"));
+        assert_eq!(result.segment_id, "seg-123");
     }
 
     #[tokio::test]

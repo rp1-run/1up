@@ -8,7 +8,7 @@ Deterministic quality harnesses for 1up search. The recall harness is the REQ-00
 **Corpus**: [`suites/1up-search/recall-corpus.jsonl`](suites/1up-search/recall-corpus.jsonl)
 **Baseline**: [`suites/1up-search/recall-baseline.json`](suites/1up-search/recall-baseline.json)
 
-The harness reads a JSONL corpus of `{ query, expected_segment_ids, expected_files? }` rows, runs `1up search --format json -n 20 --path <repo> <q>` once per query against the 1up repo itself, slices top-10 and top-20 `segment_id` lists, and computes:
+The harness reads a JSONL corpus of `{ query, expected_segment_ids, expected_files? }` rows, runs `1up search -n 20 --path <repo> <q>` once per query against the 1up repo itself, parses the lean row grammar (`<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`) to recover top-10 and top-20 `segment_id` lists, and computes:
 
 ```
 recall@k = mean_over_scored_queries(|retrieved_top_k ∩ gold| / |gold|)

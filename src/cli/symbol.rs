@@ -1,11 +1,12 @@
+use std::io::{self, Write};
+
 use clap::Args;
 
-use crate::cli::output::formatter_for;
+use crate::cli::lean;
 use crate::daemon::lifecycle;
 use crate::search::SymbolSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -27,11 +28,10 @@ pub struct SymbolArgs {
     pub path: String,
 }
 
-pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let db_path = project_db_path(&project_root);
-    let fmt = formatter_for(format);
 
     if let Ok(pid) = project::read_project_id(&project_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
@@ -61,6 +61,8 @@ pub async fn exec(args: SymbolArgs, format: OutputFormat) -> anyhow::Result<()> 
         eprintln!("No exact match found. Use --fuzzy for approximate matching.");
     }
 
-    println!("{}", fmt.format_symbol_results(&results));
+    let mut stdout = io::stdout().lock();
+    lean::render_symbol(&mut stdout, &results)?;
+    stdout.flush()?;
     Ok(())
 }

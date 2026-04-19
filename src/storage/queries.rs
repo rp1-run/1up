@@ -413,6 +413,18 @@ SELECT id, file_path, language, block_type, content,
 FROM segments
 WHERE id = ?1";
 
+/// Resolve a segment handle by prefix. LIMIT 5 keeps disambiguation hints bounded
+/// while still detecting collisions beyond the first two matches.
+pub const SELECT_SEGMENTS_BY_PREFIX: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE id LIKE ?1 || '%'
+ORDER BY id
+LIMIT 5";
+
 pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";

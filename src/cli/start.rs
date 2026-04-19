@@ -29,6 +29,10 @@ pub struct StartArgs {
     /// ONNX intra-op threads; overrides ONEUP_EMBED_THREADS
     #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
     pub embed_threads: Option<usize>,
+
+    /// Output format override (defaults to human)
+    #[arg(long, short = 'f')]
+    pub format: Option<OutputFormat>,
 }
 
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {

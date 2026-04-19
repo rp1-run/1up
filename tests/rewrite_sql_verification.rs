@@ -115,23 +115,49 @@ fn index_fts_only(dir: &Path) -> HideModelGuard {
     let guard = HideModelGuard::new();
 
     cmd()
-        .args(["--format", "json", "index", dir.to_str().unwrap()])
+        .args(["index", dir.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
     guard
 }
 
-fn search_json(dir: &Path, query: &str) -> (Vec<serde_json::Value>, String) {
+/// A lean search row: `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`.
+///
+/// Only the file_path is surfaced here since the rewrite-SQL verification
+/// suite asserts which files appear in the ranked results, not the full row
+/// shape (grammar conformance is already covered by integration_tests.rs).
+#[derive(Debug, Clone)]
+struct LeanSearchRow {
+    file_path: String,
+}
+
+fn parse_lean_rows(stdout: &str) -> Vec<LeanSearchRow> {
+    stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let parts: Vec<&str> = l.split("  ").collect();
+            assert!(
+                parts.len() >= 5,
+                "expected >=5 double-space fields in lean row, got {}: {:?}",
+                parts.len(),
+                l
+            );
+            let path_and_lines = parts[1];
+            let (file_path, _) = path_and_lines
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("expected <path>:<l1>-<l2>, got {path_and_lines:?}"));
+            LeanSearchRow {
+                file_path: file_path.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn search_lean(dir: &Path, query: &str) -> (Vec<LeanSearchRow>, String) {
     let output = cmd()
-        .args([
-            "--format",
-            "json",
-            "search",
-            query,
-            "--path",
-            dir.to_str().unwrap(),
-        ])
+        .args(["search", query, "--path", dir.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -142,9 +168,9 @@ fn search_json(dir: &Path, query: &str) -> (Vec<serde_json::Value>, String) {
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let results = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = parse_lean_rows(&stdout);
 
-    (results, String::from_utf8(output.stderr).unwrap())
+    (rows, String::from_utf8(output.stderr).unwrap())
 }
 
 fn create_stale_v4_index(dir: &Path) {
@@ -176,8 +202,6 @@ fn stale_schema_search_requires_explicit_reindex_guidance() {
 
     cmd()
         .args([
-            "--format",
-            "json",
             "search",
             "config loading",
             "--path",
@@ -201,8 +225,6 @@ fn partial_current_index_search_requires_explicit_reindex_guidance() {
 
     cmd()
         .args([
-            "--format",
-            "json",
             "search",
             "config loading",
             "--path",
@@ -222,9 +244,9 @@ fn degraded_search_warns_and_returns_results() {
     let tmp = create_search_fixture();
     let _guard = index_fts_only(tmp.path());
 
-    let (results, stderr) = search_json(tmp.path(), "config loading host port");
+    let (rows, stderr) = search_lean(tmp.path(), "config loading host port");
 
-    assert!(!results.is_empty());
+    assert!(!rows.is_empty());
     assert!(stderr.contains("degraded to FTS-only mode"));
 }
 
@@ -233,10 +255,8 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     let tmp = create_search_fixture();
     let _guard = index_fts_only(tmp.path());
 
-    let (initial_results, _) = search_json(tmp.path(), "greetingmarker");
-    assert!(initial_results
-        .iter()
-        .any(|result| result["file_path"] == "main.rs"));
+    let (initial_rows, _) = search_lean(tmp.path(), "greetingmarker");
+    assert!(initial_rows.iter().any(|r| r.file_path == "main.rs"));
 
     fs::write(
         tmp.path().join("auth.rs"),
@@ -248,14 +268,12 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
-    let (added_results, _) = search_json(tmp.path(), "tokenvalidationmarker");
-    assert!(added_results
-        .iter()
-        .any(|result| result["file_path"] == "auth.rs"));
+    let (added_rows, _) = search_lean(tmp.path(), "tokenvalidationmarker");
+    assert!(added_rows.iter().any(|r| r.file_path == "auth.rs"));
 
     fs::write(
         tmp.path().join("main.rs"),
@@ -267,27 +285,25 @@ fn rebuilt_current_index_keeps_add_edit_delete_search_freshness() {
     .unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
-    let (stale_results, _) = search_json(tmp.path(), "greetingmarker");
-    assert!(stale_results.is_empty());
+    let (stale_rows, _) = search_lean(tmp.path(), "greetingmarker");
+    assert!(stale_rows.is_empty());
 
-    let (updated_results, _) = search_json(tmp.path(), "welcomemarker");
-    assert!(updated_results
-        .iter()
-        .any(|result| result["file_path"] == "main.rs"));
+    let (updated_rows, _) = search_lean(tmp.path(), "welcomemarker");
+    assert!(updated_rows.iter().any(|r| r.file_path == "main.rs"));
 
     fs::remove_file(tmp.path().join("auth.rs")).unwrap();
 
     cmd()
-        .args(["--format", "json", "index", tmp.path().to_str().unwrap()])
+        .args(["index", tmp.path().to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
-    let (deleted_results, _) = search_json(tmp.path(), "tokenvalidationmarker");
-    assert!(deleted_results.is_empty());
+    let (deleted_rows, _) = search_lean(tmp.path(), "tokenvalidationmarker");
+    assert!(deleted_rows.is_empty());
 }
 
 #[test]
@@ -297,8 +313,8 @@ fn index_and_search_leave_source_files_unchanged() {
     let before_config = fs::read_to_string(tmp.path().join("config.rs")).unwrap();
     let _guard = index_fts_only(tmp.path());
 
-    let (results, _) = search_json(tmp.path(), "config loading host port");
-    assert!(!results.is_empty());
+    let (rows, _) = search_lean(tmp.path(), "config loading host port");
+    assert!(!rows.is_empty());
 
     assert_eq!(
         fs::read_to_string(tmp.path().join("main.rs")).unwrap(),

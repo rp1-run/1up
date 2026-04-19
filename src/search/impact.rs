@@ -19,7 +19,8 @@ use crate::storage::relations::{
     get_inbound_relations_by_lookup_symbol, get_outbound_relations, RelationKind, StoredRelation,
 };
 use crate::storage::segments::{
-    get_segment_by_id, get_segments_by_file, get_test_file_paths, StoredSegment,
+    get_segment_by_id, get_segment_by_prefix, get_segments_by_file, get_test_file_paths,
+    SegmentPrefixLookup, StoredSegment,
 };
 
 const DEFAULT_IMPACT_DEPTH: usize = 2;
@@ -440,24 +441,52 @@ impl<'a> ImpactHorizonEngine<'a> {
         id: &str,
         explicit_scope: Option<String>,
     ) -> Result<ResolveOutcome, OneupError> {
-        let Some(segment) = get_segment_by_id(self.conn, id).await? else {
-            return Ok(ResolveOutcome::Refused(refused_result(
-                "anchor_not_found",
-                format!("Segment `{id}` is not present in the current index."),
-                impact_hint(
-                    "refresh_anchor",
-                    "Choose a segment id from the current index and retry.",
-                    explicit_scope,
-                    None,
-                ),
-            )));
+        let segment = match get_segment_by_prefix(self.conn, id).await? {
+            SegmentPrefixLookup::Found(segment) => *segment,
+            SegmentPrefixLookup::NotFound => {
+                return Ok(ResolveOutcome::Refused(refused_result(
+                    "anchor_not_found",
+                    format!("Segment `{id}` is not present in the current index."),
+                    impact_hint(
+                        "refresh_anchor",
+                        "Choose a segment id from the current index and retry.",
+                        explicit_scope,
+                        None,
+                    ),
+                )));
+            }
+            SegmentPrefixLookup::Ambiguous(matches) => {
+                let preview = matches
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(ResolveOutcome::Refused(refused_result(
+                    "anchor_ambiguous",
+                    format!(
+                        "Segment prefix `{id}` matches {} segments ({preview}). Pass a longer prefix or the full id.",
+                        matches.len()
+                    ),
+                    impact_hint(
+                        "disambiguate_anchor",
+                        "Run `1up get <prefix>` to list candidates and retry with a longer prefix.",
+                        explicit_scope,
+                        None,
+                    ),
+                )));
+            }
         };
 
+        let resolved_id = segment.id.clone();
         let seed = candidate_from_stored_segment(segment);
         if let Some(scope) = explicit_scope.as_deref() {
-            if let Some(refusal) =
-                out_of_scope_anchor_refusal("segment", id, scope, std::slice::from_ref(&seed))
-            {
+            if let Some(refusal) = out_of_scope_anchor_refusal(
+                "segment",
+                &resolved_id,
+                scope,
+                std::slice::from_ref(&seed),
+            ) {
                 return Ok(ResolveOutcome::Refused(refusal));
             }
         }
@@ -465,7 +494,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
                 "segment",
-                id.to_string(),
+                resolved_id,
                 None,
                 explicit_scope.clone(),
                 std::slice::from_ref(&seed),

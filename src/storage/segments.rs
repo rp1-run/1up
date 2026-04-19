@@ -199,6 +199,59 @@ pub async fn get_segment_by_id(
     }
 }
 
+/// Outcome of a prefix-based segment lookup.
+///
+/// `get` accepts both full 16-char segment ids and the 12-char display handle emitted
+/// by the lean row grammar. Using `LIKE ?||'%'` handles both shapes uniformly; the
+/// caller distinguishes unique matches from ambiguous prefixes via this enum.
+#[derive(Debug, Clone)]
+pub enum SegmentPrefixLookup {
+    /// Exactly one segment matched the prefix. Boxed so the enum stays small; the
+    /// inner `StoredSegment` carries the full content body.
+    Found(Box<StoredSegment>),
+    /// No segment matched the prefix.
+    NotFound,
+    /// More than one segment matched; the vector carries the matching ids (bounded
+    /// to the query's LIMIT) so callers can surface a disambiguation hint.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a segment handle by prefix. A full-length id resolves to exactly one row
+/// via the same `LIKE ?||'%'` path that also handles the 12-char display handle.
+#[allow(dead_code)]
+pub async fn get_segment_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<SegmentPrefixLookup, OneupError> {
+    if prefix.is_empty() {
+        return Ok(SegmentPrefixLookup::NotFound);
+    }
+
+    let mut rows = conn
+        .query(queries::SELECT_SEGMENTS_BY_PREFIX, [prefix])
+        .await
+        .map_err(|e| StorageError::Query(format!("query segment by prefix failed: {e}")))?;
+
+    let mut matches: Vec<StoredSegment> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        matches.push(row_to_stored_segment(&row)?);
+    }
+
+    match matches.len() {
+        0 => Ok(SegmentPrefixLookup::NotFound),
+        1 => Ok(SegmentPrefixLookup::Found(Box::new(
+            matches.into_iter().next().unwrap(),
+        ))),
+        _ => Ok(SegmentPrefixLookup::Ambiguous(
+            matches.into_iter().map(|seg| seg.id).collect(),
+        )),
+    }
+}
+
 /// Get the stored file hash for every indexed file path.
 #[allow(dead_code)]
 pub async fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>, OneupError> {
@@ -1156,6 +1209,75 @@ mod tests {
 
         let missing = get_segment_by_id(&conn, "nonexistent").await.unwrap();
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_accepts_prefix_or_full_id() {
+        let (_db, conn) = setup().await;
+
+        upsert_segment(
+            &conn,
+            &test_segment("a0f1e2c3d4b5f6a7", "src/lib.rs", "hash1"),
+        )
+        .await
+        .unwrap();
+        upsert_segment(
+            &conn,
+            &test_segment("b7c2a4e5d6f812ab", "src/main.rs", "hash2"),
+        )
+        .await
+        .unwrap();
+
+        // 12-char display handle resolves unambiguously.
+        match get_segment_by_prefix(&conn, "a0f1e2c3d4b5").await.unwrap() {
+            SegmentPrefixLookup::Found(seg) => {
+                assert_eq!(seg.id, "a0f1e2c3d4b5f6a7");
+                assert_eq!(seg.file_path, "src/lib.rs");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+
+        // Full-length id also resolves through the same path.
+        match get_segment_by_prefix(&conn, "b7c2a4e5d6f812ab")
+            .await
+            .unwrap()
+        {
+            SegmentPrefixLookup::Found(seg) => assert_eq!(seg.id, "b7c2a4e5d6f812ab"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+
+        // Unknown prefix surfaces NotFound.
+        match get_segment_by_prefix(&conn, "deadbeef").await.unwrap() {
+            SegmentPrefixLookup::NotFound => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // Empty input is treated as NotFound instead of matching everything.
+        match get_segment_by_prefix(&conn, "").await.unwrap() {
+            SegmentPrefixLookup::NotFound => {}
+            other => panic!("expected NotFound for empty prefix, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_disambiguates_on_prefix_collision() {
+        let (_db, conn) = setup().await;
+
+        upsert_segment(&conn, &test_segment("abc111000000aaaa", "src/a.rs", "h1"))
+            .await
+            .unwrap();
+        upsert_segment(&conn, &test_segment("abc222000000bbbb", "src/b.rs", "h2"))
+            .await
+            .unwrap();
+
+        match get_segment_by_prefix(&conn, "abc").await.unwrap() {
+            SegmentPrefixLookup::Ambiguous(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&"abc111000000aaaa".to_string()));
+                assert!(ids.contains(&"abc222000000bbbb".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
     }
 
     #[tokio::test]

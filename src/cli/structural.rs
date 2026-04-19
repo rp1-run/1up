@@ -1,11 +1,12 @@
+use std::io::{self, Write};
+
 use clap::Args;
 
-use crate::cli::output::formatter_for;
+use crate::cli::lean;
 use crate::daemon::lifecycle;
 use crate::search::StructuralSearchEngine;
 use crate::shared::config::project_db_path;
 use crate::shared::project;
-use crate::shared::types::OutputFormat;
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -23,12 +24,11 @@ pub struct StructuralArgs {
     pub path: String,
 }
 
-pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<()> {
+pub async fn exec(args: StructuralArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let state_root = &resolved.state_root;
     let source_root = &resolved.source_root;
     let db_path = project_db_path(state_root);
-    let fmt = formatter_for(format);
 
     if let Ok(pid) = project::read_project_id(state_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, state_root) {
@@ -38,23 +38,25 @@ pub async fn exec(args: StructuralArgs, format: OutputFormat) -> anyhow::Result<
 
     let lang_filter = args.language.as_deref();
 
-    if db_path.exists() {
+    let results = if db_path.exists() {
         let db = Db::open_ro(&db_path).await?;
         let conn = db.connect()?;
         schema::ensure_current(&conn).await?;
 
         let engine = StructuralSearchEngine::new(source_root, Some(&conn));
-        let results = engine.search(&args.pattern, lang_filter).await?;
-        println!("{}", fmt.format_structural_results(&results));
+        engine.search(&args.pattern, lang_filter).await?
     } else {
         eprintln!(
             "warning: no index found at {}. Scanning files directly.",
             db_path.display()
         );
         let engine = StructuralSearchEngine::new(source_root, None);
-        let results = engine.search(&args.pattern, lang_filter).await?;
-        println!("{}", fmt.format_structural_results(&results));
-    }
+        engine.search(&args.pattern, lang_filter).await?
+    };
+
+    let mut stdout = io::stdout().lock();
+    lean::render_structural(&mut stdout, &results)?;
+    stdout.flush()?;
 
     Ok(())
 }

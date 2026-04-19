@@ -19,6 +19,7 @@ pub struct SymbolSearchEngine<'a> {
 struct SymbolMatch {
     segment_id: String,
     result: SymbolResult,
+    candidate: CandidateRow,
 }
 
 impl<'a> SymbolSearchEngine<'a> {
@@ -164,9 +165,24 @@ impl<'a> SymbolSearchEngine<'a> {
             let matched_name: String = row
                 .get(16)
                 .map_err(|e| SearchError::QueryFailed(format!("read symbol row failed: {e}")))?;
+            let candidate = CandidateRow {
+                segment_id: seg.id.clone(),
+                file_path: seg.file_path.clone(),
+                language: seg.language.clone(),
+                block_type: seg.block_type.clone(),
+                line_number: seg.line_start as usize,
+                line_end: seg.line_end as usize,
+                breadcrumb: seg.breadcrumb.clone(),
+                complexity: Some(seg.complexity as u32),
+                role: Some(seg.parsed_role()),
+                defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
+                referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
+                called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
+            };
             results.push(SymbolMatch {
                 segment_id: seg.id.clone(),
                 result: SymbolResult {
+                    segment_id: seg.id.clone(),
                     name: matched_name,
                     kind: seg.block_type.clone(),
                     file_path: seg.file_path.clone(),
@@ -176,12 +192,8 @@ impl<'a> SymbolSearchEngine<'a> {
                     content: seg.content.clone(),
                     reference_kind,
                     breadcrumb: seg.breadcrumb.clone(),
-                    complexity: Some(seg.complexity as u32),
-                    role: Some(seg.parsed_role()),
-                    defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
-                    referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
-                    called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
                 },
+                candidate,
             });
         }
 
@@ -333,20 +345,7 @@ fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
 }
 
 fn candidate_from_symbol_match(symbol_match: SymbolMatch) -> CandidateRow {
-    CandidateRow {
-        segment_id: symbol_match.segment_id,
-        file_path: symbol_match.result.file_path,
-        language: symbol_match.result.language,
-        block_type: symbol_match.result.kind,
-        line_number: symbol_match.result.line_start,
-        line_end: symbol_match.result.line_end,
-        breadcrumb: symbol_match.result.breadcrumb,
-        complexity: symbol_match.result.complexity,
-        role: symbol_match.result.role,
-        defined_symbols: symbol_match.result.defined_symbols,
-        referenced_symbols: symbol_match.result.referenced_symbols,
-        called_symbols: symbol_match.result.called_symbols,
-    }
+    symbol_match.candidate
 }
 
 fn max_edit_distance(query: &str) -> usize {

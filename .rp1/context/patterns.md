@@ -42,12 +42,14 @@
 
 ## Output Contracts
 
-- Search-like commands default to `plain`; lifecycle commands default to `human`.
-- Human output stays concise and selective.
-- Plain and JSON modes keep stable exact identifiers for automation.
-- Human impact output is more explanatory because the user already opted into a deeper follow-up workflow.
+- **One shape per core command**: `search`, `get`, `symbol`, `impact`, `context`, and `structural` emit a single lean line-oriented rendering. They do not accept `--format`, `-f`, `--full`, `--brief`, `--human`, or `--verbose-fields`; clap rejects those flags at parse time because they are declared only on maintenance command args.
+- **Unified row grammar**: discovery rows follow `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]` with two ASCII spaces between fields, a 12-char hex segment handle, and an optional trailing `~P`/`~C` channel tag reserved for `impact`. `context` and `structural` drop `<score>` and `:<segment_id>` because they are read-after-pick, not discovery.
+- **Integer score**: `SearchResult.score` is a `u32` in 0-100, produced by `normalize_score(rrf)` and monotonic with the RRF ranking.
+- **Maintenance commands keep the trio**: `start`, `stop`, `status`, `init`, `index`, `reindex`, and `update` still dispatch through `HumanFormatter`, `PlainFormatter`, and `JsonFormatter` and still accept `--format`/`-f` via their own `Args` struct.
+- Plain and JSON modes on maintenance commands keep stable exact identifiers for automation.
+- Human impact output (on the lean renderer) is still more explanatory because the user opted into deeper follow-up work.
 - Additive fields such as `segment_id` and `daemon_version` extend machine-readable contracts without breaking older consumers.
-- Timing, scope, and prefilter telemetry fields are optional additions on `IndexProgress` rendered by all three formatters (human, plain, JSON) without altering existing field names or envelope shapes.
+- Timing, scope, and prefilter telemetry fields are optional additions on `IndexProgress` rendered by all three maintenance formatters (human, plain, JSON) without altering existing field names or envelope shapes.
 
 ## Storage And I/O
 
