@@ -61,7 +61,6 @@ pub fn render_symbol<W: Write>(sink: &mut W, results: &[SymbolResult]) -> anyhow
     for r in results {
         let ref_kind_tag = reference_kind_tag(&r.reference_kind);
         let composite = format!("{ref_kind_tag}:{}", r.kind);
-        let segment_id = symbol_segment_id(r);
         write_discovery_row(
             sink,
             0,
@@ -71,7 +70,7 @@ pub fn render_symbol<W: Write>(sink: &mut W, results: &[SymbolResult]) -> anyhow
             &composite,
             r.breadcrumb.as_deref(),
             Some(r.name.as_str()),
-            &segment_id,
+            &r.segment_id,
             None,
         )?;
     }
@@ -315,13 +314,6 @@ fn defined_symbol(defined: Option<&[String]>) -> Option<&str> {
     defined.and_then(|syms| syms.first().map(String::as_str))
 }
 
-fn symbol_segment_id(result: &SymbolResult) -> String {
-    format!(
-        "{}:{}:{}",
-        result.file_path, result.line_start, result.line_end
-    )
-}
-
 fn reference_kind_tag(kind: &crate::shared::types::ReferenceKind) -> &'static str {
     match kind {
         crate::shared::types::ReferenceKind::Definition => "def",
@@ -413,6 +405,7 @@ mod tests {
     #[test]
     fn symbol_row_uses_reference_kind_prefix() {
         let sym = SymbolResult {
+            segment_id: "abcdef0123456789".to_string(),
             name: "Config".to_string(),
             kind: "struct".to_string(),
             file_path: "src/config.rs".to_string(),
@@ -426,6 +419,10 @@ mod tests {
         let out = capture(|sink| render_symbol(sink, &[sym]));
         assert!(out.contains("  def:struct  "), "got: {out}");
         assert!(out.contains("mod config::Config"), "got: {out}");
+        assert!(
+            out.contains(":abcdef012345"),
+            "row must carry real 12-char segment handle, got: {out}"
+        );
     }
 
     #[test]
@@ -555,6 +552,7 @@ mod tests {
         let search_out = capture(|sink| render_search(sink, &[sample_search_result()]));
 
         let sym = SymbolResult {
+            segment_id: "abcdef0123456789".to_string(),
             name: "Config".to_string(),
             kind: "struct".to_string(),
             file_path: "src/config.rs".to_string(),

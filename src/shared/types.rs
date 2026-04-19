@@ -113,6 +113,7 @@ impl std::fmt::Display for ReferenceKind {
 /// hydrate a full segment can still reuse the body without re-querying.
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolResult {
+    pub segment_id: String,
     pub name: String,
     pub kind: String,
     pub file_path: String,

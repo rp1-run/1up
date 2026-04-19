@@ -182,6 +182,7 @@ impl<'a> SymbolSearchEngine<'a> {
             results.push(SymbolMatch {
                 segment_id: seg.id.clone(),
                 result: SymbolResult {
+                    segment_id: seg.id.clone(),
                     name: matched_name,
                     kind: seg.block_type.clone(),
                     file_path: seg.file_path.clone(),

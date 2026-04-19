@@ -147,7 +147,29 @@ const RUST_DEFINITION_KEYWORDS = [
 ];
 
 function resolveBinary(): string {
-  return process.env.RECALL_ONEUP_BIN ?? process.env.ONEUP_BENCH_BIN ?? "1up";
+  // Resolve env-provided paths against CWD so a `cd evals && ONEUP_BENCH_BIN=../target/debug/1up`
+  // invocation does what the caller expects; absolute paths pass through
+  // unchanged. PATH-lookup fallback is intentionally disabled: the harness
+  // must run against a repo-local build so regressions in this tree cannot be
+  // masked by an older installed release.
+  const override = process.env.RECALL_ONEUP_BIN ?? process.env.ONEUP_BENCH_BIN;
+  if (override && override.length > 0) {
+    const resolved = resolve(process.cwd(), override);
+    if (!existsSync(resolved)) {
+      throw new Error(
+        `binary override resolved to ${resolved} (from ${override}), but file does not exist.`,
+      );
+    }
+    return resolved;
+  }
+  const repoRoot = resolve(__dirname, "..", "..", "..");
+  const repoLocal = join(repoRoot, "target", "debug", "1up");
+  if (!existsSync(repoLocal)) {
+    throw new Error(
+      `expected repo-local binary at ${repoLocal}; run \`cargo build --bin 1up\` or set RECALL_ONEUP_BIN/ONEUP_BENCH_BIN.`,
+    );
+  }
+  return repoLocal;
 }
 
 function resolveTargetRepo(): string {
@@ -492,10 +514,14 @@ function scoreSegmentIdRow(
   if (gold.length === 0) {
     return { matched_indices: [], hit_count: 0, recall: 0 };
   }
-  const retrievedSet = new Set(topKIds);
+  // Lean rows carry a 12-char display prefix; legacy corpus rows list the full
+  // 16-char segment id. Compare on a common prefix length so the fallback
+  // still produces a meaningful signal when anchors are absent.
+  const prefixLen = 12;
+  const retrievedSet = new Set(topKIds.map((id) => id.slice(0, prefixLen)));
   const matched: number[] = [];
   for (let i = 0; i < gold.length; i += 1) {
-    if (retrievedSet.has(gold[i])) {
+    if (retrievedSet.has(gold[i].slice(0, prefixLen))) {
       matched.push(i);
     }
   }

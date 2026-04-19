@@ -911,6 +911,56 @@ fn symbol_references_include_definitions_and_usages() {
 }
 
 #[test]
+fn symbol_handle_roundtrips_through_get_and_impact() {
+    // The advertised flow is `symbol -> get -> impact --from-segment`. The
+    // 12-char handle printed by `symbol` must resolve both through `get` (full
+    // segment body) and through `impact --from-segment` (anchor expansion).
+    let tmp = create_multi_lang_fixture();
+    init_and_index(&tmp);
+
+    let rows = symbol_rows(tmp.path(), "greet", &[]);
+    let row = rows
+        .iter()
+        .find(|r| r.kind.starts_with("def:"))
+        .expect("expected a definition row for `greet`");
+    let handle = row.segment_id.clone();
+    assert_eq!(
+        handle.len(),
+        12,
+        "symbol row must carry a 12-char lean handle, got {handle:?}"
+    );
+
+    let (get_out, get_err, get_ok) =
+        run_core_cmd(&["get", &handle, "--path", tmp.path().to_str().unwrap()]);
+    assert!(get_ok, "get failed: {get_err}");
+    assert!(
+        get_out.starts_with("segment "),
+        "get should resolve the handle and emit a segment record, got: {get_out}"
+    );
+    assert!(
+        !get_out.starts_with("not_found"),
+        "handle `{handle}` must not resolve to not_found: {get_out}"
+    );
+
+    let (impact_out, impact_err, impact_ok) = run_core_cmd(&[
+        "impact",
+        "--from-segment",
+        &handle,
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(impact_ok, "impact failed: {impact_err}");
+    assert!(
+        !impact_out.contains("anchor_not_found"),
+        "impact --from-segment must accept the 12-char handle; got: {impact_out}"
+    );
+    assert!(
+        !impact_out.contains("anchor_ambiguous"),
+        "impact --from-segment should uniquely resolve a 12-char handle for a definition; got: {impact_out}"
+    );
+}
+
+#[test]
 fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
     // Ranking stability: each acceptance query should keep the expected top
     // file across two consecutive runs (covers the "handoff does not perturb

@@ -46,7 +46,7 @@ that an rp1 skill addresses, briefly suggest it.
 - For deeper questions about rp1, suggest the user invoke /guide.
 <!-- rp1:end:v0.7.1 -->
 
-<!-- 1up:start:0.1.8 -->
+<!-- 1up:start:0.1.9 -->
 # 1up — Agent Quick Reference
 
 ## Tool Selection
@@ -93,7 +93,7 @@ Every discovery row matches:
 - `<path>:<l1>-<l2>`: file path plus 1-based inclusive line span
 - `<kind>`: segment block type (e.g. `FUNCTION`, `STRUCT`, `IMPL`)
 - `<breadcrumb>::<symbol>`: enclosing scope path, `::` separated
-- `:<segment_id>`: 12-char hex handle (feed to `1up get` or `1up impact --from-segment`)
+- `:<segment_id>`: 12-char hex handle; feed directly into `1up get` or `1up impact --from-segment` — both accept the prefix and disambiguate if it matches more than one segment
 - `~<channel>`: impact-only trailing tag, `~P` (primary) or `~C` (contextual)
 - Fields are separated by **two ASCII spaces**
 
@@ -115,4 +115,4 @@ Every discovery row matches:
 ## Search-then-Verify
 
 Semantic search ranks by relevance; may omit matches. Never conclude "only N callers" from search alone. Verify completeness w/ `1up symbol -r <name>` or `grep`.
-<!-- 1up:end:0.1.8 -->
+<!-- 1up:end:0.1.9 -->
