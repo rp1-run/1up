@@ -8,6 +8,15 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
+## [0.1.8](https://github.com/rp1-run/1up/compare/v0.1.7...v0.1.8) (2026-04-19)
+
+
+### Features
+
+* **cli:** lean, agent-first core command surface ([#32](https://github.com/rp1-run/1up/issues/32)) ([73cc9ae](https://github.com/rp1-run/1up/commit/73cc9ae10c4b78c36e2f2d8a8efc22abf38719cc))
+* query-specificity tool selection + exact symbol matching ([#29](https://github.com/rp1-run/1up/issues/29)) ([5575633](https://github.com/rp1-run/1up/commit/55756336c3f19dc9ef45ca540af73e52abe4cfc3))
+* shrink vector index 4x via FLOAT8 + tuned HNSW ([#31](https://github.com/rp1-run/1up/issues/31)) ([ea99983](https://github.com/rp1-run/1up/commit/ea999837f5c58c7038994ee48571d3ce493b26e5))
+
 ## [0.1.7](https://github.com/rp1-run/1up/compare/v0.1.6...v0.1.7) (2026-04-16)
 
 
