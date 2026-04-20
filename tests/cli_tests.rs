@@ -1,7 +1,9 @@
 use assert_cmd::Command;
+use oneup::shared::constants::SCHEMA_VERSION;
+use oneup::storage::{db::Db, queries, schema};
 use predicates::prelude::*;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -738,4 +740,238 @@ fn stop_is_a_safe_noop_on_non_unix_platforms() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no local daemon to stop"));
+}
+
+// ---------------------------------------------------------------------------
+// `1up start` UX guarantees introduced by the shell-install feature
+// (REQ-031 silent-pass on valid index, REQ-032 `1up status` hint on fresh
+// index, REQ-033 stale-schema warning + non-zero exit, BR-06 no in-place
+// migration). See features/update-script/design.md §3.2.
+// ---------------------------------------------------------------------------
+
+fn project_db_path(dir: &Path) -> PathBuf {
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .join(".1up")
+        .join("index.db")
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
+}
+
+/// Seed a project DB with a schema version older than the running binary.
+/// Matches `rewrite_sql_verification::create_stale_v4_index` so
+/// `schema::ensure_current` produces the same stable "out of date" error.
+fn create_stale_v4_index(dir: &Path) {
+    block_on(async {
+        let db = Db::open_rw(&project_db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(queries::UPSERT_META, ["schema_version", "4"])
+            .await
+            .unwrap();
+    });
+}
+
+/// Seed a project DB at the current schema version without running the
+/// indexer. Matches `prepare_for_write`'s fresh-database branch.
+fn create_current_index(dir: &Path) {
+    block_on(async {
+        let db = Db::open_rw(&project_db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn start_warns_on_stale_schema() {
+    // REQ-033 + BR-06: an existing index at a prior schema version must
+    // produce a warning that names `1up reindex`, exit non-zero, and leave
+    // the on-disk `.1up/index.db` byte-identical (no delete, no migrate).
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path()).unwrap();
+    create_stale_v4_index(dir.path());
+
+    let db_path = project_db_path(dir.path());
+    let bytes_before = fs::read(&db_path).unwrap();
+    let mtime_before = fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let output = cmd()
+        .args(["start", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "start should exit non-zero on stale schema; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("out of date"),
+        "expected stale-schema warning to mention 'out of date'; got: {combined}",
+    );
+    assert!(
+        combined.contains("1up reindex"),
+        "expected stale-schema warning to name `1up reindex`; got: {combined}",
+    );
+    assert!(
+        combined.contains(&format!("expected v{SCHEMA_VERSION}")),
+        "expected warning to name expected schema version v{SCHEMA_VERSION}; got: {combined}",
+    );
+
+    // BR-06: the on-disk index must be untouched. Content is the primary
+    // gate; mtime is asserted additively to catch silent re-writes.
+    let bytes_after = fs::read(&db_path).unwrap();
+    assert_eq!(
+        bytes_before, bytes_after,
+        "stale-schema warning path must not rewrite the index db"
+    );
+    assert_eq!(
+        mtime_before,
+        fs::metadata(&db_path).unwrap().modified().unwrap(),
+        "stale-schema warning path must not touch index db mtime"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn start_warns_on_stale_schema_json_envelope() {
+    // JSON formatter variant of REQ-033: the envelope literal is fixed by
+    // design §3.2 (`schema_out_of_date`, `found`, `expected`, `action`).
+    let dir = tempfile::tempdir().unwrap();
+    create_stale_v4_index(dir.path());
+
+    let output = cmd()
+        .args(["start", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let envelope_line = stdout
+        .lines()
+        .find(|l| l.contains("schema_out_of_date"))
+        .unwrap_or_else(|| panic!("expected schema_out_of_date line in stdout, got: {stdout}"));
+    let payload: serde_json::Value = serde_json::from_str(envelope_line).unwrap();
+    assert_eq!(payload["status"], "schema_out_of_date");
+    assert_eq!(payload["found"], 4);
+    assert_eq!(payload["expected"], SCHEMA_VERSION);
+    assert_eq!(payload["action"], "1up reindex");
+    assert!(payload["path"].as_str().unwrap().ends_with("index.db"));
+}
+
+#[cfg(unix)]
+#[test]
+fn start_prints_status_hint_on_fresh_index() {
+    // REQ-032: the post-index success message must point the user at
+    // `1up status`. Runs end-to-end against a one-file fixture so the
+    // success branch (cold start -> daemon spawn) actually fires.
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
+    let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+    fs::write(
+        canonical_dir.join("main.rs"),
+        "fn main() {\n    println!(\"status-hint\");\n}\n",
+    )
+    .unwrap();
+
+    let output = cmd()
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["start", canonical_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "start should succeed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("1up status"),
+        "expected status hint on fresh-index success message; got: {stdout}",
+    );
+
+    // Tidy up the daemon we spawned so we don't leak it across tests.
+    let pid_file = data_dir.join("daemon.pid");
+    if pid_file.exists() {
+        cmd()
+            .env("HOME", &canonical_home)
+            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+            .args(["stop", canonical_dir.to_str().unwrap(), "--format", "json"])
+            .assert()
+            .success();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn start_skips_init_on_existing_valid_index() {
+    // REQ-031: when a project already has a current-schema index, `start`
+    // must not mention the "Initialized project ..." prefix that the
+    // first-run init path emits. The check is content-only: we do not
+    // assert on daemon state because the pre-existing index means the
+    // happy path is the silent-registration branch.
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
+    let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+
+    // Pre-populate `.1up/` with a current-schema index + project_id so the
+    // "already initialized" branch is taken end-to-end.
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let output = cmd()
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["start", canonical_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "start should succeed on an existing valid index: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("Initialized project"),
+        "existing-index start must not mention init; got: {stdout}",
+    );
+
+    let pid_file = data_dir.join("daemon.pid");
+    if pid_file.exists() {
+        cmd()
+            .env("HOME", &canonical_home)
+            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+            .args(["stop", canonical_dir.to_str().unwrap(), "--format", "json"])
+            .assert()
+            .success();
+    }
 }
