@@ -16,6 +16,26 @@ use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
+/// Classification of an existing project's on-disk index state.
+///
+/// Produced by [`classify_project_index`] and consumed by `1up start` to
+/// decide whether to (a) proceed with indexing, (b) warn the user that the
+/// schema is stale and point at `1up reindex` (REQ-033, BR-06), or
+/// (c) warn that the index is unreadable and needs a reindex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectIndexState {
+    /// `.1up/index.db` does not exist yet. Indexing will create it.
+    NotCreated,
+    /// Schema matches the current `SCHEMA_VERSION`.
+    Current,
+    /// An older schema version is on disk.
+    OutOfDate { found: u32, expected: u32 },
+    /// The database file exists but its schema could not be determined
+    /// (missing schema metadata, corrupt file, newer-than-supported
+    /// version, or equivalent).
+    UnknownUnreadable,
+}
+
 #[derive(Args)]
 pub struct StartArgs {
     /// Project root directory (defaults to current directory)
@@ -76,7 +96,29 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     } else {
         String::new()
     };
-    let index_ready = project_has_usable_index(&project_root).await?;
+
+    // Classify the on-disk index before deciding the indexing branch. This
+    // gives stale-schema users a concrete `1up reindex` message (REQ-033)
+    // instead of an opaque migration error bubbling up from the indexer.
+    let index_state = classify_project_index(&project_root).await?;
+    match index_state {
+        ProjectIndexState::OutOfDate { found, expected } => {
+            emit_stale_schema_warning(&project_root, &*fmt, format, Some((found, expected)));
+            return Err(anyhow::anyhow!(
+                "index schema at {} is out of date (found v{found}, expected v{expected}); run `1up reindex`",
+                config::project_db_path(&project_root).display()
+            ));
+        }
+        ProjectIndexState::UnknownUnreadable => {
+            emit_stale_schema_warning(&project_root, &*fmt, format, None);
+            return Err(anyhow::anyhow!(
+                "index at {} is unreadable; run `1up reindex`",
+                config::project_db_path(&project_root).display()
+            ));
+        }
+        ProjectIndexState::Current | ProjectIndexState::NotCreated => {}
+    }
+    let index_ready = matches!(index_state, ProjectIndexState::Current);
 
     if let Some(pid) = lifecycle::is_daemon_running()? {
         if index_ready {
@@ -109,7 +151,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         registry.register(&project_id, &project_root, Some(indexing_config))?;
         lifecycle::send_sighup(pid)?;
         let msg = format!(
-            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload. Run: 1up status to watch progress.",
             stats.files_indexed, stats.segments_stored,
         );
         println!("{}", fmt.format_index_summary(&msg, &stats.progress));
@@ -124,7 +166,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     if let Some(pid) = lifecycle::is_daemon_running()? {
         lifecycle::send_sighup(pid)?;
         let msg = format!(
-            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload.",
+            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload. Run: 1up status to watch progress.",
             stats.files_indexed, stats.segments_stored,
         );
         println!("{}", fmt.format_index_summary(&msg, &stats.progress));
@@ -135,29 +177,121 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let pid = lifecycle::spawn_daemon(&binary)?;
 
     let msg = format!(
-        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}).",
+        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}). Run: 1up status to watch progress.",
         stats.files_indexed, stats.segments_stored,
     );
     println!("{}", fmt.format_index_summary(&msg, &stats.progress));
     Ok(())
 }
 
-async fn project_has_usable_index(project_root: &Path) -> anyhow::Result<bool> {
+/// Classify the state of a project's on-disk index without mutating it.
+///
+/// Opens the project DB read-only and asks `schema::ensure_current` whether
+/// the schema matches the running binary. The existing error substrings
+/// (`"out of date"`, `"is missing"`, etc.) are stable contracts from
+/// `schema.rs` and are matched here so the caller can pivot to a concrete
+/// user-facing recovery message instead of forwarding a raw migration error.
+async fn classify_project_index(project_root: &Path) -> anyhow::Result<ProjectIndexState> {
     let db_path = config::project_db_path(project_root);
     if !db_path.exists() {
-        return Ok(false);
+        return Ok(ProjectIndexState::NotCreated);
     }
 
     let db = match Db::open_ro(&db_path).await {
         Ok(db) => db,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(ProjectIndexState::UnknownUnreadable),
     };
     let conn = match db.connect() {
         Ok(conn) => conn,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(ProjectIndexState::UnknownUnreadable),
     };
 
-    Ok(schema::ensure_current(&conn).await.is_ok())
+    match schema::ensure_current(&conn).await {
+        Ok(()) => Ok(ProjectIndexState::Current),
+        Err(err) => Ok(classify_schema_error(&err.to_string())),
+    }
+}
+
+/// Map a `schema::ensure_current` error message to the index state it
+/// represents. `schema.rs` emits stable substrings for the shapes we care
+/// about; anything else is treated as unreadable so the user still gets a
+/// `1up reindex` recovery message instead of a raw error.
+fn classify_schema_error(message: &str) -> ProjectIndexState {
+    if message.contains("index is missing") {
+        return ProjectIndexState::NotCreated;
+    }
+    if message.contains("out of date") {
+        if let Some((found, expected)) = parse_schema_versions(message) {
+            return ProjectIndexState::OutOfDate { found, expected };
+        }
+        return ProjectIndexState::OutOfDate {
+            found: 0,
+            expected: constants::SCHEMA_VERSION,
+        };
+    }
+    ProjectIndexState::UnknownUnreadable
+}
+
+/// Extract the `(found, expected)` schema versions from an
+/// `ensure_current` error message of the form
+/// `"... (found v<N>, expected v<M>) ..."`.
+fn parse_schema_versions(message: &str) -> Option<(u32, u32)> {
+    let found_idx = message.find("found v")? + "found v".len();
+    let found_rest = &message[found_idx..];
+    let found_end = found_rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(found_rest.len());
+    let found: u32 = found_rest[..found_end].parse().ok()?;
+
+    let expected_idx = message.find("expected v")? + "expected v".len();
+    let expected_rest = &message[expected_idx..];
+    let expected_end = expected_rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(expected_rest.len());
+    let expected: u32 = expected_rest[..expected_end].parse().ok()?;
+
+    Some((found, expected))
+}
+
+/// Emit the user-facing stale-schema warning to stdout in the current
+/// output format. Non-JSON formatters print the free-form warning through
+/// `format_message` (REQ-033 D3); JSON emits the machine-readable
+/// `schema_out_of_date` object called out in design §3.2.
+fn emit_stale_schema_warning(
+    project_root: &Path,
+    fmt: &dyn Formatter,
+    format: OutputFormat,
+    versions: Option<(u32, u32)>,
+) {
+    let db_path = config::project_db_path(project_root);
+    let expected = versions
+        .map(|(_, e)| e)
+        .unwrap_or(constants::SCHEMA_VERSION);
+    let found = versions.map(|(f, _)| f).unwrap_or(0);
+
+    if matches!(format, OutputFormat::Json) {
+        let payload = serde_json::json!({
+            "status": "schema_out_of_date",
+            "found": found,
+            "expected": expected,
+            "action": "1up reindex",
+            "path": db_path.display().to_string(),
+        });
+        println!("{payload}");
+        return;
+    }
+
+    let msg = match versions {
+        Some((found, expected)) => format!(
+            "warning: index schema at {} is out of date (found v{found}, expected v{expected}).\nRun: 1up reindex",
+            db_path.display()
+        ),
+        None => format!(
+            "warning: index at {} is unreadable and needs a rebuild.\nRun: 1up reindex",
+            db_path.display()
+        ),
+    };
+    println!("{}", fmt.format_message(&msg));
 }
 
 async fn run_initial_index(
@@ -258,5 +392,55 @@ fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_schema_error_maps_out_of_date_with_versions() {
+        // Matches the substring shape `schema::ensure_current` emits for
+        // `Some(v) if v < SCHEMA_VERSION`.
+        let msg = "schema migration failed: index schema is out of date (found v4, expected v12); run `1up reindex`";
+        assert_eq!(
+            classify_schema_error(msg),
+            ProjectIndexState::OutOfDate {
+                found: 4,
+                expected: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_schema_error_maps_missing_index_to_not_created() {
+        // Matches the `None` branch of `ensure_current` when no user tables exist.
+        let msg = "schema migration failed: index is missing; run `1up reindex`";
+        assert_eq!(classify_schema_error(msg), ProjectIndexState::NotCreated);
+    }
+
+    #[test]
+    fn classify_schema_error_falls_back_to_unknown_unreadable() {
+        // Newer-than-supported schema version is neither stale nor missing; we
+        // still want the user pointed at `1up reindex` rather than a raw error.
+        let msg = "schema migration failed: index schema v99 is newer than this binary supports";
+        assert_eq!(
+            classify_schema_error(msg),
+            ProjectIndexState::UnknownUnreadable
+        );
+    }
+
+    #[test]
+    fn parse_schema_versions_reads_surrounding_parentheses() {
+        assert_eq!(
+            parse_schema_versions("... (found v4, expected v12) ..."),
+            Some((4, 12))
+        );
+    }
+
+    #[test]
+    fn parse_schema_versions_returns_none_without_markers() {
+        assert_eq!(parse_schema_versions("nothing to parse here"), None);
     }
 }
