@@ -23,13 +23,21 @@
 
 ## Install
 
-Public installs are intended to come from tagged GitHub releases and first-party package definitions. The distributed executable is always named `1up`.
+Install `1up` on macOS or Linux with one command:
 
-| Channel | Platforms | Command |
-|---|---|---|
-| Homebrew | macOS arm64, Linux | `brew install rp1-run/tap/1up` |
-| Scoop | Windows | `scoop install https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json` |
-| Direct release asset | macOS arm64, Linux arm64, Linux amd64, Windows amd64 | Download the matching archive from [GitHub Releases](https://github.com/rp1-run/1up/releases) |
+```sh
+curl -fsSL https://1up.rp1.run/setup.sh | bash
+1up start
+```
+
+The script detects your platform, downloads the matching release archive from GitHub, verifies its SHA256 checksum when available, installs the binary into `~/.1up/bin`, and ensures that directory is on your `PATH`. No sudo required.
+
+Pin a specific version or override the install directory with environment variables:
+
+```sh
+1UP_VERSION=v0.1.7 curl -fsSL https://1up.rp1.run/setup.sh | bash
+1UP_INSTALL_DIR=/opt/1up/bin curl -fsSL https://1up.rp1.run/setup.sh | bash
+```
 
 Verify the install:
 
@@ -38,7 +46,7 @@ Verify the install:
 1up --help
 ```
 
-If you downloaded a release archive directly, download the matching `SHA256SUMS` file from the same GitHub Release and verify the archive before unpacking it.
+> **Unsupported platforms.** The install script targets macOS and Linux (arm64 and x86_64). On other platforms, download the matching archive directly from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify it against the published `SHA256SUMS` file from the same release, and place the `1up` binary on your `PATH`.
 
 ## Strongly Recommended: Install the Agent Skill
 
@@ -168,23 +176,18 @@ Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-
 
 ## Upgrade
 
-Use the same channel you installed from:
+Run `1up update` to replace the installed binary in place:
 
 ```sh
-brew upgrade 1up
-scoop update 1up
+1up update
 ```
 
-For direct release assets, download the newer archive from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify it against `SHA256SUMS`, and replace the existing binary.
+This downloads the latest release, verifies it, and atomically replaces the binary at its current install path. Re-running `1up update` when you are already current is a no-op and exits 0.
 
-## Source Builds
-
-Package installs and release assets are the supported onboarding path. If you need a development build instead:
+Re-run the install script only when you want to pin to a specific version or change the install directory:
 
 ```sh
-git clone https://github.com/rp1-run/1up.git
-cd 1up
-cargo install --path .
+1UP_VERSION=v0.1.8 curl -fsSL https://1up.rp1.run/setup.sh | bash
 ```
 
 ## Project Docs
@@ -193,6 +196,18 @@ cargo install --path .
 - Release runbook: [RELEASE.md](RELEASE.md)
 - Contributor policy and merge expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Source-build and engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
+
+## Building from Source (contributors only)
+
+The `curl | bash` install above is the supported path for users. Build from source only if you are hacking on `1up` itself:
+
+```sh
+git clone https://github.com/rp1-run/1up.git
+cd 1up
+cargo install --path .
+```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the full contributor setup.
 
 ## License
 
