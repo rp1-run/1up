@@ -109,6 +109,17 @@ The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts.
 
 After indexing, `1up status` shows end-to-end timing (including DB, model, and input preparation), scope info (requested vs executed scope and fallback reasons), and prefilter counters (files discovered, metadata-skipped, content-read, and deleted). Use `1up status --format json` to consume these fields programmatically.
 
+## Project Lifecycle
+
+On macOS and Linux:
+
+- `1up start` starts watching the current repo and keeps its index up to date
+- `1up stop` stops watching the current repo
+
+`1up stop` does not remove your local index, so running `1up start` again later will start watching the repo again.
+
+If your machine restarts, the next `1up start` brings the daemon back and resumes watching any repos that were not stopped.
+
 ## Choose the Right Command
 
 | If you need to... | Use | Why |
