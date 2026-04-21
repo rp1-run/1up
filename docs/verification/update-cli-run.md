@@ -143,7 +143,9 @@ None. The existing `1up update` self-update path works correctly against binarie
 ## Reproduction
 
 ```sh
-# 1. Install pinned older release via setup.sh
+# 1. Install pinned older release via setup.sh.
+#    Run either from the repo root (so `scripts/install/setup.sh` resolves),
+#    or via the curl|bash form shown in Step 1.
 env 1UP_VERSION=v0.1.7 bash scripts/install/setup.sh
 
 # 2. Inspect install
