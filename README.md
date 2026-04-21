@@ -27,16 +27,27 @@ Install `1up` on macOS or Linux with one command:
 
 ```sh
 curl -fsSL https://1up.rp1.run/setup.sh | bash
+```
+
+The installer prints the rc file it updated. Put `1up` on your `PATH` in the current shell by sourcing that file (or open a new shell):
+
+```sh
+source ~/.zshrc   # or ~/.bashrc, per the installer's final message
+```
+
+Then start the daemon from the repo you want to search:
+
+```sh
 1up start
 ```
 
 The script detects your platform, downloads the matching release archive from GitHub, verifies its SHA256 checksum when available, installs the binary into `~/.1up/bin`, and ensures that directory is on your `PATH`. No sudo required.
 
-Pin a specific version or override the install directory with environment variables:
+Pin a specific version or override the install directory with environment variables. The install script reads `1UP_*` from its own process env, so pass them through `env` on the right-hand side of the pipe:
 
 ```sh
-1UP_VERSION=v0.1.7 curl -fsSL https://1up.rp1.run/setup.sh | bash
-1UP_INSTALL_DIR=/opt/1up/bin curl -fsSL https://1up.rp1.run/setup.sh | bash
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.7 bash
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_INSTALL_DIR=/opt/1up/bin bash
 ```
 
 Verify the install:
@@ -187,7 +198,7 @@ This downloads the latest release, verifies it, and atomically replaces the bina
 Re-run the install script only when you want to pin to a specific version or change the install directory:
 
 ```sh
-1UP_VERSION=v0.1.8 curl -fsSL https://1up.rp1.run/setup.sh | bash
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.8 bash
 ```
 
 ## Project Docs

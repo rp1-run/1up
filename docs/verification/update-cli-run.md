@@ -28,7 +28,7 @@ Command:
 
 ```sh
 rm -rf /tmp/1up-verify && mkdir -p /tmp/1up-verify && cd /tmp/1up-verify
-env 1UP_VERSION=v0.1.7 bash scripts/install/setup.sh
+curl -fsSL https://raw.githubusercontent.com/rp1-run/1up/update-script/scripts/install/setup.sh | env 1UP_VERSION=v0.1.7 bash
 ```
 
 Stdout:

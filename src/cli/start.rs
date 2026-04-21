@@ -30,9 +30,12 @@ enum ProjectIndexState {
     Current,
     /// An older schema version is on disk.
     OutOfDate { found: u32, expected: u32 },
+    /// The on-disk schema version is newer than this binary supports.
+    /// The recovery action is to upgrade `1up`, not to reindex.
+    NewerThanSupported { found: u32 },
     /// The database file exists but its schema could not be determined
-    /// (missing schema metadata, corrupt file, newer-than-supported
-    /// version, or equivalent).
+    /// (missing schema metadata, corrupt file, or equivalent). The
+    /// recovery action is `1up reindex`.
     UnknownUnreadable,
 }
 
@@ -103,14 +106,22 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let index_state = classify_project_index(&project_root).await?;
     match index_state {
         ProjectIndexState::OutOfDate { found, expected } => {
-            emit_stale_schema_warning(&project_root, &*fmt, format, Some((found, expected)));
+            emit_stale_schema_warning(&project_root, &*fmt, format, found, expected);
             return Err(anyhow::anyhow!(
                 "index schema at {} is out of date (found v{found}, expected v{expected}); run `1up reindex`",
                 config::project_db_path(&project_root).display()
             ));
         }
+        ProjectIndexState::NewerThanSupported { found } => {
+            emit_binary_out_of_date_warning(&project_root, &*fmt, format, found);
+            return Err(anyhow::anyhow!(
+                "index schema at {} is v{found}, newer than this binary supports (v{expected}); run `1up update`",
+                config::project_db_path(&project_root).display(),
+                expected = constants::SCHEMA_VERSION,
+            ));
+        }
         ProjectIndexState::UnknownUnreadable => {
-            emit_stale_schema_warning(&project_root, &*fmt, format, None);
+            emit_index_unreadable_warning(&project_root, &*fmt, format);
             return Err(anyhow::anyhow!(
                 "index at {} is unreadable; run `1up reindex`",
                 config::project_db_path(&project_root).display()
@@ -197,14 +208,11 @@ async fn classify_project_index(project_root: &Path) -> anyhow::Result<ProjectIn
         return Ok(ProjectIndexState::NotCreated);
     }
 
-    let db = match Db::open_ro(&db_path).await {
-        Ok(db) => db,
-        Err(_) => return Ok(ProjectIndexState::UnknownUnreadable),
-    };
-    let conn = match db.connect() {
-        Ok(conn) => conn,
-        Err(_) => return Ok(ProjectIndexState::UnknownUnreadable),
-    };
+    // DB open/connect errors here are genuine I/O or libSQL faults, not
+    // schema issues; propagate so the user sees the real cause instead of
+    // being sent through an incorrect "reindex to recover" path.
+    let db = Db::open_ro(&db_path).await?;
+    let conn = db.connect()?;
 
     match schema::ensure_current(&conn).await {
         Ok(()) => Ok(ProjectIndexState::Current),
@@ -220,6 +228,13 @@ fn classify_schema_error(message: &str) -> ProjectIndexState {
     if message.contains("index is missing") {
         return ProjectIndexState::NotCreated;
     }
+    if message.contains("newer than this binary supports") {
+        // `schema.rs` emits "index schema v{N} is newer than this binary
+        // supports (expected v{M}); ...". Recover the found version so we
+        // can surface it; fall back to 0 if parsing fails.
+        let found = parse_single_version(message, "index schema v").unwrap_or(0);
+        return ProjectIndexState::NewerThanSupported { found };
+    }
     if message.contains("out of date") {
         if let Some((found, expected)) = parse_schema_versions(message) {
             return ProjectIndexState::OutOfDate { found, expected };
@@ -230,6 +245,17 @@ fn classify_schema_error(message: &str) -> ProjectIndexState {
         };
     }
     ProjectIndexState::UnknownUnreadable
+}
+
+/// Extract the integer following a `v` prefix after the given marker.
+/// E.g. `parse_single_version("index schema v9 is newer ...", "index schema v")` -> `Some(9)`.
+fn parse_single_version(message: &str, prefix: &str) -> Option<u32> {
+    let idx = message.find(prefix)? + prefix.len();
+    let rest = &message[idx..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// Extract the `(found, expected)` schema versions from an
@@ -261,13 +287,10 @@ fn emit_stale_schema_warning(
     project_root: &Path,
     fmt: &dyn Formatter,
     format: OutputFormat,
-    versions: Option<(u32, u32)>,
+    found: u32,
+    expected: u32,
 ) {
     let db_path = config::project_db_path(project_root);
-    let expected = versions
-        .map(|(_, e)| e)
-        .unwrap_or(constants::SCHEMA_VERSION);
-    let found = versions.map(|(f, _)| f).unwrap_or(0);
 
     if matches!(format, OutputFormat::Json) {
         let payload = serde_json::json!({
@@ -281,16 +304,66 @@ fn emit_stale_schema_warning(
         return;
     }
 
-    let msg = match versions {
-        Some((found, expected)) => format!(
-            "warning: index schema at {} is out of date (found v{found}, expected v{expected}).\nRun: 1up reindex",
-            db_path.display()
-        ),
-        None => format!(
-            "warning: index at {} is unreadable and needs a rebuild.\nRun: 1up reindex",
-            db_path.display()
-        ),
-    };
+    let msg = format!(
+        "warning: index schema at {} is out of date (found v{found}, expected v{expected}).\nRun: 1up reindex",
+        db_path.display()
+    );
+    println!("{}", fmt.format_message(&msg));
+}
+
+/// Emit the user-facing warning when the on-disk schema is newer than the
+/// running binary supports. Recovery is `1up update` (upgrade the CLI), not
+/// `1up reindex` -- reindexing with an older binary would immediately land
+/// back in the same state.
+fn emit_binary_out_of_date_warning(
+    project_root: &Path,
+    fmt: &dyn Formatter,
+    format: OutputFormat,
+    found: u32,
+) {
+    let db_path = config::project_db_path(project_root);
+    let expected = constants::SCHEMA_VERSION;
+
+    if matches!(format, OutputFormat::Json) {
+        let payload = serde_json::json!({
+            "status": "binary_out_of_date",
+            "found": found,
+            "expected": expected,
+            "action": "1up update",
+            "path": db_path.display().to_string(),
+        });
+        println!("{payload}");
+        return;
+    }
+
+    let msg = format!(
+        "warning: index schema at {} is v{found}, newer than this binary supports (v{expected}).\nRun: 1up update to upgrade the CLI.",
+        db_path.display()
+    );
+    println!("{}", fmt.format_message(&msg));
+}
+
+/// Emit the user-facing warning when the index DB exists but its schema
+/// metadata could not be interpreted. The recovery action is a reindex;
+/// the envelope is distinct from the stale-schema envelope so downstream
+/// tooling can tell the two apart.
+fn emit_index_unreadable_warning(project_root: &Path, fmt: &dyn Formatter, format: OutputFormat) {
+    let db_path = config::project_db_path(project_root);
+
+    if matches!(format, OutputFormat::Json) {
+        let payload = serde_json::json!({
+            "status": "index_unreadable",
+            "action": "1up reindex",
+            "path": db_path.display().to_string(),
+        });
+        println!("{payload}");
+        return;
+    }
+
+    let msg = format!(
+        "warning: index at {} is unreadable and needs a rebuild.\nRun: 1up reindex",
+        db_path.display()
+    );
     println!("{}", fmt.format_message(&msg));
 }
 
@@ -421,10 +494,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_schema_error_falls_back_to_unknown_unreadable() {
-        // Newer-than-supported schema version is neither stale nor missing; we
-        // still want the user pointed at `1up reindex` rather than a raw error.
-        let msg = "schema migration failed: index schema v99 is newer than this binary supports";
+    fn classify_schema_error_maps_newer_than_supported_to_binary_out_of_date() {
+        // `schema.rs` emits this exact substring when the on-disk schema is
+        // newer than the running binary. The recovery action is `1up update`,
+        // not `1up reindex` -- reindexing with an older binary would land
+        // right back in the same state.
+        let msg = "schema migration failed: index schema v99 is newer than this binary supports (expected v12); rebuild with a compatible binary or upgrade `1up`";
+        assert_eq!(
+            classify_schema_error(msg),
+            ProjectIndexState::NewerThanSupported { found: 99 }
+        );
+    }
+
+    #[test]
+    fn classify_schema_error_falls_back_to_unknown_unreadable_for_unknown_shape() {
+        // Any error shape we don't recognize falls back to the generic
+        // unreadable state so the user still gets a `1up reindex` action.
+        let msg = "schema migration failed: some unexpected libsql error";
         assert_eq!(
             classify_schema_error(msg),
             ProjectIndexState::UnknownUnreadable
@@ -442,5 +528,21 @@ mod tests {
     #[test]
     fn parse_schema_versions_returns_none_without_markers() {
         assert_eq!(parse_schema_versions("nothing to parse here"), None);
+    }
+
+    #[test]
+    fn parse_single_version_extracts_digits_after_prefix() {
+        assert_eq!(
+            parse_single_version("index schema v42 is newer", "index schema v"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_single_version_returns_none_without_prefix() {
+        assert_eq!(
+            parse_single_version("no marker here", "index schema v"),
+            None
+        );
     }
 }

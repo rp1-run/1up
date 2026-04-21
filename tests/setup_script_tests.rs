@@ -500,6 +500,83 @@ fn setup_is_idempotent_on_second_run() {
 }
 
 #[test]
+fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
+    // When a user reruns setup.sh with a different `1UP_INSTALL_DIR`, the
+    // binary lands in the new dir but the rc PATH block must also be
+    // rewritten to point at the new dir -- otherwise the old dir stays on
+    // PATH and the freshly-installed binary is unreachable.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    // First run: default install dir.
+    let first = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/zsh",
+    });
+    assert!(
+        first.status.success(),
+        "first run should succeed: {}",
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let rc_path = host_home.path().join(".zshrc");
+    let rc_after_first = fs::read_to_string(&rc_path).unwrap();
+    let default_install_dir = host_home.path().join(".1up/bin");
+    assert!(
+        rc_after_first.contains(default_install_dir.to_str().unwrap()),
+        "first run rc should reference default install dir: {rc_after_first}"
+    );
+
+    // Second run: override install dir. Block must be rewritten.
+    let alt_dir = host_home.path().join("alt-install");
+    let second = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: Some(&alt_dir),
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/zsh",
+    });
+    assert!(
+        second.status.success(),
+        "second run with new install dir should succeed: {}",
+        String::from_utf8_lossy(&second.stderr),
+    );
+
+    let rc_after_second = fs::read_to_string(&rc_path).unwrap();
+    assert_eq!(
+        rc_after_second
+            .matches("# >>> 1up install (managed) >>>")
+            .count(),
+        1,
+        "PATH block must remain single after rerun: {rc_after_second}"
+    );
+    assert!(
+        rc_after_second.contains(alt_dir.to_str().unwrap()),
+        "rc should now reference new install dir: {rc_after_second}"
+    );
+    assert!(
+        !rc_after_second.contains(&format!(
+            "export PATH=\"{}:$PATH\"",
+            default_install_dir.to_str().unwrap()
+        )),
+        "old install-dir PATH export must be gone after rerun: {rc_after_second}"
+    );
+
+    // Script should log the replacement so the user sees the change.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("Replaced PATH block"),
+        "second-run stdout should name the rewrite: {stdout}"
+    );
+}
+
+#[test]
 fn setup_fails_on_checksum_mismatch() {
     // REQ-003: published SHA256SUMS that disagrees with the served archive
     // must be fatal. Binary must NOT land in the install dir.

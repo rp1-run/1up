@@ -791,15 +791,21 @@ fn start_warns_on_stale_schema() {
     // produce a warning that names `1up reindex`, exit non-zero, and leave
     // the on-disk `.1up/index.db` byte-identical (no delete, no migrate).
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path()).unwrap();
-    create_stale_v4_index(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(&canonical_dir).unwrap();
+    create_stale_v4_index(&canonical_dir);
 
-    let db_path = project_db_path(dir.path());
+    let db_path = project_db_path(&canonical_dir);
     let bytes_before = fs::read(&db_path).unwrap();
     let mtime_before = fs::metadata(&db_path).unwrap().modified().unwrap();
 
     let output = cmd()
-        .args(["start", dir.path().to_str().unwrap()])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["start", canonical_dir.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -848,10 +854,16 @@ fn start_warns_on_stale_schema_json_envelope() {
     // JSON formatter variant of REQ-033: the envelope literal is fixed by
     // design §3.2 (`schema_out_of_date`, `found`, `expected`, `action`).
     let dir = tempfile::tempdir().unwrap();
-    create_stale_v4_index(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    create_stale_v4_index(&canonical_dir);
 
     let output = cmd()
-        .args(["start", dir.path().to_str().unwrap(), "--format", "json"])
+        .env("HOME", &canonical_home)
+        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
+        .args(["start", canonical_dir.to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -908,7 +920,13 @@ fn start_prints_status_hint_on_fresh_index() {
     );
 
     // Tidy up the daemon we spawned so we don't leak it across tests.
+    // `start` can return before the forked daemon has finished writing
+    // its pidfile; poll briefly so the cleanup doesn't race that fork.
     let pid_file = data_dir.join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pid_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
     if pid_file.exists() {
         cmd()
             .env("HOME", &canonical_home)
@@ -964,7 +982,13 @@ fn start_skips_init_on_existing_valid_index() {
         "existing-index start must not mention init; got: {stdout}",
     );
 
+    // Poll briefly for the daemon pidfile: `start` can return before the
+    // forked daemon writes it, and the cleanup must not race that fork.
     let pid_file = data_dir.join("daemon.pid");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pid_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
     if pid_file.exists() {
         cmd()
             .env("HOME", &canonical_home)

@@ -293,7 +293,52 @@ configure_path() {
 
     # Already contains our managed block?
     if [ -f "$rc_path" ] && grep -q '^# >>> 1up install (managed) >>>$' "$rc_path" 2>/dev/null; then
-        log "PATH block already present in $rc_path; no changes."
+        # Extract the install dir recorded in the existing block so we can
+        # detect a rerun that points at a different directory. The block
+        # body is a single `export PATH="<dir>:$PATH"` line.
+        local old_dir
+        old_dir=$(awk '
+            /^# >>> 1up install \(managed\) >>>$/ { in_block = 1; next }
+            /^# <<< 1up install \(managed\) <<<$/ { in_block = 0; next }
+            in_block && /^export PATH=/ {
+                line = $0
+                sub(/^export PATH="/, "", line)
+                sub(/:\$PATH"$/, "", line)
+                print line
+                exit
+            }
+        ' "$rc_path")
+
+        if [ "$old_dir" = "$INSTALL_DIR" ]; then
+            log "PATH block already present in $rc_path; no changes."
+            return
+        fi
+
+        # Rerun with a different install dir: replace the block in place.
+        # Write everything outside the managed block to a temp file, then
+        # append the refreshed block. bash 3.2 compatible.
+        local tmp_rc
+        tmp_rc="${rc_path}.1up.tmp.$$"
+        awk '
+            /^# >>> 1up install \(managed\) >>>$/ { in_block = 1; next }
+            /^# <<< 1up install \(managed\) <<<$/ { in_block = 0; next }
+            !in_block { print }
+        ' "$rc_path" >"$tmp_rc"
+
+        {
+            printf '\n# >>> 1up install (managed) >>>\n'
+            # shellcheck disable=SC2016  # literal $PATH is intentional; expanded at rc load time.
+            printf 'export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+            printf '# <<< 1up install (managed) <<<\n'
+        } >>"$tmp_rc"
+
+        if ! mv -f "$tmp_rc" "$rc_path"; then
+            rm -f "$tmp_rc"
+            fail "failed to replace PATH block in $rc_path"
+        fi
+
+        log "Replaced PATH block in $rc_path (was $old_dir -> $INSTALL_DIR)."
+        log "Run \`source $rc_path\` or open a new shell to put 1up on PATH for this session."
         return
     fi
 
