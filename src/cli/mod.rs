@@ -1,6 +1,5 @@
 pub mod context;
 pub mod get;
-pub mod hello_agent;
 pub mod impact;
 pub mod index;
 pub mod init;
@@ -88,9 +87,6 @@ pub enum Command {
     /// Force re-index of all files
     Reindex(reindex::ReindexArgs),
 
-    /// Output a concise agent instruction for AI assistants
-    HelloAgent(hello_agent::HelloAgentArgs),
-
     /// Check for updates, view update status, or apply an update
     Update(update::UpdateArgs),
 
@@ -105,11 +101,9 @@ impl Command {
     /// which own their output protocol directly and never consult a format.
     pub fn default_maintenance_format(&self) -> Option<OutputFormat> {
         match self {
-            Command::Start(_)
-            | Command::Stop(_)
-            | Command::Status(_)
-            | Command::HelloAgent(_)
-            | Command::Update(_) => Some(OutputFormat::Human),
+            Command::Start(_) | Command::Stop(_) | Command::Status(_) | Command::Update(_) => {
+                Some(OutputFormat::Human)
+            }
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::Search(_)
             | Command::Get(_)
@@ -159,10 +153,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Reindex(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             reindex::exec(args, format).await
-        }
-        Command::HelloAgent(args) => {
-            let format = resolve_maintenance_format(args.format, maintenance_format);
-            hello_agent::exec(args, format).await
         }
         Command::Update(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
@@ -242,7 +232,7 @@ mod tests {
     }
 
     /// Maintenance commands (`start`, `stop`, `status`, `init`, `index`,
-    /// `reindex`, `update`, `hello-agent`) must still accept `--format`/`-f`
+    /// `reindex`, `update`) must still accept `--format`/`-f`
     /// so existing scripting and JSON-consuming integrations keep working.
     #[test]
     fn maintenance_commands_still_accept_format() {
@@ -254,7 +244,6 @@ mod tests {
             &["1up", "init", ".", "--format", "json"],
             &["1up", "index", ".", "--format", "json"],
             &["1up", "reindex", ".", "--format", "json"],
-            &["1up", "hello-agent", "--format", "plain"],
             &["1up", "update", "--status", "--format", "json"],
         ];
         for argv in maintenance_cases {
@@ -273,7 +262,6 @@ mod tests {
             &["1up", "start", "."],
             &["1up", "stop", "."],
             &["1up", "status", "."],
-            &["1up", "hello-agent"],
             &["1up", "update", "--status"],
         ];
         for argv in human_defaults {

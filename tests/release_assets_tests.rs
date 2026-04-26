@@ -45,7 +45,6 @@ fn build_release_fixture() -> tempfile::TempDir {
         "README.md",
         "LICENSE",
         "CHANGELOG.md",
-        "skills/1up-search/SKILL.md",
         "packaging/homebrew/1up.rb.tmpl",
         "packaging/scoop/1up.json.tmpl",
     ] {

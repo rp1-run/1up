@@ -82,7 +82,6 @@ fn maintenance_format(command: &cli::Command) -> Option<OutputFormat> {
         cli::Command::Init(args) => args.format,
         cli::Command::Index(args) => args.format,
         cli::Command::Reindex(args) => args.format,
-        cli::Command::HelloAgent(args) => args.format,
         cli::Command::Update(args) => args.format,
         _ => None,
     }

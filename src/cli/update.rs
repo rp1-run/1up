@@ -4,8 +4,7 @@ use clap::Args;
 
 use crate::cli::output::{formatter_for, UpdateResult, UpdateStatusInfo};
 use crate::daemon::lifecycle;
-use crate::shared::constants::UPDATE_DISABLED_MESSAGE;
-use crate::shared::reminder::VERSION;
+use crate::shared::constants::{UPDATE_DISABLED_MESSAGE, VERSION};
 use crate::shared::types::OutputFormat;
 use crate::shared::update::{
     build_cache_from_manifest, build_update_check_client, build_update_status, clear_update_cache,
