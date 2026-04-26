@@ -755,8 +755,7 @@ fn setup_fails_cleanly_on_missing_pinned_version() {
         "binary must not be installed when the pinned release is missing"
     );
     assert!(
-        !host_home.path().join(".bashrc").exists()
-            && !host_home.path().join(".zshrc").exists(),
+        !host_home.path().join(".bashrc").exists() && !host_home.path().join(".zshrc").exists(),
         "rc files must not be touched when install fails before configure_path"
     );
 }
