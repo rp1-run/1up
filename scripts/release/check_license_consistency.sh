@@ -41,9 +41,10 @@ read_markdown_section() {
 
 CARGO_TOML="$ROOT_DIR/Cargo.toml"
 README_PATH="$ROOT_DIR/README.md"
+SKILL_PATH="$ROOT_DIR/skills/1up-search/SKILL.md"
 LICENSE_PATH="$ROOT_DIR/LICENSE"
 
-for path in "$CARGO_TOML" "$README_PATH" "$LICENSE_PATH"; do
+for path in "$CARGO_TOML" "$README_PATH" "$SKILL_PATH" "$LICENSE_PATH"; do
   require_file "$path"
 done
 
@@ -52,6 +53,13 @@ if [[ -z "$cargo_license" ]]; then
   fail "Cargo.toml is missing a package license field"
 elif [[ "$cargo_license" != "$EXPECTED_SPDX" ]]; then
   fail "Cargo.toml license must be ${EXPECTED_SPDX}, found ${cargo_license}"
+fi
+
+skill_license=$(awk -F': *' '/^license:/ { print $2; exit }' "$SKILL_PATH")
+if [[ -z "$skill_license" ]]; then
+  fail "skills/1up-search/SKILL.md is missing a license field"
+elif [[ "$skill_license" != "$EXPECTED_SPDX" ]]; then
+  fail "skills/1up-search/SKILL.md license must be ${EXPECTED_SPDX}, found ${skill_license}"
 fi
 
 readme_license_section=$(read_markdown_section "$README_PATH" "## License")
@@ -81,4 +89,4 @@ if (( FAILURES > 0 )); then
   exit 1
 fi
 
-log "validated ${EXPECTED_SPDX} across Cargo.toml, README.md, and LICENSE"
+log "validated ${EXPECTED_SPDX} across Cargo.toml, README.md, skills/1up-search/SKILL.md, and LICENSE"

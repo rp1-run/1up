@@ -11,6 +11,7 @@ use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants;
 use crate::shared::project;
+use crate::shared::reminder;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -62,6 +63,8 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
     let fmt = formatter_for(format);
+
+    install_fences(&source_root, &*fmt);
 
     if !lifecycle::supports_daemon() {
         println!(
@@ -425,6 +428,44 @@ async fn run_initial_index(
     .await?;
 
     Ok(stats)
+}
+
+fn install_fences(project_root: &Path, fmt: &dyn Formatter) {
+    for filename in constants::FENCE_TARGET_FILES {
+        let file_path = project_root.join(filename);
+        let existing = std::fs::read_to_string(&file_path).ok();
+        let (new_content, action) = reminder::apply_fence(existing.as_deref());
+
+        match action {
+            reminder::FenceAction::AlreadyCurrent => {}
+            reminder::FenceAction::Created => {
+                if let Err(e) = std::fs::write(&file_path, &new_content) {
+                    eprintln!("warning: failed to create {filename}: {e}");
+                    continue;
+                }
+                eprintln!(
+                    "{}",
+                    fmt.format_message(&format!(
+                        "Created {filename} with 1up agent reminder (fence v{}).",
+                        reminder::FENCE_VERSION
+                    ))
+                );
+            }
+            reminder::FenceAction::Updated { old_version } => {
+                if let Err(e) = std::fs::write(&file_path, &new_content) {
+                    eprintln!("warning: failed to update {filename}: {e}");
+                    continue;
+                }
+                eprintln!(
+                    "{}",
+                    fmt.format_message(&format!(
+                        "Updated 1up reminder in {filename} ({old_version} -> {}).",
+                        reminder::FENCE_VERSION
+                    ))
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

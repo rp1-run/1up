@@ -1,9 +1,6 @@
 /// Embedding vector dimensionality (all-MiniLM-L6-v2).
 pub const EMBEDDING_DIM: usize = 384;
 
-/// 1up version from Cargo.toml, embedded at compile time.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// Default batch size for embedding inference.
 pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
@@ -151,6 +148,9 @@ pub const HF_MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
 /// Base URL for Hugging Face model downloads.
 pub const HF_BASE_URL: &str = "https://huggingface.co";
+
+/// Target files for 1up fence installation.
+pub const FENCE_TARGET_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
 /// Build/runtime env var that enables the update manifest endpoint.
 ///

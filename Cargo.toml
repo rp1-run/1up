@@ -55,10 +55,6 @@ ignore = "0.4"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "1.2"
-
-# Model Context Protocol
-rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 
 # Error handling
 thiserror = "2"

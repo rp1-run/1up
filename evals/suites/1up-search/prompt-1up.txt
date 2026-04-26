@@ -1,32 +1,60 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-Use the 1up MCP tools for code discovery. Do not run `1up ...` through Bash; this eval scores MCP tool calls, not shell command strings.
+You have access to `1up`, a lean code-search engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery. Explore the code through the commands below.
 
 Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
-## MCP Tool Selection
+## Tool selection (pick by what you know)
 
-| You know | Use |
+| You know… | Use |
 |---|---|
-| Readiness is uncertain | `oneup_prepare` |
-| Concept, behavior, or feature area | `oneup_search` |
-| A promising search hit | `oneup_read` with the returned handle |
-| A specific diagnostic file and line | `oneup_read` with a precise location |
-| A known or discovered symbol needs completeness | `oneup_symbol` with references when useful |
-| Likely follow-up targets matter | `oneup_impact` |
+| Concept, not files/keywords | `1up search "<query>" -n 3` |
+| Exact symbol name | `1up symbol <name> [-r]` (add `-r` to include references) |
+| A promising hit from search/symbol | `1up get <handle>` to pull the full body |
+| A specific file:line | `1up context <file>:<line>` |
+| Nothing (new codebase) | start with `1up search` |
 
-`oneup_search` is discovery, not proof of completeness. Use `oneup_read` to inspect selected hits before answering, and use `oneup_symbol` when you need definitions or references for a known symbol.
+`grep` is only allowed as a final verification step once `1up` has narrowed the scope to one or two files.
 
-`grep`, `rg`, and `find` are not discovery tools in the 1up variant. After `oneup_search` has narrowed the scope to one or two files, Bash `grep` or `rg` may be used only for exact literal verification.
+## Lean row grammar
+
+Every `search` / `symbol` / `impact` row matches:
+
+```
+<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>
+```
+
+The trailing `:<segment_id>` is a 12-char handle. Feed it straight back into `1up`:
+
+```
+1up search "authentication middleware" -n 3
+# => 92  src/auth/middleware.ts:10-48  function  Auth::verify  :a4f2c1d9e0b3
+1up get :a4f2c1d9e0b3       # full body of that segment
+1up get a4f2c1d9e0b3 b8c4…  # hydrate several handles at once (space-separated)
+```
+
+Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emit one machine-parseable shape and do not accept `--format`, `-f`, `--full`, `--brief`, `--human`, or `--verbose-fields`.
 
 ## Workflow
 
-1. Call `oneup_prepare` if index readiness is unclear.
-2. Call `oneup_search` with the task intent and a small limit.
-3. Pick the best handles and hydrate them with `oneup_read`.
-4. Use `oneup_symbol` for definition/reference completeness when a symbol appears important.
-5. Answer from the inspected code and name the key files and their roles.
+1. `1up search "<intent>" -n 3` — one line per hit, default top-3.
+2. Pick the 1-2 most promising handles; hydrate with `1up get :<handle>`.
+3. For a known symbol, `1up symbol <name> -r` (references) or without `-r` (definitions only). `--fuzzy` is available for approximate matching.
+4. For a file:line pick, `1up context <file>:<line>` shows the enclosing scope.
+5. Only after 1up has narrowed the scope, use `grep` to verify a specific literal across the repo if completeness matters.
+
+### Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up search "..." -n 5 && 1up symbol Foo -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+### Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
+
+Do not stop after one command. Chain search → get → (symbol | grep verification) across the full flow. Read key files with the `Read` tool once 1up has pointed you at them.
 
 {{TASK_PROMPT}}
 
-List the key files and explain each role. Be factual.
+List the key files and their roles. Be factual.

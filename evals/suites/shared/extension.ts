@@ -4,8 +4,8 @@ import {
   existsSync,
   mkdirSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
+  unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,7 +86,8 @@ export function ensureFixtureCache(): void {
     return;
   }
 
-  const needsWork = !existsSync(join(CACHE_DIR, ".git")) || cacheNeedsRefresh();
+  const needsWork =
+    !existsSync(join(CACHE_DIR, ".git")) || cacheNeedsRefresh();
   if (!needsWork) {
     if (existsSync(PROJECT_ID_PATH)) {
       rmSync(PROJECT_ID_PATH);

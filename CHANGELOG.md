@@ -8,13 +8,6 @@ This project follows an install-first public release posture:
 - Git tags use the form `vX.Y.Z`
 - GitHub Releases and this changelog together form the public release record
 
-## Unreleased
-
-### Changed
-
-* Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
-* Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
-
 ## [0.1.8](https://github.com/rp1-run/1up/compare/v0.1.7...v0.1.8) (2026-04-19)
 
 

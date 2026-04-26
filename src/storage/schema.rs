@@ -1,11 +1,7 @@
-use std::thread;
-use std::time::Duration;
-
 use libsql::Connection;
 
-use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, SCHEMA_VERSION};
+use crate::shared::constants::SCHEMA_VERSION;
 use crate::shared::errors::{OneupError, StorageError};
-use crate::storage::db::is_lock_error;
 use crate::storage::queries;
 
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
@@ -189,46 +185,22 @@ async fn schema_object_exists(
     object_type: &str,
     name: &str,
 ) -> Result<bool, OneupError> {
-    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
-    let mut last_error = None;
-
-    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
-        match schema_object_exists_once(conn, object_type, name).await {
-            Ok(exists) => return Ok(exists),
-            Err(e) => {
-                let err_text = e.to_string();
-                if !is_lock_error(&err_text) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
-                    return Err(StorageError::Query(format!(
-                        "failed to inspect schema object {object_type} `{name}`: {err_text}"
-                    ))
-                    .into());
-                }
-                last_error = Some(err_text);
-                thread::sleep(retry_delay);
-            }
-        }
-    }
-
-    Err(StorageError::Query(format!(
-        "failed to inspect schema object {object_type} `{name}`: {}",
-        last_error.unwrap_or_else(|| "database inspection failed".to_string())
-    ))
-    .into())
-}
-
-async fn schema_object_exists_once(
-    conn: &Connection,
-    object_type: &str,
-    name: &str,
-) -> Result<bool, libsql::Error> {
     let mut rows = conn
         .query(queries::SELECT_SCHEMA_OBJECT, [object_type, name])
-        .await?;
+        .await
+        .map_err(|e| {
+            StorageError::Query(format!(
+                "failed to inspect schema object {object_type} `{name}`: {e}"
+            ))
+        })?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(e) => Err(e),
+        Err(e) => Err(StorageError::Query(format!(
+            "schema object inspection failed for {object_type} `{name}`: {e}"
+        ))
+        .into()),
     }
 }
 

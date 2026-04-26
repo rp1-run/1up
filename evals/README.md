@@ -1,25 +1,8 @@
 # 1up evals
 
-Deterministic quality harnesses for 1up search and agent adoption.
-
-## MCP adoption harness
-
-The 1up agent variants in `suites/1up-search/evals.yaml` and `suites/1up-impact/evals.yaml` run the local MCP server with command `1up` and args `["mcp", "--path", "."]`. Prompts instruct agents to use canonical `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` tool calls instead of shelling out to `1up ...`.
-
-The shared assertions inspect provider MCP tool-call metadata. They require MCP search before discovery, handle or location hydration with `oneup_read`, symbol verification with `oneup_symbol` when completeness matters, and `oneup_impact` plus primary/contextual interpretation for impact tasks. Broad raw `grep`, `rg`, and `find` usage is a failure in the 1up variant; exact literal `grep` or `rg` verification is allowed only after MCP discovery narrows scope to precise files.
-
-Useful checks:
-
-```sh
-npm run lint
-npm test
-npx promptfoo validate -c suites/1up-search/evals.yaml
-npx promptfoo validate -c suites/1up-impact/evals.yaml
-```
+Deterministic quality harnesses for 1up search. The recall harness is the REQ-002 gate for vector-index changes (schema bumps, element-type flips, HNSW option changes) and must produce a single comparable recall number across baseline and post-change runs.
 
 ## Recall harness
-
-The recall harness is a separate REQ-002 gate for vector-index changes (schema bumps, element-type flips, HNSW option changes). It still invokes the manual CLI because it measures retrieval ranking directly, not agent MCP tool selection, and must produce a single comparable recall number across baseline and post-change runs.
 
 **Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts)
 **Corpus**: [`suites/1up-search/recall-corpus.jsonl`](suites/1up-search/recall-corpus.jsonl)

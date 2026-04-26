@@ -1,7 +1,5 @@
 # Eval Results: 1up Lean CLI (PR #32)
 
-> Historical pre-MCP result. This page records a CLI and Agent Hints experiment; current agent integration uses MCP with command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools. Do not use this page as current setup guidance.
-
 **Date:** 2026-04-19
 **Model:** claude-sonnet-4-6 (both agents)
 **Grading model:** claude-haiku-4-5-20251001

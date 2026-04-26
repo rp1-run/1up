@@ -1,30 +1,56 @@
 Your working directory is {{WORKSPACE_DIR}}.
 
-Use the 1up MCP tools for local code discovery and impact exploration. Do not run `1up ...` through Bash; this eval scores MCP tool calls, not shell command strings.
+You have access to `1up`, a lean code-search and impact-analysis engine. Use it — do not fall back to `find`, `grep`, `rg`, or `ls` for discovery. Explore the code through the commands below.
 
 Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
-## MCP Tool Selection
+## Tool selection (pick by what you know)
 
-| You know | Use |
+| You know… | Use |
 |---|---|
-| Readiness is uncertain | `oneup_prepare` |
-| Concept, behavior, or feature area | `oneup_search` |
-| A promising handle or file location | `oneup_read` |
-| A known or discovered symbol needs definitions/references | `oneup_symbol` |
-| Blast radius or likely follow-up targets matter | `oneup_impact` |
+| Concept or feature area | `1up search "<query>" -n 3` |
+| Exact symbol name | `1up symbol <name> [-r]` |
+| A segment handle from a prior hit | `1up get <handle>` to hydrate the body, or `1up impact --from-segment <handle>` for blast radius |
+| A symbol whose blast radius you need | `1up impact --from-symbol <name>` |
+| A file whose blast radius you need | `1up impact --from-file <path>[:<line>]` |
+| A file:line pick | `1up context <file>:<line>` |
 
-`oneup_impact` returns advisory likely-impact guidance, not guaranteed dependency truth. Treat primary results as higher-confidence follow-up targets and contextual results as lower-confidence guidance that should be verified before acting on it.
+`grep` is only allowed as a final verification pass once `1up` has narrowed the scope.
 
-`grep`, `rg`, and `find` are not discovery tools in the 1up variant. After 1up narrows the scope, Bash `grep` or `rg` may be used only for exact literal verification.
+## Lean row grammar
 
-## Impact Workflow
+Every `search` / `symbol` / `impact` row matches:
 
-1. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
-2. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
-3. Read primary results with `oneup_read` when you need implementation details.
-4. Use `oneup_symbol` to verify direct references for important symbols.
-5. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
+```
+<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]
+```
+
+- `:<segment_id>` is a 12-char handle. Feed it into `1up get` to read the body or `1up impact --from-segment <handle>` to expand from that exact anchor.
+- `impact` rows carry a trailing `~P` (primary) or `~C` (contextual) tag. Primary rows are confident relation-backed callers; contextual rows are lower-signal and must be verified before acting on them.
+
+Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) emit one machine-parseable shape and do not accept `--format`, `-f`, `--full`, `--brief`, `--human`, or `--verbose-fields`.
+
+## Impact workflow
+
+1. Find the anchor. If you already know the symbol or file, skip straight to step 2. Otherwise run `1up search "<intent>" -n 3` and pick the 1-2 most relevant handles.
+2. Expand blast radius:
+   - `1up impact --from-segment <handle>` from a search/symbol row.
+   - `1up impact --from-symbol <name>` from a known symbol.
+   - `1up impact --from-file <path>` when the anchor is a file.
+3. Read primary (`~P`) rows first; hydrate bodies with `1up get :<handle>` when you need more than the header.
+4. Cover the known misses: `impact` may not surface UI callers, dynamic dispatch, or indirect consumers. Follow up with `1up symbol -r <name>` for reference lists, and only then reach for `grep` to confirm a specific literal.
+
+### Batching
+
+- One call, many handles: `1up get :h1 :h2 :h3`.
+- Chain w/ `&&`: `1up impact --from-symbol Foo && 1up symbol Foo -r` → one turn, two result sets.
+- One wider search (`-n 5..8`) beats several narrow searches on adjacent concepts.
+
+### Use `1up symbol`, not `1up get | grep`
+
+Piping `1up get` through `grep` tokenizes the full body then filters client-side — wasteful. Use `1up symbol <name>` (`-r` for refs, `--fuzzy` for approximate) — one lean row per match, no wasted body.
+
+Do not stop after one command. Chain impact → get → (symbol -r | grep verification) and read the key files via the `Read` tool once 1up has pointed you at them.
 
 {{TASK_PROMPT}}
 

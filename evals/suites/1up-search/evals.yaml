@@ -20,19 +20,7 @@ providers:
       permission_mode: bypassPermissions
       allow_dangerously_skip_permissions: true
       max_turns: 100
-      custom_allowed_tools:
-        - Bash
-        - Read
-        - mcp__oneup__oneup_prepare
-        - mcp__oneup__oneup_search
-        - mcp__oneup__oneup_read
-        - mcp__oneup__oneup_symbol
-        - mcp__oneup__oneup_impact
-      mcp:
-        servers:
-          - name: oneup
-            command: 1up
-            args: ["mcp", "--path", "."]
+      custom_allowed_tools: [Bash, Read]
 
   - id: anthropic:claude-agent-sdk
     label: baseline-agent
@@ -73,16 +61,6 @@ tests:
           const score = found / expected.length;
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadAfterSearch
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
-      - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
         value: >
@@ -118,16 +96,6 @@ tests:
           const score = found / expected.length;
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadAfterSearch
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
-      - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
         value: >
@@ -162,16 +130,6 @@ tests:
           const score = found / expected.length;
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadAfterSearch
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
-      - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
         value: >
@@ -204,16 +162,6 @@ tests:
           const found = expected.length - missing.length;
           const score = found / expected.length;
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assert1upUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadAfterSearch
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertNoFallbackTools
-      - type: javascript
-        value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric

@@ -185,7 +185,7 @@ async fn build_local_with_retry(path_str: &str) -> Result<Database, OneupError> 
     )
 }
 
-pub(crate) fn is_lock_error(error: &str) -> bool {
+fn is_lock_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("database is locked")
         || lower.contains("locking error")

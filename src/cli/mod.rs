@@ -1,10 +1,10 @@
 pub mod context;
 pub mod get;
+pub mod hello_agent;
 pub mod impact;
 pub mod index;
 pub mod init;
 pub mod lean;
-pub mod mcp;
 pub mod output;
 pub mod reindex;
 pub mod search;
@@ -78,14 +78,14 @@ pub enum Command {
     /// followed by the indented snippet.
     Structural(structural::StructuralArgs),
 
-    /// Start the MCP stdio server for agent-facing code discovery
-    Mcp(mcp::McpArgs),
-
     /// Index a repository
     Index(index::IndexArgs),
 
     /// Force re-index of all files
     Reindex(reindex::ReindexArgs),
+
+    /// Output a concise agent instruction for AI assistants
+    HelloAgent(hello_agent::HelloAgentArgs),
 
     /// Check for updates, view update status, or apply an update
     Update(update::UpdateArgs),
@@ -98,12 +98,15 @@ pub enum Command {
 impl Command {
     /// Default output format for maintenance commands when `--format`/`-f` is
     /// not supplied. Returns `None` for core commands and the internal worker,
-    /// which own their output protocol directly and never consult a format.
+    /// which render through the lean grammar (or do not render at all) and
+    /// never consult a format.
     pub fn default_maintenance_format(&self) -> Option<OutputFormat> {
         match self {
-            Command::Start(_) | Command::Stop(_) | Command::Status(_) | Command::Update(_) => {
-                Some(OutputFormat::Human)
-            }
+            Command::Start(_)
+            | Command::Stop(_)
+            | Command::Status(_)
+            | Command::HelloAgent(_)
+            | Command::Update(_) => Some(OutputFormat::Human),
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::Search(_)
             | Command::Get(_)
@@ -111,7 +114,6 @@ impl Command {
             | Command::Context(_)
             | Command::Impact(_)
             | Command::Structural(_)
-            | Command::Mcp(_)
             | Command::Worker => None,
         }
     }
@@ -119,8 +121,8 @@ impl Command {
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Resolve the maintenance format (if any) before moving out of `cli.command`.
-    // Core commands own their output protocol directly and never consult a
-    // format; their dispatch arms below take no format argument.
+    // Core commands render through the lean grammar directly and never consult
+    // a format; their dispatch arms below take no format argument.
     let maintenance_format = cli.command.default_maintenance_format();
     match cli.command {
         Command::Init(args) => {
@@ -145,7 +147,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Context(args) => context::exec(args).await,
         Command::Impact(args) => impact::exec(args).await,
         Command::Structural(args) => structural::exec(args).await,
-        Command::Mcp(args) => mcp::exec(args).await,
         Command::Index(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             index::exec(args, format).await
@@ -153,6 +154,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Reindex(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             reindex::exec(args, format).await
+        }
+        Command::HelloAgent(args) => {
+            let format = resolve_maintenance_format(args.format, maintenance_format);
+            hello_agent::exec(args, format).await
         }
         Command::Update(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
@@ -193,10 +198,10 @@ mod tests {
     use super::*;
 
     /// Core commands (`search`, `get`, `symbol`, `impact`, `context`,
-    /// `structural`, `mcp`) must not accept any presentation flag. Verifies at clap
+    /// `structural`) must not accept any presentation flag. Verifies at clap
     /// parse time that `-f`/`--format` (and variants like `--human`/`--full`)
-    /// are rejected as unknown arguments so agents get a clean signal, not
-    /// silent coercion.
+    /// are rejected as unknown arguments — agents relying on the lean grammar
+    /// get a clean signal, not silent coercion.
     #[test]
     fn core_commands_have_no_format_arg() {
         let core_cases: &[&[&str]] = &[
@@ -219,8 +224,6 @@ mod tests {
             &["1up", "impact", "--from-symbol", "Config", "-f", "json"],
             &["1up", "structural", "(identifier) @id", "--format", "json"],
             &["1up", "structural", "(identifier) @id", "-f", "json"],
-            &["1up", "mcp", "--format", "json"],
-            &["1up", "mcp", "-f", "json"],
         ];
         for argv in core_cases {
             let result = Cli::try_parse_from(argv.iter().copied());
@@ -232,7 +235,7 @@ mod tests {
     }
 
     /// Maintenance commands (`start`, `stop`, `status`, `init`, `index`,
-    /// `reindex`, `update`) must still accept `--format`/`-f`
+    /// `reindex`, `update`, `hello-agent`) must still accept `--format`/`-f`
     /// so existing scripting and JSON-consuming integrations keep working.
     #[test]
     fn maintenance_commands_still_accept_format() {
@@ -244,6 +247,7 @@ mod tests {
             &["1up", "init", ".", "--format", "json"],
             &["1up", "index", ".", "--format", "json"],
             &["1up", "reindex", ".", "--format", "json"],
+            &["1up", "hello-agent", "--format", "plain"],
             &["1up", "update", "--status", "--format", "json"],
         ];
         for argv in maintenance_cases {
@@ -262,6 +266,7 @@ mod tests {
             &["1up", "start", "."],
             &["1up", "stop", "."],
             &["1up", "status", "."],
+            &["1up", "hello-agent"],
             &["1up", "update", "--status"],
         ];
         for argv in human_defaults {
@@ -301,7 +306,6 @@ mod tests {
             &["1up", "context", "src/main.rs:1"],
             &["1up", "impact", "--from-symbol", "Config"],
             &["1up", "structural", "(identifier) @id"],
-            &["1up", "mcp"],
         ];
         for argv in core_cases {
             let cli = Cli::parse_from(argv.iter().copied());

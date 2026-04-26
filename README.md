@@ -7,19 +7,18 @@
 </p>
 
 <p align="center">
-  <code>1up</code> combines ranked semantic search, exact-first symbol lookup, file:line reading,
-  and likely-impact exploration through MCP tools and a manual CLI.
+  <code>1up</code> combines ranked semantic search, exact-first symbol lookup, file:line context retrieval,
+  and structural AST search in one CLI so agents can find the right code path fast.
 </p>
 
-`1up` is built for code exploration, not raw text dumping. Use it when you want to understand how a system works, jump to the right symbol, or inspect selected code with minimal noise. For MCP-enabled agents, use the `oneup_*` tools first; keep `rg` or `grep` for exact literal verification after 1up has narrowed the scope to specific files.
+`1up` is built for code exploration, not raw text dumping. Use it when you want to understand how a system works, jump to the right symbol, or inspect surrounding code with minimal noise. Keep `rg` for exact strings, logs, config keys, and any search where you need guaranteed-complete text matches.
 
 ## Why 1up
 
 - Search by intent, not just keywords.
-- Move from discovery to hydration, symbol verification, and likely-impact follow-up.
-- Return structured MCP results with handles and next actions for agents.
-- Keep compact CLI rows for humans and scripts.
-- Emit `plain`, `human`, or `json` output for terminals and scripts.
+- Move from discovery to verification with `search`, `symbol -r`, and `context`.
+- Return compact, ranked results that fit agent workflows and context windows.
+- Emit `plain`, `human`, or `json` output for terminals, scripts, and coding agents.
 - Keep the index warm on macOS and Linux with a background daemon.
 
 ## Install
@@ -60,38 +59,21 @@ Verify the install:
 
 > **Unsupported platforms.** The install script targets macOS on Apple Silicon and Linux (arm64 and x86_64). Intel macOS and other platforms are not in the published release matrix yet; download the matching archive directly from [GitHub Releases](https://github.com/rp1-run/1up/releases) when one is available for your platform, verify it against the published `SHA256SUMS` file from the same release, and place the `1up` binary on your `PATH`.
 
-## Agent Integration: MCP
+## Strongly Recommended: Install the Agent Skill
 
-The supported agent path is the local MCP server. Configure your MCP-capable client with command `1up` and args `["mcp", "--path", "<repo>"]`:
+After you install `1up`, the most effective setup for agentic work is to install the portable agent skill once:
 
-```json
-{
-  "mcpServers": {
-    "oneup": {
-      "command": "1up",
-      "args": ["mcp", "--path", "<repo>"]
-    }
-  }
-}
+```sh
+npx skills add rp1-run/1up
 ```
 
-The MCP server is local to the configured repository. It does not edit source files, refactor code, run tests, or execute arbitrary shell commands. Index changes are limited to normal `.1up` local index lifecycle operations, and reindexing is explicit.
+This teaches supported agents when to use `1up search`, `1up symbol`, `1up context`, and `1up structural`, and when `rg` is still the better choice.
 
-The default MCP palette exposes one canonical name per tool:
+On macOS and Linux, `1up start` also creates or updates versioned 1up reminder fences in `AGENTS.md` and `CLAUDE.md` inside the repo. You can preview the injected reminder with:
 
-| Agent need | MCP tool |
-|---|---|
-| Check readiness, missing index, stale schema, or degraded state | `oneup_prepare` |
-| Search by meaning or intent for discovery | `oneup_search` |
-| Read selected handles or precise file locations | `oneup_read` |
-| Find definitions and references when completeness matters | `oneup_symbol` |
-| Explore likely impact from a segment, symbol, or file anchor | `oneup_impact` |
-
-Use `oneup_search` for discovery, not proof of completeness. Hydrate promising handles with `oneup_read`, switch to `oneup_symbol` when you need definitions or references, and use `oneup_impact` for advisory follow-up targets. Tool responses include concise text, structured data, and `next_actions` that name the next `oneup_*` call.
-
-Do not rely on AGENTS/CLAUDE reminder fences, `hello-agent`, the old portable skill, or digit-leading `1up_*` MCP aliases. Those were unshipped before the MCP surface.
-
-Raw `grep`, `rg`, and `find` are not the agent discovery path. After `oneup_search` has narrowed the task to one or two files, `grep` or `rg` remains appropriate for exact literal verification.
+```sh
+1up hello-agent --format human
+```
 
 ## Get Started
 
@@ -112,7 +94,7 @@ cd C:\path\to\repo
 1up index . --format human
 ```
 
-Core manual CLI commands (`search`, `symbol`, `impact`, `context`, `structural`, `get`) emit a single lean row grammar and do not accept `--format`. Maintenance commands (`start`, `stop`, `status`, `init`, `index`, `reindex`, `update`) still accept `--format plain|json|human` — use `--format human` for interactive terminal output.
+Core agent-facing commands (`search`, `symbol`, `impact`, `context`, `structural`, `get`) emit a single lean row grammar and do not accept `--format`. Maintenance commands (`start`, `stop`, `status`, `init`, `index`, `reindex`, `update`, `hello-agent`) still accept `--format plain|json|human` — use `--format human` for interactive terminal output.
 
 Try a few common workflows:
 
@@ -138,7 +120,7 @@ On macOS and Linux:
 
 If your machine restarts, the next `1up start` brings the daemon back and resumes watching any repos that were not stopped.
 
-## Choose the Right CLI Command
+## Choose the Right Command
 
 | If you need to... | Use | Why |
 |---|---|---|
@@ -152,7 +134,7 @@ If your machine restarts, the next `1up start` brings the daemon back and resume
 
 Each discovery row emitted by the core commands ends with a `:<segment_id>` handle (12 hex chars). Pass that handle back to `1up get` to pull the full body, or to `1up impact --from-segment <handle>` for bounded likely-impact follow-up — no `file:line` reconstruction required.
 
-## Recommended CLI Workflow
+## Recommended Workflow
 
 Use semantic search for discovery, then switch to symbol lookup for completeness:
 
@@ -164,7 +146,7 @@ Use semantic search for discovery, then switch to symbol lookup for completeness
 
 That pattern is important. Semantic search is ranked and intentionally selective. It is excellent for finding the right place to look, but `1up symbol -r` is the safer follow-up when you need all definitions and references for a symbol.
 
-When a manual CLI user needs likely inspection targets after discovery, capture a handle from `search` and hand it off directly:
+When an agent needs the next likely inspection targets after discovery, capture a handle from `search` and hand it off directly:
 
 ```sh
 1up search "load auth config" -n 5
@@ -193,15 +175,13 @@ The Criterion bench suite also covers `impact_file_anchor`, `impact_symbol_ancho
 
 ## Agent Eval Results
 
-The current adoption evals score MCP tool calls and chains: `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact`. They fail broad raw `grep`/`rg`/`find` discovery in the 1up variant, while still allowing exact literal verification after MCP discovery narrows scope.
+The eval suite runs Claude agents with and without `1up` on traced-flow tasks across the pinned [emdash](https://github.com/emdash-cms/emdash) monorepo (1,362 files). Each task asks the agent to trace a multi-file flow or identify blast radius — the kind of exploration where semantic search should outperform keyword matching.
 
 ```sh
 just eval-parallel --summary
 ```
 
-The most recent archived pre-MCP CLI result used Claude agents with and without `1up` on traced-flow tasks across the pinned [emdash](https://github.com/emdash-cms/emdash) monorepo (1,362 files). Each task asked the agent to trace a multi-file flow or identify blast radius.
-
-Archived result (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-agent delegation for apples-to-apples comparison):
+Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-agent delegation for apples-to-apples comparison):
 
 | Task | 1up | baseline | Winner (time) |
 |------|:---:|:--------:|:------:|
