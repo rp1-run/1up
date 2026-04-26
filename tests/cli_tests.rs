@@ -379,6 +379,14 @@ fn start_auto_initializes_project_if_needed() {
 
     let id_path = canonical_dir.join(".1up").join("project_id");
     assert!(id_path.exists(), "start should create .1up/project_id");
+    assert!(
+        !canonical_dir.join("AGENTS.md").exists(),
+        "start must not install legacy AGENTS fence guidance"
+    );
+    assert!(
+        !canonical_dir.join("CLAUDE.md").exists(),
+        "start must not install legacy CLAUDE fence guidance"
+    );
 
     let pid_file = data_dir.join("daemon.pid");
     let deadline = Instant::now() + Duration::from_secs(2);

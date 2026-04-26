@@ -203,6 +203,21 @@ describe("assertReadAfterSearch", () => {
     expect(result.score).toBe(1);
   });
 
+  test("passes when oneup_read hydrates a precise location after search", () => {
+    const result = assertReadAfterSearch(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon worker" }),
+        toolCall("mcp__oneup__oneup_read", {
+          locations: [{ path: "src/daemon/worker.rs", line: 42 }],
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
   test("fails when search is not followed by targeted read", () => {
     const result = assertReadAfterSearch(
       "",
@@ -280,6 +295,20 @@ describe("assertValidOneupMcpCalls", () => {
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("digit-leading");
     expect(result.reason).toContain("errored MCP call oneup_read");
+  });
+
+  test("fails on unknown oneup MCP server tools", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_structural", {
+          query: "(call_expression)",
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("unknown oneup MCP tool");
   });
 });
 
