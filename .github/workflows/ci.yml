@@ -128,3 +128,70 @@ jobs:
             in_package && /^version[[:space:]]*=/ { print $2; exit }
           ' Cargo.toml)
           bash scripts/release/validate_release_metadata.sh "v${version}"
+
+  setup-script-lint:
+    # Shell-only lint gates for scripts/install/setup.sh. Runs fast,
+    # no Rust toolchain needed. REQ-011 (bash 3.2 compat) is covered by
+    # running the script under a pinned bash 3.2 container; REQ-012
+    # (shellcheck) runs natively on the Ubuntu runner.
+    name: setup-script-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        shell: bash
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --severity=style scripts/install/setup.sh
+
+      - name: bash 3.2 compat smoke
+        shell: bash
+        run: |
+          # Parse setup.sh under a pinned bash 3.2 image so macOS system bash
+          # stays in the supported matrix. `bash -n` gives us a hard syntax
+          # gate without needing network access at run time (REQ-011).
+          docker run --rm \
+            -v "$PWD:/s:ro" \
+            bash:3.2 \
+            bash -n /s/scripts/install/setup.sh
+
+  setup-script-integration:
+    # Black-box integration tests for scripts/install/setup.sh. The Linux
+    # leg runs the suite under bash 5.x; the macOS leg runs the same suite
+    # under macOS system bash, which is the canonical bash 3.2.x runtime
+    # the script must support. Together they turn the parse-only bash 3.2
+    # gate into a real fixture-backed runtime check.
+    name: setup-script-integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-setup-script-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-setup-script-
+
+      - name: record bash version
+        shell: bash
+        run: bash --version
+
+      - name: setup_script_tests
+        shell: bash
+        run: cargo test --locked --test setup_script_tests

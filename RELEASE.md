@@ -10,7 +10,14 @@ Operator runbook for cutting and publishing a public `1up` release.
 | Tag | `vX.Y.Z` |
 | Release notes | `CHANGELOG.md` |
 | Public record | GitHub Release plus `CHANGELOG.md` |
-| Supported install channels | GitHub Releases, Homebrew, Scoop |
+| Primary user install channel | `scripts/install/setup.sh` (served at `https://1up.rp1.run/setup.sh`), sourced from GitHub Releases |
+| Optional downstream channels | Homebrew tap and Scoop bucket (published by CI; not advertised as primary in `README.md`) |
+
+## User Install Channel
+
+The `curl -fsSL https://1up.rp1.run/setup.sh | bash` command in `README.md` is the single user-facing install path. It consumes the archive and `SHA256SUMS` artifacts attached to each GitHub Release, so the release flow must keep producing those assets with stable names (`1up-vX.Y.Z-<target>.tar.gz` and `SHA256SUMS`).
+
+Homebrew and Scoop publication remain part of the release pipeline as optional downstream channels. They are no longer advertised in `README.md`; do not remove the CI emissions without also re-coordinating the user install narrative.
 
 ## Preconditions
 

@@ -23,13 +23,32 @@
 
 ## Install
 
-Public installs are intended to come from tagged GitHub releases and first-party package definitions. The distributed executable is always named `1up`.
+Install `1up` on macOS or Linux with one command:
 
-| Channel | Platforms | Command |
-|---|---|---|
-| Homebrew | macOS arm64, Linux | `brew install rp1-run/tap/1up` |
-| Scoop | Windows | `scoop install https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json` |
-| Direct release asset | macOS arm64, Linux arm64, Linux amd64, Windows amd64 | Download the matching archive from [GitHub Releases](https://github.com/rp1-run/1up/releases) |
+```sh
+curl -fsSL https://1up.rp1.run/setup.sh | bash
+```
+
+The installer prints the rc file it updated. Put `1up` on your `PATH` in the current shell by sourcing that file (or open a new shell):
+
+```sh
+source ~/.zshrc   # or ~/.bashrc, per the installer's final message
+```
+
+Then start the daemon from the repo you want to search:
+
+```sh
+1up start
+```
+
+The script detects your platform, downloads the matching release archive from GitHub, verifies its SHA256 checksum when available, installs the binary into `~/.1up/bin`, and ensures that directory is on your `PATH`. No sudo required.
+
+Pin a specific version or override the install directory with environment variables. The install script reads `1UP_*` from its own process env, so pass them through `env` on the right-hand side of the pipe:
+
+```sh
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.7 bash
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_INSTALL_DIR=/opt/1up/bin bash
+```
 
 Verify the install:
 
@@ -38,7 +57,7 @@ Verify the install:
 1up --help
 ```
 
-If you downloaded a release archive directly, download the matching `SHA256SUMS` file from the same GitHub Release and verify the archive before unpacking it.
+> **Unsupported platforms.** The install script targets macOS on Apple Silicon and Linux (arm64 and x86_64). Intel macOS and other platforms are not in the published release matrix yet; download the matching archive directly from [GitHub Releases](https://github.com/rp1-run/1up/releases) when one is available for your platform, verify it against the published `SHA256SUMS` file from the same release, and place the `1up` binary on your `PATH`.
 
 ## Strongly Recommended: Install the Agent Skill
 
@@ -89,6 +108,17 @@ Try a few common workflows:
 The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts. On macOS and Linux, the daemon keeps the index current after `1up start`.
 
 After indexing, `1up status` shows end-to-end timing (including DB, model, and input preparation), scope info (requested vs executed scope and fallback reasons), and prefilter counters (files discovered, metadata-skipped, content-read, and deleted). Use `1up status --format json` to consume these fields programmatically.
+
+## Project Lifecycle
+
+On macOS and Linux:
+
+- `1up start` starts watching the current repo and keeps its index up to date
+- `1up stop` stops watching the current repo
+
+`1up stop` does not remove your local index, so running `1up start` again later will start watching the repo again.
+
+If your machine restarts, the next `1up start` brings the daemon back and resumes watching any repos that were not stopped.
 
 ## Choose the Right Command
 
@@ -168,23 +198,18 @@ Latest results (Sonnet, 2026-04-19, lean CLI — both agents forbidden from sub-
 
 ## Upgrade
 
-Use the same channel you installed from:
+Run `1up update` to replace the installed binary in place:
 
 ```sh
-brew upgrade 1up
-scoop update 1up
+1up update
 ```
 
-For direct release assets, download the newer archive from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify it against `SHA256SUMS`, and replace the existing binary.
+This downloads the latest release, verifies it, and atomically replaces the binary at its current install path. Re-running `1up update` when you are already current is a no-op and exits 0.
 
-## Source Builds
-
-Package installs and release assets are the supported onboarding path. If you need a development build instead:
+Re-run the install script only when you want to pin to a specific version or change the install directory:
 
 ```sh
-git clone https://github.com/rp1-run/1up.git
-cd 1up
-cargo install --path .
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.8 bash
 ```
 
 ## Project Docs
@@ -193,6 +218,18 @@ cargo install --path .
 - Release runbook: [RELEASE.md](RELEASE.md)
 - Contributor policy and merge expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Source-build and engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
+
+## Building from Source (contributors only)
+
+The `curl | bash` install above is the supported path for users. Build from source only if you are hacking on `1up` itself:
+
+```sh
+git clone https://github.com/rp1-run/1up.git
+cd 1up
+cargo install --path .
+```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the full contributor setup.
 
 ## License
 

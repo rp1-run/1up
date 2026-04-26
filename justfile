@@ -26,6 +26,18 @@ bench-vector-index-size *flags:
 security-check:
     ./scripts/security_check.sh
 
+# Local verification gate. Runs formatter, linter, the full test surface,
+# and the install-script lint/smoke introduced by the update-script feature
+# (T4). Uses `cargo test` (no per-suite filters) so any integration test
+# crate added later -- including the security gate's existing targets -- is
+# picked up automatically and verify cannot pass while CI fails.
+verify:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+    shellcheck --severity=style scripts/install/setup.sh
+    bash -n scripts/install/setup.sh
+
 eval *flags:
     @cd evals && bun run eval; if echo "{{flags}}" | grep -q -- '--summary'; then just eval-summary; fi
 

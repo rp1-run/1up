@@ -147,6 +147,10 @@ jobs:
         run: |
           mkdir -p "${RUNNER_TEMP}/dist"
           find "${RUNNER_TEMP}/downloads" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.metadata.json' \) -exec cp {} "${RUNNER_TEMP}/dist/" \;
+          # Publish the install script as a release asset so
+          # https://github.com/<repo>/releases/latest/download/setup.sh always
+          # resolves to the current tag's copy (stable 302 redirect target).
+          cp scripts/install/setup.sh "${RUNNER_TEMP}/dist/setup.sh"
 
       - name: generate checksums and manifest
         shell: bash
@@ -198,4 +202,5 @@ jobs:
             "${RUNNER_TEMP}/dist/"*.zip \
             "${RUNNER_TEMP}/dist/SHA256SUMS" \
             "${RUNNER_TEMP}/dist/release-manifest.json" \
+            "${RUNNER_TEMP}/dist/setup.sh" \
             --clobber
