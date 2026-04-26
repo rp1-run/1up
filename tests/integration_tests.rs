@@ -1,8 +1,9 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Mutex;
 use tempfile::TempDir;
 
@@ -43,6 +44,101 @@ fn read_framed_json(stream: &mut UnixStream) -> serde_json::Value {
     let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
     stream.read_exact(&mut payload).unwrap();
     serde_json::from_slice(&payload).unwrap()
+}
+
+struct McpTestClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpTestClient {
+    fn start(path: &Path) -> Self {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
+            .args(["mcp", "--path", path.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+
+        client.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "1up-test",
+                    "version": "0"
+                }
+            }),
+        );
+        client.notify("notifications/initialized", serde_json::json!({}));
+        client
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let response = self.request(
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments
+            }),
+        );
+        response["result"].clone()
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+
+        loop {
+            let mut line = String::new();
+            let bytes = self.stdout.read_line(&mut line).unwrap();
+            assert!(bytes > 0, "MCP server closed stdout before response {id}");
+            let response: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            if response["id"].as_u64() == Some(id) {
+                return response;
+            }
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: serde_json::Value) {
+        self.write(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }));
+    }
+
+    fn write(&mut self, value: serde_json::Value) {
+        let mut line = serde_json::to_vec(&value).unwrap();
+        line.push(b'\n');
+        self.stdin.write_all(&line).unwrap();
+        self.stdin.flush().unwrap();
+    }
+}
+
+impl Drop for McpTestClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// RAII guard that temporarily hides the embedding model to force FTS-only mode.
@@ -1013,6 +1109,50 @@ fn impact_status_line(stdout: &str) -> Option<&str> {
         let token = l.split("  ").next().unwrap_or("");
         matches!(token, "refused" | "empty" | "empty_scoped")
     })
+}
+
+#[test]
+fn mcp_impact_refusal_sets_is_error() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        "oneup_impact",
+        serde_json::json!({ "segment_id": "does-not-exist" }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["status"], "refused");
+    assert_eq!(result["structuredContent"]["data"]["status"], "refused");
+    assert!(result["structuredContent"]["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|action| action["tool"].as_str().unwrap().starts_with("oneup_")));
+}
+
+#[test]
+fn mcp_read_all_failed_handles_sets_is_error() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        "oneup_read",
+        serde_json::json!({ "handles": [":does-not-exist"] }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["status"], "empty");
+    assert_eq!(
+        result["structuredContent"]["data"]["records"][0]["status"],
+        "not_found"
+    );
+    assert_eq!(
+        result["structuredContent"]["next_actions"][0]["tool"],
+        "oneup_search"
+    );
 }
 
 #[test]
