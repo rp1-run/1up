@@ -1,8 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Mutex;
 use tempfile::TempDir;
 
@@ -43,6 +45,158 @@ fn read_framed_json(stream: &mut UnixStream) -> serde_json::Value {
     let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
     stream.read_exact(&mut payload).unwrap();
     serde_json::from_slice(&payload).unwrap()
+}
+
+struct McpTestClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpTestClient {
+    fn start(path: &Path) -> Self {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
+            .args(["mcp", "--path", path.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+
+        client.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "1up-test",
+                    "version": "0"
+                }
+            }),
+        );
+        client.notify("notifications/initialized", serde_json::json!({}));
+        client
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let response = self.request(
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments
+            }),
+        );
+        response["result"].clone()
+    }
+
+    fn list_tools(&mut self) -> serde_json::Value {
+        self.request("tools/list", serde_json::json!({}))["result"].clone()
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+
+        loop {
+            let mut line = String::new();
+            let bytes = self.stdout.read_line(&mut line).unwrap();
+            assert!(bytes > 0, "MCP server closed stdout before response {id}");
+            let response: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            if response["id"].as_u64() == Some(id) {
+                return response;
+            }
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: serde_json::Value) {
+        self.write(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }));
+    }
+
+    fn write(&mut self, value: serde_json::Value) {
+        let mut line = serde_json::to_vec(&value).unwrap();
+        line.push(b'\n');
+        self.stdin.write_all(&line).unwrap();
+        self.stdin.flush().unwrap();
+    }
+}
+
+fn mcp_structured(result: &serde_json::Value) -> &serde_json::Value {
+    &result["structuredContent"]
+}
+
+fn assert_mcp_text_matches_summary(result: &serde_json::Value) {
+    assert_eq!(
+        result["content"][0]["text"],
+        result["structuredContent"]["summary"]
+    );
+}
+
+fn assert_mcp_next_actions_are_canonical(envelope: &serde_json::Value) {
+    let actions = envelope["next_actions"]
+        .as_array()
+        .expect("next_actions must be an array");
+    assert!(
+        !actions.is_empty(),
+        "MCP tool envelopes should include a next action"
+    );
+    for action in actions {
+        let tool = action["tool"]
+            .as_str()
+            .expect("next action tool must be a string");
+        assert!(
+            tool.starts_with("oneup_") && !tool.starts_with("1up_"),
+            "next action should name canonical oneup_* tools only: {action:?}"
+        );
+    }
+}
+
+fn write_running_progress(project: &Path) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("index_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "running",
+            "phase": "scanning",
+            "files_total": 1,
+            "files_scanned": 0,
+            "files_processed": 0,
+            "files_indexed": 0,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "segments_stored": 0,
+            "embeddings_enabled": true,
+            "message": "test indexing",
+            "updated_at": "2026-04-26T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+impl Drop for McpTestClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// RAII guard that temporarily hides the embedding model to force FTS-only mode.
@@ -109,6 +263,46 @@ impl Drop for HideModelGuard {
             let _ = fs::rename(&self.hidden_current_path, &self.current_path);
         }
         let _ = fs::remove_file(&self.marker_path);
+    }
+}
+
+struct RestoreHiddenModelGuard {
+    model_path: PathBuf,
+    hidden_path: PathBuf,
+    restored: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RestoreHiddenModelGuard {
+    fn new() -> Self {
+        let lock = MODEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let model_dir = dirs::data_dir()
+            .unwrap()
+            .join("1up")
+            .join("models")
+            .join("all-MiniLM-L6-v2");
+        let model_path = model_dir.join("model.onnx");
+        let hidden_path = model_dir.join("model.onnx.hidden_by_test");
+        let restored = !model_path.exists() && hidden_path.exists();
+
+        if restored {
+            fs::rename(&hidden_path, &model_path).unwrap();
+        }
+
+        Self {
+            model_path,
+            hidden_path,
+            restored,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for RestoreHiddenModelGuard {
+    fn drop(&mut self) {
+        if self.restored && self.model_path.exists() {
+            let _ = fs::rename(&self.model_path, &self.hidden_path);
+        }
     }
 }
 
@@ -1013,6 +1207,303 @@ fn impact_status_line(stdout: &str) -> Option<&str> {
         let token = l.split("  ").next().unwrap_or("");
         matches!(token, "refused" | "empty" | "empty_scoped")
     })
+}
+
+#[test]
+fn mcp_tools_list_default_palette_and_schemas() {
+    let tmp = TempDir::new().unwrap();
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.list_tools();
+    let tools = result["tools"].as_array().unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "oneup_impact",
+            "oneup_prepare",
+            "oneup_read",
+            "oneup_search",
+            "oneup_symbol",
+        ])
+    );
+    assert_eq!(tools.len(), 5);
+
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(name.starts_with("oneup_"));
+        assert!(!name.starts_with("1up_"));
+        assert!(
+            description.starts_with("Check ")
+                || description.starts_with("Search ")
+                || description.starts_with("Read ")
+                || description.starts_with("Find ")
+                || description.starts_with("Explore "),
+            "description should front-load tool selection guidance: {description}"
+        );
+        assert!(
+            tool.get("inputSchema").is_some() || tool.get("input_schema").is_some(),
+            "tool should expose an input schema: {tool:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_prepare_reports_readiness_states_and_next_actions() {
+    let missing = TempDir::new().unwrap();
+    let mut missing_client = McpTestClient::start(missing.path());
+    let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let missing_envelope = mcp_structured(&missing_result);
+    assert_eq!(missing_envelope["status"], "missing");
+    assert_eq!(missing_envelope["data"]["project_initialized"], false);
+    assert_eq!(
+        missing_envelope["next_actions"][0]["arguments"]["mode"],
+        "index_if_missing"
+    );
+    assert_mcp_next_actions_are_canonical(missing_envelope);
+
+    let indexing = TempDir::new().unwrap();
+    write_running_progress(indexing.path());
+    let mut indexing_client = McpTestClient::start(indexing.path());
+    let indexing_result = indexing_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let indexing_envelope = mcp_structured(&indexing_result);
+    assert_eq!(indexing_envelope["status"], "indexing");
+    assert_eq!(
+        indexing_envelope["next_actions"][0]["tool"],
+        "oneup_prepare"
+    );
+    assert_eq!(
+        indexing_envelope["next_actions"][0]["arguments"]["mode"],
+        "check"
+    );
+
+    let stale = TempDir::new().unwrap();
+    fs::create_dir_all(stale.path().join(".1up")).unwrap();
+    fs::write(stale.path().join(".1up").join("project_id"), "test-project").unwrap();
+    fs::write(
+        stale.path().join(".1up").join("index.db"),
+        b"not a current schema",
+    )
+    .unwrap();
+    let mut stale_client = McpTestClient::start(stale.path());
+    let stale_result = stale_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let stale_envelope = mcp_structured(&stale_result);
+    assert_eq!(stale_envelope["status"], "stale");
+    assert_eq!(stale_envelope["next_actions"][0]["tool"], "oneup_prepare");
+    assert_eq!(
+        stale_envelope["next_actions"][0]["arguments"]["mode"],
+        "reindex"
+    );
+
+    {
+        let _model_guard = RestoreHiddenModelGuard::new();
+        let ready = create_multi_lang_fixture();
+        init_and_index(&ready);
+        let mut ready_client = McpTestClient::start(ready.path());
+        let ready_result = ready_client.call_tool("oneup_prepare", serde_json::json!({}));
+        let ready_envelope = mcp_structured(&ready_result);
+        assert_eq!(ready_envelope["status"], "ready");
+        assert_eq!(ready_envelope["data"]["index_readable"], true);
+        assert_eq!(ready_envelope["next_actions"][0]["tool"], "oneup_search");
+    }
+
+    let degraded = create_multi_lang_fixture();
+    let _guard = init_and_index_fts_only(&degraded);
+    let mut degraded_client = McpTestClient::start(degraded.path());
+    let degraded_result = degraded_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let degraded_envelope = mcp_structured(&degraded_result);
+    assert_eq!(degraded_envelope["status"], "degraded");
+    assert_eq!(degraded_envelope["data"]["index_readable"], true);
+    assert!(
+        degraded_envelope["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["tool"] == "oneup_search"),
+        "degraded readiness should still allow search as a next action"
+    );
+}
+
+#[test]
+fn mcp_search_read_symbol_structured_envelopes() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let search = client.call_tool(
+        "oneup_search",
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 3 }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_text_matches_summary(&search);
+    let search_envelope = mcp_structured(&search);
+    assert_eq!(search_envelope["status"], "degraded");
+    assert_mcp_next_actions_are_canonical(search_envelope);
+    assert!(search_envelope["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["tool"] == "oneup_read"));
+
+    let hit = &search_envelope["data"]["results"][0];
+    let handle = hit["handle"].as_str().unwrap();
+    assert!(!handle.is_empty());
+    assert_eq!(hit["path"], "src/policy.rs");
+    assert!(!hit["kind"].as_str().unwrap().is_empty());
+    assert!(hit["score"].as_u64().unwrap() <= 100);
+    assert!(hit["line_end"].as_u64().unwrap() >= hit["line_start"].as_u64().unwrap());
+
+    let read_handle = client.call_tool(
+        "oneup_read",
+        serde_json::json!({ "handles": [format!(":{handle}")] }),
+    );
+    assert_mcp_text_matches_summary(&read_handle);
+    let read_handle_envelope = mcp_structured(&read_handle);
+    assert_eq!(read_handle_envelope["status"], "ok");
+    assert_eq!(
+        read_handle_envelope["data"]["records"][0]["segment"]["path"],
+        "src/policy.rs"
+    );
+    assert!(
+        read_handle_envelope["data"]["records"][0]["segment"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("PolicyRuleValidator")
+    );
+    assert_mcp_next_actions_are_canonical(read_handle_envelope);
+
+    let read_location = client.call_tool(
+        "oneup_read",
+        serde_json::json!({
+            "locations": [{ "path": "src/policy.rs", "line": 4, "expansion": 2 }]
+        }),
+    );
+    let read_location_envelope = mcp_structured(&read_location);
+    assert_eq!(read_location_envelope["status"], "ok");
+    assert_eq!(
+        read_location_envelope["data"]["records"][0]["context"]["path"],
+        "src/policy.rs"
+    );
+    assert!(
+        read_location_envelope["data"]["records"][0]["context"]["line_start"]
+            .as_u64()
+            .unwrap()
+            <= 4
+    );
+
+    let symbol = client.call_tool(
+        "oneup_symbol",
+        serde_json::json!({ "name": "PolicyRuleValidator", "include": "both" }),
+    );
+    assert_mcp_text_matches_summary(&symbol);
+    let symbol_envelope = mcp_structured(&symbol);
+    assert_eq!(symbol_envelope["status"], "ok");
+    assert!(symbol_envelope["data"]["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["path"] == "src/policy.rs"
+            && !record["handle"].as_str().unwrap().is_empty()));
+    assert!(symbol_envelope["data"]["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["path"] == "src/runner.rs"
+            && !record["handle"].as_str().unwrap().is_empty()));
+}
+
+#[test]
+fn mcp_impact_preserves_trust_buckets_and_followups() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let expanded = client.call_tool(
+        "oneup_impact",
+        serde_json::json!({ "symbol": "warm_cache_key" }),
+    );
+    assert_mcp_text_matches_summary(&expanded);
+    let expanded_envelope = mcp_structured(&expanded);
+    assert_eq!(expanded_envelope["status"], "expanded");
+    assert!(
+        !expanded_envelope["data"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "file impact should include primary likely-impact results"
+    );
+    assert!(
+        expanded_envelope["data"]["contextual_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["file_path"] == "src/cache/test_support.rs"),
+        "impact output should preserve contextual lower-confidence guidance"
+    );
+    assert_eq!(expanded_envelope["next_actions"][0]["tool"], "oneup_read");
+
+    let empty = client.call_tool(
+        "oneup_impact",
+        serde_json::json!({ "file": "src/admin/config.rs" }),
+    );
+    let empty_envelope = mcp_structured(&empty);
+    assert!(
+        matches!(
+            empty_envelope["status"].as_str().unwrap(),
+            "empty" | "empty_scoped"
+        ),
+        "expected explicit empty impact status, got {empty_envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(empty_envelope);
+}
+
+#[test]
+fn mcp_impact_refusal_sets_is_error() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        "oneup_impact",
+        serde_json::json!({ "segment_id": "does-not-exist" }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["status"], "refused");
+    assert_eq!(result["structuredContent"]["data"]["status"], "refused");
+    assert!(result["structuredContent"]["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|action| action["tool"].as_str().unwrap().starts_with("oneup_")));
+}
+
+#[test]
+fn mcp_read_all_failed_handles_sets_is_error() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        "oneup_read",
+        serde_json::json!({ "handles": [":does-not-exist"] }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["status"], "empty");
+    assert_eq!(
+        result["structuredContent"]["data"]["records"][0]["status"],
+        "not_found"
+    );
+    assert_eq!(
+        result["structuredContent"]["next_actions"][0]["tool"],
+        "oneup_search"
+    );
 }
 
 #[test]

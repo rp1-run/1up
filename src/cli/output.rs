@@ -10,7 +10,7 @@ use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
 use crate::shared::update::{InstallChannel, UpdateStatus};
 
 /// Rendering contract for the maintenance command surface (`start`, `stop`,
-/// `status`, `init`, `index`, `reindex`, `update`, `hello-agent`).
+/// `status`, `init`, `index`, `reindex`, `update`).
 ///
 /// Core agent-facing commands (`search`, `get`, `symbol`, `impact`, `context`,
 /// `structural`) bypass this trait entirely and render through

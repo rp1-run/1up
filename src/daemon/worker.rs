@@ -19,11 +19,10 @@ use crate::search::HybridSearchEngine;
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE, WATCHER_DEBOUNCE_MS,
+    SECURE_STATE_FILE_MODE, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
-use crate::shared::reminder::VERSION;
 use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope, SetupTimings};
 use crate::storage::{db::Db, schema};
 

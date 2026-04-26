@@ -1,6 +1,7 @@
 mod cli;
 mod daemon;
 mod indexer;
+mod mcp;
 mod search;
 mod shared;
 mod storage;
@@ -64,7 +65,10 @@ fn should_show_notification(command: &cli::Command) -> bool {
             return false;
         }
     }
-    !matches!(command, cli::Command::Worker | cli::Command::Update(_))
+    !matches!(
+        command,
+        cli::Command::Mcp(_) | cli::Command::Worker | cli::Command::Update(_)
+    )
 }
 
 /// Extract the explicit maintenance `--format`/`-f` selection, if any. Returns
@@ -78,8 +82,19 @@ fn maintenance_format(command: &cli::Command) -> Option<OutputFormat> {
         cli::Command::Init(args) => args.format,
         cli::Command::Index(args) => args.format,
         cli::Command::Reindex(args) => args.format,
-        cli::Command::HelloAgent(args) => args.format,
         cli::Command::Update(args) => args.format,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_suppresses_passive_update_notification() {
+        let cli = cli::Cli::parse_from(["1up", "mcp"]);
+
+        assert!(!should_show_notification(&cli.command));
     }
 }

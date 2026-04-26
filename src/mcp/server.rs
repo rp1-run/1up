@@ -1,0 +1,56 @@
+use std::path::PathBuf;
+
+use rmcp::{
+    handler::server::router::tool::ToolRouter,
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    tool_handler,
+    transport::stdio,
+    ServerHandler, ServiceExt,
+};
+
+const SERVER_GUIDANCE: &str = "Use 1up for local code discovery, reading selected code, symbol verification, and likely-impact exploration in the configured repository. Use search for discovery, read to hydrate handles or file locations, symbol when completeness matters, and impact for advisory follow-up targets.";
+
+#[derive(Debug, Clone)]
+pub(crate) struct OneupMcpServer {
+    pub(crate) state_root: PathBuf,
+    pub(crate) source_root: PathBuf,
+    pub(crate) tool_router: ToolRouter<Self>,
+}
+
+impl OneupMcpServer {
+    fn new(state_root: PathBuf, source_root: PathBuf) -> Self {
+        Self {
+            state_root,
+            source_root,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn instructions(&self) -> String {
+        format!(
+            "{SERVER_GUIDANCE} Configured repository: {}. Local index state: {}.",
+            self.source_root.display(),
+            self.state_root.display()
+        )
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for OneupMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("1up", env!("CARGO_PKG_VERSION"))
+                    .with_title("1up MCP")
+                    .with_description("Local code discovery MCP server"),
+            )
+            .with_instructions(self.instructions())
+    }
+}
+
+pub async fn serve_stdio(state_root: PathBuf, source_root: PathBuf) -> anyhow::Result<()> {
+    let service = OneupMcpServer::new(state_root, source_root);
+    let running = service.serve(stdio()).await?;
+    let _quit_reason = running.waiting().await?;
+    Ok(())
+}

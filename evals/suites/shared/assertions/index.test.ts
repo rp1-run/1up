@@ -1,48 +1,67 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  assert1upUsed,
   assert1upImpactUsed,
+  assert1upUsed,
   assertExpectedFiles,
+  assertImpactTrustInterpreted,
   assertNoFallbackTools,
+  assertReadAfterSearch,
+  assertSymbolVerificationUsed,
+  assertValidOneupMcpCalls,
   reportEfficiency,
 } from "./index.ts";
 
-function makeContext(commands: string[] = []) {
+let toolId = 0;
+
+function toolCall(name: string, input: unknown = {}, is_error = false) {
+  toolId += 1;
+  return { id: `tool-${toolId}`, name, input, is_error };
+}
+
+function bash(command: string) {
+  return toolCall("Bash", { command });
+}
+
+function makeContext(toolCalls: Array<ReturnType<typeof toolCall>> = []) {
   return {
     providerResponse: {
       metadata: {
-        toolCalls: commands.map((command, index) => ({
-          id: `tool-${index}`,
-          name: "Bash",
-          input: { command },
-        })),
+        toolCalls,
       },
     },
   };
 }
 
 describe("assert1upUsed", () => {
-  test("passes when a 1up command is present", () => {
-    const result = assert1upUsed("", makeContext(['1up search "daemon" -n 5']));
+  test("passes when canonical MCP search is present", () => {
+    const result = assert1upUsed(
+      "",
+      makeContext([toolCall("mcp__oneup__oneup_search", { query: "daemon" })]),
+    );
 
     expect(result.pass).toBe(true);
     expect(result.score).toBe(1);
   });
 
-  test("fails when no 1up command is present", () => {
-    const result = assert1upUsed("", makeContext(["rg daemon src"]));
+  test("fails when only shell CLI 1up is present", () => {
+    const result = assert1upUsed(
+      "",
+      makeContext([bash('1up search "daemon"')]),
+    );
 
     expect(result.pass).toBe(false);
-    expect(result.reason).toContain("rg daemon src");
+    expect(result.reason).toContain("oneup_search");
   });
 });
 
 describe("assert1upImpactUsed", () => {
-  test("passes when 1up impact is present", () => {
+  test("passes when canonical MCP impact is present", () => {
     const result = assert1upImpactUsed(
       "",
-      makeContext(["1up impact --from-symbol FTSManager"]),
+      makeContext([
+        toolCall("mcp__oneup__oneup_impact", { symbol: "FTSManager" }),
+      ]),
     );
 
     expect(result.pass).toBe(true);
@@ -52,11 +71,13 @@ describe("assert1upImpactUsed", () => {
   test("fails when 1up impact is not present", () => {
     const result = assert1upImpactUsed(
       "",
-      makeContext(['1up search "FTSManager"']),
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "FTSManager" }),
+      ]),
     );
 
     expect(result.pass).toBe(false);
-    expect(result.reason).toContain("did not invoke 1up impact");
+    expect(result.reason).toContain("oneup_impact");
   });
 });
 
@@ -64,22 +85,230 @@ describe("assertNoFallbackTools", () => {
   test("passes when fallback search tools are absent", () => {
     const result = assertNoFallbackTools(
       "",
-      makeContext(["1up symbol Pipeline"]),
+      makeContext([toolCall("mcp__oneup__oneup_symbol", { name: "Pipeline" })]),
     );
 
     expect(result.pass).toBe(true);
     expect(result.score).toBe(1);
   });
 
-  test("fails when fallback search tools are used", () => {
+  test("allows exact literal shell verification after MCP search", () => {
     const result = assertNoFallbackTools(
       "",
-      makeContext(["rg daemon src", "grep -R watcher src"]),
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon worker" }),
+        bash('rg -n "Worker" src/daemon/worker.rs'),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
+  test("allows exact literal Grep verification after MCP search", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon worker" }),
+        toolCall("Grep", {
+          pattern: "Worker",
+          path: "src/daemon/worker.rs",
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
+  test("fails broad shell rg discovery after MCP search", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        bash("rg daemon src"),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("rg");
+    expect(result.reason).toContain("exact literal file verification");
+  });
+
+  test("fails broad Grep discovery after MCP search", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("Grep", { pattern: "daemon", path: "src" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("Grep");
+    expect(result.reason).toContain("exact literal file verification");
+  });
+
+  test("fails when fallback search tools are used before MCP discovery", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        bash("rg daemon src"),
+        bash("grep -R watcher src"),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
     );
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("rg");
     expect(result.reason).toContain("grep");
+  });
+
+  test("fails when find is used for discovery even after search", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        bash("find src -name '*worker*'"),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("find");
+  });
+
+  test("fails when the direct Find tool is used for discovery", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("Find", { path: "src", pattern: "*worker*" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("Find");
+  });
+});
+
+describe("assertReadAfterSearch", () => {
+  test("passes when oneup_read hydrates a handle after search", () => {
+    const result = assertReadAfterSearch(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_read", { handles: [":abc123def456"] }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
+  test("passes when oneup_read hydrates a precise location after search", () => {
+    const result = assertReadAfterSearch(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon worker" }),
+        toolCall("mcp__oneup__oneup_read", {
+          locations: [{ path: "src/daemon/worker.rs", line: 42 }],
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
+  test("fails when search is not followed by targeted read", () => {
+    const result = assertReadAfterSearch(
+      "",
+      makeContext([toolCall("mcp__oneup__oneup_search", { query: "daemon" })]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_read");
+  });
+});
+
+describe("assertSymbolVerificationUsed", () => {
+  test("passes when oneup_symbol is present", () => {
+    const result = assertSymbolVerificationUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_symbol", {
+          name: "FTSManager",
+          include: "both",
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+});
+
+describe("assertImpactTrustInterpreted", () => {
+  test("passes when impact output trust buckets are interpreted", () => {
+    const result = assertImpactTrustInterpreted(
+      "Primary likely-impact files are query.ts and registry.ts. Contextual lower-confidence callers should be verified.",
+      makeContext([
+        toolCall("mcp__oneup__oneup_impact", { symbol: "FTSManager" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
+  test("gives partial credit when impact is called without trust language", () => {
+    const result = assertImpactTrustInterpreted(
+      "Files: query.ts and registry.ts.",
+      makeContext([
+        toolCall("mcp__oneup__oneup_impact", { symbol: "FTSManager" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.score).toBe(0.5);
+  });
+});
+
+describe("assertValidOneupMcpCalls", () => {
+  test("passes for canonical oneup MCP calls", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_prepare", { mode: "check" }),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
+  test("fails on digit-leading aliases and errored calls", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__1up_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_read", { handles: [":bad"] }, true),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("digit-leading");
+    expect(result.reason).toContain("errored MCP call oneup_read");
+  });
+
+  test("fails on unknown oneup MCP server tools", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_structural", {
+          query: "(call_expression)",
+        }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("unknown oneup MCP tool");
   });
 });
 
