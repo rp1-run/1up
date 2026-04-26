@@ -23,12 +23,7 @@ fn copy_surface(root: &Path, relative_path: &str) {
 fn build_fixture_root() -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
 
-    for relative_path in [
-        "Cargo.toml",
-        "README.md",
-        "LICENSE",
-        "skills/1up-search/SKILL.md",
-    ] {
+    for relative_path in ["Cargo.toml", "README.md", "LICENSE"] {
         copy_surface(tempdir.path(), relative_path);
     }
 

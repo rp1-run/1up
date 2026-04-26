@@ -98,9 +98,10 @@ fn help_shows_all_subcommands() {
             .and(predicate::str::contains("symbol"))
             .and(predicate::str::contains("search"))
             .and(predicate::str::contains("context"))
+            .and(predicate::str::contains("mcp"))
             .and(predicate::str::contains("index"))
             .and(predicate::str::contains("reindex"))
-            .and(predicate::str::contains("hello-agent")),
+            .and(predicate::str::contains("hello-agent").not()),
     );
 }
 
@@ -116,16 +117,7 @@ fn worker_subcommand_hidden_from_help() {
 #[test]
 fn subcommand_help_works() {
     for sub in &[
-        "init",
-        "start",
-        "stop",
-        "status",
-        "symbol",
-        "search",
-        "context",
-        "index",
-        "reindex",
-        "hello-agent",
+        "init", "start", "stop", "status", "symbol", "search", "context", "mcp", "index", "reindex",
     ] {
         cmd()
             .args([sub, "--help"])
@@ -133,6 +125,15 @@ fn subcommand_help_works() {
             .success()
             .stdout(predicate::str::contains("Usage:"));
     }
+}
+
+#[test]
+fn hello_agent_subcommand_is_removed() {
+    cmd()
+        .arg("hello-agent")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
 }
 
 #[test]
@@ -675,44 +676,6 @@ fn reindex_watch_plain_output_streams_rebuild_and_completion() {
             predicate::str::contains("event:index_progress")
                 .and(predicate::str::contains("index_phase:rebuilding"))
                 .and(predicate::str::contains("index_phase:complete")),
-        );
-}
-
-#[test]
-fn hello_agent_plain_output_contains_key_commands() {
-    cmd().args(["hello-agent"]).assert().success().stdout(
-        predicate::str::contains("1up search")
-            .and(predicate::str::contains("1up symbol"))
-            .and(predicate::str::contains("1up context"))
-            .and(predicate::str::contains("1up structural")),
-    );
-}
-
-#[test]
-fn hello_agent_json_output_is_valid_json() {
-    let output = cmd()
-        .args(["hello-agent", "--format", "json"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(parsed["instruction"]
-        .as_str()
-        .unwrap()
-        .contains("1up search"));
-}
-
-#[test]
-fn hello_agent_human_output_has_header() {
-    cmd()
-        .args(["hello-agent", "--format", "human"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("1up Agent Instructions")
-                .and(predicate::str::contains("1up search")),
         );
 }
 

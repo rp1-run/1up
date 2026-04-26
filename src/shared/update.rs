@@ -10,10 +10,9 @@ use crate::shared::config;
 use crate::shared::constants::{
     SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS,
     UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
-    UPDATE_MANIFEST_URL_ENV_VAR, XDG_STATE_DIR_MODE,
+    UPDATE_MANIFEST_URL_ENV_VAR, VERSION, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
-use crate::shared::reminder::VERSION;
 
 /// Machine-readable update manifest fetched from the configured update URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
