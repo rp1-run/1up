@@ -160,11 +160,19 @@ jobs:
             bash -n /s/scripts/install/setup.sh
 
   setup-script-integration:
-    # Black-box integration tests for scripts/install/setup.sh. Mirrors the
-    # `just setup-script-tests` local gate so setup.sh regressions fail the
-    # PR instead of sneaking in behind the shell-lint job.
-    name: setup-script-integration
-    runs-on: ubuntu-24.04
+    # Black-box integration tests for scripts/install/setup.sh. The Linux
+    # leg runs the suite under bash 5.x; the macOS leg runs the same suite
+    # under macOS system bash, which is the canonical bash 3.2.x runtime
+    # the script must support. Together they turn the parse-only bash 3.2
+    # gate into a real fixture-backed runtime check.
+    name: setup-script-integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -179,6 +187,10 @@ jobs:
             target
           key: rust-${{ runner.os }}-setup-script-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-setup-script-
+
+      - name: record bash version
+        shell: bash
+        run: bash --version
 
       - name: setup_script_tests
         shell: bash

@@ -8,8 +8,9 @@
 //!
 //! Matrix coverage (REQ-001..014 via feature task T4):
 //!   happy_path, idempotent_re_run, checksum_mismatch,
-//!   missing_sha256sums_warn, unsupported_platform, pinned_version,
-//!   pinned_version_missing, custom_install_dir.
+//!   missing_sha256sums_warn, unsupported_platform,
+//!   unsupported_intel_macos, pinned_version, pinned_version_missing,
+//!   latest_release, legacy_oneup_tag, custom_install_dir.
 //!
 //! Tests are gated on Unix because setup.sh is a POSIX bash script and the
 //! whole surface is out-of-scope for Windows per requirements §4.2.
@@ -86,20 +87,37 @@ impl ReleaseFixture {
         include_sha256sums: bool,
         tampered_bytes: Option<&[u8]>,
     ) -> Self {
+        Self::new_with_url_and_asset_version(tag, tag, target, include_sha256sums, tampered_bytes)
+    }
+
+    /// Build a fixture where the URL path tag and the asset filename version
+    /// can differ. Models the legacy `oneup-vX.Y.Z` tag form: the release is
+    /// addressable at `oneup-vX.Y.Z` but its archive is named `1up-vX.Y.Z-...`,
+    /// because `package_release_asset.sh` always strips the `oneup-` prefix.
+    /// When `url_tag == asset_version`, behaviour matches the unprefixed case.
+    fn new_with_url_and_asset_version(
+        url_tag: &str,
+        asset_version: &str,
+        target: &str,
+        include_sha256sums: bool,
+        tampered_bytes: Option<&[u8]>,
+    ) -> Self {
         let serve_root = tempfile::tempdir().unwrap().keep();
 
-        // Build archive at <serve_root>/repos/<REPO>/releases/download/<tag>/<archive>
-        let archive_name = format!("1up-{tag}-{target}.tar.gz");
+        // Archive and inner package dir use the asset-version segment (what
+        // setup.sh asks for after stripping any `oneup-` prefix), while the
+        // download URL path uses the raw release tag.
+        let archive_name = format!("1up-{asset_version}-{target}.tar.gz");
         let staging = tempfile::tempdir().unwrap();
-        let package_dir = staging.path().join(format!("1up-{tag}-{target}"));
+        let package_dir = staging.path().join(format!("1up-{asset_version}-{target}"));
         fs::create_dir_all(&package_dir).unwrap();
 
-        // Shell-stub `1up` binary. `--version` prints a matching tag so
-        // end-to-end verification can assert the installed binary is the
-        // one we shipped.
+        // Shell-stub `1up` binary. `--version` prints the URL tag so
+        // end-to-end verification can assert the installed binary matches
+        // the release we shipped under that tag.
         let bin_path = package_dir.join("1up");
         let stub = format!(
-            "#!/usr/bin/env bash\nif [ \"$1\" = \"--version\" ]; then echo \"1up {tag}\"; else echo \"1up fixture stub\"; fi\n"
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"--version\" ]; then echo \"1up {url_tag}\"; else echo \"1up fixture stub\"; fi\n"
         );
         fs::write(&bin_path, stub).unwrap();
         fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -109,7 +127,7 @@ impl ReleaseFixture {
             .join(FIXTURE_REPO)
             .join("releases")
             .join("download")
-            .join(tag);
+            .join(url_tag);
         fs::create_dir_all(&releases_dir).unwrap();
 
         let archive_path = releases_dir.join(&archive_name);
@@ -119,7 +137,7 @@ impl ReleaseFixture {
             .arg(&archive_path)
             .arg("-C")
             .arg(staging.path())
-            .arg(format!("1up-{tag}-{target}"))
+            .arg(format!("1up-{asset_version}-{target}"))
             .output()
             .expect("tar is available on Unix test hosts");
         assert!(
@@ -144,7 +162,8 @@ impl ReleaseFixture {
             fs::write(&archive_path, bytes).unwrap();
         }
 
-        // `/repos/<REPO>/releases/latest` endpoint (GitHub API).
+        // `/repos/<REPO>/releases/latest` endpoint (GitHub API). Returns the
+        // URL tag so unpinned installs resolve to this fixture's release.
         let api_dir = serve_root
             .join("api")
             .join("repos")
@@ -153,7 +172,7 @@ impl ReleaseFixture {
         fs::create_dir_all(&api_dir).unwrap();
         fs::write(
             api_dir.join("latest"),
-            format!("{{\"tag_name\":\"{tag}\"}}\n"),
+            format!("{{\"tag_name\":\"{url_tag}\"}}\n"),
         )
         .unwrap();
 
@@ -376,6 +395,14 @@ fn run_setup(input: RunInput) -> std::process::Output {
         .env_remove("1UP_INSTALL_DIR")
         .env_remove("1UP_VERSION")
         .env_remove("1UP_REPO")
+        // Block bash startup hooks that the caller's interactive shell may
+        // export (e.g. an `~/.bashrc` that defines `BASH_ENV` for cron).
+        // Without this, non-interactive `bash <script>` would source the
+        // caller's environment and contaminate the fixture-based assertions.
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("BASH_FUNC")
+        .env_remove("PROMPT_COMMAND")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -720,6 +747,130 @@ fn setup_honors_pinned_version() {
 }
 
 #[test]
+fn setup_rejects_intel_macos_with_specific_message() {
+    // The release matrix does not currently publish x86_64-apple-darwin, so
+    // setup.sh must fail fast on Intel macOS with a message that calls out
+    // Apple Silicon support, not the generic "unsupported platform" text.
+    // Without this branch, Intel users would 404 on the archive download and
+    // see no actionable error.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    install_curl_wrapper(wrapper_dir.path(), "http://127.0.0.1:1");
+    install_uname_wrapper(wrapper_dir.path(), "Darwin", "x86_64");
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/bash",
+    });
+    assert!(!output.status.success(), "must fail on Intel macOS");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Apple Silicon"),
+        "stderr should mention Apple Silicon: {stderr}"
+    );
+    assert!(
+        stderr.contains("Intel"),
+        "stderr should name the unsupported flavour: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".1up/bin").exists(),
+        "install dir must not be created on Intel macOS"
+    );
+}
+
+#[test]
+fn setup_resolves_latest_release_when_unpinned() {
+    // REQ-009 default path: the README's primary `curl | bash` invocation
+    // sets no version pin, which drives setup.sh through `resolve_tag()` and
+    // its GitHub `releases/latest` API call. This case covers that branch
+    // end-to-end -- a regression in API URL construction or `tag_name` JSON
+    // parsing would slip through every other test (all of which pin).
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: None,
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        output.status.success(),
+        "unpinned install should resolve latest and succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Installed 1up {FIXTURE_TAG}")),
+        "final message should name the resolved tag: {stdout}"
+    );
+
+    let installed = host_home.path().join(".1up/bin/1up");
+    assert!(installed.is_file(), "binary should be installed");
+    let version_out = Command::new(&installed).arg("--version").output().unwrap();
+    let version_stdout = String::from_utf8_lossy(&version_out.stdout);
+    assert!(
+        version_stdout.contains(FIXTURE_TAG),
+        "stub should report the tag returned by the latest API: {version_stdout}"
+    );
+}
+
+#[test]
+fn setup_strips_oneup_prefix_for_legacy_tags() {
+    // The release workflow accepts both `vX.Y.Z` and legacy `oneup-vX.Y.Z`
+    // tag forms but `package_release_asset.sh` always publishes assets named
+    // `1up-vX.Y.Z-<target>.tar.gz` (no `oneup-` segment). setup.sh must keep
+    // the raw tag in the URL path while stripping the prefix when computing
+    // the archive filename, otherwise an unpinned install against a
+    // legacy-tagged release 404s on download.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let url_tag = "oneup-v9.9.9";
+    let asset_version = "v9.9.9";
+    let fixture = ReleaseFixture::new_with_url_and_asset_version(
+        url_tag,
+        asset_version,
+        host_target(),
+        true,
+        None,
+    );
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: None,
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        output.status.success(),
+        "legacy oneup-tag install should succeed once the prefix is stripped from the archive name: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Installed 1up {url_tag}")),
+        "user-facing message should name the resolved release tag: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("release asset not found"),
+        "must not 404: archive filename should drop the oneup- prefix; stderr={stderr}"
+    );
+}
+
+#[test]
 fn setup_fails_cleanly_on_missing_pinned_version() {
     // REQ-009 negative path: pinning to a tag that has no published release
     // asset must exit non-zero and name the missing artefact, with no binary
@@ -757,6 +908,48 @@ fn setup_fails_cleanly_on_missing_pinned_version() {
     assert!(
         !host_home.path().join(".bashrc").exists() && !host_home.path().join(".zshrc").exists(),
         "rc files must not be touched when install fails before configure_path"
+    );
+}
+
+#[test]
+fn setup_rejects_unsafe_install_dir_characters() {
+    // Defense in depth around the rc-file PATH block: setup.sh interpolates
+    // $INSTALL_DIR into `export PATH="<dir>:$PATH"`. A path containing a
+    // double quote, backtick, or `$(` would close the quoted string and
+    // execute the trailing fragment when the rc file is sourced. The script
+    // must reject those values before the rc file is written.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+    let unsafe_dir = host_home.path().join("oops\";touch /tmp/1up-pwn;echo \"");
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: Some(&unsafe_dir),
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        !output.status.success(),
+        "setup.sh must reject unsafe install dirs: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("install directory contains unsupported characters"),
+        "stderr should call out the validation: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".bashrc").exists() && !host_home.path().join(".zshrc").exists(),
+        "rc files must not be touched when the install dir is rejected"
+    );
+    assert!(
+        !std::path::Path::new("/tmp/1up-pwn").exists(),
+        "command-substitution payload must not have executed"
     );
 }
 

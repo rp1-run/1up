@@ -62,6 +62,7 @@ TARGET=""
 TAG=""
 TMP=""
 ARCHIVE=""
+PACKAGE_DIR_NAME=""
 HAVE_SUMS=0
 INSTALL_DIR=""
 
@@ -121,7 +122,12 @@ detect_target() {
 
     case "${os_label}-${arch_label}" in
         darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-        darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
+        darwin-x86_64)
+            # Intel macOS is not in the published release matrix; the script
+            # only advertises platforms that have a matching artifact so users
+            # do not hit an opaque 404 on archive download.
+            fail "unsupported platform: macOS Intel (x86_64) is not currently published. The install script supports macOS on Apple Silicon. See https://github.com/$REPO/releases for available downloads."
+            ;;
         linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
         linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
         *)
@@ -169,7 +175,17 @@ download_artifacts() {
     # shellcheck disable=SC2064
     trap "rm -rf \"$TMP\"" EXIT
 
-    ARCHIVE="1up-${TAG}-${TARGET}.tar.gz"
+    # The release workflow accepts both `vX.Y.Z` and legacy `oneup-vX.Y.Z`
+    # tag forms but always publishes assets with the version-only prefix
+    # (`1up-vX.Y.Z-...`). Strip the optional `oneup-` so we ask for the asset
+    # name actually published; the URL path keeps the raw $TAG.
+    local asset_tag
+    asset_tag="$TAG"
+    case "$asset_tag" in
+        oneup-v*) asset_tag="${asset_tag#oneup-}" ;;
+    esac
+    ARCHIVE="1up-${asset_tag}-${TARGET}.tar.gz"
+    PACKAGE_DIR_NAME="1up-${asset_tag}-${TARGET}"
     local archive_url sums_url
     archive_url="https://github.com/$REPO/releases/download/$TAG/$ARCHIVE"
     sums_url="https://github.com/$REPO/releases/download/$TAG/SHA256SUMS"
@@ -233,6 +249,21 @@ install_binary() {
         INSTALL_DIR="$HOME/.1up/bin"
     fi
 
+    # Reject install-dir values that would corrupt the rc file when
+    # interpolated into `export PATH="<dir>:$PATH"`. The allowlist is
+    # intentionally narrow (path-safe punctuation common in $HOME paths);
+    # quotes, backslashes, command-substitution triggers, whitespace, and
+    # control characters are rejected so a hostile $1UP_INSTALL_DIR cannot
+    # write executable code into ~/.zshrc or ~/.bashrc.
+    case "$INSTALL_DIR" in
+        "")
+            fail "install directory is empty"
+            ;;
+        *[!A-Za-z0-9_./@:+-]*)
+            fail "install directory contains unsupported characters: $INSTALL_DIR (allowed: A-Z a-z 0-9 _ . / : @ + -)"
+            ;;
+    esac
+
     if ! mkdir -p "$INSTALL_DIR"; then
         fail "cannot write to install directory: $INSTALL_DIR"
     fi
@@ -241,12 +272,11 @@ install_binary() {
         fail "failed to extract archive $ARCHIVE"
     fi
 
-    local package_dir staged_binary stage_target
-    package_dir="1up-${TAG}-${TARGET}"
-    staged_binary="$TMP/$package_dir/1up"
+    local staged_binary stage_target
+    staged_binary="$TMP/$PACKAGE_DIR_NAME/1up"
 
     if [ ! -f "$staged_binary" ]; then
-        fail "archive did not contain expected binary: $package_dir/1up"
+        fail "archive did not contain expected binary: $PACKAGE_DIR_NAME/1up"
     fi
 
     chmod 0755 "$staged_binary"

@@ -816,22 +816,24 @@ fn start_warns_on_stale_schema() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    // The human stale-schema warning must come from
+    // `emit_stale_schema_warning` on stdout, not just from the trailing
+    // anyhow error printed on non-zero exit. Asserting on stdout
+    // independently catches a regression where the warning emitter stops
+    // running but the error message alone keeps the substrings alive.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("out of date"),
+        "expected stale-schema warning on stdout to mention 'out of date'; stdout={stdout} stderr={stderr}",
     );
     assert!(
-        combined.contains("out of date"),
-        "expected stale-schema warning to mention 'out of date'; got: {combined}",
+        stdout.contains("1up reindex"),
+        "expected stale-schema warning on stdout to name `1up reindex`; stdout={stdout} stderr={stderr}",
     );
     assert!(
-        combined.contains("1up reindex"),
-        "expected stale-schema warning to name `1up reindex`; got: {combined}",
-    );
-    assert!(
-        combined.contains(&format!("expected v{SCHEMA_VERSION}")),
-        "expected warning to name expected schema version v{SCHEMA_VERSION}; got: {combined}",
+        stdout.contains(&format!("expected v{SCHEMA_VERSION}")),
+        "expected warning on stdout to name expected schema version v{SCHEMA_VERSION}; stdout={stdout} stderr={stderr}",
     );
 
     // BR-06: the on-disk index must be untouched. Content is the primary

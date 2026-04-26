@@ -57,7 +57,7 @@ Verify the install:
 1up --help
 ```
 
-> **Unsupported platforms.** The install script targets macOS and Linux (arm64 and x86_64). On other platforms, download the matching archive directly from [GitHub Releases](https://github.com/rp1-run/1up/releases), verify it against the published `SHA256SUMS` file from the same release, and place the `1up` binary on your `PATH`.
+> **Unsupported platforms.** The install script targets macOS on Apple Silicon and Linux (arm64 and x86_64). Intel macOS and other platforms are not in the published release matrix yet; download the matching archive directly from [GitHub Releases](https://github.com/rp1-run/1up/releases) when one is available for your platform, verify it against the published `SHA256SUMS` file from the same release, and place the `1up` binary on your `PATH`.
 
 ## Strongly Recommended: Install the Agent Skill
 
