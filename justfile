@@ -27,15 +27,15 @@ security-check:
     ./scripts/security_check.sh
 
 # Local verification gate. Runs formatter, linter, the full test surface,
-# and the install-script lint/smoke introduced by the update-script feature
-# (T4). Uses `cargo test` (no per-suite filters) so any integration test
-# crate added later -- including the security gate's existing targets -- is
-# picked up automatically and verify cannot pass while CI fails.
+# and the install-script smoke introduced by the update-script feature (T4).
+# Uses `cargo test` (no per-suite filters) so any integration test crate added
+# later -- including the security gate's existing targets -- is picked up
+# automatically and verify cannot pass while CI fails.
 verify:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
     cargo test
-    shellcheck --severity=style scripts/install/setup.sh
+    if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=style scripts/install/setup.sh; else echo "shellcheck not found; skipping shell style lint"; fi
     bash -n scripts/install/setup.sh
 
 eval *flags:

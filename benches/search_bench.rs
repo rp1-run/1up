@@ -413,6 +413,7 @@ fn setup_impact_db() -> (tempfile::TempDir, std::path::PathBuf) {
             "src/auth/config.rs",
             "src/cache/config.rs",
             "src/ui/config.rs",
+            "src/admin/config.rs",
             "tests/config_fixture.rs",
         ]
         .iter()
