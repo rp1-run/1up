@@ -31,7 +31,8 @@ just install
 Run the default validation set before opening a pull request:
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 just security-check
 ```
@@ -44,6 +45,30 @@ just eval-parallel --summary
 ```
 
 `just security-check` executes the repo security gate and writes retained evidence to `target/security/security-check.json`.
+
+## MCP Adoption Evals
+
+Agent adoption evals live under `evals/suites/1up-search/` and `evals/suites/1up-impact/`. The 1up provider starts the local MCP server with command `1up` and args `["mcp", "--path", "."]`, then grades provider MCP metadata for canonical `oneup_*` calls.
+
+The 1up eval variant expects this chain:
+
+1. `oneup_prepare` when readiness is uncertain.
+2. `oneup_search` before any raw discovery tool.
+3. `oneup_read` to hydrate returned handles or precise locations.
+4. `oneup_symbol` for completeness-oriented definition/reference checks.
+5. `oneup_impact` for likely-impact tasks, with primary/contextual interpretation.
+
+Raw `grep`, `rg`, and `find` are graded as wrong discovery tools in the 1up variant. `grep` and `rg` are allowed only for exact literal verification after `oneup_search` narrows scope to precise files.
+
+Useful eval checks:
+
+```sh
+cd evals
+npm run lint
+npm test
+npx promptfoo validate -c suites/1up-search/evals.yaml
+npx promptfoo validate -c suites/1up-impact/evals.yaml
+```
 
 ## Benchmarking
 
@@ -62,7 +87,7 @@ just bench-parallel
 
 Artifacts land under `target/parallel-index-bench/<repo>-<timestamp>/` as `full-index.json`, `incremental-index.json`, `write-heavy-index.json`, and `summary.json`.
 
-For public eval workflows, use the authored suite under `evals/suites/1up-search/`. That suite also targets the same pinned `emdash` fixture.
+For public eval workflows, use the authored suites under `evals/suites/1up-search/` and `evals/suites/1up-impact/`. The adoption suites target the pinned `emdash` fixture through MCP provider metadata. The recall harness remains a separate CLI retrieval-quality gate for ranking and vector-storage changes.
 
 ## Release And Governance Docs
 

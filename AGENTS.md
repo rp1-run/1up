@@ -46,49 +46,33 @@ that an rp1 skill addresses, briefly suggest it.
 - For deeper questions about rp1, suggest the user invoke /guide.
 <!-- rp1:end:v0.7.1 -->
 
-<!-- 1up:start:0.1.7 -->
-# 1up — Agent Quick Reference
+# 1up MCP Agent Quick Reference
+
+The supported 1up agent integration is MCP. Configure the local server with command `1up` and args `["mcp", "--path", "<repo>"]`.
 
 ## Tool Selection
 
-Pick by what you know, not by habit:
+| You need | Use |
+|---|---|
+| Readiness or index state | `oneup_prepare` |
+| Conceptual code discovery | `oneup_search` |
+| A returned handle or precise file:line | `oneup_read` |
+| Definitions or references for completeness | `oneup_symbol` |
+| Likely follow-up targets or blast radius | `oneup_impact` |
 
-| You know... | Use | Reason |
-|---|---|---|
-| Concept, not files/keywords | `1up search` | Semantic search needs no vocabulary |
-| Symbol/keyword name | `1up symbol -r` or `grep` | Literal match = precise, low noise |
-| Keyword, need ALL instances | `grep` | Guaranteed-complete, best signal:noise |
-| Nothing (new codebase) | `1up search` | Works w/o prior knowledge |
-
-**Sub-agents**: Include this section in sub-agent prompts.
-
-## Setup
-
-`1up status` before searching. Confirm index built + `Last file check` recent (~30s refresh). If not initialized: `1up start` (macOS/Linux) or `1up init && 1up index .`.
-
-## Commands
-
-```
-1up search "<query>" -n 5          # semantic + keyword hybrid
-1up symbol <name> [-r]             # def lookup; -r = all references
-1up context <file>:<line>          # enclosing scope at location
-1up impact --from-symbol <name>    # blast radius from symbol
-1up impact --from-file <path>      # blast radius from file
-1up impact --from-segment <id>     # blast radius from segment
-1up structural "<ts-query>"        # tree-sitter AST pattern search
-```
-
-Flags: `--format plain|json|human` (default: plain), `-v`/`-vv`.
+`oneup_search` is ranked discovery, not proof of completeness. Read selected hits with `oneup_read`, then use `oneup_symbol` when a known symbol needs definitions or references.
 
 ## Workflow
 
-1. `search` — explore by meaning/intent
-2. `symbol` — known or partial name lookup
-3. `context` — read scope at file:line
-4. `impact` — dependency/blast-radius analysis
-5. `structural` — AST-level pattern matching
+1. Call `oneup_prepare` when readiness is uncertain.
+2. Call `oneup_search` with the task intent and a small limit.
+3. Hydrate the best handles or file locations with `oneup_read`.
+4. Use `oneup_symbol` for completeness-oriented symbol checks.
+5. Use `oneup_impact` for advisory primary/contextual follow-up targets.
 
-## Search-then-Verify
+## Boundaries
 
-Semantic search ranks by relevance; may omit matches. Never conclude "only N callers" from search alone. Verify completeness w/ `1up symbol -r <name>` or `grep`.
-<!-- 1up:end:0.1.7 -->
+- Use canonical `oneup_*` MCP names only; do not invent `1up_*` aliases.
+- Do not rely on AGENTS/CLAUDE reminder fences, `hello-agent`, or the old portable skill as the 1up adoption path.
+- `grep` and `rg` are appropriate only for exact literal verification after MCP discovery narrows scope to specific files.
+- The manual CLI remains available for humans and scripts, but agents should prefer MCP tools when the host exposes them.
