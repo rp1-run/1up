@@ -9,7 +9,7 @@
 //! Matrix coverage (REQ-001..014 via feature task T4):
 //!   happy_path, idempotent_re_run, checksum_mismatch,
 //!   missing_sha256sums_warn, unsupported_platform, pinned_version,
-//!   custom_install_dir.
+//!   pinned_version_missing, custom_install_dir.
 //!
 //! Tests are gated on Unix because setup.sh is a POSIX bash script and the
 //! whole surface is out-of-scope for Windows per requirements §4.2.
@@ -716,6 +716,48 @@ fn setup_honors_pinned_version() {
     assert!(
         version_stdout.contains(pinned),
         "installed binary should report pinned tag: {version_stdout}"
+    );
+}
+
+#[test]
+fn setup_fails_cleanly_on_missing_pinned_version() {
+    // REQ-009 negative path: pinning to a tag that has no published release
+    // asset must exit non-zero and name the missing artefact, with no binary
+    // installed. The fixture only publishes FIXTURE_TAG, so requesting any
+    // other tag drives the archive download into a 404.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let missing_tag = "v99.99.99";
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(missing_tag),
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        !output.status.success(),
+        "setup.sh must fail when the pinned tag has no release asset: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("release asset not found") && stderr.contains(missing_tag),
+        "stderr should name the missing tag and asset: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".1up/bin/1up").exists(),
+        "binary must not be installed when the pinned release is missing"
+    );
+    assert!(
+        !host_home.path().join(".bashrc").exists()
+            && !host_home.path().join(".zshrc").exists(),
+        "rc files must not be touched when install fails before configure_path"
     );
 }
 
