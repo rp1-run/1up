@@ -63,10 +63,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            2
-          ],
+          "matched_indices": [0, 2],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -119,11 +116,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            2
-          ],
+          "matched_indices": [0, 1, 2],
           "hit_count": 3,
           "recall": 0.75
         },
@@ -176,10 +169,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -232,9 +222,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            1
-          ],
+          "matched_indices": [1],
           "hit_count": 1,
           "recall": 0.3333333333333333
         },
@@ -341,10 +329,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -397,9 +382,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0
-          ],
+          "matched_indices": [0],
           "hit_count": 1,
           "recall": 0.3333333333333333
         },
@@ -451,11 +434,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            3
-          ],
+          "matched_indices": [0, 1, 3],
           "hit_count": 3,
           "recall": 0.75
         },
@@ -511,9 +490,7 @@
             }
           ],
           "gold_size": 2,
-          "matched_indices": [
-            0
-          ],
+          "matched_indices": [0],
           "hit_count": 1,
           "recall": 0.5
         },
@@ -619,9 +596,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            3
-          ],
+          "matched_indices": [3],
           "hit_count": 1,
           "recall": 0.25
         },
@@ -674,11 +649,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1,
-            2
-          ],
+          "matched_indices": [0, 1, 2],
           "hit_count": 3,
           "recall": 1
         },
@@ -784,12 +755,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            2,
-            3
-          ],
+          "matched_indices": [0, 1, 2, 3],
           "hit_count": 4,
           "recall": 1
         },
@@ -945,10 +911,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            2
-          ],
+          "matched_indices": [0, 2],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -1042,11 +1005,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            2
-          ],
+          "matched_indices": [0, 1, 2],
           "hit_count": 3,
           "recall": 0.75
         },
@@ -1145,10 +1104,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -1243,10 +1199,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -1339,10 +1292,7 @@
             }
           ],
           "gold_size": 2,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 1
         },
@@ -1441,10 +1391,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1
-          ],
+          "matched_indices": [0, 1],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -1542,9 +1489,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0
-          ],
+          "matched_indices": [0],
           "hit_count": 1,
           "recall": 0.3333333333333333
         },
@@ -1640,11 +1585,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            3
-          ],
+          "matched_indices": [0, 1, 3],
           "hit_count": 3,
           "recall": 0.75
         },
@@ -1746,9 +1687,7 @@
             }
           ],
           "gold_size": 2,
-          "matched_indices": [
-            0
-          ],
+          "matched_indices": [0],
           "hit_count": 1,
           "recall": 0.5
         },
@@ -1941,10 +1880,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            2,
-            3
-          ],
+          "matched_indices": [2, 3],
           "hit_count": 2,
           "recall": 0.5
         },
@@ -2038,11 +1974,7 @@
             }
           ],
           "gold_size": 3,
-          "matched_indices": [
-            0,
-            1,
-            2
-          ],
+          "matched_indices": [0, 1, 2],
           "hit_count": 3,
           "recall": 1
         },
@@ -2236,12 +2168,7 @@
             }
           ],
           "gold_size": 4,
-          "matched_indices": [
-            0,
-            1,
-            2,
-            3
-          ],
+          "matched_indices": [0, 1, 2, 3],
           "hit_count": 4,
           "recall": 1
         },
