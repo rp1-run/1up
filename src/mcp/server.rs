@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
 use rmcp::{
+    handler::server::router::tool::ToolRouter,
     model::{Implementation, ServerCapabilities, ServerInfo},
+    tool_handler,
     transport::stdio,
     ServerHandler, ServiceExt,
 };
 
 const SERVER_GUIDANCE: &str = "Use 1up for local code discovery, reading selected code, symbol verification, and likely-impact exploration in the configured repository. Use search for discovery, read to hydrate handles or file locations, symbol when completeness matters, and impact for advisory follow-up targets.";
 
-#[derive(Debug)]
-struct OneupMcpServer {
-    state_root: PathBuf,
-    source_root: PathBuf,
+#[derive(Debug, Clone)]
+pub(crate) struct OneupMcpServer {
+    pub(crate) state_root: PathBuf,
+    pub(crate) source_root: PathBuf,
+    pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl OneupMcpServer {
@@ -19,6 +22,7 @@ impl OneupMcpServer {
         Self {
             state_root,
             source_root,
+            tool_router: Self::tool_router(),
         }
     }
 
@@ -31,6 +35,7 @@ impl OneupMcpServer {
     }
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for OneupMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
