@@ -1273,6 +1273,21 @@ fn mcp_tools_list_default_palette_and_schemas() {
             tool.get("inputSchema").is_some() || tool.get("input_schema").is_some(),
             "tool should expose an input schema: {tool:?}"
         );
+
+        let output_schema = tool
+            .get("outputSchema")
+            .or_else(|| tool.get("output_schema"))
+            .expect("tool should expose an output schema");
+        assert_eq!(
+            output_schema["properties"]["data"]["type"],
+            "object",
+            "dynamic envelope data should use an object schema instead of boolean true for OpenCode compatibility: {output_schema:?}"
+        );
+        assert_eq!(
+            output_schema["$defs"]["NextAction"]["properties"]["arguments"]["type"],
+            "object",
+            "dynamic next-action arguments should use an object schema instead of boolean true for OpenCode compatibility: {output_schema:?}"
+        );
     }
 }
 
@@ -1304,6 +1319,12 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
         indexing_envelope["next_actions"][0]["arguments"]["mode"],
         "check"
     );
+
+    let auto_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "auto" }));
+    let auto_envelope = mcp_structured(&auto_result);
+    assert_eq!(auto_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(auto_envelope);
 
     let stale = TempDir::new().unwrap();
     fs::create_dir_all(stale.path().join(".1up")).unwrap();

@@ -1,4 +1,4 @@
-use schemars::JsonSchema;
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,6 +8,7 @@ pub enum PrepareMode {
     #[default]
     Check,
     IndexIfMissing,
+    #[serde(alias = "auto")]
     IndexIfNeeded,
     Reindex,
 }
@@ -83,6 +84,7 @@ pub struct ImpactInput {
 pub struct ToolEnvelope {
     pub status: String,
     pub summary: String,
+    #[schemars(schema_with = "json_object_schema")]
     pub data: Value,
     pub next_actions: Vec<NextAction>,
 }
@@ -91,5 +93,12 @@ pub struct ToolEnvelope {
 pub struct NextAction {
     pub tool: String,
     pub reason: String,
+    #[schemars(schema_with = "json_object_schema")]
     pub arguments: Value,
+}
+
+fn json_object_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "object"
+    })
 }
