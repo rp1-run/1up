@@ -35,7 +35,7 @@ const DEFAULT_SEARCH_LIMIT: usize = 5;
 impl OneupMcpServer {
     #[tool(
         name = "oneup_prepare",
-        description = "Check whether the local repository is ready for 1up MCP search. Use before discovery when index state is unknown.",
+        description = "Check 1up index readiness for the configured repository. Call first when a code-search task starts and readiness is unknown.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Prepare 1up", destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -65,7 +65,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_search",
-        description = "Search source code by meaning; use for discovery, not proof of completeness. Follow returned handles with read, symbol, or impact tools.",
+        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads for implementation, architecture, behavior, and pattern discovery.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Search Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -108,7 +108,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_read",
-        description = "Read code from 1up handles or precise file locations after search, diagnostics, or review comments. Use this to hydrate selected results.",
+        description = "Read selected code from oneup_search handles or precise file locations. Use after search to hydrate results before answering, citing, or editing.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Read Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -179,7 +179,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_symbol",
-        description = "Find definitions and optionally references for a symbol; use after search when completeness matters. Results are grouped by definition and reference.",
+        description = "Find definitions and references for a known symbol. Use after search or read when completeness matters, such as exact symbol resolution or caller/reference checks.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Verify Symbol", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -223,7 +223,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_impact",
-        description = "Explore likely impact from a segment, symbol, or file anchor. Use after search or read when you need advisory follow-up targets.",
+        description = "Explore likely affected code from a segment, symbol, or file anchor. Use after search or read for blast radius and advisory follow-up targets.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Explore Impact", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]

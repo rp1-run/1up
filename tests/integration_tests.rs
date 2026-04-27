@@ -58,6 +58,10 @@ struct McpTestClient {
 
 impl McpTestClient {
     fn start(path: &Path) -> Self {
+        Self::start_with_initialize_response(path).0
+    }
+
+    fn start_with_initialize_response(path: &Path) -> (Self, serde_json::Value) {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
             .args(["mcp", "--path", path.to_str().unwrap()])
             .stdin(Stdio::piped())
@@ -74,7 +78,7 @@ impl McpTestClient {
             next_id: 1,
         };
 
-        client.request(
+        let initialize_response = client.request(
             "initialize",
             serde_json::json!({
                 "protocolVersion": "2025-11-25",
@@ -86,7 +90,7 @@ impl McpTestClient {
             }),
         );
         client.notify("notifications/initialized", serde_json::json!({}));
-        client
+        (client, initialize_response)
     }
 
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
@@ -1233,6 +1237,37 @@ fn impact_status_line(stdout: &str) -> Option<&str> {
 }
 
 #[test]
+fn mcp_initialize_advertises_primary_code_search_instructions() {
+    let tmp = TempDir::new().unwrap();
+    let (_client, initialize_response) = McpTestClient::start_with_initialize_response(tmp.path());
+
+    let result = &initialize_response["result"];
+    let instructions = result["instructions"]
+        .as_str()
+        .expect("initialize should expose server instructions");
+    assert!(
+        instructions.contains("primary code-search interface"),
+        "instructions should position 1up as the primary code-search path: {instructions}"
+    );
+    assert!(
+        instructions.contains("oneup_search before raw grep, rg, find"),
+        "instructions should guide agents to use MCP before broad raw search: {instructions}"
+    );
+    assert!(
+        instructions.contains("oneup_read"),
+        "instructions should teach the search/read hydration flow: {instructions}"
+    );
+    assert!(
+        instructions.contains(&tmp.path().display().to_string()),
+        "instructions should include the configured repository: {instructions}"
+    );
+    assert_eq!(
+        result["serverInfo"]["description"],
+        "Primary local code search and discovery MCP server"
+    );
+}
+
+#[test]
 fn mcp_tools_list_default_palette_and_schemas() {
     let tmp = TempDir::new().unwrap();
     let mut client = McpTestClient::start(tmp.path());
@@ -1269,6 +1304,13 @@ fn mcp_tools_list_default_palette_and_schemas() {
                 || description.starts_with("Explore "),
             "description should front-load tool selection guidance: {description}"
         );
+        if name == "oneup_search" {
+            assert!(
+                description.contains("primary discovery path")
+                    && description.contains("before raw grep, rg, find"),
+                "oneup_search description should be strong enough for tool adoption: {description}"
+            );
+        }
         assert!(
             tool.get("inputSchema").is_some() || tool.get("input_schema").is_some(),
             "tool should expose an input schema: {tool:?}"
