@@ -156,6 +156,14 @@ while IFS=$'\t' read -r target archive expected_sha; do
     fail "archive ${archive} smoke command did not report version ${manifest_version}"
   fi
 
+  mcp_fixture_dir="$TMP_DIR/mcp-fixture/${target}"
+  mcp_smoke_path="$TMP_DIR/mcp-smoke-${target}.json"
+  mkdir -p "$mcp_fixture_dir"
+  bash "$SCRIPT_DIR/verify_mcp_smoke.sh" \
+    --binary "$binary_fs_path" \
+    --repo "$mcp_fixture_dir" \
+    --output "$mcp_smoke_path"
+
   jq -n \
     --arg target "$target" \
     --arg archive "$archive" \
@@ -165,6 +173,7 @@ while IFS=$'\t' read -r target archive expected_sha; do
     --arg readme_path "$readme_path" \
     --arg smoke_command "$smoke_command" \
     --arg smoke_output "$smoke_output" \
+    --slurpfile mcp_smoke "$mcp_smoke_path" \
     '{
       target: $target,
       archive: $archive,
@@ -178,7 +187,8 @@ while IFS=$'\t' read -r target archive expected_sha; do
         status: "passed",
         command: $smoke_command,
         output: $smoke_output
-      }
+      },
+      mcp_smoke_test: $mcp_smoke[0]
     }' \
     >>"$ARCHIVES_JSONL"
 done < <(jq -r '.artifacts[] | [.target, .archive, .sha256] | @tsv' "$MANIFEST_PATH")

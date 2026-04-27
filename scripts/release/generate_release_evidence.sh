@@ -13,6 +13,8 @@ EVAL_SKIPPED_REASON=""
 BENCHMARK_SUMMARY_PATH=""
 BENCHMARK_SKIPPED_REASON=""
 ARCHIVE_VERIFICATION_PATH=""
+MCP_HOST_SMOKE_PATH=""
+MCP_HOST_SKIPPED_REASON=""
 PACKAGE_RECORD_PATH=""
 OUTPUT_PATH=""
 
@@ -50,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       ARCHIVE_VERIFICATION_PATH="${2:-}"
       shift 2
       ;;
+    --mcp-host-smoke)
+      MCP_HOST_SMOKE_PATH="${2:-}"
+      shift 2
+      ;;
+    --mcp-host-skipped-reason)
+      MCP_HOST_SKIPPED_REASON="${2:-}"
+      shift 2
+      ;;
     --package-record)
       PACKAGE_RECORD_PATH="${2:-}"
       shift 2
@@ -65,7 +75,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$MANIFEST_PATH" || -z "$MERGE_GATE_PATH" || -z "$SECURITY_CHECK_PATH" || -z "$ARCHIVE_VERIFICATION_PATH" || -z "$OUTPUT_PATH" ]]; then
-  fail "usage: $(basename "$0") --manifest <path> --merge-gate <path> --security-check <path> --archive-verification <path> [--eval-summary <path> | --eval-skipped-reason <reason>] [--benchmark-summary <path> | --benchmark-skipped-reason <reason>] [--package-record <path>] --output <path>"
+  fail "usage: $(basename "$0") --manifest <path> --merge-gate <path> --security-check <path> --archive-verification <path> [--mcp-host-smoke <path> | --mcp-host-skipped-reason <reason>] [--eval-summary <path> | --eval-skipped-reason <reason>] [--benchmark-summary <path> | --benchmark-skipped-reason <reason>] [--package-record <path>] --output <path>"
 fi
 
 require_cmd jq
@@ -92,21 +102,76 @@ validate_optional_evidence() {
   fi
 }
 
+validate_mcp_host_evidence() {
+  if [[ -n "$MCP_HOST_SMOKE_PATH" && -n "${MCP_HOST_SKIPPED_REASON//[[:space:]]/}" ]]; then
+    fail "MCP host smoke evidence accepts either a summary path or a skipped reason, not both"
+  fi
+
+  if [[ -z "$MCP_HOST_SMOKE_PATH" && -z "${MCP_HOST_SKIPPED_REASON//[[:space:]]/}" ]]; then
+    MCP_HOST_SKIPPED_REASON="Live MCP host smoke checks require local proprietary agent hosts and were not recorded for this release evidence run."
+  fi
+
+  if [[ -n "$MCP_HOST_SMOKE_PATH" ]]; then
+    require_file "$MCP_HOST_SMOKE_PATH"
+
+    if ! jq -e '
+      def valid_readiness:
+        . as $status | ["missing", "indexing", "stale", "ready", "degraded"] | index($status) != null;
+      def valid_discovery_flow:
+        . as $status | ["passed", "failed", "skipped"] | index($status) != null;
+      def valid_recorded:
+        (.status == "recorded")
+        and (.host | type == "string" and length > 0)
+        and (.host_version | type == "string" and length > 0)
+        and (.setup_mode as $mode | ["wrapper", "add-mcp", "manual"] | index($mode) != null)
+        and (.repo_path | type == "string" and length > 0)
+        and (.tools_listed == true)
+        and (.tools | type == "array" and length > 0)
+        and (.readiness | valid_readiness)
+        and (.discovery_flow | valid_discovery_flow);
+      def valid_skipped:
+        (.status == "skipped")
+        and (.setup_mode == "skipped")
+        and (.reason | type == "string" and length > 0);
+      (.schema == "mcp_host_smoke.v1")
+      and (.hosts | type == "object")
+      and ((.hosts | length) > 0)
+      and ([.hosts[] | (valid_recorded or valid_skipped)] | all)
+    ' "$MCP_HOST_SMOKE_PATH" >/dev/null 2>&1; then
+      fail "MCP host smoke evidence is missing required recorded or skipped fields"
+    fi
+  fi
+}
+
 validate_optional_evidence "eval" "$EVAL_SUMMARY_PATH" "$EVAL_SKIPPED_REASON"
 validate_optional_evidence "benchmark" "$BENCHMARK_SUMMARY_PATH" "$BENCHMARK_SKIPPED_REASON"
+validate_mcp_host_evidence
 
 if ! jq -e '.workflow and .run_url and .conclusion and .required_checks' "$MERGE_GATE_PATH" >/dev/null 2>&1; then
   fail "merge gate metadata is missing required fields"
 fi
 
 if ! jq -e '
+  def canonical_mcp_tools_present:
+    (.mcp_smoke_test.tools | type == "array")
+    and (.mcp_smoke_test.tools as $tools
+      | ["oneup_prepare", "oneup_search", "oneup_read", "oneup_symbol", "oneup_impact"]
+      | all(. as $tool | $tools | index($tool)));
+  def valid_readiness:
+    . as $status | ["missing", "indexing", "stale", "ready", "degraded"] | index($status) != null;
   (.archive_count | numbers)
   and (.archives | type == "array")
   and ((.archives | length) == .archive_count)
   and ([.archives[]
     | (.target and .archive and .sha256)
     and (.verified_contents.binary and .verified_contents.license and .verified_contents.readme)
-    and (.smoke_test.status and .smoke_test.command and .smoke_test.output)
+    and (.smoke_test.status == "passed")
+    and (.smoke_test.command and .smoke_test.output)
+    and (.mcp_smoke_test.status == "passed")
+    and (.mcp_smoke_test.binary and .mcp_smoke_test.version and .mcp_smoke_test.server_command)
+    and canonical_mcp_tools_present
+    and (.mcp_smoke_test.readiness_status | valid_readiness)
+    and (.mcp_smoke_test.stdout_protocol_clean == true)
   ] | all)
 ' "$ARCHIVE_VERIFICATION_PATH" >/dev/null 2>&1; then
   fail "archive verification summary is missing required fields"
@@ -125,17 +190,20 @@ security_json=$(jq -n \
   }')
 
 if [[ -n "$EVAL_SUMMARY_PATH" ]]; then
-  eval_json=$(jq -n \
+  eval_json=$(jq \
     --arg asset "$(basename "$EVAL_SUMMARY_PATH")" \
     '{
       status: "recorded",
-      summary_asset: $asset
-    }')
+      evidence_type: "mcp_adoption",
+      summary_asset: $asset,
+      summary: .
+    }' "$EVAL_SUMMARY_PATH")
 else
   eval_json=$(jq -n \
     --arg reason "$EVAL_SKIPPED_REASON" \
     '{
       status: "skipped",
+      evidence_type: "mcp_adoption",
       skipped_reason: $reason
     }')
 fi
@@ -161,6 +229,30 @@ archive_json=$(jq --arg asset "$(basename "$ARCHIVE_VERIFICATION_PATH")" \
     status: "recorded",
     summary_asset: $asset
   }' "$ARCHIVE_VERIFICATION_PATH")
+
+if [[ -n "$MCP_HOST_SMOKE_PATH" ]]; then
+  mcp_host_smoke_json=$(jq --arg asset "$(basename "$MCP_HOST_SMOKE_PATH")" \
+    '. + {
+      status: "recorded",
+      evidence_asset: $asset
+    }' "$MCP_HOST_SMOKE_PATH")
+else
+  mcp_host_smoke_json=$(jq -n \
+    --arg reason "$MCP_HOST_SKIPPED_REASON" \
+    '{
+      status: "skipped",
+      schema: "mcp_host_smoke.v1",
+      skipped_reason: $reason,
+      hosts: {
+        "codex": { status: "skipped", host: "codex", setup_mode: "skipped", reason: $reason },
+        "claude-code": { status: "skipped", host: "claude-code", setup_mode: "skipped", reason: $reason },
+        "cursor": { status: "skipped", host: "cursor", setup_mode: "skipped", reason: $reason },
+        "vscode": { status: "skipped", host: "vscode", setup_mode: "skipped", reason: $reason },
+        "github-copilot-cli": { status: "skipped", host: "github-copilot-cli", setup_mode: "skipped", reason: $reason },
+        "generic": { status: "skipped", host: "generic", setup_mode: "skipped", reason: $reason }
+      }
+    }')
+fi
 
 if [[ -n "$PACKAGE_RECORD_PATH" ]]; then
   require_file "$PACKAGE_RECORD_PATH"
@@ -202,6 +294,7 @@ jq -n \
   --argjson evals "$eval_json" \
   --argjson benchmarks "$benchmark_json" \
   --argjson archive_verification "$archive_json" \
+  --argjson mcp_host_smoke "$mcp_host_smoke_json" \
   --argjson packages "$packages_json" \
   '{
     version: $version,
@@ -215,6 +308,7 @@ jq -n \
     evals: $evals,
     benchmarks: $benchmarks,
     archive_verification: $archive_verification,
+    mcp_host_smoke: $mcp_host_smoke,
     packages: $packages
   }' \
   >"$OUTPUT_PATH"

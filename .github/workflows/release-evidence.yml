@@ -24,6 +24,15 @@ on:
         required: false
         default: Hosted eval artifacts are not retained for this release candidate.
         type: string
+      mcp_host_smoke_asset:
+        description: Existing release asset name containing mcp_host_smoke.v1 live host evidence
+        required: false
+        type: string
+      mcp_host_skipped_reason:
+        description: Explicit reason to record when no live MCP host smoke asset is available
+        required: false
+        default: Live MCP host smoke checks require local proprietary agent hosts and are recorded by maintainers when available.
+        type: string
       benchmark_skipped_reason:
         description: Optional reason to skip release benchmark generation
         required: false
@@ -101,7 +110,7 @@ jobs:
 
           gh release download "${RELEASE_TAG}" --pattern "$archive" --dir "$release_dir" --clobber
 
-      - name: verify downloaded archive
+      - name: verify downloaded archive and MCP smoke
         shell: bash
         run: |
           bash scripts/release/verify_release_archives.sh \
@@ -309,6 +318,18 @@ jobs:
             exit 1
           fi
 
+          mcp_smoke_count=$(jq -r '
+            [.archives[]
+              | select(.mcp_smoke_test.status == "passed"
+                  and .mcp_smoke_test.stdout_protocol_clean == true)]
+            | length
+          ' "${evidence_dir}/archive-verification.json")
+
+          if [[ "$mcp_smoke_count" -ne "$expected_count" ]]; then
+            echo "archive verification summary is missing passed MCP smoke evidence" >&2
+            exit 1
+          fi
+
       - name: resolve eval evidence
         id: eval
         shell: bash
@@ -324,6 +345,25 @@ jobs:
 
           if [[ -z "${skipped_reason//[[:space:]]/}" ]]; then
             skipped_reason="Hosted eval artifacts are not retained for this release candidate."
+          fi
+
+          echo "skipped_reason=${skipped_reason}" >> "$GITHUB_OUTPUT"
+
+      - name: resolve MCP host smoke evidence
+        id: mcp_host
+        shell: bash
+        run: |
+          evidence_dir="${RUNNER_TEMP}/evidence"
+          asset_name="${{ inputs.mcp_host_smoke_asset }}"
+          skipped_reason="${{ inputs.mcp_host_skipped_reason }}"
+
+          if [[ -n "$asset_name" ]] && gh release download "${RELEASE_TAG}" --pattern "$asset_name" --dir "$evidence_dir" --clobber >/dev/null 2>&1; then
+            echo "evidence_path=${evidence_dir}/${asset_name}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "${skipped_reason//[[:space:]]/}" ]]; then
+            skipped_reason="Live MCP host smoke checks require local proprietary agent hosts and are recorded by maintainers when available."
           fi
 
           echo "skipped_reason=${skipped_reason}" >> "$GITHUB_OUTPUT"
@@ -360,6 +400,12 @@ jobs:
             args+=(--eval-summary "${{ steps.eval.outputs.summary_path }}")
           else
             args+=(--eval-skipped-reason "${{ steps.eval.outputs.skipped_reason }}")
+          fi
+
+          if [[ -n "${{ steps.mcp_host.outputs.evidence_path }}" ]]; then
+            args+=(--mcp-host-smoke "${{ steps.mcp_host.outputs.evidence_path }}")
+          else
+            args+=(--mcp-host-skipped-reason "${{ steps.mcp_host.outputs.skipped_reason }}")
           fi
 
           if [[ -n "${{ steps.benchmark.outputs.summary_path }}" ]]; then

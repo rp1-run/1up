@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 static MODEL_MUTEX: Mutex<()> = Mutex::new(());
@@ -190,6 +192,27 @@ fn write_running_progress(project: &Path) {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_runner(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+set -eu
+{
+  printf 'runner=%s\n' "${0##*/}"
+  i=0
+  for arg in "$@"; do
+    printf 'arg[%s]=%s\n' "$i" "$arg"
+    i=$((i + 1))
+  done
+} > "${ONEUP_FAKE_RUNNER_LOG:?}"
+exit "${ONEUP_FAKE_RUNNER_STATUS:-0}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 impl Drop for McpTestClient {
@@ -2414,6 +2437,186 @@ fn daemon_stale_pid_detection() {
 
     fs::remove_file(&pid_path).unwrap();
     assert!(!pid_path.exists(), "stale PID file should be cleaned up");
+}
+
+// =============================================================================
+// add-mcp wrapper delegation
+// =============================================================================
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_prefers_bunx_then_npx() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("bunx"));
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--agent",
+            "codex",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("runner=bunx"), "unexpected runner log: {log}");
+    assert!(log.contains("arg[0]=add-mcp"));
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_builds_oneup_server_command() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo with spaces");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+            "--agent",
+            "codex",
+            "--agent",
+            "cursor",
+            "--global",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let canonical_repo = repo.canonicalize().unwrap();
+    let expected_source = format!("arg[1]=1up mcp --path '{}'", canonical_repo.display());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("runner=npx"), "unexpected runner log: {log}");
+    assert!(log.contains("arg[0]=add-mcp"), "unexpected argv: {log}");
+    assert!(log.contains(&expected_source), "unexpected argv: {log}");
+    assert!(log.contains("arg[2]=--name"), "unexpected argv: {log}");
+    assert!(log.contains("arg[3]=oneup"), "unexpected argv: {log}");
+    assert!(log.contains("arg[4]=--agent"), "unexpected argv: {log}");
+    assert!(log.contains("arg[5]=codex"), "unexpected argv: {log}");
+    assert!(log.contains("arg[6]=--agent"), "unexpected argv: {log}");
+    assert!(log.contains("arg[7]=cursor"), "unexpected argv: {log}");
+    assert!(log.contains("arg[8]=--global"), "unexpected argv: {log}");
+    assert!(log.contains("arg[9]=--yes"), "unexpected argv: {log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_runner_override_requires_available_runner() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("bunx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Manual MCP setup fallback")
+                .and(predicate::str::contains(
+                    "selected runner `npx` was not found on PATH",
+                ))
+                .and(predicate::str::contains("call `oneup_prepare`")),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_fallback_has_manual_snippets() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .env("ONEUP_FAKE_RUNNER_STATUS", "17")
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Manual MCP setup fallback")
+                .and(predicate::str::contains("Generic MCP JSON"))
+                .and(predicate::str::contains("Codex TOML"))
+                .and(predicate::str::contains("server identity `oneup`"))
+                .and(predicate::str::contains("call `oneup_prepare`"))
+                .and(predicate::str::contains("add-mcp exited with exit code 17")),
+        );
+}
+
+#[test]
+fn add_mcp_does_not_add_config_writer_artifacts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for forbidden_path in [
+        "src/cli/mcp_install.rs",
+        "src/mcp/install",
+        "src/mcp/codex.rs",
+        "src/mcp/claude_code.rs",
+        "src/mcp/cursor.rs",
+        "src/mcp/vscode.rs",
+    ] {
+        assert!(
+            !root.join(forbidden_path).exists(),
+            "unexpected native MCP installer or host adapter artifact: {forbidden_path}"
+        );
+    }
+
+    let wrapper = fs::read_to_string(root.join("src/cli/add_mcp.rs")).unwrap();
+    let production_wrapper = wrapper.split("#[cfg(test)]").next().unwrap();
+    for forbidden_snippet in [
+        "mcp_install",
+        "mcp-install",
+        "std::fs::write",
+        "fs::write",
+        "File::create",
+        "serde_json::to_writer",
+        "toml::to_string",
+    ] {
+        assert!(
+            !production_wrapper.contains(forbidden_snippet),
+            "add-mcp wrapper should not include native config mutation snippet {forbidden_snippet:?}"
+        );
+    }
 }
 
 // =============================================================================

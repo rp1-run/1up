@@ -94,6 +94,46 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn write_mcp_smoke_fixture_binary(path: &Path, non_json_stdout: bool) {
+    let mut script = String::from(
+        r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "--version" ]; then
+  printf '1up smoke-fixture\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "mcp" ]; then
+"#,
+    );
+    if non_json_stdout {
+        script.push_str("  printf 'startup banner\\n'\n");
+    }
+    script.push_str(
+        r#"  while IFS= read -r line; do
+    case "$line" in
+      *'"id":1'*'"method":"initialize"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
+        ;;
+      *'"id":2'*'"method":"tools/list"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_prepare"},{"name":"oneup_search"},{"name":"oneup_read"},{"name":"oneup_symbol"},{"name":"oneup_impact"}]}}'
+        ;;
+      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository is not indexed.","data":{},"next_actions":[{"tool":"oneup_prepare","reason":"index the fixture repository"}]}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+printf 'unsupported fixture invocation\n' >&2
+exit 2
+"#,
+    );
+    write_executable(path, &script);
+}
+
 fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
     let dist_dir = root.join("dist");
     fs::create_dir_all(&dist_dir).unwrap();
@@ -176,7 +216,36 @@ fn write_real_release_archive(
     fs::create_dir_all(&package_dir).unwrap();
     write_executable(
         &package_dir.join(binary_name),
-        &format!("#!/bin/sh\nprintf '1up {version} ({target})\\n'\n"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+
+if [ "${{1:-}}" = "--version" ]; then
+  printf '1up {version} ({target})\n'
+  exit 0
+fi
+
+if [ "${{1:-}}" = "mcp" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *'"id":1'*'"method":"initialize"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"oneup-fixture","version":"{version}"}}}}}}'
+        ;;
+      *'"id":2'*'"method":"tools/list"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_prepare"}},{{"name":"oneup_search"}},{{"name":"oneup_read"}},{{"name":"oneup_symbol"}},{{"name":"oneup_impact"}}]}}}}'
+        ;;
+      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"missing","summary":"Fixture repository is not indexed.","data":{{}},"next_actions":[{{"tool":"oneup_prepare","reason":"index the fixture repository"}}]}}}}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+printf 'unsupported fixture invocation\n' >&2
+exit 2
+"#
+        ),
     );
     fs::copy(repo_root().join("LICENSE"), package_dir.join("LICENSE")).unwrap();
     fs::write(
@@ -669,6 +738,157 @@ fn package_publication_record_captures_repo_commit_refs() {
 }
 
 #[test]
+fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
+    let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
+    let order = [
+        "## 1. Install Or Update 1up",
+        "## 2. Choose Repository Path, Host, And Scope",
+        "## 3. Run Wrapper-First Setup",
+        "## 4. Review Add-MCP Or Host Confirmation",
+        "## 5. Approve Or Trust The Server",
+        "## 6. Verify Tool Listing And Readiness",
+        "## 7. Manual Fallback Setup",
+        "## 8. Troubleshooting",
+        "## 9. Safety And Permissions",
+    ];
+    let mut previous = 0;
+    for heading in order {
+        let position = guide
+            .find(heading)
+            .unwrap_or_else(|| panic!("missing guide heading {heading}"));
+        assert!(
+            position >= previous,
+            "guide heading {heading} appears out of wrapper-first order"
+        );
+        previous = position;
+    }
+
+    for required in [
+        "1up add-mcp --path /absolute/path/to/repo --agent codex",
+        "`1up add-mcp` does not parse, generate, or patch",
+        "Host configuration mutation remains owned by `add-mcp`",
+        "### Codex",
+        "### Claude Code",
+        "### Cursor",
+        "### VS Code And Copilot",
+        "### Generic MCP JSON Client",
+        "server identity `oneup`",
+        "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
+        "oneup_prepare",
+        "Protocol Errors Or Non-JSON Stdout",
+        "It does not:",
+        "Execute arbitrary shell commands",
+        "Mutate host MCP configuration",
+    ] {
+        assert!(
+            guide.contains(required),
+            "MCP installation guide is missing required text: {required}"
+        );
+    }
+
+    for unsupported in ["1up mcp-install", "1up mcp install", "src/mcp/install"] {
+        assert!(
+            !guide.contains(unsupported),
+            "MCP installation guide should not document unsupported installer/config writer path {unsupported}"
+        );
+    }
+}
+
+#[test]
+fn verify_mcp_smoke_lists_tools_and_readiness() {
+    let fixture_root = build_release_fixture();
+    let repo_path = fixture_root.path().join("repo");
+    let binary_path = fixture_root.path().join("fixture-1up");
+    let output_path = fixture_root.path().join("mcp-smoke.json");
+    fs::create_dir_all(&repo_path).unwrap();
+    write_mcp_smoke_fixture_binary(&binary_path, false);
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "verify_mcp_smoke.sh",
+        &[
+            "--binary",
+            binary_path.to_str().unwrap(),
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "MCP smoke unexpectedly failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(evidence["status"], "passed");
+    assert_eq!(evidence["version"], "1up smoke-fixture");
+    assert_eq!(evidence["readiness_status"], "missing");
+    assert_eq!(evidence["stdout_protocol_clean"], true);
+    assert_eq!(evidence["server_command"][1], "mcp");
+    assert_eq!(evidence["server_command"][2], "--path");
+    assert_eq!(
+        evidence["server_command"][3],
+        repo_path.canonicalize().unwrap().to_str().unwrap()
+    );
+    let tools = evidence["tools"].as_array().unwrap();
+    for expected_tool in [
+        "oneup_prepare",
+        "oneup_search",
+        "oneup_read",
+        "oneup_symbol",
+        "oneup_impact",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool == expected_tool),
+            "MCP smoke should include {expected_tool}"
+        );
+    }
+}
+
+#[test]
+fn verify_mcp_smoke_rejects_non_json_stdout() {
+    let fixture_root = build_release_fixture();
+    let repo_path = fixture_root.path().join("repo");
+    let binary_path = fixture_root.path().join("fixture-1up");
+    let output_path = fixture_root.path().join("mcp-smoke.json");
+    fs::create_dir_all(&repo_path).unwrap();
+    write_mcp_smoke_fixture_binary(&binary_path, true);
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "verify_mcp_smoke.sh",
+        &[
+            "--binary",
+            binary_path.to_str().unwrap(),
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "MCP smoke unexpectedly accepted non-JSON stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(evidence["status"], "failed");
+    assert_eq!(evidence["stdout_protocol_clean"], false);
+    let diagnostics = evidence["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.as_str().unwrap().contains("non-JSON stdout")),
+        "expected non-JSON stdout diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
 fn archive_verification_confirms_expected_release_contents() {
     let Some(host_release_target) = supported_host_release_target() else {
         return;
@@ -720,6 +940,192 @@ fn archive_verification_confirms_expected_release_contents() {
         .as_str()
         .unwrap()
         .contains(TEST_RELEASE_VERSION));
+    assert_eq!(
+        verification["archives"][0]["mcp_smoke_test"]["status"],
+        "passed"
+    );
+    assert_eq!(
+        verification["archives"][0]["mcp_smoke_test"]["readiness_status"],
+        "missing"
+    );
+    assert_eq!(
+        verification["archives"][0]["mcp_smoke_test"]["stdout_protocol_clean"],
+        true
+    );
+    let tools = verification["archives"][0]["mcp_smoke_test"]["tools"]
+        .as_array()
+        .unwrap();
+    for expected_tool in [
+        "oneup_prepare",
+        "oneup_search",
+        "oneup_read",
+        "oneup_symbol",
+        "oneup_impact",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool == expected_tool),
+            "archive MCP smoke should include {expected_tool}"
+        );
+    }
+}
+
+#[test]
+fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
+    let fixture_root = build_release_fixture();
+    let repo_path = fixture_root.path().join("repo");
+    let output_path = fixture_root.path().join("mcp-host-smoke.json");
+    fs::create_dir_all(&repo_path).unwrap();
+
+    let recorded_output = run_release_script(
+        fixture_root.path(),
+        "record_mcp_host_smoke.sh",
+        &[
+            "--output",
+            output_path.to_str().unwrap(),
+            "--host",
+            "codex",
+            "--status",
+            "recorded",
+            "--host-version",
+            "codex-cli 0.125.0",
+            "--setup-mode",
+            "wrapper",
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--tool",
+            "oneup_prepare",
+            "--tool",
+            "oneup_search",
+            "--tool",
+            "oneup_read",
+            "--readiness",
+            "ready",
+            "--discovery-flow",
+            "passed",
+        ],
+    );
+    assert!(
+        recorded_output.status.success(),
+        "recorded host smoke unexpectedly failed: {}",
+        String::from_utf8_lossy(&recorded_output.stderr)
+    );
+
+    let skipped_output = run_release_script(
+        fixture_root.path(),
+        "record_mcp_host_smoke.sh",
+        &[
+            "--output",
+            output_path.to_str().unwrap(),
+            "--host",
+            "cursor",
+            "--status",
+            "skipped",
+            "--setup-mode",
+            "skipped",
+            "--reason",
+            "Cursor approval flow was unavailable in the maintainer environment.",
+        ],
+    );
+    assert!(
+        skipped_output.status.success(),
+        "skipped host smoke unexpectedly failed: {}",
+        String::from_utf8_lossy(&skipped_output.stderr)
+    );
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(evidence["schema"], "mcp_host_smoke.v1");
+    assert_eq!(evidence["hosts"]["codex"]["status"], "recorded");
+    assert_eq!(
+        evidence["hosts"]["codex"]["host_version"],
+        "codex-cli 0.125.0"
+    );
+    assert_eq!(evidence["hosts"]["codex"]["setup_mode"], "wrapper");
+    assert_eq!(
+        evidence["hosts"]["codex"]["repo_path"],
+        repo_path.to_str().unwrap()
+    );
+    assert_eq!(evidence["hosts"]["codex"]["tools_listed"], true);
+    assert_eq!(evidence["hosts"]["codex"]["readiness"], "ready");
+    assert_eq!(evidence["hosts"]["codex"]["discovery_flow"], "passed");
+    let tools = evidence["hosts"]["codex"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool == "oneup_prepare"));
+    assert!(tools.iter().any(|tool| tool == "oneup_search"));
+    assert!(tools.iter().any(|tool| tool == "oneup_read"));
+
+    assert_eq!(evidence["hosts"]["cursor"]["status"], "skipped");
+    assert_eq!(evidence["hosts"]["cursor"]["setup_mode"], "skipped");
+    assert_eq!(
+        evidence["hosts"]["cursor"]["reason"],
+        "Cursor approval flow was unavailable in the maintainer environment."
+    );
+}
+
+#[test]
+fn mcp_host_smoke_recorder_requires_skip_reason() {
+    let fixture_root = build_release_fixture();
+    let output_path = fixture_root.path().join("mcp-host-smoke.json");
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "record_mcp_host_smoke.sh",
+        &[
+            "--output",
+            output_path.to_str().unwrap(),
+            "--host",
+            "generic",
+            "--status",
+            "skipped",
+            "--setup-mode",
+            "skipped",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "host smoke unexpectedly accepted a skipped record without a reason: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("skipped host smoke evidence requires --reason"));
+}
+
+#[test]
+fn mcp_host_smoke_recorder_rejects_unsupported_setup_mode() {
+    let fixture_root = build_release_fixture();
+    let repo_path = fixture_root.path().join("repo");
+    let output_path = fixture_root.path().join("mcp-host-smoke.json");
+    fs::create_dir_all(&repo_path).unwrap();
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "record_mcp_host_smoke.sh",
+        &[
+            "--output",
+            output_path.to_str().unwrap(),
+            "--host",
+            "claude-code",
+            "--status",
+            "recorded",
+            "--host-version",
+            "claude-code 1.0.0",
+            "--setup-mode",
+            "native",
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--tool",
+            "oneup_prepare",
+            "--readiness",
+            "ready",
+            "--discovery-flow",
+            "passed",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "host smoke unexpectedly accepted unsupported setup mode: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported setup mode: native"));
 }
 
 #[test]
@@ -998,7 +1404,17 @@ fn release_evidence_rejects_archive_verification_without_smoke_results() {
                     "1up-v{TEST_RELEASE_VERSION}-{host_release_target}.{}",
                     if host_release_target.contains("windows") { "zip" } else { "tar.gz" }
                 ),
-                "sha256": "abc123"
+                "sha256": "abc123",
+                "verified_contents": {
+                    "binary": "1up",
+                    "license": "LICENSE",
+                    "readme": "README.txt"
+                },
+                "smoke_test": {
+                    "status": "passed",
+                    "command": "1up --version",
+                    "output": "1up fixture"
+                }
             }]
         }))
         .unwrap(),

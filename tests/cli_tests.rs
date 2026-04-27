@@ -95,6 +95,7 @@ fn help_shows_all_subcommands() {
             .and(predicate::str::contains("start"))
             .and(predicate::str::contains("stop"))
             .and(predicate::str::contains("status"))
+            .and(predicate::str::contains("add-mcp"))
             .and(predicate::str::contains("symbol"))
             .and(predicate::str::contains("search"))
             .and(predicate::str::contains("context"))
@@ -117,7 +118,8 @@ fn worker_subcommand_hidden_from_help() {
 #[test]
 fn subcommand_help_works() {
     for sub in &[
-        "init", "start", "stop", "status", "symbol", "search", "context", "mcp", "index", "reindex",
+        "init", "start", "stop", "status", "add-mcp", "symbol", "search", "context", "mcp",
+        "index", "reindex",
     ] {
         cmd()
             .args([sub, "--help"])

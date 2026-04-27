@@ -62,18 +62,34 @@ Verify the install:
 
 ## Agent Integration: MCP
 
-The supported agent path is the local MCP server. Configure your MCP-capable client with command `1up` and args `["mcp", "--path", "<repo>"]`:
+The supported agent path is the local MCP server. For wrapper-first setup through external `add-mcp`, use an absolute repository path and the host target:
+
+```sh
+1up add-mcp --path /absolute/path/to/repo --agent codex
+```
+
+Supported targets include `codex`, `claude-code`, `cursor`, `vscode`, and `github-copilot-cli` when the external `add-mcp` flow supports them. The wrapper selects `bunx` or `npx`, delegates configuration changes to `add-mcp`, and falls back to manual setup guidance when it cannot continue.
+
+The direct server command remains:
+
+```sh
+1up mcp --path /absolute/path/to/repo
+```
+
+Manual MCP clients can configure the server directly with command `1up` and args `["mcp", "--path", "/absolute/path/to/repo"]`:
 
 ```json
 {
   "mcpServers": {
     "oneup": {
       "command": "1up",
-      "args": ["mcp", "--path", "<repo>"]
+      "args": ["mcp", "--path", "/absolute/path/to/repo"]
     }
   }
 }
 ```
+
+Full host-specific setup, approval, verification, troubleshooting, and manual fallback examples are in [docs/mcp-installation.md](docs/mcp-installation.md).
 
 The MCP server is local to the configured repository. It does not edit source files, refactor code, run tests, or execute arbitrary shell commands. Index changes are limited to normal `.1up` local index lifecycle operations, and reindexing is explicit.
 
