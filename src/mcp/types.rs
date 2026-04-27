@@ -6,6 +6,8 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub enum PrepareMode {
     #[default]
+    #[serde(alias = "default")]
+    #[serde(alias = "read")]
     Check,
     IndexIfMissing,
     #[serde(alias = "auto")]

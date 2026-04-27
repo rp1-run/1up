@@ -1368,6 +1368,18 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
     assert_eq!(auto_envelope["status"], "indexing");
     assert_mcp_next_actions_are_canonical(auto_envelope);
 
+    let default_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "default" }));
+    let default_envelope = mcp_structured(&default_result);
+    assert_eq!(default_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(default_envelope);
+
+    let read_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "read" }));
+    let read_envelope = mcp_structured(&read_result);
+    assert_eq!(read_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(read_envelope);
+
     let stale = TempDir::new().unwrap();
     fs::create_dir_all(stale.path().join(".1up")).unwrap();
     fs::write(stale.path().join(".1up").join("project_id"), "test-project").unwrap();
@@ -1427,6 +1439,19 @@ fn mcp_search_read_symbol_structured_envelopes() {
     );
     assert_ne!(search["isError"], true);
     assert_mcp_text_matches_summary(&search);
+    let search_text = search["content"][0]["text"].as_str().unwrap();
+    assert!(
+        search_text.contains("src/policy.rs:"),
+        "oneup_search text should include ranked rows, not only a count summary: {search_text}"
+    );
+    assert!(
+        search_text
+            .lines()
+            .any(|line| line.contains("PolicyRuleValidator")
+                && line.contains(":")
+                && line.contains("  ")),
+        "oneup_search text should include a CLI-like row with symbol and handle: {search_text}"
+    );
     let search_envelope = mcp_structured(&search);
     assert_eq!(search_envelope["status"], "degraded");
     assert_mcp_next_actions_are_canonical(search_envelope);
@@ -1449,6 +1474,15 @@ fn mcp_search_read_symbol_structured_envelopes() {
         serde_json::json!({ "handles": [format!(":{handle}")] }),
     );
     assert_mcp_text_matches_summary(&read_handle);
+    let read_handle_text = read_handle["content"][0]["text"].as_str().unwrap();
+    assert!(
+        read_handle_text.contains("segment "),
+        "oneup_read text should include hydrated segment records, not only a status summary: {read_handle_text}"
+    );
+    assert!(
+        read_handle_text.contains("PolicyRuleValidator"),
+        "oneup_read text should include hydrated source content: {read_handle_text}"
+    );
     let read_handle_envelope = mcp_structured(&read_handle);
     assert_eq!(read_handle_envelope["status"], "ok");
     assert_eq!(
@@ -1468,6 +1502,15 @@ fn mcp_search_read_symbol_structured_envelopes() {
         serde_json::json!({
             "locations": [{ "path": "src/policy.rs", "line": 4, "expansion": 2 }]
         }),
+    );
+    let read_location_text = read_location["content"][0]["text"].as_str().unwrap();
+    assert!(
+        read_location_text.contains("context src/policy.rs:"),
+        "oneup_read location text should include hydrated context records: {read_location_text}"
+    );
+    assert!(
+        read_location_text.contains("validate(&self"),
+        "oneup_read location text should include source context: {read_location_text}"
     );
     let read_location_envelope = mcp_structured(&read_location);
     assert_eq!(read_location_envelope["status"], "ok");
