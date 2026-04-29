@@ -293,6 +293,13 @@ pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> Readin
     payload.indexed_files = count_files(&conn).await.ok();
     payload.total_segments = count_segments(&conn).await.ok();
 
+    if payload.total_segments.unwrap_or(0) == 0 {
+        payload.status = ReadinessStatus::Missing;
+        payload.summary = "No indexed code is available for this repository.".to_string();
+        payload.reason = Some("run oneup_prepare with an explicit indexing mode".to_string());
+        return payload;
+    }
+
     let progress_without_embeddings = payload
         .index_progress
         .as_ref()

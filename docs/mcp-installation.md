@@ -17,17 +17,16 @@ Configure 1up MCP for this repository.
 
 1. Resolve the repository root as a canonical absolute path. Use `git rev-parse --show-toplevel` when the directory is a Git checkout; otherwise use `pwd -P`.
 2. If `1up` is not installed, install it with `curl -fsSL https://1up.rp1.run/setup.sh | bash`, make sure the installed binary is on the PATH visible to this agent host, and verify `1up --version`. If `1up` is already installed, run `1up update` and verify `1up --version`.
-3. Configure the MCP server with identity `oneup`, command `1up`, and args `["mcp", "--path", "<absolute repo path>"]`.
-4. Try the wrapper first: `1up add-mcp --path "<absolute repo path>" --agent <host>`, where `<host>` is one of `codex`, `claude-code`, `cursor`, `vscode`, or `github-copilot-cli` when applicable. Use manual host configuration only if the wrapper cannot complete or policy requires a reviewed config file.
-5. Append this minimal 1up hint to the relevant agent instruction file for the repository, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent instruction file. Prefer an existing file; create the host's normal repo instruction file only when none exists.
+3. Add or update the host's normal MCP configuration directly. Use server identity `oneup`, command `1up`, and args `["mcp", "--path", "<absolute repo path>"]`. For JSON-based hosts, use `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<absolute repo path>"]}}}`. For TOML-based hosts, create the equivalent `oneup` server entry with the same command and args.
+4. Append this minimal 1up hint to the relevant agent instruction file for the repository, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent instruction file. Prefer an existing file; create the host's normal repo instruction file only when none exists.
 
 For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
 
-6. Reload or restart the host if needed, approve or trust the `oneup` server when prompted, list MCP tools, and verify that `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` are available.
-7. Call `oneup_prepare` for the configured repository and report the readiness state, files changed, and any host approval still needed.
+5. Reload or restart the host if needed, approve or trust the `oneup` server when prompted, list MCP tools, and verify that `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` are available.
+6. Call `oneup_prepare` for the configured repository and report the readiness state, files changed, and any host approval still needed.
 ```
 
-The prompt keeps host configuration mutation in the wrapper or host-owned config files. It only adds the small repository instruction that tells future agents when to use 1up.
+The prompt keeps host configuration mutation in host-owned config files. It only adds the small repository instruction that tells future agents when to use 1up.
 
 ## Human Quick Setup
 

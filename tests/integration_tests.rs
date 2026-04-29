@@ -1340,7 +1340,7 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_eq!(missing_envelope["status"], "missing");
-    assert_eq!(missing_envelope["data"]["project_initialized"], false);
+    assert_eq!(missing_envelope["data"]["project_initialized"], true);
     assert_eq!(
         missing_envelope["next_actions"][0]["arguments"]["mode"],
         "index_if_missing"
