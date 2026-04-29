@@ -740,7 +740,10 @@ fn package_publication_record_captures_repo_commit_refs() {
 #[test]
 fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
     let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
+    let readme = fs::read_to_string(repo_root().join("README.md")).unwrap();
     let order = [
+        "## Ready-To-Run Agent Prompt",
+        "## Human Quick Setup",
         "## 1. Install Or Update 1up",
         "## 2. Choose Repository Path, Host, And Scope",
         "## 3. Run Wrapper-First Setup",
@@ -764,6 +767,15 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
     }
 
     for required in [
+        "Configure 1up MCP for this repository.",
+        "If `1up` is not installed, install it with",
+        "Append this minimal 1up hint",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".github/copilot-instructions.md",
+        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
+        "Use `oneup_prepare` when readiness is unknown",
+        "list MCP tools",
         "1up add-mcp --path /absolute/path/to/repo --agent codex",
         "`1up add-mcp` does not parse, generate, or patch",
         "Host configuration mutation remains owned by `add-mcp`",
@@ -783,6 +795,19 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
         assert!(
             guide.contains(required),
             "MCP installation guide is missing required text: {required}"
+        );
+    }
+
+    for required in [
+        "ready-to-run agent prompt",
+        "human quick setup path",
+        "minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md`",
+        "Use the plain minimal instruction from the MCP installation guide",
+        "[docs/mcp-installation.md](docs/mcp-installation.md)",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README is missing required MCP setup text: {required}"
         );
     }
 

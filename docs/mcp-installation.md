@@ -8,6 +8,68 @@ Use this guide to connect the local `1up` binary to an MCP-capable agent host. T
 
 The wrapper-first path uses `1up add-mcp` to delegate setup to the external `add-mcp` CLI. Manual snippets are the fallback for locked-down environments, team-managed configuration, or hosts where `add-mcp` cannot complete.
 
+## Ready-To-Run Agent Prompt
+
+Paste this into the agent host you want to configure:
+
+```text
+Configure 1up MCP for this repository.
+
+1. Resolve the repository root as a canonical absolute path. Use `git rev-parse --show-toplevel` when the directory is a Git checkout; otherwise use `pwd -P`.
+2. If `1up` is not installed, install it with `curl -fsSL https://1up.rp1.run/setup.sh | bash`, make sure the installed binary is on the PATH visible to this agent host, and verify `1up --version`. If `1up` is already installed, run `1up update` and verify `1up --version`.
+3. Configure the MCP server with identity `oneup`, command `1up`, and args `["mcp", "--path", "<absolute repo path>"]`.
+4. Try the wrapper first: `1up add-mcp --path "<absolute repo path>" --agent <host>`, where `<host>` is one of `codex`, `claude-code`, `cursor`, `vscode`, or `github-copilot-cli` when applicable. Use manual host configuration only if the wrapper cannot complete or policy requires a reviewed config file.
+5. Append this minimal 1up hint to the relevant agent instruction file for the repository, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent instruction file. Prefer an existing file; create the host's normal repo instruction file only when none exists.
+
+For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
+
+6. Reload or restart the host if needed, approve or trust the `oneup` server when prompted, list MCP tools, and verify that `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` are available.
+7. Call `oneup_prepare` for the configured repository and report the readiness state, files changed, and any host approval still needed.
+```
+
+The prompt keeps host configuration mutation in the wrapper or host-owned config files. It only adds the small repository instruction that tells future agents when to use 1up.
+
+## Human Quick Setup
+
+1. Install or update `1up`, then verify it.
+
+If `1up` is not installed:
+
+```sh
+curl -fsSL https://1up.rp1.run/setup.sh | bash
+1up --version
+```
+
+If `1up` is already installed:
+
+```sh
+1up update
+1up --version
+```
+
+2. Resolve the repository path:
+
+```sh
+cd /path/to/repo
+pwd -P
+```
+
+3. Try wrapper-first setup for your host:
+
+```sh
+1up add-mcp --path /absolute/path/to/repo --agent codex
+```
+
+Use `claude-code`, `cursor`, `vscode`, or `github-copilot-cli` instead of `codex` when configuring that host. If the wrapper cannot complete, use the host-specific manual snippets in [Manual Fallback Setup](#7-manual-fallback-setup).
+
+4. Paste this single minimal agent hint into the repository instruction file your host reads, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent file:
+
+```text
+For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
+```
+
+5. Reload or restart the host if needed, approve or trust the `oneup` server, list MCP tools, and call `oneup_prepare`.
+
 ## 1. Install Or Update 1up
 
 Install `1up` and verify that the installed binary is on the same `PATH` your agent host can use:

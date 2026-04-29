@@ -62,7 +62,9 @@ Verify the install:
 
 ## Agent Integration: MCP
 
-The supported agent path is the local MCP server. For wrapper-first setup through external `add-mcp`, use an absolute repository path and the host target:
+The supported agent path is the local MCP server. The fastest path is to paste the ready-to-run agent prompt from [docs/mcp-installation.md](docs/mcp-installation.md), which asks the agent to install or update `1up`, configure the `oneup` MCP server, add the minimal repository instruction, and verify `oneup_prepare`.
+
+For human setup, use wrapper-first configuration through external `add-mcp` with an absolute repository path and the host target:
 
 ```sh
 1up add-mcp --path /absolute/path/to/repo --agent codex
@@ -89,7 +91,7 @@ Manual MCP clients can configure the server directly with command `1up` and args
 }
 ```
 
-Full host-specific setup, approval, verification, troubleshooting, and manual fallback examples are in [docs/mcp-installation.md](docs/mcp-installation.md).
+Full host-specific setup, the human quick setup path, the minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md`, approval, verification, troubleshooting, and manual fallback examples are in [docs/mcp-installation.md](docs/mcp-installation.md).
 
 The MCP server is local to the configured repository. It does not edit source files, refactor code, run tests, or execute arbitrary shell commands. Index changes are limited to normal `.1up` local index lifecycle operations, and reindexing is explicit.
 
@@ -105,7 +107,7 @@ The default MCP palette exposes one canonical name per tool:
 
 Use `oneup_search` for discovery, not proof of completeness. Hydrate promising handles with `oneup_read`, switch to `oneup_symbol` when you need definitions or references, and use `oneup_impact` for advisory follow-up targets. Tool responses include concise text, structured data, and `next_actions` that name the next `oneup_*` call.
 
-Do not rely on AGENTS/CLAUDE reminder fences, `hello-agent`, the old portable skill, or digit-leading `1up_*` MCP aliases. Those were unshipped before the MCP surface.
+Do not rely on managed AGENTS/CLAUDE reminder fences, `hello-agent`, the old portable skill, or digit-leading `1up_*` MCP aliases. Those were unshipped before the MCP surface. Use the plain minimal instruction from the MCP installation guide when you want future agents to prefer the `oneup_*` tools.
 
 Raw `grep`, `rg`, and `find` are not the agent discovery path. After `oneup_search` has narrowed the task to one or two files, `grep` or `rg` remains appropriate for exact literal verification.
 
