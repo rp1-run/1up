@@ -15,15 +15,41 @@ Paste this into the agent host you want to configure:
 ```text
 Configure 1up MCP for this repository.
 
-1. Resolve the repository root as a canonical absolute path. Use `git rev-parse --show-toplevel` when the directory is a Git checkout; otherwise use `pwd -P`.
-2. If `1up` is not installed, install it with `curl -fsSL https://1up.rp1.run/setup.sh | bash`, make sure the installed binary is on the PATH visible to this agent host, and verify `1up --version`. If `1up` is already installed, run `1up update` and verify `1up --version`.
-3. Add or update the host's normal MCP configuration directly. Use server identity `oneup`, command `1up`, and args `["mcp", "--path", "<absolute repo path>"]`. For JSON-based hosts, use `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<absolute repo path>"]}}}`. For TOML-based hosts, create the equivalent `oneup` server entry with the same command and args.
-4. Append this minimal 1up hint to the relevant agent instruction file for the repository, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent instruction file. Prefer an existing file; create the host's normal repo instruction file only when none exists.
+RULES
+- Configure MCP directly in the host's config. Do not run `1up add-mcp`.
+- Use `MAIN_ROOT` for the MCP path and repository instruction file.
+- If this checkout is a linked Git worktree, `MAIN_ROOT` is the main worktree root, not the linked worktree path.
+- Do not try to restart this active host or verify newly added MCP tools from it.
+
+PROC
+1. Resolve `MAIN_ROOT` as the main worktree root:
+   - If Git is available: run `git rev-parse --path-format=absolute --git-common-dir`.
+   - If the result ends with `/.git`, strip `/.git`; that path is `MAIN_ROOT`. Stop.
+   - Otherwise use `git rev-parse --show-toplevel`.
+   - If Git resolution fails, use `pwd -P`.
+   - Do not substitute the current linked worktree path after `MAIN_ROOT` is resolved.
+2. Install/update `1up`:
+   - If `1up` is not installed, install it with: `curl -fsSL https://1up.rp1.run/setup.sh | bash`
+   - If present: `1up update`
+   - Verify: `1up --version`
+3. Add/update MCP config:
+   - Server name: `oneup`
+   - Command: `1up`
+   - Args: `["mcp", "--path", "<MAIN_ROOT>"]`
+   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<MAIN_ROOT>"]}}}`
+   - For TOML hosts, create the equivalent `oneup` server entry.
+4. Insert this minimal 1up hint into the repo instruction file under `MAIN_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
 
 For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
 
-5. Reload or restart the host if needed, approve or trust the `oneup` server when prompted, list MCP tools, and verify that `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` are available.
-6. Call `oneup_prepare` for the configured repository and report the readiness state, files changed, and any host approval still needed.
+5. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
+
+OUT
+- `MAIN_ROOT`
+- `1up --version`
+- MCP config file changed
+- repo instruction file changed
+- restart/approval message given to user, if needed
 ```
 
 The prompt keeps host configuration mutation in host-owned config files. It only adds the small repository instruction that tells future agents when to use 1up.

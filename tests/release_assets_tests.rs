@@ -768,8 +768,15 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
 
     for required in [
         "Configure 1up MCP for this repository.",
+        "main worktree root",
+        "git rev-parse --path-format=absolute --git-common-dir",
+        "Do not run `1up add-mcp`",
+        "Use `MAIN_ROOT` for the MCP path and repository instruction file.",
+        "Do not try to restart this active host or verify newly added MCP tools from it.",
+        "ask the user to restart/reload this host so it can load `oneup`",
         "If `1up` is not installed, install it with",
-        "Append this minimal 1up hint",
+        "Insert this minimal 1up hint",
+        "Do not duplicate the hint.",
         "AGENTS.md",
         "CLAUDE.md",
         ".github/copilot-instructions.md",
