@@ -2,20 +2,21 @@
 
 ## Summary
 
-1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact` workflow remains a separate local-only read path for bounded advisory exploration. `segment_relations` persists raw, canonical, lookup-tail, qualifier-fingerprint, and normalized `edge_identity_kind` evidence, while `ImpactHorizonEngine` derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, and requires corroborating structural signals before ambiguous or low-signal matches can reach primary `results`. The indexing path is tuned with connection-level PRAGMAs, an `indexed_files` manifest for metadata-based file skipping, and batched multi-value writes, all behind schema v11.
+1up keeps its layered two-process model: a short-lived CLI, an optional long-lived daemon for warm search, and a project-local libSQL index. The `impact` workflow remains a separate local-only read path for bounded advisory exploration. `segment_relations` persists raw, canonical, lookup-tail, qualifier-fingerprint, and normalized `edge_identity_kind` evidence, while `ImpactHorizonEngine` derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, and requires corroborating structural signals before ambiguous or low-signal matches can reach primary `results`. Startup is coordinated by a short-lived per-project guard so defensive `1up start` calls converge on one daemon lifecycle. The indexing path is tuned with connection-level PRAGMAs, an `indexed_files` manifest for metadata-based file skipping, `FLOAT8(384)` vectors, and batched multi-value writes, all behind schema v12.
 
 ## Key Architecture Patterns
 
 | Pattern | Meaning | Evidence |
 |---|---|---|
 | Layered two-process model | CLI and daemon share local state through the project index and status files, not in-process runtime state. | `src/cli/mod.rs`, `src/daemon/search_service.rs` |
+| Idempotent daemon startup | `1up start` serializes startup per project, rechecks state under the guard, skips foreground indexing for current indexes, and observes daemon contention instead of taking over a healthy holder. | `src/cli/start.rs`, `src/daemon/lifecycle.rs`, `src/shared/project.rs` |
 | Staged single-writer indexing | Parse work can fan out, but persisted segment, symbol, vector, relation, and manifest mutations converge through batched multi-value INSERTs in the transactional file-batch seam. | `src/storage/segments.rs`, `src/storage/schema.rs` |
 | Candidate-first retrieval | Search ranks lightweight vector, FTS, and exact-first symbol candidates before hydrating full segment data. | `src/search/hybrid.rs`, `src/storage/queries.rs` |
 | Local-only advisory impact path | `1up impact` reads the current index directly and avoids daemon IPC so discovery behavior remains unchanged. | `src/cli/impact.rs`, `src/search/impact.rs` |
 | Descriptor-backed relation resolution | Unresolved relation rows persist canonical, lookup-tail, qualifier, and edge-identity evidence at write time, then resolve bounded definition candidates through owner-aware shortlisting and corroboration gating only for active seeds. | `src/storage/relations.rs`, `src/search/impact.rs` |
 | Trust-bucketed impact results | Confident relation-backed candidates stay in primary `results`; ambiguous, low-signal, same-file, and test-only observations move to `contextual_results` or explicit empty outcomes. | `src/search/impact.rs`, `src/cli/output.rs` |
 | Additive search handoff | Search results expose optional `segment_id` values for exact impact follow-up without changing ranking. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
-| Schema-gated local state | Schema v11 requires `indexed_files` table and lookup-target, qualifier, and `edge_identity_kind` columns on `segment_relations`; stale indexes fail closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
+| Schema-gated local state | Schema v12 requires `indexed_files` table and lookup-target, qualifier, and `edge_identity_kind` columns on `segment_relations`, plus `FLOAT8(384)` vectors; stale indexes fail closed with explicit reindex guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
 | Interactive guardrails | Benchmarks and black-box tests encode latency, contract, and rollout-gate expectations for the new workflow. | `benches/search_bench.rs`, `tests/integration_tests.rs`, `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_vector_index_size.sh` |
 
 ## Layers
@@ -37,7 +38,15 @@
 2. Callers capture pre-pipeline setup timing (`SetupTimings`) for DB preparation and model loading so `total_ms` reflects end-to-end wall-clock time.
 3. Indexer scans files, enriches them with filesystem metadata (size, mtime), and compares against the `indexed_files` manifest to skip metadata-unchanged files before content reads. Files that pass the metadata prefilter still go through content-hash comparison as the correctness backstop.
 4. Storage writes segments, vectors, canonical symbols, relation descriptors, and `indexed_files` manifest rows through chunked multi-value INSERTs within the existing transactional seam.
-5. Schema validation ensures later reads only proceed against schema v11 with the required `indexed_files` table and relation evidence columns.
+5. Schema validation ensures later reads only proceed against schema v12 with the required `indexed_files` table, relation evidence columns, and `FLOAT8(384)` vector storage.
+
+### Daemon-Backed Startup
+
+1. `1up start` resolves the project state and source roots, then acquires a startup guard file under the secure XDG data root before project initialization, registry mutation, index classification, foreground indexing, or daemon spawn work.
+2. Project identity creation goes through `project::ensure_project_id`, which reads an existing id first, creates `.1up/` only when absent, and re-reads if another caller wins a create race. Registry updates lock, reload, mutate, and save the shared registry file.
+3. When the index is current, start registers the project and daemon settings, probes daemon state, and does not call `run_initial_index`. The start result omits index `progress` and `work` because no foreground indexing ran.
+4. If a daemon is running, start sends SIGHUP and reports `already_running`. If the daemon is starting, start observes briefly and reports the final running pid or `startup_in_progress`. If no daemon exists, start spawns a worker and then polls the authoritative pid because the spawned child can still lose the daemon pid lock to another worker.
+5. Worker pid-lock contention is non-destructive during normal startup. The loser reads or observes the holder and returns `AlreadyRunning` or `StartupInProgress`; explicit lifecycle commands such as `stop` keep their separate authority to terminate.
 
 ### Daemon-Backed Refresh And Scope Fallback
 
@@ -75,6 +84,7 @@
 | Area | Location | Notes |
 |---|---|---|
 | Global runtime state | `dirs::data_dir()/1up` | Registry, PID/socket files, cache, models, update metadata. |
+| Startup guard files | `dirs::data_dir()/1up/startup-<hash>.lock` | Short-lived per-project CLI startup locks keyed by the project state root. |
 | Project-local state | `<project>/.1up/` | `project_id`, `index.db`, `index_status.json`, `daemon_status.json`. |
 | Search persistence | `segments`, `segment_vectors`, `segment_symbols` | Discovery retrieval inputs. `segment_vectors.embedding_vec` is declared `FLOAT8(384)` (schema v12); the HNSW index `idx_segment_vectors_embedding` is created via `libsql_vector_idx(..., 'metric=cosine', 'compress_neighbors=float8')`. Writes go through the typed `vector8(?)` constructor so libSQL quantizes server-side. |
 | File manifest | `indexed_files` | Stores per-file path, extension, content hash, size, and mtime for metadata-based unchanged-file prefiltering. |

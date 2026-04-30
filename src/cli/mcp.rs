@@ -23,17 +23,12 @@ fn ensure_daemon_for_mcp(project_root: &Path) {
         return;
     }
 
-    let project_id = match project::read_project_id(project_root) {
-        Ok(project_id) => project_id,
-        Err(_) => match project::write_project_id(project_root) {
-            Ok(project_id) => project_id,
-            Err(err) => {
-                tracing::debug!(
-                    "MCP daemon auto-start skipped; failed to initialize project: {err}"
-                );
-                return;
-            }
-        },
+    let project_id = match project::ensure_project_id(project_root) {
+        Ok((project_id, _)) => project_id,
+        Err(err) => {
+            tracing::debug!("MCP daemon auto-start skipped; failed to initialize project: {err}");
+            return;
+        }
     };
 
     if let Err(err) = lifecycle::ensure_daemon(&project_id, project_root) {

@@ -1,9 +1,12 @@
+use assert_cmd::prelude::CommandCargoExt;
 use assert_cmd::Command;
 use oneup::shared::constants::SCHEMA_VERSION;
 use oneup::storage::{db::Db, queries, schema};
 use predicates::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +26,115 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
     #[cfg(not(target_os = "macos"))]
     {
         home.join(".local").join("share").join("1up")
+    }
+}
+
+fn cmd_with_home(home: &Path) -> Command {
+    let mut command = cmd();
+    command
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    command
+}
+
+#[cfg(unix)]
+fn std_cmd_with_home(home: &Path) -> StdCommand {
+    let mut command = StdCommand::cargo_bin("1up").unwrap();
+    command
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    command
+}
+
+fn seed_model_download_failure(home: &Path) {
+    let model_dir = test_data_dir(home).join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+}
+
+fn json_stdout(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON stdout ({err}); stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn status_json(home: &Path, project: &Path) -> serde_json::Value {
+    let output = cmd_with_home(home)
+        .args(["status", project.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_stdout(&output)
+}
+
+fn wait_for_daemon_running(home: &Path, project: &Path) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let payload = status_json(home, project);
+        if payload["daemon_running"].as_bool() == Some(true) {
+            return payload;
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon did not become running; last status={payload}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn stop_daemon(home: &Path, project: &Path) {
+    let _ = cmd_with_home(home)
+        .args(["stop", project.to_str().unwrap(), "--format", "json"])
+        .output();
+}
+
+#[cfg(unix)]
+fn run_start_json(home: &Path, project: &Path) -> Output {
+    let output_dir = tempfile::tempdir().unwrap();
+    let stdout_path = output_dir.path().join("stdout.json");
+    let stderr_path = output_dir.path().join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path).unwrap();
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    let status = std_cmd_with_home(home)
+        .args(["start", project.to_str().unwrap(), "--format", "json"])
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .status()
+        .unwrap();
+
+    Output {
+        status,
+        stdout: fs::read(stdout_path).unwrap(),
+        stderr: fs::read(stderr_path).unwrap(),
+    }
+}
+
+struct DaemonCleanupGuard {
+    home: PathBuf,
+    project: PathBuf,
+}
+
+impl DaemonCleanupGuard {
+    fn new(home: &Path, project: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            project: project.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for DaemonCleanupGuard {
+    fn drop(&mut self) {
+        stop_daemon(&self.home, &self.project);
     }
 }
 
@@ -581,6 +693,54 @@ fn status_human_output_includes_last_index_progress() {
 }
 
 #[test]
+fn index_json_output_includes_full_run_prefilter_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+
+    fs::write(canonical_dir.join("a.rs"), "fn a() {}\n").unwrap();
+    fs::write(canonical_dir.join("b.rs"), "fn b() {}\n").unwrap();
+
+    let first = cmd_with_home(&canonical_home)
+        .args(["index", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "initial index should succeed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_payload = json_stdout(&first);
+    assert_eq!(first_payload["progress"]["prefilter"]["discovered"], 2);
+    assert_eq!(
+        first_payload["progress"]["prefilter"]["metadata_skipped"],
+        0
+    );
+    assert_eq!(first_payload["progress"]["prefilter"]["content_read"], 2);
+
+    let second = cmd_with_home(&canonical_home)
+        .args(["index", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second index should succeed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_payload = json_stdout(&second);
+
+    assert_eq!(second_payload["progress"]["prefilter"]["discovered"], 2);
+    assert_eq!(
+        second_payload["progress"]["prefilter"]["metadata_skipped"],
+        2
+    );
+    assert_eq!(second_payload["progress"]["prefilter"]["content_read"], 0);
+    assert_eq!(second_payload["progress"]["prefilter"]["deleted"], 0);
+}
+
+#[test]
 fn index_watch_plain_output_streams_progress_updates() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
@@ -916,22 +1076,13 @@ fn start_prints_status_hint_on_fresh_index() {
 #[cfg(unix)]
 #[test]
 fn start_skips_init_on_existing_valid_index() {
-    // REQ-031: when a project already has a current-schema index, `start`
-    // must not mention the "Initialized project ..." prefix that the
-    // first-run init path emits. The check is content-only: we do not
-    // assert on daemon state because the pre-existing index means the
-    // happy path is the silent-registration branch.
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
-    let data_dir = test_data_dir(&canonical_home);
-    let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
-    fs::create_dir_all(&model_dir).unwrap();
-    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
 
-    // Pre-populate `.1up/` with a current-schema index + project_id so the
-    // "already initialized" branch is taken end-to-end.
     create_current_index(&canonical_dir);
     fs::write(
         canonical_dir.join(".1up").join("project_id"),
@@ -939,38 +1090,204 @@ fn start_skips_init_on_existing_valid_index() {
     )
     .unwrap();
 
-    let output = cmd()
-        .env("HOME", &canonical_home)
-        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-        .args(["start", canonical_dir.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let output = run_start_json(&canonical_home, &canonical_dir);
     assert!(
         output.status.success(),
         "start should succeed on an existing valid index: {}",
         String::from_utf8_lossy(&output.stderr),
     );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload = json_stdout(&output);
+    assert_eq!(payload["status"], "started");
     assert!(
-        !stdout.contains("Initialized project"),
-        "existing-index start must not mention init; got: {stdout}",
+        payload.get("progress").is_none(),
+        "current-index start must not include foreground index progress: {payload}"
+    );
+    assert!(
+        payload.get("work").is_none(),
+        "current-index start must not include foreground index work: {payload}"
+    );
+    let message = payload["message"].as_str().unwrap();
+    assert!(
+        !message.contains("Initialized project"),
+        "existing-index start must not mention init; got: {message}",
+    );
+    assert!(
+        !message.contains("Indexed"),
+        "current-index start must not report indexing work; got: {message}",
     );
 
-    // Poll briefly for the daemon pidfile: `start` can return before the
-    // forked daemon writes it, and the cleanup must not race that fork.
-    let pid_file = data_dir.join("daemon.pid");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
+    let status = wait_for_daemon_running(&canonical_home, &canonical_dir);
+    assert!(status["pid"].as_u64().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_start_current_index_converges_to_one_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let home = canonical_home.clone();
+            let project = canonical_dir.clone();
+            thread::spawn(move || run_start_json(&home, &project))
+        })
+        .collect();
+
+    let mut reported_pids = HashSet::new();
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent start should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = json_stdout(&output);
+        let status = payload["status"].as_str().unwrap();
+        assert!(
+            matches!(
+                status,
+                "started" | "already_running" | "startup_in_progress"
+            ),
+            "unexpected current-index start status: {payload}"
+        );
+        assert!(
+            payload.get("progress").is_none(),
+            "current-index concurrent start must not index: {payload}"
+        );
+        assert!(
+            payload.get("work").is_none(),
+            "current-index concurrent start must not report work: {payload}"
+        );
+        if let Some(pid) = payload["pid"].as_u64() {
+            reported_pids.insert(pid);
+        }
     }
-    if pid_file.exists() {
-        cmd()
-            .env("HOME", &canonical_home)
-            .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
-            .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-            .args(["stop", canonical_dir.to_str().unwrap(), "--format", "json"])
-            .assert()
-            .success();
+
+    let status = wait_for_daemon_running(&canonical_home, &canonical_dir);
+    let final_pid = status["pid"].as_u64().unwrap();
+    assert!(
+        reported_pids.iter().all(|pid| *pid == final_pid),
+        "all reported daemon pids should match final pid {final_pid}; got {reported_pids:?}"
+    );
+    assert!(
+        reported_pids.len() <= 1,
+        "concurrent starts should report at most one daemon pid; got {reported_pids:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn start_contention_preserves_existing_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let output = run_start_json(&canonical_home, &canonical_dir);
+    assert!(
+        output.status.success(),
+        "initial start should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_status = wait_for_daemon_running(&canonical_home, &canonical_dir);
+    let first_pid = first_status["pid"].as_u64().unwrap();
+
+    let output = run_start_json(&canonical_home, &canonical_dir);
+    assert!(
+        output.status.success(),
+        "contending start should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = json_stdout(&output);
+    assert_eq!(payload["status"], "already_running");
+    assert_eq!(payload["pid"].as_u64(), Some(first_pid));
+
+    let second_status = wait_for_daemon_running(&canonical_home, &canonical_dir);
+    assert_eq!(second_status["pid"].as_u64(), Some(first_pid));
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_first_start_reuses_project_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+    fs::write(
+        canonical_dir.join("main.rs"),
+        "fn main() {\n    println!(\"first start\");\n}\n",
+    )
+    .unwrap();
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let home = canonical_home.clone();
+            let project = canonical_dir.clone();
+            thread::spawn(move || run_start_json(&home, &project))
+        })
+        .collect();
+
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "first concurrent start should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = json_stdout(&output);
+        let status = payload["status"].as_str().unwrap();
+        assert!(
+            matches!(
+                status,
+                "indexed_and_started" | "started" | "already_running" | "startup_in_progress"
+            ),
+            "unexpected first-start status: {payload}"
+        );
     }
+
+    let id_path = canonical_dir.join(".1up").join("project_id");
+    let project_id = fs::read_to_string(&id_path).unwrap();
+    assert!(
+        !project_id.trim().is_empty(),
+        "project id should be created once"
+    );
+    wait_for_daemon_running(&canonical_home, &canonical_dir);
+
+    let registry_path = test_data_dir(&canonical_home).join("projects.json");
+    let registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(registry_path).unwrap()).unwrap();
+    let projects = registry["projects"].as_array().unwrap();
+    let matching: Vec<_> = projects
+        .iter()
+        .filter(|entry| entry["project_root"].as_str() == canonical_dir.to_str())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "registry should contain one project entry"
+    );
+    assert_eq!(matching[0]["project_id"].as_str(), Some(project_id.trim()));
 }

@@ -1,5 +1,8 @@
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 
 use crate::shared::config;
@@ -7,6 +10,8 @@ use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
 use crate::shared::errors::{DaemonError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_xdg_root, validate_regular_file_path};
 use crate::shared::types::IndexingConfig;
+
+const REGISTRY_LOCK_FILE: &str = "projects.lock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
@@ -28,6 +33,7 @@ impl Registry {
         Self::load_from_path(&config::projects_registry_path()?, &xdg_root)
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), OneupError> {
         let xdg_root = ensure_secure_xdg_root()?;
         self.save_to_path(&config::projects_registry_path()?, &xdg_root)
@@ -71,47 +77,19 @@ impl Registry {
         project_root: &Path,
         indexing: Option<IndexingConfig>,
     ) -> Result<(), OneupError> {
-        let canonical = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-
-        if let Some(existing) = self
-            .projects
-            .iter_mut()
-            .find(|project| project.project_root == canonical)
-        {
-            existing.project_id = project_id.to_string();
-            if let Some(indexing) = indexing {
-                existing.indexing = Some(indexing);
-            }
-            self.save()?;
-            return Ok(());
-        }
-
-        self.projects.push(ProjectEntry {
-            project_id: project_id.to_string(),
-            project_root: canonical,
-            registered_at: chrono::Utc::now().to_rfc3339(),
+        let xdg_root = ensure_secure_xdg_root()?;
+        self.register_at_path(
+            project_id,
+            project_root,
             indexing,
-        });
-
-        self.save()
+            &config::projects_registry_path()?,
+            &xdg_root,
+        )
     }
 
     pub fn deregister(&mut self, project_root: &Path) -> Result<bool, OneupError> {
-        let canonical = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-
-        let before = self.projects.len();
-        self.projects.retain(|p| p.project_root != canonical);
-        let removed = self.projects.len() < before;
-
-        if removed {
-            self.save()?;
-        }
-
-        Ok(removed)
+        let xdg_root = ensure_secure_xdg_root()?;
+        self.deregister_at_path(project_root, &config::projects_registry_path()?, &xdg_root)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,6 +114,110 @@ impl Registry {
             .map(|p| p.project_root.clone())
             .collect()
     }
+
+    fn register_at_path(
+        &mut self,
+        project_id: &str,
+        project_root: &Path,
+        indexing: Option<IndexingConfig>,
+        path: &Path,
+        approved_root: &Path,
+    ) -> Result<(), OneupError> {
+        let _lock = acquire_registry_lock(approved_root)?;
+        let mut latest = Self::load_from_path(path, approved_root)?;
+        latest.upsert_project(project_id, project_root, indexing);
+        latest.save_to_path(path, approved_root)?;
+        *self = latest;
+        Ok(())
+    }
+
+    fn deregister_at_path(
+        &mut self,
+        project_root: &Path,
+        path: &Path,
+        approved_root: &Path,
+    ) -> Result<bool, OneupError> {
+        let _lock = acquire_registry_lock(approved_root)?;
+        let mut latest = Self::load_from_path(path, approved_root)?;
+        let removed = latest.remove_project(project_root);
+        if removed {
+            latest.save_to_path(path, approved_root)?;
+        }
+        *self = latest;
+        Ok(removed)
+    }
+
+    fn upsert_project(
+        &mut self,
+        project_id: &str,
+        project_root: &Path,
+        indexing: Option<IndexingConfig>,
+    ) {
+        let canonical = canonical_project_root(project_root);
+
+        if let Some(existing) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.project_root == canonical)
+        {
+            existing.project_id = project_id.to_string();
+            if let Some(indexing) = indexing {
+                existing.indexing = Some(indexing);
+            }
+            return;
+        }
+
+        self.projects.push(ProjectEntry {
+            project_id: project_id.to_string(),
+            project_root: canonical,
+            registered_at: chrono::Utc::now().to_rfc3339(),
+            indexing,
+        });
+    }
+
+    fn remove_project(&mut self, project_root: &Path) -> bool {
+        let canonical = canonical_project_root(project_root);
+        let before = self.projects.len();
+        self.projects.retain(|p| p.project_root != canonical);
+        self.projects.len() < before
+    }
+}
+
+struct RegistryLock {
+    _lock: Flock<File>,
+}
+
+fn acquire_registry_lock(approved_root: &Path) -> Result<RegistryLock, OneupError> {
+    let lock_path =
+        validate_regular_file_path(&approved_root.join(REGISTRY_LOCK_FILE), approved_root)
+            .map_err(|err| {
+                DaemonError::WatcherError(format!("failed to validate registry lock path: {err}"))
+            })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(SECURE_STATE_FILE_MODE)
+        .open(&lock_path)
+        .map_err(|err| DaemonError::WatcherError(format!("failed to open registry lock: {err}")))?;
+    fs::set_permissions(
+        &lock_path,
+        fs::Permissions::from_mode(SECURE_STATE_FILE_MODE),
+    )
+    .map_err(|err| DaemonError::WatcherError(format!("failed to secure registry lock: {err}")))?;
+
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map(|lock| RegistryLock { _lock: lock })
+        .map_err(|(_, errno)| {
+            DaemonError::WatcherError(format!("failed to lock registry: {errno}")).into()
+        })
+}
+
+fn canonical_project_root(project_root: &Path) -> PathBuf {
+    project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf())
 }
 
 #[cfg(test)]
@@ -302,6 +384,67 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn registry_register_reloads_locked_state_before_saving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project_a = tmp_root.join("project-a");
+        let project_b = tmp_root.join("project-b");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+
+        let mut first = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        let mut stale_second = first.clone();
+
+        first
+            .register_at_path("id-a", &project_a, None, &registry_path, &xdg_root)
+            .unwrap();
+        stale_second
+            .register_at_path("id-b", &project_b, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(loaded.projects.len(), 2);
+        assert!(loaded
+            .projects
+            .iter()
+            .any(|entry| entry.project_id == "id-a"));
+        assert!(loaded
+            .projects
+            .iter()
+            .any(|entry| entry.project_id == "id-b"));
+        assert_eq!(stale_second.projects.len(), 2);
+    }
+
+    #[test]
+    fn registry_register_keeps_one_entry_for_same_project_under_stale_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project = tmp_root.join("project");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project).unwrap();
+
+        let mut first = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        let mut stale_second = first.clone();
+
+        first
+            .register_at_path("id-a", &project, None, &registry_path, &xdg_root)
+            .unwrap();
+        stale_second
+            .register_at_path("id-b", &project, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].project_id, "id-b");
+        assert_eq!(stale_second.projects.len(), 1);
     }
 
     #[cfg(unix)]

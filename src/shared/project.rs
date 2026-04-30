@@ -1,4 +1,7 @@
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -51,9 +54,129 @@ pub fn write_project_id(project_root: &Path) -> Result<String, OneupError> {
     Ok(id)
 }
 
+#[allow(dead_code)]
+pub fn ensure_project_id(project_root: &Path) -> Result<(String, bool), OneupError> {
+    match read_project_id(project_root) {
+        Ok(project_id) => return Ok((project_id, false)),
+        Err(err) if !is_not_initialized(&err) => return Err(err),
+        Err(_) => {}
+    }
+
+    let dot_dir = ensure_secure_project_root(project_root)
+        .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+
+    match create_project_id_if_absent(&dot_dir) {
+        Ok(project_id) => Ok((project_id, true)),
+        Err(err) if is_already_initialized(&err) => Ok((read_project_id(project_root)?, false)),
+        Err(err) => Err(err),
+    }
+}
+
 /// Checks whether a project has been initialized at the given root.
 pub fn is_initialized(project_root: &Path) -> bool {
     read_project_id(project_root).is_ok()
+}
+
+#[allow(dead_code)]
+fn create_project_id_if_absent(dot_dir: &Path) -> Result<String, OneupError> {
+    let id = Uuid::new_v4().to_string();
+    let path = validate_regular_file_path(&dot_dir.join("project_id"), dot_dir)
+        .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+    let temp_path = validate_regular_file_path(
+        &dot_dir.join(format!(".project-id-tmp-{}", Uuid::new_v4())),
+        dot_dir,
+    )
+    .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(SECURE_STATE_FILE_MODE);
+
+    let mut file = match options.open(&temp_path) {
+        Ok(file) => file,
+        Err(err) => return Err(project_write_io_error(&path, err)),
+    };
+
+    let write_result = (|| -> Result<(), OneupError> {
+        set_project_id_mode(&temp_path)?;
+        file.write_all(id.as_bytes())
+            .map_err(|source| project_write_io_error(&temp_path, source))?;
+        file.sync_all()
+            .map_err(|source| project_write_io_error(&temp_path, source))
+    })();
+    drop(file);
+
+    let publish_result = write_result.and_then(|()| {
+        std::fs::hard_link(&temp_path, &path).map_err(|source| {
+            if source.kind() == ErrorKind::AlreadyExists {
+                ProjectError::AlreadyInitialized(path.display().to_string()).into()
+            } else {
+                project_write_io_error(&path, source)
+            }
+        })?;
+        set_project_id_mode(&path)?;
+        Ok(())
+    });
+
+    let _ = std::fs::remove_file(&temp_path);
+    publish_result?;
+    sync_project_state_dir(dot_dir)?;
+
+    Ok(id)
+}
+
+#[allow(dead_code)]
+fn is_not_initialized(err: &OneupError) -> bool {
+    matches!(err, OneupError::Project(ProjectError::NotInitialized))
+}
+
+#[allow(dead_code)]
+fn is_already_initialized(err: &OneupError) -> bool {
+    matches!(
+        err,
+        OneupError::Project(ProjectError::AlreadyInitialized(_))
+    )
+}
+
+#[allow(dead_code)]
+fn project_write_io_error(path: &Path, source: std::io::Error) -> OneupError {
+    ProjectError::WriteFailed(format!("{}: {source}", path.display())).into()
+}
+
+#[allow(dead_code)]
+fn set_project_id_mode(path: &Path) -> Result<(), OneupError> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(SECURE_STATE_FILE_MODE),
+        )
+        .map_err(|source| project_write_io_error(path, source))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+fn sync_project_state_dir(path: &Path) -> Result<(), OneupError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .map_err(|source| project_write_io_error(path, source))?
+            .sync_all()
+            .map_err(|source| project_write_io_error(path, source))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// A resolved project with separate state and source roots.
@@ -142,7 +265,10 @@ fn resolve_worktree_main_root(start: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
     use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -170,6 +296,59 @@ mod tests {
             assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
             assert_eq!(mode_bits(&project_id_path), SECURE_STATE_FILE_MODE);
         }
+    }
+
+    #[test]
+    fn ensure_project_id_reuses_existing_project_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let first = write_project_id(&project_root).unwrap();
+        let (second, created_now) = ensure_project_id(&project_root).unwrap();
+
+        assert_eq!(second, first);
+        assert!(!created_now);
+    }
+
+    #[test]
+    fn ensure_project_id_concurrent_callers_converge_on_one_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = Arc::new(tmp.path().canonicalize().unwrap().join("project"));
+        fs::create_dir_all(project_root.as_ref()).unwrap();
+
+        let callers = 16;
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles = (0..callers)
+            .map(|_| {
+                let project_root = Arc::clone(&project_root);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_project_id(project_root.as_ref()).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let ids = outcomes
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<HashSet<_>>();
+        let created_count = outcomes
+            .iter()
+            .filter(|(_, created_now)| *created_now)
+            .count();
+
+        assert_eq!(ids.len(), 1);
+        assert_eq!(created_count, 1);
+        assert_eq!(
+            read_project_id(project_root.as_ref()).unwrap(),
+            outcomes[0].0
+        );
     }
 
     #[cfg(unix)]
