@@ -31,7 +31,7 @@ pub async fn exec(args: StructuralArgs) -> anyhow::Result<()> {
     let db_path = project_db_path(state_root);
 
     if let Ok(pid) = project::read_project_id(state_root) {
-        if let Err(e) = lifecycle::ensure_daemon(&pid, state_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, state_root, source_root) {
             tracing::debug!("auto-start daemon skipped: {e}");
         }
     }

@@ -196,28 +196,25 @@ pub struct ResolvedProject {
     pub source_root: PathBuf,
 }
 
-/// Resolves the project roots for a given path by searching for an existing
-/// `.1up/` directory. Checks the canonicalized path and its ancestors first,
-/// then falls back to git worktree detection. Returns separate state and
-/// source roots to avoid conflating where `.1up/` lives with where the
-/// user's files are.
+/// Resolves the project roots for a given path. Linked git worktrees anchor
+/// state to the main worktree root while scanning files from the linked
+/// worktree. Other paths reuse the nearest existing `.1up/` ancestor before
+/// falling back to the enclosing git root.
 pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
     let canonical = path.canonicalize()?;
+
+    if let Some(worktree_roots) = resolve_worktree_roots(&canonical) {
+        return Ok(ResolvedProject {
+            state_root: worktree_roots.main_root,
+            source_root: worktree_roots.worktree_root,
+        });
+    }
 
     if let Some(existing_root) = find_existing_project_root(&canonical) {
         return Ok(ResolvedProject {
             state_root: existing_root,
             source_root: canonical,
         });
-    }
-
-    if let Some(main_root) = resolve_worktree_main_root(&canonical) {
-        if main_root.join(".1up").is_dir() {
-            return Ok(ResolvedProject {
-                state_root: main_root,
-                source_root: canonical,
-            });
-        }
     }
 
     if let Some(git_root) = resolve_git_root(&canonical) {
@@ -293,11 +290,16 @@ fn is_git_root(path: &Path) -> bool {
     dot_git.is_dir() || dot_git.is_file()
 }
 
+struct WorktreeRoots {
+    main_root: PathBuf,
+    worktree_root: PathBuf,
+}
+
 /// Detects if the given path is inside a git worktree and returns the main
 /// worktree root. A git worktree has a `.git` file (not directory) containing
 /// `gitdir: <path>`. The referenced gitdir contains a `commondir` file
 /// pointing to the main repository's `.git` directory.
-fn resolve_worktree_main_root(start: &Path) -> Option<PathBuf> {
+fn resolve_worktree_roots(start: &Path) -> Option<WorktreeRoots> {
     let mut current = Some(start);
     while let Some(dir) = current {
         let dot_git = dir.join(".git");
@@ -319,7 +321,10 @@ fn resolve_worktree_main_root(start: &Path) -> Option<PathBuf> {
             };
 
             let main_root = common_git_dir.canonicalize().ok()?.parent()?.to_path_buf();
-            return Some(main_root);
+            return Some(WorktreeRoots {
+                main_root,
+                worktree_root: dir.to_path_buf(),
+            });
         }
         current = dir.parent();
     }
@@ -495,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_root_uses_worktree_root_when_no_project_exists() {
+    fn resolve_project_root_uses_worktree_main_root_when_no_project_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
 
@@ -513,7 +518,53 @@ mod tests {
         .unwrap();
 
         let resolved = resolve_project_root(&worktree.join("src")).unwrap();
-        assert_eq!(resolved.state_root, worktree);
+        assert_eq!(resolved.state_root, main_repo);
+        assert_eq!(resolved.source_root, worktree);
+    }
+
+    #[test]
+    fn resolve_project_root_for_creation_uses_worktree_main_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        let main_repo = tmp_root.join("main");
+        fs::create_dir_all(main_repo.join(".git").join("worktrees").join("feature")).unwrap();
+        let wt_gitdir = main_repo.join(".git").join("worktrees").join("feature");
+        fs::write(wt_gitdir.join("commondir"), "../..").unwrap();
+
+        let worktree = tmp_root.join("worktree");
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let resolved = resolve_project_root_for_creation(&worktree.join("src")).unwrap();
+        assert_eq!(resolved.state_root, main_repo);
+        assert_eq!(resolved.source_root, worktree);
+    }
+
+    #[test]
+    fn resolve_project_root_ignores_accidental_worktree_local_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        let main_repo = tmp_root.join("main");
+        fs::create_dir_all(main_repo.join(".git").join("worktrees").join("feature")).unwrap();
+        let wt_gitdir = main_repo.join(".git").join("worktrees").join("feature");
+        fs::write(wt_gitdir.join("commondir"), "../..").unwrap();
+
+        let worktree = tmp_root.join("worktree");
+        fs::create_dir_all(worktree.join(".1up")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let resolved = resolve_project_root(&worktree).unwrap();
+        assert_eq!(resolved.state_root, main_repo);
         assert_eq!(resolved.source_root, worktree);
     }
 

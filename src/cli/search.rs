@@ -33,10 +33,11 @@ const DAEMON_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
 pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
+    let source_root = resolved.source_root;
     let db_path = project_db_path(&project_root);
 
     if let Ok(pid) = project::read_project_id(&project_root) {
-        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root) {
+        if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root, &source_root) {
             tracing::debug!("auto-start daemon skipped: {e}");
         }
     }

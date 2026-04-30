@@ -167,7 +167,12 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     if index_ready {
         let already_registered = registry_contains_project(&registry, &project_root);
-        registry.register(&project_id, &project_root, Some(indexing_config))?;
+        registry.register_with_source(
+            &project_id,
+            &project_root,
+            &source_root,
+            Some(indexing_config),
+        )?;
         let daemon = ensure_daemon_after_registration(daemon_state)?;
         let msg =
             current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
@@ -187,7 +192,12 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     }
 
     let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
-    registry.register(&project_id, &project_root, Some(indexing_config))?;
+    registry.register_with_source(
+        &project_id,
+        &project_root,
+        &source_root,
+        Some(indexing_config),
+    )?;
     let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?)?;
     let msg = indexed_start_message(
         &init_prefix,

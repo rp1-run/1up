@@ -31,11 +31,11 @@ pub struct McpArgs {
 pub async fn exec(args: McpArgs) -> anyhow::Result<()> {
     let resolved = project::resolve_project_root(Path::new(&args.path))?;
     let _instance_lock = acquire_mcp_instance_lock(&resolved.state_root)?;
-    ensure_daemon_for_mcp(&resolved.state_root);
+    ensure_daemon_for_mcp(&resolved.state_root, &resolved.source_root);
     crate::mcp::server::serve_stdio(resolved.state_root, resolved.source_root).await
 }
 
-fn ensure_daemon_for_mcp(project_root: &Path) {
+fn ensure_daemon_for_mcp(project_root: &Path, source_root: &Path) {
     if !lifecycle::supports_daemon() {
         return;
     }
@@ -48,7 +48,7 @@ fn ensure_daemon_for_mcp(project_root: &Path) {
         }
     };
 
-    if let Err(err) = lifecycle::ensure_daemon(&project_id, project_root) {
+    if let Err(err) = lifecycle::ensure_daemon(&project_id, project_root, source_root) {
         tracing::debug!("MCP daemon auto-start skipped: {err}");
     }
 }

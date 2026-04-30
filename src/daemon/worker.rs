@@ -65,6 +65,7 @@ impl ProjectRunState {
 
 struct ProjectState {
     project_root: PathBuf,
+    source_root: PathBuf,
     db: Db,
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
@@ -342,10 +343,15 @@ async fn load_and_watch_projects(
             continue;
         };
 
-        watcher.watch(&entry.project_root)?;
+        let source_root = entry.source_root().to_path_buf();
+        watcher.watch(&source_root)?;
         projects.insert(entry.project_root.clone(), state);
 
-        info!("watching project: {}", entry.project_root.display());
+        info!(
+            "watching project: {} (source {})",
+            entry.project_root.display(),
+            source_root.display()
+        );
     }
 
     Ok(())
@@ -365,14 +371,27 @@ async fn reload_projects(
     let current_roots: Vec<PathBuf> = projects.keys().cloned().collect();
     for root in &current_roots {
         if !registered_roots.contains(root) {
-            info!("removing project: {}", root.display());
-            watcher.unwatch(root)?;
-            projects.remove(root);
+            if let Some(state) = projects.remove(root) {
+                info!("removing project: {}", root.display());
+                watcher.unwatch(&state.source_root)?;
+            }
         }
     }
 
     for entry in &registry.projects {
+        let entry_source_root = entry.source_root().to_path_buf();
         if let Some(existing) = projects.get_mut(&entry.project_root) {
+            if existing.source_root != entry_source_root {
+                watcher.unwatch(&existing.source_root)?;
+                watcher.watch(&entry_source_root)?;
+                existing.source_root = entry_source_root.clone();
+                existing.run_state.mark_dirty(RunScope::Full);
+                info!(
+                    "refreshed source root for {} to {}",
+                    entry.project_root.display(),
+                    entry_source_root.display()
+                );
+            }
             if existing.indexing != entry.indexing {
                 existing.indexing = entry.indexing.clone();
                 info!(
@@ -387,10 +406,14 @@ async fn reload_projects(
             continue;
         };
 
-        watcher.watch(&entry.project_root)?;
+        watcher.watch(&entry_source_root)?;
         projects.insert(entry.project_root.clone(), state);
 
-        info!("now watching project: {}", entry.project_root.display());
+        info!(
+            "now watching project: {} (source {})",
+            entry.project_root.display(),
+            entry_source_root.display()
+        );
     }
 
     Ok(())
@@ -401,6 +424,15 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         warn!(
             "skipping non-existent project: {}",
             entry.project_root.display()
+        );
+        return Ok(None);
+    }
+    let source_root = entry.source_root().to_path_buf();
+    if !source_root.exists() {
+        warn!(
+            "skipping project {} because source root is missing: {}",
+            entry.project_root.display(),
+            source_root.display()
         );
         return Ok(None);
     }
@@ -418,6 +450,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
 
     Ok(Some(ProjectState {
         project_root: entry.project_root.clone(),
+        source_root,
         db,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
@@ -508,11 +541,12 @@ fn mark_changed_projects(
     projects: &mut HashMap<PathBuf, ProjectState>,
     changes: &watcher::WatcherChanges,
 ) {
-    for (root, state) in projects.iter_mut() {
+    for state in projects.values_mut() {
+        let source_root = &state.source_root;
         let has_ambiguous = changes
             .ambiguous_paths
             .iter()
-            .any(|path| path.starts_with(root));
+            .any(|path| path.starts_with(source_root));
         let (scope, promotion_reason) = if changes.has_unscoped_error || has_ambiguous {
             let reason = if changes.has_unscoped_error {
                 "has_unscoped_error".to_string()
@@ -526,8 +560,8 @@ fn mark_changed_projects(
                     changes
                         .file_paths
                         .iter()
-                        .filter(|path| path.starts_with(root))
-                        .filter_map(|path| normalize_relative_path(root, path)),
+                        .filter(|path| path.starts_with(source_root))
+                        .filter_map(|path| normalize_relative_path(source_root, path)),
                 ),
                 None,
             )
@@ -540,7 +574,7 @@ fn mark_changed_projects(
         let relevant_count = changes
             .file_paths
             .iter()
-            .filter(|path| path.starts_with(root))
+            .filter(|path| path.starts_with(source_root))
             .count();
 
         let was_dirty = state.run_state.dirty;
@@ -556,7 +590,7 @@ fn mark_changed_projects(
         if was_running && !was_dirty {
             debug!(
                 "project {} changed during an active run; queued one follow-up {}",
-                root.display(),
+                state.project_root.display(),
                 match scope {
                     RunScope::Full => "full re-index".to_string(),
                     RunScope::Paths(paths) => format!("run for {} changed paths", paths.len()),
@@ -565,12 +599,12 @@ fn mark_changed_projects(
         } else if !was_dirty {
             match scope {
                 RunScope::Full => {
-                    debug!("queued full re-index for {}", root.display());
+                    debug!("queued full re-index for {}", state.project_root.display());
                 }
                 RunScope::Paths(paths) => {
                     debug!(
                         "queued re-index for {} after {} changed paths",
-                        root.display(),
+                        state.project_root.display(),
                         paths.len().max(relevant_count)
                     );
                 }
@@ -655,13 +689,14 @@ async fn run_project(
     projects: &mut HashMap<PathBuf, ProjectState>,
 ) -> Result<pipeline::PipelineStats, OneupError> {
     let mut setup = SetupTimings::new(std::time::Instant::now());
-    let (project_root, scope, daemon_fallback_reason, conn_setup) = {
+    let (project_root, source_root, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects
             .get_mut(root)
             .expect("dirty project must exist while running");
         let daemon_fallback_reason = state.run_state.pending_fallback_reason.take();
         let scope = state.run_state.start_run();
         let project_root = state.project_root.clone();
+        let source_root = state.source_root.clone();
         let db_start = std::time::Instant::now();
         let conn_setup = async {
             let conn = state.db.connect_tuned().await?;
@@ -672,7 +707,13 @@ async fn run_project(
         .await;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
 
-        (project_root, scope, daemon_fallback_reason, conn_setup)
+        (
+            project_root,
+            source_root,
+            scope,
+            daemon_fallback_reason,
+            conn_setup,
+        )
     };
 
     let (conn, indexing_config) = match conn_setup {
@@ -690,17 +731,19 @@ async fn run_project(
     match &scope {
         RunScope::Full => {
             info!(
-                "re-indexing full project {} (jobs={}, embed_threads={})",
+                "re-indexing full project {} from {} (jobs={}, embed_threads={})",
                 project_root.display(),
+                source_root.display(),
                 indexing_config.jobs,
                 indexing_config.embed_threads
             );
         }
         RunScope::Paths(paths) => {
             info!(
-                "re-indexing {} changed files in {} (jobs={}, embed_threads={})",
+                "re-indexing {} changed files in {} from {} (jobs={}, embed_threads={})",
                 paths.len(),
                 project_root.display(),
+                source_root.display(),
                 indexing_config.jobs,
                 indexing_config.embed_threads
             );
@@ -718,9 +761,9 @@ async fn run_project(
             .await;
         setup.model_prepare_ms = model_start.elapsed().as_millis();
         log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
-        pipeline::run_with_scope_and_setup(
+        pipeline::run_with_scope_setup_and_progress_root(
             &conn,
-            &project_root,
+            &source_root,
             state.embedding_runtime.current_embedder(),
             &scope,
             &indexing_config,
@@ -728,6 +771,7 @@ async fn run_project(
             true,
             Some(setup),
             daemon_fallback_reason,
+            Some(&project_root),
         )
         .await
     };
@@ -868,6 +912,7 @@ mod tests {
             alpha_root.clone(),
             ProjectState {
                 project_root: alpha_root.clone(),
+                source_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -884,6 +929,7 @@ mod tests {
             beta_root.clone(),
             ProjectState {
                 project_root: beta_root.clone(),
+                source_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -941,6 +987,7 @@ mod tests {
             alpha_root.clone(),
             ProjectState {
                 project_root: alpha_root.clone(),
+                source_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -952,6 +999,7 @@ mod tests {
             beta_root.clone(),
             ProjectState {
                 project_root: beta_root.clone(),
+                source_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -998,6 +1046,45 @@ mod tests {
     }
 
     #[test]
+    fn mark_changed_projects_matches_source_root_when_state_root_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path().join("main");
+        let source_root = tmp.path().join("worktree");
+        std::fs::create_dir_all(source_root.join("src")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+
+        let mut projects = HashMap::new();
+        projects.insert(
+            state_root.clone(),
+            ProjectState {
+                project_root: state_root.clone(),
+                source_root: source_root.clone(),
+                db,
+                indexing: None,
+                embedding_runtime: EmbeddingRuntime::default(),
+                run_state: ProjectRunState::default(),
+                last_file_check_persisted_at: None,
+            },
+        );
+
+        let changes = watcher::WatcherChanges {
+            file_paths: std::collections::BTreeSet::from([source_root.join("src").join("lib.rs")]),
+            ambiguous_paths: std::collections::BTreeSet::new(),
+            has_unscoped_error: false,
+        };
+
+        mark_changed_projects(&mut projects, &changes);
+
+        assert_eq!(
+            projects.get(&state_root).unwrap().run_state.pending_scope,
+            RunScope::from_paths([PathBuf::from("src/lib.rs")])
+        );
+    }
+
+    #[test]
     fn next_dirty_project_prefers_follow_up_root() {
         let tmp = tempfile::tempdir().unwrap();
         let alpha_root = tmp.path().join("alpha");
@@ -1016,6 +1103,7 @@ mod tests {
             alpha_root.clone(),
             ProjectState {
                 project_root: alpha_root.clone(),
+                source_root: alpha_root.clone(),
                 db: alpha_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -1034,6 +1122,7 @@ mod tests {
             beta_root.clone(),
             ProjectState {
                 project_root: beta_root.clone(),
+                source_root: beta_root.clone(),
                 db: beta_db,
                 indexing: None,
                 embedding_runtime: EmbeddingRuntime::default(),
@@ -1110,6 +1199,7 @@ mod tests {
         let db = runtime.block_on(Db::open_memory()).unwrap();
         let mut state = ProjectState {
             project_root: project_root.clone(),
+            source_root: project_root.clone(),
             db,
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),
@@ -1151,6 +1241,7 @@ mod tests {
         let db = runtime.block_on(Db::open_memory()).unwrap();
         let mut state = ProjectState {
             project_root: project_root.clone(),
+            source_root: project_root.clone(),
             db,
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),

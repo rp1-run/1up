@@ -337,7 +337,11 @@ pub fn current_binary_path() -> Result<std::path::PathBuf, OneupError> {
 /// registers the project and spawns a new daemon. If a daemon is already running
 /// but the project is not registered, registers it and sends SIGHUP to reload.
 /// Returns the daemon PID.
-pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, OneupError> {
+pub fn ensure_daemon(
+    project_id: &str,
+    project_root: &Path,
+    source_root: &Path,
+) -> Result<u32, OneupError> {
     use crate::daemon::registry::Registry;
 
     if let Some(pid) = is_daemon_running()? {
@@ -350,7 +354,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
         });
 
         if !already_registered {
-            registry.register(project_id, project_root, None)?;
+            registry.register_with_source(project_id, project_root, source_root, None)?;
             send_sighup(pid)?;
             debug!("auto-registered project and sent SIGHUP to daemon (pid={pid})");
         }
@@ -359,7 +363,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
     }
 
     let mut registry = Registry::load()?;
-    registry.register(project_id, project_root, None)?;
+    registry.register_with_source(project_id, project_root, source_root, None)?;
 
     let binary = current_binary_path()?;
     let pid = spawn_daemon(&binary)?;

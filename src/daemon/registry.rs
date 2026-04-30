@@ -17,9 +17,17 @@ const REGISTRY_LOCK_FILE: &str = "projects.lock";
 pub struct ProjectEntry {
     pub project_id: String,
     pub project_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<PathBuf>,
     pub registered_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexing: Option<IndexingConfig>,
+}
+
+impl ProjectEntry {
+    pub fn source_root(&self) -> &Path {
+        self.source_root.as_deref().unwrap_or(&self.project_root)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -71,16 +79,28 @@ impl Registry {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn register(
         &mut self,
         project_id: &str,
         project_root: &Path,
         indexing: Option<IndexingConfig>,
     ) -> Result<(), OneupError> {
+        self.register_with_source(project_id, project_root, project_root, indexing)
+    }
+
+    pub fn register_with_source(
+        &mut self,
+        project_id: &str,
+        project_root: &Path,
+        source_root: &Path,
+        indexing: Option<IndexingConfig>,
+    ) -> Result<(), OneupError> {
         let xdg_root = ensure_secure_xdg_root()?;
         self.register_at_path(
             project_id,
             project_root,
+            source_root,
             indexing,
             &config::projects_registry_path()?,
             &xdg_root,
@@ -119,13 +139,14 @@ impl Registry {
         &mut self,
         project_id: &str,
         project_root: &Path,
+        source_root: &Path,
         indexing: Option<IndexingConfig>,
         path: &Path,
         approved_root: &Path,
     ) -> Result<(), OneupError> {
         let _lock = acquire_registry_lock(approved_root)?;
         let mut latest = Self::load_from_path(path, approved_root)?;
-        latest.upsert_project(project_id, project_root, indexing);
+        latest.upsert_project(project_id, project_root, source_root, indexing);
         latest.save_to_path(path, approved_root)?;
         *self = latest;
         Ok(())
@@ -151,9 +172,12 @@ impl Registry {
         &mut self,
         project_id: &str,
         project_root: &Path,
+        source_root: &Path,
         indexing: Option<IndexingConfig>,
     ) {
         let canonical = canonical_project_root(project_root);
+        let canonical_source = canonical_project_root(source_root);
+        let source_root = (canonical_source != canonical).then_some(canonical_source);
 
         if let Some(existing) = self
             .projects
@@ -161,6 +185,7 @@ impl Registry {
             .find(|project| project.project_root == canonical)
         {
             existing.project_id = project_id.to_string();
+            existing.source_root = source_root;
             if let Some(indexing) = indexing {
                 existing.indexing = Some(indexing);
             }
@@ -170,6 +195,7 @@ impl Registry {
         self.projects.push(ProjectEntry {
             project_id: project_id.to_string(),
             project_root: canonical,
+            source_root,
             registered_at: chrono::Utc::now().to_rfc3339(),
             indexing,
         });
@@ -247,6 +273,7 @@ mod tests {
         reg.projects.push(ProjectEntry {
             project_id: "abc-123".to_string(),
             project_root: project_dir.clone(),
+            source_root: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             indexing: Some(IndexingConfig::new(4, 2, 1).unwrap()),
         });
@@ -276,12 +303,14 @@ mod tests {
         reg.projects.push(ProjectEntry {
             project_id: "id-a".to_string(),
             project_root: dir_a.canonicalize().unwrap(),
+            source_root: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             indexing: None,
         });
         reg.projects.push(ProjectEntry {
             project_id: "id-b".to_string(),
             project_root: dir_b.canonicalize().unwrap(),
+            source_root: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             indexing: None,
         });
@@ -367,6 +396,7 @@ mod tests {
         registry.projects.push(ProjectEntry {
             project_id: "abc-123".to_string(),
             project_root,
+            source_root: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             indexing: Some(IndexingConfig::new(4, 2, 1).unwrap()),
         });
@@ -402,10 +432,24 @@ mod tests {
         let mut stale_second = first.clone();
 
         first
-            .register_at_path("id-a", &project_a, None, &registry_path, &xdg_root)
+            .register_at_path(
+                "id-a",
+                &project_a,
+                &project_a,
+                None,
+                &registry_path,
+                &xdg_root,
+            )
             .unwrap();
         stale_second
-            .register_at_path("id-b", &project_b, None, &registry_path, &xdg_root)
+            .register_at_path(
+                "id-b",
+                &project_b,
+                &project_b,
+                None,
+                &registry_path,
+                &xdg_root,
+            )
             .unwrap();
 
         let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
@@ -435,16 +479,39 @@ mod tests {
         let mut stale_second = first.clone();
 
         first
-            .register_at_path("id-a", &project, None, &registry_path, &xdg_root)
+            .register_at_path("id-a", &project, &project, None, &registry_path, &xdg_root)
             .unwrap();
         stale_second
-            .register_at_path("id-b", &project, None, &registry_path, &xdg_root)
+            .register_at_path("id-b", &project, &project, None, &registry_path, &xdg_root)
             .unwrap();
 
         let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].project_id, "id-b");
         assert_eq!(stale_second.projects.len(), 1);
+    }
+
+    #[test]
+    fn registry_register_persists_distinct_source_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project = tmp_root.join("main");
+        let source = tmp_root.join("worktree");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&source).unwrap();
+
+        let mut registry = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        registry
+            .register_at_path("id", &project, &source, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].project_root, project);
+        assert_eq!(loaded.projects[0].source_root, Some(source));
     }
 
     #[cfg(unix)]
