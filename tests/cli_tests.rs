@@ -464,6 +464,7 @@ fn start_auto_initializes_project_if_needed() {
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
     let data_dir = test_data_dir(&canonical_home);
     let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
@@ -548,6 +549,42 @@ fn start_auto_initializes_project_if_needed() {
 }
 
 #[test]
+fn start_refuses_to_auto_initialize_non_git_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+
+    cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a git root"));
+
+    assert!(
+        !canonical_dir.join(".1up").exists(),
+        "start must not create project state outside a git root"
+    );
+}
+
+#[test]
+fn index_refuses_to_auto_initialize_non_git_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+
+    cmd()
+        .args(["index", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a git root"));
+
+    assert!(
+        !canonical_dir.join(".1up").exists(),
+        "index must not create project state outside a git root"
+    );
+}
+
+#[test]
 fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
     let home = tempfile::tempdir().unwrap();
     let project_a = tempfile::tempdir().unwrap();
@@ -555,6 +592,8 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
     let canonical_home = home.path().canonicalize().unwrap();
     let canonical_project_a = project_a.path().canonicalize().unwrap();
     let canonical_project_b = project_b.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_project_a.join(".git")).unwrap();
+    fs::create_dir_all(canonical_project_b.join(".git")).unwrap();
     let data_dir = test_data_dir(&canonical_home);
     let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
@@ -698,6 +737,7 @@ fn index_json_output_includes_full_run_prefilter_counters() {
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
     seed_model_download_failure(&canonical_home);
 
     fs::write(canonical_dir.join("a.rs"), "fn a() {}\n").unwrap();
@@ -744,6 +784,7 @@ fn index_json_output_includes_full_run_prefilter_counters() {
 fn index_watch_plain_output_streams_progress_updates() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
     fs::write(
         dir.path().join("main.rs"),
         "fn main() {\n    println!(\"watch\");\n}\n",
@@ -772,6 +813,7 @@ fn index_watch_plain_output_streams_progress_updates() {
 fn index_watch_json_output_streams_progress_updates() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
     fs::write(
         dir.path().join("main.rs"),
         "fn main() {\n    println!(\"watch\");\n}\n",
@@ -800,6 +842,7 @@ fn index_watch_json_output_streams_progress_updates() {
 fn index_watch_human_output_keeps_progress_off_stdout() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
     fs::write(
         dir.path().join("main.rs"),
         "fn main() {\n    println!(\"watch\");\n}\n",
@@ -826,6 +869,7 @@ fn index_watch_human_output_keeps_progress_off_stdout() {
 fn reindex_watch_plain_output_streams_rebuild_and_completion() {
     let _guard = HideModelGuard::new();
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
     fs::write(
         dir.path().join("lib.rs"),
         "pub fn watch_mode() -> &'static str {\n    \"ready\"\n}\n",
@@ -1026,6 +1070,7 @@ fn start_prints_status_hint_on_fresh_index() {
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
     let data_dir = test_data_dir(&canonical_home);
     let model_dir = data_dir.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
@@ -1080,6 +1125,7 @@ fn start_skips_init_on_existing_valid_index() {
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
     seed_model_download_failure(&canonical_home);
     let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
 
@@ -1234,6 +1280,7 @@ fn concurrent_first_start_reuses_project_id() {
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
     seed_model_download_failure(&canonical_home);
     let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
     fs::write(

@@ -81,7 +81,9 @@ fn send_watch_progress(
 }
 
 async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root_for_creation(
+        std::path::Path::new(&args.path),
+    )?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);
@@ -163,7 +165,9 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         return exec_watch(args, format).await;
     }
 
-    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root_for_creation(
+        std::path::Path::new(&args.path),
+    )?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
     let db_path = config::project_db_path(&project_root);

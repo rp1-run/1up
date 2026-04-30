@@ -89,6 +89,7 @@ fn db_path(dir: &Path) -> PathBuf {
 
 fn create_search_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join(".git")).unwrap();
 
     fs::write(
         tmp.path().join("main.rs"),

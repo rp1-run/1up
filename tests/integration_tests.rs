@@ -1267,6 +1267,28 @@ fn mcp_initialize_advertises_primary_code_search_instructions() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_rejects_second_instance_for_same_project_root() {
+    let tmp = TempDir::new().unwrap();
+    let _client = McpTestClient::start(tmp.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
+        .args(["mcp", "--path", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "second MCP process should exit while first one holds the lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already running"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn mcp_tools_list_default_palette_and_schemas() {
     let tmp = TempDir::new().unwrap();
@@ -1336,6 +1358,7 @@ fn mcp_tools_list_default_palette_and_schemas() {
 #[test]
 fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let missing = TempDir::new().unwrap();
+    fs::create_dir_all(missing.path().join(".git")).unwrap();
     let mut missing_client = McpTestClient::start(missing.path());
     let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);

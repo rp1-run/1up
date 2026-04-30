@@ -317,7 +317,7 @@ async fn run_index(
     rebuild: bool,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     if project::read_project_id(&roots.state_root).is_err() {
-        project::write_project_id(&roots.state_root)?;
+        project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
     let db_path = config::project_db_path(&roots.state_root);

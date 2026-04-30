@@ -37,6 +37,7 @@ pub fn read_project_id(project_root: &Path) -> Result<String, OneupError> {
 
 /// Writes a new project ID to the .1up/project_id file, creating the directory if needed.
 /// Returns the generated project ID.
+#[allow(dead_code)]
 pub fn write_project_id(project_root: &Path) -> Result<String, OneupError> {
     let dot_dir = ensure_secure_project_root(project_root)
         .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
@@ -185,6 +186,7 @@ fn sync_project_state_dir(path: &Path) -> Result<(), OneupError> {
 /// repository (where `.1up/` lives) while `source_root` points to the
 /// worktree (where the user's files are). Outside a worktree, both are
 /// identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProject {
     /// Root where `.1up/` state directory lives — use for DB path, project ID,
     /// daemon communication, and registry operations.
@@ -202,15 +204,11 @@ pub struct ResolvedProject {
 pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
     let canonical = path.canonicalize()?;
 
-    let mut current = Some(canonical.as_path());
-    while let Some(dir) = current {
-        if dir.join(".1up").is_dir() {
-            return Ok(ResolvedProject {
-                state_root: dir.to_path_buf(),
-                source_root: canonical,
-            });
-        }
-        current = dir.parent();
+    if let Some(existing_root) = find_existing_project_root(&canonical) {
+        return Ok(ResolvedProject {
+            state_root: existing_root,
+            source_root: canonical,
+        });
     }
 
     if let Some(main_root) = resolve_worktree_main_root(&canonical) {
@@ -222,10 +220,77 @@ pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
         }
     }
 
+    if let Some(git_root) = resolve_git_root(&canonical) {
+        return Ok(ResolvedProject {
+            state_root: git_root.clone(),
+            source_root: git_root,
+        });
+    }
+
     Ok(ResolvedProject {
         state_root: canonical.clone(),
         source_root: canonical,
     })
+}
+
+/// Resolves a project root for commands that may create `.1up/` state.
+///
+/// Existing 1up projects are reused from the nearest ancestor. When no project
+/// exists yet, automatic creation is only allowed at an actual git root. This
+/// prevents daemon/MCP auto-start flows from creating large accidental projects
+/// in broad parent directories such as a home or workspace folder.
+pub fn resolve_project_root_for_creation(path: &Path) -> std::io::Result<ResolvedProject> {
+    let resolved = resolve_project_root(path)?;
+    if resolved.state_root.join(".1up").is_dir() || is_git_root(&resolved.state_root) {
+        return Ok(resolved);
+    }
+
+    Err(std::io::Error::new(
+        ErrorKind::NotFound,
+        format!(
+            "no existing 1up project found and {} is not a git root",
+            resolved.state_root.display()
+        ),
+    ))
+}
+
+pub fn ensure_project_id_for_auto_init(project_root: &Path) -> Result<(String, bool), OneupError> {
+    if is_initialized(project_root) || is_git_root(project_root) {
+        return ensure_project_id(project_root);
+    }
+
+    Err(ProjectError::WriteFailed(format!(
+        "refusing to create .1up at {}; automatic project creation requires an existing 1up project or a git root",
+        project_root.display()
+    ))
+    .into())
+}
+
+fn find_existing_project_root(canonical: &Path) -> Option<PathBuf> {
+    let mut current = Some(canonical);
+    while let Some(dir) = current {
+        if dir.join(".1up").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn resolve_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if is_git_root(dir) {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn is_git_root(path: &Path) -> bool {
+    let dot_git = path.join(".git");
+    dot_git.is_dir() || dot_git.is_file()
 }
 
 /// Detects if the given path is inside a git worktree and returns the main
@@ -417,6 +482,42 @@ mod tests {
     }
 
     #[test]
+    fn resolve_project_root_uses_git_root_when_no_project_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let subdir = repo.join("src").join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let resolved = resolve_project_root(&subdir).unwrap();
+        assert_eq!(resolved.state_root, repo);
+        assert_eq!(resolved.source_root, repo);
+    }
+
+    #[test]
+    fn resolve_project_root_uses_worktree_root_when_no_project_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        let main_repo = tmp_root.join("main");
+        fs::create_dir_all(main_repo.join(".git").join("worktrees").join("feature")).unwrap();
+        let wt_gitdir = main_repo.join(".git").join("worktrees").join("feature");
+        fs::write(wt_gitdir.join("commondir"), "../..").unwrap();
+
+        let worktree = tmp_root.join("worktree");
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        let resolved = resolve_project_root(&worktree.join("src")).unwrap();
+        assert_eq!(resolved.state_root, worktree);
+        assert_eq!(resolved.source_root, worktree);
+    }
+
+    #[test]
     fn resolve_project_root_returns_canonical_when_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -426,5 +527,39 @@ mod tests {
         let resolved = resolve_project_root(&subdir).unwrap();
         assert_eq!(resolved.state_root, subdir);
         assert_eq!(resolved.source_root, subdir);
+    }
+
+    #[test]
+    fn resolve_project_root_for_creation_rejects_non_git_without_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let subdir = root.join("empty");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let err = resolve_project_root_for_creation(&subdir).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn ensure_project_id_for_auto_init_rejects_non_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let err = ensure_project_id_for_auto_init(&project_root).unwrap_err();
+        assert!(err.to_string().contains("automatic project creation"));
+        assert!(!project_root.join(".1up").exists());
+    }
+
+    #[test]
+    fn ensure_project_id_for_auto_init_allows_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(project_root.join(".git")).unwrap();
+
+        let (project_id, created_now) = ensure_project_id_for_auto_init(&project_root).unwrap();
+
+        assert!(created_now);
+        assert_eq!(read_project_id(&project_root).unwrap(), project_id);
     }
 }
