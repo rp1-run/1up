@@ -548,6 +548,142 @@ fn start_auto_initializes_project_if_needed() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn start_from_worktree_uses_main_state_and_indexes_worktree_source() {
+    let _guard = HideModelGuard::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tmp_root = tmp.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+
+    let main_repo = tmp_root.join("main");
+    fs::create_dir_all(&main_repo).unwrap();
+    StdCommand::new("git")
+        .args(["init", main_repo.to_str().unwrap()])
+        .output()
+        .expect("git init failed");
+    StdCommand::new("git")
+        .args(["config", "user.email", "oneup-test@example.com"])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git config user.email failed");
+    StdCommand::new("git")
+        .args(["config", "user.name", "1up Test"])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git config user.name failed");
+
+    fs::write(
+        main_repo.join("main_only.rs"),
+        "fn main_only() -> bool { true }\n",
+    )
+    .unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git add failed");
+    let commit = StdCommand::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git commit failed");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    let worktree = tmp_root.join("feature-worktree");
+    let add_worktree = StdCommand::new("git")
+        .args([
+            "worktree",
+            "add",
+            worktree.to_str().unwrap(),
+            "-b",
+            "feature-branch",
+        ])
+        .current_dir(&main_repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(
+        add_worktree.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&add_worktree.stderr)
+    );
+    let canonical_main = main_repo.canonicalize().unwrap();
+    let canonical_worktree = worktree.canonicalize().unwrap();
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_worktree);
+
+    fs::write(
+        canonical_worktree.join("worktree_only.rs"),
+        "fn worktree_start_marker() -> &'static str { \"worktree start marker\" }\n",
+    )
+    .unwrap();
+
+    let output = cmd_with_home(&canonical_home)
+        .args([
+            "start",
+            canonical_worktree.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "start from worktree should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = json_stdout(&output);
+    assert!(payload["progress"]["files_indexed"].as_u64().unwrap() > 0);
+
+    assert!(
+        canonical_main.join(".1up").join("project_id").exists(),
+        "start should create project id under main worktree state root"
+    );
+    assert!(
+        !canonical_worktree.join(".1up").join("project_id").exists(),
+        "start must not create a worktree-local project id"
+    );
+
+    let registry_path = test_data_dir(&canonical_home).join("projects.json");
+    let registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    let projects = registry["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(
+        projects[0]["project_root"].as_str(),
+        Some(canonical_main.to_str().unwrap())
+    );
+    assert_eq!(
+        projects[0]["source_root"].as_str(),
+        Some(canonical_worktree.to_str().unwrap())
+    );
+
+    let search = cmd_with_home(&canonical_home)
+        .args([
+            "search",
+            "worktree_start_marker",
+            "--path",
+            canonical_worktree.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search from worktree should succeed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_stdout = String::from_utf8(search.stdout).unwrap();
+    assert!(
+        search_stdout.contains("worktree_only.rs"),
+        "worktree-only file should be indexed from start; stdout={search_stdout}"
+    );
+}
+
 #[test]
 fn start_refuses_to_auto_initialize_non_git_directory() {
     let dir = tempfile::tempdir().unwrap();
