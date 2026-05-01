@@ -26,7 +26,7 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 # Configure 1up MCP for this repository.
 
 §RULES
-- Configure MCP directly in the host's config. Do not run `1up add-mcp`.
+- Configure MCP directly in the host's config.
 - Use `MAIN_ROOT` for the MCP path and repository instruction file.
 - If this checkout is a linked Git worktree, `MAIN_ROOT` is the main worktree root, not the linked worktree path.
 - Do not try to restart this active host or verify newly added MCP tools from it.
@@ -64,11 +64,11 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 - restart/approval message given to user, if needed
 ```
 
-The full ready-to-run agent prompt, human quick setup path, host-specific examples, approval guidance, troubleshooting, and manual fallback setup are in [docs/mcp-installation.md](docs/mcp-installation.md).
+The full ready-to-run agent prompt, human quick setup path, host-specific examples, approval guidance, troubleshooting, and manual setup guidance are in [docs/mcp-installation.md](docs/mcp-installation.md).
 
-## Option 2: Run Add-MCP Yourself
+## Option 2: Install 1up Yourself
 
-Use this human quick setup path when you want to configure the agent host from your terminal.
+Use this human quick setup path when you want to install the binary from your terminal before adding the manual MCP server entry.
 
 Install `1up`:
 
@@ -88,26 +88,9 @@ Verify the install:
 1up --version
 ```
 
-Then connect a repository to your agent host:
+Then use the manual server identity, command, and args from the next section to connect a repository to your agent host.
 
-```sh
-cd /path/to/repo
-1up add-mcp --path "$(pwd -P)" --agent codex
-```
-
-Use the target for your host:
-
-| Host | Target |
-|---|---|
-| Codex | `codex` |
-| Claude Code | `claude-code` |
-| Cursor | `cursor` |
-| VS Code | `vscode` |
-| GitHub Copilot CLI | `github-copilot-cli` |
-
-After setup, reload the host if needed, approve or trust the `oneup` server, and ask the agent to call `oneup_prepare`. Connecting the server handles daemon startup where supported.
-
-## Option 3: Fully Manual MCP Config
+## Option 3: Manual MCP Config
 
 Manual setup is useful when a team wants to review config changes before applying them.
 
@@ -136,6 +119,30 @@ args = ["mcp", "--path", "/Users/alex/code/my-app"]
 
 See [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
 
+After saving config, reload the host if needed, approve or trust the `oneup` server, and ask the agent to call `oneup_prepare`. Connecting the server handles daemon startup where supported.
+
+## Human Project Lifecycle
+
+When you are working from a terminal, the retained project lifecycle is:
+
+```sh
+1up start
+1up status
+1up list
+1up stop
+```
+
+Default lifecycle output is written for humans, with readable labels and summaries. Add `--plain` for stable script-friendly text:
+
+```sh
+1up start --plain
+1up status --plain
+1up list --plain
+1up stop --plain
+```
+
+`--plain` is only for shell scripts and terminal automation. Agents should use the `oneup_*` MCP tools through the configured `oneup` server.
+
 ## Add The Agent Hint
 
 Add this minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md` to the repository instruction file your host reads:
@@ -144,7 +151,7 @@ Add this minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md` to the reposi
 For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
 ```
 
-Use the plain minimal instruction from the MCP installation guide. You do not need managed AGENTS/CLAUDE reminder fences, `hello-agent`, the old portable skill, or digit-leading `1up_*` MCP aliases.
+Use the plain minimal instruction from the MCP installation guide; keep repository guidance focused on the canonical `oneup_*` tools.
 
 ## What The Agent Gets
 
@@ -186,9 +193,9 @@ It does not:
 - Refactor code.
 - Run tests for the agent.
 - Execute arbitrary shell commands through MCP.
-- Mutate host MCP configuration after setup.
+- Mutate host MCP configuration.
 
-Host configuration remains owned by `add-mcp`, by the host itself, or by the user through manual config review.
+Host configuration remains owned by the host itself or by the user through manual config review.
 
 ## What To Expect
 

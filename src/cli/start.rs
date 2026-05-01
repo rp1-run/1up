@@ -9,7 +9,9 @@ use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 
-use crate::cli::output::{formatter_for, Formatter, StartResultInfo, StartStatus};
+use crate::cli::output::{
+    formatter_for, Formatter, ProjectListIndexStatus, StartResultInfo, StartStatus,
+};
 use crate::daemon::lifecycle;
 use crate::daemon::lifecycle::DaemonProbeState;
 use crate::daemon::registry::Registry;
@@ -18,6 +20,7 @@ use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants;
 use crate::shared::fs::{ensure_secure_xdg_root, validate_regular_file_path};
+use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::project;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
@@ -27,6 +30,36 @@ const STARTUP_GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_OBSERVE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
+
+fn unsupported_daemon_start_message() -> &'static str {
+    "Background daemon workflows are not supported on this platform yet. No project was started. The retained project lifecycle is available on daemon-supported platforms through `1up start`, `1up status`, `1up list`, and `1up stop`."
+}
+
+fn spin(msg: impl Into<String>, show_progress_ui: bool) -> ProgressUi {
+    ProgressUi::stderr_if(ProgressState::spinner(msg), show_progress_ui)
+}
+
+fn model_status_message(status: &EmbeddingLoadStatus) -> String {
+    match status {
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {
+            "Embedding model ready".to_string()
+        }
+        EmbeddingLoadStatus::Downloaded => "Embedding model downloaded".to_string(),
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
+            "Embedding model unavailable (previous download failed)".to_string()
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+            format!("Model download failed ({err})")
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
+            format!("Embedding model failed to load ({err})")
+        }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
+            "Embedding model unavailable".to_string()
+        }
+    }
+}
 
 /// Classification of an existing project's on-disk index state.
 ///
@@ -53,7 +86,7 @@ enum ProjectIndexState {
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Project root directory (defaults to current directory)
+    /// Project root to start (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
 
@@ -65,8 +98,12 @@ pub struct StartArgs {
     #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
     pub embed_threads: Option<usize>,
 
+    /// Print stable plain text output for simple scripts
+    #[arg(long, conflicts_with = "format")]
+    pub plain: bool,
+
     /// Output format override (defaults to human)
-    #[arg(long, short = 'f')]
+    #[arg(long, short = 'f', hide = true, conflicts_with = "plain")]
     pub format: Option<OutputFormat>,
 }
 
@@ -93,19 +130,14 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let fmt = formatter_for(format);
 
     if !lifecycle::supports_daemon() {
-        println!(
-            "{}",
-            fmt.format_message(
-                "Background daemon workflows are not supported on this platform yet. Use `1up init` and `1up index`, then rerun `1up index` or `1up reindex` to refresh the local database."
-            )
-        );
+        println!("{}", fmt.format_message(unsupported_daemon_start_message()));
         return Ok(());
     }
 
     let _startup_guard = match acquire_project_startup_guard(&project_root)? {
         StartupGuardAcquire::Acquired(guard) => guard,
         StartupGuardAcquire::Busy(probe) => {
-            let result = startup_guard_busy_result(probe);
+            let result = startup_guard_busy_result(probe, &project_root, &source_root);
             emit_start_result(&*fmt, format, &result, false);
             return Ok(());
         }
@@ -178,6 +210,11 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
         let result = StartResultInfo {
             status: daemon.status,
+            project_id: Some(project_id),
+            project_root: Some(project_root),
+            source_root: Some(source_root),
+            registered: Some(true),
+            index_status: Some(ProjectListIndexStatus::Ready),
             pid: daemon.pid,
             message: msg,
             progress: None,
@@ -186,12 +223,19 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             &*fmt,
             format,
             &result,
-            already_registered && !matches!(format, OutputFormat::Json),
+            already_registered && matches!(format, OutputFormat::Human),
         );
         return Ok(());
     }
 
-    let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
+    let show_progress_ui = format == OutputFormat::Human;
+    let stats = run_initial_index(
+        &project_root,
+        &source_root,
+        &indexing_config,
+        show_progress_ui,
+    )
+    .await?;
     registry.register_with_source(
         &project_id,
         &project_root,
@@ -212,6 +256,11 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     };
     let result = StartResultInfo {
         status,
+        project_id: Some(project_id),
+        project_root: Some(project_root),
+        source_root: Some(source_root),
+        registered: Some(true),
+        index_status: Some(ProjectListIndexStatus::Ready),
         pid: daemon.pid,
         message: msg,
         progress: Some(stats.progress),
@@ -351,10 +400,20 @@ fn wait_for_daemon_ready() -> anyhow::Result<DaemonProbeState> {
     }
 }
 
-fn startup_guard_busy_result(probe: DaemonProbeState) -> StartResultInfo {
+fn startup_guard_busy_result(
+    probe: DaemonProbeState,
+    project_root: &Path,
+    source_root: &Path,
+) -> StartResultInfo {
+    let project_id = project::read_project_id(project_root).ok();
     match probe {
         DaemonProbeState::Running(pid) => StartResultInfo {
             status: StartStatus::AlreadyRunning,
+            project_id: project_id.clone(),
+            project_root: Some(project_root.to_path_buf()),
+            source_root: Some(source_root.to_path_buf()),
+            registered: None,
+            index_status: None,
             pid: Some(pid),
             message: format!(
                 "Daemon already running (pid={pid}); another startup is refreshing project settings."
@@ -363,6 +422,11 @@ fn startup_guard_busy_result(probe: DaemonProbeState) -> StartResultInfo {
         },
         DaemonProbeState::NotRunning | DaemonProbeState::Starting => StartResultInfo {
             status: StartStatus::StartupInProgress,
+            project_id,
+            project_root: Some(project_root.to_path_buf()),
+            source_root: Some(source_root.to_path_buf()),
+            registered: None,
+            index_status: None,
             pid: None,
             message: "Daemon startup already in progress.".to_string(),
             progress: None,
@@ -632,46 +696,32 @@ async fn run_initial_index(
     project_root: &Path,
     source_root: &Path,
     indexing_config: &IndexingConfig,
+    show_progress_ui: bool,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let mut setup = SetupTimings::new(Instant::now());
     let db_path = config::project_db_path(project_root);
+    let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect_tuned().await?;
     schema::prepare_for_write(&conn).await?;
     setup.db_prepare_ms = db_start.elapsed().as_millis();
+    setup_spinner.success();
+
+    let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
     let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
-        .prepare_for_indexing(indexing_config.embed_threads)
+        .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
+    let status_message = model_status_message(&status);
     match &status {
-        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
-        EmbeddingLoadStatus::Downloaded => {
-            eprintln!("info: embedding model downloaded successfully");
-        }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
-            eprintln!("warning: embedding model download previously failed; indexing without embeddings (semantic search will be unavailable). Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
-        }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
-            eprintln!(
-                "warning: embedding model download failed ({err}); indexing without embeddings (semantic search will be unavailable)"
-            );
-        }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
-        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
-            eprintln!(
-                "warning: embedding model failed to load ({err}); indexing without embeddings (semantic search will be unavailable)"
-            );
-        }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
-            eprintln!(
-                "warning: embedding model unavailable; indexing without embeddings (semantic search will be unavailable)"
-            );
-        }
+        EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => model_spinner.success(),
+        EmbeddingLoadStatus::Downloaded => model_spinner.success_with(status_message),
+        EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message),
     }
 
     let stats = pipeline::run_with_scope_setup_and_progress_root(
@@ -681,7 +731,7 @@ async fn run_initial_index(
         &crate::shared::types::RunScope::Full,
         indexing_config,
         None,
-        true,
+        show_progress_ui,
         Some(setup),
         None,
         Some(project_root),
@@ -767,5 +817,24 @@ mod tests {
             parse_single_version("no marker here", "index schema v"),
             None
         );
+    }
+
+    #[test]
+    fn unsupported_daemon_start_message_mentions_only_retained_lifecycle_commands() {
+        let message = unsupported_daemon_start_message();
+
+        for retained in ["1up start", "1up status", "1up list", "1up stop"] {
+            assert!(
+                message.contains(retained),
+                "unsupported daemon guidance should mention retained command {retained}; message={message}"
+            );
+        }
+
+        for hidden in ["1up init", "1up index", "1up reindex", "1up add-mcp"] {
+            assert!(
+                !message.contains(hidden),
+                "unsupported daemon guidance must not mention hidden command {hidden}; message={message}"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 use assert_cmd::prelude::CommandCargoExt;
 use assert_cmd::Command;
-use oneup::shared::constants::SCHEMA_VERSION;
+use oneup::shared::constants::{SCHEMA_VERSION, VERSION};
 use oneup::storage::{db::Db, queries, schema};
 use predicates::prelude::*;
 use std::collections::HashSet;
@@ -62,6 +62,28 @@ fn json_stdout(output: &std::process::Output) -> serde_json::Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn text_stdout(output: &std::process::Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+fn assert_no_ansi(output: &str) {
+    assert!(
+        !output.contains('\u{1b}'),
+        "plain output should not contain ANSI styling: {output:?}"
+    );
+}
+
+fn assert_plain_field_order(line: &str, fields: &[&str]) {
+    let mut cursor = 0;
+    for field in fields {
+        let remaining = &line[cursor..];
+        let offset = remaining
+            .find(field)
+            .unwrap_or_else(|| panic!("missing field {field:?} in line {line:?}"));
+        cursor += offset + field.len();
+    }
 }
 
 fn status_json(home: &Path, project: &Path) -> serde_json::Value {
@@ -201,21 +223,51 @@ impl Drop for HideModelGuard {
 }
 
 #[test]
-fn help_shows_all_subcommands() {
-    cmd().arg("--help").assert().success().stdout(
-        predicate::str::contains("init")
-            .and(predicate::str::contains("start"))
-            .and(predicate::str::contains("stop"))
-            .and(predicate::str::contains("status"))
-            .and(predicate::str::contains("add-mcp"))
-            .and(predicate::str::contains("symbol"))
-            .and(predicate::str::contains("search"))
-            .and(predicate::str::contains("context"))
-            .and(predicate::str::contains("mcp"))
-            .and(predicate::str::contains("index"))
-            .and(predicate::str::contains("reindex"))
-            .and(predicate::str::contains("hello-agent").not()),
-    );
+fn top_level_help_shows_only_p1_lifecycle_commands() {
+    let output = cmd().arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    for visible in ["start", "status", "list", "stop"] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(visible)),
+            "expected top-level help to show {visible}; help was:\n{stdout}"
+        );
+    }
+
+    for hidden in [
+        "add-mcp",
+        "init",
+        "symbol",
+        "search",
+        "get",
+        "context",
+        "impact",
+        "structural",
+        "mcp",
+        "index",
+        "reindex",
+        "update",
+        "__worker",
+        "hello-agent",
+        "1up",
+    ] {
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(hidden)),
+            "expected top-level help to hide {hidden}; help was:\n{stdout}"
+        );
+    }
+
+    for unsupported in ["add-mcp", "Homebrew", "Scoop", "hello-agent"] {
+        assert!(
+            !stdout.contains(unsupported),
+            "top-level help should not advertise {unsupported}; help was:\n{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -229,10 +281,7 @@ fn worker_subcommand_hidden_from_help() {
 
 #[test]
 fn subcommand_help_works() {
-    for sub in &[
-        "init", "start", "stop", "status", "add-mcp", "symbol", "search", "context", "mcp",
-        "index", "reindex",
-    ] {
+    for sub in &["start", "stop", "status", "list"] {
         cmd()
             .args([sub, "--help"])
             .assert()
@@ -309,9 +358,7 @@ fn help_describes_maintenance_format_flag() {
 
 #[test]
 fn maintenance_command_help_documents_format_flag() {
-    for sub in &[
-        "status", "start", "stop", "init", "index", "reindex", "update",
-    ] {
+    for sub in &["init", "index", "reindex", "update"] {
         cmd()
             .args([sub, "--help"])
             .assert()
@@ -321,16 +368,37 @@ fn maintenance_command_help_documents_format_flag() {
 }
 
 #[test]
+fn lifecycle_command_help_documents_plain_and_hides_removed_surfaces() {
+    for sub in &["start", "status", "list", "stop"] {
+        cmd().args([sub, "--help"]).assert().success().stdout(
+            predicate::str::contains("--plain")
+                .and(predicate::str::contains("--format").not())
+                .and(predicate::str::contains("Output format override").not())
+                .and(predicate::str::contains("add-mcp").not())
+                .and(predicate::str::contains("Homebrew").not())
+                .and(predicate::str::contains("Scoop").not())
+                .and(predicate::str::contains("hello-agent").not()),
+        );
+    }
+}
+
+#[test]
 fn status_defaults_to_human_output() {
     let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
 
-    cmd()
+    cmd_with_home(&canonical_home)
         .args(["status", dir.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("Daemon:")
-                .and(predicate::str::contains("Project:"))
+            predicate::str::contains("Lifecycle:")
+                .and(predicate::str::contains("Registered:"))
+                .and(predicate::str::contains("Daemon:"))
+                .and(predicate::str::contains("Project root:"))
+                .and(predicate::str::contains("Source root:"))
+                .and(predicate::str::contains("Index:"))
                 .and(predicate::str::contains("daemon:").not()),
         );
 }
@@ -403,6 +471,151 @@ fn update_status_ignores_cache_from_different_binary_version() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("No cached update information."));
     assert!(!stdout.contains("Latest version:"));
+}
+
+#[test]
+fn update_status_formats_cached_update_in_all_maintenance_formats() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(
+        data_dir.join("update-check.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "current_version": VERSION,
+            "latest_version": "99.0.0",
+            "checked_at": "2026-04-10T10:27:24Z",
+            "install_channel": "manual",
+            "yanked": false,
+            "message": "New lifecycle release available",
+            "notes_url": "https://example.com/notes",
+            "upgrade_instruction": "1up update"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let json_output = cmd_with_home(&canonical_home)
+        .env(
+            "ONEUP_UPDATE_MANIFEST_URL",
+            "https://example.com/update-manifest.json",
+        )
+        .args(["update", "--status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let json = json_stdout(&json_output);
+    assert_eq!(json["current_version"], VERSION);
+    assert_eq!(json["latest_version"], "99.0.0");
+    assert_eq!(json["update_available"], true);
+    assert_eq!(json["install_channel"], "manual");
+    assert_eq!(json["message"], "New lifecycle release available");
+    assert_eq!(json["upgrade_instruction"], "1up update");
+    assert_eq!(json["cached"], true);
+    assert!(json["cache_age_secs"].as_i64().is_some());
+
+    let human_output = cmd_with_home(&canonical_home)
+        .env(
+            "ONEUP_UPDATE_MANIFEST_URL",
+            "https://example.com/update-manifest.json",
+        )
+        .args(["update", "--status", "--format", "human"])
+        .output()
+        .unwrap();
+    assert!(human_output.status.success());
+    let human = text_stdout(&human_output);
+    assert!(human.contains("Current version:"));
+    assert!(human.contains("Latest version:"));
+    assert!(human.contains("Install source:"));
+    assert!(human.contains("Last checked:"));
+    assert!(human.contains("update available (99.0.0)"));
+    assert!(human.contains("Run: 1up update"));
+
+    let plain_output = cmd_with_home(&canonical_home)
+        .env(
+            "ONEUP_UPDATE_MANIFEST_URL",
+            "https://example.com/update-manifest.json",
+        )
+        .args(["update", "--status", "--format", "plain"])
+        .output()
+        .unwrap();
+    assert!(plain_output.status.success());
+    let plain = text_stdout(&plain_output);
+    assert_plain_field_order(
+        plain.lines().next().unwrap(),
+        &[
+            "current:",
+            "latest:99.0.0",
+            "status:update_available",
+            "update_available:true",
+            "channel:manual",
+            "instruction:1up update",
+            "checked_at:",
+            "cache_age_secs:",
+            "message:New lifecycle release available",
+        ],
+    );
+    assert_no_ansi(&plain);
+}
+
+#[test]
+fn update_status_human_reports_yanked_and_minimum_safe_cache_states() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let data_dir = test_data_dir(&canonical_home);
+    fs::create_dir_all(&data_dir).unwrap();
+    let update_env = "https://example.com/update-manifest.json";
+
+    fs::write(
+        data_dir.join("update-check.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "current_version": VERSION,
+            "latest_version": "99.0.0",
+            "checked_at": "2026-04-10T10:27:24Z",
+            "install_channel": "manual",
+            "yanked": true,
+            "message": "Current version was recalled",
+            "upgrade_instruction": "1up update"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let yanked_output = cmd_with_home(&canonical_home)
+        .env("ONEUP_UPDATE_MANIFEST_URL", update_env)
+        .args(["update", "--status", "--format", "human"])
+        .output()
+        .unwrap();
+    assert!(yanked_output.status.success());
+    let yanked = text_stdout(&yanked_output);
+    assert!(yanked.contains("YANKED"));
+    assert!(yanked.contains("Current version was recalled"));
+    assert!(yanked.contains("Run: 1up update"));
+
+    fs::write(
+        data_dir.join("update-check.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "current_version": VERSION,
+            "latest_version": "99.0.0",
+            "checked_at": "2026-04-10T10:27:24Z",
+            "install_channel": "manual",
+            "yanked": false,
+            "minimum_safe_version": "99.0.0",
+            "message": "Minimum safe version changed",
+            "upgrade_instruction": "1up update"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let minimum_output = cmd_with_home(&canonical_home)
+        .env("ONEUP_UPDATE_MANIFEST_URL", update_env)
+        .args(["update", "--status", "--format", "human"])
+        .output()
+        .unwrap();
+    assert!(minimum_output.status.success());
+    let minimum = text_stdout(&minimum_output);
+    assert!(minimum.contains("below minimum safe version (99.0.0)"));
+    assert!(minimum.contains("Minimum safe version changed"));
+    assert!(minimum.contains("Run: 1up update"));
 }
 
 #[test]
@@ -546,6 +759,195 @@ fn start_auto_initializes_project_if_needed() {
             .assert()
             .success();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
+    seed_model_download_failure(&canonical_home);
+
+    let source_file = canonical_dir.join("main.rs");
+    fs::write(
+        &source_file,
+        "fn main() {\n    println!(\"plain lifecycle\");\n}\n",
+    )
+    .unwrap();
+    let source_before = fs::read(&source_file).unwrap();
+
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    let empty_list = cmd_with_home(&canonical_home)
+        .args(["list", "--plain"])
+        .output()
+        .unwrap();
+    assert!(empty_list.status.success());
+    let empty_list_stdout = text_stdout(&empty_list);
+    assert_eq!(empty_list_stdout.trim_end(), "projects:0");
+    assert_no_ansi(&empty_list_stdout);
+
+    let before_status = cmd_with_home(&canonical_home)
+        .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(before_status.status.success());
+    let before_status_stdout = text_stdout(&before_status);
+    assert_plain_field_order(
+        before_status_stdout.lines().next().unwrap(),
+        &[
+            "lifecycle:not_started",
+            "registered:false",
+            "daemon:stopped",
+            "pid:none",
+            "project_initialized:false",
+            "project_id:none",
+            "project_root:",
+            "source_root:",
+            "index:not_built",
+            "last_file_check:none",
+        ],
+    );
+    assert_no_ansi(&before_status_stdout);
+
+    let start = cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "start --plain should succeed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let start_stdout = text_stdout(&start);
+    let start_line = start_stdout.lines().next().unwrap();
+    assert_plain_field_order(
+        start_line,
+        &[
+            "status:",
+            "project_id:",
+            "project_root:",
+            "source_root:",
+            "registered:true",
+            "index:ready",
+            "pid:",
+            "message:",
+        ],
+    );
+    assert!(start_line.contains("Indexed") || start_line.contains("Project registered"));
+    assert_no_ansi(&start_stdout);
+
+    let project_id_path = canonical_dir.join(".1up").join("project_id");
+    let index_path = canonical_dir.join(".1up").join("index.db");
+    assert!(
+        project_id_path.exists(),
+        "start should create .1up/project_id"
+    );
+    assert!(index_path.exists(), "start should create .1up/index.db");
+    let project_id = fs::read_to_string(&project_id_path).unwrap();
+    let project_id = project_id.trim();
+    assert!(!project_id.is_empty());
+
+    let started_status = cmd_with_home(&canonical_home)
+        .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(started_status.status.success());
+    let started_status_stdout = text_stdout(&started_status);
+    let started_status_line = started_status_stdout.lines().next().unwrap();
+    assert!(
+        started_status_line.starts_with("lifecycle:active")
+            || started_status_line.starts_with("lifecycle:registered")
+            || started_status_line.starts_with("lifecycle:indexing"),
+        "started lifecycle should be active, registered, or indexing; got {started_status_line:?}"
+    );
+    assert!(started_status_line.contains("\tregistered:true\t"));
+    assert!(started_status_line.contains("\tproject_initialized:true\t"));
+    assert!(started_status_line.contains(&format!("\tproject_id:{project_id}\t")));
+    assert!(started_status_line.contains("\tindex:ready\t"));
+    assert_no_ansi(&started_status_stdout);
+
+    let registered_list = cmd_with_home(&canonical_home)
+        .args(["list", "--plain"])
+        .output()
+        .unwrap();
+    assert!(registered_list.status.success());
+    let registered_list_stdout = text_stdout(&registered_list);
+    let registered_line = registered_list_stdout.lines().next().unwrap();
+    assert_plain_field_order(
+        registered_line,
+        &[
+            "project:",
+            "state:",
+            "project_root:",
+            "source_root:",
+            "index:ready",
+            "files:",
+            "segments:",
+            "last_file_check:",
+            "registered_at:",
+        ],
+    );
+    assert!(registered_line.starts_with(&format!("project:{project_id}\t")));
+    assert!(registered_line.contains(&format!("\tproject_root:{}\t", canonical_dir.display())));
+    assert_no_ansi(&registered_list_stdout);
+
+    let stop = cmd_with_home(&canonical_home)
+        .args(["stop", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "stop --plain should succeed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let stop_stdout = text_stdout(&stop);
+    let stop_line = stop_stdout.lines().next().unwrap();
+    assert_plain_field_order(
+        stop_line,
+        &[
+            "status:",
+            "project_root:",
+            "registered:false",
+            "daemon:",
+            "pid:",
+            "message:",
+        ],
+    );
+    assert!(
+        stop_line.starts_with("status:stopped")
+            || stop_line.starts_with("status:daemon_not_running")
+    );
+    assert_no_ansi(&stop_stdout);
+
+    let after_status = cmd_with_home(&canonical_home)
+        .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(after_status.status.success());
+    let after_status_stdout = text_stdout(&after_status);
+    let after_status_line = after_status_stdout.lines().next().unwrap();
+    assert!(after_status_line.starts_with("lifecycle:stopped"));
+    assert!(after_status_line.contains("\tregistered:false\t"));
+    assert_no_ansi(&after_status_stdout);
+
+    let after_list = cmd_with_home(&canonical_home)
+        .args(["list", "--plain"])
+        .output()
+        .unwrap();
+    assert!(after_list.status.success());
+    let after_list_stdout = text_stdout(&after_list);
+    assert_eq!(after_list_stdout.trim_end(), "projects:0");
+    assert_no_ansi(&after_list_stdout);
+
+    assert_eq!(
+        source_before,
+        fs::read(&source_file).unwrap(),
+        "stop must not modify source files"
+    );
 }
 
 #[cfg(unix)]
@@ -1034,13 +1436,25 @@ fn reindex_watch_plain_output_streams_rebuild_and_completion() {
 fn start_reports_local_mode_guidance_on_non_unix_platforms() {
     let dir = tempfile::tempdir().unwrap();
 
-    cmd()
+    let output = cmd()
         .args(["start", dir.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Background daemon workflows are not supported",
-        ));
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = text_stdout(&output);
+    assert!(stdout.contains("Background daemon workflows are not supported"));
+    for retained in ["1up start", "1up status", "1up list", "1up stop"] {
+        assert!(
+            stdout.contains(retained),
+            "unsupported daemon guidance should mention retained command {retained}; stdout={stdout}"
+        );
+    }
+    for hidden in ["1up init", "1up index", "1up reindex", "1up add-mcp"] {
+        assert!(
+            !stdout.contains(hidden),
+            "unsupported daemon guidance must not mention hidden command {hidden}; stdout={stdout}"
+        );
+    }
 }
 
 #[cfg(not(unix))]
@@ -1087,6 +1501,30 @@ fn create_stale_v4_index(dir: &Path) {
     });
 }
 
+fn create_newer_index(dir: &Path) {
+    block_on(async {
+        let db = Db::open_rw(&project_db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            ["schema_version", &(SCHEMA_VERSION + 1).to_string()],
+        )
+        .await
+        .unwrap();
+    });
+}
+
+fn create_schema_missing_index(dir: &Path) {
+    block_on(async {
+        let db = Db::open_rw(&project_db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE orphaned_segments(id TEXT)", ())
+            .await
+            .unwrap();
+    });
+}
+
 /// Seed a project DB at the current schema version without running the
 /// indexer. Matches `prepare_for_write`'s fresh-database branch.
 fn create_current_index(dir: &Path) {
@@ -1095,6 +1533,76 @@ fn create_current_index(dir: &Path) {
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
     });
+}
+
+fn write_registry(home: &Path, projects: serde_json::Value) {
+    let data_dir = test_data_dir(home);
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(
+        data_dir.join("projects.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "projects": projects })).unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_lifecycle_progress_fixture(project: &Path, project_id: &str) {
+    let dot_dir = project.join(".1up");
+    fs::create_dir_all(&dot_dir).unwrap();
+    fs::write(dot_dir.join("project_id"), project_id).unwrap();
+    fs::write(
+        dot_dir.join("index_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "running",
+            "phase": "storing",
+            "files_total": 4,
+            "files_scanned": 4,
+            "files_processed": 3,
+            "files_indexed": 2,
+            "files_skipped": 1,
+            "files_deleted": 1,
+            "segments_stored": 9,
+            "embeddings_enabled": true,
+            "message": "storing lifecycle fixture",
+            "parallelism": {
+                "jobs_configured": 4,
+                "jobs_effective": 2,
+                "embed_threads": 1
+            },
+            "timings": {
+                "scan_ms": 10,
+                "parse_ms": 20,
+                "embed_ms": 30,
+                "store_ms": 40,
+                "total_ms": 100,
+                "db_prepare_ms": 5,
+                "model_prepare_ms": 6,
+                "input_prep_ms": 7
+            },
+            "scope": {
+                "requested": "scoped",
+                "executed": "full",
+                "changed_paths": 2,
+                "fallback_reason": "fixture fallback"
+            },
+            "prefilter": {
+                "discovered": 4,
+                "metadata_skipped": 1,
+                "content_read": 3,
+                "deleted": 1
+            },
+            "updated_at": "2026-05-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        dot_dir.join("daemon_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "last_file_check_at": "2026-05-01T00:05:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -1194,6 +1702,228 @@ fn start_warns_on_stale_schema_json_envelope() {
     assert_eq!(payload["expected"], SCHEMA_VERSION);
     assert_eq!(payload["action"], "1up reindex");
     assert!(payload["path"].as_str().unwrap().ends_with("index.db"));
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_newer_schema_as_binary_update_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    create_newer_index(&canonical_dir);
+
+    let json_output = cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!json_output.status.success());
+    let json_stdout = text_stdout(&json_output);
+    let envelope_line = json_stdout
+        .lines()
+        .find(|line| line.contains("binary_out_of_date"))
+        .unwrap_or_else(|| panic!("expected binary_out_of_date envelope; stdout={json_stdout}"));
+    let payload: serde_json::Value = serde_json::from_str(envelope_line).unwrap();
+    assert_eq!(payload["status"], "binary_out_of_date");
+    assert_eq!(payload["found"], SCHEMA_VERSION + 1);
+    assert_eq!(payload["expected"], SCHEMA_VERSION);
+    assert_eq!(payload["action"], "1up update");
+
+    let human_dir = tempfile::tempdir().unwrap();
+    let human_project = human_dir.path().canonicalize().unwrap();
+    create_newer_index(&human_project);
+    let human_output = cmd_with_home(&canonical_home)
+        .args(["start", human_project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!human_output.status.success());
+    let human_stdout = text_stdout(&human_output);
+    assert!(human_stdout.contains("newer than this binary supports"));
+    assert!(human_stdout.contains("1up update"));
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_schema_missing_index_as_reindex_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    create_schema_missing_index(&canonical_dir);
+
+    let json_output = cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!json_output.status.success());
+    let json_stdout = text_stdout(&json_output);
+    let envelope_line = json_stdout
+        .lines()
+        .find(|line| line.contains("index_unreadable"))
+        .unwrap_or_else(|| panic!("expected index_unreadable envelope; stdout={json_stdout}"));
+    let payload: serde_json::Value = serde_json::from_str(envelope_line).unwrap();
+    assert_eq!(payload["status"], "index_unreadable");
+    assert_eq!(payload["action"], "1up reindex");
+
+    let human_dir = tempfile::tempdir().unwrap();
+    let human_project = human_dir.path().canonicalize().unwrap();
+    create_schema_missing_index(&human_project);
+    let human_output = cmd_with_home(&canonical_home)
+        .args(["start", human_project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!human_output.status.success());
+    let human_stdout = text_stdout(&human_output);
+    assert!(human_stdout.contains("unreadable"));
+    assert!(human_stdout.contains("1up reindex"));
+}
+
+#[cfg(unix)]
+#[test]
+fn lifecycle_registry_outputs_cover_json_human_progress_and_stop_states() {
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let unavailable_dir = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let project = project_dir.path().canonicalize().unwrap();
+    let unavailable_project = unavailable_dir.path().canonicalize().unwrap();
+    let source_root = project.join("source-root");
+    fs::create_dir_all(&source_root).unwrap();
+
+    write_lifecycle_progress_fixture(&project, "progress-project");
+    fs::create_dir_all(unavailable_project.join(".1up")).unwrap();
+    fs::write(
+        unavailable_project.join(".1up").join("project_id"),
+        "unavailable-project",
+    )
+    .unwrap();
+    create_newer_index(&unavailable_project);
+    write_registry(
+        &canonical_home,
+        serde_json::json!([
+            {
+                "project_id": "progress-project",
+                "project_root": project,
+                "source_root": source_root,
+                "registered_at": "2026-05-01T00:10:00Z"
+            },
+            {
+                "project_id": "unavailable-project",
+                "project_root": unavailable_project,
+                "registered_at": "2026-05-01T00:15:00Z"
+            }
+        ]),
+    );
+
+    let list_json_output = cmd_with_home(&canonical_home)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(list_json_output.status.success());
+    let list_json = json_stdout(&list_json_output);
+    assert_eq!(list_json["projects"][0]["project_id"], "progress-project");
+    assert_eq!(list_json["projects"][0]["state"], "indexing");
+    assert_eq!(list_json["projects"][0]["index_status"], "not_built");
+    assert_eq!(list_json["projects"][0]["files"], 2);
+    assert_eq!(list_json["projects"][0]["segments"], 9);
+    assert_eq!(
+        list_json["projects"][0]["last_file_check_at"],
+        "2026-05-01T00:05:00Z"
+    );
+    assert_eq!(list_json["projects"][1]["index_status"], "unavailable");
+
+    let list_plain_output = cmd_with_home(&canonical_home)
+        .args(["list", "--plain"])
+        .output()
+        .unwrap();
+    assert!(list_plain_output.status.success());
+    let list_plain = text_stdout(&list_plain_output);
+    assert!(list_plain.contains("project:progress-project\tstate:indexing"));
+    assert!(list_plain.contains("\tindex:not_built\tfiles:2\tsegments:9\t"));
+    assert!(list_plain.contains("project:unavailable-project\tstate:registered"));
+    assert!(list_plain.contains("\tindex:unavailable\tfiles:unknown\tsegments:unknown\t"));
+    assert_no_ansi(&list_plain);
+
+    let list_human_output = cmd_with_home(&canonical_home)
+        .args(["list"])
+        .output()
+        .unwrap();
+    assert!(list_human_output.status.success());
+    let list_human = text_stdout(&list_human_output);
+    assert!(list_human.contains("Registered projects"));
+    assert!(list_human.contains("progress-project"));
+    assert!(list_human.contains("unavailable-project"));
+
+    let status_json_output = cmd_with_home(&canonical_home)
+        .args(["status", project.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(status_json_output.status.success());
+    let status_json = json_stdout(&status_json_output);
+    assert_eq!(status_json["lifecycle_state"], "indexing");
+    assert_eq!(status_json["registered"], true);
+    assert_eq!(status_json["index_status"], "indexing");
+    assert_eq!(
+        status_json["index_progress"]["message"],
+        "storing lifecycle fixture"
+    );
+    assert_eq!(status_json["index_work"]["files_completed"], 3);
+
+    let status_human_output = cmd_with_home(&canonical_home)
+        .args(["status", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(status_human_output.status.success());
+    let status_human = text_stdout(&status_human_output);
+    assert!(status_human.contains("Lifecycle:"));
+    assert!(status_human.contains("Index message: storing lifecycle fixture"));
+    assert!(status_human.contains("Parallelism: workers 2 effective / 4 configured"));
+    assert!(status_human.contains("Timings: db_prepare 5ms"));
+    assert!(status_human.contains("Scope: requested scoped | executed full"));
+    assert!(status_human.contains("fallback: fixture fallback"));
+    assert!(status_human.contains("Prefilter: discovered 4"));
+    assert!(status_human.contains("Last file check:"));
+
+    let stop_human_output = cmd_with_home(&canonical_home)
+        .args(["stop", unavailable_project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(stop_human_output.status.success());
+    let stop_human = text_stdout(&stop_human_output);
+    assert!(stop_human.contains("Status:"));
+    assert!(stop_human.contains("daemon not running"));
+    assert!(stop_human.contains("Project root:"));
+    assert!(stop_human.contains("Registered:"));
+    assert!(stop_human.contains("Message: Project deregistered."));
+
+    let stop_registered = cmd_with_home(&canonical_home)
+        .args(["stop", project.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(stop_registered.status.success());
+    let stop_registered_json = json_stdout(&stop_registered);
+    assert_eq!(stop_registered_json["status"], "daemon_not_running");
+    assert_eq!(stop_registered_json["registered"], false);
+    assert_eq!(stop_registered_json["daemon_running"], false);
+
+    let stop_again = cmd_with_home(&canonical_home)
+        .args(["stop", project.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(stop_again.status.success());
+    let stop_again_json = json_stdout(&stop_again);
+    assert_eq!(stop_again_json["status"], "not_registered");
+    assert_eq!(stop_again_json["registered"], false);
+    assert_eq!(stop_again_json["daemon_running"], false);
+
+    let empty_human_list = cmd_with_home(&canonical_home)
+        .args(["list"])
+        .output()
+        .unwrap();
+    assert!(empty_human_list.status.success());
+    let empty_human = text_stdout(&empty_human_list);
+    assert!(empty_human.contains("No registered projects."));
+    assert!(empty_human.contains("1up start"));
 }
 
 #[cfg(unix)]
