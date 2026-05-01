@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -18,10 +19,16 @@ use crate::shared::fs::{
 
 const CONTENTION_RETRY_INTERVAL_MS: u64 = 200;
 const CONTENTION_TIMEOUT_MS: u64 = 5000;
-const SIGKILL_WAIT_MS: u64 = 1000;
 
 pub const fn supports_daemon() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonProbeState {
+    NotRunning,
+    Running(u32),
+    Starting,
 }
 
 pub struct DaemonLock {
@@ -86,56 +93,64 @@ fn write_pid_and_wrap(mut lock: Flock<File>, pid_path: PathBuf) -> Result<Daemon
 }
 
 fn handle_lock_contention(pid_path: &Path, _xdg_root: &Path) -> Result<DaemonLock, OneupError> {
-    let contending_pid = read_pid_from_path(pid_path);
+    observe_lock_contention(
+        pid_path,
+        Duration::from_millis(CONTENTION_TIMEOUT_MS),
+        Duration::from_millis(CONTENTION_RETRY_INTERVAL_MS),
+    )
+}
 
-    if let Some(pid) = contending_pid {
-        info!("daemon lock contention: sending SIGTERM to pid={pid}");
-        let _ = send_sigterm(pid);
+fn observe_lock_contention(
+    pid_path: &Path,
+    timeout: Duration,
+    retry_interval: Duration,
+) -> Result<DaemonLock, OneupError> {
+    let deadline = Instant::now() + timeout;
 
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(CONTENTION_TIMEOUT_MS);
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(
-                CONTENTION_RETRY_INTERVAL_MS,
-            ));
-            let file = open_pid_file(pid_path)?;
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(lock) => return write_pid_and_wrap(lock, pid_path.to_path_buf()),
-                Err((_, Errno::EWOULDBLOCK)) => continue,
-                Err((_, errno)) => {
-                    return Err(DaemonError::PidFileError(format!(
-                        "failed to lock pid file after SIGTERM: {errno}"
-                    ))
-                    .into())
-                }
+    loop {
+        if let Some(pid) = read_pid_from_path(pid_path) {
+            if is_process_alive(pid) {
+                info!("daemon lock contention: pid={pid} already holds the daemon lock");
+                return Err(DaemonError::AlreadyRunning(pid).into());
             }
+            debug!(
+                "daemon lock contention: pid file contains inactive pid={pid}; observing holder"
+            );
+        } else {
+            debug!("daemon lock contention: pid file is not ready; observing holder");
         }
 
-        warn!("SIGTERM timeout; sending SIGKILL to pid={pid}");
-        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
-        std::thread::sleep(std::time::Duration::from_millis(SIGKILL_WAIT_MS));
+        if let Some(lock) = try_acquire_pid_lock(pid_path)? {
+            return write_pid_and_wrap(lock, pid_path.to_path_buf());
+        }
 
-        let file = open_pid_file(pid_path)?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => write_pid_and_wrap(lock, pid_path.to_path_buf()),
-            Err((_, errno)) => Err(DaemonError::PidFileError(format!(
-                "failed to acquire daemon lock after SIGKILL: {errno}"
-            ))
-            .into()),
+        let now = Instant::now();
+        if now >= deadline {
+            break;
         }
-    } else {
-        warn!("lock contention but no readable PID; retrying lock");
-        std::thread::sleep(std::time::Duration::from_millis(
-            CONTENTION_RETRY_INTERVAL_MS,
-        ));
-        let file = open_pid_file(pid_path)?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => write_pid_and_wrap(lock, pid_path.to_path_buf()),
-            Err((_, errno)) => Err(DaemonError::PidFileError(format!(
-                "failed to acquire daemon lock: {errno}"
-            ))
-            .into()),
+        std::thread::sleep(retry_interval.min(deadline.saturating_duration_since(now)));
+    }
+
+    if let Some(pid) = read_pid_from_path(pid_path) {
+        if is_process_alive(pid) {
+            info!("daemon lock contention resolved to running pid={pid}");
+            return Err(DaemonError::AlreadyRunning(pid).into());
         }
+    }
+
+    warn!("daemon lock contention: another startup still holds the daemon lock");
+    Err(DaemonError::StartupInProgress.into())
+}
+
+fn try_acquire_pid_lock(pid_path: &Path) -> Result<Option<Flock<File>>, OneupError> {
+    let file = open_pid_file(pid_path)?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, errno)) => Err(DaemonError::PidFileError(format!(
+            "failed to probe daemon lock during contention: {errno}"
+        ))
+        .into()),
     }
 }
 
@@ -220,14 +235,19 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-pub fn is_daemon_running() -> Result<Option<u32>, OneupError> {
+pub fn probe_daemon() -> Result<DaemonProbeState, OneupError> {
     let xdg_root = ensure_secure_xdg_root()
         .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
     let pid_path = config::pid_file_path()?;
+    probe_daemon_at(&pid_path, &xdg_root)
+}
 
-    let file = match File::open(&pid_path) {
+fn probe_daemon_at(pid_path: &Path, xdg_root: &Path) -> Result<DaemonProbeState, OneupError> {
+    let file = match File::open(pid_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DaemonProbeState::NotRunning);
+        }
         Err(e) => {
             return Err(DaemonError::PidFileError(format!("failed to open pid file: {e}")).into())
         }
@@ -237,26 +257,37 @@ pub fn is_daemon_running() -> Result<Option<u32>, OneupError> {
         Ok(lock) => {
             drop(lock);
             warn!("stale pid file detected, cleaning up");
-            let _ = remove_pid_file_at(&pid_path, &xdg_root);
-            Ok(None)
+            let _ = remove_pid_file_at(pid_path, xdg_root);
+            Ok(DaemonProbeState::NotRunning)
         }
         Err((mut file, Errno::EWOULDBLOCK)) => {
             let mut content = String::new();
-            file.read_to_string(&mut content)
-                .map_err(|e| DaemonError::PidFileError(format!("failed to read pid: {e}")))?;
-            let pid: u32 = content
-                .trim()
-                .parse()
-                .map_err(|e| DaemonError::PidFileError(format!("invalid pid in file: {e}")))?;
+            if file.read_to_string(&mut content).is_err() {
+                return Ok(DaemonProbeState::Starting);
+            }
+            let Ok(pid) = content.trim().parse::<u32>() else {
+                return Ok(DaemonProbeState::Starting);
+            };
             debug!(
                 "flock held by pid={pid}, is_process_alive={}",
                 is_process_alive(pid)
             );
-            Ok(Some(pid))
+            if is_process_alive(pid) {
+                Ok(DaemonProbeState::Running(pid))
+            } else {
+                Ok(DaemonProbeState::Starting)
+            }
         }
         Err((_, errno)) => {
             Err(DaemonError::PidFileError(format!("failed to probe pid file lock: {errno}")).into())
         }
+    }
+}
+
+pub fn is_daemon_running() -> Result<Option<u32>, OneupError> {
+    match probe_daemon()? {
+        DaemonProbeState::Running(pid) => Ok(Some(pid)),
+        DaemonProbeState::NotRunning | DaemonProbeState::Starting => Ok(None),
     }
 }
 
@@ -306,7 +337,11 @@ pub fn current_binary_path() -> Result<std::path::PathBuf, OneupError> {
 /// registers the project and spawns a new daemon. If a daemon is already running
 /// but the project is not registered, registers it and sends SIGHUP to reload.
 /// Returns the daemon PID.
-pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, OneupError> {
+pub fn ensure_daemon(
+    project_id: &str,
+    project_root: &Path,
+    source_root: &Path,
+) -> Result<u32, OneupError> {
     use crate::daemon::registry::Registry;
 
     if let Some(pid) = is_daemon_running()? {
@@ -319,7 +354,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
         });
 
         if !already_registered {
-            registry.register(project_id, project_root, None)?;
+            registry.register_with_source(project_id, project_root, source_root, None)?;
             send_sighup(pid)?;
             debug!("auto-registered project and sent SIGHUP to daemon (pid={pid})");
         }
@@ -328,7 +363,7 @@ pub fn ensure_daemon(project_id: &str, project_root: &Path) -> Result<u32, Oneup
     }
 
     let mut registry = Registry::load()?;
-    registry.register(project_id, project_root, None)?;
+    registry.register_with_source(project_id, project_root, source_root, None)?;
 
     let binary = current_binary_path()?;
     let pid = spawn_daemon(&binary)?;
@@ -426,5 +461,73 @@ mod tests {
                 assert_eq!(errno, Errno::EWOULDBLOCK);
             }
         }
+    }
+
+    #[test]
+    fn lock_contention_reports_running_pid_without_terminating_it() {
+        struct ChildGuard {
+            child: std::process::Child,
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let _child = ChildGuard { child };
+
+        fs::write(&pid_path, child_pid.to_string()).unwrap();
+        let holder = File::open(&pid_path).unwrap();
+        let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock)
+            .expect("should acquire lock as holder");
+
+        let err = match observe_lock_contention(
+            &pid_path,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(1),
+        ) {
+            Ok(_) => panic!("expected lock contention to lose to running daemon"),
+            Err(err) => err,
+        };
+
+        match err {
+            OneupError::Daemon(DaemonError::AlreadyRunning(pid)) => assert_eq!(pid, child_pid),
+            other => panic!("expected already-running contention, got {other:?}"),
+        }
+        assert!(is_process_alive(child_pid));
+    }
+
+    #[test]
+    fn lock_contention_without_readable_pid_reports_starting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+
+        fs::write(&pid_path, "").unwrap();
+        let holder = File::open(&pid_path).unwrap();
+        let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock)
+            .expect("should acquire lock as holder");
+
+        let err = match observe_lock_contention(
+            &pid_path,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+        ) {
+            Ok(_) => panic!("expected unreadable lock holder to remain in progress"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            OneupError::Daemon(DaemonError::StartupInProgress)
+        ));
     }
 }

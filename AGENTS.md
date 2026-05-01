@@ -46,33 +46,15 @@ that an rp1 skill addresses, briefly suggest it.
 - For deeper questions about rp1, suggest the user invoke /guide.
 <!-- rp1:end:v0.7.1 -->
 
-# 1up MCP Agent Quick Reference
+## 1up MCP Code Discovery
 
-The supported 1up agent integration is MCP. Configure the local server with command `1up` and args `["mcp", "--path", "<repo>"]`.
+For code-discovery questions in this repo, use the `oneup` MCP tools before broad
+raw search. This includes questions like "how does X work", "where is Y handled
+or saved", "what calls Z", "where is this pattern implemented", or "what code is
+impacted by this change".
 
-## Tool Selection
-
-| You need | Use |
-|---|---|
-| Readiness or index state | `oneup_prepare` |
-| Conceptual code discovery | `oneup_search` |
-| A returned handle or precise file:line | `oneup_read` |
-| Definitions or references for completeness | `oneup_symbol` |
-| Likely follow-up targets or blast radius | `oneup_impact` |
-
-`oneup_search` is ranked discovery, not proof of completeness. Read selected hits with `oneup_read`, then use `oneup_symbol` when a known symbol needs definitions or references.
-
-## Workflow
-
-1. Call `oneup_prepare` when readiness is uncertain.
-2. Call `oneup_search` with the task intent and a small limit.
-3. Hydrate the best handles or file locations with `oneup_read`.
-4. Use `oneup_symbol` for completeness-oriented symbol checks.
-5. Use `oneup_impact` for advisory primary/contextual follow-up targets.
-
-## Boundaries
-
-- Use canonical `oneup_*` MCP names only; do not invent `1up_*` aliases.
-- Do not rely on AGENTS/CLAUDE reminder fences, `hello-agent`, or the old portable skill as the 1up adoption path.
-- `grep` and `rg` are appropriate only for exact literal verification after MCP discovery narrows scope to specific files.
-- The manual CLI remains available for humans and scripts, but agents should prefer MCP tools when the host exposes them.
+Use `oneup_prepare` when index readiness is unknown, `oneup_search` for ranked
+discovery, `oneup_read` to hydrate returned handles or locations, `oneup_symbol`
+for definition/reference completeness, and `oneup_impact` for likely blast
+radius. Use `rg`, `grep`, `find`, shell `1up`, or broad file reads first only for
+exact literals, regexes, non-code files, or when the MCP server is unavailable.

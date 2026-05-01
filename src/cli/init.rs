@@ -24,7 +24,13 @@ pub async fn exec(args: InitArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let id = crate::shared::project::write_project_id(&project_root)?;
+    let (id, initialized_now) = crate::shared::project::ensure_project_id(&project_root)?;
+    if !initialized_now {
+        let msg = format!("Project already initialized at {}", project_root.display());
+        eprintln!("{}", fmt.format_message(&msg));
+        return Ok(());
+    }
+
     let msg = format!("Initialized project {} at {}", id, project_root.display());
     println!("{}", fmt.format_message(&msg));
     Ok(())

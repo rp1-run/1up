@@ -525,6 +525,15 @@ FALLBACK_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.fallba
 SCOPED_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.executed | startswith("scoped"))] | length')
 FULL_COUNT=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.scope.executed == "full")] | length')
 
+# Count prefilter work distribution. Full-run metadata skips are expected on
+# unchanged refreshes and indicate files avoided content reads before parsing.
+PREFILTER_DISCOVERED_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | (.prefilter.discovered // 0)] | add // 0')
+PREFILTER_METADATA_SKIPPED_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | (.prefilter.metadata_skipped // 0)] | add // 0')
+PREFILTER_CONTENT_READ_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | (.prefilter.content_read // 0)] | add // 0')
+PREFILTER_DELETED_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | (.prefilter.deleted // 0)] | add // 0')
+FULL_METADATA_SKIPPED_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.label | startswith("full:")) | (.prefilter.metadata_skipped // 0)] | add // 0')
+FULL_CONTENT_READ_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.label | startswith("full:")) | (.prefilter.content_read // 0)] | add // 0')
+
 jq -n \
   --arg repo "$REPO" \
   --arg out_dir "$OUT_DIR" \
@@ -547,6 +556,12 @@ jq -n \
   --argjson fallback_count "$FALLBACK_COUNT" \
   --argjson scoped_count "$SCOPED_COUNT" \
   --argjson full_count "$FULL_COUNT" \
+  --argjson prefilter_discovered_total "$PREFILTER_DISCOVERED_TOTAL" \
+  --argjson prefilter_metadata_skipped_total "$PREFILTER_METADATA_SKIPPED_TOTAL" \
+  --argjson prefilter_content_read_total "$PREFILTER_CONTENT_READ_TOTAL" \
+  --argjson prefilter_deleted_total "$PREFILTER_DELETED_TOTAL" \
+  --argjson full_metadata_skipped_total "$FULL_METADATA_SKIPPED_TOTAL" \
+  --argjson full_content_read_total "$FULL_CONTENT_READ_TOTAL" \
   --argjson telemetry "$TELEMETRY_JSON" \
   '{
     repo: $repo,
@@ -579,6 +594,14 @@ jq -n \
       scoped_count: $scoped_count,
       full_count: $full_count
     },
+    prefilter_evidence: {
+      discovered_total: $prefilter_discovered_total,
+      metadata_skipped_total: $prefilter_metadata_skipped_total,
+      content_read_total: $prefilter_content_read_total,
+      deleted_total: $prefilter_deleted_total,
+      full_metadata_skipped_total: $full_metadata_skipped_total,
+      full_content_read_total: $full_content_read_total
+    },
     configs: {
       serial: {
         jobs: $serial_jobs,
@@ -608,3 +631,7 @@ printf 'Write-heavy median ms: serial=%s auto=%s constrained=%s\n' \
 printf 'Daemon refresh median ms: %s\n' "$DAEMON_REFRESH_MEDIAN_MS"
 printf 'Scope evidence: fallback=%s scoped=%s full=%s\n' \
   "$FALLBACK_COUNT" "$SCOPED_COUNT" "$FULL_COUNT"
+printf 'Prefilter evidence: discovered=%s metadata_skipped=%s content_read=%s deleted=%s full_metadata_skipped=%s full_content_read=%s\n' \
+  "$PREFILTER_DISCOVERED_TOTAL" "$PREFILTER_METADATA_SKIPPED_TOTAL" \
+  "$PREFILTER_CONTENT_READ_TOTAL" "$PREFILTER_DELETED_TOTAL" \
+  "$FULL_METADATA_SKIPPED_TOTAL" "$FULL_CONTENT_READ_TOTAL"

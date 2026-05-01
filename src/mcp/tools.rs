@@ -30,12 +30,15 @@ use crate::storage::db::Db;
 use crate::storage::schema;
 
 const DEFAULT_SEARCH_LIMIT: usize = 5;
+const MCP_HANDLE_DISPLAY_LEN: usize = 12;
+const MCP_FIELD_SEP: &str = "  ";
+const MCP_PLACEHOLDER: &str = "-";
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl OneupMcpServer {
     #[tool(
         name = "oneup_prepare",
-        description = "Check whether the local repository is ready for 1up MCP search. Use before discovery when index state is unknown.",
+        description = "Check 1up index readiness for the configured repository. Call first when a code-search task starts and readiness is unknown.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Prepare 1up", destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -65,7 +68,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_search",
-        description = "Search source code by meaning; use for discovery, not proof of completeness. Follow returned handles with read, symbol, or impact tools.",
+        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads for implementation, architecture, behavior, and pattern discovery.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Search Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -108,7 +111,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_read",
-        description = "Read code from 1up handles or precise file locations after search, diagnostics, or review comments. Use this to hydrate selected results.",
+        description = "Read selected code from oneup_search handles or precise file locations. Use after search to hydrate results before answering, citing, or editing.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Read Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -179,7 +182,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_symbol",
-        description = "Find definitions and optionally references for a symbol; use after search when completeness matters. Results are grouped by definition and reference.",
+        description = "Find definitions and references for a known symbol. Use after search or read when completeness matters, such as exact symbol resolution or caller/reference checks.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Verify Symbol", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -223,7 +226,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_impact",
-        description = "Explore likely impact from a segment, symbol, or file anchor. Use after search or read when you need advisory follow-up targets.",
+        description = "Explore likely affected code from a segment, symbol, or file anchor. Use after search or read for blast radius and advisory follow-up targets.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Explore Impact", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -314,7 +317,7 @@ async fn run_index(
     rebuild: bool,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     if project::read_project_id(&roots.state_root).is_err() {
-        project::write_project_id(&roots.state_root)?;
+        project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
     let db_path = config::project_db_path(&roots.state_root);
@@ -623,7 +626,7 @@ fn all_read_records_failed(payload: &ReadPayload) -> bool {
 }
 
 fn search_summary(payload: &SearchPayload, query: &str) -> String {
-    match payload.status {
+    let header = match payload.status {
         OperationStatus::Ok => format!(
             "Found {} ranked 1up search result(s) for \"{}\".",
             payload.results.len(),
@@ -640,15 +643,126 @@ fn search_summary(payload: &SearchPayload, query: &str) -> String {
             payload.results.len(),
             query
         ),
+    };
+
+    if payload.results.is_empty() {
+        return header;
     }
+
+    let rows = payload
+        .results
+        .iter()
+        .map(format_search_hit_row)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{header}\n\n{rows}")
+}
+
+fn format_search_hit_row(hit: &ops::SearchHit) -> String {
+    let symbol = hit
+        .symbol
+        .as_deref()
+        .or_else(|| hit.defined_symbols.first().map(String::as_str));
+    let breadcrumb_symbol = format_breadcrumb_symbol(hit.breadcrumb.as_deref(), symbol);
+    format!(
+        "{}{MCP_FIELD_SEP}{}:{}-{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}:{}",
+        hit.score,
+        hit.path,
+        hit.line_start,
+        hit.line_end,
+        hit.kind,
+        breadcrumb_symbol,
+        short_handle(&hit.handle)
+    )
+}
+
+fn format_breadcrumb_symbol(breadcrumb: Option<&str>, symbol: Option<&str>) -> String {
+    let breadcrumb = breadcrumb
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MCP_PLACEHOLDER);
+    let symbol = symbol
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MCP_PLACEHOLDER);
+    format!("{breadcrumb}::{symbol}")
+}
+
+fn short_handle(handle: &str) -> String {
+    handle.chars().take(MCP_HANDLE_DISPLAY_LEN).collect()
 }
 
 fn read_summary(payload: &ReadPayload) -> String {
-    format!(
+    let header = format!(
         "Read {} code record(s); status is {}.",
         payload.records.len(),
         status_string(&payload.status)
+    );
+
+    if payload.records.is_empty() {
+        return header;
+    }
+
+    let records = payload
+        .records
+        .iter()
+        .map(format_read_record)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{header}\n\n{records}")
+}
+
+fn format_read_record(record: &ops::ReadRecord) -> String {
+    if let Some(segment) = &record.segment {
+        return format_segment_record(segment);
+    }
+    if let Some(context) = &record.context {
+        return format_context_record(context);
+    }
+
+    format!(
+        "{}\t{}\t{}\n---",
+        status_string(&record.status),
+        format_read_source(&record.source),
+        record.message.as_deref().unwrap_or("")
     )
+}
+
+fn format_segment_record(segment: &ops::SegmentRecord) -> String {
+    format!(
+        "segment {}\npath\t{}\tlines\t{}-{}\tkind\t{}\tlanguage\t{}\tbreadcrumb\t{}\trole\t{}\tdefines\t{}\treferences\t{}\tcalls\t{}\n\n{}\n\n---",
+        segment.handle,
+        segment.path,
+        segment.line_start,
+        segment.line_end,
+        segment.kind,
+        segment.language,
+        segment.breadcrumb.as_deref().unwrap_or(MCP_PLACEHOLDER),
+        status_string(&segment.role),
+        segment.defined_symbols.join(","),
+        segment.referenced_symbols.join(","),
+        segment.called_symbols.join(","),
+        segment.content
+    )
+}
+
+fn format_context_record(context: &ops::ContextRecord) -> String {
+    format!(
+        "context {}:{}-{}\nlanguage\t{}\tscope\t{}\n\n{}\n\n---",
+        context.path,
+        context.line_start,
+        context.line_end,
+        context.language,
+        context.scope_type,
+        context.content
+    )
+}
+
+fn format_read_source(source: &ops::ReadSource) -> String {
+    match source {
+        ops::ReadSource::Handle { raw, .. } => raw.clone(),
+        ops::ReadSource::Location { path, line } => format!("{path}:{line}"),
+    }
 }
 
 fn symbol_summary(payload: &SymbolPayload, name: &str) -> String {

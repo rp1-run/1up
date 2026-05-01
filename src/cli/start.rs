@@ -1,19 +1,32 @@
-use std::path::Path;
-use std::time::Instant;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::Args;
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
+use sha2::{Digest, Sha256};
 
-use crate::cli::output::{formatter_for, Formatter};
+use crate::cli::output::{formatter_for, Formatter, StartResultInfo, StartStatus};
 use crate::daemon::lifecycle;
+use crate::daemon::lifecycle::DaemonProbeState;
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants;
+use crate::shared::fs::{ensure_secure_xdg_root, validate_regular_file_path};
 use crate::shared::project;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
 use crate::storage::db::Db;
 use crate::storage::schema;
+
+const STARTUP_GUARD_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const DAEMON_OBSERVE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Classification of an existing project's on-disk index state.
 ///
@@ -57,8 +70,24 @@ pub struct StartArgs {
     pub format: Option<OutputFormat>,
 }
 
+struct StartupGuard {
+    _lock: Flock<File>,
+}
+
+enum StartupGuardAcquire {
+    Acquired(StartupGuard),
+    Busy(DaemonProbeState),
+}
+
+struct DaemonStartOutcome {
+    status: StartStatus,
+    pid: Option<u32>,
+}
+
 pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root_for_creation(
+        std::path::Path::new(&args.path),
+    )?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
     let fmt = formatter_for(format);
@@ -73,6 +102,15 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let _startup_guard = match acquire_project_startup_guard(&project_root)? {
+        StartupGuardAcquire::Acquired(guard) => guard,
+        StartupGuardAcquire::Busy(probe) => {
+            let result = startup_guard_busy_result(probe);
+            emit_start_result(&*fmt, format, &result, false);
+            return Ok(());
+        }
+    };
+
     let mut registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         args.jobs,
@@ -80,17 +118,14 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         registry.indexing_config_for(&project_root),
     )?;
 
-    let (project_id, initialized_now) = if project::is_initialized(&project_root) {
-        (project::read_project_id(&project_root)?, false)
-    } else {
-        let id = project::write_project_id(&project_root)?;
+    let (project_id, initialized_now) = project::ensure_project_id(&project_root)?;
+    if initialized_now {
         tracing::info!(
             "initialized project {} at {} during start",
-            id,
+            project_id,
             project_root.display()
         );
-        (id, true)
-    };
+    }
     let init_prefix = if initialized_now {
         format!("Initialized project {project_id}. ")
     } else {
@@ -128,68 +163,297 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     }
     let index_ready = matches!(index_state, ProjectIndexState::Current);
 
-    if let Some(pid) = lifecycle::is_daemon_running()? {
-        if index_ready {
-            let already_registered = registry
-                .projects
-                .iter()
-                .any(|p| p.project_root == project_root);
+    let daemon_state = lifecycle::probe_daemon()?;
 
-            registry.register(&project_id, &project_root, Some(indexing_config.clone()))?;
-            lifecycle::send_sighup(pid)?;
-            let msg = if already_registered {
-                format!(
-                    "{init_prefix}Daemon already running (pid={pid}); project settings refreshed."
-                )
-            } else {
-                format!(
-                    "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
-                    project_root.display()
-                )
-            };
-            if already_registered {
-                eprintln!("{}", fmt.format_message(&msg));
-            } else {
-                println!("{}", fmt.format_message(&msg));
-            }
-            return Ok(());
-        }
-
-        let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
-        registry.register(&project_id, &project_root, Some(indexing_config))?;
-        lifecycle::send_sighup(pid)?;
-        let msg = format!(
-            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload. Run: 1up status to watch progress.",
-            stats.files_indexed, stats.segments_stored,
+    if index_ready {
+        let already_registered = registry_contains_project(&registry, &project_root);
+        registry.register_with_source(
+            &project_id,
+            &project_root,
+            &source_root,
+            Some(indexing_config),
+        )?;
+        let daemon = ensure_daemon_after_registration(daemon_state)?;
+        let msg =
+            current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
+        let result = StartResultInfo {
+            status: daemon.status,
+            pid: daemon.pid,
+            message: msg,
+            progress: None,
+        };
+        emit_start_result(
+            &*fmt,
+            format,
+            &result,
+            already_registered && !matches!(format, OutputFormat::Json),
         );
-        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
         return Ok(());
     }
 
     let stats = run_initial_index(&project_root, &source_root, &indexing_config).await?;
-
-    registry.register(&project_id, &project_root, Some(indexing_config))?;
-
-    // Double-check: another `1up start` may have spawned a daemon while we were indexing.
-    if let Some(pid) = lifecycle::is_daemon_running()? {
-        lifecycle::send_sighup(pid)?;
-        let msg = format!(
-            "{init_prefix}Indexed {} files ({} segments). Daemon already running (pid={pid}); notified to reload. Run: 1up status to watch progress.",
-            stats.files_indexed, stats.segments_stored,
-        );
-        println!("{}", fmt.format_index_summary(&msg, &stats.progress));
-        return Ok(());
-    }
-
-    let binary = lifecycle::current_binary_path()?;
-    let pid = lifecycle::spawn_daemon(&binary)?;
-
-    let msg = format!(
-        "{init_prefix}Indexed {} files ({} segments). Daemon started (pid={pid}). Run: 1up status to watch progress.",
-        stats.files_indexed, stats.segments_stored,
+    registry.register_with_source(
+        &project_id,
+        &project_root,
+        &source_root,
+        Some(indexing_config),
+    )?;
+    let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?)?;
+    let msg = indexed_start_message(
+        &init_prefix,
+        stats.files_indexed,
+        stats.segments_stored,
+        &daemon,
     );
-    println!("{}", fmt.format_index_summary(&msg, &stats.progress));
+    let status = if matches!(daemon.status, StartStatus::StartupInProgress) {
+        StartStatus::StartupInProgress
+    } else {
+        StartStatus::IndexedAndStarted
+    };
+    let result = StartResultInfo {
+        status,
+        pid: daemon.pid,
+        message: msg,
+        progress: Some(stats.progress),
+    };
+    emit_start_result(&*fmt, format, &result, false);
     Ok(())
+}
+
+fn acquire_project_startup_guard(project_root: &Path) -> anyhow::Result<StartupGuardAcquire> {
+    let xdg_root = ensure_secure_xdg_root()?;
+    let lock_path = startup_lock_path(&xdg_root, project_root);
+    let validated_path = validate_regular_file_path(&lock_path, &xdg_root)?;
+    let mut file = open_startup_lock_file(&validated_path)?;
+    let deadline = Instant::now() + STARTUP_GUARD_TIMEOUT;
+
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(StartupGuardAcquire::Acquired(StartupGuard { _lock: lock })),
+            Err((returned_file, Errno::EWOULDBLOCK)) => {
+                let probe = lifecycle::probe_daemon()?;
+                if matches!(probe, DaemonProbeState::Running(_)) || Instant::now() >= deadline {
+                    return Ok(StartupGuardAcquire::Busy(probe));
+                }
+                file = returned_file;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(STARTUP_GUARD_RETRY_INTERVAL.min(remaining));
+            }
+            Err((_, errno)) => {
+                return Err(anyhow::anyhow!(
+                    "failed to lock startup guard {}: {errno}",
+                    validated_path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn open_startup_lock_file(path: &Path) -> anyhow::Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(constants::SECURE_STATE_FILE_MODE)
+        .open(path)?)
+}
+
+fn startup_lock_path(xdg_root: &Path, project_root: &Path) -> PathBuf {
+    xdg_root.join(format!("startup-{}.lock", startup_lock_key(project_root)))
+}
+
+fn startup_lock_key(project_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_root.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn registry_contains_project(registry: &Registry, project_root: &Path) -> bool {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    registry
+        .projects
+        .iter()
+        .any(|project| project.project_root == canonical)
+}
+
+fn ensure_daemon_after_registration(
+    initial_state: DaemonProbeState,
+) -> anyhow::Result<DaemonStartOutcome> {
+    match initial_state {
+        DaemonProbeState::Running(pid) => {
+            lifecycle::send_sighup(pid)?;
+            Ok(DaemonStartOutcome {
+                status: StartStatus::AlreadyRunning,
+                pid: Some(pid),
+            })
+        }
+        DaemonProbeState::Starting => observe_existing_daemon_startup(),
+        DaemonProbeState::NotRunning => {
+            let binary = lifecycle::current_binary_path()?;
+            let spawned_pid = lifecycle::spawn_daemon(&binary)?;
+            observe_spawned_daemon(spawned_pid)
+        }
+    }
+}
+
+fn observe_existing_daemon_startup() -> anyhow::Result<DaemonStartOutcome> {
+    match wait_for_daemon_ready()? {
+        DaemonProbeState::Running(pid) => {
+            lifecycle::send_sighup(pid)?;
+            Ok(DaemonStartOutcome {
+                status: StartStatus::AlreadyRunning,
+                pid: Some(pid),
+            })
+        }
+        DaemonProbeState::Starting | DaemonProbeState::NotRunning => Ok(DaemonStartOutcome {
+            status: StartStatus::StartupInProgress,
+            pid: None,
+        }),
+    }
+}
+
+fn observe_spawned_daemon(spawned_pid: u32) -> anyhow::Result<DaemonStartOutcome> {
+    match wait_for_daemon_ready()? {
+        DaemonProbeState::Running(pid) => {
+            if pid != spawned_pid {
+                lifecycle::send_sighup(pid)?;
+            }
+            Ok(DaemonStartOutcome {
+                status: StartStatus::Started,
+                pid: Some(pid),
+            })
+        }
+        DaemonProbeState::Starting | DaemonProbeState::NotRunning => Ok(DaemonStartOutcome {
+            status: StartStatus::StartupInProgress,
+            pid: None,
+        }),
+    }
+}
+
+fn wait_for_daemon_ready() -> anyhow::Result<DaemonProbeState> {
+    let deadline = Instant::now() + DAEMON_OBSERVE_TIMEOUT;
+    let mut last_state = lifecycle::probe_daemon()?;
+
+    loop {
+        if matches!(last_state, DaemonProbeState::Running(_)) || Instant::now() >= deadline {
+            return Ok(last_state);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(DAEMON_OBSERVE_INTERVAL.min(remaining));
+        last_state = lifecycle::probe_daemon()?;
+    }
+}
+
+fn startup_guard_busy_result(probe: DaemonProbeState) -> StartResultInfo {
+    match probe {
+        DaemonProbeState::Running(pid) => StartResultInfo {
+            status: StartStatus::AlreadyRunning,
+            pid: Some(pid),
+            message: format!(
+                "Daemon already running (pid={pid}); another startup is refreshing project settings."
+            ),
+            progress: None,
+        },
+        DaemonProbeState::NotRunning | DaemonProbeState::Starting => StartResultInfo {
+            status: StartStatus::StartupInProgress,
+            pid: None,
+            message: "Daemon startup already in progress.".to_string(),
+            progress: None,
+        },
+    }
+}
+
+fn current_index_start_message(
+    init_prefix: &str,
+    project_root: &Path,
+    already_registered: bool,
+    daemon: &DaemonStartOutcome,
+) -> String {
+    match daemon.status {
+        StartStatus::AlreadyRunning => match daemon.pid {
+            Some(pid) if already_registered => {
+                format!("{init_prefix}Daemon already running (pid={pid}); project settings refreshed.")
+            }
+            Some(pid) => format!(
+                "{init_prefix}Project registered. Daemon (pid={pid}) notified to watch {}.",
+                project_root.display()
+            ),
+            None => format!("{init_prefix}Daemon already running; project settings refreshed."),
+        },
+        StartStatus::Started => match daemon.pid {
+            Some(pid) => format!(
+                "{init_prefix}Project registered. Daemon started (pid={pid}). Run: 1up status to watch progress."
+            ),
+            None => format!(
+                "{init_prefix}Project registered. Daemon startup in progress. Run: 1up status to watch progress."
+            ),
+        },
+        StartStatus::StartupInProgress => match daemon.pid {
+            Some(pid) => format!(
+                "{init_prefix}Project registered. Daemon startup in progress (pid={pid}). Run: 1up status to watch progress."
+            ),
+            None => format!(
+                "{init_prefix}Project registered. Daemon startup in progress. Run: 1up status to watch progress."
+            ),
+        },
+        StartStatus::IndexedAndStarted => unreachable!("current-index start does not index"),
+    }
+}
+
+fn indexed_start_message(
+    init_prefix: &str,
+    files_indexed: usize,
+    segments_stored: usize,
+    daemon: &DaemonStartOutcome,
+) -> String {
+    match daemon.status {
+        StartStatus::AlreadyRunning => match daemon.pid {
+            Some(pid) => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon already running (pid={pid}); notified to reload. Run: 1up status to watch progress."
+            ),
+            None => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon already running; notified to reload. Run: 1up status to watch progress."
+            ),
+        },
+        StartStatus::Started => match daemon.pid {
+            Some(pid) => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon started (pid={pid}). Run: 1up status to watch progress."
+            ),
+            None => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon startup in progress. Run: 1up status to watch progress."
+            ),
+        },
+        StartStatus::StartupInProgress => match daemon.pid {
+            Some(pid) => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon startup in progress (pid={pid}). Run: 1up status to watch progress."
+            ),
+            None => format!(
+                "{init_prefix}Indexed {files_indexed} files ({segments_stored} segments). Daemon startup in progress. Run: 1up status to watch progress."
+            ),
+        },
+        StartStatus::IndexedAndStarted => unreachable!("daemon outcome is not an indexed status"),
+    }
+}
+
+fn emit_start_result(
+    fmt: &dyn Formatter,
+    _format: OutputFormat,
+    result: &StartResultInfo,
+    stderr: bool,
+) {
+    let rendered = fmt.format_start_result(result);
+    if stderr {
+        eprintln!("{rendered}");
+    } else {
+        println!("{rendered}");
+    }
 }
 
 /// Classify the state of a project's on-disk index without mutating it.

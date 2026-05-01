@@ -29,20 +29,9 @@ pub fn ensure_secure_dir(path: &Path, mode: u32) -> Result<PathBuf, OneupError> 
     for component in absolute.components() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                if file_type.is_symlink() {
-                    return Err(
-                        FilesystemError::SymlinkComponent(current.display().to_string()).into(),
-                    );
-                }
-                if !file_type.is_dir() {
-                    return Err(unexpected_type(&current, "directory", &file_type));
-                }
-            }
+            Ok(metadata) => validate_directory_metadata(&current, &metadata)?,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|source| io_error(&current, source))?;
-                set_path_mode(&current, mode)?;
+                create_secure_dir_component(&current, mode)?;
             }
             Err(err) => return Err(io_error(&current, err)),
         }
@@ -51,6 +40,29 @@ pub fn ensure_secure_dir(path: &Path, mode: u32) -> Result<PathBuf, OneupError> 
     set_path_mode(&absolute, mode)?;
 
     Ok(absolute)
+}
+
+fn create_secure_dir_component(path: &Path, mode: u32) -> Result<(), OneupError> {
+    match fs::create_dir(path) {
+        Ok(()) => set_path_mode(path, mode),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+            validate_directory_metadata(path, &metadata)?;
+            set_path_mode(path, mode)
+        }
+        Err(err) => Err(io_error(path, err)),
+    }
+}
+
+fn validate_directory_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), OneupError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(FilesystemError::SymlinkComponent(path.display().to_string()).into());
+    }
+    if !file_type.is_dir() {
+        return Err(unexpected_type(path, "directory", &file_type));
+    }
+    Ok(())
 }
 
 pub fn ensure_secure_dir_within_root(
@@ -484,7 +496,8 @@ mod tests {
     use std::ffi::OsString;
     use std::io::Read;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
 
     use crate::shared::constants::SECURE_STATE_FILE_MODE;
 
@@ -673,6 +686,31 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let err = remove_regular_file(&directory, &root).unwrap_err();
         assert!(err.to_string().contains("regular file"));
+    }
+
+    #[test]
+    fn ensure_secure_dir_tolerates_concurrent_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = Arc::new(canonical_tmp_root(tmp.path()).join("secure").join("nested"));
+        let callers = 16;
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles = (0..callers)
+            .map(|_| {
+                let target = Arc::clone(&target);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_secure_dir(target.as_ref(), PROJECT_STATE_DIR_MODE).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), *target);
+        }
+        assert!(target.is_dir());
+        #[cfg(unix)]
+        assert_eq!(mode_bits(target.as_ref()), PROJECT_STATE_DIR_MODE);
     }
 
     #[cfg(unix)]

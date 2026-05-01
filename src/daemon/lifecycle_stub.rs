@@ -48,7 +48,11 @@ pub fn current_binary_path() -> Result<PathBuf, OneupError> {
     })
 }
 
-pub fn ensure_daemon(_project_id: &str, _project_root: &Path) -> Result<u32, OneupError> {
+pub fn ensure_daemon(
+    _project_id: &str,
+    _project_root: &Path,
+    _source_root: &Path,
+) -> Result<u32, OneupError> {
     Err(unsupported_daemon_error())
 }
 

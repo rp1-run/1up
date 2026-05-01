@@ -109,6 +109,9 @@ pub enum DaemonError {
     #[allow(dead_code)]
     AlreadyRunning(u32),
 
+    #[error("daemon startup already in progress")]
+    StartupInProgress,
+
     #[error("daemon not running")]
     #[allow(dead_code)]
     NotRunning,

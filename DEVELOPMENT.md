@@ -70,6 +70,60 @@ npx promptfoo validate -c suites/1up-search/evals.yaml
 npx promptfoo validate -c suites/1up-impact/evals.yaml
 ```
 
+These suites are the adoption evidence for MCP installation readiness: agents should call `oneup_prepare`, discover with `oneup_search`, hydrate with `oneup_read`, and use `oneup_symbol` or `oneup_impact` before falling back to raw file search for supported discovery tasks.
+
+Release evidence records either the retained adoption summary JSON or an explicit skipped reason; it does not introduce a second eval harness.
+
+## MCP Installation Release Checks
+
+The user-facing setup guide is [docs/mcp-installation.md](docs/mcp-installation.md). Keep it aligned with the thin wrapper contract: `1up add-mcp` validates the repository path, selects `bunx` or `npx`, delegates host configuration mutation to external `add-mcp`, and prints manual fallback guidance when delegation cannot continue.
+
+Focused wrapper validation:
+
+```sh
+cargo test add_mcp
+cargo test --test cli_tests add_mcp
+```
+
+Installed-binary MCP smoke should exercise the binary users install, not `target/debug/1up`:
+
+```sh
+bash scripts/release/verify_mcp_smoke.sh \
+  --binary /path/to/1up \
+  --repo /path/to/fixture-repo \
+  --output target/release-evidence/mcp-smoke.json
+```
+
+Archive verification records MCP smoke beside version smoke:
+
+```sh
+bash scripts/release/verify_release_archives.sh --help
+```
+
+Maintainer-run live host evidence records either an observed smoke or an explicit skip reason for Codex, Claude Code, Cursor, VS Code/Copilot, and generic MCP clients:
+
+```sh
+bash scripts/release/record_mcp_host_smoke.sh --help
+```
+
+Release evidence requires each archive verification summary to contain both the version smoke and installed-binary `mcp_smoke_test`. It also includes live-host smoke evidence from `mcp_host_smoke.v1` when a maintainer attaches it, otherwise it records a skipped reason for the supported hosts. Setup modes stay limited to wrapper-mediated `add-mcp`, direct `add-mcp`, and manual setup; there is no native 1up installer, custom config writer, or host adapter fallback.
+
+Release evidence should include archive MCP smoke, live-host recorded or skipped evidence, and adoption-eval evidence or skipped reasons:
+
+```sh
+bash scripts/release/generate_release_evidence.sh \
+  --manifest target/release/release-manifest.json \
+  --merge-gate target/release-evidence/merge-gate.json \
+  --security-check target/release-evidence/security-check.json \
+  --archive-verification target/release-evidence/archive-verification.json \
+  --mcp-host-smoke target/release-evidence/mcp-host-smoke.json \
+  --eval-summary target/release-evidence/eval-summary.json \
+  --benchmark-summary target/release-evidence/benchmark-summary.json \
+  --output target/release-evidence/release-evidence.json
+```
+
+The release evidence workflow is [.github/workflows/release-evidence.yml](.github/workflows/release-evidence.yml). Proprietary live-host checks are maintainer evidence, not mandatory CI credentials.
+
 ## Benchmarking
 
 ```sh

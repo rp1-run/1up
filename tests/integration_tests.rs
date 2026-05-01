@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 static MODEL_MUTEX: Mutex<()> = Mutex::new(());
@@ -56,6 +58,10 @@ struct McpTestClient {
 
 impl McpTestClient {
     fn start(path: &Path) -> Self {
+        Self::start_with_initialize_response(path).0
+    }
+
+    fn start_with_initialize_response(path: &Path) -> (Self, serde_json::Value) {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
             .args(["mcp", "--path", path.to_str().unwrap()])
             .stdin(Stdio::piped())
@@ -72,7 +78,7 @@ impl McpTestClient {
             next_id: 1,
         };
 
-        client.request(
+        let initialize_response = client.request(
             "initialize",
             serde_json::json!({
                 "protocolVersion": "2025-11-25",
@@ -84,7 +90,7 @@ impl McpTestClient {
             }),
         );
         client.notify("notifications/initialized", serde_json::json!({}));
-        client
+        (client, initialize_response)
     }
 
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
@@ -190,6 +196,27 @@ fn write_running_progress(project: &Path) {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_runner(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+set -eu
+{
+  printf 'runner=%s\n' "${0##*/}"
+  i=0
+  for arg in "$@"; do
+    printf 'arg[%s]=%s\n' "$i" "$arg"
+    i=$((i + 1))
+  done
+} > "${ONEUP_FAKE_RUNNER_LOG:?}"
+exit "${ONEUP_FAKE_RUNNER_STATUS:-0}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 impl Drop for McpTestClient {
@@ -1210,6 +1237,59 @@ fn impact_status_line(stdout: &str) -> Option<&str> {
 }
 
 #[test]
+fn mcp_initialize_advertises_primary_code_search_instructions() {
+    let tmp = TempDir::new().unwrap();
+    let (_client, initialize_response) = McpTestClient::start_with_initialize_response(tmp.path());
+
+    let result = &initialize_response["result"];
+    let instructions = result["instructions"]
+        .as_str()
+        .expect("initialize should expose server instructions");
+    assert!(
+        instructions.contains("primary code-search interface"),
+        "instructions should position 1up as the primary code-search path: {instructions}"
+    );
+    assert!(
+        instructions.contains("oneup_search before raw grep, rg, find"),
+        "instructions should guide agents to use MCP before broad raw search: {instructions}"
+    );
+    assert!(
+        instructions.contains("oneup_read"),
+        "instructions should teach the search/read hydration flow: {instructions}"
+    );
+    assert!(
+        instructions.contains(&tmp.path().display().to_string()),
+        "instructions should include the configured repository: {instructions}"
+    );
+    assert_eq!(
+        result["serverInfo"]["description"],
+        "Primary local code search and discovery MCP server"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_rejects_second_instance_for_same_project_root() {
+    let tmp = TempDir::new().unwrap();
+    let _client = McpTestClient::start(tmp.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
+        .args(["mcp", "--path", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "second MCP process should exit while first one holds the lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already running"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn mcp_tools_list_default_palette_and_schemas() {
     let tmp = TempDir::new().unwrap();
     let mut client = McpTestClient::start(tmp.path());
@@ -1246,9 +1326,31 @@ fn mcp_tools_list_default_palette_and_schemas() {
                 || description.starts_with("Explore "),
             "description should front-load tool selection guidance: {description}"
         );
+        if name == "oneup_search" {
+            assert!(
+                description.contains("primary discovery path")
+                    && description.contains("before raw grep, rg, find"),
+                "oneup_search description should be strong enough for tool adoption: {description}"
+            );
+        }
         assert!(
             tool.get("inputSchema").is_some() || tool.get("input_schema").is_some(),
             "tool should expose an input schema: {tool:?}"
+        );
+
+        let output_schema = tool
+            .get("outputSchema")
+            .or_else(|| tool.get("output_schema"))
+            .expect("tool should expose an output schema");
+        assert_eq!(
+            output_schema["properties"]["data"]["type"],
+            "object",
+            "dynamic envelope data should use an object schema instead of boolean true for OpenCode compatibility: {output_schema:?}"
+        );
+        assert_eq!(
+            output_schema["$defs"]["NextAction"]["properties"]["arguments"]["type"],
+            "object",
+            "dynamic next-action arguments should use an object schema instead of boolean true for OpenCode compatibility: {output_schema:?}"
         );
     }
 }
@@ -1256,11 +1358,12 @@ fn mcp_tools_list_default_palette_and_schemas() {
 #[test]
 fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let missing = TempDir::new().unwrap();
+    fs::create_dir_all(missing.path().join(".git")).unwrap();
     let mut missing_client = McpTestClient::start(missing.path());
     let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_eq!(missing_envelope["status"], "missing");
-    assert_eq!(missing_envelope["data"]["project_initialized"], false);
+    assert_eq!(missing_envelope["data"]["project_initialized"], true);
     assert_eq!(
         missing_envelope["next_actions"][0]["arguments"]["mode"],
         "index_if_missing"
@@ -1281,6 +1384,24 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
         indexing_envelope["next_actions"][0]["arguments"]["mode"],
         "check"
     );
+
+    let auto_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "auto" }));
+    let auto_envelope = mcp_structured(&auto_result);
+    assert_eq!(auto_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(auto_envelope);
+
+    let default_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "default" }));
+    let default_envelope = mcp_structured(&default_result);
+    assert_eq!(default_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(default_envelope);
+
+    let read_result =
+        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "read" }));
+    let read_envelope = mcp_structured(&read_result);
+    assert_eq!(read_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(read_envelope);
 
     let stale = TempDir::new().unwrap();
     fs::create_dir_all(stale.path().join(".1up")).unwrap();
@@ -1341,6 +1462,19 @@ fn mcp_search_read_symbol_structured_envelopes() {
     );
     assert_ne!(search["isError"], true);
     assert_mcp_text_matches_summary(&search);
+    let search_text = search["content"][0]["text"].as_str().unwrap();
+    assert!(
+        search_text.contains("src/policy.rs:"),
+        "oneup_search text should include ranked rows, not only a count summary: {search_text}"
+    );
+    assert!(
+        search_text
+            .lines()
+            .any(|line| line.contains("PolicyRuleValidator")
+                && line.contains(":")
+                && line.contains("  ")),
+        "oneup_search text should include a CLI-like row with symbol and handle: {search_text}"
+    );
     let search_envelope = mcp_structured(&search);
     assert_eq!(search_envelope["status"], "degraded");
     assert_mcp_next_actions_are_canonical(search_envelope);
@@ -1363,6 +1497,15 @@ fn mcp_search_read_symbol_structured_envelopes() {
         serde_json::json!({ "handles": [format!(":{handle}")] }),
     );
     assert_mcp_text_matches_summary(&read_handle);
+    let read_handle_text = read_handle["content"][0]["text"].as_str().unwrap();
+    assert!(
+        read_handle_text.contains("segment "),
+        "oneup_read text should include hydrated segment records, not only a status summary: {read_handle_text}"
+    );
+    assert!(
+        read_handle_text.contains("PolicyRuleValidator"),
+        "oneup_read text should include hydrated source content: {read_handle_text}"
+    );
     let read_handle_envelope = mcp_structured(&read_handle);
     assert_eq!(read_handle_envelope["status"], "ok");
     assert_eq!(
@@ -1382,6 +1525,15 @@ fn mcp_search_read_symbol_structured_envelopes() {
         serde_json::json!({
             "locations": [{ "path": "src/policy.rs", "line": 4, "expansion": 2 }]
         }),
+    );
+    let read_location_text = read_location["content"][0]["text"].as_str().unwrap();
+    assert!(
+        read_location_text.contains("context src/policy.rs:"),
+        "oneup_read location text should include hydrated context records: {read_location_text}"
+    );
+    assert!(
+        read_location_text.contains("validate(&self"),
+        "oneup_read location text should include source context: {read_location_text}"
     );
     let read_location_envelope = mcp_structured(&read_location);
     assert_eq!(read_location_envelope["status"], "ok");
@@ -2414,6 +2566,186 @@ fn daemon_stale_pid_detection() {
 
     fs::remove_file(&pid_path).unwrap();
     assert!(!pid_path.exists(), "stale PID file should be cleaned up");
+}
+
+// =============================================================================
+// add-mcp wrapper delegation
+// =============================================================================
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_prefers_bunx_then_npx() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("bunx"));
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--agent",
+            "codex",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("runner=bunx"), "unexpected runner log: {log}");
+    assert!(log.contains("arg[0]=add-mcp"));
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_builds_oneup_server_command() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo with spaces");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+            "--agent",
+            "codex",
+            "--agent",
+            "cursor",
+            "--global",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let canonical_repo = repo.canonicalize().unwrap();
+    let expected_source = format!("arg[1]=1up mcp --path '{}'", canonical_repo.display());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("runner=npx"), "unexpected runner log: {log}");
+    assert!(log.contains("arg[0]=add-mcp"), "unexpected argv: {log}");
+    assert!(log.contains(&expected_source), "unexpected argv: {log}");
+    assert!(log.contains("arg[2]=--name"), "unexpected argv: {log}");
+    assert!(log.contains("arg[3]=oneup"), "unexpected argv: {log}");
+    assert!(log.contains("arg[4]=--agent"), "unexpected argv: {log}");
+    assert!(log.contains("arg[5]=codex"), "unexpected argv: {log}");
+    assert!(log.contains("arg[6]=--agent"), "unexpected argv: {log}");
+    assert!(log.contains("arg[7]=cursor"), "unexpected argv: {log}");
+    assert!(log.contains("arg[8]=--global"), "unexpected argv: {log}");
+    assert!(log.contains("arg[9]=--yes"), "unexpected argv: {log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_runner_override_requires_available_runner() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("bunx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Manual MCP setup fallback")
+                .and(predicate::str::contains(
+                    "selected runner `npx` was not found on PATH",
+                ))
+                .and(predicate::str::contains("call `oneup_prepare`")),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_mcp_fallback_has_manual_snippets() {
+    let tmp = TempDir::new().unwrap();
+    let fake_bin = tmp.path().join("bin");
+    let repo = tmp.path().join("repo");
+    let log_path = tmp.path().join("runner.log");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    write_fake_runner(&fake_bin.join("npx"));
+
+    cmd()
+        .env("PATH", &fake_bin)
+        .env("ONEUP_FAKE_RUNNER_LOG", &log_path)
+        .env("ONEUP_FAKE_RUNNER_STATUS", "17")
+        .args([
+            "add-mcp",
+            "--path",
+            repo.to_str().unwrap(),
+            "--runner",
+            "npx",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Manual MCP setup fallback")
+                .and(predicate::str::contains("Generic MCP JSON"))
+                .and(predicate::str::contains("Codex TOML"))
+                .and(predicate::str::contains("server identity `oneup`"))
+                .and(predicate::str::contains("call `oneup_prepare`"))
+                .and(predicate::str::contains("add-mcp exited with exit code 17")),
+        );
+}
+
+#[test]
+fn add_mcp_does_not_add_config_writer_artifacts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for forbidden_path in [
+        "src/cli/mcp_install.rs",
+        "src/mcp/install",
+        "src/mcp/codex.rs",
+        "src/mcp/claude_code.rs",
+        "src/mcp/cursor.rs",
+        "src/mcp/vscode.rs",
+    ] {
+        assert!(
+            !root.join(forbidden_path).exists(),
+            "unexpected native MCP installer or host adapter artifact: {forbidden_path}"
+        );
+    }
+
+    let wrapper = fs::read_to_string(root.join("src/cli/add_mcp.rs")).unwrap();
+    let production_wrapper = wrapper.split("#[cfg(test)]").next().unwrap();
+    for forbidden_snippet in [
+        "mcp_install",
+        "mcp-install",
+        "std::fs::write",
+        "fs::write",
+        "File::create",
+        "serde_json::to_writer",
+        "toml::to_string",
+    ] {
+        assert!(
+            !production_wrapper.contains(forbidden_snippet),
+            "add-mcp wrapper should not include native config mutation snippet {forbidden_snippet:?}"
+        );
+    }
 }
 
 // =============================================================================

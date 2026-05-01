@@ -305,6 +305,7 @@ fn build_scanned_work_items(
 
 struct RunInputs {
     scanned_files: Vec<ScannedWorkItem>,
+    discovered_count: usize,
     deleted_paths: Vec<String>,
     metadata_unchanged_count: usize,
 }
@@ -342,11 +343,21 @@ fn is_known_extensionless_file(relative_path: &Path) -> bool {
         })
 }
 
+fn indexed_metadata_matches(
+    indexed_file_size: i64,
+    indexed_modified_ns: i64,
+    scanned_file: &scanner::ScannedFile,
+) -> bool {
+    i64::try_from(scanned_file.file_size).is_ok_and(|file_size| indexed_file_size == file_size)
+        && indexed_modified_ns == scanned_file.modified_ns
+}
+
 async fn prepare_full_run_inputs(
     conn: &Connection,
     project_root: &Path,
 ) -> Result<RunInputs, OneupError> {
     let scanned = scanner::scan_directory(project_root)?;
+    let discovered_count = scanned.len();
     let manifest = segments::get_all_indexed_files(conn).await?;
     let stored_hashes = segments::get_all_file_hashes(conn).await?;
 
@@ -356,14 +367,20 @@ async fn prepare_full_run_inputs(
 
     let mut scanned_files = Vec::new();
     let mut scanned_paths = HashSet::new();
+    let mut metadata_unchanged_count = 0usize;
     for scanned_file in scanned {
         let relative_path = relative_path_for(&project_root_canonical, &scanned_file.path);
         scanned_paths.insert(relative_path.clone());
 
-        let stored_hash = if let Some(entry) = manifest.get(&relative_path) {
-            Some(entry.file_hash.clone())
-        } else {
-            stored_hashes.get(&relative_path).cloned()
+        let stored_hash = match manifest.get(&relative_path) {
+            Some(entry)
+                if indexed_metadata_matches(entry.file_size, entry.modified_ns, &scanned_file) =>
+            {
+                metadata_unchanged_count += 1;
+                continue;
+            }
+            Some(entry) => Some(entry.file_hash.clone()),
+            None => stored_hashes.get(&relative_path).cloned(),
         };
 
         scanned_files.push(ScannedWorkItem {
@@ -376,8 +393,6 @@ async fn prepare_full_run_inputs(
             modified_ns: scanned_file.modified_ns,
         });
     }
-
-    let metadata_unchanged_count = 0usize;
 
     let manifest_paths: HashSet<&String> = manifest.keys().collect();
     let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
@@ -396,6 +411,7 @@ async fn prepare_full_run_inputs(
 
     Ok(RunInputs {
         scanned_files,
+        discovered_count,
         deleted_paths,
         metadata_unchanged_count,
     })
@@ -409,16 +425,18 @@ async fn prepare_scoped_run_inputs(
     if changed_paths.is_empty() {
         return Ok(ScopePreparation::Ready(RunInputs {
             scanned_files: Vec::new(),
+            discovered_count: 0,
             deleted_paths: Vec::new(),
             metadata_unchanged_count: 0,
         }));
     }
 
-    let mut scoped_scan_results: HashMap<String, scanner::ScannedFile> =
-        scanner::scan_paths(project_root, changed_paths)?
-            .into_iter()
-            .map(|file| (relative_path_for(project_root, &file.path), file))
-            .collect();
+    let scoped_scan = scanner::scan_paths(project_root, changed_paths)?;
+    let discovered_count = scoped_scan.len();
+    let mut scoped_scan_results: HashMap<String, scanner::ScannedFile> = scoped_scan
+        .into_iter()
+        .map(|file| (relative_path_for(project_root, &file.path), file))
+        .collect();
 
     let mut scanned_files = Vec::new();
     let mut deleted_paths = Vec::new();
@@ -445,9 +463,7 @@ async fn prepare_scoped_run_inputs(
 
             if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
                 if let Some(entry) = segments::get_indexed_file(conn, &relative_string).await? {
-                    if entry.file_size == scanned_file.file_size as i64
-                        && entry.modified_ns == scanned_file.modified_ns
-                    {
+                    if indexed_metadata_matches(entry.file_size, entry.modified_ns, &scanned_file) {
                         metadata_unchanged_count += 1;
                         continue;
                     }
@@ -502,6 +518,7 @@ async fn prepare_scoped_run_inputs(
 
     Ok(ScopePreparation::Ready(RunInputs {
         scanned_files,
+        discovered_count,
         deleted_paths,
         metadata_unchanged_count,
     }))
@@ -768,6 +785,7 @@ struct FlushState<'a> {
     stats: &'a mut PipelineStats,
     project_root: &'a Path,
     files_total: usize,
+    content_read_count: usize,
     parallelism: Option<IndexParallelism>,
     timings: &'a mut TimingAccumulator,
     run_started_at: Instant,
@@ -806,7 +824,7 @@ async fn flush_reorder_buffer(
     state: &mut FlushState<'_>,
 ) -> Result<(), OneupError> {
     let mut ready_files = Vec::new();
-    let write_batch_files = config.effective_write_batch_files(state.files_total);
+    let write_batch_files = config.effective_write_batch_files(state.content_read_count);
 
     while let Some(result) = reorder_buffer.remove(next_sequence) {
         match result {
@@ -1156,9 +1174,11 @@ async fn execute_run_with_inputs(
     } = resolution;
     let RunInputs {
         scanned_files,
+        discovered_count,
         deleted_paths,
         metadata_unchanged_count,
     } = inputs;
+    let content_read_count = scanned_files.len();
 
     let has_embedder = embedder.is_some();
     stats.embeddings_generated = has_embedder;
@@ -1200,27 +1220,27 @@ async fn execute_run_with_inputs(
     );
     let scan_started_at = Instant::now();
 
-    stats.files_scanned = scanned_files.len();
-    let total_files = scanned_files.len();
+    stats.files_scanned = discovered_count;
+    let total_files = discovered_count;
     progress_ui.set_state(pipeline_progress_ui_state(
         &stats,
         IndexPhase::Scanning,
         total_files,
     ));
     timings.scan_ms = scan_started_at.elapsed().as_millis();
-    parallelism = Some(config.reporting_parallelism(total_files, has_embedder));
+    parallelism = Some(config.reporting_parallelism(content_read_count, has_embedder));
 
     let prefilter_info = Some(IndexPrefilterInfo {
-        discovered: stats.files_scanned,
+        discovered: discovered_count,
         metadata_skipped: metadata_unchanged_count,
-        content_read: total_files,
+        content_read: content_read_count,
         deleted: deleted_paths.len(),
     });
 
     if metadata_unchanged_count > 0 {
         info!(
             "metadata prefilter: {} files skipped (unchanged), {} files need processing",
-            metadata_unchanged_count, total_files,
+            metadata_unchanged_count, content_read_count,
         );
     }
 
@@ -1229,7 +1249,7 @@ async fn execute_run_with_inputs(
             "scan stage complete: {} files discovered ({} metadata-unchanged, {} to process) in {}ms (jobs configured {}, effective {}, embed threads {})",
             stats.files_scanned,
             metadata_unchanged_count,
-            total_files,
+            content_read_count,
             timings.scan_ms,
             parallelism.jobs_configured,
             parallelism.jobs_effective,
@@ -1276,7 +1296,7 @@ async fn execute_run_with_inputs(
     progress_ui.set_state(pipeline_progress_ui_state(
         &stats,
         IndexPhase::Parsing,
-        total_files,
+        content_read_count,
     ));
     let parse_started_at = Instant::now();
 
@@ -1290,6 +1310,7 @@ async fn execute_run_with_inputs(
             stats: &mut stats,
             project_root,
             files_total: total_files,
+            content_read_count,
             parallelism: parallelism.clone(),
             timings: &mut timings,
             run_started_at,
@@ -1299,8 +1320,8 @@ async fn execute_run_with_inputs(
             prefilter: prefilter_info.clone(),
         };
 
-        while next_to_dispatch < total_files || !parse_workers.is_empty() {
-            while next_to_dispatch < total_files && parse_workers.len() < config.jobs {
+        while next_to_dispatch < content_read_count || !parse_workers.is_empty() {
+            while next_to_dispatch < content_read_count && parse_workers.len() < config.jobs {
                 let scanned_file = scanned_files[next_to_dispatch].clone();
                 let sequence_id = scanned_file.sequence_id;
                 parse_workers.spawn_blocking(move || ParseResult {
@@ -1343,7 +1364,7 @@ async fn execute_run_with_inputs(
             progress_ui.set_state(pipeline_progress_ui_state(
                 flush_state.stats,
                 current_progress_phase(flush_state.stats),
-                total_files,
+                content_read_count,
             ));
         }
 
@@ -1366,7 +1387,7 @@ async fn execute_run_with_inputs(
 
     info!(
         "parse stage complete: {} files processed in {}ms",
-        total_files, timings.parse_ms
+        content_read_count, timings.parse_ms
     );
 
     progress_ui.success_with(format!(
@@ -1524,6 +1545,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_run_metadata_prefilter_skips_unchanged_content_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+
+        let stats1 = run(&conn, tmp.path(), None).await.unwrap();
+        assert_eq!(stats1.files_scanned, 2);
+        assert_eq!(stats1.progress.prefilter.as_ref().unwrap().discovered, 2);
+        assert_eq!(stats1.progress.prefilter.as_ref().unwrap().content_read, 2);
+
+        let stats2 = run(&conn, tmp.path(), None).await.unwrap();
+        let prefilter = stats2.progress.prefilter.as_ref().unwrap();
+
+        assert_eq!(stats2.files_scanned, 2);
+        assert_eq!(stats2.files_processed, 0);
+        assert_eq!(stats2.files_indexed, 0);
+        assert_eq!(stats2.files_skipped, 2);
+        assert_eq!(prefilter.discovered, 2);
+        assert_eq!(prefilter.metadata_skipped, prefilter.discovered);
+        assert_eq!(prefilter.content_read, 0);
+        assert_eq!(prefilter.deleted, 0);
+    }
+
+    #[tokio::test]
     async fn incremental_indexing_reindexes_changed() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.rs"), "fn hello() {}\n").unwrap();
@@ -1537,6 +1584,30 @@ mod tests {
 
         let stats2 = run(&conn, tmp.path(), None).await.unwrap();
         assert!(stats2.files_indexed > 0);
+    }
+
+    #[tokio::test]
+    async fn full_run_metadata_prefilter_reads_changed_metadata_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+
+        run(&conn, tmp.path(), None).await.unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\nfn a2() {}\n").unwrap();
+
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+        let prefilter = stats.progress.prefilter.as_ref().unwrap();
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(stats.files_skipped, 1);
+        assert_eq!(prefilter.discovered, 2);
+        assert_eq!(prefilter.metadata_skipped, 1);
+        assert_eq!(prefilter.content_read, 1);
+        assert_eq!(prefilter.deleted, 0);
     }
 
     #[tokio::test]

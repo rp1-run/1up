@@ -283,6 +283,27 @@ describe("assertValidOneupMcpCalls", () => {
     expect(result.pass).toBe(true);
   });
 
+  test("passes for every canonical oneup MCP tool name form", () => {
+    const canonicalTools = [
+      "oneup_prepare",
+      "oneup_search",
+      "oneup_read",
+      "oneup_symbol",
+      "oneup_impact",
+    ];
+    const calls = canonicalTools.flatMap((tool) => [
+      toolCall(tool, {}),
+      toolCall(`mcp__oneup__${tool}`, {}),
+      toolCall(`mcp.oneup.${tool}`, {}),
+      toolCall(`mcp:oneup:${tool}`, {}),
+    ]);
+
+    const result = assertValidOneupMcpCalls("", makeContext(calls));
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("canonical oneup_* MCP tool names");
+  });
+
   test("fails on digit-leading aliases and errored calls", () => {
     const result = assertValidOneupMcpCalls(
       "",

@@ -19,6 +19,7 @@ use crate::shared::update::{InstallChannel, UpdateStatus};
 /// selection.
 pub trait Formatter {
     fn format_message(&self, message: &str) -> String;
+    fn format_start_result(&self, result: &StartResultInfo) -> String;
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_index_watch_update(&self, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
@@ -28,6 +29,33 @@ pub trait Formatter {
     fn format_update_result(&self, _result: &UpdateResult) -> String {
         String::new()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartStatus {
+    Started,
+    AlreadyRunning,
+    StartupInProgress,
+    IndexedAndStarted,
+}
+
+impl StartStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::AlreadyRunning => "already_running",
+            Self::StartupInProgress => "startup_in_progress",
+            Self::IndexedAndStarted => "indexed_and_started",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StartResultInfo {
+    pub status: StartStatus,
+    pub pid: Option<u32>,
+    pub message: String,
+    pub progress: Option<IndexProgress>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +199,19 @@ impl Formatter for JsonFormatter {
         to_json(&serde_json::json!({ "message": message }))
     }
 
+    fn format_start_result(&self, result: &StartResultInfo) -> String {
+        let mut payload = serde_json::json!({
+            "status": result.status.as_str(),
+            "pid": result.pid,
+            "message": &result.message,
+        });
+        if let Some(progress) = &result.progress {
+            payload["progress"] = serde_json::json!(progress);
+            payload["work"] = serde_json::json!(WorkSummary::from(progress));
+        }
+        to_json(&payload)
+    }
+
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
         let work = WorkSummary::from(progress);
         to_json(&serde_json::json!({
@@ -281,6 +322,13 @@ impl Formatter for JsonFormatter {
 impl Formatter for HumanFormatter {
     fn format_message(&self, message: &str) -> String {
         message.to_string()
+    }
+
+    fn format_start_result(&self, result: &StartResultInfo) -> String {
+        match &result.progress {
+            Some(progress) => self.format_index_summary(&result.message, progress),
+            None => result.message.clone(),
+        }
     }
 
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
@@ -651,6 +699,21 @@ impl Formatter for HumanFormatter {
 impl Formatter for PlainFormatter {
     fn format_message(&self, message: &str) -> String {
         message.to_string()
+    }
+
+    fn format_start_result(&self, result: &StartResultInfo) -> String {
+        let mut out = format!("status:{}", result.status.as_str());
+        match result.pid {
+            Some(pid) => out.push_str(&format!("\tpid:{pid}")),
+            None => out.push_str("\tpid:none"),
+        }
+        if let Some(progress) = &result.progress {
+            out.push('\n');
+            out.push_str(&self.format_index_summary(&result.message, progress));
+        } else {
+            out.push_str(&format!("\tmessage:{}\n", result.message));
+        }
+        out
     }
 
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
@@ -1301,6 +1364,41 @@ mod tests {
         assert_eq!(value["work"]["files_skipped"], 2);
         assert_eq!(value["progress"]["parallelism"]["jobs_effective"], 3);
         assert_eq!(value["progress"]["timings"]["total_ms"], 41);
+    }
+
+    #[test]
+    fn json_start_result_without_progress_omits_index_work() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_start_result(&StartResultInfo {
+            status: StartStatus::Started,
+            pid: Some(42),
+            message: "Daemon started.".to_string(),
+            progress: None,
+        });
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "started");
+        assert_eq!(value["pid"], 42);
+        assert_eq!(value["message"], "Daemon started.");
+        assert!(value.get("progress").is_none());
+        assert!(value.get("work").is_none());
+    }
+
+    #[test]
+    fn json_start_result_with_progress_includes_index_work() {
+        let formatter = JsonFormatter;
+        let rendered = formatter.format_start_result(&StartResultInfo {
+            status: StartStatus::IndexedAndStarted,
+            pid: Some(42),
+            message: "Indexed and started.".to_string(),
+            progress: Some(sample_progress()),
+        });
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "indexed_and_started");
+        assert_eq!(value["pid"], 42);
+        assert_eq!(value["progress"]["files_indexed"], 3);
+        assert_eq!(value["work"]["files_completed"], 4);
     }
 
     #[test]

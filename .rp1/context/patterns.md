@@ -15,6 +15,7 @@
 - Internal relation rows keep both stable identity and disambiguation evidence: `raw_target_symbol`, `canonical_target_symbol`, `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind`.
 - Impact-side identity stays additive: definition-owner fingerprints are derived from candidate path, breadcrumb, and defined symbols at evaluation time instead of changing symbol-search contracts.
 - New user-facing flows prefer stable envelopes over ad hoc maps: `SearchResult` adds optional `segment_id`, and impact uses `status + resolved_anchor + results + contextual_results + hint + refusal`.
+- Start outcomes use `StartResultInfo` with `status`, `pid`, `message`, and optional `progress` so daemon-only startup and indexed startup share one maintenance-command envelope.
 - Strong enums and typed request structs keep CLI, storage, and output boundaries explicit.
 - Pre-pipeline telemetry uses `SetupTimings` (wall-clock start, `db_prepare_ms`, `model_prepare_ms`) passed from callers so `total_ms` reflects user-perceived elapsed time. `IndexStageTimings` extends additively with optional `db_prepare_ms`, `model_prepare_ms`, and `input_prep_ms`.
 - `IndexProgress` gains additive `scope: Option<IndexScopeInfo>` (requested/executed scope, changed paths, fallback reason) and `prefilter: Option<IndexPrefilterInfo>` (discovered, metadata_skipped, content_read, deleted) without changing existing fields or envelope shapes.
@@ -35,6 +36,9 @@
 - Schema readiness for impact now requires schema v10 plus `segment_relations.lookup_canonical_symbol`, `segment_relations.qualifier_fingerprint`, and `segment_relations.edge_identity_kind`.
 - Paths and scopes are normalized to repo-style slashes before use.
 - Symbols are canonicalized before writing symbol and relation rows.
+- `1up start` validates startup state by acquiring a per-project guard before project-id, registry, index classification, foreground indexing, and daemon spawn/observe work, then re-reading state under that guard.
+- Project identity creation is idempotent: `ensure_project_id` reads first, publishes with create-new semantics, and re-reads if another caller created the id.
+- Normal daemon pid-lock contention is classified as running or startup-in-progress without sending termination signals; destructive lifecycle authority stays with explicit commands such as `stop`.
 - Relation expansion validates owner alignment, edge compatibility, corroboration count, and ambiguity before a candidate can become a primary result.
 - A bare leaf-name match with no second corroborating structural signal is contextual-only or absent rather than primary.
 - `IMPORT` and `DOCS` relation matches remain contextual-only even when they clear lookup resolution.
@@ -47,6 +51,8 @@
 - **Integer score**: `SearchResult.score` is a `u32` in 0-100, produced by `normalize_score(rrf)` and monotonic with the RRF ranking.
 - **Maintenance commands keep the trio**: `start`, `stop`, `status`, `init`, `index`, `reindex`, and `update` still dispatch through `HumanFormatter`, `PlainFormatter`, and `JsonFormatter` and still accept `--format`/`-f` via their own `Args` struct.
 - Plain and JSON modes on maintenance commands keep stable exact identifiers for automation.
+- `start --format json` emits additive `status`, `pid`, and `message` fields. Status values are `started`, `already_running`, `startup_in_progress`, and `indexed_and_started`.
+- Start output includes `progress` and `work` only when foreground indexing ran. Current-index startup, already-running, and startup-in-progress outcomes omit those fields so automation can distinguish daemon coordination from indexing work.
 - Human impact output (on the lean renderer) is still more explanatory because the user opted into deeper follow-up work.
 - Additive fields such as `segment_id` and `daemon_version` extend machine-readable contracts without breaking older consumers.
 - Timing, scope, and prefilter telemetry fields are optional additions on `IndexProgress` rendered by all three maintenance formatters (human, plain, JSON) without altering existing field names or envelope shapes.
@@ -61,12 +67,14 @@
 - Relation rows store unresolved canonical targets alongside lookup/disambiguation evidence and are resolved at query time for bounded seeds.
 - Segment, symbol, relation, vector, and `indexed_files` maintenance shares one transactional seam with chunked multi-value INSERTs (SQLITE_MAX_PARAMS=999, per-table chunk sizes derived from column counts).
 - Project-local connections apply performance PRAGMAs (WAL, synchronous=NORMAL, cache_size=-32768, mmap_size=268435456, temp_store=MEMORY) via `connect_tuned` at open time.
-- File-level prefiltering compares filesystem metadata (size, mtime) against the `indexed_files` manifest before content reads; content hash remains the correctness backstop when metadata differs.
+- File-level prefiltering compares filesystem metadata (size, mtime) against the `indexed_files` manifest before content reads in both full and scoped runs. Metadata matches increment `metadata_skipped` and avoid content reads; missing rows or metadata differences still reach the content-hash correctness backstop.
+- Full-run deletion detection is based on manifest paths plus segment paths, so metadata-skipped unchanged files remain discovered files and are not mistaken for deletions.
 - Daemon IPC uses tagged serde frames, same-UID authorization, bounded sizes, and read/write deadlines.
 
 ## Concurrency
 
 - CLI, search, storage, and daemon entry points are async over Tokio/libSQL.
+- Defensive startup uses short-lived cross-process locks: a startup guard serializes CLI startup per project, and registry register/deregister locks reload the current shared registry before saving.
 - Impact expansion stays intentionally sequential and budgeted rather than aggressively parallel.
 - Intermediate state remains local `HashMap` and `HashSet` aggregates instead of shared mutable globals.
 

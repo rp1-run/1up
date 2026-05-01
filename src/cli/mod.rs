@@ -1,3 +1,4 @@
+pub mod add_mcp;
 pub mod context;
 pub mod get;
 pub mod impact;
@@ -37,6 +38,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Add the local 1up MCP server to an agent host through add-mcp
+    AddMcp(add_mcp::AddMcpArgs),
+
     /// Initialize a project for 1up indexing
     Init(init::InitArgs),
 
@@ -105,7 +109,8 @@ impl Command {
                 Some(OutputFormat::Human)
             }
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
-            Command::Search(_)
+            Command::AddMcp(_)
+            | Command::Search(_)
             | Command::Get(_)
             | Command::Symbol(_)
             | Command::Context(_)
@@ -123,6 +128,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // format; their dispatch arms below take no format argument.
     let maintenance_format = cli.command.default_maintenance_format();
     match cli.command {
+        Command::AddMcp(args) => add_mcp::exec(args).await,
         Command::Init(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             init::exec(args, format).await
@@ -221,6 +227,8 @@ mod tests {
             &["1up", "structural", "(identifier) @id", "-f", "json"],
             &["1up", "mcp", "--format", "json"],
             &["1up", "mcp", "-f", "json"],
+            &["1up", "add-mcp", "--format", "json"],
+            &["1up", "add-mcp", "-f", "json"],
         ];
         for argv in core_cases {
             let result = Cli::try_parse_from(argv.iter().copied());
@@ -302,6 +310,7 @@ mod tests {
             &["1up", "impact", "--from-symbol", "Config"],
             &["1up", "structural", "(identifier) @id"],
             &["1up", "mcp"],
+            &["1up", "add-mcp"],
         ];
         for argv in core_cases {
             let cli = Cli::parse_from(argv.iter().copied());
