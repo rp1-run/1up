@@ -2,21 +2,35 @@
   "strategy": "parallel-map-reduce",
   "repo_type": "single-project",
   "monorepo_projects": [],
-  "generated_at": "2026-04-17T12:40:00Z",
-  "git_commit": "e247eea32f5d3ae72b658cca547dfbcb10c531b8",
-  "files_analyzed": 11,
-  "languages": ["Rust", "TypeScript", "Shell", "Markdown"],
+  "generated_at": "2026-05-01T00:45:02Z",
+  "git_commit": "cb841a0cbccaaba559a00c0e23d1b76a2b894e08",
+  "files_analyzed": 151,
+  "languages": [
+    "Rust",
+    "TypeScript",
+    "Shell",
+    "Markdown",
+    "YAML",
+    "JSON",
+    "TOML",
+    "Ruby template",
+    "Scoop JSON template"
+  ],
   "metrics": {
-    "mode": "FEATURE_LEARNING",
-    "feature_id": "shrink-hnsw-vector-index",
+    "mode": "FULL",
+    "previous_git_commit": "e247eea32f5d3ae72b658cca547dfbcb10c531b8",
+    "changed_files": 100,
+    "total_files_scanned": 151,
     "section_lines": {
-      "concept_map": 125,
-      "architecture": 147,
-      "interaction_model": 131,
-      "modules": 106,
-      "patterns": 91
+      "concept_map": 176,
+      "architecture": 183,
+      "interaction_model": 169,
+      "modules": 158,
+      "patterns": 92,
+      "index": 88
     },
-    "total_files_scanned": 11,
-    "schema_version": 12
+    "schema_version": 12,
+    "mcp_surface": true,
+    "strategy_detail": "large-change wide reconcile against prior KB with novelty scan"
   }
 }
