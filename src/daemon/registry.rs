@@ -1,7 +1,10 @@
+#[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +12,7 @@ use crate::shared::config;
 use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
 use crate::shared::errors::{DaemonError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_xdg_root, validate_regular_file_path};
+use crate::shared::project::canonical_project_root;
 use crate::shared::types::IndexingConfig;
 
 const REGISTRY_LOCK_FILE: &str = "projects.lock";
@@ -209,10 +213,15 @@ impl Registry {
     }
 }
 
+#[cfg(unix)]
 struct RegistryLock {
     _lock: Flock<File>,
 }
 
+#[cfg(not(unix))]
+struct RegistryLock;
+
+#[cfg(unix)]
 fn acquire_registry_lock(approved_root: &Path) -> Result<RegistryLock, OneupError> {
     let lock_path =
         validate_regular_file_path(&approved_root.join(REGISTRY_LOCK_FILE), approved_root)
@@ -240,10 +249,9 @@ fn acquire_registry_lock(approved_root: &Path) -> Result<RegistryLock, OneupErro
         })
 }
 
-fn canonical_project_root(project_root: &Path) -> PathBuf {
-    project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf())
+#[cfg(not(unix))]
+fn acquire_registry_lock(_approved_root: &Path) -> Result<RegistryLock, OneupError> {
+    Ok(RegistryLock)
 }
 
 #[cfg(test)]

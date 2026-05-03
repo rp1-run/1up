@@ -7,7 +7,18 @@ pub const fn supports_daemon() -> bool {
 }
 
 pub fn unsupported_message() -> &'static str {
-    "background daemon workflows are not supported on this platform; use `1up index` or `1up reindex` and the local-mode search commands instead"
+    "background daemon workflows are not supported on this platform yet"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonProbeState {
+    NotRunning,
+    Running(u32),
+    Starting,
+}
+
+pub fn probe_daemon() -> Result<DaemonProbeState, OneupError> {
+    Ok(DaemonProbeState::NotRunning)
 }
 
 pub fn write_pid_file() -> Result<(), OneupError> {
@@ -73,6 +84,6 @@ mod tests {
     #[test]
     fn ensure_daemon_returns_local_mode_guidance() {
         let err = ensure_daemon("project-id", Path::new(".")).unwrap_err();
-        assert!(err.to_string().contains("local-mode search commands"));
+        assert!(err.to_string().contains("not supported"));
     }
 }

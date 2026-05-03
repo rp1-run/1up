@@ -54,6 +54,7 @@ struct McpTestClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    _state_home: Option<TempDir>,
 }
 
 impl McpTestClient {
@@ -61,14 +62,34 @@ impl McpTestClient {
         Self::start_with_initialize_response(path).0
     }
 
+    fn start_with_isolated_state(path: &Path) -> Self {
+        Self::start_with_initialize_response_and_state(path, true).0
+    }
+
     fn start_with_initialize_response(path: &Path) -> (Self, serde_json::Value) {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_1up"))
+        Self::start_with_initialize_response_and_state(path, false)
+    }
+
+    fn start_with_initialize_response_and_state(
+        path: &Path,
+        isolate_state: bool,
+    ) -> (Self, serde_json::Value) {
+        let state_home = isolate_state.then(|| TempDir::new().unwrap());
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_1up"));
+        command
             .args(["mcp", "--path", path.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if let Some(home) = &state_home {
+            let home_path = home.path().canonicalize().unwrap();
+            command
+                .env("HOME", &home_path)
+                .env("XDG_DATA_HOME", home_path.join("data"))
+                .env("XDG_CONFIG_HOME", home_path.join("config"));
+        }
+
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut client = Self {
@@ -76,6 +97,7 @@ impl McpTestClient {
             stdin,
             stdout,
             next_id: 1,
+            _state_home: state_home,
         };
 
         let initialize_response = client.request(
@@ -1359,7 +1381,7 @@ fn mcp_tools_list_default_palette_and_schemas() {
 fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let missing = TempDir::new().unwrap();
     fs::create_dir_all(missing.path().join(".git")).unwrap();
-    let mut missing_client = McpTestClient::start(missing.path());
+    let mut missing_client = McpTestClient::start_with_isolated_state(missing.path());
     let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_eq!(missing_envelope["status"], "missing");
@@ -1372,7 +1394,7 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
 
     let indexing = TempDir::new().unwrap();
     write_running_progress(indexing.path());
-    let mut indexing_client = McpTestClient::start(indexing.path());
+    let mut indexing_client = McpTestClient::start_with_isolated_state(indexing.path());
     let indexing_result = indexing_client.call_tool("oneup_prepare", serde_json::json!({}));
     let indexing_envelope = mcp_structured(&indexing_result);
     assert_eq!(indexing_envelope["status"], "indexing");
@@ -1411,7 +1433,7 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
         b"not a current schema",
     )
     .unwrap();
-    let mut stale_client = McpTestClient::start(stale.path());
+    let mut stale_client = McpTestClient::start_with_isolated_state(stale.path());
     let stale_result = stale_client.call_tool("oneup_prepare", serde_json::json!({}));
     let stale_envelope = mcp_structured(&stale_result);
     assert_eq!(stale_envelope["status"], "stale");

@@ -1,6 +1,6 @@
 use clap::Args;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::cli::output::{formatter_for, LifecycleState, StatusInfo};
 use crate::cli::project_status_files::{read_daemon_status, read_index_progress};
@@ -110,16 +110,10 @@ fn find_registered_project<'a>(
     projects: &'a [ProjectEntry],
     project_root: &Path,
 ) -> Option<&'a ProjectEntry> {
-    let canonical = canonical_project_root(project_root);
+    let canonical = project::canonical_project_root(project_root);
     projects
         .iter()
         .find(|project| project.project_root == canonical)
-}
-
-fn canonical_project_root(project_root: &Path) -> PathBuf {
-    project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf())
 }
 
 fn derive_lifecycle_state(
@@ -134,7 +128,12 @@ fn derive_lifecycle_state(
         return LifecycleState::Indexing;
     }
 
-    if !project_initialized && !index_readable && !registered {
+    if !project_initialized
+        && !index_readable
+        && !index_present
+        && index_progress.is_none()
+        && !registered
+    {
         return LifecycleState::NotStarted;
     }
 
@@ -151,4 +150,32 @@ fn derive_lifecycle_state(
     }
 
     LifecycleState::NotStarted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::types::IndexPhase;
+
+    #[test]
+    fn lifecycle_is_stopped_when_index_artifact_exists_without_project_id() {
+        let state = derive_lifecycle_state(false, false, false, true, false, None);
+
+        assert_eq!(state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_is_stopped_when_progress_artifact_exists_without_project_id() {
+        let progress = IndexProgress::watch(IndexState::Complete, IndexPhase::Complete, "done");
+        let state = derive_lifecycle_state(false, false, false, false, false, Some(&progress));
+
+        assert_eq!(state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_is_not_started_when_no_project_or_index_artifacts_exist() {
+        let state = derive_lifecycle_state(false, false, false, false, false, None);
+
+        assert_eq!(state, LifecycleState::NotStarted);
+    }
 }

@@ -1,11 +1,16 @@
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+};
 
 use clap::Args;
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +24,7 @@ use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingU
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants;
+#[cfg(unix)]
 use crate::shared::fs::{ensure_secure_xdg_root, validate_regular_file_path};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::project;
@@ -107,9 +113,13 @@ pub struct StartArgs {
     pub format: Option<OutputFormat>,
 }
 
+#[cfg(unix)]
 struct StartupGuard {
     _lock: Flock<File>,
 }
+
+#[cfg(not(unix))]
+struct StartupGuard;
 
 enum StartupGuardAcquire {
     Acquired(StartupGuard),
@@ -269,6 +279,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn acquire_project_startup_guard(project_root: &Path) -> anyhow::Result<StartupGuardAcquire> {
     let xdg_root = ensure_secure_xdg_root()?;
     let lock_path = startup_lock_path(&xdg_root, project_root);
@@ -298,6 +309,12 @@ fn acquire_project_startup_guard(project_root: &Path) -> anyhow::Result<StartupG
     }
 }
 
+#[cfg(not(unix))]
+fn acquire_project_startup_guard(_project_root: &Path) -> anyhow::Result<StartupGuardAcquire> {
+    Ok(StartupGuardAcquire::Acquired(StartupGuard))
+}
+
+#[cfg(unix)]
 fn open_startup_lock_file(path: &Path) -> anyhow::Result<File> {
     Ok(OpenOptions::new()
         .read(true)

@@ -1,4 +1,6 @@
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -76,6 +78,12 @@ pub fn ensure_project_id(project_root: &Path) -> Result<(String, bool), OneupErr
 /// Checks whether a project has been initialized at the given root.
 pub fn is_initialized(project_root: &Path) -> bool {
     read_project_id(project_root).is_ok()
+}
+
+pub fn canonical_project_root(project_root: &Path) -> PathBuf {
+    project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf())
 }
 
 #[allow(dead_code)]

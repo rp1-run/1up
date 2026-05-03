@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(unix, test))]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
