@@ -2,17 +2,16 @@ use clap::Args;
 use std::path::Path;
 
 use crate::cli::output::{
-    formatter_for, ProjectListIndexStatus, ProjectListInfo, ProjectListItem, ProjectListState,
+    formatter_for, LifecycleState, ProjectListIndexStatus, ProjectListInfo, ProjectListItem,
 };
+use crate::cli::project_status_files::{read_daemon_status, read_index_progress};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::shared::config;
-use crate::shared::types::{DaemonProjectStatus, IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{IndexProgress, IndexState, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments;
-
-const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -69,13 +68,13 @@ async fn project_list_item(entry: &ProjectEntry, daemon_running: bool) -> Projec
     }
 }
 
-fn project_state(daemon_running: bool, progress: Option<&IndexProgress>) -> ProjectListState {
+fn project_state(daemon_running: bool, progress: Option<&IndexProgress>) -> LifecycleState {
     if progress.is_some_and(|progress| progress.state == IndexState::Running) {
-        ProjectListState::Indexing
+        LifecycleState::Indexing
     } else if daemon_running {
-        ProjectListState::Active
+        LifecycleState::Active
     } else {
-        ProjectListState::Registered
+        LifecycleState::Registered
     }
 }
 
@@ -100,16 +99,4 @@ async fn read_index_health(
     let files = segments::count_files(&conn).await.ok();
     let segments = segments::count_segments(&conn).await.ok();
     (ProjectListIndexStatus::Ready, files, segments)
-}
-
-fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
-    let path = config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn read_daemon_status(project_root: &Path) -> Option<DaemonProjectStatus> {
-    let path = config::project_daemon_status_path(project_root);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
 }

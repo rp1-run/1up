@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -144,7 +144,7 @@ pub struct ProjectListInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectListItem {
     pub project_id: String,
-    pub state: ProjectListState,
+    pub state: LifecycleState,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
     pub registered_at: String,
@@ -154,24 +154,6 @@ pub struct ProjectListItem {
     pub segments: Option<u64>,
     pub last_file_check_at: Option<DateTime<Utc>>,
     pub index_progress: Option<IndexProgress>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectListState {
-    Active,
-    Registered,
-    Indexing,
-}
-
-impl ProjectListState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Registered => "registered",
-            Self::Indexing => "indexing",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1649,32 +1631,28 @@ fn render_index_health_plain(status: &StatusInfo) -> &'static str {
 #[derive(Debug, Clone)]
 struct ProjectListRow {
     project: String,
-    state: ProjectListState,
+    state: LifecycleState,
     index: ProjectListIndexStatus,
     files: String,
     segments: String,
-    root: String,
-    source: String,
-    last_check: String,
-    registered: String,
+    path: String,
+    checked: String,
 }
 
 impl ProjectListRow {
     fn from_item(item: &ProjectListItem) -> Self {
         Self {
-            project: item.project_id.clone(),
+            project: compact_project_id(&item.project_id),
             state: item.state,
             index: item.index_status,
             files: render_optional_count(item.files),
             segments: render_optional_count(item.segments),
-            root: item.project_root.display().to_string(),
-            source: item.source_root.display().to_string(),
-            last_check: item
+            path: render_project_list_path(&item.project_root, &item.source_root),
+            checked: item
                 .last_file_check_at
                 .as_ref()
-                .map(|ts| format!("{} ({})", render_time_ago(ts), ts.to_rfc3339()))
+                .map(render_time_ago)
                 .unwrap_or_else(|| "none".to_string()),
-            registered: item.registered_at.clone(),
         }
     }
 }
@@ -1686,10 +1664,8 @@ struct ProjectListWidths {
     index: usize,
     files: usize,
     segments: usize,
-    root: usize,
-    source: usize,
-    last_check: usize,
-    registered: usize,
+    path: usize,
+    checked: usize,
 }
 
 impl ProjectListWidths {
@@ -1700,10 +1676,8 @@ impl ProjectListWidths {
             index: "Index".len(),
             files: "Files".len(),
             segments: "Segments".len(),
-            root: "Project root".len(),
-            source: "Source root".len(),
-            last_check: "Last file check".len(),
-            registered: "Registered".len(),
+            path: "Path".len(),
+            checked: "Checked".len(),
         };
 
         for row in rows {
@@ -1712,10 +1686,8 @@ impl ProjectListWidths {
             widths.index = widths.index.max(row.index.as_str().len());
             widths.files = widths.files.max(row.files.len());
             widths.segments = widths.segments.max(row.segments.len());
-            widths.root = widths.root.max(row.root.len());
-            widths.source = widths.source.max(row.source.len());
-            widths.last_check = widths.last_check.max(row.last_check.len());
-            widths.registered = widths.registered.max(row.registered.len());
+            widths.path = widths.path.max(row.path.len());
+            widths.checked = widths.checked.max(row.checked.len());
         }
 
         widths
@@ -1724,71 +1696,63 @@ impl ProjectListWidths {
 
 fn format_project_list_header(widths: &ProjectListWidths) -> String {
     format!(
-        "{:<project$}  {:<state$}  {:<index$}  {:>files$}  {:>segments$}  {:<root$}  {:<source$}  {:<last_check$}  {:<registered$}\n",
+        "{:<project$}  {:<state$}  {:<index$}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
         "Project",
         "State",
         "Index",
         "Files",
         "Segments",
-        "Project root",
-        "Source root",
-        "Last file check",
-        "Registered",
+        "Path",
+        "Checked",
         project = widths.project,
         state = widths.state,
         index = widths.index,
         files = widths.files,
         segments = widths.segments,
-        root = widths.root,
-        source = widths.source,
-        last_check = widths.last_check,
-        registered = widths.registered,
+        path = widths.path,
+        checked = widths.checked,
     )
 }
 
 fn format_project_list_separator(widths: &ProjectListWidths) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}  {}  {}  {}\n",
+        "{}  {}  {}  {}  {}  {}  {}\n",
         "-".repeat(widths.project),
         "-".repeat(widths.state),
         "-".repeat(widths.index),
         "-".repeat(widths.files),
         "-".repeat(widths.segments),
-        "-".repeat(widths.root),
-        "-".repeat(widths.source),
-        "-".repeat(widths.last_check),
-        "-".repeat(widths.registered),
+        "-".repeat(widths.path),
+        "-".repeat(widths.checked),
     )
 }
 
 fn format_project_list_row(row: &ProjectListRow, widths: &ProjectListWidths) -> String {
     format!(
-        "{:<project$}  {}  {}  {:>files$}  {:>segments$}  {:<root$}  {:<source$}  {:<last_check$}  {:<registered$}\n",
+        "{:<project$}  {}  {}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
         row.project,
         render_project_list_state_cell(row.state, widths.state),
         render_project_list_index_cell(row.index, widths.index),
         row.files,
         row.segments,
-        row.root,
-        row.source,
-        row.last_check,
-        row.registered,
+        row.path,
+        row.checked,
         project = widths.project,
         files = widths.files,
         segments = widths.segments,
-        root = widths.root,
-        source = widths.source,
-        last_check = widths.last_check,
-        registered = widths.registered,
+        path = widths.path,
+        checked = widths.checked,
     )
 }
 
-fn render_project_list_state_cell(state: ProjectListState, width: usize) -> String {
+fn render_project_list_state_cell(state: LifecycleState, width: usize) -> String {
     let padded = format!("{:<width$}", state.as_str(), width = width);
     match state {
-        ProjectListState::Active => padded.green().to_string(),
-        ProjectListState::Registered => padded.yellow().to_string(),
-        ProjectListState::Indexing => padded.cyan().to_string(),
+        LifecycleState::NotStarted => padded.yellow().to_string(),
+        LifecycleState::Indexing => padded.yellow().to_string(),
+        LifecycleState::Active => padded.green().to_string(),
+        LifecycleState::Registered => padded.cyan().to_string(),
+        LifecycleState::Stopped => padded.red().to_string(),
     }
 }
 
@@ -1806,6 +1770,76 @@ fn render_optional_count(value: Option<u64>) -> String {
         Some(count) => count.to_string(),
         None => "unknown".to_string(),
     }
+}
+
+fn compact_project_id(project_id: &str) -> String {
+    if is_uuid_like(project_id) {
+        project_id.chars().take(8).collect()
+    } else {
+        project_id.to_string()
+    }
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(idx, ch)| {
+            if matches!(idx, 8 | 13 | 18 | 23) {
+                ch == '-'
+            } else {
+                ch.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn render_project_list_path(project_root: &Path, source_root: &Path) -> String {
+    const MAX_PATH_WIDTH: usize = 56;
+
+    let root = compact_display_path(project_root);
+    let source = compact_display_path(source_root);
+    let path = if project_root == source_root {
+        root
+    } else {
+        format!("{root} -> {source}")
+    };
+
+    ellipsize_middle(&path, MAX_PATH_WIDTH)
+}
+
+fn compact_display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return PathBuf::from("~").join(rest).display().to_string();
+        }
+    }
+    path.display().to_string()
+}
+
+fn ellipsize_middle(value: &str, max_width: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_width {
+        return value.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let keep = max_width - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let prefix: String = value.chars().take(left).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn render_optional_time(value: Option<&DateTime<Utc>>) -> String {
@@ -2212,7 +2246,7 @@ mod tests {
         let rendered = formatter.format_project_list(&ProjectListInfo {
             projects: vec![ProjectListItem {
                 project_id: "project-123".to_string(),
-                state: ProjectListState::Active,
+                state: LifecycleState::Active,
                 project_root: PathBuf::from("/repo"),
                 source_root: PathBuf::from("/repo/src"),
                 registered_at: "2026-05-01T00:00:00Z".to_string(),
@@ -2249,7 +2283,7 @@ mod tests {
         let rendered = formatter.format_project_list(&ProjectListInfo {
             projects: vec![ProjectListItem {
                 project_id: "project-123".to_string(),
-                state: ProjectListState::Registered,
+                state: LifecycleState::Registered,
                 project_root: PathBuf::from("/repo"),
                 source_root: PathBuf::from("/repo/src"),
                 registered_at: "2026-05-01T00:00:00Z".to_string(),
@@ -2266,6 +2300,10 @@ mod tests {
         assert!(rendered.contains("Project"));
         assert!(rendered.contains("State"));
         assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Path"));
+        assert!(rendered.contains("Checked"));
+        assert!(!rendered.contains("Project root"));
+        assert!(!rendered.contains("Source root"));
         assert!(rendered.contains("project-123"));
         assert!(rendered.contains("registered"));
         assert!(rendered.contains("not_built"));
@@ -2273,6 +2311,39 @@ mod tests {
         assert!(rendered.contains("/repo/src"));
         assert!(rendered.contains("unknown"));
         assert!(rendered.contains("none"));
+    }
+
+    #[test]
+    fn human_project_list_compacts_wide_values_for_readability() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_project_list(&ProjectListInfo {
+            projects: vec![ProjectListItem {
+                project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                state: LifecycleState::Active,
+                project_root: PathBuf::from(
+                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments",
+                ),
+                source_root: PathBuf::from(
+                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments/worktree-feature-branch",
+                ),
+                registered_at: "2026-05-01T00:00:00Z".to_string(),
+                daemon_running: true,
+                index_status: ProjectListIndexStatus::Ready,
+                files: Some(132),
+                segments: Some(3732),
+                last_file_check_at: Some(sample_progress().updated_at),
+                index_progress: None,
+            }],
+        });
+
+        assert!(rendered.contains("123e4567"));
+        assert!(!rendered.contains("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains(" ago"));
+        assert!(rendered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.len() <= 130));
     }
 
     fn sample_update_status_info(status: UpdateStatus) -> UpdateStatusInfo {

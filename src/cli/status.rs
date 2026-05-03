@@ -3,16 +3,15 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 use crate::cli::output::{formatter_for, LifecycleState, StatusInfo};
+use crate::cli::project_status_files::{read_daemon_status, read_index_progress};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::shared::config;
 use crate::shared::project;
-use crate::shared::types::{DaemonProjectStatus, IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{IndexProgress, IndexState, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments;
-
-const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -27,18 +26,6 @@ pub struct StatusArgs {
     /// Output format override (defaults to human)
     #[arg(long, short = 'f', hide = true, conflicts_with = "plain")]
     pub format: Option<OutputFormat>,
-}
-
-fn read_index_progress(project_root: &std::path::Path) -> Option<IndexProgress> {
-    let path = config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn read_daemon_status(project_root: &std::path::Path) -> Option<DaemonProjectStatus> {
-    let path = config::project_daemon_status_path(project_root);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
 }
 
 pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> {

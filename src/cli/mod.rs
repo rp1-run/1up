@@ -8,6 +8,7 @@ pub mod lean;
 pub mod list;
 pub mod mcp;
 pub mod output;
+pub mod project_status_files;
 pub mod reindex;
 pub mod search;
 pub mod start;
