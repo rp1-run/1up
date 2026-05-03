@@ -1,114 +1,158 @@
-# 1up — Modules
+# 1up - Modules
 
 ## Top-Level Modules
 
 | Module | Purpose | Key Files |
 |---|---|---|
-| `src/cli` | Command surface, output formatting, and machine-readable follow-up UX. Core commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) render through the lean line grammar in `src/cli/lean.rs`; maintenance commands keep the three-formatter trio in `src/cli/output.rs`. `start` owns guarded startup orchestration, current-index daemon fast path, final pid observation, and additive `status`/`pid` output. | `src/cli/mod.rs`, `src/cli/start.rs`, `src/cli/impact.rs`, `src/cli/lean.rs`, `src/cli/output.rs` |
-| `src/search` | Hybrid retrieval, symbol/context/structural search, and bounded advisory impact expansion with owner-aware corroboration and primary/contextual trust bucketing. | `src/search/hybrid.rs`, `src/search/impact.rs`, `src/search/mod.rs` |
-| `src/indexer` | Incremental scan/parse/embed pipeline that assigns deterministic segment IDs and parser-derived relation edge identities. Scanner enriches files with filesystem metadata; full and scoped runs compare against the `indexed_files` manifest to skip metadata-unchanged files before content reads, preserve deleted-path detection, and report discovered, metadata-skipped, and content-read counters. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/indexer/scanner.rs` |
-| `src/storage` | libSQL schema (v12: `FLOAT8(384)` `segment_vectors.embedding_vec` with `compress_neighbors=float8` on the HNSW index, written via the typed `vector8(?)` constructor), segment storage, symbol/relation tables, `indexed_files` manifest, tuned connection initialization (`connect_tuned`), and transactional maintenance with chunked multi-value INSERTs. | `src/storage/schema.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`, `src/storage/queries.rs`, `src/storage/db.rs` |
-| `src/daemon` | Background search/watch service with secure IPC, version-aware responses, startup-safe registry mutation, non-destructive daemon pid-lock probing, and per-project scope fallback tracking (`pending_fallback_reason` on `ProjectRunState`). | `src/daemon/lifecycle.rs`, `src/daemon/search_service.rs`, `src/daemon/worker.rs`, `src/daemon/registry.rs` |
-| `src/shared` | Shared types, constants, config, errors, reminder/update helpers, idempotent project identity helpers, secure filesystem helpers, and cross-layer contracts including `SetupTimings`, `IndexScopeInfo`, and `IndexPrefilterInfo` telemetry structs. | `src/shared/types.rs`, `src/shared/project.rs`, `src/shared/fs.rs`, `src/shared/constants.rs`, `src/shared/update.rs` |
-| `tests` | Black-box CLI and integration coverage. | `tests/integration_tests.rs`, `tests/cli_tests.rs` |
-| `benches` | Criterion non-regression and latency guardrails, including impact outcome coverage. | `benches/search_bench.rs` |
-| `scripts` | Performance gate automation plus release and security helpers. Parallel indexing benchmark covers full, incremental, write-heavy, and daemon refresh scenarios with scope and prefilter evidence in per-run telemetry; vector-index-size benchmark gates HNSW shrink targets. | `scripts/benchmark_parallel_indexing.sh`, `scripts/benchmark_vector_index_size.sh`, `scripts/security_check.sh`, `scripts/release/` |
-| `evals` | Search-quality evaluation suites and support scripts. | includes `evals/suites/1up-search/search-bench.ts` |
+| `src/lib.rs`, `src/main.rs` | Crate export surface and binary boot path. `main` initializes tracing, runs CLI dispatch, suppresses passive update notices for MCP/internal/update-safe paths, and leaves module ownership below the directory modules. | `src/main.rs`, `src/lib.rs` |
+| `src/cli` | User-facing command surface. Core discovery commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) render via `lean`; maintenance commands (`init`, `index`, `reindex`, `start`, `stop`, `status`, `update`) render via `output`. Also owns `add-mcp` and `mcp` launch/setup commands. | `src/cli/mod.rs`, `src/cli/lean.rs`, `src/cli/output.rs`, `src/cli/start.rs`, `src/cli/add_mcp.rs`, `src/cli/mcp.rs` |
+| `src/mcp` | Model Context Protocol stdio server for agent-facing code discovery. Exposes readiness, ranked search, handle/location read, symbol lookup, and likely-impact tools with structured envelopes and next-action guidance. | `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
+| `src/search` | Retrieval and follow-up engines: hybrid semantic/FTS/symbol ranking, context retrieval, structural AST matching, symbol reference lookup, and bounded likely-impact expansion with primary/contextual trust buckets. | `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/search/symbol.rs`, `src/search/impact.rs`, `src/search/context.rs`, `src/search/structural.rs` |
+| `src/indexer` | Repository scan, parse/chunk, embed, and storage pipeline. Full and scoped runs use `indexed_files` metadata prefiltering, deterministic segment IDs, parser-derived relation evidence, optional embeddings, progress persistence, and batched writes. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/indexer/scanner.rs`, `src/indexer/chunker.rs` |
+| `src/storage` | libSQL persistence boundary. Owns schema v12, vector storage, FTS, symbols, relation descriptors, `indexed_files` manifest, tuned project-local connections, schema compatibility checks, and transactional replace/delete APIs. | `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`, `src/storage/db.rs` |
+| `src/daemon` | Background indexing/search service with secure Unix IPC, registry-backed project watching, daemon lifecycle/lock handling, same-UID socket permissions, and non-Unix stubs. | `src/daemon/worker.rs`, `src/daemon/lifecycle.rs`, `src/daemon/search_service.rs`, `src/daemon/watcher.rs`, `src/daemon/registry.rs`, `src/daemon/ipc.rs` |
+| `src/shared` | Cross-layer contracts and utilities: result types, progress telemetry, config paths, errors, secure filesystem operations, project identity/worktree resolution, symbol normalization, and self-update helpers. | `src/shared/types.rs`, `src/shared/config.rs`, `src/shared/project.rs`, `src/shared/fs.rs`, `src/shared/update.rs`, `src/shared/symbols.rs` |
+| `tests` | Black-box and focused regression coverage for CLI, MCP, daemon behavior, index/search correctness, release assets, installer script, security check, and SQL rewrite invariants. | `tests/integration_tests.rs`, `tests/cli_tests.rs`, `tests/release_assets_tests.rs`, `tests/setup_script_tests.rs`, `tests/security_check_tests.rs` |
+| `benches` | Criterion guardrails for symbol lookup, FTS, chunked content search, retrieval backend selection, and impact horizon behavior. | `benches/search_bench.rs` |
+| `evals` | TypeScript/promptfoo evaluation support for search quality, recall, MCP tool-use assertions, fixture-cache setup, and search benchmark comparisons. | `evals/suites/1up-search/recall.ts`, `evals/suites/1up-search/search-bench.ts`, `evals/suites/shared/assertions/index.ts`, `evals/suites/shared/extension.ts` |
+| `scripts`, `.lefthook`, `packaging` | Operational automation: indexing/vector benchmarks, installer, security evidence, release manifest/archive/package publication, Homebrew/Scoop rendering, MCP smoke verification/recording, and main-branch protection. | `scripts/install/setup.sh`, `scripts/security_check.sh`, `scripts/benchmark_vector_index_size.sh`, `scripts/release/`, `packaging/homebrew/1up.rb.tmpl`, `packaging/scoop/1up.json.tmpl` |
 
 ## Key Components
 
 | Component | File | Responsibility | Depends On |
 |---|---|---|---|
-| `Cli` | `src/cli/mod.rs` | Top-level clap dispatch and default output-format resolution. | `src/cli/impact.rs`, `src/shared/types.rs` |
-| `ImpactArgs` | `src/cli/impact.rs` | Exact-anchor CLI for bounded likely-impact exploration. | `src/search/impact.rs`, `src/storage/db.rs`, `src/storage/schema.rs`, `src/shared/config.rs` |
-| `Formatter` | `src/cli/output.rs` | Shared rendering for maintenance commands only (`start`, `stop`, `status`, `init`, `index`, `reindex`, `update`): human, plain, and json variants with additive start `status`/`pid` output plus timing/scope/prefilter telemetry in index and status output. Core-command rendering moved to `LeanRenderer`. | `src/shared/types.rs`, `src/shared/update.rs` |
-| `StartCommand` | `src/cli/start.rs` | Guarded daemon-backed startup coordinator. Acquires the per-project startup guard, ensures project identity, classifies index state, skips foreground indexing for current indexes, registers settings, and observes the final daemon pid. | `src/daemon/lifecycle.rs`, `src/daemon/registry.rs`, `src/shared/project.rs`, `src/indexer/pipeline.rs` |
-| `LeanRenderer` | `src/cli/lean.rs` | Single-shape line renderer for the six core agent-facing commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`). Implements the `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]` grammar with primary/contextual `~P`/`~C` bucketing for impact rows; free functions, no trait dispatch. | `src/search/impact.rs`, `src/shared/types.rs`, `src/storage/segments.rs` |
-| `HybridSearchEngine` | `src/search/hybrid.rs` | Candidate-first hybrid search with additive `segment_id` hydration. | `src/search/*`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
-| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded probable-impact expansion that resolves lookup-symbol relation targets, derives definition-side owner fingerprints, shortlists owner-aligned candidates before truncation, requires corroborating structural signals for primary promotion, and preserves primary/contextual bucketing plus explicit empty outcomes. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs` |
-| `Pipeline` | `src/indexer/pipeline.rs` | Convert repository files into deterministic segments, parser-derived relation edge identities, and symbol metadata. Accepts `SetupTimings` from callers for end-to-end timing; full and scoped input preparation compare filesystem metadata against the `indexed_files` manifest to skip unchanged files before content reads and tracks `input_prep_ms` and prefilter counters. | `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs`, `src/indexer/scanner.rs` |
-| `Schema` | `src/storage/schema.rs` | Schema init, validation, rebuild, and compatibility gating (v12 with `indexed_files`, relation evidence columns, and `FLOAT8(384)` vectors). | `src/storage/queries.rs`, `src/shared/constants.rs` |
-| `Relations` | `src/storage/relations.rs` | Persist and query relation descriptors with canonical, lookup-tail, qualifier, and edge-identity evidence for outbound and inbound expansion. | `src/storage/queries.rs`, `src/shared/symbols.rs` |
-| `Segments` | `src/storage/segments.rs` | Transactional segment replacement, symbol/relation synchronization, and `indexed_files` manifest upsert/delete through chunked multi-value INSERTs (SQLITE_MAX_PARAMS=999). | `src/storage/queries.rs`, `src/storage/relations.rs`, `src/shared/types.rs` |
-| `SearchService` | `src/daemon/search_service.rs` | Secure daemon-backed search IPC with optional version metadata. | `src/daemon/ipc.rs`, `src/shared/constants.rs`, `src/shared/types.rs` |
-| `DaemonLifecycle` | `src/daemon/lifecycle.rs` | Daemon process lifecycle, pid-lock acquisition, state probing, SIGHUP/SIGTERM helpers, and non-destructive startup contention outcomes (`AlreadyRunning`, `StartupInProgress`). | `src/shared/errors.rs`, `src/shared/fs.rs`, `src/shared/config.rs` |
-| `Registry` | `src/daemon/registry.rs` | Shared project registry persistence. Register/deregister operations lock, reload, mutate, and save so concurrent startup paths do not lose project entries. | `src/shared/fs.rs`, `src/shared/types.rs`, `src/shared/config.rs` |
-| `SharedTypes` | `src/shared/types.rs` | Cross-layer result, config, progress, daemon status, and telemetry contracts including `SetupTimings`, `IndexScopeInfo`, `IndexPrefilterInfo`, and additive `IndexStageTimings` fields (`db_prepare_ms`, `model_prepare_ms`, `input_prep_ms`). | `src/shared/constants.rs`, `serde`, `chrono` |
-| `IntegrationTests` | `tests/integration_tests.rs` | Black-box regression coverage for CLI, impact, and search stability. | binary + real local fixtures |
-| `SearchBench` | `benches/search_bench.rs` | Criterion latency guardrail suite for discovery plus owner-aligned, low-signal, expanded, refused, empty, and empty-scoped impact paths. | `criterion`, search + storage engines |
+| `Cli` / `Command` | `src/cli/mod.rs` | Clap dispatch, subcommand list, and default maintenance format resolution. Public commands include `add-mcp`, `init`, `start`, `stop`, `status`, `symbol`, `search`, `get`, `context`, `impact`, `structural`, `mcp`, `index`, `reindex`, and `update`; hidden `__worker` remains internal. | `src/cli/*`, `src/shared/types.rs` |
+| `LeanRenderer` | `src/cli/lean.rs` | Single lean grammar for agent-facing core commands, including search/symbol rows, get records, context blocks, structural snippets, and impact `~P`/`~C` channels. | `src/search/impact.rs`, `src/shared/types.rs`, `src/storage/segments.rs` |
+| `Formatter` | `src/cli/output.rs` | Human/plain/json maintenance output plus progress/watch rendering for init/index/reindex/start/stop/status/update. | `src/shared/types.rs`, `src/shared/progress.rs`, `src/shared/update.rs` |
+| `StartCommand` | `src/cli/start.rs` | Guarded daemon startup. Resolves project identity, prepares schema/model setup timings, avoids unnecessary foreground indexing on current indexes, registers daemon settings, and observes final daemon pid. | `src/daemon/lifecycle.rs`, `src/daemon/registry.rs`, `src/indexer/pipeline.rs`, `src/shared/project.rs` |
+| `AddMcpCommand` | `src/cli/add_mcp.rs` | Wrapper around `bunx`/`npx add-mcp`; builds the local `1up mcp --path ...` server command and prints manual fallback snippets on setup failure. | external `add-mcp`, shell runners |
+| `McpCommand` | `src/cli/mcp.rs` | Starts the MCP stdio server for a resolved project, enforces one MCP instance per project via secure lock file, and best-effort starts the daemon for MCP search. | `src/mcp/server.rs`, `src/daemon/lifecycle.rs`, `src/shared/project.rs`, `src/shared/fs.rs` |
+| `OneupMcpServer` | `src/mcp/server.rs`, `src/mcp/tools.rs` | rmcp server implementation exposing `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact`. Adds server guidance that MCP search should precede broad grep/rg/find. | `rmcp`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
+| `McpOps` | `src/mcp/ops.rs` | Pure operation layer for readiness classification, search execution, handle/location reads, symbol lookup, and impact exploration over the current local index. | `src/search/*`, `src/storage/*`, `src/indexer/embedder.rs`, `src/shared/project.rs` |
+| `ToolEnvelope` / `NextAction` | `src/mcp/types.rs` | MCP input/output schemas with deny-unknown-fields inputs and structured `status`, `summary`, `data`, and canonical follow-up actions. | `serde`, `schemars`, `rmcp` |
+| `HybridSearchEngine` | `src/search/hybrid.rs` | Embeds queries when possible, combines vector, FTS, and symbol candidates, falls back to FTS if vector search fails, ranks candidates, and hydrates lean search results. | `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/search/symbol.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
+| `RetrievalBackend` | `src/search/retrieval.rs` | Chooses SQL vector v2 when embeddings exist and FTS-only otherwise; returns bounded candidate sets for ranking. | `src/storage/queries.rs`, `src/shared/constants.rs` |
+| `SymbolSearchEngine` | `src/search/symbol.rs` | Finds definitions/usages with exact, prefix, contains, and fuzzy fallback matching over normalized symbols. | `src/storage/queries.rs`, `src/storage/segments.rs`, `src/shared/symbols.rs` |
+| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded advisory impact from file, line, symbol, or segment anchors. Uses relation lookup tails, owner fingerprints, edge identity, path affinity, role signals, scope checks, and test-path guidance to split primary and contextual results. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs`, `src/shared/symbols.rs` |
+| `ContextEngine` | `src/search/context.rs` | Reads source context around a location and prefers enclosing tree-sitter scopes, with explicit outside-root access handling. | `src/indexer/parser.rs`, `src/shared/types.rs` |
+| `StructuralSearchEngine` | `src/search/structural.rs` | Runs tree-sitter query patterns over files and optionally uses stored segments for candidate paths. | `tree-sitter`, `src/storage/segments.rs` |
+| `Pipeline` | `src/indexer/pipeline.rs` | Full/scoped indexing with metadata prefilter, deleted-file cleanup, parse worker ordering, optional embedding, batched file replacement, progress telemetry, and separate scan/progress roots for worktrees. | `src/indexer/{scanner,parser,chunker,embedder}.rs`, `src/storage/*`, `src/shared/types.rs` |
+| `Parser` | `src/indexer/parser.rs` | Multi-language tree-sitter parser for structural segments, complexity, roles, symbols, references, calls, conformance relations, owner/edge evidence, and text fallback decisions. | tree-sitter grammars, `src/shared/symbols.rs` |
+| `Embedder` / `EmbeddingRuntime` | `src/indexer/embedder.rs` | Verified local ONNX/tokenizer artifact lifecycle, secure model roots, download/activation, warm runtime reuse, batch embeddings, and degraded-mode status. | `ort`, `tokenizers`, `reqwest`, `sha2`, `src/shared/fs.rs` |
+| `Schema` | `src/storage/schema.rs` | Initializes/rebuilds/validates schema v12, checks required objects/columns, stores embedding model metadata, and fails closed with `1up reindex` guidance for stale/incompatible indexes. | `src/storage/queries.rs`, `src/shared/constants.rs` |
+| `Segments` | `src/storage/segments.rs` | Stores and hydrates segments, resolves 12-char handles, replaces file batches transactionally, synchronizes vectors/symbols/relations, and maintains `indexed_files`. | `src/storage/relations.rs`, `src/storage/queries.rs`, `src/shared/types.rs` |
+| `Relations` | `src/storage/relations.rs` | Persists call/reference/conformance descriptors with canonical target, lookup tail, qualifier fingerprint, and edge identity; serves outbound and inbound lookups. | `src/shared/symbols.rs`, `src/storage/queries.rs` |
+| `DaemonWorker` | `src/daemon/worker.rs` | Loads registered projects, watches source roots, batches dirty scopes, indexes incrementally, serves bounded search requests, persists daemon heartbeat, and records fallback reasons. | `src/daemon/{lifecycle,registry,watcher,search_service}.rs`, `src/indexer/pipeline.rs`, `src/search/hybrid.rs` |
+| `SearchService` | `src/daemon/search_service.rs` | Secure Unix-domain daemon search transport with framed JSON, request sanitization, version metadata, timeouts, busy/unavailable responses, and socket cleanup. | `src/daemon/ipc.rs`, `src/shared/constants.rs` |
+| `Registry` | `src/daemon/registry.rs` | Concurrent-safe project registry. Register/deregister lock, reload, mutate, and atomically save so startup paths do not drop entries. | `src/shared/fs.rs`, `src/shared/types.rs` |
+| `ProjectResolution` | `src/shared/project.rs` | Project ID creation, initialized-state checks, source-root/state-root resolution, and git-worktree mapping to main repo state. | `src/shared/config.rs`, `src/shared/fs.rs` |
 
 ## Internal Dependency Chains
 
-- `src/cli` -> `src/search`: CLI dispatches discovery and local impact engines.
-- `src/cli` -> `src/storage`: `impact` opens the project-local DB and validates schema before reads.
-- `src/search` -> `src/storage`: search and impact hydrate segments and resolve symbol/relation rows at query time.
-- `src/search` -> `src/indexer`: hybrid search reuses embedding infrastructure for query embeddings.
-- `src/indexer` -> `src/storage`: indexer writes `SegmentInsert` batches, symbols, and relation rows through storage.
-- `src/daemon` -> `src/search`: daemon workers execute hybrid search and serialize daemon-backed responses.
-- `src/cli/start` -> `src/daemon/lifecycle` and `src/daemon/registry`: startup coordinates daemon state and registry settings after acquiring the per-project guard.
-- `src/cli/start` -> `src/shared/project`: startup and init-adjacent paths use idempotent project identity creation.
-- `tests` -> `src/cli`: integration tests execute the binary as a black-box CLI surface.
-- `benches` -> `src/search`: benchmarks instantiate real search and impact engines directly.
+- `src/main.rs` -> `src/cli` and `src/shared/update`: binary boot, dispatch, and passive update notification handling.
+- `src/cli` -> `src/search`/`src/storage`: core commands open the project-local index, validate schema, run engines, and render lean output.
+- `src/cli/mcp.rs` -> `src/mcp`: CLI starts the stdio MCP server and best-effort daemon support.
+- `src/mcp` -> `src/search`/`src/storage`/`src/indexer`: MCP tools share local search, read, symbol, impact, and explicit indexing operations with the CLI stack.
+- `src/search` -> `src/storage`: retrieval, symbol, context, structural, and impact engines hydrate segments and relation/symbol tables at query time.
+- `src/search` -> `src/indexer/embedder.rs`: hybrid search reuses the embedding runtime for query vectors.
+- `src/indexer` -> `src/storage`: pipeline writes segment, vector, symbol, relation, and manifest rows through transactional storage APIs.
+- `src/daemon` -> `src/indexer`/`src/search`: worker refreshes indexes on file changes and serves daemon-backed search requests.
+- `src/shared` -> all runtime modules: shared types, constants, filesystem security, project identity, update, symbol normalization, and error contracts.
+- `tests`, `benches`, `evals`, and `scripts` -> binary/library surfaces: black-box CLI/MCP tests, direct engine benches, prompt/eval harnesses, and release/installer/security automation.
+
+## External Dependencies
+
+| Dependency | Purpose |
+|---|---|
+| `tokio`, `futures-util` | Async runtime, daemon/MCP/server tasks, channels, timeouts, and async IO. |
+| `clap` | CLI parser and subcommand definitions. |
+| `libsql` | Project-local SQLite/libSQL storage, FTS, vector index, and transactions. |
+| `tree-sitter-*`, `streaming-iterator` | Multi-language parsing and structural query support. |
+| `ort`, `tokenizers`, `reqwest` | ONNX embedding runtime, tokenizer loading, model download/update HTTP clients. |
+| `rmcp`, `schemars`, `serde`, `serde_json` | MCP server, JSON schemas, structured tool envelopes, and persisted metadata. |
+| `notify`, `ignore` | Daemon file watching and gitignore-aware scans. |
+| `nix`, `dirs`, `indicatif`, `tracing`, `chrono`, `uuid`, `sha2` | Process/signal locks, XDG paths, progress UI, logging, timestamps, IDs, hashing. |
+| `semver`, `flate2`, `tar`, `zip` | Self-update and release archive handling. |
+| `assert_cmd`, `predicates`, `criterion`, `tempfile`, `libc` | Tests and benchmarks. |
+| `promptfoo`, Bun/TypeScript tooling | Agent/search evals and MCP tool-use assertions. |
+
+## Metrics
+
+| Module | Files Analyzed | Lines Analyzed | Component Count |
+|---|---:|---:|---:|
+| `src root` | 2 | 107 | 2 |
+| `src/cli` | 18 | 5,737 | 13 commands/renderers |
+| `src/mcp` | 5 | 1,892 | 5 tools + ops/types/server |
+| `src/search` | 10 | 7,223 | 7 engines/helpers |
+| `src/indexer` | 6 | 7,650 | 5 pipeline stages |
+| `src/storage` | 6 | 4,160 | 5 persistence components |
+| `src/daemon` | 10 | 3,440 | 6 runtime components/stubs |
+| `src/shared` | 10 | 4,679 | 8 shared contract/helper areas |
+| `tests` | 7 | 8,069 | CLI/MCP/release/setup/security suites |
+| `benches` | 1 | 1,033 | Criterion suite |
+| `evals` | 8 | 2,489 | recall, benchmark, fixture, assertion helpers |
+| `scripts` | 20 | 3,733 | benchmark/install/release/security helpers |
+| `.lefthook`, `packaging` | 3 | 77 | git hook + package templates |
 
 ## Public Boundaries
 
 ### CLI Boundary
 
-- Commands: `init`, `start`, `stop`, `status`, `search`, `symbol`, `context`, `impact`, `structural`, `index`, `reindex`, `hello-agent`, `update`
-- Format contract: `plain`, `human`, `json`
-- Rule: `impact` requires exactly one anchor and runs against the project-local index
-- Rule: `start --format json` reports `status`, `pid`, and `message`; `progress` and `work` appear only when foreground indexing actually ran
+- Public commands: `add-mcp`, `init`, `start`, `stop`, `status`, `symbol`, `search`, `get`, `context`, `impact`, `structural`, `mcp`, `index`, `reindex`, `update`.
+- Hidden internal command: `__worker`.
+- Removed boundary: prior `hello-agent` is no longer present; tests assert its removal.
+- Core command output is the lean protocol and intentionally rejects legacy format flags.
+- Maintenance command output supports `plain`, `human`, and `json`; JSON maintenance output suppresses passive update notices.
+- `impact` remains local-index only and requires exactly one anchor: segment, symbol, or file/line.
+
+### MCP Boundary
+
+- Server: `1up mcp --path <repo>` over stdio with one instance per project lock.
+- Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
+- Readiness modes: `check` (aliases `default`, `read`), `index_if_missing`, `index_if_needed` (alias `auto`), and `reindex`.
+- Tool output contract: `ToolEnvelope { status, summary, data, next_actions }`; all tools attach canonical follow-up actions for search, read, symbol, impact, or prepare.
+- MCP search is ranked discovery, not exhaustive proof; guidance instructs agents to hydrate with `oneup_read` before relying on results.
 
 ### Search Boundary
 
-- Engines: `HybridSearchEngine`, `SymbolSearchEngine`, `StructuralSearchEngine`, `ImpactHorizonEngine`
-- Result contracts: `SearchResult`, `SymbolResult`, `ContextResult`, `StructuralResult`, `ImpactResultEnvelope`
-- Rule: `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused` envelopes where only corroborated, non-ambiguous, owner-consistent relation matches become primary `results` and additive `contextual_results` carries demoted relation, same-file, and test guidance
+- Engines: `HybridSearchEngine`, `SymbolSearchEngine`, `StructuralSearchEngine`, `ContextEngine`, `ImpactHorizonEngine`.
+- Result contracts: `SearchResult`, `SymbolResult`, `StructuralResult`, `ContextResult`, `ImpactResultEnvelope`.
+- `search` stays discovery-oriented; `impact` returns advisory `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused` envelopes with primary `results` and optional `contextual_results`.
 
 ### Storage Boundary
 
-- Components: `Db`, `schema`, `segments`, `relations`, `queries`
-- Rule: schema v12 includes the `indexed_files` manifest table, relation evidence columns, and `FLOAT8(384)` vectors; replace/delete flows must keep segments, symbols, relation descriptors, vectors, and `indexed_files` rows aligned transactionally through chunked multi-value INSERTs
+- Schema version: 12.
+- Vector storage: `segment_vectors.embedding_vec FLOAT8(384)`, `vector8(?)` writes, and `libsql_vector_idx(..., compress_neighbors=float8, max_neighbors=32)`.
+- Manifest: `indexed_files(file_path, extension, file_hash, file_size, modified_ns)` supports metadata prefiltering.
+- Replace/delete flows must keep segments, vectors, symbols, relations, FTS, and manifest rows transactionally aligned.
 
 ### Daemon Boundary
 
-- IPC: `SearchRequest`, `SearchResponse`, `request_search`
-- Rule: daemon search is Unix-domain and same-UID only; `impact` is intentionally not exposed through daemon IPC in v1
-- Rule: normal daemon pid-lock contention observes a running or starting holder and exits benignly instead of terminating it
+- Secure Unix IPC via daemon socket and framed JSON `SearchRequest`/`SearchResponse`; non-Unix uses explicit stubs.
+- Daemon search carries version metadata and bounded unavailable/busy responses.
+- Registry and pid-lock handling are non-destructive under startup contention.
+- `impact` is still not daemon IPC; it runs locally through CLI/MCP storage reads.
 
 ## Cross-Module Patterns
 
 | Pattern | Modules | Why It Matters |
 |---|---|---|
-| Candidate-first hybrid retrieval | Search, Storage | Keeps discovery selective and performant before hydration. |
-| Local impact read path | CLI, Search, Storage | Adds likely-impact exploration without perturbing daemon behavior. |
-| Additive search handoff | CLI, Search, Shared, Tests, Benches | Lets agents move from discovery to bounded follow-up without reconstructing anchors. |
-| Deterministic segment anchors | Indexer, Search, Storage, CLI | Stable segment IDs underpin the `search -> impact` contract. |
-| Transactional relation maintenance | Indexer, Storage, Search | Prevents stale descriptor rows from distorting lookup-symbol relation resolution. |
-| Manifest-backed file prefilter | Indexer, Storage | Skips metadata-unchanged files before content reads in full and scoped runs; content hash remains the correctness backstop. |
-| End-to-end timing propagation | CLI, Daemon, Indexer, Shared | `SetupTimings` flows from callers through the pipeline so `total_ms` reflects user-perceived wall-clock time. |
-| Idempotent daemon startup | CLI, Daemon, Shared | Startup guard, project-id convergence, registry locking, and daemon probing make defensive `1up start` calls safe under contention. |
-| Batched transactional writes | Indexer, Storage | Chunked multi-value INSERTs reduce SQL chatter for segments, symbols, relations, vectors, and manifest rows. |
-| Ambiguity-aware refusal envelopes | Search, CLI, Tests | Preserves trust and keeps advisory semantics explicit. |
-| Trust bucket separation | Search, CLI, Shared | Keeps confident relation-backed likely impact distinct from demoted low-signal or heuristic-only contextual guidance and explicit empty outcomes. |
-| Latency guardrails | Search, Tests, Benches, Scripts | Ensures impact stays additive without regressing core discovery paths or rollout-gate measurements. |
-| Version-aware daemon search | Daemon, CLI, Shared | Supports mismatch warnings and safer upgrades without breaking transport. |
+| CLI/MCP dual surface over shared engines | CLI, MCP, Search, Storage, Indexer | Agents and humans use different transports while preserving one local indexing/search contract. |
+| Lean handle handoff | CLI, MCP, Search, Storage, Tests, Evals | `search -> read/get -> impact/symbol` flows use short durable segment handles without embedding full bodies in discovery output. |
+| Candidate-first hybrid retrieval | Search, Storage, Indexer | Combines vector, FTS, and symbol candidates before hydration and ranking. |
+| Local-only impact trust buckets | Search, CLI, MCP, Storage | Keeps advisory blast-radius exploration bounded, relation-aware, and explicit about primary vs contextual confidence. |
+| Manifest-backed file prefilter | Indexer, Storage, CLI, Daemon | Skips metadata-unchanged files before content reads and reports discovered/metadata-skipped/content-read/deleted counters. |
+| Transactional search index maintenance | Indexer, Storage | Batched replacement keeps segments, vectors, symbols, relations, FTS, and manifest rows synchronized. |
+| Secure local state | Shared, Storage, Daemon, CLI, MCP | XDG/project roots, pid/socket/lock files, model artifacts, and DB paths are validated and permissioned before use. |
+| Worktree-aware project identity | Shared, CLI, MCP, Indexer | Source roots can differ from state roots so worktrees reuse the main repo index/progress state correctly. |
+| Version-aware degraded paths | CLI, Daemon, MCP, Search, Indexer | Stale schema, missing embeddings, daemon mismatch, and model failures degrade or refuse with explicit guidance instead of silent corruption. |
+| Release/eval evidence gates | Scripts, Tests, Evals, Packaging | Release assets, package manifests, MCP smoke, security evidence, recall, and vector-size gates are tested as first-class modules. |
 
-## Feature-Learning Deltas From Impact Horizon
+## Reconciliation Notes
 
-- `src/cli` gained a first-class `impact` command surface and formatter support for impact envelopes.
-- `src/search` now resolves relation targets through lookup-symbol fetches plus definition-side owner-fingerprint derivation, owner-aware shortlisting, corroboration scoring, ambiguity margins, and low-signal demotion inside `src/search/impact.rs`.
-- `src/storage` now persists relation descriptors in schema v10, including `lookup_canonical_symbol`, `qualifier_fingerprint`, and `edge_identity_kind`, and exposes lookup-target relation queries.
-- `src/cli` and `src/cli/output.rs` keep the existing impact envelope stable while surfacing primary-versus-contextual trust buckets for richer relation scoring.
-- `tests`, `benches`, and `scripts` now encode qualified-relation, ambiguous-helper, and stronger-candidate-wins regressions, with `impact-rollout-approve` binding both summaries to the pinned April 14, 2026 baseline and current HEAD while honoring unresolved field-note blockers.
-
-## Feature-Learning Deltas From Faster Indexing
-
-- `src/storage/db.rs` gained `connect_tuned` and `apply_project_pragmas` for write-optimized project-local connections.
-- `src/storage` now manages the `indexed_files` manifest table (schema v11) and uses chunked multi-value INSERTs (SQLITE_MAX_PARAMS=999) for segments, symbols, relations, vectors, and manifest rows.
-- `src/indexer/scanner.rs` enriches `ScannedFile` with filesystem metadata (size, mtime) for prefilter comparisons.
-- `src/indexer/pipeline.rs` compares filesystem metadata against the manifest, tracks `input_prep_ms`, and accepts `SetupTimings` plus `daemon_fallback_reason` for end-to-end timing and scope visibility.
-- `src/daemon/worker.rs` tracks `pending_fallback_reason` on `ProjectRunState` and passes it through to the pipeline for scope promotion visibility.
-- `src/shared/types.rs` added `SetupTimings`, `IndexScopeInfo`, `IndexPrefilterInfo`, and additive `IndexStageTimings` fields.
-- `src/cli/output.rs` renders timing, scope, and prefilter fields additively across all three formatters.
-- `scripts/benchmark_parallel_indexing.sh` expanded to benchmark daemon refresh and report scope evidence in summary JSON.
+- Confirmed: prior CLI/search/indexer/storage/daemon/shared/test/bench/eval/script module boundaries still fit the current code.
+- Refined: `src/cli` is now explicitly split between lean core-command rendering and maintenance-format rendering; `src/cli/output.rs` no longer owns core discovery result rendering.
+- Added: `src/mcp` is a standalone top-level module with a real public contract and should no longer be treated as incidental daemon/CLI behavior.
+- Added: installer and release automation now include MCP setup, wrapper-first install guidance, host smoke recording, and smoke verification.
+- Contradicted: `hello-agent` should be removed from the public CLI boundary.
+- Preserved: schema v12, `indexed_files`, relation evidence columns, trust buckets, timing propagation, and daemon startup/idempotency claims remain supported by current files.

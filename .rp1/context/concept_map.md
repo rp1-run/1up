@@ -1,125 +1,176 @@
-# 1up — Concept Map
+# 1up - Concept Map
+
+## Reconciliation Notes
+
+| Prior Claim | Status | Update |
+|---|---|---|
+| Schema v12 stores `segment_vectors.embedding_vec` as `FLOAT8(384)` and uses `vector8(?)`. | confirmed | Current schema/query/storage paths still declare `FLOAT8(384)`, `compress_neighbors=float8`, `max_neighbors=32`, and typed `vector8(?)` insert/query sites. |
+| Impact Horizon separates primary likely impact from contextual guidance. | confirmed | `ImpactResultEnvelope.results` and `contextual_results` remain separate; relation scoring still gates primary promotion through owner, edge, path, role, and ambiguity checks. |
+| Search emits a machine follow-up segment handle. | refined | `SearchResult.segment_id` is now required in the current shared contract, while display surfaces may shorten it to a 12-char `:<handle>` prefix accepted by read/impact follow-up. |
+| Project state lives at the project root. | refined | Current project resolution separates `state_root` from `source_root`, especially for linked worktrees and MCP/daemon flows. |
+| Eval and benchmark harnesses gate retrieval/storage changes. | untested | Preserved from prior KB; eval files were outside this pass's assigned concept set. |
+| MCP is not modeled in the prior concept map. | contradicted-by-new-evidence | MCP is now a first-class code-discovery surface with stdio serving, readiness, search, read, symbol, and impact tools. |
 
 ## Core Concepts
 
 | Concept | Type | Meaning | Primary Evidence |
 |---|---|---|---|
-| `Segment` | Entity | Fundamental indexed code block. A stable `segment_id` now also acts as an exact cross-command anchor. | `src/shared/types.rs`, `src/storage/segments.rs` |
-| `SearchResult` | Entity | Ranked discovery result hydrated from indexed segments. It now carries an additive optional `segment_id` for machine follow-up. | `src/shared/types.rs`, `src/search/hybrid.rs`, `src/cli/output.rs` |
-| `Impact Horizon` | Process | Explicit local-only workflow for bounded likely-impact exploration from a known anchor. | `src/search/impact.rs`, `src/cli/impact.rs` |
-| `ImpactAnchor` | Value object | Exact-one-anchor request model: file, file:line, symbol, or segment. | `src/search/impact.rs`, `src/cli/impact.rs` |
-| `ImpactCandidate` | Entity | Ranked likely-impact segment with hop distance, advisory score, and reason evidence after structural confidence and ambiguity gating. | `src/search/impact.rs`, `src/cli/output.rs` |
-| `Contextual Guidance` | Contract concept | Lower-confidence impact support surfaced separately from primary likely impact, including same-file/test heuristics plus ambiguous or low-signal relation matches. | `src/search/impact.rs`, `src/cli/output.rs` |
-| `ImpactResultEnvelope` | Value object | Shared output envelope for `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, and `refused` outcomes, with additive optional `contextual_results`. | `src/search/impact.rs`, `src/cli/output.rs` |
-| `SegmentRelation` | Entity | Persisted unresolved call/reference edge keyed by source segment plus canonical, lookup-tail, qualifier, and edge-identity evidence. | `src/storage/relations.rs`, `src/storage/queries.rs`, `src/storage/schema.rs` |
-| `RelationTargetDescriptor` | Value object | Normalized lookup/disambiguation fields derived from a raw target symbol before relation rows are stored. | `src/storage/relations.rs` |
-| `Daemon Search IPC` | Interface | Unix-socket discovery protocol for daemon-backed search. Responses now optionally carry `daemon_version`. | `src/daemon/search_service.rs`, `src/cli/search.rs` |
-| `Segment Vector` | Entity | Quantized embedding row in `segment_vectors.embedding_vec` as `FLOAT8(384)` under schema v12. Written via the typed `vector8(?)` constructor; generic `vector(?)` does not auto-cast. | `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/schema.rs` |
-| `Vector Index` | Entity | libSQL `libsql_vector_idx` on `segment_vectors.embedding_vec` with `metric=cosine`, `compress_neighbors=float8`, `max_neighbors=32`. Delivers ~4x on-disk shrink vs FLOAT32 while staying in a sub-80 MiB DiskANN page tier at repo scale. | `src/storage/queries.rs`, `src/storage/schema.rs` |
-| `Schema Version` | Value object | Monotonic integer (currently 12) stamped in `meta`. `ensure_current` rejects older or newer layouts with an explicit `1up reindex` hint. v12 gates the FLOAT32 -> FLOAT8 migration. | `src/shared/constants.rs`, `src/storage/schema.rs` |
-| `Recall Eval Harness` | Process | Deterministic anchor-based recall@k measurement run via `just eval-recall`. Decision gate for quantization and prefilter tuning; requires cold state (daemon stopped, index wiped) to avoid contamination. | `evals/suites/1up-search/recall.ts`, `evals/suites/1up-search/recall-corpus.jsonl`, `evals/suites/1up-search/recall-baseline.json` |
-| `Anchor-based Gold Corpus` | Value object | Recall gold keyed by durable anchors (`{file, symbol}` or `{file, line_contains}`), not segment IDs or a specific index's top-k output. Survives line drift and avoids version-bias. | `evals/suites/1up-search/recall-corpus.jsonl` |
+| `Segment` | Entity | Fundamental indexed code block with deterministic id, file span, language, block type, role, symbols, relations, and optional vector row. | `src/shared/types.rs`, `src/storage/segments.rs` |
+| `Segment Handle` | Value object | A segment id used for exact follow-up; MCP and lean rows display a short `:<12-char>` prefix, and read lookup resolves full or unique prefix handles. | `src/storage/segments.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs` |
+| `SearchResult` | Entity | Ranked hydrated discovery result carrying a required `segment_id`, integer score, path/span/kind, breadcrumb, content, and optional defined symbols. | `src/shared/types.rs`, `src/search/hybrid.rs` |
+| `CandidateRow` | Internal entity | Lightweight retrieval/ranking candidate selected before full segment hydration. | `src/search/retrieval.rs`, `src/search/ranking.rs` |
+| `QueryIntent` | Value object | Query classifier (`Definition`, `Flow`, `Usage`, `Docs`, `General`) that influences symbol variant search and rank boosts. | `src/search/intent.rs`, `src/search/ranking.rs` |
+| `Hybrid Search` | Process | Candidate-first discovery combining vector, FTS, and exact/fuzzy symbol candidates through RRF ranking before hydration. | `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs` |
+| `Symbol Lookup` | Process | Canonical exact/fuzzy definition and usage lookup over `segment_symbols`, with definitions deduped from usage results. | `src/search/symbol.rs`, `src/storage/queries.rs` |
+| `Context Retrieval` | Process | Read-after-pick source hydration that returns the smallest tree-sitter enclosing scope or a bounded line fallback. | `src/search/context.rs`, `src/mcp/ops.rs` |
+| `Structural Search` | Process | Tree-sitter query execution over indexed or scanned files for AST-pattern matches. | `src/search/structural.rs` |
+| `Impact Horizon` | Process | Local-only bounded likely-impact exploration from exactly one anchor. | `src/search/impact.rs`, `src/mcp/tools.rs` |
+| `ImpactAnchor` | Value object | Exact-one-anchor request model: file/line, symbol, or segment id. | `src/search/impact.rs`, `src/mcp/types.rs`, `src/mcp/tools.rs` |
+| `ImpactCandidate` | Entity | Ranked likely-impact segment with hop distance, advisory score, reason evidence, and role/symbol metadata. | `src/search/impact.rs` |
+| `Contextual Guidance` | Contract concept | Lower-confidence impact support kept outside primary results, including same-file/test heuristics and demoted relation matches. | `src/search/impact.rs` |
+| `ImpactResultEnvelope` | Value object | Shared impact output envelope for `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, and `refused`, with optional contextual results, hint, and refusal. | `src/search/impact.rs` |
+| `ParsedRelation` | Value object | Parser-extracted call/reference/conformance relation with raw symbol and normalized edge identity. | `src/shared/types.rs`, `src/indexer/parser.rs` |
+| `SegmentRelation` | Entity | Persisted unresolved relation edge keyed by source segment plus raw/canonical/lookup/qualifier/edge evidence. | `src/storage/relations.rs`, `src/storage/schema.rs` |
+| `RelationTargetDescriptor` | Value object | Normalized target descriptor that splits a raw relation into canonical symbol, lookup tail, and qualifier fingerprint. | `src/storage/relations.rs` |
+| `Indexed Files Manifest` | Entity | Per-file manifest (`indexed_files`) storing path, extension, hash, size, and mtime for metadata prefiltering and deletion detection. | `src/storage/schema.rs`, `src/storage/segments.rs`, `src/indexer/pipeline.rs` |
+| `Indexing Pipeline` | Process | Scans, metadata-prefilters, parses/chunks, embeds, batches, stores, and deletes repository segments transactionally. | `src/indexer/pipeline.rs`, `src/indexer/scanner.rs` |
+| `RunScope` | Value object | Index run scope: full repository or a set of changed paths, with fallback to full when scoped correctness is ambiguous. | `src/shared/types.rs`, `src/indexer/pipeline.rs`, `src/daemon/worker.rs` |
+| `IndexProgress` | Contract concept | Persisted progress/status telemetry with phase, counts, parallelism, timings, scope, and prefilter counters. | `src/shared/types.rs`, `src/indexer/pipeline.rs` |
+| `EmbeddingRuntime` | Service | Warm embedding runtime cache for indexing/search that can load/download verified artifacts for indexing and degrade search without downloading. | `src/indexer/embedder.rs`, `src/daemon/worker.rs` |
+| `Verified Model Artifact` | Entity | Hash-pinned ONNX/tokenizer artifact set activated through staging, manifest, and current pointer files under secure XDG state. | `src/indexer/embedder.rs`, `src/shared/constants.rs` |
+| `Segment Vector` | Entity | Quantized embedding row stored as `FLOAT8(384)` in `segment_vectors.embedding_vec`. | `src/storage/queries.rs`, `src/storage/schema.rs` |
+| `Vector Index` | Entity | libSQL vector index over segment vectors using cosine distance, `compress_neighbors=float8`, and `max_neighbors=32`. | `src/storage/queries.rs` |
+| `Schema Version` | Value object | Monotonic schema integer (`SCHEMA_VERSION = 12`) validated before reads/writes; mismatches fail closed with `1up reindex` guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
+| `Daemon Search IPC` | Interface | Same-UID Unix-socket framed JSON search protocol with bounded payloads, query sanitization, busy/unavailable responses, and optional daemon version metadata. | `src/daemon/search_service.rs`, `src/daemon/worker.rs` |
+| `Daemon Project Run State` | State model | Per-project dirty/running/pending scope tracker that collapses file-watch bursts and records full-scope fallback reasons. | `src/daemon/worker.rs` |
+| `ResolvedProject` | Value object | Worktree-aware root pair: `state_root` owns `.1up` state and daemon registry, while `source_root` supplies files to scan/read. | `src/shared/project.rs`, `src/mcp/ops.rs` |
+| `MCP Stdio Server` | Interface | Agent-facing stdio MCP server exposing 1up tools and instructions that make 1up the primary local code-discovery path. | `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/cli/mcp.rs` |
+| `ToolEnvelope` | Contract concept | Uniform MCP response shape: `status`, `summary`, structured `data`, and typed `next_actions`. | `src/mcp/types.rs`, `src/mcp/tools.rs` |
+| `ReadinessPayload` | Contract concept | MCP readiness state summarizing initialization, schema/index readability, counts, progress, daemon heartbeat, and degraded embedding state. | `src/mcp/ops.rs` |
+| `Recall Eval Harness` | Process | Prior KB concept for cold recall/size gating of retrieval and vector-storage changes. Preserved but not revalidated in this pass. | prior KB, `evals/` |
 
 ## Terminology
 
 | Term | Meaning |
 |---|---|
-| `impact` | The explicit CLI workflow for advisory likely-impact exploration. |
-| `segment_id` | Stable machine-readable handle emitted by search and accepted by `1up impact --from-segment`. |
-| `seed segment` | Resolved starting segment or bounded segment set used before impact expansion begins. |
-| `scope` | Repo-relative subtree constraint that narrows anchor resolution and candidate retention. |
-| `relation row` | Stored unresolved call/reference record in `segment_relations`, including canonical, lookup-tail, qualifier-fingerprint, and `edge_identity_kind` fields. |
-| `lookup_canonical_symbol` | Normalized tail symbol used to fetch bounded definition candidates for relation resolution and inbound lookup. |
-| `qualifier_fingerprint` | Normalized non-tail qualifier tokens used to align relation targets with file paths and breadcrumbs. |
-| `definition_owner_fingerprint` | Normalized owner tokens derived at impact-evaluation time from candidate file path, breadcrumb, and enclosing definition symbols. |
-| `edge_identity_kind` | Normalized relation-form vocabulary such as `qualified_path`, `member_access`, `method_receiver`, `constructor_like`, `macro_like`, or `bare_identifier`. |
-| `structural confidence` | Combined symbol, owner-alignment, edge-identity, path, breadcrumb, scope, role, and relation-kind evidence used before primary promotion. |
-| `corroboration signal` | A positive structural signal such as owner alignment, exact identity, compatible edge identity, scope/path affinity, or implementation-like role. |
-| `ambiguity margin` | Minimum confidence gap required for the best relation candidate to outrank the runner-up as primary. |
-| `refusal envelope` | Structured impact response that explains why expansion was refused and what to do next. |
-| `contextual_results` | Additive machine-readable field that holds non-primary same-file, test-only, or demoted relation guidance. |
-| `empty` | Impact status meaning the anchor resolved, but no primary likely-impact candidates were found. |
-| `empty_scoped` | Scoped variant of `empty`; no primary likely-impact candidates survived within the requested scope. |
-| `daemon_version` | Optional search-response metadata used to warn about CLI/daemon version skew. |
-| `context_only` | Hint code used when the anchor resolved but only contextual guidance remains after trust-bucket selection. |
-| `schema v10` | Index schema version that requires relation lookup-target, qualifier-fingerprint, and edge-identity columns and reindexing from older layouts. |
-| `schema v12` | Current schema version. Migrates `segment_vectors.embedding_vec` from `FLOAT32(384)` to `FLOAT8(384)` with `compress_neighbors=float8` and `max_neighbors=32`. Version bump forces reindex; no in-place migration. |
-| `advisory impact` | Likely-impact guidance derived from relations and heuristics, not exact dependency truth. |
-| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used for `segment_vectors.embedding_vec` in schema v12. ~4x smaller than FLOAT32 with no recall impact under an anchor-based corpus. |
-| `vector8(?)` | libSQL typed vector constructor required to insert/query `FLOAT8` columns. Generic `vector(?)` raises `InputValidationError: vector type differs from column type`. |
-| `libsql_vector_idx` | libSQL 0.9.30 vector index — a DiskANN graph (not classic HNSW) accepting `type`, `metric`, `compress_neighbors`, `max_neighbors`, `alpha`, `search_l`, `insert_l`. |
-| `compress_neighbors` | `libsql_vector_idx` option selecting neighbor-list element quantization (`float1bit`, `float8`, `float16`, `float32`). |
-| `max_neighbors` | DiskANN fanout cap (32 in v12). Graph size quantizes by discrete page tier, not linearly — observed boundaries at max_n=38 (~71–80 MiB) and 40 (~81 MiB). |
-| `VECTOR_PREFILTER_K` | Vector-search prefilter candidate count. Raised 200 -> 400 in v12 to absorb FLOAT8's noisier top-k ranking with no measurable latency hit. Correct lever for FLOAT8 recall, not RRF weights. |
-| `gold corpus` | Hand-curated recall ground truth. Must be version-neutral (never seeded from a specific index's top-k) and keyed by durable anchors, not segment IDs. |
-| `cold-state measurement` | Required eval protocol: stop the watch daemon, wipe `.1up/index.db`, reindex cold, then run the harness to avoid daemon-induced segment drift (~3 pt bias otherwise). |
+| `oneup_prepare` | MCP readiness/indexing tool; modes are `check`, `index_if_missing`, `index_if_needed`, and `reindex`. |
+| `oneup_search` | MCP ranked discovery tool backed by Hybrid Search; returns handles and may mark results degraded when embeddings are unavailable. |
+| `oneup_read` | MCP hydration tool for segment handles or repo-contained file locations; returns segment records or context records. |
+| `oneup_symbol` | MCP completeness tool for symbol definitions, references, or both. |
+| `oneup_impact` | MCP likely-impact tool that maps one segment/symbol/file anchor into `ImpactRequest`. |
+| `next_actions` | MCP follow-up hints that name another 1up tool and structured arguments. |
+| `handle` | MCP-visible segment identifier, normally rendered with a leading colon and shortened for display. |
+| `state_root` | Root where `.1up/` state, index DB, project id, daemon status, and registry identity live. |
+| `source_root` | Root whose files are scanned, indexed, watched, and read; can differ from `state_root` for linked worktrees. |
+| `readiness status` | MCP readiness enum: `ready`, `missing`, `indexing`, `stale`, `degraded`. |
+| `operation status` | MCP operation enum: `ok`, `empty`, `partial`, `degraded`. |
+| `read status` | Per-record read enum: `found`, `not_found`, `ambiguous`, `rejected`, `error`. |
+| `degraded search` | Search path where semantic embeddings are unavailable and FTS-only retrieval is used. |
+| `segment_id` | Required machine-readable segment id on current `SearchResult` and `SymbolResult`; prefix lookup supports shorter handles. |
+| `SegmentRole` | Parser role vocabulary: `DEFINITION`, `IMPLEMENTATION`, `ORCHESTRATION`, `IMPORT`, `DOCS`. |
+| `lookup_canonical_symbol` | Normalized tail symbol used for bounded relation target lookup. |
+| `qualifier_fingerprint` | Normalized non-tail owner tokens used to align relation targets with paths/breadcrumbs/owners. |
+| `edge_identity_kind` | Relation-form vocabulary such as `qualified_path`, `member_access`, `method_receiver`, `constructor_like`, `macro_like`, or `bare_identifier`. |
+| `conformance relation` | Relation kind for inheritance/implements/trait conformance extracted from Rust, TypeScript, and Java constructs. |
+| `definition_owner_fingerprint` | Impact-time owner tokens derived from candidate path, breadcrumb, and defined symbols. |
+| `corroboration signal` | Structural support signal required before ambiguous relation matches become primary impact results. |
+| `ambiguity margin` | Confidence gap required for the best relation candidate to beat the runner-up. |
+| `metadata_skipped` | Prefilter count for indexed files skipped because size and mtime matched the manifest. |
+| `content_read` | Prefilter count for files that passed metadata screening and were actually read/parsed. |
+| `MCP instance lock` | Per-project Unix lock preventing multiple stdio MCP server instances for one state root. |
+| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used by schema v12. |
+| `vector8(?)` | Typed libSQL constructor required for reads/writes against `FLOAT8` vector columns. |
+| `VECTOR_PREFILTER_K` | Candidate prefilter count (`400`) used by vector/FTS retrieval before RRF reranking. |
+| `gold corpus` | Prior KB term for version-neutral recall ground truth keyed by durable anchors, not transient segment ids. |
 
 ## Relationships
 
-- `SearchResult` provides an exact follow-up handle to `ImpactAnchor` through optional `segment_id`.
-- `Impact Horizon` traverses `SegmentRelation` rows plus same-file and test heuristics to build primary likely-impact candidates and contextual guidance.
-- `Impact Horizon` resolves relation targets through `lookup_canonical_symbol`, derives `definition_owner_fingerprint` from candidate metadata, then applies owner, edge-identity, path, scope, and role evidence before primary promotion.
-- `RelationTargetDescriptor` is derived at write time and materialized into each `SegmentRelation` row for later query-time resolution.
-- `ImpactResultEnvelope.results` contains only primary likely-impact candidates, while `contextual_results` carries lower-confidence guidance.
-- `ImpactResultEnvelope` uses explicit empty statuses when the anchor resolves but no primary candidates survive confidence and ambiguity gating.
-- `edge_identity_kind` and `qualifier_fingerprint` together decide whether a leaf-symbol match has enough corroboration to compete for primary promotion.
-- `SegmentInsert` materializes `SegmentRelation` rows during storage writes.
-- `Daemon Search IPC` returns `SearchResult` values but remains a separate surface from Impact Horizon.
-- Each `Segment` has at most one `Segment Vector` row; `segment_vectors.embedding_vec` is indexed by `Vector Index`.
-- `Schema Version` gates the `Vector Index` DDL — v12 mismatch forces reindex rather than in-place migration.
-- `Vector Index` pairs `FLOAT8` quantization with widened `VECTOR_PREFILTER_K=400` so the RRF reranker recovers displaced gold neighbors.
-- `Recall Eval Harness` consumes `Anchor-based Gold Corpus` and gates schema bumps against REQ-002's 2 pt envelope.
+- `MCP Stdio Server` exposes `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` as tool-router methods on `OneupMcpServer`.
+- `ToolEnvelope` wraps every MCP payload and uses `next_actions` to encode the expected search -> read -> symbol/impact workflow.
+- `ResolvedProject` feeds MCP, daemon, and indexing flows with distinct `state_root` and `source_root` responsibilities.
+- `oneup_prepare` can create/rebuild the local index through `Db`, `schema`, `EmbeddingRuntime`, and the `Indexing Pipeline`.
+- `oneup_search` calls `Hybrid Search`; `oneup_read` hydrates `Segment Handle` values through storage or file locations through `Context Retrieval`.
+- `Hybrid Search` combines vector, FTS, and symbol candidates into `CandidateRow` values, ranks them, then hydrates `SearchResult` from `Segment` rows.
+- `SearchResult.segment_id` and `SymbolResult.segment_id` provide exact handles for `oneup_read` and `ImpactAnchor::Segment`.
+- `Indexing Pipeline` turns parser/chunker output into `SegmentInsert` batches, `Segment Vector` rows, `segment_symbols`, `SegmentRelation` rows, and `Indexed Files Manifest` rows.
+- `ParsedRelation` rows become `SegmentRelation` records through `RelationTargetDescriptor` normalization.
+- `Impact Horizon` resolves relation targets through `lookup_canonical_symbol`, scores owner/edge/path/role evidence, and separates primary `results` from `contextual_results`.
+- `Daemon Project Run State` supplies scoped/full `RunScope` values and fallback reasons into `Indexing Pipeline` progress telemetry.
+- `Schema Version` gates all current storage reads and writes; stale or incomplete schemas produce reindex-required errors.
 
 ## Recurrent Patterns
 
 | Pattern | Context | Application |
 |---|---|---|
-| Additive search-to-impact handoff | Discovery workflow | Search keeps existing ranking semantics and only adds optional `segment_id` handles for exact follow-up. |
-| Bounded advisory expansion | Impact Horizon | Depth, seed count, relation fan-out, and result budgets stay capped; broad symbols are refused with hints and relation resolution stays bounded per lookup symbol. |
-| Owner-aware corroboration | Impact Horizon | Owner-aligned candidates are shortlisted before truncation, and primary promotion requires more than a leaf-name match when ambiguity exists. |
-| Trust bucket separation | Impact Horizon, Output | Primary relation-backed impact stays distinct from demoted relation or heuristic-only contextual guidance and empty-state handling. |
-| Late relation resolution | Local index graph | Indexing stores unresolved canonical plus lookup/qualifier/edge relation evidence, and impact resolves exact targets only for active seeds. |
-| Transactional relation maintenance | Storage writes | Segment upsert, replace, and delete flows keep `segment_relations` aligned with `segments` and `segment_symbols`. |
-| Backward-compatible surface evolution | CLI output and daemon IPC | New fields such as `segment_id` and `daemon_version` stay optional to preserve compatibility. |
-| Latency guarding | Verification | Benchmarks and integration tests protect interactive latency and search-stability expectations. |
-| Force-reindex schema evolution | Storage schema | Breaking column changes (e.g. FLOAT32 -> FLOAT8) bump `SCHEMA_VERSION` and rely on `ensure_current` to reject stale layouts. No in-place migration code is written. |
-| Quantization with prefilter widening | Vector search | When element-type quantization degrades top-k ranking, widen `VECTOR_PREFILTER_K` rather than reweighting RRF. RRF recovers displaced gold neighbors. |
-| Typed vector constructor discipline | libSQL write/read | Every INSERT/SELECT on a `FLOAT8` column uses `vector8(?)`. Generic `vector()` does not auto-cast. Enforced uniformly across query constants and batch-insert format strings. |
-| Cold-state eval protocol | Recall measurement | Stop daemon, wipe index, reindex cold, then run harness. Prevents daemon-induced transient segment IDs from biasing recall. |
-| Anchor-based gold curation | Eval corpus design | Gold entries key by `{file, symbol}` or `{file, line_contains}` — durable across line shifts and version-neutral. |
-| Hypothesis-validated schema change | Storage evolution | Non-obvious libSQL behaviors (e.g. `vector()` auto-cast, DiskANN page-tier quantization) are confirmed via HYP experiments before DDL lands. |
+| Search-before-read workflow | MCP and lean CLI | Discovery returns handles first; callers hydrate selected records with `oneup_read`/`get` before relying on content. |
+| Structured follow-up guidance | MCP tools | Every tool result carries `next_actions` rather than leaving agents to infer the next command. |
+| State/source root split | Project resolution | Worktree-aware operations store state in the main repo while indexing/reading the active source tree. |
+| Candidate-first retrieval | Search | Vector, FTS, and symbol paths produce lightweight candidates before full segment hydration. |
+| RRF with intent boosts | Ranking | Reciprocal rank fusion is adjusted by query intent, path, text-match, content kind, and short-segment penalties. |
+| Graceful semantic degradation | Search, MCP, Daemon | Missing/load-failed embeddings fall back to FTS-only search and readiness/status explains degradation. |
+| Descriptor-backed relation resolution | Impact/storage | Indexing stores unresolved relation descriptors; impact resolves bounded candidate definitions only for active seeds. |
+| Trust bucket separation | Impact | Confident relation-backed likely impact stays primary; weak or heuristic guidance stays contextual or empty. |
+| Manifest-backed prefilter | Indexing | Size/mtime matching skips file reads, while content hash remains the correctness backstop when metadata changes. |
+| Batched transactional writes | Storage | Segment, vector, symbol, relation, and manifest mutations use chunked multi-value inserts inside file-batch transactions. |
+| Force-reindex schema evolution | Storage | Breaking storage changes bump `SCHEMA_VERSION`; no in-place migration is attempted. |
+| Secure local state | Project/storage/daemon/MCP | `.1up`, XDG state, model artifacts, DB paths, sockets, and lock files are validated or permissioned before use. |
+| Bounded daemon concurrency | Daemon IPC | Search requests are limited by a semaphore and return busy/unavailable responses under saturation. |
 
 ## Bounded Contexts
 
+### MCP Code Discovery
+
+- Owns stdio server instructions, tool schemas, envelopes, summaries, and next-action choreography for agent-facing discovery.
+- Delegates actual search, read, symbol, impact, readiness, and indexing work to search/storage/indexing/shared modules.
+
 ### Search Discovery
 
-- Owns ranked discovery, daemon-backed search IPC, and additive machine follow-up handles.
-- Does not compute impact expansion or claim dependency truth.
+- Owns hybrid retrieval, query intent, ranking, symbol lookup, context retrieval, and structural pattern search.
+- Does not claim exhaustive dependency truth; ranked discovery must be followed by read/symbol checks when completeness matters.
 
 ### Impact Analysis
 
-- Owns local `1up impact` request handling, refusal semantics, owner-aware ranking, corroboration gating, and next-step hints.
-- Does not use daemon IPC in v1.
+- Owns local likely-impact expansion, anchor validation, refusal/empty semantics, relation scoring, and primary/contextual separation.
+- Does not run through daemon IPC and remains advisory.
+
+### Indexing And Embeddings
+
+- Owns scan, parse/chunk, embedding preparation, metadata prefiltering, scoped/full fallback, progress telemetry, and batched storage writes.
+- Search can operate without embeddings; indexing is where downloads and model compatibility checks occur.
 
 ### Index Graph Storage
 
-- Owns persisted segments, symbol rows, unresolved relation rows, and quantized vector rows in the local libSQL index (schema v12: FLOAT8(384) embeddings + compressed DiskANN graph).
-- Query-time code resolves targets rather than storing an exact dependency graph.
-- Schema changes evolve via force-reindex rather than in-place migration.
+- Owns schema v12, segments, vectors, symbols, relations, indexed-file manifest rows, meta records, and DB path validation.
+- Uses force-reindex for incompatible schema/model changes.
+
+### Daemon Coordination
+
+- Owns file watching, registry-driven projects, source-root watching, dirty run coalescing, heartbeat persistence, and bounded search IPC.
+- Does not own MCP stdio transport, but MCP can auto-start the daemon when safe.
+
+### Project Identity And Roots
+
+- Owns project id creation, secure `.1up` state, auto-init safety, linked-worktree detection, and state/source root resolution.
+- Automatic creation is refused outside an existing 1up project or git root.
 
 ### Eval And Benchmarks
 
-- Owns recall@k and on-disk size measurement under `evals/` and `scripts/`.
-- Requires cold-state measurement (daemon stopped, index wiped) for deterministic numbers.
-- Gates production schema bumps against REQ-001 (size) and REQ-002 (recall) absolutes.
+- Preserved prior context for recall/size/latency gates; not revalidated by the assigned files in this pass.
 
 ## Cross-Cutting Concerns
 
-- Ambiguity management: broad symbol anchors are refused with narrowing hints instead of widened into noisy output.
-- Advisory semantics: scores are framed as likely/probable guidance, not guaranteed blast radius.
-- Empty-state trust: resolved anchors without relation-backed evidence stay empty instead of being echoed back as synthetic success results.
-- Interactive latency: budgets and benchmarks keep impact and vector changes additive without regressing core discovery commands; FLOAT8 + `VECTOR_PREFILTER_K=400` verified latency-neutral at repo scale.
-- Compatibility: search and IPC surfaces stay additive and optional while relation-row and vector-column schema changes remain local to the index and guarded by reindex checks.
-- Reindex safety: schema mismatches fail early with explicit `1up reindex` guidance. Force-reindex is the only migration path for breaking column changes.
-- Measurement integrity: eval runs require cold state and version-neutral anchor-based gold to avoid daemon contamination and version-bias regressions.
-- Typed libSQL surfaces: `FLOAT8` columns require `vector8(?)` at every write/read site; generic `vector()` does not auto-cast.
+- Compatibility: public surfaces evolve through stable structs/enums and additive fields where possible; storage incompatibility is handled by schema version checks.
+- Ambiguity management: impact refuses broad anchors; handle prefix reads report ambiguity; MCP read locations reject path escapes.
+- Advisory semantics: impact scores and reasons are likely-impact guidance, not exact dependency truth.
+- Performance: metadata prefiltering, write batching, tuned PRAGMAs, warm embedding runtime, bounded vector prefiltering, and daemon request limits protect interactive latency.
+- Security: same-UID daemon IPC, secure socket/file modes, validated project DB paths, repo-contained location reads, and verified model artifact hashes defend local state boundaries.
+- Observability: `IndexProgress`, daemon heartbeat, readiness payloads, setup timings, scope info, and prefilter counters make local state inspectable.
+- Degradation transparency: missing embeddings, stale schemas, unreadable indexes, and busy/unavailable daemon states surface explicit statuses and retry guidance.
+
+## Novelty Scan Findings
+
+- MCP is now a reusable domain boundary, not just a wrapper: it defines typed inputs, structured envelopes, summaries, and tool-to-tool workflows.
+- `SearchResult.segment_id` has moved from optional/additive prior wording to a required current handle in shared search results.
+- Project resolution now has durable state/source root semantics that future worktree, daemon, and MCP changes must preserve.
+- Search has an explicit intent/ranking layer beyond vector + FTS; future rank changes should account for `QueryIntent`, symbol candidates, per-file caps, and content-kind/path boosts.
+- Embedding availability is a first-class readiness/degradation axis across MCP, daemon, indexing, and search.

@@ -738,21 +738,20 @@ fn package_publication_record_captures_repo_commit_refs() {
 }
 
 #[test]
-fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
+fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
     let readme = fs::read_to_string(repo_root().join("README.md")).unwrap();
     let order = [
         "## Ready-To-Run Agent Prompt",
         "## Human Quick Setup",
-        "## 1. Install Or Update 1up",
-        "## 2. Choose Repository Path, Host, And Scope",
-        "## 3. Run Wrapper-First Setup",
-        "## 4. Review Add-MCP Or Host Confirmation",
-        "## 5. Approve Or Trust The Server",
-        "## 6. Verify Tool Listing And Readiness",
-        "## 7. Manual Fallback Setup",
-        "## 8. Troubleshooting",
-        "## 9. Safety And Permissions",
+        "## Install Or Update 1up",
+        "## Choose Repository Path And Scope",
+        "## Manual Host Config",
+        "## Approve Or Trust The Server",
+        "## Verify Tool Listing And Readiness",
+        "## Human Project Lifecycle",
+        "## Troubleshooting",
+        "## Safety And Permissions",
     ];
     let mut previous = 0;
     for heading in order {
@@ -761,16 +760,17 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
             .unwrap_or_else(|| panic!("missing guide heading {heading}"));
         assert!(
             position >= previous,
-            "guide heading {heading} appears out of wrapper-first order"
+            "guide heading {heading} appears out of manual-setup order"
         );
         previous = position;
     }
 
     for required in [
+        "All setup below uses manual host configuration.",
+        "curl -fsSL https://1up.rp1.run/setup.sh | bash",
         "Configure 1up MCP for this repository.",
         "main worktree root",
         "git rev-parse --path-format=absolute --git-common-dir",
-        "Do not run `1up add-mcp`",
         "Use `MAIN_ROOT` for the MCP path and repository instruction file.",
         "Do not try to restart this active host or verify newly added MCP tools from it.",
         "ask the user to restart/reload this host so it can load `oneup`",
@@ -783,18 +783,22 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
         "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
         "Use `oneup_prepare` when readiness is unknown",
         "list MCP tools",
-        "1up add-mcp --path /absolute/path/to/repo --agent codex",
-        "`1up add-mcp` does not parse, generate, or patch",
-        "Host configuration mutation remains owned by `add-mcp`",
         "### Codex",
         "### Claude Code",
         "### Cursor",
         "### VS Code And Copilot",
         "### Generic MCP JSON Client",
         "server identity `oneup`",
+        "command `1up`",
         "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
         "oneup_prepare",
+        "1up start",
+        "1up status",
+        "1up list",
+        "1up stop",
+        "`--plain` is not the agent protocol",
         "Protocol Errors Or Non-JSON Stdout",
+        "Setup path: manual host config",
         "It does not:",
         "Execute arbitrary shell commands",
         "Mutate host MCP configuration",
@@ -808,6 +812,18 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
     for required in [
         "ready-to-run agent prompt",
         "human quick setup path",
+        "curl -fsSL https://1up.rp1.run/setup.sh | bash",
+        "Manual MCP Config",
+        "server identity is `oneup`",
+        "The command is `1up`",
+        "args are `[\"mcp\", \"--path\", \"/Users/alex/code/my-app\"]`",
+        "Human Project Lifecycle",
+        "1up start",
+        "1up status",
+        "1up list",
+        "1up stop",
+        "`--plain` is only for shell scripts and terminal automation",
+        "Agents should use the `oneup_*` MCP tools",
         "minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md`",
         "Use the plain minimal instruction from the MCP installation guide",
         "[docs/mcp-installation.md](docs/mcp-installation.md)",
@@ -818,10 +834,27 @@ fn mcp_installation_docs_are_wrapper_first_and_manual_fallback_safe() {
         );
     }
 
-    for unsupported in ["1up mcp-install", "1up mcp install", "src/mcp/install"] {
+    for unsupported in [
+        "1up add-mcp",
+        "add-mcp",
+        "Run Wrapper-First Setup",
+        "wrapper-first",
+        "bunx",
+        "npx",
+        "Homebrew",
+        "Scoop",
+        "hello-agent",
+        "1up mcp-install",
+        "1up mcp install",
+        "src/mcp/install",
+    ] {
         assert!(
             !guide.contains(unsupported),
-            "MCP installation guide should not document unsupported installer/config writer path {unsupported}"
+            "MCP installation guide should not document unsupported setup/package path {unsupported}"
+        );
+        assert!(
+            !readme.contains(unsupported),
+            "README should not document unsupported setup/package path {unsupported}"
         );
     }
 }

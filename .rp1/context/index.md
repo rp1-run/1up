@@ -1,28 +1,31 @@
-# 1up — Knowledge Base Index
+# 1up - Knowledge Base Index
 
-**What**: A semantic code search engine that indexes local repositories with tree-sitter parsing and ONNX embeddings, then serves hybrid search, symbol lookup, structural queries, context retrieval, and bounded impact exploration through a CLI with an optional background daemon.
+**What**: A local-first code discovery substrate that indexes repositories with tree-sitter parsing, ONNX embeddings, libSQL FTS/vector storage, and relation metadata, then exposes search, read, symbol, context, structural, impact, indexing, daemon, and MCP workflows through a single Rust binary.
 
-**Why**: It gives developers and agents fast code discovery by meaning and structure while keeping indexing local, incremental, and stable enough for interactive workflows.
+**Why**: It gives humans and agents a fast, local, evidence-oriented path from ranked code discovery to exact source hydration, symbol verification, and bounded likely-impact exploration without relying on broad raw search as the first step.
 
 ## Quick Reference
 
 | Attribute | Value |
 |---|---|
+| Type | Single project |
 | Entry point | `src/main.rs` -> `src/cli/mod.rs` |
-| Key patterns | Layered CLI + daemon model, candidate-first retrieval, local-only impact analysis, quantized vector storage with widened prefilter |
-| Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, clap |
-| Distribution | Homebrew, Scoop, GitHub Releases, built-in self-update |
-| Schema version | 12 (FLOAT8(384) embeddings, compress_neighbors=float8, max_neighbors=32) |
+| Primary agent surface | `1up mcp --path <repo>` exposing `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact` |
+| Key patterns | Layered CLI + MCP + daemon, search-before-read, candidate-first retrieval, local-only advisory impact, metadata-prefiltered indexing |
+| Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, rmcp, clap, TypeScript evals, shell release scripts |
+| Version | 0.1.8 |
+| Schema version | 12 (`FLOAT8(384)`, `vector8(?)`, `compress_neighbors=float8`, `max_neighbors=32`, `VECTOR_PREFILTER_K=400`) |
+| Last generated | 2026-05-01T00:45:02Z |
 
 ## KB File Manifest
 
 | File | Lines | Load For |
 |---|---:|---|
-| [concept_map.md](concept_map.md) | ~125 | Terminology, types, domain relationships, vector/schema vocabulary, impact outcomes |
-| [architecture.md](architecture.md) | ~147 | Topology, data flow, storage, daemon boundaries, shrunk-vector-index changes |
-| [interaction-model.md](interaction-model.md) | ~131 | CLI states, output contracts, follow-up flows, developer harness surface |
-| [modules.md](modules.md) | ~106 | Component ownership, dependencies, evals and scripts modules |
-| [patterns.md](patterns.md) | ~91 | Coding, storage, error, output, eval, and test idioms |
+| [concept_map.md](concept_map.md) | 176 | Domain terminology, code-discovery concepts, MCP tool vocabulary, storage/search/impact relationships |
+| [architecture.md](architecture.md) | 183 | System topology, data/state layout, MCP/CLI/daemon flows, release and indexing architecture |
+| [interaction-model.md](interaction-model.md) | 169 | Agent and CLI interaction semantics, readiness states, output contracts, setup/onboarding flows |
+| [modules.md](modules.md) | 158 | Component ownership, module dependencies, public boundaries, tests/evals/scripts organization |
+| [patterns.md](patterns.md) | 92 | Coding conventions, data modeling, errors, validation, output, storage, concurrency, testing idioms |
 
 ## Task-Based Loading
 
@@ -31,30 +34,55 @@
 | Code review | `patterns.md` |
 | Bug investigation | `architecture.md`, `modules.md` |
 | Feature work | `modules.md`, `patterns.md` |
-| Search and ranking changes | `concept_map.md`, `architecture.md`, `interaction-model.md` |
+| Search, ranking, or symbol changes | `concept_map.md`, `architecture.md`, `interaction-model.md`, `patterns.md` |
+| MCP or CLI surface changes | `interaction-model.md`, `modules.md`, `patterns.md` |
 | Impact or relation work | `concept_map.md`, `architecture.md`, `modules.md`, `interaction-model.md`, `patterns.md` |
-| Vector/storage/schema changes | `concept_map.md`, `architecture.md`, `modules.md`, `patterns.md` |
+| Indexing, storage, schema, vector, or daemon changes | `concept_map.md`, `architecture.md`, `modules.md`, `patterns.md` |
+| Release, install, packaging, or eval changes | `architecture.md`, `modules.md`, `interaction-model.md` |
 | Strategic or system-wide analysis | All files |
 
 ## Recent Learnings
 
-- `impact` now separates confident relation-backed likely-impact `results` from heuristic-only or demoted-relation `contextual_results`, and empty expansions return explicit `empty` or `empty_scoped` states instead of anchor-echo fallbacks.
-- Search results expose additive machine-readable `segment_id` handles for exact impact follow-up without changing discovery ranking.
-- Schema v9 persists relation lookup-target and qualifier-fingerprint evidence in `segment_relations`, enabling bounded structural-confidence scoring without changing the impact envelope.
-- Rollout evidence now has dedicated entry points: `just impact-eval` for trust gating and `just impact-bench` for latency gating.
-- Schema v11 adds `indexed_files` manifest table for metadata-based unchanged-file prefiltering; indexing path uses tuned connections, batched multi-value INSERTs, and end-to-end timing propagation via `SetupTimings`.
-- `IndexProgress` exposes additive `scope` and `prefilter` fields; daemon tracks scope fallback reasons via `pending_fallback_reason`.
-- Benchmark script expanded with daemon refresh and scope evidence in summary JSON.
-- Schema v12 migrates `segment_vectors.embedding_vec` from `FLOAT32(384)` to `FLOAT8(384)` with `compress_neighbors=float8` + `max_neighbors=32` on the HNSW index. Measured on the 1up repo: `index.db` 281 MB -> ~71 MB (~4x), cold indexing 81 s -> ~36 s, recall 0.00 pt delta under an anchor-based corpus. Writes use the typed `vector8(?)` constructor (generic `vector(?)` rejected at `FLOAT8` columns). `VECTOR_PREFILTER_K` widened 200 -> 400 to absorb quantization noise without latency impact.
-- Force-reindex schema evolution: breaking column changes bump `SCHEMA_VERSION` and rely on `ensure_current` to fail closed. No in-place migration.
-- Anchor-based recall gold: recall corpora key gold by `{file, symbol}` / `{file, line_contains}` anchors — durable across line drift, version-neutral. Hash-based gold is fragile (any line shift invalidates segment IDs) and was replaced.
-- libSQL 0.9.30's `libsql_vector_idx` is DiskANN, not classic HNSW; graph size quantizes by page tier, not linearly in `max_neighbors`. `max_neighbors=32` sits below the 80 MiB page boundary.
-- Cold-state eval protocol: daemon must be stopped and `.1up/index.db` wiped before measuring recall/size to avoid ~3 pt bias from transient segment IDs.
-- Developer harness: `just eval-recall` and `just bench-vector-index-size` gate storage-format changes without expanding the shipped CLI contract.
+- MCP is now a first-class top-level module and the canonical agent surface, not an incidental CLI/daemon behavior. Agents should use canonical `oneup_*` MCP tools for discovery before broad raw search.
+- The former reminder/skill/`hello-agent` adoption path is historical; current onboarding uses server identity `oneup`, `1up mcp --path <repo>`, repo instruction files, setup docs, host reload/trust prompts, and adoption evals.
+- Search is explicitly search -> read -> verify: ranked discovery returns compact segment handles, `oneup_read`/`get` hydrates selected evidence, and `oneup_symbol` is the completeness-oriented path for known symbols.
+- Core discovery CLI commands now use one lean row grammar and reject `--format`; maintenance commands keep human/plain/json formatting.
+- MCP tools return structured `ToolEnvelope` responses with `status`, `summary`, `data`, and `next_actions`, making prepare/search/read/symbol/impact a guided loop.
+- Project resolution separates `state_root` from `source_root`, allowing linked worktrees to reuse main-worktree `.1up` state while scanning the active source tree.
+- Schema v12 remains current: `segment_vectors.embedding_vec` is `FLOAT8(384)`, vector writes and reads use `vector8(?)`, and incompatible storage formats fail closed with `1up reindex` guidance.
+- Indexing is metadata-first and transactional: `indexed_files` skips unchanged size/mtime rows before content reads, scoped runs fall back to full when unsafe, and file replacement updates segments, vectors, symbols, relations, and manifest rows together.
+- Impact remains local-only and advisory. Primary likely-impact `results` must stay separate from lower-confidence `contextual_results`, and `refused`/`empty` states carry narrowing guidance.
+- Release architecture now validates MCP as a public contract: archive smoke checks list canonical tools, call `oneup_prepare`, verify structured content, and ensure stdout remains JSON-RPC clean.
+
+## Project Structure
+
+```text
+src/
+  cli/       # Human CLI commands, lean core output, maintenance renderers, MCP launch/setup
+  mcp/       # rmcp stdio server, tool schemas, operation adapters, structured envelopes
+  search/    # Hybrid retrieval, ranking, symbol, context, structural, impact engines
+  indexer/   # Scan, parse/chunk, embed, metadata prefilter, progress, storage pipeline
+  storage/   # libSQL schema v12, SQL, segments, vectors, symbols, relations, manifest
+  daemon/    # Registry, lifecycle, watcher, worker, secure search IPC, platform stubs
+  shared/    # Types, config, project roots, secure FS, symbols, errors, update helpers
+tests/       # CLI/MCP/release/setup/security regression suites
+evals/       # Promptfoo/TypeScript search and MCP adoption evals
+scripts/     # Benchmarks, installer, release, security, MCP smoke automation
+packaging/   # Homebrew and Scoop templates
+```
+
+## Navigation
+
+- **[concept_map.md](concept_map.md)**: Terminology and conceptual relationships.
+- **[architecture.md](architecture.md)**: System design, data flow, storage, deployment, and release topology.
+- **[interaction-model.md](interaction-model.md)**: User/agent-visible states, output contracts, and setup/discovery loops.
+- **[modules.md](modules.md)**: Module/component inventory and dependency boundaries.
+- **[patterns.md](patterns.md)**: Implementation idioms and local engineering conventions.
 
 ## How To Load
 
 Agents load this KB automatically:
+
 1. Read `index.md` first.
 2. Load only the files needed for the current task.
 3. Avoid loading the full KB unless the work is system-wide.

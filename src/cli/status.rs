@@ -1,43 +1,44 @@
 use clap::Args;
 
-use crate::cli::output::{formatter_for, StatusInfo};
+use std::path::Path;
+
+use crate::cli::output::{formatter_for, LifecycleState, StatusInfo};
+use crate::cli::project_status_files::{read_daemon_status, read_index_progress};
 use crate::daemon::lifecycle;
+use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::shared::config;
 use crate::shared::project;
-use crate::shared::types::{DaemonProjectStatus, IndexProgress, OutputFormat};
+use crate::shared::types::{IndexProgress, IndexState, OutputFormat};
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments;
 
-const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
-
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Project root directory (defaults to current directory)
+    /// Project root to inspect (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
 
+    /// Print stable plain text output for simple scripts
+    #[arg(long, conflicts_with = "format")]
+    pub plain: bool,
+
     /// Output format override (defaults to human)
-    #[arg(long, short = 'f')]
+    #[arg(long, short = 'f', hide = true, conflicts_with = "plain")]
     pub format: Option<OutputFormat>,
 }
 
-fn read_index_progress(project_root: &std::path::Path) -> Option<IndexProgress> {
-    let path = config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-fn read_daemon_status(project_root: &std::path::Path) -> Option<DaemonProjectStatus> {
-    let path = config::project_daemon_status_path(project_root);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
 pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> {
-    let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
+    let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
+    let resolved_source_root = resolved.source_root;
     let fmt = formatter_for(format);
+    let registry = Registry::load()?;
+    let registry_entry = find_registered_project(&registry.projects, &project_root);
+    let registered = registry_entry.is_some();
+    let source_root = registry_entry
+        .map(|entry| entry.source_root().to_path_buf())
+        .unwrap_or(resolved_source_root);
 
     let (daemon_running, pid) = match lifecycle::is_daemon_running()? {
         Some(pid) => (true, Some(pid)),
@@ -74,19 +75,107 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         }
     };
 
+    let index_progress = read_index_progress(&project_root);
+    let lifecycle_state = derive_lifecycle_state(
+        registered,
+        daemon_running,
+        project_initialized,
+        index_present,
+        index_readable,
+        index_progress.as_ref(),
+    );
+
     let status = StatusInfo {
+        lifecycle_state,
+        registered,
         daemon_running,
         pid,
         project_initialized,
         indexed_files,
         total_segments,
         project_id,
+        project_root,
+        source_root,
         index_present,
         index_readable,
         last_file_check_at: daemon_status.map(|status| status.last_file_check_at),
-        index_progress: read_index_progress(&project_root),
+        index_progress,
     };
 
     println!("{}", fmt.format_status(&status));
     Ok(())
+}
+
+fn find_registered_project<'a>(
+    projects: &'a [ProjectEntry],
+    project_root: &Path,
+) -> Option<&'a ProjectEntry> {
+    let canonical = project::canonical_project_root(project_root);
+    projects
+        .iter()
+        .find(|project| project.project_root == canonical)
+}
+
+fn derive_lifecycle_state(
+    registered: bool,
+    daemon_running: bool,
+    project_initialized: bool,
+    index_present: bool,
+    index_readable: bool,
+    index_progress: Option<&IndexProgress>,
+) -> LifecycleState {
+    if index_progress.is_some_and(|progress| progress.state == IndexState::Running) {
+        return LifecycleState::Indexing;
+    }
+
+    if !project_initialized
+        && !index_readable
+        && !index_present
+        && index_progress.is_none()
+        && !registered
+    {
+        return LifecycleState::NotStarted;
+    }
+
+    if registered && daemon_running {
+        return LifecycleState::Active;
+    }
+
+    if registered {
+        return LifecycleState::Registered;
+    }
+
+    if project_initialized || index_present || index_progress.is_some() {
+        return LifecycleState::Stopped;
+    }
+
+    LifecycleState::NotStarted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::types::IndexPhase;
+
+    #[test]
+    fn lifecycle_is_stopped_when_index_artifact_exists_without_project_id() {
+        let state = derive_lifecycle_state(false, false, false, true, false, None);
+
+        assert_eq!(state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_is_stopped_when_progress_artifact_exists_without_project_id() {
+        let progress = IndexProgress::watch(IndexState::Complete, IndexPhase::Complete, "done");
+        let state = derive_lifecycle_state(false, false, false, false, false, Some(&progress));
+
+        assert_eq!(state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_is_not_started_when_no_project_or_index_artifacts_exist() {
+        let state = derive_lifecycle_state(false, false, false, false, false, None);
+
+        assert_eq!(state, LifecycleState::NotStarted);
+    }
 }

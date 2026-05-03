@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -23,6 +24,8 @@ pub trait Formatter {
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String;
     fn format_index_watch_update(&self, progress: &IndexProgress) -> String;
     fn format_status(&self, status: &StatusInfo) -> String;
+    fn format_stop_result(&self, result: &StopResultInfo) -> String;
+    fn format_project_list(&self, projects: &ProjectListInfo) -> String;
     fn format_update_status(&self, _status: &UpdateStatusInfo) -> String {
         String::new()
     }
@@ -53,23 +56,122 @@ impl StartStatus {
 #[derive(Debug, Clone)]
 pub struct StartResultInfo {
     pub status: StartStatus,
+    pub project_id: Option<String>,
+    pub project_root: Option<PathBuf>,
+    pub source_root: Option<PathBuf>,
+    pub registered: Option<bool>,
+    pub index_status: Option<ProjectListIndexStatus>,
     pub pid: Option<u32>,
     pub message: String,
     pub progress: Option<IndexProgress>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    NotStarted,
+    Indexing,
+    Active,
+    Registered,
+    Stopped,
+}
+
+impl LifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Indexing => "indexing",
+            Self::Active => "active",
+            Self::Registered => "registered",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusInfo {
+    pub lifecycle_state: LifecycleState,
+    pub registered: bool,
     pub daemon_running: bool,
     pub pid: Option<u32>,
     pub project_initialized: bool,
     pub indexed_files: Option<u64>,
     pub total_segments: Option<u64>,
     pub project_id: Option<String>,
+    pub project_root: PathBuf,
+    pub source_root: PathBuf,
     pub index_present: bool,
     pub index_readable: bool,
     pub last_file_check_at: Option<DateTime<Utc>>,
     pub index_progress: Option<IndexProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopStatus {
+    Stopped,
+    NotRegistered,
+    DaemonNotRunning,
+    Unsupported,
+}
+
+impl StopStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::NotRegistered => "not_registered",
+            Self::DaemonNotRunning => "daemon_not_running",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StopResultInfo {
+    pub status: StopStatus,
+    pub project_root: PathBuf,
+    pub registered: bool,
+    pub daemon_running: bool,
+    pub pid: Option<u32>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectListInfo {
+    pub projects: Vec<ProjectListItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectListItem {
+    pub project_id: String,
+    pub state: LifecycleState,
+    pub project_root: PathBuf,
+    pub source_root: PathBuf,
+    pub registered_at: String,
+    pub daemon_running: bool,
+    pub index_status: ProjectListIndexStatus,
+    pub files: Option<u64>,
+    pub segments: Option<u64>,
+    pub last_file_check_at: Option<DateTime<Utc>>,
+    pub index_progress: Option<IndexProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectListIndexStatus {
+    Ready,
+    NotBuilt,
+    Unavailable,
+}
+
+impl ProjectListIndexStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NotBuilt => "not_built",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +304,11 @@ impl Formatter for JsonFormatter {
     fn format_start_result(&self, result: &StartResultInfo) -> String {
         let mut payload = serde_json::json!({
             "status": result.status.as_str(),
+            "project_id": &result.project_id,
+            "project_root": &result.project_root,
+            "source_root": &result.source_root,
+            "registered": result.registered,
+            "index_status": result.index_status.map(ProjectListIndexStatus::as_str),
             "pid": result.pid,
             "message": &result.message,
         });
@@ -233,17 +340,29 @@ impl Formatter for JsonFormatter {
     fn format_status(&self, status: &StatusInfo) -> String {
         let index_work = status.index_progress.as_ref().map(WorkSummary::from);
         to_json(&serde_json::json!({
+            "lifecycle_state": status.lifecycle_state.as_str(),
+            "registered": status.registered,
             "daemon_running": status.daemon_running,
             "pid": status.pid,
             "project_initialized": status.project_initialized,
             "indexed_files": status.indexed_files,
             "total_segments": status.total_segments,
             "project_id": &status.project_id,
+            "project_root": &status.project_root,
+            "source_root": &status.source_root,
             "index_status": render_index_health_plain(status),
             "last_file_check_at": status.last_file_check_at,
             "index_progress": &status.index_progress,
             "index_work": index_work,
         }))
+    }
+
+    fn format_stop_result(&self, result: &StopResultInfo) -> String {
+        to_json(result)
+    }
+
+    fn format_project_list(&self, projects: &ProjectListInfo) -> String {
+        to_json(projects)
     }
 
     fn format_update_status(&self, info: &UpdateStatusInfo) -> String {
@@ -325,10 +444,16 @@ impl Formatter for HumanFormatter {
     }
 
     fn format_start_result(&self, result: &StartResultInfo) -> String {
-        match &result.progress {
+        let mut out = match &result.progress {
             Some(progress) => self.format_index_summary(&result.message, progress),
-            None => result.message.clone(),
-        }
+            None => {
+                let mut out = result.message.clone();
+                out.push('\n');
+                out
+            }
+        };
+        append_start_fields_human(&mut out, result);
+        out
     }
 
     fn format_index_summary(&self, message: &str, progress: &IndexProgress) -> String {
@@ -423,22 +548,35 @@ impl Formatter for HumanFormatter {
 
     fn format_status(&self, status: &StatusInfo) -> String {
         let mut out = String::new();
-        let state = if status.daemon_running {
+        out.push_str(&format!(
+            "Lifecycle: {}\n",
+            render_lifecycle_state_human(status.lifecycle_state)
+        ));
+        out.push_str(&format!(
+            "Registered: {}\n",
+            render_bool_human(status.registered)
+        ));
+        let daemon_state = if status.daemon_running {
             "running".green().to_string()
         } else {
             "stopped".red().to_string()
         };
-        out.push_str(&format!("Daemon: {state}\n"));
+        out.push_str(&format!("Daemon: {daemon_state}\n"));
         if let Some(pid) = status.pid {
             out.push_str(&format!("PID: {pid}\n"));
         }
         if let Some(id) = &status.project_id {
-            out.push_str(&format!("Project: {id}\n"));
+            out.push_str(&format!("Project ID: {id}\n"));
         } else if status.project_initialized {
-            out.push_str("Project: initialized\n");
+            out.push_str("Project ID: initialized\n");
         } else {
-            out.push_str(&format!("Project: {}\n", "not initialized".yellow()));
+            out.push_str(&format!("Project ID: {}\n", "not initialized".yellow()));
         }
+        out.push_str(&format!(
+            "Project root: {}\n",
+            status.project_root.display()
+        ));
+        out.push_str(&format!("Source root: {}\n", status.source_root.display()));
         out.push_str(&format!("Index: {}\n", render_index_health_human(status)));
         if let Some(last_file_check_at) = &status.last_file_check_at {
             out.push_str(&format!(
@@ -540,6 +678,53 @@ impl Formatter for HumanFormatter {
                 render_time_ago(&progress.updated_at),
                 progress.updated_at.to_rfc3339()
             ));
+        }
+        out
+    }
+
+    fn format_stop_result(&self, result: &StopResultInfo) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Status: {}\n",
+            render_stop_status_human(result.status)
+        ));
+        out.push_str(&format!(
+            "Project root: {}\n",
+            result.project_root.display()
+        ));
+        out.push_str(&format!(
+            "Registered: {}\n",
+            render_bool_human(result.registered)
+        ));
+        out.push_str(&format!(
+            "Daemon: {}\n",
+            render_daemon_state_human(result.daemon_running)
+        ));
+        if let Some(pid) = result.pid {
+            out.push_str(&format!("PID: {pid}\n"));
+        }
+        out.push_str(&format!("Message: {}\n", result.message));
+        out
+    }
+
+    fn format_project_list(&self, projects: &ProjectListInfo) -> String {
+        if projects.projects.is_empty() {
+            return "No registered projects.\nRun `1up start` in a repository to register one.\n"
+                .to_string();
+        }
+
+        let rows: Vec<ProjectListRow> = projects
+            .projects
+            .iter()
+            .map(ProjectListRow::from_item)
+            .collect();
+        let widths = ProjectListWidths::from_rows(&rows);
+
+        let mut out = String::from("Registered projects\n");
+        out.push_str(&format_project_list_header(&widths));
+        out.push_str(&format_project_list_separator(&widths));
+        for row in rows {
+            out.push_str(&format_project_list_row(&row, &widths));
         }
         out
     }
@@ -702,17 +887,17 @@ impl Formatter for PlainFormatter {
     }
 
     fn format_start_result(&self, result: &StartResultInfo) -> String {
-        let mut out = format!("status:{}", result.status.as_str());
-        match result.pid {
-            Some(pid) => out.push_str(&format!("\tpid:{pid}")),
-            None => out.push_str("\tpid:none"),
-        }
-        if let Some(progress) = &result.progress {
-            out.push('\n');
-            out.push_str(&self.format_index_summary(&result.message, progress));
-        } else {
-            out.push_str(&format!("\tmessage:{}\n", result.message));
-        }
+        let out = format!(
+            "status:{}\tproject_id:{}\tproject_root:{}\tsource_root:{}\tregistered:{}\tindex:{}\tpid:{}\tmessage:{}\n",
+            result.status.as_str(),
+            render_optional_plain(result.project_id.as_deref()),
+            render_optional_path_plain(result.project_root.as_ref()),
+            render_optional_path_plain(result.source_root.as_ref()),
+            render_optional_bool_plain(result.registered),
+            render_start_index_plain(result.index_status),
+            render_optional_pid_plain(result.pid),
+            plain_field(&result.message),
+        );
         out
     }
 
@@ -831,28 +1016,27 @@ impl Formatter for PlainFormatter {
     }
 
     fn format_status(&self, status: &StatusInfo) -> String {
-        let state = if status.daemon_running {
+        let daemon_state = if status.daemon_running {
             "running"
         } else {
             "stopped"
         };
-        let mut out = format!("daemon:{state}");
-        if let Some(pid) = status.pid {
-            out.push_str(&format!("\tpid:{pid}"));
-        }
-        out.push_str(&format!(
-            "\tproject_initialized:{}",
-            status.project_initialized
-        ));
-        if let Some(id) = &status.project_id {
-            out.push_str(&format!("\tproject:{id}"));
-        }
-        out.push_str(&format!("\tindex:{}", render_index_health_plain(status)));
+        let mut out = format!(
+            "lifecycle:{}\tregistered:{}\tdaemon:{}\tpid:{}\tproject_initialized:{}\tproject_id:{}\tproject_root:{}\tsource_root:{}\tindex:{}",
+            status.lifecycle_state.as_str(),
+            status.registered,
+            daemon_state,
+            render_optional_pid_plain(status.pid),
+            status.project_initialized,
+            render_optional_plain(status.project_id.as_deref()),
+            plain_field(&status.project_root.display().to_string()),
+            plain_field(&status.source_root.display().to_string()),
+            render_index_health_plain(status),
+        );
         match &status.last_file_check_at {
             Some(last_file_check_at) => out.push_str(&format!(
-                "\tlast_file_check:{}\tlast_file_check_ago:{}",
-                last_file_check_at.to_rfc3339(),
-                render_time_ago(last_file_check_at)
+                "\tlast_file_check:{}",
+                last_file_check_at.to_rfc3339()
             )),
             None => out.push_str("\tlast_file_check:none"),
         }
@@ -879,7 +1063,7 @@ impl Formatter for PlainFormatter {
             ));
             out.push_str(&format!("\tlast_processed:{}", progress.files_processed));
             if let Some(message) = progress.message.as_deref() {
-                out.push_str(&format!("\tindex_message:{message}"));
+                out.push_str(&format!("\tindex_message:{}", plain_field(message)));
             }
             if let Some(parallelism) = &progress.parallelism {
                 out.push_str(&format!(
@@ -914,7 +1098,7 @@ impl Formatter for PlainFormatter {
                     scope.requested, scope.executed, scope.changed_paths,
                 ));
                 if let Some(reason) = &scope.fallback_reason {
-                    out.push_str(&format!("\tscope_fallback_reason:{reason}"));
+                    out.push_str(&format!("\tscope_fallback_reason:{}", plain_field(reason)));
                 }
             }
             if let Some(prefilter) = &progress.prefilter {
@@ -923,13 +1107,49 @@ impl Formatter for PlainFormatter {
                     prefilter.discovered, prefilter.metadata_skipped, prefilter.content_read, prefilter.deleted,
                 ));
             }
-            out.push_str(&format!(
-                "\tupdated:{}\tago:{}",
-                progress.updated_at.to_rfc3339(),
-                render_time_ago(&progress.updated_at)
-            ));
+            out.push_str(&format!("\tupdated:{}", progress.updated_at.to_rfc3339()));
         }
         out.push('\n');
+        out
+    }
+
+    fn format_stop_result(&self, result: &StopResultInfo) -> String {
+        let daemon_state = if result.daemon_running {
+            "running"
+        } else {
+            "stopped"
+        };
+        format!(
+            "status:{}\tproject_root:{}\tregistered:{}\tdaemon:{}\tpid:{}\tmessage:{}\n",
+            result.status.as_str(),
+            plain_field(&result.project_root.display().to_string()),
+            result.registered,
+            daemon_state,
+            render_optional_pid_plain(result.pid),
+            plain_field(&result.message),
+        )
+    }
+
+    fn format_project_list(&self, projects: &ProjectListInfo) -> String {
+        if projects.projects.is_empty() {
+            return "projects:0\n".to_string();
+        }
+
+        let mut out = String::new();
+        for project in &projects.projects {
+            out.push_str(&format!(
+                "project:{}\tstate:{}\tproject_root:{}\tsource_root:{}\tindex:{}\tfiles:{}\tsegments:{}\tlast_file_check:{}\tregistered_at:{}\n",
+                plain_field(&project.project_id),
+                project.state.as_str(),
+                plain_field(&project.project_root.display().to_string()),
+                plain_field(&project.source_root.display().to_string()),
+                project.index_status.as_str(),
+                render_optional_count(project.files),
+                render_optional_count(project.segments),
+                render_optional_time(project.last_file_check_at.as_ref()),
+                project.registered_at,
+            ));
+        }
         out
     }
 
@@ -1171,6 +1391,88 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
+fn render_lifecycle_state_human(state: LifecycleState) -> String {
+    match state {
+        LifecycleState::NotStarted => "not started".yellow().to_string(),
+        LifecycleState::Indexing => "indexing".yellow().to_string(),
+        LifecycleState::Active => "active".green().to_string(),
+        LifecycleState::Registered => "registered".cyan().to_string(),
+        LifecycleState::Stopped => "stopped".red().to_string(),
+    }
+}
+
+fn render_stop_status_human(status: StopStatus) -> String {
+    match status {
+        StopStatus::Stopped => "stopped".green().to_string(),
+        StopStatus::NotRegistered => "not registered".yellow().to_string(),
+        StopStatus::DaemonNotRunning => "daemon not running".yellow().to_string(),
+        StopStatus::Unsupported => "unsupported".red().to_string(),
+    }
+}
+
+fn render_daemon_state_human(running: bool) -> String {
+    if running {
+        "running".green().to_string()
+    } else {
+        "stopped".red().to_string()
+    }
+}
+
+fn render_bool_human(value: bool) -> String {
+    if value {
+        "yes".green().to_string()
+    } else {
+        "no".yellow().to_string()
+    }
+}
+
+fn append_start_fields_human(out: &mut String, result: &StartResultInfo) {
+    out.push_str(&format!(
+        "Status: {}\n",
+        render_start_status_human(result.status)
+    ));
+    if let Some(project_id) = &result.project_id {
+        out.push_str(&format!("Project ID: {project_id}\n"));
+    }
+    if let Some(project_root) = &result.project_root {
+        out.push_str(&format!("Project root: {}\n", project_root.display()));
+    }
+    if let Some(source_root) = &result.source_root {
+        out.push_str(&format!("Source root: {}\n", source_root.display()));
+    }
+    match result.registered {
+        Some(registered) => {
+            out.push_str(&format!("Registered: {}\n", render_bool_human(registered)))
+        }
+        None => out.push_str(&format!("Registered: {}\n", "unknown".yellow())),
+    }
+    out.push_str(&format!(
+        "Index: {}\n",
+        render_start_index_human(result.index_status)
+    ));
+    if let Some(pid) = result.pid {
+        out.push_str(&format!("PID: {pid}\n"));
+    }
+}
+
+fn render_start_status_human(status: StartStatus) -> String {
+    match status {
+        StartStatus::Started => "started".green().to_string(),
+        StartStatus::IndexedAndStarted => "indexed and started".green().to_string(),
+        StartStatus::AlreadyRunning => "already running".cyan().to_string(),
+        StartStatus::StartupInProgress => "startup in progress".yellow().to_string(),
+    }
+}
+
+fn render_start_index_human(status: Option<ProjectListIndexStatus>) -> String {
+    match status {
+        Some(ProjectListIndexStatus::Ready) => "ready".green().to_string(),
+        Some(ProjectListIndexStatus::NotBuilt) => "not built".yellow().to_string(),
+        Some(ProjectListIndexStatus::Unavailable) => "unavailable".red().to_string(),
+        None => "unknown".yellow().to_string(),
+    }
+}
+
 fn render_index_state_human(state: IndexState) -> String {
     match state {
         IndexState::Idle => "idle".dimmed().to_string(),
@@ -1262,22 +1564,288 @@ fn render_embeddings_plain(enabled: bool) -> &'static str {
     }
 }
 
+fn render_optional_pid_plain(pid: Option<u32>) -> String {
+    pid.map(|pid| pid.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn render_optional_bool_plain(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn render_optional_plain(value: Option<&str>) -> String {
+    plain_field(value.unwrap_or("none"))
+}
+
+fn render_optional_path_plain(value: Option<&PathBuf>) -> String {
+    value
+        .map(|path| plain_field(&path.display().to_string()))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn render_start_index_plain(status: Option<ProjectListIndexStatus>) -> &'static str {
+    status
+        .map(ProjectListIndexStatus::as_str)
+        .unwrap_or("unknown")
+}
+
+fn plain_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\t' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 fn render_index_health_human(status: &StatusInfo) -> colored::ColoredString {
     match render_index_health_plain(status) {
         "ready" => "ready".green(),
+        "indexing" => "indexing".yellow(),
         "not_built" => "not built".yellow(),
         _ => "unavailable".red(),
     }
 }
 
 fn render_index_health_plain(status: &StatusInfo) -> &'static str {
-    if !status.index_present {
+    if status
+        .index_progress
+        .as_ref()
+        .is_some_and(|progress| progress.state == IndexState::Running)
+    {
+        "indexing"
+    } else if !status.index_present {
         "not_built"
     } else if status.index_readable {
         "ready"
     } else {
         "unavailable"
     }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectListRow {
+    project: String,
+    state: LifecycleState,
+    index: ProjectListIndexStatus,
+    files: String,
+    segments: String,
+    path: String,
+    checked: String,
+}
+
+impl ProjectListRow {
+    fn from_item(item: &ProjectListItem) -> Self {
+        Self {
+            project: compact_project_id(&item.project_id),
+            state: item.state,
+            index: item.index_status,
+            files: render_optional_count(item.files),
+            segments: render_optional_count(item.segments),
+            path: render_project_list_path(&item.project_root, &item.source_root),
+            checked: item
+                .last_file_check_at
+                .as_ref()
+                .map(render_time_ago)
+                .unwrap_or_else(|| "none".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectListWidths {
+    project: usize,
+    state: usize,
+    index: usize,
+    files: usize,
+    segments: usize,
+    path: usize,
+    checked: usize,
+}
+
+impl ProjectListWidths {
+    fn from_rows(rows: &[ProjectListRow]) -> Self {
+        let mut widths = Self {
+            project: "Project".len(),
+            state: "State".len(),
+            index: "Index".len(),
+            files: "Files".len(),
+            segments: "Segments".len(),
+            path: "Path".len(),
+            checked: "Checked".len(),
+        };
+
+        for row in rows {
+            widths.project = widths.project.max(row.project.len());
+            widths.state = widths.state.max(row.state.as_str().len());
+            widths.index = widths.index.max(row.index.as_str().len());
+            widths.files = widths.files.max(row.files.len());
+            widths.segments = widths.segments.max(row.segments.len());
+            widths.path = widths.path.max(row.path.len());
+            widths.checked = widths.checked.max(row.checked.len());
+        }
+
+        widths
+    }
+}
+
+fn format_project_list_header(widths: &ProjectListWidths) -> String {
+    format!(
+        "{:<project$}  {:<state$}  {:<index$}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
+        "Project",
+        "State",
+        "Index",
+        "Files",
+        "Segments",
+        "Path",
+        "Checked",
+        project = widths.project,
+        state = widths.state,
+        index = widths.index,
+        files = widths.files,
+        segments = widths.segments,
+        path = widths.path,
+        checked = widths.checked,
+    )
+}
+
+fn format_project_list_separator(widths: &ProjectListWidths) -> String {
+    format!(
+        "{}  {}  {}  {}  {}  {}  {}\n",
+        "-".repeat(widths.project),
+        "-".repeat(widths.state),
+        "-".repeat(widths.index),
+        "-".repeat(widths.files),
+        "-".repeat(widths.segments),
+        "-".repeat(widths.path),
+        "-".repeat(widths.checked),
+    )
+}
+
+fn format_project_list_row(row: &ProjectListRow, widths: &ProjectListWidths) -> String {
+    format!(
+        "{:<project$}  {}  {}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
+        row.project,
+        render_project_list_state_cell(row.state, widths.state),
+        render_project_list_index_cell(row.index, widths.index),
+        row.files,
+        row.segments,
+        row.path,
+        row.checked,
+        project = widths.project,
+        files = widths.files,
+        segments = widths.segments,
+        path = widths.path,
+        checked = widths.checked,
+    )
+}
+
+fn render_project_list_state_cell(state: LifecycleState, width: usize) -> String {
+    let padded = format!("{:<width$}", state.as_str(), width = width);
+    match state {
+        LifecycleState::NotStarted => padded.yellow().to_string(),
+        LifecycleState::Indexing => padded.yellow().to_string(),
+        LifecycleState::Active => padded.green().to_string(),
+        LifecycleState::Registered => padded.cyan().to_string(),
+        LifecycleState::Stopped => padded.red().to_string(),
+    }
+}
+
+fn render_project_list_index_cell(status: ProjectListIndexStatus, width: usize) -> String {
+    let padded = format!("{:<width$}", status.as_str(), width = width);
+    match status {
+        ProjectListIndexStatus::Ready => padded.green().to_string(),
+        ProjectListIndexStatus::NotBuilt => padded.yellow().to_string(),
+        ProjectListIndexStatus::Unavailable => padded.red().to_string(),
+    }
+}
+
+fn render_optional_count(value: Option<u64>) -> String {
+    match value {
+        Some(count) => count.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn compact_project_id(project_id: &str) -> String {
+    if is_uuid_like(project_id) {
+        project_id.chars().take(8).collect()
+    } else {
+        project_id.to_string()
+    }
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(idx, ch)| {
+            if matches!(idx, 8 | 13 | 18 | 23) {
+                ch == '-'
+            } else {
+                ch.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn render_project_list_path(project_root: &Path, source_root: &Path) -> String {
+    const MAX_PATH_WIDTH: usize = 56;
+
+    let root = compact_display_path(project_root);
+    let source = compact_display_path(source_root);
+    let path = if project_root == source_root {
+        root
+    } else {
+        format!("{root} -> {source}")
+    };
+
+    ellipsize_middle(&path, MAX_PATH_WIDTH)
+}
+
+fn compact_display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return PathBuf::from("~").join(rest).display().to_string();
+        }
+    }
+    path.display().to_string()
+}
+
+fn ellipsize_middle(value: &str, max_width: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_width {
+        return value.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let keep = max_width - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let prefix: String = value.chars().take(left).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
+}
+
+fn render_optional_time(value: Option<&DateTime<Utc>>) -> String {
+    value
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn render_index_phase(progress: &IndexProgress) -> &'static str {
@@ -1371,6 +1939,11 @@ mod tests {
         let formatter = JsonFormatter;
         let rendered = formatter.format_start_result(&StartResultInfo {
             status: StartStatus::Started,
+            project_id: Some("project-123".to_string()),
+            project_root: Some(PathBuf::from("/repo")),
+            source_root: Some(PathBuf::from("/repo")),
+            registered: Some(true),
+            index_status: Some(ProjectListIndexStatus::Ready),
             pid: Some(42),
             message: "Daemon started.".to_string(),
             progress: None,
@@ -1378,6 +1951,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["status"], "started");
+        assert_eq!(value["project_id"], "project-123");
+        assert_eq!(value["registered"], true);
+        assert_eq!(value["index_status"], "ready");
         assert_eq!(value["pid"], 42);
         assert_eq!(value["message"], "Daemon started.");
         assert!(value.get("progress").is_none());
@@ -1389,6 +1965,11 @@ mod tests {
         let formatter = JsonFormatter;
         let rendered = formatter.format_start_result(&StartResultInfo {
             status: StartStatus::IndexedAndStarted,
+            project_id: Some("project-123".to_string()),
+            project_root: Some(PathBuf::from("/repo")),
+            source_root: Some(PathBuf::from("/repo")),
+            registered: Some(true),
+            index_status: Some(ProjectListIndexStatus::Ready),
             pid: Some(42),
             message: "Indexed and started.".to_string(),
             progress: Some(sample_progress()),
@@ -1399,6 +1980,28 @@ mod tests {
         assert_eq!(value["pid"], 42);
         assert_eq!(value["progress"]["files_indexed"], 3);
         assert_eq!(value["work"]["files_completed"], 4);
+    }
+
+    #[test]
+    fn plain_start_result_uses_stable_lifecycle_field_order() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_start_result(&StartResultInfo {
+            status: StartStatus::IndexedAndStarted,
+            project_id: Some("project-123".to_string()),
+            project_root: Some(PathBuf::from("/repo")),
+            source_root: Some(PathBuf::from("/repo/src")),
+            registered: Some(true),
+            index_status: Some(ProjectListIndexStatus::Ready),
+            pid: Some(42),
+            message: "Indexed and started.".to_string(),
+            progress: Some(sample_progress()),
+        });
+
+        assert_eq!(
+            rendered,
+            "status:indexed_and_started\tproject_id:project-123\tproject_root:/repo\tsource_root:/repo/src\tregistered:true\tindex:ready\tpid:42\tmessage:Indexed and started.\n"
+        );
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]
@@ -1535,42 +2138,57 @@ mod tests {
     fn plain_status_renders_last_work_and_total_duration() {
         let formatter = PlainFormatter;
         let rendered = formatter.format_status(&StatusInfo {
+            lifecycle_state: LifecycleState::Active,
+            registered: true,
             daemon_running: true,
             pid: Some(42),
             project_initialized: true,
             indexed_files: Some(3),
             total_segments: Some(14),
             project_id: Some("project-123".to_string()),
+            project_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
             index_present: true,
             index_readable: true,
             last_file_check_at: Some(sample_progress().updated_at),
             index_progress: Some(sample_progress()),
         });
 
+        assert!(rendered.starts_with("lifecycle:active\tregistered:true\tdaemon:running"));
+        assert!(rendered.contains("project_root:/repo"));
         assert!(rendered.contains("last_completed:4"));
         assert!(rendered.contains("last_processed:6"));
         assert!(rendered.contains("index_message:Processed 6 files"));
         assert!(rendered.contains("jobs_effective:3"));
         assert!(rendered.contains("total_ms:41"));
+        assert!(!rendered.contains("last_file_check_ago"));
+        assert!(!rendered.contains("\tago:"));
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]
     fn human_status_reports_uninitialized_project_and_missing_index() {
         let formatter = HumanFormatter;
         let rendered = formatter.format_status(&StatusInfo {
+            lifecycle_state: LifecycleState::NotStarted,
+            registered: false,
             daemon_running: false,
             pid: None,
             project_initialized: false,
             indexed_files: None,
             total_segments: None,
             project_id: None,
+            project_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
             index_present: false,
             index_readable: false,
             last_file_check_at: None,
             index_progress: None,
         });
 
-        assert!(rendered.contains("Project: not initialized"));
+        assert!(rendered.contains("Lifecycle: not started"));
+        assert!(rendered.contains("Registered: no"));
+        assert!(rendered.contains("Project ID: not initialized"));
         assert!(rendered.contains("Index: not built"));
         assert!(rendered.contains("Last file check: never recorded"));
     }
@@ -1579,21 +2197,153 @@ mod tests {
     fn plain_status_reports_uninitialized_project_and_missing_index() {
         let formatter = PlainFormatter;
         let rendered = formatter.format_status(&StatusInfo {
+            lifecycle_state: LifecycleState::NotStarted,
+            registered: false,
             daemon_running: false,
             pid: None,
             project_initialized: false,
             indexed_files: None,
             total_segments: None,
             project_id: None,
+            project_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
             index_present: false,
             index_readable: false,
             last_file_check_at: None,
             index_progress: None,
         });
 
+        assert!(rendered.starts_with("lifecycle:not_started\tregistered:false\tdaemon:stopped"));
         assert!(rendered.contains("project_initialized:false"));
+        assert!(rendered.contains("project_id:none"));
         assert!(rendered.contains("index:not_built"));
         assert!(rendered.contains("last_file_check:none"));
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn plain_stop_result_renders_structured_fields() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_stop_result(&StopResultInfo {
+            status: StopStatus::DaemonNotRunning,
+            project_root: PathBuf::from("/repo"),
+            registered: false,
+            daemon_running: false,
+            pid: None,
+            message: "Project deregistered. No daemon is currently running.".to_string(),
+        });
+
+        assert_eq!(
+            rendered,
+            "status:daemon_not_running\tproject_root:/repo\tregistered:false\tdaemon:stopped\tpid:none\tmessage:Project deregistered. No daemon is currently running.\n"
+        );
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn plain_project_list_uses_stable_lifecycle_field_order() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_project_list(&ProjectListInfo {
+            projects: vec![ProjectListItem {
+                project_id: "project-123".to_string(),
+                state: LifecycleState::Active,
+                project_root: PathBuf::from("/repo"),
+                source_root: PathBuf::from("/repo/src"),
+                registered_at: "2026-05-01T00:00:00Z".to_string(),
+                daemon_running: true,
+                index_status: ProjectListIndexStatus::Ready,
+                files: Some(3),
+                segments: Some(14),
+                last_file_check_at: Some(sample_progress().updated_at),
+                index_progress: None,
+            }],
+        });
+
+        assert_eq!(
+            rendered,
+            "project:project-123\tstate:active\tproject_root:/repo\tsource_root:/repo/src\tindex:ready\tfiles:3\tsegments:14\tlast_file_check:2026-04-03T06:07:08+00:00\tregistered_at:2026-05-01T00:00:00Z\n"
+        );
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn human_project_list_renders_clear_empty_state() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_project_list(&ProjectListInfo { projects: vec![] });
+
+        assert_eq!(
+            rendered,
+            "No registered projects.\nRun `1up start` in a repository to register one.\n"
+        );
+    }
+
+    #[test]
+    fn human_project_list_renders_table_for_registered_projects() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_project_list(&ProjectListInfo {
+            projects: vec![ProjectListItem {
+                project_id: "project-123".to_string(),
+                state: LifecycleState::Registered,
+                project_root: PathBuf::from("/repo"),
+                source_root: PathBuf::from("/repo/src"),
+                registered_at: "2026-05-01T00:00:00Z".to_string(),
+                daemon_running: false,
+                index_status: ProjectListIndexStatus::NotBuilt,
+                files: None,
+                segments: None,
+                last_file_check_at: None,
+                index_progress: None,
+            }],
+        });
+
+        assert!(rendered.starts_with("Registered projects\n"));
+        assert!(rendered.contains("Project"));
+        assert!(rendered.contains("State"));
+        assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Path"));
+        assert!(rendered.contains("Checked"));
+        assert!(!rendered.contains("Project root"));
+        assert!(!rendered.contains("Source root"));
+        assert!(rendered.contains("project-123"));
+        assert!(rendered.contains("registered"));
+        assert!(rendered.contains("not_built"));
+        assert!(rendered.contains("/repo"));
+        assert!(rendered.contains("/repo/src"));
+        assert!(rendered.contains("unknown"));
+        assert!(rendered.contains("none"));
+    }
+
+    #[test]
+    fn human_project_list_compacts_wide_values_for_readability() {
+        let formatter = HumanFormatter;
+        let rendered = formatter.format_project_list(&ProjectListInfo {
+            projects: vec![ProjectListItem {
+                project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                state: LifecycleState::Active,
+                project_root: PathBuf::from(
+                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments",
+                ),
+                source_root: PathBuf::from(
+                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments/worktree-feature-branch",
+                ),
+                registered_at: "2026-05-01T00:00:00Z".to_string(),
+                daemon_running: true,
+                index_status: ProjectListIndexStatus::Ready,
+                files: Some(132),
+                segments: Some(3732),
+                last_file_check_at: Some(sample_progress().updated_at),
+                index_progress: None,
+            }],
+        });
+
+        assert!(rendered.contains("123e4567"));
+        assert!(!rendered.contains("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains(" ago"));
+        assert!(rendered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.len() <= 130));
     }
 
     fn sample_update_status_info(status: UpdateStatus) -> UpdateStatusInfo {
