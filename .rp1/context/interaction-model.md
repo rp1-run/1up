@@ -30,9 +30,10 @@
 
 - Entry point: `1up mcp --path <repo>` under server identity `oneup`.
 - Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
-- Role: primary agent-facing code discovery and impact workflow.
-- Output: structured `ToolEnvelope` with `status`, `summary`, `data`, and `next_actions`; text content mirrors the summary for host display.
+- Role: primary agent-facing prepare, search, read, symbol, and context workflow; impact remains available for explicit blast-radius questions but is not required for the core discovery loop.
+- Output: presentation-free structured `ToolEnvelope` with `status`, `summary`, `data`, and `next_actions`; text content mirrors the summary for host display without ANSI color, spinners, or terminal table formatting.
 - Readiness modes: `check`, `index_if_missing`, `index_if_needed`, `reindex`.
+- Product terms map to current tools: readiness/status and allowed start/index behavior use `oneup_prepare` modes, and file-line context retrieval uses `oneup_read.locations`. There are no separate `oneup_status`, `oneup_start`, or `oneup_context` tools.
 - Safety: read-only tool annotations, single configured repository root, no arbitrary command execution.
 
 ### MCP Setup And Onboarding
@@ -77,6 +78,7 @@
 | `indexing` | Index progress file reports a running index job. | Poll `oneup_prepare` or `1up status`. |
 | `stale` | Index exists but is unreadable, stale, or schema-incompatible. | Rebuild with `oneup_prepare` mode `reindex` or `1up reindex`. |
 | `degraded` | Search can run, but embeddings are unavailable or latest index lacks embeddings. | Results may be FTS-only; fix model/index state then recheck. |
+| `blocked` | MCP prepare could not make the repository ready. | Structured data explains the blocking condition and suggests corrective prepare or setup actions. |
 | `ok` / `empty` / `partial` / `degraded` | MCP operation status for search/read/symbol. | `summary`, `data`, and `next_actions` explain next step. |
 | `found` / `not_found` / `ambiguous` / `rejected` / `error` | Per-record `oneup_read` outcomes. | Ambiguous handles list matching IDs; rejected locations identify path-scope violations. |
 | `expanded` / `expanded_scoped` | Impact returned primary likely-impact rows. | CLI rows end `~P`; MCP data contains primary `results`. |
@@ -91,16 +93,18 @@
 ### MCP Readiness Loop
 
 1. Agent calls `oneup_prepare` when readiness is unknown.
-2. The tool reports `ready`, `missing`, `indexing`, `stale`, or `degraded`.
-3. `next_actions` steer to search, indexing, polling, or reindexing.
+2. The tool reports `ready`, `missing`, `indexing`, `stale`, `degraded`, or `blocked`.
+3. `next_actions` steer to search, explicit indexing, polling, reindexing, or setup correction.
+4. Status/start requirements are satisfied through `oneup_prepare` modes rather than separate MCP tools.
 
 ### MCP Discovery Loop
 
 1. Agent calls `oneup_search` with a task-specific intent query.
 2. Search returns compact handles and ranked summaries.
-3. Agent calls `oneup_read` on selected handles or precise locations.
-4. Agent calls `oneup_symbol` for definition/reference completeness when a symbol matters.
-5. Agent answers from inspected code, not from ranked search alone.
+3. Agent calls `oneup_read` on selected handles to hydrate source evidence.
+4. Agent calls `oneup_read.locations` for bounded file-line context around a relevant path and line.
+5. Agent calls `oneup_symbol` for definition/reference completeness when a symbol matters.
+6. Agent answers from inspected code, not from ranked search alone.
 
 ### MCP Impact Loop
 
@@ -131,7 +135,7 @@
 
 | Surface | Contract |
 |---|---|
-| MCP tools | Structured envelope: `status`, `summary`, `data`, `next_actions`; errors are structured errors with recovery actions. |
+| MCP tools | Presentation-free structured envelope: `status`, `summary`, `data`, `next_actions`; errors are structured errors with recovery actions. |
 | `search` | `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>` rows. |
 | `symbol` | Same lean row grammar; `<kind>` is prefixed with `def:` or `usage:`. |
 | `impact` | Primary rows use `~P`, contextual rows use `~C`; terminal states emit `refused`, `empty`, or `empty_scoped` plus optional hint. |

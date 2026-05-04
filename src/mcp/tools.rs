@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -38,7 +38,7 @@ const MCP_PLACEHOLDER: &str = "-";
 impl OneupMcpServer {
     #[tool(
         name = "oneup_prepare",
-        description = "Check 1up index readiness for the configured repository. Call first when a code-search task starts and readiness is unknown.",
+        description = "Check 1up index readiness for the configured repository. Call first when a code-search task starts and readiness is unknown, then follow the returned oneup_search or oneup_prepare action.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Prepare 1up", destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -48,7 +48,11 @@ impl OneupMcpServer {
     ) -> CallToolResult {
         let roots = match self.roots(input.path.as_deref()) {
             Ok(roots) => roots,
-            Err(err) => return error_result("error", err.to_string(), vec![]),
+            Err(err) => {
+                let path = input.path.as_deref().unwrap_or(".");
+                let payload = ops::blocked_readiness_for_path(path, err.to_string());
+                return result(readiness_result(payload));
+            }
         };
 
         let payload = match prepare(&roots, input.mode).await {
@@ -56,19 +60,12 @@ impl OneupMcpServer {
             Err(err) => return indexed_tool_error(err.to_string()),
         };
 
-        let status = status_string(&payload.status);
-        let summary = payload.summary.clone();
-        result(envelope(
-            status,
-            summary,
-            payload_value(&payload),
-            readiness_next_actions(&payload),
-        ))
+        result(readiness_result(payload))
     }
 
     #[tool(
         name = "oneup_search",
-        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads for implementation, architecture, behavior, and pattern discovery.",
+        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads, then hydrate handles, inspect file-line context, or verify symbols from the returned actions.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Search Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -111,7 +108,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_read",
-        description = "Read selected code from oneup_search handles or precise file locations. Use after search to hydrate results before answering, citing, or editing.",
+        description = "Read selected code from oneup_search handles or retrieve file-line context from locations. Use after search to hydrate results before answering, citing, or editing.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Read Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -127,14 +124,6 @@ impl OneupMcpServer {
                 )],
             );
         }
-        if let Some(location) = input.locations.iter().find(|location| location.line == 0) {
-            return error_result(
-                "error",
-                format!("line must be 1-based for {}", location.path),
-                vec![],
-            );
-        }
-
         let roots = match self.roots(input.path.as_deref()) {
             Ok(roots) => roots,
             Err(err) => return error_result("error", err.to_string(), vec![]),
@@ -182,7 +171,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_symbol",
-        description = "Find definitions and references for a known symbol. Use after search or read when completeness matters, such as exact symbol resolution or caller/reference checks.",
+        description = "Find definitions and references for a known symbol. Use after search or read when completeness matters, then read returned handles or locations for evidence.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Verify Symbol", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -226,7 +215,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_impact",
-        description = "Explore likely affected code from a segment, symbol, or file anchor. Use after search or read for blast radius and advisory follow-up targets.",
+        description = "Explore likely affected code from a segment, symbol, or file anchor. Use for explicit blast-radius questions after the core prepare, search, read, symbol, and context loop.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Explore Impact", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -292,8 +281,7 @@ async fn prepare(roots: &McpProjectRoots, mode: PrepareMode) -> anyhow::Result<R
     match mode {
         PrepareMode::Check => Ok(readiness),
         PrepareMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
-            run_index(roots, false).await?;
-            Ok(ops::classify_readiness(&roots.state_root, &roots.source_root).await)
+            run_index_then_classify(roots, false).await
         }
         PrepareMode::IndexIfNeeded
             if matches!(
@@ -301,15 +289,37 @@ async fn prepare(roots: &McpProjectRoots, mode: PrepareMode) -> anyhow::Result<R
                 ReadinessStatus::Missing | ReadinessStatus::Degraded
             ) =>
         {
-            run_index(roots, false).await?;
-            Ok(ops::classify_readiness(&roots.state_root, &roots.source_root).await)
+            run_index_then_classify(roots, false).await
         }
-        PrepareMode::Reindex => {
-            run_index(roots, true).await?;
-            Ok(ops::classify_readiness(&roots.state_root, &roots.source_root).await)
-        }
+        PrepareMode::Reindex => run_index_then_classify(roots, true).await,
         _ => Ok(readiness),
     }
+}
+
+async fn run_index_then_classify(
+    roots: &McpProjectRoots,
+    rebuild: bool,
+) -> anyhow::Result<ReadinessPayload> {
+    match run_index(roots, rebuild).await {
+        Ok(_) => Ok(classify_after_index(roots).await),
+        Err(err) => Ok(ops::blocked_readiness(
+            &roots.state_root,
+            &roots.source_root,
+            err.to_string(),
+        )),
+    }
+}
+
+async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
+    let mut payload = ops::classify_readiness(&roots.state_root, &roots.source_root).await;
+    for _ in 0..20 {
+        if payload.status != ReadinessStatus::Stale {
+            return payload;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        payload = ops::classify_readiness(&roots.state_root, &roots.source_root).await;
+    }
+    payload
 }
 
 async fn run_index(
@@ -452,6 +462,11 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
             "Rebuild the local index explicitly before searching.",
             json!({ "mode": "reindex" }),
         )],
+        ReadinessStatus::Blocked => vec![action(
+            "oneup_prepare",
+            "Retry readiness after correcting the local repository path or project state.",
+            json!({ "mode": "check" }),
+        )],
     }
 }
 
@@ -471,13 +486,13 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
             json!({ "handles": [format!(":{}", first.handle)] }),
         ),
         action(
-            "oneup_impact",
-            "Explore likely follow-up targets from the selected result.",
-            json!({ "segment_id": first.handle }),
+            "oneup_read",
+            "Retrieve file-line context around the top search result.",
+            json!({ "locations": [location_argument(&first.path, first.line_start)] }),
         ),
     ];
 
-    if let Some(symbol) = &first.symbol {
+    if let Some(symbol) = search_symbol_hint(first) {
         actions.push(action(
             "oneup_symbol",
             "Verify definitions and references when completeness matters.",
@@ -489,40 +504,56 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
 }
 
 fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
-    let Some(segment) = payload
+    if let Some(segment) = payload
         .records
         .iter()
         .filter_map(|record| record.segment.as_ref())
         .next()
-    else {
+    {
+        let mut actions = vec![action(
+            "oneup_read",
+            "Retrieve file-line context around the hydrated segment.",
+            json!({ "locations": [location_argument(&segment.path, segment.line_start)] }),
+        )];
+        if let Some(symbol) = segment.defined_symbols.first() {
+            actions.push(action(
+                "oneup_symbol",
+                "Verify references for the symbol defined in this segment.",
+                json!({ "name": symbol, "include": "both", "fuzzy": true }),
+            ));
+        }
+        return actions;
+    }
+
+    if let Some(context) = payload
+        .records
+        .iter()
+        .filter_map(|record| record.context.as_ref())
+        .next()
+    {
         return vec![action(
             "oneup_search",
-            "Search again to obtain a valid handle or precise file location.",
-            json!({ "query": "<code discovery query>" }),
+            "Search indexed code if this file-line context needs more evidence.",
+            json!({ "query": format!("{} {}", context.path, context.scope_type) }),
         )];
-    };
-
-    let mut actions = vec![action(
-        "oneup_impact",
-        "Explore likely impact from the hydrated segment.",
-        json!({ "segment_id": segment.handle }),
-    )];
-    if let Some(symbol) = segment.defined_symbols.first() {
-        actions.push(action(
-            "oneup_symbol",
-            "Verify references for the symbol defined in this segment.",
-            json!({ "name": symbol, "include": "both", "fuzzy": true }),
-        ));
     }
-    actions
+
+    vec![action(
+        "oneup_search",
+        "Search again to obtain a valid handle or precise file location.",
+        json!({ "query": "<code discovery query>" }),
+    )]
 }
 
 fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
-    let handles = payload
+    let records = payload
         .definitions
         .iter()
         .chain(payload.references.iter())
         .take(3)
+        .collect::<Vec<_>>();
+    let handles = records
+        .iter()
         .map(|record| format!(":{}", record.handle))
         .collect::<Vec<_>>();
 
@@ -534,6 +565,11 @@ fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
         )];
     }
 
+    let locations = records
+        .iter()
+        .map(|record| location_argument(&record.path, record.line_start))
+        .collect::<Vec<_>>();
+
     vec![
         action(
             "oneup_read",
@@ -541,11 +577,25 @@ fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
             json!({ "handles": handles }),
         ),
         action(
-            "oneup_impact",
-            "Explore likely impact from this symbol anchor.",
-            json!({ "symbol": name }),
+            "oneup_read",
+            "Retrieve file-line context around the symbol matches.",
+            json!({ "locations": locations }),
         ),
     ]
+}
+
+fn search_symbol_hint(hit: &ops::SearchHit) -> Option<&str> {
+    hit.symbol
+        .as_deref()
+        .or_else(|| hit.defined_symbols.first().map(String::as_str))
+}
+
+fn location_argument(path: &str, line: usize) -> Value {
+    json!({
+        "path": path,
+        "line": line,
+        "expansion": 2
+    })
 }
 
 fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
@@ -692,8 +742,9 @@ fn short_handle(handle: &str) -> String {
 }
 
 fn read_summary(payload: &ReadPayload) -> String {
+    let record_label = read_record_label(payload);
     let header = format!(
-        "Read {} code record(s); status is {}.",
+        "Read {} {record_label} record(s); status is {}.",
         payload.records.len(),
         status_string(&payload.status)
     );
@@ -710,6 +761,26 @@ fn read_summary(payload: &ReadPayload) -> String {
         .join("\n");
 
     format!("{header}\n\n{records}")
+}
+
+fn read_record_label(payload: &ReadPayload) -> &'static str {
+    if payload
+        .records
+        .iter()
+        .all(|record| matches!(record.source, ops::ReadSource::Location { .. }))
+    {
+        return "file-line context";
+    }
+
+    if payload
+        .records
+        .iter()
+        .all(|record| matches!(record.source, ops::ReadSource::Handle { .. }))
+    {
+        return "code segment";
+    }
+
+    "code and file-line context"
 }
 
 fn format_read_record(record: &ops::ReadRecord) -> String {
@@ -805,6 +876,17 @@ fn indexed_tool_error(message: String) -> CallToolResult {
             "Check readiness and index state before retrying this MCP call.",
             json!({ "mode": "check" }),
         )],
+    )
+}
+
+fn readiness_result(payload: ReadinessPayload) -> ToolEnvelope {
+    let status = status_string(&payload.status);
+    let summary = payload.summary.clone();
+    envelope(
+        status,
+        summary,
+        payload_value(&payload),
+        readiness_next_actions(&payload),
     )
 }
 

@@ -110,8 +110,11 @@
 - Server: `1up mcp --path <repo>` over stdio with one instance per project lock.
 - Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
 - Readiness modes: `check` (aliases `default`, `read`), `index_if_missing`, `index_if_needed` (alias `auto`), and `reindex`.
-- Tool output contract: `ToolEnvelope { status, summary, data, next_actions }`; all tools attach canonical follow-up actions for search, read, symbol, impact, or prepare.
+- Tool output contract: presentation-free `ToolEnvelope { status, summary, data, next_actions }`; all tools attach canonical follow-up actions for prepare, search, read, symbol, and explicit impact flows.
+- Core discovery loop: readiness/status and allowed start/index behavior map to `oneup_prepare`; ranked discovery uses `oneup_search`; evidence hydration uses `oneup_read.handles`; file-line context uses `oneup_read.locations`; symbol completeness uses `oneup_symbol`.
+- No P2-only alias tools were added: there is no `oneup_status`, `oneup_start`, or `oneup_context`.
 - MCP search is ranked discovery, not exhaustive proof; guidance instructs agents to hydrate with `oneup_read` before relying on results.
+- Focused MCP smoke coverage exercises prepare, search, handle read, symbol lookup, and read-location context, while impact, structural search, branch filtering, benchmarks, and installer behavior remain outside the core discovery-loop evidence.
 
 ### Search Boundary
 

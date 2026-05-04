@@ -116,7 +116,7 @@ validate_mcp_host_evidence() {
 
     if ! jq -e '
       def valid_readiness:
-        . as $status | ["missing", "indexing", "stale", "ready", "degraded"] | index($status) != null;
+        . as $status | ["missing", "indexing", "stale", "ready", "degraded", "blocked"] | index($status) != null;
       def valid_discovery_flow:
         . as $status | ["passed", "failed", "skipped"] | index($status) != null;
       def valid_recorded:
@@ -158,7 +158,30 @@ if ! jq -e '
       | ["oneup_prepare", "oneup_search", "oneup_read", "oneup_symbol", "oneup_impact"]
       | all(. as $tool | $tools | index($tool)));
   def valid_readiness:
-    . as $status | ["missing", "indexing", "stale", "ready", "degraded"] | index($status) != null;
+    . as $status | ["missing", "indexing", "stale", "ready", "degraded", "blocked"] | index($status) != null;
+  def valid_p2_mcp_smoke:
+    .mcp_smoke_test as $smoke
+    | ($smoke.schema == "mcp_smoke.v2")
+    and ($smoke.presentation_free == true)
+    and ($smoke.discovery_flow.status == "passed")
+    and ($smoke.exercised_tools | type == "array")
+    and (["oneup_prepare", "oneup_search", "oneup_read", "oneup_symbol"]
+      | all(. as $tool | ($smoke.exercised_tools | index($tool) != null)))
+    and ($smoke.tool_calls | type == "array")
+    and (["prepare", "search", "read_handle", "symbol", "read_location"]
+      | all(. as $label
+        | ([$smoke.tool_calls[]
+          | select(.label == $label)
+          | select((.name | type == "string" and length > 0)
+              and (.status | type == "string" and length > 0)
+              and (.structured_content == true)
+              and (.presentation_free == true))]
+          | length > 0)))
+    and ($smoke.structured_content_present.prepare == true)
+    and ($smoke.structured_content_present.search == true)
+    and ($smoke.structured_content_present.read_handle == true)
+    and ($smoke.structured_content_present.symbol == true)
+    and ($smoke.structured_content_present.read_location == true);
   (.archive_count | numbers)
   and (.archives | type == "array")
   and ((.archives | length) == .archive_count)
@@ -172,6 +195,7 @@ if ! jq -e '
     and canonical_mcp_tools_present
     and (.mcp_smoke_test.readiness_status | valid_readiness)
     and (.mcp_smoke_test.stdout_protocol_clean == true)
+    and valid_p2_mcp_smoke
   ] | all)
 ' "$ARCHIVE_VERIFICATION_PATH" >/dev/null 2>&1; then
   fail "archive verification summary is missing required fields"

@@ -8,7 +8,7 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 
-const SERVER_GUIDANCE: &str = "Use 1up as the primary code-search interface for the configured repository. For questions about where behavior lives, how code works, implementation patterns, symbol relationships, or likely impact, start with oneup_prepare when readiness is unknown, then call oneup_search before raw grep, rg, find, or broad file reads. Hydrate selected search results with oneup_read before relying on them. Use oneup_symbol for definitions, references, and completeness checks around a known symbol. Use oneup_impact for likely follow-up targets or blast radius. Use raw file reads, grep, rg, or find only after 1up narrows the scope, or for exact literal verification. oneup_search is ranked discovery, not exhaustive proof.";
+const SERVER_GUIDANCE: &str = "Use 1up as the primary code-search interface for the configured repository. For questions about where behavior lives, how code works, implementation patterns, or symbol relationships, start with oneup_prepare when readiness is unknown, then call oneup_search before raw grep, rg, find, or broad file reads. Hydrate selected search results with oneup_read handles before relying on them, and use oneup_read locations for file-line context. Use oneup_symbol for definitions, references, and completeness checks around a known symbol. Use oneup_impact only for explicit blast-radius questions after the core prepare/search/read/symbol/context loop has produced evidence. Use raw file reads, grep, rg, or find only after 1up narrows the scope, or for exact literal verification. oneup_search is ranked discovery, not exhaustive proof.";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OneupMcpServer {
