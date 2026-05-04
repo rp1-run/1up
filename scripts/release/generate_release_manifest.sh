@@ -67,7 +67,10 @@ if [[ -z "$COMMIT_SHA" ]]; then
   fail "unable to determine commit sha for release manifest"
 fi
 
-mapfile -t METADATA_FILES < <(find "$ASSETS_DIR" -maxdepth 1 -type f -name '*.metadata.json' | sort)
+declare -a METADATA_FILES=()
+while IFS= read -r metadata_path; do
+  METADATA_FILES+=("$metadata_path")
+done < <(find "$ASSETS_DIR" -maxdepth 1 -type f -name '*.metadata.json' | sort)
 
 if [[ ${#METADATA_FILES[@]} -eq 0 ]]; then
   fail "no release metadata files found in $(relative_path "$ASSETS_DIR")"

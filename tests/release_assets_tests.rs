@@ -120,7 +120,31 @@ if [ "${1:-}" = "mcp" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_prepare"},{"name":"oneup_search"},{"name":"oneup_read"},{"name":"oneup_symbol"},{"name":"oneup_impact"}]}}'
         ;;
       *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository is not indexed.","data":{},"next_actions":[{"tool":"oneup_prepare","reason":"index the fixture repository"}]}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+        ;;
+      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*'"query":"PolicyRuleValidator"'*'"limit":5'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"structuredContent":{"status":"degraded","summary":"Found fixture search results.","data":{"results":[{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}]},"next_actions":[]}}}'
+        ;;
+      *'"id":4'*'"method":"tools/call"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unexpected search arguments"}}'
+        ;;
+      *'"id":5'*'"method":"tools/call"'*'"oneup_read"'*'"handles":[":abcdef123456"]'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture segment.","data":{"records":[{"status":"found","handle":":abcdef123456","segment":{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
+        ;;
+      *'"id":5'*'"method":"tools/call"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"unexpected read-handle arguments"}}'
+        ;;
+      *'"id":6'*'"method":"tools/call"'*'"oneup_symbol"'*'"name":"PolicyRuleValidator"'*'"include":"both"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"structuredContent":{"status":"ok","summary":"Found fixture symbol evidence.","data":{"definitions":[{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}],"references":[{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}]},"next_actions":[]}}}'
+        ;;
+      *'"id":6'*'"method":"tools/call"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unexpected symbol arguments"}}'
+        ;;
+      *'"id":7'*'"method":"tools/call"'*'"oneup_read"'*'"locations":[{"path":"src/policy.rs","line":4,"expansion":2}]'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture file-line context.","data":{"records":[{"status":"found","location":{"path":"src/policy.rs","line":4},"context":{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
+        ;;
+      *'"id":7'*'"method":"tools/call"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"unexpected read-location arguments"}}'
         ;;
     esac
   done
@@ -132,6 +156,43 @@ exit 2
 "#,
     );
     write_executable(path, &script);
+}
+
+fn write_mcp_smoke_tool_error_fixture_binary(path: &Path) {
+    write_executable(
+        path,
+        r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "--version" ]; then
+  printf '1up smoke-fixture\n'
+  exit 0
+fi
+
+if [ "${1:-}" = "mcp" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *'"id":1'*'"method":"initialize"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
+        ;;
+      *'"id":2'*'"method":"tools/list"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_prepare"},{"name":"oneup_search"},{"name":"oneup_read"},{"name":"oneup_symbol"},{"name":"oneup_impact"}]}}'
+        ;;
+      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+        ;;
+      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"isError":true,"structuredContent":{"status":"error","summary":"search failed","data":{},"next_actions":[]}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+printf 'unsupported fixture invocation\n' >&2
+exit 2
+"#,
+    );
 }
 
 fn write_release_artifacts(root: &Path, version: &str) -> PathBuf {
@@ -235,7 +296,19 @@ if [ "${{1:-}}" = "mcp" ]; then
         printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_prepare"}},{{"name":"oneup_search"}},{{"name":"oneup_read"}},{{"name":"oneup_symbol"}},{{"name":"oneup_impact"}}]}}}}'
         ;;
       *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"missing","summary":"Fixture repository is not indexed.","data":{{}},"next_actions":[{{"tool":"oneup_prepare","reason":"index the fixture repository"}}]}}}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{{"index_readable":true}},"next_actions":[{{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{{"query":"PolicyRuleValidator"}}}}]}}}}}}'
+        ;;
+      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"structuredContent":{{"status":"degraded","summary":"Found fixture search results.","data":{{"results":[{{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":5'*'"method":"tools/call"'*'"oneup_read"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture segment.","data":{{"records":[{{"status":"found","handle":":abcdef123456","segment":{{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":6'*'"method":"tools/call"'*'"oneup_symbol"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{{"structuredContent":{{"status":"ok","summary":"Found fixture symbol evidence.","data":{{"definitions":[{{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}}],"references":[{{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":7'*'"method":"tools/call"'*'"oneup_read"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture file-line context.","data":{{"records":[{{"status":"found","location":{{"path":"src/policy.rs","line":4}},"context":{{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
         ;;
     esac
   done
@@ -889,9 +962,17 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     let evidence: serde_json::Value =
         serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
     assert_eq!(evidence["status"], "passed");
+    assert_eq!(evidence["schema"], "mcp_smoke.v2");
     assert_eq!(evidence["version"], "1up smoke-fixture");
-    assert_eq!(evidence["readiness_status"], "missing");
+    assert_eq!(evidence["readiness_status"], "degraded");
     assert_eq!(evidence["stdout_protocol_clean"], true);
+    assert_eq!(evidence["presentation_free"], true);
+    assert_eq!(evidence["discovery_flow"]["status"], "passed");
+    assert_eq!(evidence["response_statuses"]["prepare"], "degraded");
+    assert_eq!(evidence["response_statuses"]["search"], "degraded");
+    assert_eq!(evidence["response_statuses"]["read_handle"], "ok");
+    assert_eq!(evidence["response_statuses"]["symbol"], "ok");
+    assert_eq!(evidence["response_statuses"]["read_location"], "ok");
     assert_eq!(evidence["server_command"][1], "mcp");
     assert_eq!(evidence["server_command"][2], "--path");
     assert_eq!(
@@ -909,6 +990,33 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
         assert!(
             tools.iter().any(|tool| tool == expected_tool),
             "MCP smoke should include {expected_tool}"
+        );
+    }
+    let exercised_tools = evidence["exercised_tools"].as_array().unwrap();
+    for expected_tool in [
+        "oneup_prepare",
+        "oneup_search",
+        "oneup_read",
+        "oneup_symbol",
+    ] {
+        assert!(
+            exercised_tools.iter().any(|tool| tool == expected_tool),
+            "MCP smoke should exercise {expected_tool}"
+        );
+    }
+    let calls = evidence["tool_calls"].as_array().unwrap();
+    for expected_label in [
+        "prepare",
+        "search",
+        "read_handle",
+        "symbol",
+        "read_location",
+    ] {
+        assert!(
+            calls.iter().any(|call| call["label"] == expected_label
+                && call["structured_content"] == true
+                && call["presentation_free"] == true),
+            "MCP smoke should record a structured presentation-free {expected_label} call"
         );
     }
 }
@@ -950,6 +1058,46 @@ fn verify_mcp_smoke_rejects_non_json_stdout() {
             .iter()
             .any(|diagnostic| diagnostic.as_str().unwrap().contains("non-JSON stdout")),
         "expected non-JSON stdout diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn verify_mcp_smoke_rejects_tool_error_results() {
+    let fixture_root = build_release_fixture();
+    let repo_path = fixture_root.path().join("repo");
+    let binary_path = fixture_root.path().join("fixture-1up");
+    let output_path = fixture_root.path().join("mcp-smoke.json");
+    fs::create_dir_all(&repo_path).unwrap();
+    write_mcp_smoke_tool_error_fixture_binary(&binary_path);
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "verify_mcp_smoke.sh",
+        &[
+            "--binary",
+            binary_path.to_str().unwrap(),
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "MCP smoke unexpectedly accepted a tool error result: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(evidence["status"], "failed");
+    let diagnostics = evidence["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .as_str()
+            .unwrap()
+            .contains("search returned tool error result")),
+        "MCP smoke should explain that required tool errors are rejected: {diagnostics:?}"
     );
 }
 
@@ -1011,11 +1159,19 @@ fn archive_verification_confirms_expected_release_contents() {
     );
     assert_eq!(
         verification["archives"][0]["mcp_smoke_test"]["readiness_status"],
-        "missing"
+        "degraded"
     );
     assert_eq!(
         verification["archives"][0]["mcp_smoke_test"]["stdout_protocol_clean"],
         true
+    );
+    assert_eq!(
+        verification["archives"][0]["mcp_smoke_test"]["presentation_free"],
+        true
+    );
+    assert_eq!(
+        verification["archives"][0]["mcp_smoke_test"]["discovery_flow"]["status"],
+        "passed"
     );
     let tools = verification["archives"][0]["mcp_smoke_test"]["tools"]
         .as_array()
@@ -1075,6 +1231,36 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
         String::from_utf8_lossy(&recorded_output.stderr)
     );
 
+    let blocked_output = run_release_script(
+        fixture_root.path(),
+        "record_mcp_host_smoke.sh",
+        &[
+            "--output",
+            output_path.to_str().unwrap(),
+            "--host",
+            "generic",
+            "--status",
+            "recorded",
+            "--host-version",
+            "generic-mcp 1.0.0",
+            "--setup-mode",
+            "manual",
+            "--repo",
+            repo_path.to_str().unwrap(),
+            "--tool",
+            "oneup_prepare",
+            "--readiness",
+            "blocked",
+            "--discovery-flow",
+            "failed",
+        ],
+    );
+    assert!(
+        blocked_output.status.success(),
+        "blocked host smoke unexpectedly failed: {}",
+        String::from_utf8_lossy(&blocked_output.stderr)
+    );
+
     let skipped_output = run_release_script(
         fixture_root.path(),
         "record_mcp_host_smoke.sh",
@@ -1117,6 +1303,10 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
     assert!(tools.iter().any(|tool| tool == "oneup_prepare"));
     assert!(tools.iter().any(|tool| tool == "oneup_search"));
     assert!(tools.iter().any(|tool| tool == "oneup_read"));
+
+    assert_eq!(evidence["hosts"]["generic"]["status"], "recorded");
+    assert_eq!(evidence["hosts"]["generic"]["readiness"], "blocked");
+    assert_eq!(evidence["hosts"]["generic"]["discovery_flow"], "failed");
 
     assert_eq!(evidence["hosts"]["cursor"]["status"], "skipped");
     assert_eq!(evidence["hosts"]["cursor"]["setup_mode"], "skipped");
@@ -1205,6 +1395,7 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
     let security_check_path = dist_dir.join("security-check.json");
     let benchmark_summary_path = dist_dir.join("benchmark-summary.json");
     let archive_verification_path = dist_dir.join("archive-verification.json");
+    let mcp_host_smoke_path = dist_dir.join("mcp-host-smoke.json");
     let output_path = dist_dir.join("release-evidence.json");
 
     fs::write(
@@ -1239,6 +1430,29 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
         &benchmark_summary_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "scenario": "parallel-indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &mcp_host_smoke_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generated_at": "2026-04-09T00:00:00Z",
+            "schema": "mcp_host_smoke.v1",
+            "hosts": {
+                "generic": {
+                    "status": "recorded",
+                    "host": "generic",
+                    "host_version": "generic-mcp 1.0.0",
+                    "setup_mode": "manual",
+                    "repo_path": "/tmp/blocked-repo",
+                    "tools_listed": true,
+                    "tools": ["oneup_prepare"],
+                    "readiness": "blocked",
+                    "discovery_flow": "failed",
+                    "recorded_at": "2026-04-09T00:00:00Z"
+                }
+            }
         }))
         .unwrap(),
     )
@@ -1282,6 +1496,8 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
             benchmark_summary_path.to_str().unwrap(),
             "--archive-verification",
             archive_verification_path.to_str().unwrap(),
+            "--mcp-host-smoke",
+            mcp_host_smoke_path.to_str().unwrap(),
             "--output",
             output_path.to_str().unwrap(),
         ],
@@ -1313,6 +1529,11 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
     );
     assert_eq!(evidence["archive_verification"]["status"], "recorded");
     assert_eq!(evidence["archive_verification"]["archive_count"], 1);
+    assert_eq!(evidence["mcp_host_smoke"]["status"], "recorded");
+    assert_eq!(
+        evidence["mcp_host_smoke"]["hosts"]["generic"]["readiness"],
+        "blocked"
+    );
     assert_eq!(evidence["packages"]["status"], "pending");
 }
 

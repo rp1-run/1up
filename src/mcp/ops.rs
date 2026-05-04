@@ -11,6 +11,7 @@ use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::{HybridSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{project_daemon_status_path, project_db_path, project_dot_dir};
+use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     ContextAccessScope, ContextResult, DaemonProjectStatus, IndexProgress, IndexState,
@@ -48,6 +49,7 @@ pub enum ReadinessStatus {
     Indexing,
     Stale,
     Degraded,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -222,7 +224,8 @@ pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
 }
 
 pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> ReadinessPayload {
-    let project_initialized = project::read_project_id(state_root).is_ok();
+    let project_id_result = project::read_project_id(state_root);
+    let project_initialized = project_id_result.is_ok();
     let db_path = project_db_path(state_root);
     let index_present = db_path.exists();
     let index_progress = read_index_progress(state_root);
@@ -242,6 +245,16 @@ pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> Readin
         index_progress,
         daemon_status,
     };
+
+    if let Err(err) = project_id_result {
+        if !is_not_initialized(&err) {
+            payload.status = ReadinessStatus::Blocked;
+            payload.summary =
+                "The repository cannot be prepared for 1up MCP discovery.".to_string();
+            payload.reason = Some(err.to_string());
+            return payload;
+        }
+    }
 
     if payload
         .index_progress
@@ -320,6 +333,49 @@ pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> Readin
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
     payload
+}
+
+pub fn blocked_readiness(
+    state_root: &Path,
+    source_root: &Path,
+    reason: impl Into<String>,
+) -> ReadinessPayload {
+    let project_initialized = project::read_project_id(state_root).is_ok();
+    let db_path = project_db_path(state_root);
+    ReadinessPayload {
+        status: ReadinessStatus::Blocked,
+        summary: "The repository cannot be prepared for 1up MCP discovery.".to_string(),
+        state_root: path_string(state_root),
+        source_root: path_string(source_root),
+        project_initialized,
+        index_present: db_path.exists(),
+        index_readable: false,
+        schema_version: None,
+        indexed_files: None,
+        total_segments: None,
+        reason: Some(reason.into()),
+        index_progress: read_index_progress(state_root),
+        daemon_status: read_daemon_status(state_root),
+    }
+}
+
+pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> ReadinessPayload {
+    let raw_path = Path::new(path);
+    ReadinessPayload {
+        status: ReadinessStatus::Blocked,
+        summary: "The repository cannot be prepared for 1up MCP discovery.".to_string(),
+        state_root: path_string(raw_path),
+        source_root: path_string(raw_path),
+        project_initialized: false,
+        index_present: false,
+        index_readable: false,
+        schema_version: None,
+        indexed_files: None,
+        total_segments: None,
+        reason: Some(reason.into()),
+        index_progress: None,
+        daemon_status: None,
+    }
 }
 
 pub async fn run_search(
@@ -492,6 +548,14 @@ fn read_location_record(source_root: &Path, location: &ReadLocation) -> ReadReco
         path: location.path.clone(),
         line: location.line,
     };
+
+    if location.line == 0 {
+        return read_message(
+            ReadStatus::Rejected,
+            source,
+            "line must be 1-based for file-line context retrieval",
+        );
+    }
 
     let file_path = match resolve_location_path(source_root, &location.path) {
         Ok(path) => path,
@@ -751,6 +815,10 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn is_not_initialized(err: &OneupError) -> bool {
+    matches!(err, OneupError::Project(ProjectError::NotInitialized))
+}
+
 enum LocationError {
     Rejected(String),
     Error(String),
@@ -779,6 +847,31 @@ mod tests {
 
         assert_eq!(payload.status, OperationStatus::Empty);
         assert_eq!(payload.records[0].status, ReadStatus::Rejected);
+    }
+
+    #[test]
+    fn read_locations_rejects_zero_line_as_structured_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+
+        let payload = read_locations(
+            &root,
+            &[ReadLocation {
+                path: "src/lib.rs".to_string(),
+                line: 0,
+                expansion: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payload.status, OperationStatus::Empty);
+        assert_eq!(payload.records[0].status, ReadStatus::Rejected);
+        assert!(payload.records[0]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("1-based"));
     }
 
     #[test]

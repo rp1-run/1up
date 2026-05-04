@@ -37,15 +37,28 @@ pub struct ReadInput {
     #[serde(default)]
     pub handles: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Repository-scoped locations for file-line context retrieval. Use paths relative to the configured repository and 1-based line numbers."
+    )]
     pub locations: Vec<ReadLocationInput>,
     pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(
+    description = "A repository-contained file-line location for oneup_read context retrieval."
+)]
 pub struct ReadLocationInput {
+    #[schemars(
+        description = "File path relative to the configured repository. Absolute paths are accepted only when they stay inside that repository."
+    )]
     pub path: String,
+    #[schemars(description = "1-based source line to retrieve bounded context around.")]
     pub line: usize,
+    #[schemars(
+        description = "Optional number of fallback lines to include around the requested line when no enclosing scope is found."
+    )]
     pub expansion: Option<usize>,
 }
 

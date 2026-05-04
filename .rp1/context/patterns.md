@@ -46,6 +46,8 @@
 - `get` is the fat hydration companion and preserves request order with `segment ... ---` records or `not_found` records (`src/cli/get.rs:14`, `src/cli/lean.rs:165`).
 - Maintenance commands still render through `HumanFormatter`, `PlainFormatter`, and `JsonFormatter`; JSON/plain identifiers remain stable for automation (`src/cli/output.rs`, `src/cli/mod.rs:106`).
 - MCP text content mirrors the structured envelope summary, while `structuredContent` carries machine data and canonical `oneup_*` next actions (`src/mcp/tools.rs:831`, `tests/integration_tests.rs:152`).
+- MCP core discovery responses stay presentation-free: no ANSI color, spinners, or terminal table formatting in prepare, search, read, symbol, or read-location context responses.
+- MCP source context is represented through `oneup_read.locations`; status/start behavior is represented through `oneup_prepare` modes, not separate alias tools.
 - `add-mcp` delegates to host-owned `bunx/npx add-mcp`; on failure it prints manual generic JSON and Codex TOML snippets instead of mutating host config directly (`src/cli/add_mcp.rs:48`).
 
 ## Storage And I/O

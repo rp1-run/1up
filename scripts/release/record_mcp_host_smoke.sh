@@ -75,7 +75,7 @@ validate_status() {
 
 validate_readiness_status() {
   case "$1" in
-    missing|indexing|stale|ready|degraded) ;;
+    missing|indexing|stale|ready|degraded|blocked) ;;
     *) fail "unsupported readiness status: $1" ;;
   esac
 }
