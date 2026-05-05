@@ -313,7 +313,7 @@ mod tests {
         let hit = test_candidate("seg-lexical");
 
         assert!(is_exact_lexical_hit(
-            "manual_unique_linked_context_token",
+            "test_exact_lexical_short_circuit_token",
             &[],
             &[hit]
         ));
