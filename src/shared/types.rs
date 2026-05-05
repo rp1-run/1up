@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -155,6 +155,55 @@ pub struct ContextResult {
     pub scope_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_scope: Option<ContextAccessScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeRole {
+    Main,
+    Linked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchStatus {
+    Named,
+    Detached,
+    Unreadable,
+    #[default]
+    Unknown,
+}
+
+impl BranchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Named => "named",
+            Self::Detached => "detached",
+            Self::Unreadable => "unreadable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeContext {
+    pub context_id: String,
+    pub state_root: PathBuf,
+    pub source_root: PathBuf,
+    pub main_worktree_root: PathBuf,
+    pub worktree_role: WorktreeRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_git_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    pub branch_status: BranchStatus,
 }
 
 /// Scope for an indexing run.
@@ -394,6 +443,14 @@ pub enum IndexPhase {
 pub struct IndexProgress {
     pub state: IndexState,
     pub phase: IndexPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_status: Option<BranchStatus>,
     pub files_total: usize,
     pub files_scanned: usize,
     #[serde(default)]
@@ -421,6 +478,10 @@ impl IndexProgress {
         Self {
             state: IndexState::Idle,
             phase: IndexPhase::Pending,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
             files_total: 0,
             files_scanned: 0,
             files_processed: 0,
@@ -452,6 +513,57 @@ impl IndexProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonProjectStatus {
     pub last_file_check_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonWatchStatus {
+    Watching,
+    DaemonStopped,
+    SourceMissing,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonRefreshState {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonContextStatus {
+    pub context_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<PathBuf>,
+    #[serde(default)]
+    pub watch_status: DaemonWatchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_file_check_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_refresh_state: DaemonRefreshState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(default)]
+    pub branch_status: BranchStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonContextStatusFile {
+    #[serde(default)]
+    pub contexts: BTreeMap<String, DaemonContextStatus>,
 }
 
 /// Output format for CLI results.

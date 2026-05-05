@@ -5,6 +5,7 @@ use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
 use crate::search::ranking::{rank_candidates, RankedCandidate};
 use crate::search::retrieval::{CandidateRow, RetrievalBackend, RetrievalMode};
+use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{normalize_score, SearchResult};
@@ -13,11 +14,25 @@ use crate::storage::segments::{get_segment_by_id, StoredSegment};
 pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
     embedder: Option<&'a mut Embedder>,
+    scope: SearchScope,
 }
 
 impl<'a> HybridSearchEngine<'a> {
+    #[allow(dead_code)]
     pub fn new(conn: &'a Connection, embedder: Option<&'a mut Embedder>) -> Self {
-        Self { conn, embedder }
+        Self::new_scoped(conn, embedder, SearchScope::default_context())
+    }
+
+    pub fn new_scoped(
+        conn: &'a Connection,
+        embedder: Option<&'a mut Embedder>,
+        scope: SearchScope,
+    ) -> Self {
+        Self {
+            conn,
+            embedder,
+            scope,
+        }
     }
 
     pub async fn search(
@@ -26,7 +41,14 @@ impl<'a> HybridSearchEngine<'a> {
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
         let query_embedding = self.embed_query(query);
-        execute_search(self.conn, query, limit, query_embedding.as_deref()).await
+        execute_search(
+            self.conn,
+            &self.scope,
+            query,
+            limit,
+            query_embedding.as_deref(),
+        )
+        .await
     }
 
     pub async fn fts_only_search(
@@ -34,7 +56,7 @@ impl<'a> HybridSearchEngine<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        execute_search(self.conn, query, limit, None).await
+        execute_search(self.conn, &self.scope, query, limit, None).await
     }
 
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
@@ -54,6 +76,7 @@ impl<'a> HybridSearchEngine<'a> {
 
 async fn execute_search(
     conn: &Connection,
+    scope: &SearchScope,
     query: &str,
     limit: usize,
     query_embedding: Option<&[f32]>,
@@ -63,8 +86,8 @@ async fn execute_search(
     }
 
     let intent = detect_intent(query);
-    let symbol_results = symbol_search(conn, query, intent).await?;
-    let backend = RetrievalBackend::select(conn, query_embedding).await?;
+    let symbol_results = symbol_search(conn, scope, query, intent).await?;
+    let backend = RetrievalBackend::select_scoped(conn, query_embedding, scope.clone()).await?;
     let candidates = match backend.search(query, query_embedding).await {
         Ok(candidates) => candidates,
         Err(err) if matches!(backend.mode(), RetrievalMode::SqlVectorV2) => {
@@ -72,7 +95,7 @@ async fn execute_search(
                 "warning: vector retrieval failed ({err}); search is degraded to FTS-only mode for this query"
             );
             tracing::debug!("vector retrieval failed: {err}");
-            RetrievalBackend::select(conn, None)
+            RetrievalBackend::select_scoped(conn, None, scope.clone())
                 .await?
                 .search(query, None)
                 .await?
@@ -101,6 +124,7 @@ async fn execute_search(
 
 async fn symbol_search(
     conn: &Connection,
+    scope: &SearchScope,
     query: &str,
     intent: QueryIntent,
 ) -> Result<Vec<CandidateRow>, OneupError> {
@@ -109,7 +133,7 @@ async fn symbol_search(
         return Ok(Vec::new());
     }
 
-    let engine = SymbolSearchEngine::new(conn);
+    let engine = SymbolSearchEngine::new_scoped(conn, scope.clone());
     let include_usages = matches!(intent, QueryIntent::Usage);
     let mut matches = Vec::new();
 
@@ -217,6 +241,8 @@ fn candidate_key(candidate: &CandidateRow) -> String {
 mod tests {
     use super::*;
 
+    use crate::shared::types::BranchStatus;
+
     #[test]
     fn symbol_variants_keep_one_canonical_query() {
         let variants = build_symbol_variants("config loader", QueryIntent::Definition);
@@ -284,9 +310,14 @@ mod tests {
             .await
             .unwrap();
 
-        let results = symbol_search(&conn, "config loader", QueryIntent::Definition)
-            .await
-            .unwrap();
+        let results = symbol_search(
+            &conn,
+            &SearchScope::default_context(),
+            "config loader",
+            QueryIntent::Definition,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "src/lib.rs");
@@ -368,5 +399,54 @@ mod tests {
             !results.is_empty(),
             "search with None embedder should fall back to FTS"
         );
+    }
+
+    #[tokio::test]
+    async fn search_filters_results_to_active_context() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let main = scoped_insert("seg-main", "src/main.rs", "fn branch_needle() {}");
+        let other = scoped_insert("seg-other", "src/other.rs", "fn branch_needle() {}");
+        crate::storage::segments::upsert_segment_for_context(&conn, "ctx-main", &main)
+            .await
+            .unwrap();
+        crate::storage::segments::upsert_segment_for_context(&conn, "ctx-other", &other)
+            .await
+            .unwrap();
+
+        let scope = SearchScope::new("ctx-main", BranchStatus::Named);
+        let engine = HybridSearchEngine::new_scoped(&conn, None, scope);
+        let results = engine.fts_only_search("branch_needle", 10).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].segment_id, "seg-main");
+    }
+
+    fn scoped_insert(
+        id: &str,
+        file_path: &str,
+        content: &str,
+    ) -> crate::storage::segments::SegmentInsert {
+        crate::storage::segments::SegmentInsert {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: content.to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("hash-{id}"),
+        }
     }
 }

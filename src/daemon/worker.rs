@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
 use crate::daemon::watcher::{self, FileWatcher};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
-use crate::search::HybridSearchEngine;
+use crate::search::{HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
@@ -23,8 +23,15 @@ use crate::shared::constants::{
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
-use crate::shared::types::{DaemonProjectStatus, IndexingConfig, RunScope, SetupTimings};
+use crate::shared::project::canonical_project_root;
+use crate::shared::types::WorktreeContext;
+use crate::shared::types::{
+    DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus, DaemonRefreshState,
+    DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
+};
 use crate::storage::{db::Db, schema};
+
+const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
 
 #[derive(Debug, Default)]
 struct ProjectRunState {
@@ -66,10 +73,16 @@ impl ProjectRunState {
 struct ProjectState {
     project_root: PathBuf,
     source_root: PathBuf,
+    context: WorktreeContext,
     db: Db,
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
+    watch_status: DaemonWatchStatus,
+    last_refresh_state: DaemonRefreshState,
+    last_refresh_started_at: Option<DateTime<Utc>>,
+    last_refresh_completed_at: Option<DateTime<Utc>>,
+    last_refresh_error: Option<String>,
     last_file_check_persisted_at: Option<DateTime<Utc>>,
 }
 
@@ -77,6 +90,8 @@ struct QueuedSearchRequest {
     request: SearchRequest,
     respond_to: oneshot::Sender<SearchResponse>,
 }
+
+type ProjectStates = HashMap<String, ProjectState>;
 
 pub async fn run() -> Result<(), OneupError> {
     let _daemon_lock = lifecycle::acquire_daemon_lock()?;
@@ -95,7 +110,7 @@ async fn run_inner() -> Result<(), OneupError> {
     })?;
 
     let mut file_watcher = FileWatcher::new()?;
-    let mut projects: HashMap<PathBuf, ProjectState> = HashMap::new();
+    let mut projects: ProjectStates = HashMap::new();
     let request_limit = Arc::new(Semaphore::new(MAX_DAEMON_IN_FLIGHT_REQUESTS));
     let (search_requests_tx, mut search_requests_rx) =
         mpsc::channel::<QueuedSearchRequest>(MAX_DAEMON_IN_FLIGHT_REQUESTS);
@@ -168,7 +183,9 @@ async fn run_inner() -> Result<(), OneupError> {
             _ = tokio::time::sleep(debounce) => {
                 let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
+                mark_branch_context_changes(&mut projects);
                 if filtered.is_empty() {
+                    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
                     continue;
                 }
 
@@ -182,6 +199,8 @@ async fn run_inner() -> Result<(), OneupError> {
             }
         }
     }
+
+    mark_all_contexts_daemon_stopped(&mut projects);
 
     if let Err(e) = file_watcher.unwatch_all() {
         warn!("failed to unwatch on shutdown: {e}");
@@ -334,7 +353,7 @@ fn log_search_embedding_status(
 
 async fn load_and_watch_projects(
     watcher: &mut FileWatcher,
-    projects: &mut HashMap<PathBuf, ProjectState>,
+    projects: &mut ProjectStates,
 ) -> Result<(), OneupError> {
     let registry = Registry::load()?;
 
@@ -343,13 +362,15 @@ async fn load_and_watch_projects(
             continue;
         };
 
-        let source_root = entry.source_root().to_path_buf();
+        let source_root = state.source_root.clone();
         watcher.watch(&source_root)?;
-        projects.insert(entry.project_root.clone(), state);
+        let context_id = state.context.context_id.clone();
+        projects.insert(context_id.clone(), state);
 
         info!(
-            "watching project: {} (source {})",
+            "watching project: {} (context {}, source {})",
             entry.project_root.display(),
+            context_id,
             source_root.display()
         );
     }
@@ -359,37 +380,53 @@ async fn load_and_watch_projects(
 
 async fn reload_projects(
     watcher: &mut FileWatcher,
-    projects: &mut HashMap<PathBuf, ProjectState>,
+    projects: &mut ProjectStates,
 ) -> Result<(), OneupError> {
     let registry = Registry::load()?;
-    let registered_roots: std::collections::HashSet<PathBuf> = registry
+    let registered_contexts: HashSet<String> = registry
         .projects
         .iter()
-        .map(|p| p.project_root.clone())
+        .map(ProjectEntry::context_id)
+        .collect();
+    let registered_sources: HashSet<PathBuf> = registry
+        .projects
+        .iter()
+        .map(|entry| canonical_project_root(entry.source_root()))
         .collect();
 
-    let current_roots: Vec<PathBuf> = projects.keys().cloned().collect();
-    for root in &current_roots {
-        if !registered_roots.contains(root) {
-            if let Some(state) = projects.remove(root) {
-                info!("removing project: {}", root.display());
-                watcher.unwatch(&state.source_root)?;
+    let current_contexts: Vec<String> = projects.keys().cloned().collect();
+    for context_id in &current_contexts {
+        if !registered_contexts.contains(context_id) {
+            if let Some(mut state) = projects.remove(context_id) {
+                info!(
+                    "removing project context {} for {}",
+                    context_id,
+                    state.project_root.display()
+                );
+                state.watch_status = DaemonWatchStatus::DaemonStopped;
+                persist_daemon_context_status_for_state(&state);
+                if !registered_sources.contains(&canonical_project_root(&state.source_root)) {
+                    watcher.unwatch(&state.source_root)?;
+                }
             }
         }
     }
 
     for entry in &registry.projects {
-        let entry_source_root = entry.source_root().to_path_buf();
-        if let Some(existing) = projects.get_mut(&entry.project_root) {
-            if existing.source_root != entry_source_root {
-                watcher.unwatch(&existing.source_root)?;
-                watcher.watch(&entry_source_root)?;
-                existing.source_root = entry_source_root.clone();
-                existing.run_state.mark_dirty(RunScope::Full);
+        let context_id = entry.context_id();
+        if let Some(existing) = projects.get_mut(&context_id) {
+            let entry_context = context_from_entry(entry);
+            if branch_context_changed(&existing.context, &entry_context) {
+                existing.context = entry_context;
+                mark_refresh_pending(
+                    existing,
+                    RunScope::Full,
+                    Some("branch_context_changed".to_string()),
+                );
                 info!(
-                    "refreshed source root for {} to {}",
-                    entry.project_root.display(),
-                    entry_source_root.display()
+                    "queued full context refresh for {} ({}) after branch context changed",
+                    existing.project_root.display(),
+                    context_id
                 );
             }
             if existing.indexing != entry.indexing {
@@ -406,12 +443,15 @@ async fn reload_projects(
             continue;
         };
 
+        let entry_source_root = state.source_root.clone();
+        let context_id = state.context.context_id.clone();
         watcher.watch(&entry_source_root)?;
-        projects.insert(entry.project_root.clone(), state);
+        projects.insert(context_id.clone(), state);
 
         info!(
-            "now watching project: {} (source {})",
+            "now watching project: {} (context {}, source {})",
             entry.project_root.display(),
+            context_id,
             entry_source_root.display()
         );
     }
@@ -434,6 +474,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
             entry.project_root.display(),
             source_root.display()
         );
+        persist_source_missing_context_status(entry);
         return Ok(None);
     }
 
@@ -451,16 +492,50 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
     Ok(Some(ProjectState {
         project_root: entry.project_root.clone(),
         source_root,
+        context: context_from_entry(entry),
         db,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
+        watch_status: DaemonWatchStatus::Watching,
+        last_refresh_state: DaemonRefreshState::Unknown,
+        last_refresh_started_at: None,
+        last_refresh_completed_at: None,
+        last_refresh_error: None,
         last_file_check_persisted_at: None,
     }))
 }
 
+fn context_from_entry(entry: &ProjectEntry) -> WorktreeContext {
+    WorktreeContext {
+        context_id: entry.context_id(),
+        state_root: entry.project_root.clone(),
+        source_root: entry.source_root().to_path_buf(),
+        main_worktree_root: entry.main_worktree_root().to_path_buf(),
+        worktree_role: entry.worktree_role(),
+        git_dir: None,
+        common_git_dir: None,
+        branch_name: entry.branch_name.clone(),
+        branch_ref: entry.branch_ref.clone(),
+        head_oid: entry.head_oid.clone(),
+        branch_status: entry.branch_status(),
+    }
+}
+
+fn current_context_for_state(state: &ProjectState) -> WorktreeContext {
+    crate::daemon::registry::registration_context(&state.project_root, &state.source_root)
+}
+
+fn branch_context_changed(old: &WorktreeContext, new: &WorktreeContext) -> bool {
+    old.context_id != new.context_id
+        || old.branch_ref != new.branch_ref
+        || old.head_oid != new.head_oid
+        || old.branch_status != new.branch_status
+        || canonical_project_root(&old.source_root) != canonical_project_root(&new.source_root)
+}
+
 fn record_file_check_for_all_projects(
-    projects: &mut HashMap<PathBuf, ProjectState>,
+    projects: &mut ProjectStates,
     checked_at: DateTime<Utc>,
     force: bool,
 ) {
@@ -488,6 +563,7 @@ fn record_file_check(state: &mut ProjectState, checked_at: DateTime<Utc>, force:
     };
     persist_daemon_project_status(&state.project_root, &status);
     state.last_file_check_persisted_at = Some(checked_at);
+    persist_daemon_context_status_for_state(state);
 }
 
 fn persist_daemon_project_status(project_root: &Path, status: &DaemonProjectStatus) {
@@ -528,6 +604,141 @@ fn persist_daemon_project_status(project_root: &Path, status: &DaemonProjectStat
     }
 }
 
+fn daemon_context_status_path(project_root: &Path) -> PathBuf {
+    config::project_dot_dir(project_root).join(DAEMON_CONTEXT_STATUS_FILE_NAME)
+}
+
+fn context_status_for_state(state: &ProjectState) -> DaemonContextStatus {
+    DaemonContextStatus {
+        context_id: state.context.context_id.clone(),
+        source_root: Some(state.source_root.clone()),
+        watch_status: state.watch_status,
+        last_file_check_at: state.last_file_check_persisted_at,
+        last_refresh_state: state.last_refresh_state,
+        last_refresh_started_at: state.last_refresh_started_at,
+        last_refresh_completed_at: state.last_refresh_completed_at,
+        last_refresh_error: state.last_refresh_error.clone(),
+        branch_name: state.context.branch_name.clone(),
+        branch_status: state.context.branch_status,
+    }
+}
+
+fn context_status_for_entry(
+    entry: &ProjectEntry,
+    watch_status: DaemonWatchStatus,
+) -> DaemonContextStatus {
+    let context = context_from_entry(entry);
+    DaemonContextStatus {
+        context_id: context.context_id.clone(),
+        source_root: Some(context.source_root.clone()),
+        watch_status,
+        last_file_check_at: None,
+        last_refresh_state: DaemonRefreshState::Unknown,
+        last_refresh_started_at: None,
+        last_refresh_completed_at: None,
+        last_refresh_error: None,
+        branch_name: context.branch_name,
+        branch_status: context.branch_status,
+    }
+}
+
+fn persist_source_missing_context_status(entry: &ProjectEntry) {
+    let status = context_status_for_entry(entry, DaemonWatchStatus::SourceMissing);
+    persist_daemon_context_status(&entry.project_root, &status);
+}
+
+fn persist_daemon_context_status_for_state(state: &ProjectState) {
+    let status = context_status_for_state(state);
+    persist_daemon_context_status(&state.project_root, &status);
+}
+
+fn persist_daemon_context_status(project_root: &Path, status: &DaemonContextStatus) {
+    let secure_root = match ensure_secure_project_root(project_root) {
+        Ok(root) => root,
+        Err(err) => {
+            debug!(
+                "failed to prepare secure project root for daemon context status {}: {err}",
+                project_root.display()
+            );
+            return;
+        }
+    };
+
+    let path = daemon_context_status_path(project_root);
+    let mut file = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<DaemonContextStatusFile>(&content).ok())
+        .unwrap_or_default();
+    file.contexts
+        .insert(status.context_id.clone(), status.clone());
+
+    let payload = match serde_json::to_vec_pretty(&file) {
+        Ok(payload) => payload,
+        Err(err) => {
+            debug!(
+                "failed to serialize daemon context status for {}: {err}",
+                project_root.display()
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = atomic_replace(
+        &path,
+        &payload,
+        &secure_root,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    ) {
+        debug!(
+            "failed to persist daemon context status for {}: {err}",
+            project_root.display()
+        );
+    }
+}
+
+fn mark_refresh_pending(
+    state: &mut ProjectState,
+    scope: RunScope,
+    fallback_reason: Option<String>,
+) {
+    if let Some(reason) = fallback_reason {
+        state.run_state.mark_dirty_with_reason(scope, reason);
+    } else {
+        state.run_state.mark_dirty(scope);
+    }
+    state.last_refresh_state = DaemonRefreshState::Pending;
+    state.last_refresh_error = None;
+    persist_daemon_context_status_for_state(state);
+}
+
+fn mark_refresh_running(state: &mut ProjectState, started_at: DateTime<Utc>) {
+    state.last_refresh_state = DaemonRefreshState::Running;
+    state.last_refresh_started_at = Some(started_at);
+    state.last_refresh_completed_at = None;
+    state.last_refresh_error = None;
+    persist_daemon_context_status_for_state(state);
+}
+
+fn mark_refresh_finished(
+    state: &mut ProjectState,
+    finished_at: DateTime<Utc>,
+    result: Result<(), &OneupError>,
+) {
+    state.last_refresh_completed_at = Some(finished_at);
+    match result {
+        Ok(()) => {
+            state.last_refresh_state = DaemonRefreshState::Complete;
+            state.last_refresh_error = None;
+        }
+        Err(err) => {
+            state.last_refresh_state = DaemonRefreshState::Failed;
+            state.last_refresh_error = Some(err.to_string());
+        }
+    }
+    persist_daemon_context_status_for_state(state);
+}
+
 fn normalize_relative_path(project_root: &Path, changed_path: &Path) -> Option<PathBuf> {
     let relative = changed_path.strip_prefix(project_root).ok()?;
     if relative.as_os_str().is_empty() {
@@ -537,10 +748,7 @@ fn normalize_relative_path(project_root: &Path, changed_path: &Path) -> Option<P
     }
 }
 
-fn mark_changed_projects(
-    projects: &mut HashMap<PathBuf, ProjectState>,
-    changes: &watcher::WatcherChanges,
-) {
+fn mark_changed_projects(projects: &mut ProjectStates, changes: &watcher::WatcherChanges) {
     for state in projects.values_mut() {
         let source_root = &state.source_root;
         let has_ambiguous = changes
@@ -579,13 +787,7 @@ fn mark_changed_projects(
 
         let was_dirty = state.run_state.dirty;
         let was_running = state.run_state.running;
-        if let Some(reason) = promotion_reason {
-            state
-                .run_state
-                .mark_dirty_with_reason(scope.clone(), reason);
-        } else {
-            state.run_state.mark_dirty(scope.clone());
-        }
+        mark_refresh_pending(state, scope.clone(), promotion_reason);
 
         if was_running && !was_dirty {
             debug!(
@@ -613,38 +815,32 @@ fn mark_changed_projects(
     }
 }
 
-fn next_dirty_project_root(
-    projects: &HashMap<PathBuf, ProjectState>,
-    preferred_root: Option<&Path>,
-) -> Option<PathBuf> {
-    if let Some(preferred_root) = preferred_root {
+fn next_dirty_project_key(projects: &ProjectStates, preferred_key: Option<&str>) -> Option<String> {
+    if let Some(preferred_key) = preferred_key {
         if projects
-            .get(preferred_root)
+            .get(preferred_key)
             .is_some_and(|state| state.run_state.dirty && !state.run_state.running)
         {
-            return Some(preferred_root.to_path_buf());
+            return Some(preferred_key.to_string());
         }
     }
 
-    let mut dirty_roots: Vec<PathBuf> = projects
+    let mut dirty_keys: Vec<String> = projects
         .iter()
         .filter(|(_, state)| state.run_state.dirty && !state.run_state.running)
-        .map(|(root, _)| root.clone())
+        .map(|(key, _)| key.clone())
         .collect();
-    dirty_roots.sort();
-    dirty_roots.into_iter().next()
+    dirty_keys.sort();
+    dirty_keys.into_iter().next()
 }
 
-async fn run_dirty_projects_until_clean(
-    watcher: &FileWatcher,
-    projects: &mut HashMap<PathBuf, ProjectState>,
-) {
-    let mut preferred_root: Option<PathBuf> = None;
+async fn run_dirty_projects_until_clean(watcher: &FileWatcher, projects: &mut ProjectStates) {
+    let mut preferred_key: Option<String> = None;
 
-    while let Some(root) = next_dirty_project_root(projects, preferred_root.as_deref()) {
-        preferred_root = None;
+    while let Some(key) = next_dirty_project_key(projects, preferred_key.as_deref()) {
+        preferred_key = None;
 
-        let result = run_project(&root, projects).await;
+        let result = run_project(&key, projects).await;
 
         let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
@@ -659,44 +855,95 @@ async fn run_dirty_projects_until_clean(
 
         match result {
             Ok(stats) => {
+                let project_root = projects
+                    .get(&key)
+                    .map(|state| state.project_root.clone())
+                    .unwrap_or_else(|| PathBuf::from(&key));
                 info!(
                     "re-index complete for {}: {} indexed, {} skipped",
-                    root.display(),
+                    project_root.display(),
                     stats.files_indexed,
                     stats.files_skipped
                 );
 
                 if projects
-                    .get(&root)
+                    .get(&key)
                     .is_some_and(|state| state.run_state.dirty)
                 {
                     debug!(
-                        "collapsed change burst for {} into one queued follow-up run",
-                        root.display()
+                        "collapsed change burst for context {} into one queued follow-up run",
+                        key
                     );
-                    preferred_root = Some(root);
+                    preferred_key = Some(key);
                 }
             }
             Err(e) => {
-                error!("re-index failed for {}: {e}", root.display());
+                error!("re-index failed for context {key}: {e}");
             }
         }
     }
 }
 
+fn mark_branch_context_changes(projects: &mut ProjectStates) {
+    let changed_contexts: Vec<(String, WorktreeContext)> = projects
+        .iter()
+        .filter_map(|(context_id, state)| {
+            let current_context = current_context_for_state(state);
+            branch_context_changed(&state.context, &current_context)
+                .then(|| (context_id.clone(), current_context))
+        })
+        .collect();
+
+    for (old_context_id, current_context) in changed_contexts {
+        let Some(mut state) = projects.remove(&old_context_id) else {
+            continue;
+        };
+        let new_context_id = current_context.context_id.clone();
+        state.context = current_context;
+        mark_refresh_pending(
+            &mut state,
+            RunScope::Full,
+            Some("branch_context_changed".to_string()),
+        );
+        info!(
+            "queued full re-index for {} after branch context changed",
+            state.project_root.display()
+        );
+
+        if let Some(existing) = projects.get_mut(&new_context_id) {
+            mark_refresh_pending(
+                existing,
+                RunScope::Full,
+                Some("branch_context_changed".to_string()),
+            );
+        } else {
+            projects.insert(new_context_id, state);
+        }
+    }
+}
+
+fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
+    for state in projects.values_mut() {
+        state.watch_status = DaemonWatchStatus::DaemonStopped;
+        persist_daemon_context_status_for_state(state);
+    }
+}
+
 async fn run_project(
-    root: &Path,
-    projects: &mut HashMap<PathBuf, ProjectState>,
+    context_id: &str,
+    projects: &mut ProjectStates,
 ) -> Result<pipeline::PipelineStats, OneupError> {
     let mut setup = SetupTimings::new(std::time::Instant::now());
-    let (project_root, source_root, scope, daemon_fallback_reason, conn_setup) = {
+    let (project_root, source_root, context, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects
-            .get_mut(root)
+            .get_mut(context_id)
             .expect("dirty project must exist while running");
         let daemon_fallback_reason = state.run_state.pending_fallback_reason.take();
         let scope = state.run_state.start_run();
+        mark_refresh_running(state, Utc::now());
         let project_root = state.project_root.clone();
         let source_root = state.source_root.clone();
+        let context = state.context.clone();
         let db_start = std::time::Instant::now();
         let conn_setup = async {
             let conn = state.db.connect_tuned().await?;
@@ -710,6 +957,7 @@ async fn run_project(
         (
             project_root,
             source_root,
+            context,
             scope,
             daemon_fallback_reason,
             conn_setup,
@@ -720,10 +968,14 @@ async fn run_project(
         Ok(values) => values,
         Err(e) => {
             projects
-                .get_mut(root)
+                .get_mut(context_id)
                 .expect("dirty project must exist while finishing a failed setup")
                 .run_state
                 .finish_run();
+            let state = projects
+                .get_mut(context_id)
+                .expect("dirty project must exist while recording failed setup");
+            mark_refresh_finished(state, Utc::now(), Err(&e));
             return Err(e);
         }
     };
@@ -752,7 +1004,7 @@ async fn run_project(
 
     let result = {
         let state = projects
-            .get_mut(root)
+            .get_mut(context_id)
             .expect("dirty project must exist while preparing embeddings");
         let model_start = std::time::Instant::now();
         let status = state
@@ -761,9 +1013,9 @@ async fn run_project(
             .await;
         setup.model_prepare_ms = model_start.elapsed().as_millis();
         log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
-        pipeline::run_with_scope_setup_and_progress_root(
+        pipeline::run_with_context_scope_setup_and_progress_root(
             &conn,
-            &source_root,
+            &context,
             state.embedding_runtime.current_embedder(),
             &scope,
             &indexing_config,
@@ -776,26 +1028,40 @@ async fn run_project(
         .await
     };
 
-    projects
-        .get_mut(root)
-        .expect("dirty project must exist while finishing a run")
-        .run_state
-        .finish_run();
+    let state = projects
+        .get_mut(context_id)
+        .expect("dirty project must exist while finishing a run");
+    state.run_state.finish_run();
+    mark_refresh_finished(state, Utc::now(), result.as_ref().map(|_| ()));
 
     result
 }
 
 async fn handle_search_request(
-    projects: &mut HashMap<PathBuf, ProjectState>,
+    projects: &mut ProjectStates,
     request: SearchRequest,
 ) -> SearchResponse {
-    let Some(state) = projects.get_mut(&request.project_root) else {
+    let Some(state) = projects.get_mut(&request.context_id) else {
         debug!(
-            "daemon search requested for unregistered project {}",
+            "daemon search requested for unregistered context {} on project {}",
+            request.context_id,
             request.project_root.display()
         );
         return search_service::unavailable_response();
     };
+    if canonical_project_root(&state.project_root) != canonical_project_root(&request.project_root)
+        || canonical_project_root(&state.source_root)
+            != canonical_project_root(&request.source_root)
+    {
+        debug!(
+            "daemon search requested for mismatched context {} source {} on project {}",
+            request.context_id,
+            request.source_root.display(),
+            request.project_root.display()
+        );
+        return search_service::unavailable_response();
+    }
+    let search_scope = SearchScope::from_worktree_context(&state.context);
 
     let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
     {
@@ -834,10 +1100,14 @@ async fn handle_search_request(
     log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
 
     let results = if status.is_available() {
-        let mut engine = HybridSearchEngine::new(&conn, state.embedding_runtime.current_embedder());
+        let mut engine = HybridSearchEngine::new_scoped(
+            &conn,
+            state.embedding_runtime.current_embedder(),
+            search_scope.clone(),
+        );
         engine.search(&request.query, request.limit).await
     } else {
-        let engine = HybridSearchEngine::new(&conn, None);
+        let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
         engine.fts_only_search(&request.query, request.limit).await
     };
 
@@ -861,6 +1131,61 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    fn test_context(project_root: &Path, source_root: &Path) -> WorktreeContext {
+        WorktreeContext {
+            context_id: format!(
+                "test-{}",
+                source_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("root")
+            ),
+            state_root: project_root.to_path_buf(),
+            source_root: source_root.to_path_buf(),
+            main_worktree_root: project_root.to_path_buf(),
+            worktree_role: if project_root == source_root {
+                crate::shared::types::WorktreeRole::Main
+            } else {
+                crate::shared::types::WorktreeRole::Linked
+            },
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: Some("0000000000000000000000000000000000000000".to_string()),
+            branch_status: crate::shared::types::BranchStatus::Named,
+        }
+    }
+
+    fn project_state(
+        project_root: &Path,
+        source_root: &Path,
+        db: Db,
+        run_state: ProjectRunState,
+    ) -> ProjectState {
+        ProjectState {
+            project_root: project_root.to_path_buf(),
+            source_root: source_root.to_path_buf(),
+            context: test_context(project_root, source_root),
+            db,
+            indexing: None,
+            embedding_runtime: EmbeddingRuntime::default(),
+            run_state,
+            watch_status: DaemonWatchStatus::Watching,
+            last_refresh_state: DaemonRefreshState::Unknown,
+            last_refresh_started_at: None,
+            last_refresh_completed_at: None,
+            last_refresh_error: None,
+            last_file_check_persisted_at: None,
+        }
+    }
+
+    fn insert_project(projects: &mut ProjectStates, state: ProjectState) -> String {
+        let context_id = state.context.context_id.clone();
+        projects.insert(context_id.clone(), state);
+        context_id
+    }
 
     #[test]
     fn run_state_collapses_bursts_into_follow_up() {
@@ -908,34 +1233,23 @@ mod tests {
         let beta_db = runtime.block_on(beta_db).unwrap();
 
         let mut projects = HashMap::new();
-        projects.insert(
-            alpha_root.clone(),
-            ProjectState {
-                project_root: alpha_root.clone(),
-                source_root: alpha_root.clone(),
-                db: alpha_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState {
+        let alpha_key = insert_project(
+            &mut projects,
+            project_state(
+                &alpha_root,
+                &alpha_root,
+                alpha_db,
+                ProjectRunState {
                     running: true,
                     dirty: false,
                     pending_scope: None,
                     pending_fallback_reason: None,
                 },
-                last_file_check_persisted_at: None,
-            },
+            ),
         );
-        projects.insert(
-            beta_root.clone(),
-            ProjectState {
-                project_root: beta_root.clone(),
-                source_root: beta_root.clone(),
-                db: beta_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState::default(),
-                last_file_check_persisted_at: None,
-            },
+        let beta_key = insert_project(
+            &mut projects,
+            project_state(&beta_root, &beta_root, beta_db, ProjectRunState::default()),
         );
 
         let changes = watcher::WatcherChanges {
@@ -951,7 +1265,7 @@ mod tests {
 
         mark_changed_projects(&mut projects, &changes);
 
-        let alpha = &projects.get(&alpha_root).unwrap().run_state;
+        let alpha = &projects.get(&alpha_key).unwrap().run_state;
         assert!(alpha.running);
         assert!(alpha.dirty);
         assert_eq!(
@@ -959,7 +1273,7 @@ mod tests {
             RunScope::from_paths([PathBuf::from("README.md"), PathBuf::from("src/lib.rs")])
         );
 
-        let beta = &projects.get(&beta_root).unwrap().run_state;
+        let beta = &projects.get(&beta_key).unwrap().run_state;
         assert!(!beta.running);
         assert!(beta.dirty);
         assert_eq!(
@@ -983,29 +1297,18 @@ mod tests {
         let beta_db = runtime.block_on(beta_db).unwrap();
 
         let mut projects = HashMap::new();
-        projects.insert(
-            alpha_root.clone(),
-            ProjectState {
-                project_root: alpha_root.clone(),
-                source_root: alpha_root.clone(),
-                db: alpha_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState::default(),
-                last_file_check_persisted_at: None,
-            },
+        let alpha_key = insert_project(
+            &mut projects,
+            project_state(
+                &alpha_root,
+                &alpha_root,
+                alpha_db,
+                ProjectRunState::default(),
+            ),
         );
-        projects.insert(
-            beta_root.clone(),
-            ProjectState {
-                project_root: beta_root.clone(),
-                source_root: beta_root.clone(),
-                db: beta_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState::default(),
-                last_file_check_persisted_at: None,
-            },
+        let beta_key = insert_project(
+            &mut projects,
+            project_state(&beta_root, &beta_root, beta_db, ProjectRunState::default()),
         );
 
         mark_changed_projects(
@@ -1017,11 +1320,11 @@ mod tests {
             },
         );
         assert_eq!(
-            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            projects.get(&alpha_key).unwrap().run_state.pending_scope,
             Some(RunScope::Full)
         );
         assert!(projects
-            .get(&beta_root)
+            .get(&beta_key)
             .unwrap()
             .run_state
             .pending_scope
@@ -1036,11 +1339,11 @@ mod tests {
             },
         );
         assert_eq!(
-            projects.get(&alpha_root).unwrap().run_state.pending_scope,
+            projects.get(&alpha_key).unwrap().run_state.pending_scope,
             Some(RunScope::Full)
         );
         assert_eq!(
-            projects.get(&beta_root).unwrap().run_state.pending_scope,
+            projects.get(&beta_key).unwrap().run_state.pending_scope,
             Some(RunScope::Full)
         );
     }
@@ -1057,17 +1360,9 @@ mod tests {
         let db = runtime.block_on(Db::open_memory()).unwrap();
 
         let mut projects = HashMap::new();
-        projects.insert(
-            state_root.clone(),
-            ProjectState {
-                project_root: state_root.clone(),
-                source_root: source_root.clone(),
-                db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState::default(),
-                last_file_check_persisted_at: None,
-            },
+        let state_key = insert_project(
+            &mut projects,
+            project_state(&state_root, &source_root, db, ProjectRunState::default()),
         );
 
         let changes = watcher::WatcherChanges {
@@ -1079,9 +1374,66 @@ mod tests {
         mark_changed_projects(&mut projects, &changes);
 
         assert_eq!(
-            projects.get(&state_root).unwrap().run_state.pending_scope,
+            projects.get(&state_key).unwrap().run_state.pending_scope,
             RunScope::from_paths([PathBuf::from("src/lib.rs")])
         );
+    }
+
+    #[test]
+    fn mark_changed_projects_keeps_shared_state_root_contexts_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path().join("main");
+        let alpha_source = tmp.path().join("alpha-worktree");
+        let beta_source = tmp.path().join("beta-worktree");
+        std::fs::create_dir_all(alpha_source.join("src")).unwrap();
+        std::fs::create_dir_all(beta_source.join("src")).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let alpha_db = runtime.block_on(Db::open_memory()).unwrap();
+        let beta_db = runtime.block_on(Db::open_memory()).unwrap();
+
+        let mut projects = HashMap::new();
+        let alpha_key = insert_project(
+            &mut projects,
+            project_state(
+                &state_root,
+                &alpha_source,
+                alpha_db,
+                ProjectRunState::default(),
+            ),
+        );
+        let beta_key = insert_project(
+            &mut projects,
+            project_state(
+                &state_root,
+                &beta_source,
+                beta_db,
+                ProjectRunState::default(),
+            ),
+        );
+
+        mark_changed_projects(
+            &mut projects,
+            &watcher::WatcherChanges {
+                file_paths: std::collections::BTreeSet::from([alpha_source
+                    .join("src")
+                    .join("lib.rs")]),
+                ambiguous_paths: std::collections::BTreeSet::new(),
+                has_unscoped_error: false,
+            },
+        );
+
+        assert_eq!(
+            projects.get(&alpha_key).unwrap().run_state.pending_scope,
+            RunScope::from_paths([PathBuf::from("src/lib.rs")])
+        );
+        assert!(projects
+            .get(&beta_key)
+            .unwrap()
+            .run_state
+            .pending_scope
+            .is_none());
     }
 
     #[test]
@@ -1099,15 +1451,13 @@ mod tests {
         let beta_db = runtime.block_on(beta_db).unwrap();
 
         let mut projects = HashMap::new();
-        projects.insert(
-            alpha_root.clone(),
-            ProjectState {
-                project_root: alpha_root.clone(),
-                source_root: alpha_root.clone(),
-                db: alpha_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState {
+        let alpha_key = insert_project(
+            &mut projects,
+            project_state(
+                &alpha_root,
+                &alpha_root,
+                alpha_db,
+                ProjectRunState {
                     running: false,
                     dirty: true,
                     pending_scope: Some(
@@ -1115,18 +1465,15 @@ mod tests {
                     ),
                     pending_fallback_reason: None,
                 },
-                last_file_check_persisted_at: None,
-            },
+            ),
         );
-        projects.insert(
-            beta_root.clone(),
-            ProjectState {
-                project_root: beta_root.clone(),
-                source_root: beta_root.clone(),
-                db: beta_db,
-                indexing: None,
-                embedding_runtime: EmbeddingRuntime::default(),
-                run_state: ProjectRunState {
+        let beta_key = insert_project(
+            &mut projects,
+            project_state(
+                &beta_root,
+                &beta_root,
+                beta_db,
+                ProjectRunState {
                     running: false,
                     dirty: true,
                     pending_scope: Some(
@@ -1134,16 +1481,15 @@ mod tests {
                     ),
                     pending_fallback_reason: None,
                 },
-                last_file_check_persisted_at: None,
-            },
+            ),
         );
 
-        let preferred = next_dirty_project_root(&projects, Some(beta_root.as_path()));
-        assert_eq!(preferred, Some(beta_root.clone()));
+        let preferred = next_dirty_project_key(&projects, Some(&beta_key));
+        assert_eq!(preferred, Some(beta_key.clone()));
 
-        projects.get_mut(&beta_root).unwrap().run_state.dirty = false;
-        let fallback = next_dirty_project_root(&projects, Some(beta_root.as_path()));
-        assert_eq!(fallback, Some(alpha_root));
+        projects.get_mut(&beta_key).unwrap().run_state.dirty = false;
+        let fallback = next_dirty_project_key(&projects, Some(&beta_key));
+        assert_eq!(fallback, Some(alpha_key));
     }
 
     #[tokio::test]
@@ -1153,6 +1499,8 @@ mod tests {
             &mut projects,
             SearchRequest {
                 project_root: PathBuf::from("/tmp/missing-project"),
+                source_root: PathBuf::from("/tmp/missing-project"),
+                context_id: "missing-context".to_string(),
                 query: "needle".to_string(),
                 limit: 3,
             },
@@ -1197,15 +1545,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let db = runtime.block_on(Db::open_memory()).unwrap();
-        let mut state = ProjectState {
-            project_root: project_root.clone(),
-            source_root: project_root.clone(),
-            db,
-            indexing: None,
-            embedding_runtime: EmbeddingRuntime::default(),
-            run_state: ProjectRunState::default(),
-            last_file_check_persisted_at: None,
-        };
+        let mut state = project_state(&project_root, &project_root, db, ProjectRunState::default());
 
         let first_check = Utc::now();
         record_file_check(&mut state, first_check, false);
@@ -1228,6 +1568,16 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
         assert_eq!(next_status.last_file_check_at, next_check);
         assert_eq!(state.last_file_check_persisted_at, Some(next_check));
+
+        let context_status_path = daemon_context_status_path(&project_root);
+        let context_status: DaemonContextStatusFile =
+            serde_json::from_str(&std::fs::read_to_string(context_status_path).unwrap()).unwrap();
+        let entry = context_status
+            .contexts
+            .get(&state.context.context_id)
+            .unwrap();
+        assert_eq!(entry.watch_status, DaemonWatchStatus::Watching);
+        assert_eq!(entry.last_file_check_at, Some(next_check));
     }
 
     #[test]
@@ -1239,15 +1589,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let db = runtime.block_on(Db::open_memory()).unwrap();
-        let mut state = ProjectState {
-            project_root: project_root.clone(),
-            source_root: project_root.clone(),
-            db,
-            indexing: None,
-            embedding_runtime: EmbeddingRuntime::default(),
-            run_state: ProjectRunState::default(),
-            last_file_check_persisted_at: None,
-        };
+        let mut state = project_state(&project_root, &project_root, db, ProjectRunState::default());
 
         let first_check = Utc::now();
         let forced_check = first_check + chrono::Duration::seconds(1);
@@ -1259,5 +1601,46 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
         assert_eq!(status.last_file_check_at, forced_check);
         assert_eq!(state.last_file_check_persisted_at, Some(forced_check));
+    }
+
+    #[test]
+    fn refresh_status_persists_running_and_failed_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+
+        let started_at = Utc::now();
+        mark_refresh_running(&mut state, started_at);
+        let status_path = daemon_context_status_path(&project_root);
+        let running_status: DaemonContextStatusFile =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        let entry = running_status
+            .contexts
+            .get(&state.context.context_id)
+            .unwrap();
+        assert_eq!(entry.last_refresh_state, DaemonRefreshState::Running);
+        assert_eq!(entry.last_refresh_started_at, Some(started_at));
+
+        let err: OneupError =
+            crate::shared::errors::DaemonError::WatcherError("boom".to_string()).into();
+        let finished_at = started_at + chrono::Duration::seconds(1);
+        mark_refresh_finished(&mut state, finished_at, Err(&err));
+        let failed_status: DaemonContextStatusFile =
+            serde_json::from_str(&std::fs::read_to_string(&status_path).unwrap()).unwrap();
+        let entry = failed_status
+            .contexts
+            .get(&state.context.context_id)
+            .unwrap();
+        assert_eq!(entry.last_refresh_state, DaemonRefreshState::Failed);
+        assert_eq!(entry.last_refresh_completed_at, Some(finished_at));
+        assert_eq!(
+            entry.last_refresh_error.as_deref(),
+            Some("daemon error: watcher error: boom")
+        );
     }
 }

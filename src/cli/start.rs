@@ -28,7 +28,7 @@ use crate::shared::constants;
 use crate::shared::fs::{ensure_secure_xdg_root, validate_regular_file_path};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::project;
-use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings};
+use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings, WorktreeContext};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -137,6 +137,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     )?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
+    let worktree_context = resolved.worktree_context;
     let fmt = formatter_for(format);
 
     if !lifecycle::supports_daemon() {
@@ -157,7 +158,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let indexing_config = config::resolve_indexing_config(
         args.jobs,
         args.embed_threads,
-        registry.indexing_config_for(&project_root),
+        registry.indexing_config_for_context(&worktree_context),
     )?;
 
     let (project_id, initialized_now) = project::ensure_project_id(&project_root)?;
@@ -208,13 +209,8 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let daemon_state = lifecycle::probe_daemon()?;
 
     if index_ready {
-        let already_registered = registry_contains_project(&registry, &project_root);
-        registry.register_with_source(
-            &project_id,
-            &project_root,
-            &source_root,
-            Some(indexing_config),
-        )?;
+        let already_registered = registry_contains_context(&registry, &worktree_context);
+        registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
         let daemon = ensure_daemon_after_registration(daemon_state)?;
         let msg =
             current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
@@ -241,17 +237,12 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     let show_progress_ui = format == OutputFormat::Human;
     let stats = run_initial_index(
         &project_root,
-        &source_root,
+        &worktree_context,
         &indexing_config,
         show_progress_ui,
     )
     .await?;
-    registry.register_with_source(
-        &project_id,
-        &project_root,
-        &source_root,
-        Some(indexing_config),
-    )?;
+    registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
     let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?)?;
     let msg = indexed_start_message(
         &init_prefix,
@@ -339,14 +330,11 @@ fn startup_lock_key(project_root: &Path) -> String {
         .collect()
 }
 
-fn registry_contains_project(registry: &Registry, project_root: &Path) -> bool {
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    registry
-        .projects
-        .iter()
-        .any(|project| project.project_root == canonical)
+fn registry_contains_context(
+    registry: &Registry,
+    context: &crate::shared::types::WorktreeContext,
+) -> bool {
+    registry.contains_context(context)
 }
 
 fn ensure_daemon_after_registration(
@@ -711,7 +699,7 @@ fn emit_index_unreadable_warning(project_root: &Path, fmt: &dyn Formatter, forma
 
 async fn run_initial_index(
     project_root: &Path,
-    source_root: &Path,
+    context: &WorktreeContext,
     indexing_config: &IndexingConfig,
     show_progress_ui: bool,
 ) -> anyhow::Result<pipeline::PipelineStats> {
@@ -741,9 +729,9 @@ async fn run_initial_index(
         EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message),
     }
 
-    let stats = pipeline::run_with_scope_setup_and_progress_root(
+    let stats = pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
-        source_root,
+        context,
         runtime.current_embedder(),
         &crate::shared::types::RunScope::Full,
         indexing_config,

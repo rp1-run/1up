@@ -342,19 +342,15 @@ pub fn ensure_daemon(
     project_root: &Path,
     source_root: &Path,
 ) -> Result<u32, OneupError> {
-    use crate::daemon::registry::Registry;
+    use crate::daemon::registry::{registration_context, Registry};
 
     if let Some(pid) = is_daemon_running()? {
         let mut registry = Registry::load()?;
-        let already_registered = registry.projects.iter().any(|p| {
-            p.project_root
-                == project_root
-                    .canonicalize()
-                    .unwrap_or(project_root.to_path_buf())
-        });
+        let context = registration_context(project_root, source_root);
+        let already_registered = registry.contains_context(&context);
 
         if !already_registered {
-            registry.register_with_source(project_id, project_root, source_root, None)?;
+            registry.register_with_context(project_id, &context, None)?;
             send_sighup(pid)?;
             debug!("auto-registered project and sent SIGHUP to daemon (pid={pid})");
         }
@@ -363,7 +359,8 @@ pub fn ensure_daemon(
     }
 
     let mut registry = Registry::load()?;
-    registry.register_with_source(project_id, project_root, source_root, None)?;
+    let context = registration_context(project_root, source_root);
+    registry.register_with_context(project_id, &context, None)?;
 
     let binary = current_binary_path()?;
     let pid = spawn_daemon(&binary)?;

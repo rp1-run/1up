@@ -6,12 +6,14 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::shared::config;
 use crate::shared::constants::{PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE};
 use crate::shared::errors::{FilesystemError, OneupError, ProjectError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root, validate_regular_file_path};
+use crate::shared::types::{BranchStatus, WorktreeContext, WorktreeRole};
 
 /// Reads the project ID from the .1up/project_id file at the given project root.
 pub fn read_project_id(project_root: &Path) -> Result<String, OneupError> {
@@ -202,6 +204,8 @@ pub struct ResolvedProject {
     /// Root where source files should be read — use for scanning, indexing,
     /// file resolution, and fence installation.
     pub source_root: PathBuf,
+    /// Explicit git worktree and branch metadata for the active source root.
+    pub worktree_context: WorktreeContext,
 }
 
 /// Resolves the project roots for a given path. Linked git worktrees anchor
@@ -211,31 +215,23 @@ pub struct ResolvedProject {
 pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
     let canonical = path.canonicalize()?;
 
-    if let Some(worktree_roots) = resolve_worktree_roots(&canonical) {
-        return Ok(ResolvedProject {
-            state_root: worktree_roots.main_root,
-            source_root: worktree_roots.worktree_root,
-        });
+    if let Some(worktree_info) = resolve_linked_worktree_info(&canonical) {
+        return Ok(resolved_project(
+            worktree_info.main_root.clone(),
+            worktree_info.worktree_root.clone(),
+            Some(worktree_info),
+        ));
     }
 
     if let Some(existing_root) = find_existing_project_root(&canonical) {
-        return Ok(ResolvedProject {
-            state_root: existing_root,
-            source_root: canonical,
-        });
+        return Ok(resolved_project(existing_root, canonical, None));
     }
 
     if let Some(git_root) = resolve_git_root(&canonical) {
-        return Ok(ResolvedProject {
-            state_root: git_root.clone(),
-            source_root: git_root,
-        });
+        return Ok(resolved_project(git_root.clone(), git_root, None));
     }
 
-    Ok(ResolvedProject {
-        state_root: canonical.clone(),
-        source_root: canonical,
-    })
+    Ok(resolved_project(canonical.clone(), canonical, None))
 }
 
 /// Resolves a project root for commands that may create `.1up/` state.
@@ -298,45 +294,269 @@ fn is_git_root(path: &Path) -> bool {
     dot_git.is_dir() || dot_git.is_file()
 }
 
-struct WorktreeRoots {
+#[derive(Debug, Clone)]
+struct GitWorktreeInfo {
     main_root: PathBuf,
     worktree_root: PathBuf,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    role: WorktreeRole,
 }
 
-/// Detects if the given path is inside a git worktree and returns the main
-/// worktree root. A git worktree has a `.git` file (not directory) containing
-/// `gitdir: <path>`. The referenced gitdir contains a `commondir` file
-/// pointing to the main repository's `.git` directory.
-fn resolve_worktree_roots(start: &Path) -> Option<WorktreeRoots> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchIdentity {
+    branch_name: Option<String>,
+    branch_ref: Option<String>,
+    head_oid: Option<String>,
+    branch_status: BranchStatus,
+}
+
+/// Detects if the given path is inside a linked git worktree. A linked
+/// worktree has a `.git` file containing `gitdir: <path>`. The referenced
+/// gitdir contains a `commondir` file pointing to the main repository's `.git`
+/// directory.
+fn resolve_linked_worktree_info(start: &Path) -> Option<GitWorktreeInfo> {
     let mut current = Some(start);
     while let Some(dir) = current {
         let dot_git = dir.join(".git");
         if dot_git.is_file() {
-            let content = std::fs::read_to_string(&dot_git).ok()?;
-            let gitdir_path = content.trim().strip_prefix("gitdir: ")?;
-            let gitdir = if Path::new(gitdir_path).is_absolute() {
-                PathBuf::from(gitdir_path)
-            } else {
-                dir.join(gitdir_path)
-            };
+            let git_dir = read_gitdir_file(&dot_git, dir)?;
+            let common_git_dir = read_commondir(&git_dir)?;
+            let main_root = canonical_path(&common_git_dir).parent()?.to_path_buf();
 
-            let commondir_content = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-            let commondir_ref = commondir_content.trim();
-            let common_git_dir = if Path::new(commondir_ref).is_absolute() {
-                PathBuf::from(commondir_ref)
-            } else {
-                gitdir.join(commondir_ref)
-            };
-
-            let main_root = common_git_dir.canonicalize().ok()?.parent()?.to_path_buf();
-            return Some(WorktreeRoots {
+            return Some(GitWorktreeInfo {
                 main_root,
                 worktree_root: dir.to_path_buf(),
+                git_dir: canonical_path(&git_dir),
+                common_git_dir: canonical_path(&common_git_dir),
+                role: WorktreeRole::Linked,
             });
         }
         current = dir.parent();
     }
     None
+}
+
+fn resolved_project(
+    state_root: PathBuf,
+    source_root: PathBuf,
+    linked_info: Option<GitWorktreeInfo>,
+) -> ResolvedProject {
+    let git_info = linked_info.or_else(|| resolve_main_worktree_info(&state_root));
+    let worktree_context = build_worktree_context(&state_root, &source_root, git_info);
+
+    ResolvedProject {
+        state_root,
+        source_root,
+        worktree_context,
+    }
+}
+
+fn resolve_main_worktree_info(state_root: &Path) -> Option<GitWorktreeInfo> {
+    let dot_git = state_root.join(".git");
+    if !dot_git.is_dir() {
+        return None;
+    }
+
+    Some(GitWorktreeInfo {
+        main_root: state_root.to_path_buf(),
+        worktree_root: state_root.to_path_buf(),
+        git_dir: canonical_path(&dot_git),
+        common_git_dir: canonical_path(&dot_git),
+        role: WorktreeRole::Main,
+    })
+}
+
+fn build_worktree_context(
+    state_root: &Path,
+    source_root: &Path,
+    git_info: Option<GitWorktreeInfo>,
+) -> WorktreeContext {
+    let branch = git_info
+        .as_ref()
+        .map(read_branch_identity)
+        .unwrap_or_else(unknown_branch_identity);
+    let main_worktree_root = git_info
+        .as_ref()
+        .map(|info| info.main_root.clone())
+        .unwrap_or_else(|| state_root.to_path_buf());
+    let worktree_role = git_info
+        .as_ref()
+        .map(|info| info.role)
+        .unwrap_or(WorktreeRole::Unknown);
+    let git_dir = git_info.as_ref().map(|info| info.git_dir.clone());
+    let common_git_dir = git_info.as_ref().map(|info| info.common_git_dir.clone());
+    let context_id = context_id_for(state_root, source_root, &branch);
+
+    WorktreeContext {
+        context_id,
+        state_root: state_root.to_path_buf(),
+        source_root: source_root.to_path_buf(),
+        main_worktree_root,
+        worktree_role,
+        git_dir,
+        common_git_dir,
+        branch_name: branch.branch_name,
+        branch_ref: branch.branch_ref,
+        head_oid: branch.head_oid,
+        branch_status: branch.branch_status,
+    }
+}
+
+fn read_gitdir_file(dot_git: &Path, worktree_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(dot_git).ok()?;
+    let gitdir_path = content.trim().strip_prefix("gitdir:")?.trim();
+    if gitdir_path.is_empty() {
+        return None;
+    }
+
+    Some(resolve_git_path(worktree_root, gitdir_path))
+}
+
+fn read_commondir(git_dir: &Path) -> Option<PathBuf> {
+    let commondir_content = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let commondir_ref = commondir_content.trim();
+    if commondir_ref.is_empty() {
+        return None;
+    }
+
+    Some(resolve_git_path(git_dir, commondir_ref))
+}
+
+fn resolve_git_path(base: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn read_branch_identity(info: &GitWorktreeInfo) -> BranchIdentity {
+    let head = match std::fs::read_to_string(info.git_dir.join("HEAD")) {
+        Ok(content) => content.trim().to_string(),
+        Err(_) => {
+            return BranchIdentity {
+                branch_status: BranchStatus::Unreadable,
+                ..unknown_branch_identity()
+            };
+        }
+    };
+
+    if let Some(branch_ref) = head.strip_prefix("ref:").map(str::trim) {
+        if branch_ref.is_empty() {
+            return BranchIdentity {
+                branch_status: BranchStatus::Unreadable,
+                ..unknown_branch_identity()
+            };
+        }
+
+        let branch_ref = branch_ref.to_string();
+        let branch_name = branch_ref
+            .strip_prefix("refs/heads/")
+            .map(|name| name.to_string());
+        let head_oid = read_ref_oid(&info.git_dir, &info.common_git_dir, &branch_ref);
+
+        return BranchIdentity {
+            branch_name,
+            branch_ref: Some(branch_ref),
+            head_oid,
+            branch_status: BranchStatus::Named,
+        };
+    }
+
+    if is_hex_oid(&head) {
+        return BranchIdentity {
+            branch_name: None,
+            branch_ref: None,
+            head_oid: Some(head),
+            branch_status: BranchStatus::Detached,
+        };
+    }
+
+    BranchIdentity {
+        branch_status: BranchStatus::Unreadable,
+        ..unknown_branch_identity()
+    }
+}
+
+fn read_ref_oid(git_dir: &Path, common_git_dir: &Path, branch_ref: &str) -> Option<String> {
+    [git_dir, common_git_dir]
+        .into_iter()
+        .find_map(|root| read_loose_ref_oid(root, branch_ref))
+        .or_else(|| read_packed_ref_oid(common_git_dir, branch_ref))
+        .or_else(|| read_packed_ref_oid(git_dir, branch_ref))
+}
+
+fn read_loose_ref_oid(root: &Path, branch_ref: &str) -> Option<String> {
+    std::fs::read_to_string(root.join(branch_ref))
+        .ok()
+        .and_then(|content| first_oid_token(content.trim()))
+}
+
+fn read_packed_ref_oid(git_dir: &Path, branch_ref: &str) -> Option<String> {
+    let packed_refs = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    packed_refs.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+
+        let mut parts = line.split_whitespace();
+        let oid = parts.next()?;
+        let name = parts.next()?;
+        (name == branch_ref).then(|| first_oid_token(oid)).flatten()
+    })
+}
+
+fn first_oid_token(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .next()
+        .filter(|token| is_hex_oid(token))
+        .map(|token| token.to_string())
+}
+
+fn is_hex_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn unknown_branch_identity() -> BranchIdentity {
+    BranchIdentity {
+        branch_name: None,
+        branch_ref: None,
+        head_oid: None,
+        branch_status: BranchStatus::Unknown,
+    }
+}
+
+fn context_id_for(state_root: &Path, source_root: &Path, branch: &BranchIdentity) -> String {
+    let branch_identity = branch
+        .branch_ref
+        .as_deref()
+        .or(match branch.branch_status {
+            BranchStatus::Detached => branch.head_oid.as_deref(),
+            BranchStatus::Named | BranchStatus::Unreadable | BranchStatus::Unknown => None,
+        })
+        .unwrap_or_else(|| branch.branch_status.as_str());
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"oneup-worktree-context-v1\0");
+    hasher.update(state_root.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(source_root.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(branch.branch_status.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(branch_identity.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -577,6 +797,147 @@ mod tests {
     }
 
     #[test]
+    fn resolve_project_root_exposes_main_worktree_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        write_main_git_branch(&repo, "main", "1111111111111111111111111111111111111111");
+        let subdir = repo.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let resolved = resolve_project_root(&subdir).unwrap();
+        let context = &resolved.worktree_context;
+
+        assert_eq!(context.state_root, repo);
+        assert_eq!(context.source_root, repo);
+        assert_eq!(context.main_worktree_root, repo);
+        assert_eq!(context.worktree_role, WorktreeRole::Main);
+        assert_eq!(
+            context.git_dir,
+            Some(context.main_worktree_root.join(".git"))
+        );
+        assert_eq!(context.common_git_dir, context.git_dir);
+        assert_eq!(context.branch_name.as_deref(), Some("main"));
+        assert_eq!(context.branch_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            context.head_oid.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(context.branch_status, BranchStatus::Named);
+        assert_eq!(context.context_id.len(), 32);
+        assert_eq!(
+            resolve_project_root(&subdir)
+                .unwrap()
+                .worktree_context
+                .context_id,
+            context.context_id
+        );
+    }
+
+    #[test]
+    fn resolve_project_root_exposes_linked_worktree_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let main_repo = tmp_root.join("main");
+        let worktree = tmp_root.join("worktree");
+        write_main_git_branch(
+            &main_repo,
+            "main",
+            "1111111111111111111111111111111111111111",
+        );
+        write_linked_worktree_branch(
+            &main_repo,
+            &worktree,
+            "feature",
+            "2222222222222222222222222222222222222222",
+        );
+
+        let resolved = resolve_project_root(&worktree).unwrap();
+        let context = &resolved.worktree_context;
+
+        assert_eq!(resolved.state_root, main_repo);
+        assert_eq!(resolved.source_root, worktree);
+        assert_eq!(context.state_root, main_repo);
+        assert_eq!(context.source_root, worktree);
+        assert_eq!(context.main_worktree_root, main_repo);
+        assert_eq!(context.worktree_role, WorktreeRole::Linked);
+        assert_eq!(
+            context.git_dir,
+            Some(main_repo.join(".git").join("worktrees").join("feature"))
+        );
+        assert_eq!(context.common_git_dir, Some(main_repo.join(".git")));
+        assert_eq!(context.branch_name.as_deref(), Some("feature"));
+        assert_eq!(context.branch_ref.as_deref(), Some("refs/heads/feature"));
+        assert_eq!(
+            context.head_oid.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(context.branch_status, BranchStatus::Named);
+        assert_eq!(context.context_id.len(), 32);
+    }
+
+    #[test]
+    fn resolve_project_root_exposes_detached_branch_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let git_dir = repo.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("HEAD"),
+            "3333333333333333333333333333333333333333\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_project_root(&repo).unwrap();
+        let context = &resolved.worktree_context;
+
+        assert_eq!(context.worktree_role, WorktreeRole::Main);
+        assert_eq!(context.branch_name, None);
+        assert_eq!(context.branch_ref, None);
+        assert_eq!(
+            context.head_oid.as_deref(),
+            Some("3333333333333333333333333333333333333333")
+        );
+        assert_eq!(context.branch_status, BranchStatus::Detached);
+    }
+
+    #[test]
+    fn resolve_project_root_exposes_unreadable_branch_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let resolved = resolve_project_root(&repo).unwrap();
+        let context = &resolved.worktree_context;
+
+        assert_eq!(context.worktree_role, WorktreeRole::Main);
+        assert_eq!(context.branch_name, None);
+        assert_eq!(context.branch_ref, None);
+        assert_eq!(context.head_oid, None);
+        assert_eq!(context.branch_status, BranchStatus::Unreadable);
+    }
+
+    #[test]
+    fn resolve_project_root_exposes_unknown_worktree_context_without_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("empty");
+        fs::create_dir_all(&root).unwrap();
+
+        let resolved = resolve_project_root(&root).unwrap();
+        let context = &resolved.worktree_context;
+
+        assert_eq!(context.state_root, root);
+        assert_eq!(context.source_root, root);
+        assert_eq!(context.main_worktree_root, root);
+        assert_eq!(context.worktree_role, WorktreeRole::Unknown);
+        assert_eq!(context.git_dir, None);
+        assert_eq!(context.common_git_dir, None);
+        assert_eq!(context.branch_name, None);
+        assert_eq!(context.branch_ref, None);
+        assert_eq!(context.head_oid, None);
+        assert_eq!(context.branch_status, BranchStatus::Unknown);
+    }
+
+    #[test]
     fn resolve_project_root_returns_canonical_when_no_project() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -620,5 +981,45 @@ mod tests {
 
         assert!(created_now);
         assert_eq!(read_project_id(&project_root).unwrap(), project_id);
+    }
+
+    fn write_main_git_branch(repo: &std::path::Path, branch: &str, oid: &str) {
+        let git_dir = repo.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+        write_ref(&git_dir, &format!("refs/heads/{branch}"), oid);
+    }
+
+    fn write_linked_worktree_branch(
+        main_repo: &std::path::Path,
+        worktree: &std::path::Path,
+        branch: &str,
+        oid: &str,
+    ) {
+        let worktree_git_dir = main_repo.join(".git").join("worktrees").join(branch);
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::create_dir_all(worktree).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..").unwrap();
+        fs::write(
+            worktree_git_dir.join("HEAD"),
+            format!("ref: refs/heads/{branch}\n"),
+        )
+        .unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        write_ref(
+            &main_repo.join(".git"),
+            &format!("refs/heads/{branch}"),
+            oid,
+        );
+    }
+
+    fn write_ref(git_dir: &std::path::Path, branch_ref: &str, oid: &str) {
+        let ref_path = git_dir.join(branch_ref);
+        fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+        fs::write(ref_path, format!("{oid}\n")).unwrap();
     }
 }

@@ -27,17 +27,16 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 
 §RULES
 - Configure MCP directly in the host's config.
-- Use `MAIN_ROOT` for the MCP path and repository instruction file.
-- If this checkout is a linked Git worktree, `MAIN_ROOT` is the main worktree root, not the linked worktree path.
+- Use `SOURCE_ROOT` for the MCP path and repository instruction file.
+- If this checkout is a linked Git worktree, keep the linked worktree path as `SOURCE_ROOT`.
+- `1up` stores shared index state in the main worktree automatically.
 - Do not try to restart this active host or verify newly added MCP tools from it.
 
 §PROC
-1. Resolve `MAIN_ROOT` as the main worktree root:
-   - If Git is available: run `git rev-parse --path-format=absolute --git-common-dir`.
-   - If the result ends with `/.git`, strip `/.git`; that path is `MAIN_ROOT`. Stop.
-   - Otherwise use `git rev-parse --show-toplevel`.
+1. Resolve `SOURCE_ROOT` as the active checkout root:
+   - If Git is available: run `git rev-parse --show-toplevel`.
    - If Git resolution fails, use `pwd -P`.
-   - Do not substitute the current linked worktree path after `MAIN_ROOT` is resolved.
+   - Do not replace a linked worktree path with the main worktree path for MCP config.
 2. Install/update `1up`:
    - If `1up` is not installed, install it with: `curl -fsSL https://1up.rp1.run/setup.sh | bash`
    - If present: `1up update`
@@ -45,10 +44,10 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 3. Add/update MCP config:
    - Server name: `oneup`
    - Command: `1up`
-   - Args: `["mcp", "--path", "<MAIN_ROOT>"]`
-   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<MAIN_ROOT>"]}}}`
+   - Args: `["mcp", "--path", "<SOURCE_ROOT>"]`
+   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<SOURCE_ROOT>"]}}}`
    - For TOML hosts, create the equivalent `oneup` server entry.
-4. Insert this minimal 1up hint into the repo instruction file under `MAIN_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
+4. Insert this minimal 1up hint into the repo instruction file under `SOURCE_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
 
   ```markdown
   For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
@@ -57,7 +56,7 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 5. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
 
 §OUT
-- `MAIN_ROOT`
+- `SOURCE_ROOT`
 - `1up --version`
 - MCP config file changed
 - repo instruction file changed
@@ -88,13 +87,13 @@ Verify the install:
 1up --version
 ```
 
-Then use the manual server identity, command, and args from the next section to connect a repository to your agent host.
+Then use the manual server identity, command, and args from the next section to connect a repository or active worktree to your agent host.
 
 ## Option 3: Manual MCP Config
 
 Manual setup is useful when a team wants to review config changes before applying them.
 
-The repo path is the full filesystem path to the folder this MCP server entry should search. For example, if your project is in `/Users/alex/code/my-app`, use that path in the config. A full path is safer than a relative path because your agent host may launch the MCP server from a different directory.
+The repo path is the full filesystem path to the folder this MCP server entry should search. For example, if your project is in `/Users/alex/code/my-app`, use that path in the config. If you are working in a linked Git worktree, use the linked worktree path; `1up` will keep shared state under the main worktree while indexing and searching the active worktree. A full path is safer than a relative path because your agent host may launch the MCP server from a different directory.
 
 The server identity is `oneup`. The command is `1up`. The args are `["mcp", "--path", "/Users/alex/code/my-app"]`.
 
@@ -182,6 +181,7 @@ A good agent flow looks like this:
 It can:
 
 - Build and refresh a local `.1up` index for the configured repository.
+- Share `.1up` state from the main worktree while keeping linked worktree results scoped to the active source root and branch context.
 - Search by intent with semantic and keyword ranking.
 - Return compact handles that agents can hydrate with `oneup_read`.
 - Follow symbols and references when a ranked search is not enough.
@@ -201,6 +201,7 @@ Host configuration remains owned by the host itself or by the user through manua
 
 - The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts.
 - On macOS and Linux, one background daemon can watch all registered projects. Connecting an MCP server or running `1up start` in another repository registers that project and asks the existing daemon to reload.
+- Linked Git worktrees share the main worktree `.1up` directory, but status, list, readiness, indexing, and search are scoped to the active worktree context.
 - Windows currently focuses on local indexing workflows rather than daemon-backed `start`.
 - If embeddings are unavailable, `1up` can fall back to full-text search instead of failing outright.
 - If the agent cannot see the `1up` binary, use an absolute binary path in the host config or launch the host from an environment where `1up --version` works.

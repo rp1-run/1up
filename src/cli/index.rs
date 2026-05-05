@@ -9,7 +9,9 @@ use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::fs::ensure_secure_project_root;
 use crate::shared::progress::{ProgressState, ProgressUi};
-use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat, SetupTimings};
+use crate::shared::types::{
+    IndexPhase, IndexProgress, IndexState, OutputFormat, SetupTimings, WorktreeContext,
+};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -85,14 +87,14 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
         std::path::Path::new(&args.path),
     )?;
     let project_root = resolved.state_root;
-    let source_root = resolved.source_root;
+    let worktree_context = resolved.worktree_context;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         args.jobs,
         args.embed_threads,
-        registry.indexing_config_for(&project_root),
+        registry.indexing_config_for_context(&worktree_context),
     )?;
 
     ensure_secure_project_root(&project_root)?;
@@ -100,7 +102,7 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
     if should_use_direct_watch_progress_ui(format) {
         let stats = run_index_once(
             &db_path,
-            &source_root,
+            &worktree_context,
             Some(&project_root),
             &indexing_config,
             true,
@@ -129,7 +131,7 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
 
     let result = run_index_once(
         &db_path,
-        &source_root,
+        &worktree_context,
         Some(&project_root),
         &indexing_config,
         false,
@@ -169,14 +171,14 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
         std::path::Path::new(&args.path),
     )?;
     let project_root = resolved.state_root;
-    let source_root = resolved.source_root;
+    let worktree_context = resolved.worktree_context;
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         args.jobs,
         args.embed_threads,
-        registry.indexing_config_for(&project_root),
+        registry.indexing_config_for_context(&worktree_context),
     )?;
     let show_progress_ui = format == OutputFormat::Human;
 
@@ -184,7 +186,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let stats = run_index_once(
         &db_path,
-        &source_root,
+        &worktree_context,
         Some(&project_root),
         &indexing_config,
         show_progress_ui,
@@ -210,7 +212,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
 async fn run_index_once(
     db_path: &std::path::Path,
-    project_root: &std::path::Path,
+    context: &WorktreeContext,
     state_root: Option<&std::path::Path>,
     indexing_config: &crate::shared::types::IndexingConfig,
     show_progress_ui: bool,
@@ -254,9 +256,9 @@ async fn run_index_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
-    pipeline::run_with_scope_setup_and_progress_root(
+    pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
-        project_root,
+        context,
         runtime.current_embedder(),
         &crate::shared::types::RunScope::Full,
         indexing_config,

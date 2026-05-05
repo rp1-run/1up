@@ -18,14 +18,17 @@ use crate::mcp::ops::{
 };
 use crate::mcp::server::OneupMcpServer;
 use crate::mcp::types::{
-    ImpactInput, NextAction, PrepareInput, PrepareMode, ReadInput, SearchInput, SymbolIncludeInput,
-    SymbolInput, ToolEnvelope,
+    ImpactInput, NextAction, PrepareInput, PrepareMode, ReadInput, ReadinessContextMetadata,
+    SearchInput, SymbolIncludeInput, SymbolInput, ToolEnvelope,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::config;
 use crate::shared::constants::MAX_SEARCH_RESULTS;
 use crate::shared::project;
-use crate::shared::types::{RunScope, SetupTimings};
+use crate::shared::types::{
+    BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, RunScope, SetupTimings,
+    WorktreeContext,
+};
 use crate::storage::db::Db;
 use crate::storage::schema;
 
@@ -51,16 +54,18 @@ impl OneupMcpServer {
             Err(err) => {
                 let path = input.path.as_deref().unwrap_or(".");
                 let payload = ops::blocked_readiness_for_path(path, err.to_string());
-                return result(readiness_result(payload));
+                return result(readiness_result(payload, None));
             }
         };
 
-        let payload = match prepare(&roots, input.mode).await {
+        let mut payload = match prepare(&roots, input.mode).await {
             Ok(payload) => payload,
             Err(err) => return indexed_tool_error(err.to_string()),
         };
+        apply_branch_readiness(&mut payload, &roots.worktree_context);
+        let metadata = readiness_context_metadata(&roots, &payload);
 
-        result(readiness_result(payload))
+        result(readiness_result(payload, Some(metadata)))
     }
 
     #[tool(
@@ -91,7 +96,14 @@ impl OneupMcpServer {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_RESULTS);
 
-        match ops::run_search(&roots.state_root, &input.query, limit).await {
+        match ops::run_search(
+            &roots.state_root,
+            &roots.worktree_context,
+            &input.query,
+            limit,
+        )
+        .await
+        {
             Ok(payload) => {
                 let summary = search_summary(&payload, &input.query);
                 let next_actions = search_next_actions(&payload);
@@ -198,7 +210,7 @@ impl OneupMcpServer {
             fuzzy: input.fuzzy,
         };
 
-        match ops::lookup_symbol(&roots.state_root, request).await {
+        match ops::lookup_symbol(&roots.state_root, &roots.worktree_context, request).await {
             Ok(payload) => {
                 let summary = symbol_summary(&payload, &input.name);
                 let next_actions = symbol_next_actions(&payload, &input.name);
@@ -247,7 +259,7 @@ impl OneupMcpServer {
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
 
-        match ops::explore_impact(&roots.state_root, request).await {
+        match ops::explore_impact(&roots.state_root, &roots.worktree_context, request).await {
             Ok(payload) => {
                 let summary = impact_summary(&payload);
                 let next_actions = impact_next_actions(&payload);
@@ -271,13 +283,22 @@ impl OneupMcpServer {
             None => Ok(McpProjectRoots {
                 state_root: self.state_root.clone(),
                 source_root: self.source_root.clone(),
+                worktree_context: crate::daemon::registry::registration_context(
+                    &self.state_root,
+                    &self.source_root,
+                ),
             }),
         }
     }
 }
 
 async fn prepare(roots: &McpProjectRoots, mode: PrepareMode) -> anyhow::Result<ReadinessPayload> {
-    let readiness = ops::classify_readiness(&roots.state_root, &roots.source_root).await;
+    let readiness = ops::classify_readiness(
+        &roots.state_root,
+        &roots.source_root,
+        &roots.worktree_context,
+    )
+    .await;
     match mode {
         PrepareMode::Check => Ok(readiness),
         PrepareMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
@@ -305,19 +326,30 @@ async fn run_index_then_classify(
         Err(err) => Ok(ops::blocked_readiness(
             &roots.state_root,
             &roots.source_root,
+            &roots.worktree_context,
             err.to_string(),
         )),
     }
 }
 
 async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
-    let mut payload = ops::classify_readiness(&roots.state_root, &roots.source_root).await;
+    let mut payload = ops::classify_readiness(
+        &roots.state_root,
+        &roots.source_root,
+        &roots.worktree_context,
+    )
+    .await;
     for _ in 0..20 {
         if payload.status != ReadinessStatus::Stale {
             return payload;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        payload = ops::classify_readiness(&roots.state_root, &roots.source_root).await;
+        payload = ops::classify_readiness(
+            &roots.state_root,
+            &roots.source_root,
+            &roots.worktree_context,
+        )
+        .await;
     }
     payload
 }
@@ -335,7 +367,7 @@ async fn run_index(
     let indexing_config = config::resolve_indexing_config(
         None,
         None,
-        registry.indexing_config_for(&roots.state_root),
+        registry.indexing_config_for_context(&roots.worktree_context),
     )?;
     let mut setup = SetupTimings::new(Instant::now());
 
@@ -356,9 +388,9 @@ async fn run_index(
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
-    pipeline::run_with_scope_setup_and_progress_root(
+    pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
-        &roots.source_root,
+        &roots.worktree_context,
         runtime.current_embedder(),
         &RunScope::Full,
         &indexing_config,
@@ -425,6 +457,64 @@ fn symbol_include(include: SymbolIncludeInput) -> SymbolInclude {
         SymbolIncludeInput::Definitions => SymbolInclude::Definitions,
         SymbolIncludeInput::References => SymbolInclude::References,
         SymbolIncludeInput::Both => SymbolInclude::Both,
+    }
+}
+
+fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeContext) {
+    if payload.status == ReadinessStatus::Ready && context.branch_status != BranchStatus::Named {
+        payload.status = ReadinessStatus::Degraded;
+        payload.summary =
+            "The index is readable, but the active branch context is ambiguous.".to_string();
+        payload.reason = Some(format!(
+            "branch_status is {}; search results may not be definitively branch-filtered",
+            context.branch_status.as_str()
+        ));
+    }
+}
+
+fn readiness_context_metadata(
+    roots: &McpProjectRoots,
+    payload: &ReadinessPayload,
+) -> ReadinessContextMetadata {
+    let context_status = crate::cli::project_status_files::read_daemon_context_status(
+        &roots.state_root,
+        &roots.worktree_context.context_id,
+    );
+    let last_update_state = context_status
+        .as_ref()
+        .map(|status| status.last_refresh_state)
+        .unwrap_or_else(|| {
+            match payload
+                .index_progress
+                .as_ref()
+                .map(|progress| progress.state)
+            {
+                Some(IndexState::Running) => DaemonRefreshState::Running,
+                Some(IndexState::Complete) => DaemonRefreshState::Complete,
+                _ => DaemonRefreshState::Unknown,
+            }
+        });
+
+    ReadinessContextMetadata {
+        context_id: roots.worktree_context.context_id.clone(),
+        main_worktree_root: roots.worktree_context.main_worktree_root.clone(),
+        worktree_role: roots.worktree_context.worktree_role,
+        branch_name: roots.worktree_context.branch_name.clone(),
+        branch_ref: roots.worktree_context.branch_ref.clone(),
+        branch_status: roots.worktree_context.branch_status,
+        head_oid: roots.worktree_context.head_oid.clone(),
+        watch_status: context_status
+            .as_ref()
+            .map(|status| status.watch_status)
+            .unwrap_or(DaemonWatchStatus::Unknown),
+        last_update_state,
+        last_update_started_at: context_status
+            .as_ref()
+            .and_then(|status| status.last_refresh_started_at.as_ref().cloned()),
+        last_update_completed_at: context_status
+            .as_ref()
+            .and_then(|status| status.last_refresh_completed_at.as_ref().cloned()),
+        last_update_error: context_status.and_then(|status| status.last_refresh_error),
     }
 }
 
@@ -879,15 +969,17 @@ fn indexed_tool_error(message: String) -> CallToolResult {
     )
 }
 
-fn readiness_result(payload: ReadinessPayload) -> ToolEnvelope {
+fn readiness_result(
+    payload: ReadinessPayload,
+    metadata: Option<ReadinessContextMetadata>,
+) -> ToolEnvelope {
     let status = status_string(&payload.status);
     let summary = payload.summary.clone();
-    envelope(
-        status,
-        summary,
-        payload_value(&payload),
-        readiness_next_actions(&payload),
-    )
+    let mut data = payload_value(&payload);
+    if let Some(metadata) = metadata {
+        merge_object_fields(&mut data, payload_value(&metadata));
+    }
+    envelope(status, summary, data, readiness_next_actions(&payload))
 }
 
 fn result(envelope: ToolEnvelope) -> CallToolResult {
@@ -949,6 +1041,16 @@ fn payload_value<T: Serialize>(payload: &T) -> Value {
             "serialization_error": err.to_string()
         })
     })
+}
+
+fn merge_object_fields(target: &mut Value, fields: Value) {
+    let (Some(target), Some(fields)) = (target.as_object_mut(), fields.as_object()) else {
+        return;
+    };
+
+    for (key, value) in fields {
+        target.insert(key.clone(), value.clone());
+    }
 }
 
 fn status_string<T: Serialize>(status: &T) -> String {

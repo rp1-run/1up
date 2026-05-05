@@ -7,6 +7,7 @@ use clap::Args;
 use crate::cli::lean;
 use crate::search::context::parse_location;
 use crate::search::impact::{ImpactAnchor, ImpactHorizonEngine, ImpactRequest};
+use crate::search::SearchScope;
 use crate::shared::config::project_db_path;
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -89,7 +90,10 @@ impl ImpactArgs {
 pub async fn exec(args: ImpactArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
+    let search_scope = SearchScope::from_worktree_context(&resolved.worktree_context);
     let db_path = project_db_path(&project_root);
+
+    warn_if_degraded_branch_context(&search_scope);
 
     if !db_path.exists() {
         bail!(
@@ -102,13 +106,19 @@ pub async fn exec(args: ImpactArgs) -> anyhow::Result<()> {
     let conn = db.connect()?;
     schema::ensure_current(&conn).await?;
 
-    let engine = ImpactHorizonEngine::new(&conn);
+    let engine = ImpactHorizonEngine::new_scoped(&conn, search_scope);
     let result = engine.explore(args.to_request()?).await?;
 
     let mut stdout = io::stdout().lock();
     lean::render_impact(&mut stdout, &result)?;
     stdout.flush()?;
     Ok(())
+}
+
+fn warn_if_degraded_branch_context(scope: &SearchScope) {
+    if let Some(reason) = scope.degraded_reason() {
+        eprintln!("warning: {reason}");
+    }
 }
 
 fn parse_file_anchor(raw: &str) -> anyhow::Result<ImpactAnchor> {

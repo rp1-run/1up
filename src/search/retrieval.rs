@@ -1,5 +1,6 @@
 use libsql::{Connection, Row};
 
+use crate::search::scope::SearchScope;
 use crate::shared::constants::VECTOR_PREFILTER_K;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
@@ -76,21 +77,32 @@ pub enum RetrievalBackend<'a> {
 
 pub struct SqlVectorV2<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
 pub struct FtsOnly<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
 impl<'a> RetrievalBackend<'a> {
+    #[allow(dead_code)]
     pub async fn select(
         conn: &'a Connection,
         query_embedding: Option<&[f32]>,
     ) -> Result<Self, OneupError> {
-        if query_embedding.is_some() && has_indexed_embeddings(conn).await? {
-            Ok(Self::SqlVectorV2(SqlVectorV2 { conn }))
+        Self::select_scoped(conn, query_embedding, SearchScope::default_context()).await
+    }
+
+    pub async fn select_scoped(
+        conn: &'a Connection,
+        query_embedding: Option<&[f32]>,
+        scope: SearchScope,
+    ) -> Result<Self, OneupError> {
+        if query_embedding.is_some() && has_indexed_embeddings(conn, &scope).await? {
+            Ok(Self::SqlVectorV2(SqlVectorV2 { conn, scope }))
         } else {
-            Ok(Self::FtsOnly(FtsOnly { conn }))
+            Ok(Self::FtsOnly(FtsOnly { conn, scope }))
         }
     }
 
@@ -131,8 +143,8 @@ impl<'a> SqlVectorV2<'a> {
         query_embedding: &[f32],
     ) -> Result<RetrievedCandidates, OneupError> {
         let (vector_results, fts_results) = tokio::try_join!(
-            fetch_vector_candidates(self.conn, query_embedding),
-            fetch_fts_candidates(self.conn, query),
+            fetch_vector_candidates(self.conn, &self.scope, query_embedding),
+            fetch_fts_candidates(self.conn, &self.scope, query),
         )?;
 
         Ok(RetrievedCandidates {
@@ -146,14 +158,20 @@ impl<'a> FtsOnly<'a> {
     async fn search(&self, query: &str) -> Result<RetrievedCandidates, OneupError> {
         Ok(RetrievedCandidates {
             vector_results: Vec::new(),
-            fts_results: fetch_fts_candidates(self.conn, query).await?,
+            fts_results: fetch_fts_candidates(self.conn, &self.scope, query).await?,
         })
     }
 }
 
-async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
+async fn has_indexed_embeddings(
+    conn: &Connection,
+    scope: &SearchScope,
+) -> Result<bool, OneupError> {
     let mut rows = conn
-        .query(queries::SELECT_HAS_INDEXED_EMBEDDINGS, ())
+        .query(
+            queries::SELECT_HAS_INDEXED_EMBEDDINGS_FOR_CONTEXT,
+            [scope.context_id()],
+        )
         .await
         .map_err(|e| {
             SearchError::QueryFailed(format!("failed to inspect indexed embeddings: {e}"))
@@ -171,13 +189,18 @@ async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
 
 async fn fetch_vector_candidates(
     conn: &Connection,
+    scope: &SearchScope,
     query_embedding: &[f32],
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let query_embedding = serialize_query_embedding(query_embedding)?;
     let mut rows = conn
         .query(
-            queries::SELECT_VECTOR_CANDIDATES,
-            libsql::params![query_embedding, VECTOR_PREFILTER_K as i64],
+            queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
+            libsql::params![
+                query_embedding,
+                VECTOR_PREFILTER_K as i64,
+                scope.context_id()
+            ],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
@@ -196,6 +219,7 @@ async fn fetch_vector_candidates(
 
 async fn fetch_fts_candidates(
     conn: &Connection,
+    scope: &SearchScope,
     query: &str,
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let fts_query = build_fts_query(query);
@@ -205,8 +229,8 @@ async fn fetch_fts_candidates(
 
     let mut rows = conn
         .query(
-            queries::SELECT_FTS_CANDIDATES,
-            libsql::params![fts_query, VECTOR_PREFILTER_K as i64],
+            queries::SELECT_FTS_CANDIDATES_FOR_CONTEXT,
+            libsql::params![fts_query, scope.context_id(), VECTOR_PREFILTER_K as i64],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
@@ -579,9 +603,10 @@ mod tests {
 
         // Query close to seg-3's dimension. seg-3 must rank top-1 through vector_top_k.
         let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
-        let candidates = fetch_vector_candidates(&conn, &query_embedding)
-            .await
-            .unwrap();
+        let candidates =
+            fetch_vector_candidates(&conn, &SearchScope::default_context(), &query_embedding)
+                .await
+                .unwrap();
 
         assert!(!candidates.is_empty(), "vector_top_k returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");

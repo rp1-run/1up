@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::cli::lean;
 use crate::daemon::{lifecycle, search_service};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
-use crate::search::HybridSearchEngine;
+use crate::search::{HybridSearchEngine, SearchScope};
 use crate::shared::config::project_db_path;
 use crate::shared::constants::VERSION;
 use crate::shared::project;
@@ -34,7 +34,10 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
+    let search_scope = SearchScope::from_worktree_context(&resolved.worktree_context);
     let db_path = project_db_path(&project_root);
+
+    warn_if_degraded_branch_context(&search_scope);
 
     if let Ok(pid) = project::read_project_id(&project_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root, &source_root) {
@@ -42,8 +45,14 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Some((results, daemon_version)) =
-        try_daemon_search(&project_root, &args.query, args.limit).await
+    if let Some((results, daemon_version)) = try_daemon_search(
+        &project_root,
+        &source_root,
+        search_scope.context_id(),
+        &args.query,
+        args.limit,
+    )
+    .await
     {
         write_results(&results)?;
         if let Some(ref dv) = daemon_version {
@@ -90,10 +99,11 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     }
 
     let results = if status.is_available() {
-        let mut engine = HybridSearchEngine::new(&conn, runtime.current_embedder());
+        let mut engine =
+            HybridSearchEngine::new_scoped(&conn, runtime.current_embedder(), search_scope.clone());
         engine.search(&args.query, args.limit).await?
     } else {
-        let engine = HybridSearchEngine::new(&conn, None);
+        let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope.clone());
         engine.fts_only_search(&args.query, args.limit).await?
     };
 
@@ -112,12 +122,14 @@ fn write_results(results: &[SearchResult]) -> anyhow::Result<()> {
 
 async fn try_daemon_search(
     project_root: &Path,
+    source_root: &Path,
+    context_id: &str,
     query: &str,
     limit: usize,
 ) -> Option<(Vec<SearchResult>, Option<String>)> {
     let result = tokio::time::timeout(
         DAEMON_SEARCH_TIMEOUT,
-        search_service::request_search(project_root, query, limit),
+        search_service::request_search(project_root, source_root, context_id, query, limit),
     )
     .await;
 
@@ -135,6 +147,12 @@ async fn try_daemon_search(
             tracing::debug!("daemon search timed out; falling back to local runtime");
             None
         }
+    }
+}
+
+fn warn_if_degraded_branch_context(scope: &SearchScope) {
+    if let Some(reason) = scope.degraded_reason() {
+        eprintln!("warning: {reason}");
     }
 }
 

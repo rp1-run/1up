@@ -16,8 +16,9 @@
 - Core discovery structs stay lean and handle-oriented: `SearchResult`, `SymbolResult`, `StructuralResult`, and `ContextResult` keep bodies only where needed for hydration (`src/shared/types.rs:58`, `src/cli/lean.rs`).
 - Impact uses stable envelopes: `status`, `resolved_anchor`, primary `results`, optional `contextual_results`, `hint`, and `refusal` (`src/search/impact.rs:145`).
 - MCP tools wrap every result in `ToolEnvelope { status, summary, data, next_actions }`; dynamic JSON fields get object schemas for host compatibility (`src/mcp/types.rs:85`, `tests/integration_tests.rs:1293`).
-- Indexing telemetry is typed and additive: `SetupTimings`, `IndexStageTimings`, `IndexScopeInfo`, `IndexPrefilterInfo`, and `IndexProgress` (`src/shared/types.rs:312`, `src/shared/types.rs:333`).
-- Storage keeps stable identity plus disambiguation evidence: symbols, relations, `lookup_canonical_symbol`, `qualifier_fingerprint`, `edge_identity_kind`, and `indexed_files` metadata (`src/storage/queries.rs:48`, `src/storage/queries.rs:85`).
+- Worktree state is explicit: `WorktreeContext` carries context id, state/source/main roots, worktree role, git dirs, branch name/ref/head, and branch status (`src/shared/types.rs:190`, `src/shared/project.rs:336`).
+- Indexing telemetry is typed and additive: `SetupTimings`, `IndexStageTimings`, `IndexScopeInfo`, `IndexPrefilterInfo`, and `IndexProgress`; current progress includes optional context id, source root, branch name, and branch status (`src/shared/types.rs:443`, `src/indexer/pipeline.rs:103`).
+- Storage keeps stable identity plus disambiguation evidence: `context_id`, symbols, relations, `lookup_canonical_symbol`, `qualifier_fingerprint`, `edge_identity_kind`, and `indexed_files` metadata (`src/storage/queries.rs:2`, `src/storage/queries.rs:72`).
 
 ## Error Handling
 
@@ -53,11 +54,14 @@
 ## Storage And I/O
 
 - SQL DDL and named queries live in `src/storage/queries.rs`; Rust storage modules call constants or build chunked multi-value statements from table-specific column counts.
-- Schema v12 stores embeddings as `FLOAT8(384)` and all vector writes/reads use `vector8(?)`; generic `vector(?)` is not used for the FLOAT8 column (`src/storage/queries.rs:30`, `src/storage/segments.rs:816`).
+- Schema v13 stores context-scoped rows for segments, symbols, relations, and indexed files, with `worktree_contexts` available for worktree metadata (`src/storage/queries.rs:2`, `src/storage/schema.rs:597`).
+- Segment ids are generated from `context_id`, file path, and line range so linked worktrees can share one DB without colliding on identical paths (`src/storage/segments.rs:87`, `src/indexer/pipeline.rs:617`).
+- Embeddings are stored as `FLOAT8(384)` and all vector writes/reads use `vector8(?)`; generic `vector(?)` is not used for the FLOAT8 column (`src/storage/queries.rs:48`, `src/storage/segments.rs:1142`).
 - Schema changes that alter storage format bump `SCHEMA_VERSION` and require explicit rebuild/reindex rather than in-place migration (`src/shared/constants.rs`, `src/storage/schema.rs:132`).
 - Project DB connections use tuned local PRAGMAs on write/indexing paths (`WAL`, `synchronous=NORMAL`, cache, mmap, memory temp store) (`src/storage/db.rs:76`).
-- Segment, vector, symbol, relation, and indexed-file manifest updates share transactional replace seams and rollback together (`src/storage/segments.rs:342`, `src/storage/segments.rs:740`).
-- File prefiltering uses `indexed_files` size/mtime metadata first, then content hash as the correctness backstop; full deletion detection unions manifest and segment paths (`src/indexer/pipeline.rs:355`).
+- Segment, vector, symbol, relation, and indexed-file manifest updates share context-aware transactional replace seams and rollback together (`src/storage/segments.rs:1089`, `src/storage/segments.rs:1551`).
+- File prefiltering uses context-scoped `indexed_files` size/mtime metadata first, then content hash as the correctness backstop; full deletion detection unions manifest and segment paths within the active context (`src/indexer/pipeline.rs:382`, `src/storage/segments.rs:1434`).
+- Status, readiness, and list counts use `count_files_for_context` and `count_segments_for_context`, not whole-DB totals (`src/storage/queries.rs:713`, `src/cli/status.rs:64`).
 - External HTTP I/O is wrapped in purpose-specific adapters with timeouts and verified artifacts for model/update/install flows (`src/indexer/embedder.rs`, `scripts/install/setup.sh`).
 
 ## Concurrency

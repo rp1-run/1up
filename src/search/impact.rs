@@ -6,6 +6,7 @@ use libsql::Connection;
 use serde::Serialize;
 
 use crate::search::retrieval::CandidateRow;
+use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS};
 use crate::shared::errors::{OneupError, SearchError};
@@ -16,11 +17,12 @@ use crate::shared::symbols::{
 };
 use crate::shared::types::SegmentRole;
 use crate::storage::relations::{
-    get_inbound_relations_by_lookup_symbol, get_outbound_relations, RelationKind, StoredRelation,
+    get_inbound_relations_by_lookup_symbol_for_context, get_outbound_relations_for_context,
+    RelationKind, StoredRelation,
 };
 use crate::storage::segments::{
-    get_segment_by_id, get_segment_by_prefix, get_segments_by_file, get_test_file_paths,
-    SegmentPrefixLookup, StoredSegment,
+    get_segment_by_id, get_segment_by_prefix_for_context, get_segments_by_file_for_context,
+    get_test_file_paths_for_context, SegmentPrefixLookup, StoredSegment,
 };
 
 const DEFAULT_IMPACT_DEPTH: usize = 2;
@@ -159,6 +161,7 @@ pub struct ImpactResultEnvelope {
 #[allow(dead_code)]
 pub struct ImpactHorizonEngine<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
 struct AnchorResolution {
@@ -220,7 +223,11 @@ struct FinalizedImpactResults {
 
 impl<'a> ImpactHorizonEngine<'a> {
     pub fn new(conn: &'a Connection) -> Self {
-        Self { conn }
+        Self::new_scoped(conn, SearchScope::default_context())
+    }
+
+    pub fn new_scoped(conn: &'a Connection, scope: SearchScope) -> Self {
+        Self { conn, scope }
     }
 
     pub async fn explore(
@@ -371,7 +378,9 @@ impl<'a> ImpactHorizonEngine<'a> {
         explicit_scope: Option<String>,
     ) -> Result<ResolveOutcome, OneupError> {
         let normalized_path = normalize_path(path);
-        let stored = get_segments_by_file(self.conn, &normalized_path).await?;
+        let stored =
+            get_segments_by_file_for_context(self.conn, self.scope.context_id(), &normalized_path)
+                .await?;
         if stored.is_empty() {
             return Ok(ResolveOutcome::Refused(refused_result(
                 "anchor_not_indexed",
@@ -441,7 +450,13 @@ impl<'a> ImpactHorizonEngine<'a> {
         id: &str,
         explicit_scope: Option<String>,
     ) -> Result<ResolveOutcome, OneupError> {
-        let segment = match get_segment_by_prefix(self.conn, id).await? {
+        let segment = match get_segment_by_prefix_for_context(
+            self.conn,
+            self.scope.context_id(),
+            id,
+        )
+        .await?
+        {
             SegmentPrefixLookup::Found(segment) => *segment,
             SegmentPrefixLookup::NotFound => {
                 return Ok(ResolveOutcome::Refused(refused_result(
@@ -511,7 +526,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         name: &str,
         explicit_scope: Option<String>,
     ) -> Result<ResolveOutcome, OneupError> {
-        let engine = SymbolSearchEngine::new(self.conn);
+        let engine = SymbolSearchEngine::new_scoped(self.conn, self.scope.clone());
         let mut seeds = engine.find_definition_candidates(name, true).await?;
         if let Some(scope) = explicit_scope.as_deref() {
             seeds.retain(|candidate| scope_matches(&candidate.file_path, Some(scope)));
@@ -716,8 +731,9 @@ impl<'a> ImpactHorizonEngine<'a> {
                 break;
             }
 
-            let mut fetched = get_outbound_relations(
+            let mut fetched = get_outbound_relations_for_context(
                 self.conn,
+                self.scope.context_id(),
                 source_segment_id,
                 Some(relation_kind),
                 remaining,
@@ -746,8 +762,9 @@ impl<'a> ImpactHorizonEngine<'a> {
                 break;
             }
 
-            let mut fetched = get_inbound_relations_by_lookup_symbol(
+            let mut fetched = get_inbound_relations_by_lookup_symbol_for_context(
                 self.conn,
+                self.scope.context_id(),
                 lookup_symbol,
                 Some(relation_kind),
                 *remaining,
@@ -774,7 +791,13 @@ impl<'a> ImpactHorizonEngine<'a> {
                 continue;
             }
 
-            for sibling in get_segments_by_file(self.conn, &seed.file_path).await? {
+            for sibling in get_segments_by_file_for_context(
+                self.conn,
+                self.scope.context_id(),
+                &seed.file_path,
+            )
+            .await?
+            {
                 let candidate = candidate_from_stored_segment(sibling);
                 if seed_ids.contains(&candidate.segment_id)
                     || !scope_matches(&candidate.file_path, scope)
@@ -819,8 +842,9 @@ impl<'a> ImpactHorizonEngine<'a> {
             .filter(|symbol| !symbol.is_empty())
             .collect();
 
-        let mut candidate_files = get_test_file_paths(
+        let mut candidate_files = get_test_file_paths_for_context(
             self.conn,
+            self.scope.context_id(),
             scope,
             max_files.saturating_mul(TEST_FILE_QUERY_FACTOR),
         )
@@ -844,7 +868,10 @@ impl<'a> ImpactHorizonEngine<'a> {
                 continue;
             }
 
-            for segment in get_segments_by_file(self.conn, &file_path).await? {
+            for segment in
+                get_segments_by_file_for_context(self.conn, self.scope.context_id(), &file_path)
+                    .await?
+            {
                 if observations.len() >= max_observations {
                     break;
                 }
@@ -895,7 +922,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         relation: &StoredRelation,
         scope: Option<&str>,
     ) -> Result<Vec<CandidateRow>, OneupError> {
-        let engine = SymbolSearchEngine::new(self.conn);
+        let engine = SymbolSearchEngine::new_scoped(self.conn, self.scope.clone());
         let mut candidates = engine
             .find_definition_candidates_by_canonical(&relation.lookup_canonical_symbol)
             .await?;
@@ -975,7 +1002,7 @@ impl<'a> ImpactHorizonEngine<'a> {
             return Ok(vec![source_candidate.clone()]);
         }
 
-        let engine = SymbolSearchEngine::new(self.conn);
+        let engine = SymbolSearchEngine::new_scoped(self.conn, self.scope.clone());
         let mut emitted = Vec::new();
         let mut seen = HashSet::new();
 
@@ -2191,7 +2218,7 @@ fn normalized_stem(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::types::{ParsedRelation, ParsedRelationKind};
+    use crate::shared::types::{BranchStatus, ParsedRelation, ParsedRelationKind};
     use crate::storage::{db::Db, schema, segments};
 
     struct SegmentFixture<'a> {
@@ -2256,6 +2283,116 @@ mod tests {
         for segment in segments_to_insert {
             segments::upsert_segment(conn, &segment).await.unwrap();
         }
+    }
+
+    async fn insert_segments_for_context(
+        conn: &Connection,
+        context_id: &str,
+        segments_to_insert: Vec<segments::SegmentInsert>,
+    ) {
+        for segment in segments_to_insert {
+            segments::upsert_segment_for_context(conn, context_id, &segment)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn impact_expansion_filters_relations_to_active_context() {
+        let (_db, conn) = setup().await;
+        insert_segments_for_context(
+            &conn,
+            "ctx-main",
+            vec![
+                make_segment(SegmentFixture {
+                    id: "target-main",
+                    file_path: "src/main/target.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Target"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "caller-main",
+                        file_path: "src/main/caller.rs",
+                        line_start: 10,
+                        block_type: "function",
+                        role: "ORCHESTRATION",
+                        defined_symbols: &["call_main"],
+                        referenced_symbols: &["Target"],
+                        called_symbols: &["Target"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Target".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Call),
+                    }],
+                ),
+            ],
+        )
+        .await;
+        insert_segments_for_context(
+            &conn,
+            "ctx-other",
+            vec![
+                make_segment(SegmentFixture {
+                    id: "target-other",
+                    file_path: "src/other/target.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["Target"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_called_relations(
+                    SegmentFixture {
+                        id: "caller-other",
+                        file_path: "src/other/caller.rs",
+                        line_start: 10,
+                        block_type: "function",
+                        role: "ORCHESTRATION",
+                        defined_symbols: &["call_other"],
+                        referenced_symbols: &["Target"],
+                        called_symbols: &["Target"],
+                    },
+                    &[ParsedRelation {
+                        symbol: "Target".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Call),
+                    }],
+                ),
+            ],
+        )
+        .await;
+
+        let engine = ImpactHorizonEngine::new_scoped(
+            &conn,
+            SearchScope::new("ctx-main", BranchStatus::Named),
+        );
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "Target".to_string(),
+                },
+                scope: None,
+                depth: 1,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        let ids = result
+            .results
+            .iter()
+            .chain(result.contextual_results.iter().flatten())
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"caller-main"));
+        assert!(!ids.contains(&"caller-other"));
     }
 
     #[tokio::test]

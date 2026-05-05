@@ -12,6 +12,7 @@ const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
 const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("table", "worktree_contexts"),
     ("table", "segments"),
     ("table", "segment_vectors"),
     ("table", "segment_symbols"),
@@ -20,6 +21,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "segments_fts"),
     ("table", "meta"),
     ("index", "idx_segments_file_path"),
+    ("index", "idx_segments_context_file_path"),
     ("index", "idx_segments_language"),
     ("index", "idx_segments_file_hash"),
     ("index", "idx_segment_vectors_embedding"),
@@ -28,6 +30,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segment_relations_source"),
     ("index", "idx_segment_relations_target"),
     ("index", "idx_segment_relations_lookup_target"),
+    ("index", "idx_indexed_files_context_path"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
@@ -39,15 +42,18 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{};{}",
+        queries::CREATE_WORKTREE_CONTEXTS_TABLE,
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
+        queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
         queries::CREATE_SEGMENT_VECTORS_TABLE,
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
         queries::CREATE_SEGMENT_RELATIONS_TABLE,
         queries::CREATE_INDEXED_FILES_TABLE,
+        queries::CREATE_INDEX_INDEXED_FILES_CONTEXT_PATH,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
@@ -304,6 +310,19 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
         return Err(reindex_required(format!(
             "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.embedding_vec`)"
         )));
+    }
+
+    for (table_name, column_name) in [
+        ("segments", "context_id"),
+        ("indexed_files", "context_id"),
+        ("segment_symbols", "context_id"),
+        ("segment_relations", "context_id"),
+    ] {
+        if !table_has_column(conn, table_name, column_name).await? {
+            return Err(reindex_required(format!(
+                "index schema v{SCHEMA_VERSION} is incomplete (missing required column `{table_name}.{column_name}`)"
+            )));
+        }
     }
 
     if !table_has_column(conn, "segment_relations", "lookup_canonical_symbol").await? {
@@ -568,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_v12() {
+    async fn prepare_for_write_initializes_v13() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -577,9 +596,17 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
+        assert!(schema_object_exists(&conn, "table", "worktree_contexts")
+            .await
+            .unwrap());
         assert!(
             schema_object_exists(&conn, "index", "idx_segment_vectors_embedding")
+                .await
+                .unwrap()
+        );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segments_context_file_path")
                 .await
                 .unwrap()
         );
@@ -622,10 +649,27 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            schema_object_exists(&conn, "index", "idx_indexed_files_context_path")
+                .await
+                .unwrap()
+        );
         assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
             .await
             .unwrap());
         assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
+        assert!(table_has_column(&conn, "segments", "context_id")
+            .await
+            .unwrap());
+        assert!(table_has_column(&conn, "indexed_files", "context_id")
+            .await
+            .unwrap());
+        assert!(table_has_column(&conn, "segment_symbols", "context_id")
+            .await
+            .unwrap());
+        assert!(table_has_column(&conn, "segment_relations", "context_id")
+            .await
+            .unwrap());
         assert!(
             table_has_column(&conn, "segment_relations", "lookup_canonical_symbol")
                 .await
@@ -660,17 +704,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v12_schema() {
+    async fn prepare_for_write_rejects_pre_v13_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "11"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "12"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v11, expected v12"));
+        assert!(msg.contains("found v12, expected v13"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
@@ -722,15 +766,18 @@ mod tests {
         conn.execute_batch(queries::DROP_SEARCH_SCHEMA)
             .await
             .unwrap();
-        conn.execute_batch(&format!(
-            "{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
-            queries::CREATE_SEGMENTS_TABLE,
-            queries::CREATE_INDEX_FILE_PATH,
-            queries::CREATE_INDEX_LANGUAGE,
-            queries::CREATE_INDEX_FILE_HASH,
-            queries::CREATE_SEGMENT_VECTORS_TABLE,
-            queries::CREATE_SEGMENT_SYMBOLS_TABLE,
-            "CREATE TABLE segment_relations (
+        conn.execute_batch(
+            &[
+                queries::CREATE_WORKTREE_CONTEXTS_TABLE,
+                queries::CREATE_SEGMENTS_TABLE,
+                queries::CREATE_INDEX_FILE_PATH,
+                queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
+                queries::CREATE_INDEX_LANGUAGE,
+                queries::CREATE_INDEX_FILE_HASH,
+                queries::CREATE_SEGMENT_VECTORS_TABLE,
+                queries::CREATE_SEGMENT_SYMBOLS_TABLE,
+                "CREATE TABLE segment_relations (
+                context_id TEXT NOT NULL DEFAULT 'default',
                 source_segment_id TEXT NOT NULL,
                 relation_kind TEXT NOT NULL,
                 raw_target_symbol TEXT NOT NULL,
@@ -739,23 +786,27 @@ mod tests {
                 qualifier_fingerprint TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (
+                    context_id,
                     source_segment_id,
                     relation_kind,
                     canonical_target_symbol,
                     raw_target_symbol
                 )
             )",
-            queries::CREATE_INDEXED_FILES_TABLE,
-            queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
-            queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
-            queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
-            queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
-            queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
-            queries::CREATE_FTS_TABLE,
-            queries::CREATE_FTS_TRIGGERS,
-            queries::CREATE_SEGMENT_SYMBOLS_TRIGGER,
-            queries::CREATE_META_TABLE,
-        ))
+                queries::CREATE_INDEXED_FILES_TABLE,
+                queries::CREATE_INDEX_INDEXED_FILES_CONTEXT_PATH,
+                queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
+                queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
+                queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
+                queries::CREATE_INDEX_SEGMENT_RELATIONS_TARGET,
+                queries::CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET,
+                queries::CREATE_FTS_TABLE,
+                queries::CREATE_FTS_TRIGGERS,
+                queries::CREATE_SEGMENT_SYMBOLS_TRIGGER,
+                queries::CREATE_META_TABLE,
+            ]
+            .join(";"),
+        )
         .await
         .unwrap();
         conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())

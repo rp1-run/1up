@@ -5,6 +5,7 @@ use std::fmt::Write;
 
 use libsql::Connection;
 
+use crate::shared::constants::DEFAULT_INDEX_CONTEXT_ID;
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::symbols::{
     normalize_edge_identity_kind, normalize_symbolish, owner_fingerprint_from_components,
@@ -146,6 +147,23 @@ pub async fn get_outbound_relations(
     relation_kind: Option<RelationKind>,
     limit: usize,
 ) -> Result<Vec<StoredRelation>, OneupError> {
+    get_outbound_relations_for_context(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        source_segment_id,
+        relation_kind,
+        limit,
+    )
+    .await
+}
+
+pub async fn get_outbound_relations_for_context(
+    conn: &Connection,
+    context_id: &str,
+    source_segment_id: &str,
+    relation_kind: Option<RelationKind>,
+    limit: usize,
+) -> Result<Vec<StoredRelation>, OneupError> {
     let Some(limit) = relation_limit(limit)? else {
         return Ok(Vec::new());
     };
@@ -153,15 +171,15 @@ pub async fn get_outbound_relations(
     let mut rows = match relation_kind {
         Some(relation_kind) => conn
             .query(
-                queries::SELECT_OUTBOUND_RELATIONS_BY_KIND,
-                libsql::params![source_segment_id, relation_kind.as_str(), limit],
+                queries::SELECT_OUTBOUND_RELATIONS_BY_KIND_FOR_CONTEXT,
+                libsql::params![context_id, source_segment_id, relation_kind.as_str(), limit],
             )
             .await
             .map_err(|e| StorageError::Query(format!("outbound relation lookup failed: {e}")))?,
         None => conn
             .query(
-                queries::SELECT_OUTBOUND_RELATIONS,
-                libsql::params![source_segment_id, limit],
+                queries::SELECT_OUTBOUND_RELATIONS_FOR_CONTEXT,
+                libsql::params![context_id, source_segment_id, limit],
             )
             .await
             .map_err(|e| StorageError::Query(format!("outbound relation lookup failed: {e}")))?,
@@ -185,6 +203,23 @@ pub async fn get_inbound_relations(
     relation_kind: Option<RelationKind>,
     limit: usize,
 ) -> Result<Vec<StoredRelation>, OneupError> {
+    get_inbound_relations_for_context(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        canonical_target_symbol,
+        relation_kind,
+        limit,
+    )
+    .await
+}
+
+pub async fn get_inbound_relations_for_context(
+    conn: &Connection,
+    context_id: &str,
+    canonical_target_symbol: &str,
+    relation_kind: Option<RelationKind>,
+    limit: usize,
+) -> Result<Vec<StoredRelation>, OneupError> {
     let Some(limit) = relation_limit(limit)? else {
         return Ok(Vec::new());
     };
@@ -192,15 +227,20 @@ pub async fn get_inbound_relations(
     let mut rows = match relation_kind {
         Some(relation_kind) => conn
             .query(
-                queries::SELECT_INBOUND_RELATIONS_BY_KIND,
-                libsql::params![canonical_target_symbol, relation_kind.as_str(), limit],
+                queries::SELECT_INBOUND_RELATIONS_BY_KIND_FOR_CONTEXT,
+                libsql::params![
+                    context_id,
+                    canonical_target_symbol,
+                    relation_kind.as_str(),
+                    limit
+                ],
             )
             .await
             .map_err(|e| StorageError::Query(format!("inbound relation lookup failed: {e}")))?,
         None => conn
             .query(
-                queries::SELECT_INBOUND_RELATIONS,
-                libsql::params![canonical_target_symbol, limit],
+                queries::SELECT_INBOUND_RELATIONS_FOR_CONTEXT,
+                libsql::params![context_id, canonical_target_symbol, limit],
             )
             .await
             .map_err(|e| StorageError::Query(format!("inbound relation lookup failed: {e}")))?,
@@ -225,6 +265,23 @@ pub async fn get_inbound_relations_by_lookup_symbol(
     relation_kind: Option<RelationKind>,
     limit: usize,
 ) -> Result<Vec<StoredRelation>, OneupError> {
+    get_inbound_relations_by_lookup_symbol_for_context(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        lookup_canonical_symbol,
+        relation_kind,
+        limit,
+    )
+    .await
+}
+
+pub async fn get_inbound_relations_by_lookup_symbol_for_context(
+    conn: &Connection,
+    context_id: &str,
+    lookup_canonical_symbol: &str,
+    relation_kind: Option<RelationKind>,
+    limit: usize,
+) -> Result<Vec<StoredRelation>, OneupError> {
     let Some(limit) = relation_limit(limit)? else {
         return Ok(Vec::new());
     };
@@ -232,8 +289,13 @@ pub async fn get_inbound_relations_by_lookup_symbol(
     let mut rows = match relation_kind {
         Some(relation_kind) => conn
             .query(
-                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND,
-                libsql::params![lookup_canonical_symbol, relation_kind.as_str(), limit],
+                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND_FOR_CONTEXT,
+                libsql::params![
+                    context_id,
+                    lookup_canonical_symbol,
+                    relation_kind.as_str(),
+                    limit
+                ],
             )
             .await
             .map_err(|e| {
@@ -241,8 +303,8 @@ pub async fn get_inbound_relations_by_lookup_symbol(
             })?,
         None => conn
             .query(
-                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL,
-                libsql::params![lookup_canonical_symbol, limit],
+                queries::SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_FOR_CONTEXT,
+                libsql::params![context_id, lookup_canonical_symbol, limit],
             )
             .await
             .map_err(|e| {

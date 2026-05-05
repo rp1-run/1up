@@ -7,7 +7,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::shared::progress::{ProgressState, ProgressUi};
-use crate::shared::types::{IndexPhase, IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{
+    BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexPhase, IndexProgress, IndexState,
+    OutputFormat, WorktreeRole,
+};
 use crate::shared::update::{InstallChannel, UpdateStatus};
 
 /// Rendering contract for the maintenance command surface (`start`, `stop`,
@@ -100,6 +103,18 @@ pub struct StatusInfo {
     pub project_id: Option<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
+    pub context_id: String,
+    pub main_worktree_root: PathBuf,
+    pub worktree_role: WorktreeRole,
+    pub branch_name: Option<String>,
+    pub branch_ref: Option<String>,
+    pub branch_status: BranchStatus,
+    pub head_oid: Option<String>,
+    pub watch_status: DaemonWatchStatus,
+    pub last_update_state: DaemonRefreshState,
+    pub last_update_started_at: Option<DateTime<Utc>>,
+    pub last_update_completed_at: Option<DateTime<Utc>>,
+    pub last_update_error: Option<String>,
     pub index_present: bool,
     pub index_readable: bool,
     pub last_file_check_at: Option<DateTime<Utc>>,
@@ -147,6 +162,18 @@ pub struct ProjectListItem {
     pub state: LifecycleState,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
+    pub context_id: String,
+    pub main_worktree_root: PathBuf,
+    pub worktree_role: WorktreeRole,
+    pub branch_name: Option<String>,
+    pub branch_ref: Option<String>,
+    pub branch_status: BranchStatus,
+    pub head_oid: Option<String>,
+    pub watch_status: DaemonWatchStatus,
+    pub last_update_state: DaemonRefreshState,
+    pub last_update_started_at: Option<DateTime<Utc>>,
+    pub last_update_completed_at: Option<DateTime<Utc>>,
+    pub last_update_error: Option<String>,
     pub registered_at: String,
     pub daemon_running: bool,
     pub index_status: ProjectListIndexStatus,
@@ -350,6 +377,18 @@ impl Formatter for JsonFormatter {
             "project_id": &status.project_id,
             "project_root": &status.project_root,
             "source_root": &status.source_root,
+            "context_id": &status.context_id,
+            "main_worktree_root": &status.main_worktree_root,
+            "worktree_role": status.worktree_role,
+            "branch_name": &status.branch_name,
+            "branch_ref": &status.branch_ref,
+            "branch_status": status.branch_status,
+            "head_oid": &status.head_oid,
+            "watch_status": status.watch_status,
+            "last_update_state": status.last_update_state,
+            "last_update_started_at": &status.last_update_started_at,
+            "last_update_completed_at": &status.last_update_completed_at,
+            "last_update_error": &status.last_update_error,
             "index_status": render_index_health_plain(status),
             "last_file_check_at": status.last_file_check_at,
             "index_progress": &status.index_progress,
@@ -577,6 +616,31 @@ impl Formatter for HumanFormatter {
             status.project_root.display()
         ));
         out.push_str(&format!("Source root: {}\n", status.source_root.display()));
+        out.push_str(&format!(
+            "Main worktree: {}\n",
+            status.main_worktree_root.display()
+        ));
+        out.push_str(&format!(
+            "Worktree: {}\n",
+            render_worktree_role_plain(status.worktree_role)
+        ));
+        out.push_str(&format!(
+            "Branch: {} ({})\n",
+            render_branch_label(&status.branch_name, status.branch_status),
+            status.branch_status.as_str()
+        ));
+        out.push_str(&format!(
+            "Watch: {}\n",
+            render_watch_status_plain(status.watch_status)
+        ));
+        out.push_str(&format!(
+            "Last update: {}\n",
+            render_last_update_human(
+                status.last_update_state,
+                status.last_update_completed_at.as_ref(),
+                status.last_update_error.as_deref()
+            )
+        ));
         out.push_str(&format!("Index: {}\n", render_index_health_human(status)));
         if let Some(last_file_check_at) = &status.last_file_check_at {
             out.push_str(&format!(
@@ -1109,6 +1173,7 @@ impl Formatter for PlainFormatter {
             }
             out.push_str(&format!("\tupdated:{}", progress.updated_at.to_rfc3339()));
         }
+        append_status_context_plain(&mut out, status);
         out.push('\n');
         out
     }
@@ -1138,7 +1203,7 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for project in &projects.projects {
             out.push_str(&format!(
-                "project:{}\tstate:{}\tproject_root:{}\tsource_root:{}\tindex:{}\tfiles:{}\tsegments:{}\tlast_file_check:{}\tregistered_at:{}\n",
+                "project:{}\tstate:{}\tproject_root:{}\tsource_root:{}\tindex:{}\tfiles:{}\tsegments:{}\tlast_file_check:{}\tregistered_at:{}\tmain_worktree:{}\tworktree_role:{}\tbranch:{}\tbranch_status:{}\twatch:{}\tlast_update:{}\n",
                 plain_field(&project.project_id),
                 project.state.as_str(),
                 plain_field(&project.project_root.display().to_string()),
@@ -1148,6 +1213,12 @@ impl Formatter for PlainFormatter {
                 render_optional_count(project.segments),
                 render_optional_time(project.last_file_check_at.as_ref()),
                 project.registered_at,
+                plain_field(&project.main_worktree_root.display().to_string()),
+                render_worktree_role_plain(project.worktree_role),
+                plain_field(&render_branch_label(&project.branch_name, project.branch_status)),
+                project.branch_status.as_str(),
+                render_watch_status_plain(project.watch_status),
+                render_update_state_plain(project.last_update_state),
             ));
         }
         out
@@ -1587,6 +1658,70 @@ fn render_optional_path_plain(value: Option<&PathBuf>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+fn append_status_context_plain(out: &mut String, status: &StatusInfo) {
+    out.push_str(&format!(
+        "\tmain_worktree:{}\tworktree_role:{}\tbranch:{}\tbranch_status:{}\twatch:{}\tlast_update:{}",
+        plain_field(&status.main_worktree_root.display().to_string()),
+        render_worktree_role_plain(status.worktree_role),
+        plain_field(&render_branch_label(&status.branch_name, status.branch_status)),
+        status.branch_status.as_str(),
+        render_watch_status_plain(status.watch_status),
+        render_update_state_plain(status.last_update_state),
+    ));
+}
+
+fn render_worktree_role_plain(role: WorktreeRole) -> &'static str {
+    match role {
+        WorktreeRole::Main => "main",
+        WorktreeRole::Linked => "linked",
+        WorktreeRole::Unknown => "unknown",
+    }
+}
+
+fn render_branch_label(branch_name: &Option<String>, status: BranchStatus) -> String {
+    branch_name.clone().unwrap_or_else(|| match status {
+        BranchStatus::Named => "unknown".to_string(),
+        BranchStatus::Detached => "detached".to_string(),
+        BranchStatus::Unreadable => "unreadable".to_string(),
+        BranchStatus::Unknown => "unknown".to_string(),
+    })
+}
+
+fn render_watch_status_plain(status: DaemonWatchStatus) -> &'static str {
+    match status {
+        DaemonWatchStatus::Watching => "watching",
+        DaemonWatchStatus::DaemonStopped => "stopped",
+        DaemonWatchStatus::SourceMissing => "source_missing",
+        DaemonWatchStatus::Unsupported => "unsupported",
+        DaemonWatchStatus::Unknown => "unknown",
+    }
+}
+
+fn render_update_state_plain(state: DaemonRefreshState) -> &'static str {
+    match state {
+        DaemonRefreshState::Pending => "pending",
+        DaemonRefreshState::Running => "running",
+        DaemonRefreshState::Complete => "complete",
+        DaemonRefreshState::Failed => "failed",
+        DaemonRefreshState::Unknown => "unknown",
+    }
+}
+
+fn render_last_update_human(
+    state: DaemonRefreshState,
+    completed_at: Option<&DateTime<Utc>>,
+    error: Option<&str>,
+) -> String {
+    let label = render_update_state_plain(state);
+    match (state, completed_at, error) {
+        (DaemonRefreshState::Complete, Some(ts), _) => {
+            format!("{label} ({}, {})", render_time_ago(ts), ts.to_rfc3339())
+        }
+        (DaemonRefreshState::Failed, _, Some(error)) => format!("{label}: {error}"),
+        _ => label.to_string(),
+    }
+}
+
 fn render_start_index_plain(status: Option<ProjectListIndexStatus>) -> &'static str {
     status
         .map(ProjectListIndexStatus::as_str)
@@ -1635,6 +1770,10 @@ struct ProjectListRow {
     index: ProjectListIndexStatus,
     files: String,
     segments: String,
+    worktree: String,
+    branch: String,
+    watch: String,
+    update: String,
     path: String,
     checked: String,
 }
@@ -1647,6 +1786,13 @@ impl ProjectListRow {
             index: item.index_status,
             files: render_optional_count(item.files),
             segments: render_optional_count(item.segments),
+            worktree: render_worktree_role_plain(item.worktree_role).to_string(),
+            branch: ellipsize_middle(
+                &render_branch_label(&item.branch_name, item.branch_status),
+                18,
+            ),
+            watch: render_watch_status_plain(item.watch_status).to_string(),
+            update: render_update_state_plain(item.last_update_state).to_string(),
             path: render_project_list_path(&item.project_root, &item.source_root),
             checked: item
                 .last_file_check_at
@@ -1664,6 +1810,10 @@ struct ProjectListWidths {
     index: usize,
     files: usize,
     segments: usize,
+    worktree: usize,
+    branch: usize,
+    watch: usize,
+    update: usize,
     path: usize,
     checked: usize,
 }
@@ -1676,6 +1826,10 @@ impl ProjectListWidths {
             index: "Index".len(),
             files: "Files".len(),
             segments: "Segments".len(),
+            worktree: "Worktree".len(),
+            branch: "Branch".len(),
+            watch: "Watch".len(),
+            update: "Update".len(),
             path: "Path".len(),
             checked: "Checked".len(),
         };
@@ -1686,6 +1840,10 @@ impl ProjectListWidths {
             widths.index = widths.index.max(row.index.as_str().len());
             widths.files = widths.files.max(row.files.len());
             widths.segments = widths.segments.max(row.segments.len());
+            widths.worktree = widths.worktree.max(row.worktree.len());
+            widths.branch = widths.branch.max(row.branch.len());
+            widths.watch = widths.watch.max(row.watch.len());
+            widths.update = widths.update.max(row.update.len());
             widths.path = widths.path.max(row.path.len());
             widths.checked = widths.checked.max(row.checked.len());
         }
@@ -1696,12 +1854,16 @@ impl ProjectListWidths {
 
 fn format_project_list_header(widths: &ProjectListWidths) -> String {
     format!(
-        "{:<project$}  {:<state$}  {:<index$}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
+        "{:<project$}  {:<state$}  {:<index$}  {:>files$}  {:>segments$}  {:<worktree$}  {:<branch$}  {:<watch$}  {:<update$}  {:<path$}  {:<checked$}\n",
         "Project",
         "State",
         "Index",
         "Files",
         "Segments",
+        "Worktree",
+        "Branch",
+        "Watch",
+        "Update",
         "Path",
         "Checked",
         project = widths.project,
@@ -1709,6 +1871,10 @@ fn format_project_list_header(widths: &ProjectListWidths) -> String {
         index = widths.index,
         files = widths.files,
         segments = widths.segments,
+        worktree = widths.worktree,
+        branch = widths.branch,
+        watch = widths.watch,
+        update = widths.update,
         path = widths.path,
         checked = widths.checked,
     )
@@ -1716,12 +1882,16 @@ fn format_project_list_header(widths: &ProjectListWidths) -> String {
 
 fn format_project_list_separator(widths: &ProjectListWidths) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}  {}\n",
+        "{}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}\n",
         "-".repeat(widths.project),
         "-".repeat(widths.state),
         "-".repeat(widths.index),
         "-".repeat(widths.files),
         "-".repeat(widths.segments),
+        "-".repeat(widths.worktree),
+        "-".repeat(widths.branch),
+        "-".repeat(widths.watch),
+        "-".repeat(widths.update),
         "-".repeat(widths.path),
         "-".repeat(widths.checked),
     )
@@ -1729,17 +1899,25 @@ fn format_project_list_separator(widths: &ProjectListWidths) -> String {
 
 fn format_project_list_row(row: &ProjectListRow, widths: &ProjectListWidths) -> String {
     format!(
-        "{:<project$}  {}  {}  {:>files$}  {:>segments$}  {:<path$}  {:<checked$}\n",
+        "{:<project$}  {}  {}  {:>files$}  {:>segments$}  {:<worktree$}  {:<branch$}  {:<watch$}  {:<update$}  {:<path$}  {:<checked$}\n",
         row.project,
         render_project_list_state_cell(row.state, widths.state),
         render_project_list_index_cell(row.index, widths.index),
         row.files,
         row.segments,
+        row.worktree,
+        row.branch,
+        row.watch,
+        row.update,
         row.path,
         row.checked,
         project = widths.project,
         files = widths.files,
         segments = widths.segments,
+        worktree = widths.worktree,
+        branch = widths.branch,
+        watch = widths.watch,
+        update = widths.update,
         path = widths.path,
         checked = widths.checked,
     )
@@ -1792,7 +1970,7 @@ fn is_uuid_like(value: &str) -> bool {
 }
 
 fn render_project_list_path(project_root: &Path, source_root: &Path) -> String {
-    const MAX_PATH_WIDTH: usize = 56;
+    const MAX_PATH_WIDTH: usize = 24;
 
     let root = compact_display_path(project_root);
     let source = compact_display_path(source_root);
@@ -1883,12 +2061,19 @@ fn render_cache_age(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::types::{IndexParallelism, IndexStageTimings};
+    use crate::shared::types::{
+        BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexParallelism, IndexStageTimings,
+        WorktreeRole,
+    };
 
     fn sample_progress() -> IndexProgress {
         IndexProgress {
             state: IndexState::Complete,
             phase: IndexPhase::Complete,
+            context_id: Some("ctx-main".to_string()),
+            source_root: Some(PathBuf::from("/repo")),
+            branch_name: Some("main".to_string()),
+            branch_status: Some(crate::shared::types::BranchStatus::Named),
             files_total: 6,
             files_scanned: 6,
             files_processed: 6,
@@ -2148,6 +2333,18 @@ mod tests {
             project_id: Some("project-123".to_string()),
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
+            context_id: "ctx-main".to_string(),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: WorktreeRole::Main,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            branch_status: BranchStatus::Named,
+            head_oid: Some("abc123".to_string()),
+            watch_status: DaemonWatchStatus::Watching,
+            last_update_state: DaemonRefreshState::Complete,
+            last_update_started_at: None,
+            last_update_completed_at: Some(sample_progress().updated_at),
+            last_update_error: None,
             index_present: true,
             index_readable: true,
             last_file_check_at: Some(sample_progress().updated_at),
@@ -2161,6 +2358,12 @@ mod tests {
         assert!(rendered.contains("index_message:Processed 6 files"));
         assert!(rendered.contains("jobs_effective:3"));
         assert!(rendered.contains("total_ms:41"));
+        assert!(rendered.contains("main_worktree:/repo"));
+        assert!(rendered.contains("worktree_role:main"));
+        assert!(rendered.contains("branch:main"));
+        assert!(rendered.contains("branch_status:named"));
+        assert!(rendered.contains("watch:watching"));
+        assert!(rendered.contains("last_update:complete"));
         assert!(!rendered.contains("last_file_check_ago"));
         assert!(!rendered.contains("\tago:"));
         assert!(!rendered.contains('\u{1b}'));
@@ -2180,6 +2383,18 @@ mod tests {
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
+            context_id: "ctx-main".to_string(),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: WorktreeRole::Main,
+            branch_name: None,
+            branch_ref: None,
+            branch_status: BranchStatus::Unknown,
+            head_oid: None,
+            watch_status: DaemonWatchStatus::Unknown,
+            last_update_state: DaemonRefreshState::Unknown,
+            last_update_started_at: None,
+            last_update_completed_at: None,
+            last_update_error: None,
             index_present: false,
             index_readable: false,
             last_file_check_at: None,
@@ -2207,6 +2422,18 @@ mod tests {
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
+            context_id: "ctx-main".to_string(),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: WorktreeRole::Main,
+            branch_name: None,
+            branch_ref: None,
+            branch_status: BranchStatus::Unknown,
+            head_oid: None,
+            watch_status: DaemonWatchStatus::Unknown,
+            last_update_state: DaemonRefreshState::Unknown,
+            last_update_started_at: None,
+            last_update_completed_at: None,
+            last_update_error: None,
             index_present: false,
             index_readable: false,
             last_file_check_at: None,
@@ -2249,6 +2476,18 @@ mod tests {
                 state: LifecycleState::Active,
                 project_root: PathBuf::from("/repo"),
                 source_root: PathBuf::from("/repo/src"),
+                context_id: "ctx-linked".to_string(),
+                main_worktree_root: PathBuf::from("/repo"),
+                worktree_role: WorktreeRole::Linked,
+                branch_name: Some("feature".to_string()),
+                branch_ref: Some("refs/heads/feature".to_string()),
+                branch_status: BranchStatus::Named,
+                head_oid: Some("abc123".to_string()),
+                watch_status: DaemonWatchStatus::Watching,
+                last_update_state: DaemonRefreshState::Complete,
+                last_update_started_at: None,
+                last_update_completed_at: Some(sample_progress().updated_at),
+                last_update_error: None,
                 registered_at: "2026-05-01T00:00:00Z".to_string(),
                 daemon_running: true,
                 index_status: ProjectListIndexStatus::Ready,
@@ -2261,7 +2500,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "project:project-123\tstate:active\tproject_root:/repo\tsource_root:/repo/src\tindex:ready\tfiles:3\tsegments:14\tlast_file_check:2026-04-03T06:07:08+00:00\tregistered_at:2026-05-01T00:00:00Z\n"
+            "project:project-123\tstate:active\tproject_root:/repo\tsource_root:/repo/src\tindex:ready\tfiles:3\tsegments:14\tlast_file_check:2026-04-03T06:07:08+00:00\tregistered_at:2026-05-01T00:00:00Z\tmain_worktree:/repo\tworktree_role:linked\tbranch:feature\tbranch_status:named\twatch:watching\tlast_update:complete\n"
         );
         assert!(!rendered.contains('\u{1b}'));
     }
@@ -2286,6 +2525,18 @@ mod tests {
                 state: LifecycleState::Registered,
                 project_root: PathBuf::from("/repo"),
                 source_root: PathBuf::from("/repo/src"),
+                context_id: "ctx-linked".to_string(),
+                main_worktree_root: PathBuf::from("/repo"),
+                worktree_role: WorktreeRole::Linked,
+                branch_name: Some("feature".to_string()),
+                branch_ref: Some("refs/heads/feature".to_string()),
+                branch_status: BranchStatus::Named,
+                head_oid: Some("abc123".to_string()),
+                watch_status: DaemonWatchStatus::DaemonStopped,
+                last_update_state: DaemonRefreshState::Unknown,
+                last_update_started_at: None,
+                last_update_completed_at: None,
+                last_update_error: None,
                 registered_at: "2026-05-01T00:00:00Z".to_string(),
                 daemon_running: false,
                 index_status: ProjectListIndexStatus::NotBuilt,
@@ -2300,6 +2551,10 @@ mod tests {
         assert!(rendered.contains("Project"));
         assert!(rendered.contains("State"));
         assert!(rendered.contains("Index"));
+        assert!(rendered.contains("Worktree"));
+        assert!(rendered.contains("Branch"));
+        assert!(rendered.contains("Watch"));
+        assert!(rendered.contains("Update"));
         assert!(rendered.contains("Path"));
         assert!(rendered.contains("Checked"));
         assert!(!rendered.contains("Project root"));
@@ -2307,6 +2562,9 @@ mod tests {
         assert!(rendered.contains("project-123"));
         assert!(rendered.contains("registered"));
         assert!(rendered.contains("not_built"));
+        assert!(rendered.contains("linked"));
+        assert!(rendered.contains("feature"));
+        assert!(rendered.contains("stopped"));
         assert!(rendered.contains("/repo"));
         assert!(rendered.contains("/repo/src"));
         assert!(rendered.contains("unknown"));
@@ -2326,6 +2584,20 @@ mod tests {
                 source_root: PathBuf::from(
                     "/Users/prem/Development/some-very-long-project-name-with-extra-segments/worktree-feature-branch",
                 ),
+                context_id: "ctx-linked".to_string(),
+                main_worktree_root: PathBuf::from(
+                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments",
+                ),
+                worktree_role: WorktreeRole::Linked,
+                branch_name: Some("feature/very-long-branch-name".to_string()),
+                branch_ref: Some("refs/heads/feature/very-long-branch-name".to_string()),
+                branch_status: BranchStatus::Named,
+                head_oid: Some("abc123".to_string()),
+                watch_status: DaemonWatchStatus::Watching,
+                last_update_state: DaemonRefreshState::Complete,
+                last_update_started_at: None,
+                last_update_completed_at: Some(sample_progress().updated_at),
+                last_update_error: None,
                 registered_at: "2026-05-01T00:00:00Z".to_string(),
                 daemon_running: true,
                 index_status: ProjectListIndexStatus::Ready,

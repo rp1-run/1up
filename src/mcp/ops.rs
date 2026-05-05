@@ -9,19 +9,19 @@ use serde::Serialize;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
-use crate::search::{HybridSearchEngine, SymbolSearchEngine};
-use crate::shared::config::{project_daemon_status_path, project_db_path, project_dot_dir};
+use crate::search::{HybridSearchEngine, SearchScope, SymbolSearchEngine};
+use crate::shared::config::{project_db_path, project_dot_dir};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     ContextAccessScope, ContextResult, DaemonProjectStatus, IndexProgress, IndexState,
-    ReferenceKind, SearchResult, SegmentRole, SymbolResult,
+    ReferenceKind, SearchResult, SegmentRole, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments::{
-    count_files, count_segments, get_segment_by_id, get_segment_by_prefix, SegmentPrefixLookup,
-    StoredSegment,
+    count_files_for_context, count_segments_for_context, get_segment_by_id, get_segment_by_prefix,
+    SegmentPrefixLookup, StoredSegment,
 };
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -30,6 +30,7 @@ const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 pub struct McpProjectRoots {
     pub state_root: PathBuf,
     pub source_root: PathBuf,
+    pub worktree_context: WorktreeContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -220,16 +221,24 @@ pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
     Ok(McpProjectRoots {
         state_root: resolved.state_root,
         source_root: resolved.source_root,
+        worktree_context: resolved.worktree_context,
     })
 }
 
-pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> ReadinessPayload {
+pub async fn classify_readiness(
+    state_root: &Path,
+    source_root: &Path,
+    worktree_context: &WorktreeContext,
+) -> ReadinessPayload {
     let project_id_result = project::read_project_id(state_root);
     let project_initialized = project_id_result.is_ok();
     let db_path = project_db_path(state_root);
     let index_present = db_path.exists();
-    let index_progress = read_index_progress(state_root);
-    let daemon_status = read_daemon_status(state_root);
+    let index_progress = read_index_progress_for_context(state_root, &worktree_context.context_id);
+    let daemon_status = crate::cli::project_status_files::read_daemon_status_for_context(
+        state_root,
+        &worktree_context.context_id,
+    );
     let mut payload = ReadinessPayload {
         status: ReadinessStatus::Missing,
         summary: String::new(),
@@ -303,8 +312,12 @@ pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> Readin
     }
 
     payload.index_readable = true;
-    payload.indexed_files = count_files(&conn).await.ok();
-    payload.total_segments = count_segments(&conn).await.ok();
+    payload.indexed_files = count_files_for_context(&conn, &worktree_context.context_id)
+        .await
+        .ok();
+    payload.total_segments = count_segments_for_context(&conn, &worktree_context.context_id)
+        .await
+        .ok();
 
     if payload.total_segments.unwrap_or(0) == 0 {
         payload.status = ReadinessStatus::Missing;
@@ -338,10 +351,16 @@ pub async fn classify_readiness(state_root: &Path, source_root: &Path) -> Readin
 pub fn blocked_readiness(
     state_root: &Path,
     source_root: &Path,
+    worktree_context: &WorktreeContext,
     reason: impl Into<String>,
 ) -> ReadinessPayload {
     let project_initialized = project::read_project_id(state_root).is_ok();
     let db_path = project_db_path(state_root);
+    let index_progress = read_index_progress_for_context(state_root, &worktree_context.context_id);
+    let daemon_status = crate::cli::project_status_files::read_daemon_status_for_context(
+        state_root,
+        &worktree_context.context_id,
+    );
     ReadinessPayload {
         status: ReadinessStatus::Blocked,
         summary: "The repository cannot be prepared for 1up MCP discovery.".to_string(),
@@ -354,8 +373,8 @@ pub fn blocked_readiness(
         indexed_files: None,
         total_segments: None,
         reason: Some(reason.into()),
-        index_progress: read_index_progress(state_root),
-        daemon_status: read_daemon_status(state_root),
+        index_progress,
+        daemon_status,
     }
 }
 
@@ -380,19 +399,25 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
 
 pub async fn run_search(
     state_root: &Path,
+    worktree_context: &WorktreeContext,
     query: &str,
     limit: usize,
 ) -> anyhow::Result<SearchPayload> {
     let current = open_current_index(state_root).await?;
     let mut runtime = EmbeddingRuntime::default();
     let embedding_status = runtime.prepare_for_search(1);
-    let degraded_reason = embedding_unavailable_reason(&embedding_status);
+    let search_scope = SearchScope::from_worktree_context(worktree_context);
+    let degraded_reason = combine_degraded_reasons(
+        embedding_unavailable_reason(&embedding_status),
+        search_scope.degraded_reason(),
+    );
 
     let results = if embedding_status.is_available() {
-        let mut engine = HybridSearchEngine::new(&current.conn, runtime.current_embedder());
+        let mut engine =
+            HybridSearchEngine::new_scoped(&current.conn, runtime.current_embedder(), search_scope);
         engine.search(query, limit).await?
     } else {
-        let engine = HybridSearchEngine::new(&current.conn, None);
+        let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope);
         engine.fts_only_search(query, limit).await?
     };
 
@@ -444,6 +469,7 @@ pub fn read_locations(
 
 pub async fn lookup_symbol(
     state_root: &Path,
+    worktree_context: &WorktreeContext,
     request: SymbolLookupRequest,
 ) -> anyhow::Result<SymbolPayload> {
     if request.name.trim().is_empty() {
@@ -451,7 +477,8 @@ pub async fn lookup_symbol(
     }
 
     let current = open_current_index(state_root).await?;
-    let engine = SymbolSearchEngine::new(&current.conn);
+    let search_scope = SearchScope::from_worktree_context(worktree_context);
+    let engine = SymbolSearchEngine::new_scoped(&current.conn, search_scope);
 
     let (definitions, references) = match request.include {
         SymbolInclude::Definitions => (
@@ -485,10 +512,12 @@ pub async fn lookup_symbol(
 
 pub async fn explore_impact(
     state_root: &Path,
+    worktree_context: &WorktreeContext,
     request: ImpactRequest,
 ) -> anyhow::Result<ImpactResultEnvelope> {
     let current = open_current_index(state_root).await?;
-    let engine = ImpactHorizonEngine::new(&current.conn);
+    let search_scope = SearchScope::from_worktree_context(worktree_context);
+    let engine = ImpactHorizonEngine::new_scoped(&current.conn, search_scope);
     Ok(engine.explore(request).await?)
 }
 
@@ -773,10 +802,13 @@ fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     serde_json::from_str(&content).ok()
 }
 
-fn read_daemon_status(project_root: &Path) -> Option<DaemonProjectStatus> {
-    let path = project_daemon_status_path(project_root);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Option<IndexProgress> {
+    read_index_progress(project_root).filter(|progress| {
+        progress
+            .context_id
+            .as_deref()
+            .is_none_or(|progress_context_id| progress_context_id == context_id)
+    })
 }
 
 fn embedding_status_for_search() -> EmbeddingLoadStatus {
@@ -804,6 +836,14 @@ fn embedding_unavailable_reason(status: &EmbeddingLoadStatus) -> Option<String> 
         EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
             Some(format!("embedding model download failed: {err}"))
         }
+    }
+}
+
+fn combine_degraded_reasons(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+        (Some(reason), None) | (None, Some(reason)) => Some(reason),
+        (None, None) => None,
     }
 }
 

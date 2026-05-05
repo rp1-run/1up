@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use libsql::Connection;
 
 use crate::search::retrieval::CandidateRow;
+use crate::search::scope::SearchScope;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::symbols::normalize_symbolish;
 use crate::shared::types::{ReferenceKind, SymbolResult};
@@ -14,6 +15,7 @@ const SYMBOL_PREFIX_SEED_LEN: usize = 3;
 
 pub struct SymbolSearchEngine<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
 struct SymbolMatch {
@@ -23,8 +25,13 @@ struct SymbolMatch {
 }
 
 impl<'a> SymbolSearchEngine<'a> {
+    #[allow(dead_code)]
     pub fn new(conn: &'a Connection) -> Self {
-        Self { conn }
+        Self::new_scoped(conn, SearchScope::default_context())
+    }
+
+    pub fn new_scoped(conn: &'a Connection, scope: SearchScope) -> Self {
+        Self { conn, scope }
     }
 
     pub async fn find_definitions(
@@ -149,8 +156,12 @@ impl<'a> SymbolSearchEngine<'a> {
         let mut rows = self
             .conn
             .query(
-                queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL,
-                libsql::params![reference_kind_label(reference_kind), canonical_symbol],
+                queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT,
+                libsql::params![
+                    self.scope.context_id(),
+                    reference_kind_label(reference_kind),
+                    canonical_symbol
+                ],
             )
             .await
             .map_err(|e| SearchError::QueryFailed(format!("symbol lookup failed: {e}")))?;
@@ -211,7 +222,7 @@ impl<'a> SymbolSearchEngine<'a> {
 
         for value in self
             .load_canonical_rows(
-                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX,
+                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX_FOR_CONTEXT,
                 reference_kind,
                 &prefix_seed,
             )
@@ -224,7 +235,7 @@ impl<'a> SymbolSearchEngine<'a> {
 
         for value in self
             .load_canonical_rows(
-                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS,
+                queries::SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS_FOR_CONTEXT,
                 reference_kind,
                 canonical_query,
             )
@@ -249,6 +260,7 @@ impl<'a> SymbolSearchEngine<'a> {
             .query(
                 query,
                 libsql::params![
+                    self.scope.context_id(),
                     reference_kind_label(reference_kind),
                     value,
                     SYMBOL_FALLBACK_CANONICAL_LIMIT,
@@ -390,6 +402,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::types::BranchStatus;
     use crate::storage::{db::Db, schema, segments};
 
     async fn setup() -> (Db, Connection) {
@@ -557,6 +570,35 @@ mod tests {
         let engine = SymbolSearchEngine::new(&conn);
         let results = engine.find_definitions("unknown", false).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn symbol_lookup_filters_matches_to_active_context() {
+        let (_db, conn) = setup().await;
+
+        let main = make_segment("s-main", "src/main.rs", "function", r#"["Feature"]"#, "[]");
+        let other = make_segment(
+            "s-other",
+            "src/other.rs",
+            "function",
+            r#"["Feature"]"#,
+            "[]",
+        );
+        segments::upsert_segment_for_context(&conn, "ctx-main", &main)
+            .await
+            .unwrap();
+        segments::upsert_segment_for_context(&conn, "ctx-other", &other)
+            .await
+            .unwrap();
+
+        let engine = SymbolSearchEngine::new_scoped(
+            &conn,
+            SearchScope::new("ctx-main", BranchStatus::Named),
+        );
+        let results = engine.find_definitions("Feature", false).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].segment_id, "s-main");
     }
 
     #[tokio::test]

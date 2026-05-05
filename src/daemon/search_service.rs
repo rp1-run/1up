@@ -29,6 +29,8 @@ pub(crate) struct SearchListener {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SearchRequest {
     pub project_root: PathBuf,
+    pub source_root: PathBuf,
+    pub context_id: String,
     pub query: String,
     pub limit: usize,
 }
@@ -90,10 +92,20 @@ pub(crate) async fn send_response(
 
 pub(crate) async fn request_search(
     project_root: &Path,
+    source_root: &Path,
+    context_id: &str,
     query: &str,
     limit: usize,
 ) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
-    request_search_at(&config::daemon_socket_path()?, project_root, query, limit).await
+    request_search_at(
+        &config::daemon_socket_path()?,
+        project_root,
+        source_root,
+        context_id,
+        query,
+        limit,
+    )
+    .await
 }
 
 pub(crate) fn unavailable_response() -> SearchResponse {
@@ -167,6 +179,8 @@ fn cleanup_socket_file_at(socket_path: &Path, approved_root: &Path) -> Result<()
 async fn request_search_at(
     socket_path: &Path,
     project_root: &Path,
+    source_root: &Path,
+    context_id: &str,
     query: &str,
     limit: usize,
 ) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
@@ -179,6 +193,8 @@ async fn request_search_at(
 
     let request = SearchRequest {
         project_root: project_root.to_path_buf(),
+        source_root: source_root.to_path_buf(),
+        context_id: context_id.to_string(),
         query: query.to_string(),
         limit,
     };
@@ -218,9 +234,24 @@ fn sanitize_request(request: SearchRequest) -> Result<SearchRequest, OneupError>
             request.project_root.display()
         ))
     })?;
+    let source_root = request.source_root.canonicalize().map_err(|err| {
+        DaemonError::RequestError(format!(
+            "failed to canonicalize daemon source root {}: {err}",
+            request.source_root.display()
+        ))
+    })?;
+    let context_id = request.context_id.trim();
+    if context_id.is_empty() {
+        return Err(DaemonError::RequestError(
+            "daemon search context id must not be empty".to_string(),
+        )
+        .into());
+    }
 
     Ok(SearchRequest {
         project_root,
+        source_root,
+        context_id: context_id.to_string(),
         query: request.query,
         limit: request.limit.clamp(1, MAX_SEARCH_RESULTS),
     })
@@ -290,6 +321,8 @@ mod tests {
                 request,
                 SearchRequest {
                     project_root: expected_root.canonicalize().unwrap(),
+                    source_root: expected_root.canonicalize().unwrap(),
+                    context_id: "ctx-main".to_string(),
                     query: "needle".to_string(),
                     limit: 7,
                 }
@@ -316,10 +349,17 @@ mod tests {
             .unwrap();
         });
 
-        let (results, daemon_version) = request_search_at(&socket_path, &project_root, "needle", 7)
-            .await
-            .unwrap()
-            .unwrap();
+        let (results, daemon_version) = request_search_at(
+            &socket_path,
+            &project_root,
+            &project_root,
+            "ctx-main",
+            "needle",
+            7,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         server.await.unwrap();
         assert_eq!(results.len(), 1);
@@ -342,9 +382,16 @@ mod tests {
             send_unavailable_response(&mut stream).await.unwrap();
         });
 
-        let results = request_search_at(&socket_path, &project_root, "needle", 7)
-            .await
-            .unwrap();
+        let results = request_search_at(
+            &socket_path,
+            &project_root,
+            &project_root,
+            "ctx-main",
+            "needle",
+            7,
+        )
+        .await
+        .unwrap();
 
         server.await.unwrap();
         assert!(results.is_none());
@@ -358,12 +405,16 @@ mod tests {
 
         let request = sanitize_request(SearchRequest {
             project_root: project_root.clone(),
+            source_root: project_root.clone(),
+            context_id: "ctx-main".to_string(),
             query: "needle".to_string(),
             limit: MAX_SEARCH_RESULTS + 10,
         })
         .unwrap();
 
         assert_eq!(request.project_root, project_root.canonicalize().unwrap());
+        assert_eq!(request.source_root, project_root.canonicalize().unwrap());
+        assert_eq!(request.context_id, "ctx-main");
         assert_eq!(request.limit, MAX_SEARCH_RESULTS);
     }
 
