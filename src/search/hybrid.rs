@@ -4,7 +4,7 @@ use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
 use crate::search::ranking::{rank_candidates, RankedCandidate};
-use crate::search::retrieval::{CandidateRow, RetrievalBackend, RetrievalMode};
+use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
@@ -87,32 +87,39 @@ async fn execute_search(
 
     let intent = detect_intent(query);
     let symbol_results = symbol_search(conn, scope, query, intent).await?;
-    let backend = RetrievalBackend::select_scoped(conn, query_embedding, scope.clone()).await?;
-    let candidates = match backend.search(query, query_embedding).await {
-        Ok(candidates) => candidates,
-        Err(err) if matches!(backend.mode(), RetrievalMode::SqlVectorV2) => {
-            eprintln!(
+    let fts_results = retrieval::fetch_fts_candidates(conn, scope, query).await?;
+    let should_fetch_vector = query_embedding.is_some()
+        && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
+        && retrieval::has_indexed_embeddings(conn, scope).await?;
+
+    let vector_results = if should_fetch_vector {
+        match retrieval::fetch_vector_candidates(
+            conn,
+            scope,
+            query_embedding.expect("checked above"),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(err) => {
+                eprintln!(
                 "warning: vector retrieval failed ({err}); search is degraded to FTS-only mode for this query"
             );
-            tracing::debug!("vector retrieval failed: {err}");
-            RetrievalBackend::select_scoped(conn, None, scope.clone())
-                .await?
-                .search(query, None)
-                .await?
+                tracing::debug!("vector retrieval failed: {err}");
+                Vec::new()
+            }
         }
-        Err(err) => return Err(err),
+    } else {
+        Vec::new()
     };
 
-    if candidates.vector_results.is_empty()
-        && candidates.fts_results.is_empty()
-        && symbol_results.is_empty()
-    {
+    if vector_results.is_empty() && fts_results.is_empty() && symbol_results.is_empty() {
         return Ok(Vec::new());
     }
 
     let ranked = rank_candidates(
-        candidates.vector_results,
-        candidates.fts_results,
+        vector_results,
+        fts_results,
         symbol_results,
         query,
         intent,
@@ -120,6 +127,26 @@ async fn execute_search(
     );
 
     hydrate_ranked_candidates(conn, ranked).await
+}
+
+fn is_exact_lexical_hit(
+    query: &str,
+    symbol_results: &[CandidateRow],
+    fts_results: &[CandidateRow],
+) -> bool {
+    if symbol_results.is_empty() && fts_results.is_empty() {
+        return false;
+    }
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().nth(1).is_some() {
+        return false;
+    }
+
+    trimmed
+        .chars()
+        .any(|c| matches!(c, '_' | ':' | '/' | '\\' | '.' | '-' | '#'))
+        || trimmed.len() >= 24
 }
 
 async fn symbol_search(
@@ -279,6 +306,24 @@ mod tests {
         });
 
         assert_eq!(result.segment_id, "seg-123");
+    }
+
+    #[test]
+    fn exact_lexical_hit_short_circuits_identifier_queries() {
+        let hit = test_candidate("seg-lexical");
+
+        assert!(is_exact_lexical_hit(
+            "manual_unique_linked_context_token",
+            &[],
+            &[hit]
+        ));
+    }
+
+    #[test]
+    fn exact_lexical_hit_keeps_natural_language_semantic_path() {
+        let hit = test_candidate("seg-lexical");
+
+        assert!(!is_exact_lexical_hit("config loader", &[], &[hit]));
     }
 
     #[tokio::test]
@@ -447,6 +492,23 @@ mod tests {
             called_symbols: "[]".to_string(),
             called_relations: "[]".to_string(),
             file_hash: format!("hash-{id}"),
+        }
+    }
+
+    fn test_candidate(id: &str) -> CandidateRow {
+        CandidateRow {
+            segment_id: id.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            line_number: 1,
+            line_end: 1,
+            breadcrumb: None,
+            complexity: None,
+            role: None,
+            defined_symbols: None,
+            referenced_symbols: None,
+            called_symbols: None,
         }
     }
 }

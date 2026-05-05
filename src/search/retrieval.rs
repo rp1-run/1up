@@ -60,26 +60,31 @@ impl CandidateRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RetrievalMode {
     SqlVectorV2,
     FtsOnly,
 }
 
+#[allow(dead_code)]
 pub struct RetrievedCandidates {
     pub vector_results: Vec<CandidateRow>,
     pub fts_results: Vec<CandidateRow>,
 }
 
+#[allow(dead_code)]
 pub enum RetrievalBackend<'a> {
     SqlVectorV2(SqlVectorV2<'a>),
     FtsOnly(FtsOnly<'a>),
 }
 
+#[allow(dead_code)]
 pub struct SqlVectorV2<'a> {
     conn: &'a Connection,
     scope: SearchScope,
 }
 
+#[allow(dead_code)]
 pub struct FtsOnly<'a> {
     conn: &'a Connection,
     scope: SearchScope,
@@ -106,6 +111,7 @@ impl<'a> RetrievalBackend<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mode(&self) -> RetrievalMode {
         match self {
             Self::SqlVectorV2(_) => RetrievalMode::SqlVectorV2,
@@ -113,6 +119,7 @@ impl<'a> RetrievalBackend<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn search(
         &self,
         query: &str,
@@ -137,6 +144,7 @@ impl<'a> RetrievalBackend<'a> {
 }
 
 impl<'a> SqlVectorV2<'a> {
+    #[allow(dead_code)]
     async fn search(
         &self,
         query: &str,
@@ -155,6 +163,7 @@ impl<'a> SqlVectorV2<'a> {
 }
 
 impl<'a> FtsOnly<'a> {
+    #[allow(dead_code)]
     async fn search(&self, query: &str) -> Result<RetrievedCandidates, OneupError> {
         Ok(RetrievedCandidates {
             vector_results: Vec::new(),
@@ -163,7 +172,7 @@ impl<'a> FtsOnly<'a> {
     }
 }
 
-async fn has_indexed_embeddings(
+pub(crate) async fn has_indexed_embeddings(
     conn: &Connection,
     scope: &SearchScope,
 ) -> Result<bool, OneupError> {
@@ -187,7 +196,7 @@ async fn has_indexed_embeddings(
     }
 }
 
-async fn fetch_vector_candidates(
+pub(crate) async fn fetch_vector_candidates(
     conn: &Connection,
     scope: &SearchScope,
     query_embedding: &[f32],
@@ -217,7 +226,7 @@ async fn fetch_vector_candidates(
     Ok(results)
 }
 
-async fn fetch_fts_candidates(
+pub(crate) async fn fetch_fts_candidates(
     conn: &Connection,
     scope: &SearchScope,
     query: &str,

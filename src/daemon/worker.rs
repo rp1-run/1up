@@ -15,7 +15,7 @@ use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
 use crate::daemon::watcher::{self, FileWatcher};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::indexer::pipeline;
-use crate::search::{HybridSearchEngine, SearchScope};
+use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
@@ -1094,18 +1094,34 @@ async fn handle_search_request(
         return search_service::unavailable_response();
     }
 
-    let status = state
-        .embedding_runtime
-        .prepare_for_search(indexing_config.embed_threads);
-    log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
+    let has_embeddings = match retrieval::has_indexed_embeddings(&conn, &search_scope).await {
+        Ok(has_embeddings) => has_embeddings,
+        Err(err) => {
+            warn!(
+                "failed to inspect daemon search embeddings for {}: {err}",
+                state.project_root.display()
+            );
+            return search_service::unavailable_response();
+        }
+    };
 
-    let results = if status.is_available() {
-        let mut engine = HybridSearchEngine::new_scoped(
-            &conn,
-            state.embedding_runtime.current_embedder(),
-            search_scope.clone(),
-        );
-        engine.search(&request.query, request.limit).await
+    let results = if has_embeddings {
+        let status = state
+            .embedding_runtime
+            .prepare_for_search(indexing_config.embed_threads);
+        log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
+
+        if status.is_available() {
+            let mut engine = HybridSearchEngine::new_scoped(
+                &conn,
+                state.embedding_runtime.current_embedder(),
+                search_scope.clone(),
+            );
+            engine.search(&request.query, request.limit).await
+        } else {
+            let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
+            engine.fts_only_search(&request.query, request.limit).await
+        }
     } else {
         let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
         engine.fts_only_search(&request.query, request.limit).await
