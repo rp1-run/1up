@@ -461,14 +461,28 @@ fn symbol_include(include: SymbolIncludeInput) -> SymbolInclude {
 }
 
 fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeContext) {
-    if payload.status == ReadinessStatus::Ready && context.branch_status != BranchStatus::Named {
+    if context.branch_status == BranchStatus::Named {
+        return;
+    }
+
+    let branch_reason = format!(
+        "branch_status is {}; search results may not be definitively branch-filtered",
+        context.branch_status.as_str()
+    );
+
+    if payload.status == ReadinessStatus::Ready {
         payload.status = ReadinessStatus::Degraded;
         payload.summary =
             "The index is readable, but the active branch context is ambiguous.".to_string();
-        payload.reason = Some(format!(
-            "branch_status is {}; search results may not be definitively branch-filtered",
-            context.branch_status.as_str()
-        ));
+        payload.reason = Some(branch_reason);
+    } else if payload.status == ReadinessStatus::Degraded {
+        payload.reason = Some(match payload.reason.take() {
+            Some(existing) if !existing.contains(&branch_reason) => {
+                format!("{existing}; {branch_reason}")
+            }
+            Some(existing) => existing,
+            None => branch_reason,
+        });
     }
 }
 
@@ -480,20 +494,25 @@ fn readiness_context_metadata(
         &roots.state_root,
         &roots.worktree_context.context_id,
     );
+    let progress_update_state = match payload
+        .index_progress
+        .as_ref()
+        .map(|progress| progress.state)
+    {
+        Some(IndexState::Running) => Some(DaemonRefreshState::Running),
+        Some(IndexState::Complete) => Some(DaemonRefreshState::Complete),
+        _ => None,
+    };
     let last_update_state = context_status
         .as_ref()
-        .map(|status| status.last_refresh_state)
-        .unwrap_or_else(|| {
-            match payload
-                .index_progress
-                .as_ref()
-                .map(|progress| progress.state)
-            {
-                Some(IndexState::Running) => DaemonRefreshState::Running,
-                Some(IndexState::Complete) => DaemonRefreshState::Complete,
-                _ => DaemonRefreshState::Unknown,
+        .map(|status| match status.last_refresh_state {
+            DaemonRefreshState::Unknown => {
+                progress_update_state.unwrap_or(DaemonRefreshState::Unknown)
             }
+            state => state,
         });
+    let last_update_state = last_update_state
+        .unwrap_or_else(|| progress_update_state.unwrap_or(DaemonRefreshState::Unknown));
 
     ReadinessContextMetadata {
         context_id: roots.worktree_context.context_id.clone(),
@@ -1049,7 +1068,11 @@ fn merge_object_fields(target: &mut Value, fields: Value) {
     };
 
     for (key, value) in fields {
-        target.insert(key.clone(), value.clone());
+        debug_assert!(
+            !target.contains_key(key),
+            "MCP readiness metadata should not overwrite payload key `{key}`"
+        );
+        target.entry(key.clone()).or_insert_with(|| value.clone());
     }
 }
 

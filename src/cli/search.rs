@@ -45,7 +45,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Some((results, daemon_version)) = try_daemon_search(
+    if let Some((results, daemon_version, degraded_reason)) = try_daemon_search(
         &project_root,
         &source_root,
         search_scope.context_id(),
@@ -55,6 +55,9 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     .await
     {
         write_results(&results)?;
+        if let Some(reason) = degraded_reason {
+            eprintln!("warning: {reason}");
+        }
         if let Some(ref dv) = daemon_version {
             if dv != VERSION {
                 eprintln!(
@@ -115,6 +118,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             engine.fts_only_search(&args.query, args.limit).await?
         }
     } else {
+        eprintln!("warning: semantic embeddings unavailable; search is degraded to FTS-only mode");
         let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope.clone());
         engine.fts_only_search(&args.query, args.limit).await?
     };
@@ -138,7 +142,7 @@ async fn try_daemon_search(
     context_id: &str,
     query: &str,
     limit: usize,
-) -> Option<(Vec<SearchResult>, Option<String>)> {
+) -> Option<(Vec<SearchResult>, Option<String>, Option<String>)> {
     let result = tokio::time::timeout(
         DAEMON_SEARCH_TIMEOUT,
         search_service::request_search(project_root, source_root, context_id, query, limit),

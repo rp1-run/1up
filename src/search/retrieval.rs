@@ -1,7 +1,7 @@
 use libsql::{Connection, Row};
 
 use crate::search::scope::SearchScope;
-use crate::shared::constants::VECTOR_PREFILTER_K;
+use crate::shared::constants::{VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
 use crate::storage::queries;
@@ -202,14 +202,11 @@ pub(crate) async fn fetch_vector_candidates(
     query_embedding: &[f32],
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let query_embedding = serialize_query_embedding(query_embedding)?;
+    let prefilter_k = vector_prefilter_k(conn).await?;
     let mut rows = conn
         .query(
             queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
-            libsql::params![
-                query_embedding,
-                VECTOR_PREFILTER_K as i64,
-                scope.context_id()
-            ],
+            libsql::params![query_embedding, prefilter_k as i64, scope.context_id()],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
@@ -224,6 +221,37 @@ pub(crate) async fn fetch_vector_candidates(
     }
 
     Ok(results)
+}
+
+async fn vector_prefilter_k(conn: &Connection) -> Result<usize, OneupError> {
+    let context_count = count_vector_contexts(conn).await?;
+    Ok(scaled_vector_prefilter_k(context_count))
+}
+
+async fn count_vector_contexts(conn: &Connection) -> Result<usize, OneupError> {
+    let mut rows = conn
+        .query(queries::COUNT_VECTOR_CONTEXTS, ())
+        .await
+        .map_err(|e| SearchError::QueryFailed(format!("failed to count vector contexts: {e}")))?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let count: i64 = row.get(0).map_err(|e| {
+                SearchError::QueryFailed(format!("read vector context count failed: {e}"))
+            })?;
+            Ok(usize::try_from(count.max(1)).unwrap_or(usize::MAX))
+        }
+        Ok(None) => Ok(1),
+        Err(e) => Err(SearchError::QueryFailed(format!(
+            "vector context count iteration failed: {e}"
+        ))
+        .into()),
+    }
+}
+
+fn scaled_vector_prefilter_k(context_count: usize) -> usize {
+    let scale = context_count.clamp(1, VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT);
+    VECTOR_PREFILTER_K.saturating_mul(scale)
 }
 
 pub(crate) async fn fetch_fts_candidates(
@@ -619,5 +647,16 @@ mod tests {
 
         assert!(!candidates.is_empty(), "vector_top_k returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");
+    }
+
+    #[test]
+    fn vector_prefilter_scales_with_context_count_up_to_bound() {
+        assert_eq!(scaled_vector_prefilter_k(0), VECTOR_PREFILTER_K);
+        assert_eq!(scaled_vector_prefilter_k(1), VECTOR_PREFILTER_K);
+        assert_eq!(scaled_vector_prefilter_k(3), VECTOR_PREFILTER_K * 3);
+        assert_eq!(
+            scaled_vector_prefilter_k(VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT + 1),
+            VECTOR_PREFILTER_K * VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT
+        );
     }
 }

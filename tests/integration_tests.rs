@@ -2847,7 +2847,7 @@ fn get_preserves_order_across_handles() {
 #[test]
 fn search_segment_id_round_trips_into_impact_from_segment() {
     // The lean row grammar emits a 12-char display handle (`:<prefix>`). `get`
-    // resolves that prefix back to the full 16-char segment id, which is what
+    // resolves that prefix back to the full segment id, which is what
     // `impact --from-segment` expects for its exact-anchor lookup. This pins
     // the discovery -> hydrate -> impact follow-up chain at the row-grammar
     // layer.

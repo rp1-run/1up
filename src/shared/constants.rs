@@ -20,6 +20,13 @@ pub const EMBEDDING_MAX_TOKENS: usize = 256;
 /// latency impact at repo scale (~3.3k segments).
 pub const VECTOR_PREFILTER_K: usize = 400;
 
+/// Maximum number of indexed worktree contexts used to scale vector prefiltering.
+///
+/// libSQL vector search runs against the shared vector index before context
+/// filtering, so linked worktrees dilute the active context's candidate share.
+/// Scaling by context count preserves recall while bounding worst-case latency.
+pub const VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT: usize = 8;
+
 /// RRF fusion constant.
 pub const RRF_K: f64 = 60.0;
 

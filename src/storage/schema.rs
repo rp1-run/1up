@@ -30,7 +30,6 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segment_relations_source"),
     ("index", "idx_segment_relations_target"),
     ("index", "idx_segment_relations_lookup_target"),
-    ("index", "idx_indexed_files_context_path"),
     ("trigger", "segments_ai"),
     ("trigger", "segments_ad"),
     ("trigger", "segments_au"),
@@ -42,7 +41,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{}",
         queries::CREATE_WORKTREE_CONTEXTS_TABLE,
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
@@ -53,7 +52,6 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
         queries::CREATE_SEGMENT_RELATIONS_TABLE,
         queries::CREATE_INDEXED_FILES_TABLE,
-        queries::CREATE_INDEX_INDEXED_FILES_CONTEXT_PATH,
     ))
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
@@ -649,11 +647,6 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            schema_object_exists(&conn, "index", "idx_indexed_files_context_path")
-                .await
-                .unwrap()
-        );
         assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
             .await
             .unwrap());
@@ -794,7 +787,6 @@ mod tests {
                 )
             )",
                 queries::CREATE_INDEXED_FILES_TABLE,
-                queries::CREATE_INDEX_INDEXED_FILES_CONTEXT_PATH,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
                 queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,

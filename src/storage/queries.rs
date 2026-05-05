@@ -119,9 +119,6 @@ CREATE TABLE IF NOT EXISTS indexed_files (
     PRIMARY KEY (context_id, file_path)
 )";
 
-pub const CREATE_INDEX_INDEXED_FILES_CONTEXT_PATH: &str =
-    "CREATE INDEX IF NOT EXISTS idx_indexed_files_context_path ON indexed_files(context_id, file_path)";
-
 pub const CREATE_FTS_TABLE: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
     content,
@@ -195,6 +192,11 @@ FROM segment_vectors AS sv
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?1
 LIMIT 1";
+
+pub const COUNT_VECTOR_CONTEXTS: &str = "
+SELECT COUNT(DISTINCT s.context_id)
+FROM segment_vectors AS sv
+JOIN segments AS s ON s.id = sv.segment_id";
 
 #[allow(dead_code)]
 pub const SELECT_VECTOR_CANDIDATES: &str = "

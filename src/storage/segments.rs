@@ -101,7 +101,7 @@ pub(crate) fn generate_segment_id(
     let hash = hasher.finalize();
     hash.iter()
         .map(|b| format!("{:02x}", b))
-        .collect::<String>()[..16]
+        .collect::<String>()[..32]
         .to_string()
 }
 
@@ -273,7 +273,7 @@ pub async fn get_segment_by_id(
 
 /// Outcome of a prefix-based segment lookup.
 ///
-/// `get` accepts both full 16-char segment ids and the 12-char display handle emitted
+/// `get` accepts both full segment ids and the 12-char display handle emitted
 /// by the lean row grammar. Using `LIKE ?||'%'` handles both shapes uniformly; the
 /// caller distinguishes unique matches from ambiguous prefixes via this enum.
 #[derive(Debug, Clone)]
@@ -973,6 +973,12 @@ fn validate_context_id(context_id: &str) -> Result<(), OneupError> {
             StorageError::Transaction("index context id cannot be empty".to_string()).into(),
         );
     }
+    if context_id.trim() != context_id {
+        return Err(StorageError::Transaction(
+            "index context id cannot contain surrounding whitespace".to_string(),
+        )
+        .into());
+    }
 
     Ok(())
 }
@@ -1634,6 +1640,19 @@ mod tests {
     fn generated_test_segment(context_id: &str, file_path: &str, file_hash: &str) -> SegmentInsert {
         let id = generate_segment_id(context_id, file_path, 1, 3);
         test_segment(&id, file_path, file_hash)
+    }
+
+    #[test]
+    fn segment_ids_use_extended_hash_prefix() {
+        let id = generate_segment_id("ctx-main", "src/main.rs", 1, 3);
+        assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    fn context_ids_reject_surrounding_whitespace() {
+        assert!(validate_context_id("ctx-main").is_ok());
+        assert!(validate_context_id(" ctx-main").is_err());
+        assert!(validate_context_id("ctx-main ").is_err());
     }
 
     async fn symbol_rows(conn: &Connection, segment_id: &str) -> Vec<(String, String, String)> {

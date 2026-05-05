@@ -1197,6 +1197,9 @@ fn rank_impact_candidates(mut ranked: Vec<ImpactCandidate>, limit: usize) -> Vec
                 implemented_by_reason_count(right).cmp(&implemented_by_reason_count(left))
             })
             .then_with(|| direct_reason_count(right).cmp(&direct_reason_count(left)))
+            .then_with(|| {
+                non_wrapper_impact_priority(right).cmp(&non_wrapper_impact_priority(left))
+            })
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.hop.cmp(&right.hop))
             .then_with(|| left.file_path.cmp(&right.file_path))
@@ -1261,6 +1264,21 @@ fn direct_reason_count(candidate: &ImpactCandidate) -> usize {
             )
         })
         .count()
+}
+
+fn non_wrapper_impact_priority(candidate: &ImpactCandidate) -> usize {
+    let line_count = candidate
+        .line_end
+        .saturating_sub(candidate.line_start)
+        .saturating_add(1);
+    let complexity = candidate.complexity.unwrap_or_default();
+    let wrapper_like = matches!(
+        candidate.role,
+        Some(SegmentRole::Implementation | SegmentRole::Orchestration)
+    ) && line_count <= 4
+        && complexity <= 1;
+
+    usize::from(!wrapper_like)
 }
 
 fn outcome_hint(

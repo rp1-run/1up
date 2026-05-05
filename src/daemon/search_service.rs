@@ -42,6 +42,8 @@ pub(crate) enum SearchResponse {
         results: Vec<SearchResult>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         daemon_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded_reason: Option<String>,
     },
     Unavailable {
         reason: String,
@@ -96,7 +98,7 @@ pub(crate) async fn request_search(
     context_id: &str,
     query: &str,
     limit: usize,
-) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>, Option<String>)>, OneupError> {
     request_search_at(
         &config::daemon_socket_path()?,
         project_root,
@@ -183,7 +185,7 @@ async fn request_search_at(
     context_id: &str,
     query: &str,
     limit: usize,
-) -> Result<Option<(Vec<SearchResult>, Option<String>)>, OneupError> {
+) -> Result<Option<(Vec<SearchResult>, Option<String>, Option<String>)>, OneupError> {
     let mut stream = UnixStream::connect(socket_path).await.map_err(|err| {
         DaemonError::RequestError(format!(
             "failed to connect to search socket {}: {err}",
@@ -210,7 +212,8 @@ async fn request_search_at(
         SearchResponse::Results {
             results,
             daemon_version,
-        } => Ok(Some((results, daemon_version))),
+            degraded_reason,
+        } => Ok(Some((results, daemon_version, degraded_reason))),
         SearchResponse::Unavailable { .. } => Ok(None),
     }
 }
@@ -343,13 +346,14 @@ mod tests {
                         defined_symbols: None,
                     }],
                     daemon_version: Some("0.1.0".to_string()),
+                    degraded_reason: Some("semantic embeddings unavailable".to_string()),
                 },
             )
             .await
             .unwrap();
         });
 
-        let (results, daemon_version) = request_search_at(
+        let (results, daemon_version, degraded_reason) = request_search_at(
             &socket_path,
             &project_root,
             &project_root,
@@ -366,6 +370,10 @@ mod tests {
         assert_eq!(results[0].file_path, "src/lib.rs");
         assert_eq!(results[0].segment_id, "seg-1");
         assert_eq!(daemon_version, Some("0.1.0".to_string()));
+        assert_eq!(
+            degraded_reason,
+            Some("semantic embeddings unavailable".to_string())
+        );
     }
 
     #[tokio::test]
@@ -423,6 +431,7 @@ mod tests {
         let response = SearchResponse::Results {
             results: vec![],
             daemon_version: Some("0.1.0".to_string()),
+            degraded_reason: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"daemon_version\":\"0.1.0\""));
@@ -437,9 +446,11 @@ mod tests {
             SearchResponse::Results {
                 results,
                 daemon_version,
+                degraded_reason,
             } => {
                 assert!(results.is_empty());
                 assert!(daemon_version.is_none());
+                assert!(degraded_reason.is_none());
             }
             _ => panic!("expected Results variant"),
         }

@@ -183,7 +183,7 @@ async fn run_inner() -> Result<(), OneupError> {
             _ = tokio::time::sleep(debounce) => {
                 let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
-                mark_branch_context_changes(&mut projects);
+                mark_branch_context_changes(&mut file_watcher, &mut projects);
                 if filtered.is_empty() {
                     run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
                     continue;
@@ -884,7 +884,7 @@ async fn run_dirty_projects_until_clean(watcher: &FileWatcher, projects: &mut Pr
     }
 }
 
-fn mark_branch_context_changes(projects: &mut ProjectStates) {
+fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut ProjectStates) {
     let changed_contexts: Vec<(String, WorktreeContext)> = projects
         .iter()
         .filter_map(|(context_id, state)| {
@@ -899,6 +899,10 @@ fn mark_branch_context_changes(projects: &mut ProjectStates) {
             continue;
         };
         let new_context_id = current_context.context_id.clone();
+        let old_source_root = state.source_root.clone();
+        state.watch_status = DaemonWatchStatus::DaemonStopped;
+        persist_daemon_context_status_for_state(&state);
+        state.watch_status = DaemonWatchStatus::Watching;
         state.context = current_context;
         mark_refresh_pending(
             &mut state,
@@ -916,10 +920,25 @@ fn mark_branch_context_changes(projects: &mut ProjectStates) {
                 RunScope::Full,
                 Some("branch_context_changed".to_string()),
             );
+            if !source_root_is_still_tracked(projects, &old_source_root) {
+                if let Err(err) = watcher.unwatch(&old_source_root) {
+                    warn!(
+                        "failed to unwatch merged branch context source {}: {err}",
+                        old_source_root.display()
+                    );
+                }
+            }
         } else {
             projects.insert(new_context_id, state);
         }
     }
+}
+
+fn source_root_is_still_tracked(projects: &ProjectStates, source_root: &Path) -> bool {
+    let canonical_source_root = canonical_project_root(source_root);
+    projects
+        .values()
+        .any(|state| canonical_project_root(&state.source_root) == canonical_source_root)
 }
 
 fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
@@ -1105,6 +1124,7 @@ async fn handle_search_request(
         }
     };
 
+    let mut degraded_reason = None;
     let results = if has_embeddings {
         let status = state
             .embedding_runtime
@@ -1119,10 +1139,12 @@ async fn handle_search_request(
             );
             engine.search(&request.query, request.limit).await
         } else {
+            degraded_reason = Some(daemon_search_degraded_reason());
             let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
             engine.fts_only_search(&request.query, request.limit).await
         }
     } else {
+        degraded_reason = Some(daemon_search_degraded_reason());
         let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
         engine.fts_only_search(&request.query, request.limit).await
     };
@@ -1131,6 +1153,7 @@ async fn handle_search_request(
         Ok(results) => SearchResponse::Results {
             results,
             daemon_version: Some(VERSION.to_string()),
+            degraded_reason,
         },
         Err(err) => {
             warn!(
@@ -1140,6 +1163,10 @@ async fn handle_search_request(
             search_service::unavailable_response()
         }
     }
+}
+
+fn daemon_search_degraded_reason() -> String {
+    "semantic embeddings unavailable; search is degraded to FTS-only mode".to_string()
 }
 
 #[cfg(test)]
@@ -1450,6 +1477,40 @@ mod tests {
             .run_state
             .pending_scope
             .is_none());
+    }
+
+    #[test]
+    fn mark_branch_context_changes_marks_old_context_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+        let old_context_id = state.context.context_id.clone();
+
+        let mut projects = HashMap::new();
+        projects.insert(old_context_id.clone(), state);
+
+        let mut watcher = FileWatcher::new().unwrap();
+        watcher.watch(&project_root).unwrap();
+
+        mark_branch_context_changes(&mut watcher, &mut projects);
+
+        assert!(!projects.contains_key(&old_context_id));
+        assert_eq!(projects.len(), 1);
+        assert_eq!(
+            projects.values().next().unwrap().run_state.pending_scope,
+            Some(RunScope::Full)
+        );
+
+        let context_status_path = daemon_context_status_path(&project_root);
+        let context_status: DaemonContextStatusFile =
+            serde_json::from_str(&std::fs::read_to_string(context_status_path).unwrap()).unwrap();
+        let old_entry = context_status.contexts.get(&old_context_id).unwrap();
+        assert_eq!(old_entry.watch_status, DaemonWatchStatus::DaemonStopped);
     }
 
     #[test]
