@@ -1854,7 +1854,9 @@ fn mcp_prepare_ignores_index_rows_from_other_context() {
 #[test]
 fn mcp_prepare_index_if_missing_builds_index_state_only() {
     let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let git_dir = tmp.path().join(".git");
+    fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
 
     let source_path = tmp.path().join("src").join("lib.rs");
