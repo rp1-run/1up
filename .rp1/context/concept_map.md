@@ -4,19 +4,19 @@
 
 | Prior Claim | Status | Update |
 |---|---|---|
-| Schema v12 stores `segment_vectors.embedding_vec` as `FLOAT8(384)` and uses `vector8(?)`. | confirmed | Current schema/query/storage paths still declare `FLOAT8(384)`, `compress_neighbors=float8`, `max_neighbors=32`, and typed `vector8(?)` insert/query sites. |
+| Schema v13 stores `segment_vectors.embedding_vec` as `FLOAT8(384)` and uses `vector8(?)`. | confirmed | Current schema/query/storage paths still declare `FLOAT8(384)`, `compress_neighbors=float8`, `max_neighbors=32`, and typed `vector8(?)` insert/query sites. |
 | Impact Horizon separates primary likely impact from contextual guidance. | confirmed | `ImpactResultEnvelope.results` and `contextual_results` remain separate; relation scoring still gates primary promotion through owner, edge, path, role, and ambiguity checks. |
-| Search emits a machine follow-up segment handle. | refined | `SearchResult.segment_id` is now required in the current shared contract, while display surfaces may shorten it to a 12-char `:<handle>` prefix accepted by read/impact follow-up. |
+| Search emits a machine follow-up segment handle. | refined | `SearchResult.segment_id` is now required in the current shared contract, while display surfaces may shorten it to a 12-char `:<handle>` prefix accepted by get/impact follow-up. |
 | Project state lives at the project root. | refined | Current project resolution separates `state_root` from `source_root`, especially for linked worktrees and MCP/daemon flows. |
 | Eval and benchmark harnesses gate retrieval/storage changes. | untested | Preserved from prior KB; eval files were outside this pass's assigned concept set. |
-| MCP is not modeled in the prior concept map. | contradicted-by-new-evidence | MCP is now a first-class code-discovery surface with stdio serving, readiness, search, read, symbol, and impact tools. |
+| MCP is not modeled in the prior concept map. | contradicted-by-new-evidence | MCP is now a first-class code-discovery surface with stdio serving, status/start, search, get, symbol, context, impact, and structural tools. |
 
 ## Core Concepts
 
 | Concept | Type | Meaning | Primary Evidence |
 |---|---|---|---|
 | `Segment` | Entity | Fundamental indexed code block with deterministic id, file span, language, block type, role, symbols, relations, and optional vector row. | `src/shared/types.rs`, `src/storage/segments.rs` |
-| `Segment Handle` | Value object | A segment id used for exact follow-up; MCP and lean rows display a short `:<12-char>` prefix, and read lookup resolves full or unique prefix handles. | `src/storage/segments.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs` |
+| `Segment Handle` | Value object | A segment id used for exact follow-up; MCP and lean rows display a short `:<12-char>` prefix, and get lookup resolves full or unique prefix handles. | `src/storage/segments.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs` |
 | `SearchResult` | Entity | Ranked hydrated discovery result carrying a required `segment_id`, integer score, path/span/kind, breadcrumb, content, and optional defined symbols. | `src/shared/types.rs`, `src/search/hybrid.rs` |
 | `CandidateRow` | Internal entity | Lightweight retrieval/ranking candidate selected before full segment hydration. | `src/search/retrieval.rs`, `src/search/ranking.rs` |
 | `QueryIntent` | Value object | Query classifier (`Definition`, `Flow`, `Usage`, `Docs`, `General`) that influences symbol variant search and rank boosts. | `src/search/intent.rs`, `src/search/ranking.rs` |
@@ -53,18 +53,21 @@
 
 | Term | Meaning |
 |---|---|
-| `oneup_prepare` | MCP readiness/indexing tool; modes are `check`, `index_if_missing`, `index_if_needed`, and `reindex`. |
+| `oneup_status` | MCP readiness tool that checks the configured repository without indexing. |
+| `oneup_start` | MCP lifecycle tool that can create, refresh, or rebuild the local index; modes are `index_if_needed`, `index_if_missing`, and `reindex`. |
 | `oneup_search` | MCP ranked discovery tool backed by Hybrid Search; returns handles and may mark results degraded when embeddings are unavailable. |
-| `oneup_read` | MCP hydration tool for segment handles or repo-contained file locations; returns segment records or context records. |
+| `oneup_get` | MCP hydration tool for segment handles; returns segment records in request order. |
 | `oneup_symbol` | MCP completeness tool for symbol definitions, references, or both. |
-| `oneup_impact` | MCP likely-impact tool that maps one segment/symbol/file anchor into `ImpactRequest`. |
+| `oneup_context` | MCP file-line context tool for repo-contained source locations. |
+| `oneup_impact` | MCP likely-impact tool that maps one handle/symbol/file anchor into `ImpactRequest`. |
+| `oneup_structural` | MCP tree-sitter structural search tool with explicit ok, empty, and error diagnostics. |
 | `next_actions` | MCP follow-up hints that name another 1up tool and structured arguments. |
 | `handle` | MCP-visible segment identifier, normally rendered with a leading colon and shortened for display. |
 | `state_root` | Root where `.1up/` state, index DB, project id, daemon status, and registry identity live. |
 | `source_root` | Root whose files are scanned, indexed, watched, and read; can differ from `state_root` for linked worktrees. |
 | `readiness status` | MCP readiness enum: `ready`, `missing`, `indexing`, `stale`, `degraded`. |
 | `operation status` | MCP operation enum: `ok`, `empty`, `partial`, `degraded`. |
-| `read status` | Per-record read enum: `found`, `not_found`, `ambiguous`, `rejected`, `error`. |
+| `get/context status` | Per-record get/context enum: `found`, `not_found`, `ambiguous`, `rejected`, `error`. |
 | `degraded search` | Search path where semantic embeddings are unavailable and FTS-only retrieval is used. |
 | `segment_id` | Required machine-readable segment id on current `SearchResult` and `SymbolResult`; prefix lookup supports shorter handles. |
 | `SegmentRole` | Parser role vocabulary: `DEFINITION`, `IMPLEMENTATION`, `ORCHESTRATION`, `IMPORT`, `DOCS`. |
@@ -78,20 +81,20 @@
 | `metadata_skipped` | Prefilter count for indexed files skipped because size and mtime matched the manifest. |
 | `content_read` | Prefilter count for files that passed metadata screening and were actually read/parsed. |
 | `MCP instance lock` | Per-project Unix lock preventing multiple stdio MCP server instances for one state root. |
-| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used by schema v12. |
+| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used by schema v13. |
 | `vector8(?)` | Typed libSQL constructor required for reads/writes against `FLOAT8` vector columns. |
 | `VECTOR_PREFILTER_K` | Candidate prefilter count (`400`) used by vector/FTS retrieval before RRF reranking. |
 | `gold corpus` | Prior KB term for version-neutral recall ground truth keyed by durable anchors, not transient segment ids. |
 
 ## Relationships
 
-- `MCP Stdio Server` exposes `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` as tool-router methods on `OneupMcpServer`.
-- `ToolEnvelope` wraps every MCP payload and uses `next_actions` to encode the expected search -> read -> symbol/impact workflow.
+- `MCP Stdio Server` exposes `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural` as tool-router methods on `OneupMcpServer`.
+- `ToolEnvelope` wraps every MCP payload and uses `next_actions` to encode the expected status/start/search -> get/context -> symbol/impact/structural workflow.
 - `ResolvedProject` feeds MCP, daemon, and indexing flows with distinct `state_root` and `source_root` responsibilities.
-- `oneup_prepare` can create/rebuild the local index through `Db`, `schema`, `EmbeddingRuntime`, and the `Indexing Pipeline`.
-- `oneup_search` calls `Hybrid Search`; `oneup_read` hydrates `Segment Handle` values through storage or file locations through `Context Retrieval`.
+- `oneup_status` checks readiness, and `oneup_start` can create/rebuild the local index through `Db`, `schema`, `EmbeddingRuntime`, and the `Indexing Pipeline`.
+- `oneup_search` calls `Hybrid Search`; `oneup_get` hydrates `Segment Handle` values through storage; `oneup_context` reads file locations through `Context Retrieval`.
 - `Hybrid Search` combines vector, FTS, and symbol candidates into `CandidateRow` values, ranks them, then hydrates `SearchResult` from `Segment` rows.
-- `SearchResult.segment_id` and `SymbolResult.segment_id` provide exact handles for `oneup_read` and `ImpactAnchor::Segment`.
+- `SearchResult.segment_id` and `SymbolResult.segment_id` provide exact handles for `oneup_get` and `ImpactAnchor::Segment`.
 - `Indexing Pipeline` turns parser/chunker output into `SegmentInsert` batches, `Segment Vector` rows, `segment_symbols`, `SegmentRelation` rows, and `Indexed Files Manifest` rows.
 - `ParsedRelation` rows become `SegmentRelation` records through `RelationTargetDescriptor` normalization.
 - `Impact Horizon` resolves relation targets through `lookup_canonical_symbol`, scores owner/edge/path/role evidence, and separates primary `results` from `contextual_results`.
@@ -102,7 +105,7 @@
 
 | Pattern | Context | Application |
 |---|---|---|
-| Search-before-read workflow | MCP and lean CLI | Discovery returns handles first; callers hydrate selected records with `oneup_read`/`get` before relying on content. |
+| Search-before-get workflow | MCP and lean CLI | Discovery returns handles first; callers hydrate selected records with `oneup_get`/`get` before relying on content. |
 | Structured follow-up guidance | MCP tools | Every tool result carries `next_actions` rather than leaving agents to infer the next command. |
 | State/source root split | Project resolution | Worktree-aware operations store state in the main repo while indexing/reading the active source tree. |
 | Candidate-first retrieval | Search | Vector, FTS, and symbol paths produce lightweight candidates before full segment hydration. |
@@ -121,7 +124,7 @@
 ### MCP Code Discovery
 
 - Owns stdio server instructions, tool schemas, envelopes, summaries, and next-action choreography for agent-facing discovery.
-- Delegates actual search, read, symbol, impact, readiness, and indexing work to search/storage/indexing/shared modules.
+- Delegates actual status/start, search, get, context, symbol, impact, and structural work to search/storage/indexing/shared modules.
 
 ### Search Discovery
 
@@ -140,7 +143,7 @@
 
 ### Index Graph Storage
 
-- Owns schema v12, segments, vectors, symbols, relations, indexed-file manifest rows, meta records, and DB path validation.
+- Owns schema v13, segments, vectors, symbols, relations, indexed-file manifest rows, meta records, and DB path validation.
 - Uses force-reindex for incompatible schema/model changes.
 
 ### Daemon Coordination
@@ -160,7 +163,7 @@
 ## Cross-Cutting Concerns
 
 - Compatibility: public surfaces evolve through stable structs/enums and additive fields where possible; storage incompatibility is handled by schema version checks.
-- Ambiguity management: impact refuses broad anchors; handle prefix reads report ambiguity; MCP read locations reject path escapes.
+- Ambiguity management: impact refuses broad anchors; handle prefix get calls report ambiguity; MCP context locations reject path escapes.
 - Advisory semantics: impact scores and reasons are likely-impact guidance, not exact dependency truth.
 - Performance: metadata prefiltering, write batching, tuned PRAGMAs, warm embedding runtime, bounded vector prefiltering, and daemon request limits protect interactive latency.
 - Security: same-UID daemon IPC, secure socket/file modes, validated project DB paths, repo-contained location reads, and verified model artifact hashes defend local state boundaries.

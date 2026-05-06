@@ -43,7 +43,11 @@ pub async fn exec(args: StructuralArgs) -> anyhow::Result<()> {
         let conn = db.connect()?;
         schema::ensure_current(&conn).await?;
 
-        let engine = StructuralSearchEngine::new(source_root, Some(&conn));
+        let engine = StructuralSearchEngine::new_scoped(
+            source_root,
+            &conn,
+            &resolved.worktree_context.context_id,
+        );
         engine.search(&args.pattern, lang_filter).await?
     } else {
         eprintln!(

@@ -8,24 +8,27 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 | You know | Use |
 |---|---|
-| Readiness is uncertain | `oneup_prepare` |
+| Readiness is uncertain | `oneup_status` |
+| Indexing or rebuilding is needed | `oneup_start` with the mode suggested by status |
 | Concept, behavior, or feature area | `oneup_search` |
-| A promising search hit | `oneup_read` with the returned handle |
-| A specific diagnostic file and line | `oneup_read` with a precise location |
+| A promising search hit | `oneup_get` with the returned handle |
+| A specific diagnostic file and line | `oneup_context` with a precise location |
 | A known or discovered symbol needs completeness | `oneup_symbol` with references when useful |
 | Likely follow-up targets matter | `oneup_impact` |
 
-`oneup_search` is discovery, not proof of completeness. Use `oneup_read` to inspect selected hits before answering, and use `oneup_symbol` when you need definitions or references for a known symbol.
+`oneup_search` is discovery, not proof of completeness. Use `oneup_get` to inspect selected handles before answering, use `oneup_context` for precise file-line context, and use `oneup_symbol` when you need definitions or references for a known symbol.
 
 `grep`, `rg`, and `find` are not discovery tools in the 1up variant. After `oneup_search` has narrowed the scope to one or two files, Bash `grep` or `rg` may be used only for exact literal verification.
 
 ## Workflow
 
-1. Call `oneup_prepare` if index readiness is unclear.
-2. Call `oneup_search` with the task intent and a small limit.
-3. Pick the best handles and hydrate them with `oneup_read`.
-4. Use `oneup_symbol` for definition/reference completeness when a symbol appears important.
-5. Answer from the inspected code and name the key files and their roles.
+1. Call `oneup_status` if index readiness is unclear.
+2. Call `oneup_start` only if status says indexing or rebuilding is needed.
+3. Call `oneup_search` with the task intent and a small limit.
+4. Pick the best handles and hydrate them with `oneup_get`.
+5. Use `oneup_context` for precise file-line context when needed.
+6. Use `oneup_symbol` for definition/reference completeness when a symbol appears important.
+7. Answer from the inspected code and name the key files and their roles.
 
 {{TASK_PROMPT}}
 

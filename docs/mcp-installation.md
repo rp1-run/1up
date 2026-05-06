@@ -21,17 +21,16 @@ Configure 1up MCP for this repository.
 
 RULES
 - Configure MCP directly in the host's config.
-- Use `MAIN_ROOT` for the MCP path and repository instruction file.
-- If this checkout is a linked Git worktree, `MAIN_ROOT` is the main worktree root, not the linked worktree path.
+- Use `SOURCE_ROOT` for the MCP path and repository instruction file.
+- If this checkout is a linked Git worktree, keep the linked worktree path as `SOURCE_ROOT`.
+- `1up` stores shared index state in the main worktree automatically.
 - Do not try to restart this active host or verify newly added MCP tools from it.
 
 PROC
-1. Resolve `MAIN_ROOT` as the main worktree root:
-   - If Git is available: run `git rev-parse --path-format=absolute --git-common-dir`.
-   - If the result ends with `/.git`, strip `/.git`; that path is `MAIN_ROOT`. Stop.
-   - Otherwise use `git rev-parse --show-toplevel`.
+1. Resolve `SOURCE_ROOT` as the active checkout root:
+   - If Git is available: run `git rev-parse --show-toplevel`.
    - If Git resolution fails, use `pwd -P`.
-   - Do not substitute the current linked worktree path after `MAIN_ROOT` is resolved.
+   - Do not replace a linked worktree path with the main worktree path for MCP config.
 2. Install/update `1up`:
    - If `1up` is not installed, install it with: `curl -fsSL https://1up.rp1.run/setup.sh | bash`
    - If present: `1up update`
@@ -39,17 +38,17 @@ PROC
 3. Add/update MCP config:
    - Server name: `oneup`
    - Command: `1up`
-   - Args: `["mcp", "--path", "<MAIN_ROOT>"]`
-   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<MAIN_ROOT>"]}}}`
+   - Args: `["mcp", "--path", "<SOURCE_ROOT>"]`
+   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<SOURCE_ROOT>"]}}}`
    - For TOML hosts, create the equivalent `oneup` server entry.
-4. Insert this minimal 1up hint into the repo instruction file under `MAIN_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
+4. Insert this minimal 1up hint into the repo instruction file under `SOURCE_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
 
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
+For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
 
-5. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
+5. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart. After reload, list tools and call `oneup_status`.
 
 OUT
-- `MAIN_ROOT`
+- `SOURCE_ROOT`
 - `1up --version`
 - MCP config file changed
 - repo instruction file changed
@@ -86,10 +85,10 @@ pwd -P
 4. Paste this single minimal agent hint into the repository instruction file your host reads, such as `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent file:
 
 ```text
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_prepare` when readiness is unknown, `oneup_search` for ranked discovery, `oneup_read` to hydrate returned handles or precise file locations, `oneup_symbol` for definitions/references, and `oneup_impact` for likely blast radius. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
+For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
 ```
 
-5. Reload or restart the host if needed, approve or trust the `oneup` server, list MCP tools, and call `oneup_prepare`.
+5. Reload or restart the host if needed, approve or trust the `oneup` server, list MCP tools, and call `oneup_status`.
 
 ## Install Or Update 1up
 
@@ -217,7 +216,7 @@ Use the standard MCP server entry expected by your client:
 
 If your client uses `servers` instead of `mcpServers`, keep the same server identity, command, args, and stdio transport.
 
-After saving manual configuration, reload the host, list tools, and call `oneup_prepare`.
+After saving manual configuration, reload the host, list tools, and call `oneup_status`.
 
 ## Approve Or Trust The Server
 
@@ -235,23 +234,26 @@ In the configured host, list MCP tools for the `oneup` server. The expected tool
 
 | Tool | Purpose |
 |---|---|
-| `oneup_prepare` | Check readiness, missing index, stale schema, indexing, or degraded state |
+| `oneup_status` | Check readiness, missing index, stale schema, indexing, or degraded state without indexing |
+| `oneup_start` | Create, refresh, or rebuild the local index when explicitly requested |
 | `oneup_search` | Search local code by meaning or intent |
-| `oneup_read` | Hydrate returned handles or precise file locations |
+| `oneup_get` | Hydrate returned result handles |
 | `oneup_symbol` | Find definitions and references |
-| `oneup_impact` | Explore likely impact from a segment, symbol, or file anchor |
+| `oneup_context` | Retrieve precise repository-scoped file-line context |
+| `oneup_impact` | Explore likely impact from a result handle, symbol, or file anchor |
+| `oneup_structural` | Run tree-sitter structural pattern searches for supported languages |
 
-Then call `oneup_prepare` in its default check mode. A clear `ready`, `indexing`, `missing`, `stale`, or `degraded` readiness state is acceptable when it includes actionable guidance. Typical next steps are:
+Then call `oneup_status`. A clear `ready`, `indexing`, `missing`, `stale`, or `degraded` readiness state is acceptable when it includes actionable guidance. Typical next steps are:
 
 | Readiness | User action |
 |---|---|
 | `ready` | Start discovery with `oneup_search`. |
 | `indexing` | Wait for the current index run to finish, then check readiness again. |
-| `missing` | Run `1up start` from the repository, then check readiness again. |
-| `stale` | Follow the action returned by `oneup_prepare`, then check readiness again. |
+| `missing` | Call `oneup_start` with `{"mode":"index_if_missing"}`, then check readiness again. |
+| `stale` | Call `oneup_start` with `{"mode":"reindex"}`, then check readiness again. |
 | `degraded` | Read the diagnostic, fix the environment issue, and retry readiness. |
 
-For a discovery smoke, ask the host to search with `oneup_search`, hydrate a selected handle with `oneup_read`, and use `oneup_symbol` when it needs definition or reference completeness.
+For a discovery smoke, ask the host to search with `oneup_search`, hydrate a selected handle with `oneup_get`, retrieve file-line context with `oneup_context`, use `oneup_symbol` when it needs definition or reference completeness, use `oneup_impact` for explicit likely-impact questions, and use `oneup_structural` for explicit tree-sitter patterns.
 
 ## Human Project Lifecycle
 
@@ -309,14 +311,14 @@ MCP stdio requires protocol messages on stdout. User-facing diagnostics should g
 
 ### Missing Or Stale Index
 
-`oneup_prepare` reports index state before discovery. If the index is missing, run:
+`oneup_status` reports index state before discovery. If the index is missing, run:
 
 ```sh
 cd /absolute/path/to/repo
 1up start
 ```
 
-Then call `oneup_prepare` again from the host. If readiness still reports stale or degraded state, follow the specific action in the `oneup_prepare` response.
+Then call `oneup_status` again from the host. If readiness still reports stale or degraded state, follow the specific action in the `oneup_status` response, usually `oneup_start` with the returned mode.
 
 ### Reporting An Unresolved Setup Issue
 
@@ -329,7 +331,7 @@ Include this information in a maintainer report:
 - Server identity, command, args, and scope
 - Repository path used in configuration
 - Tool listing result
-- `oneup_prepare` readiness result or host protocol error
+- `oneup_status` readiness result or host protocol error
 
 ## Safety And Permissions
 

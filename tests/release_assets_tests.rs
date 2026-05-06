@@ -117,34 +117,43 @@ if [ "${1:-}" = "mcp" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_prepare"},{"name":"oneup_search"},{"name":"oneup_read"},{"name":"oneup_symbol"},{"name":"oneup_impact"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"}]}}'
         ;;
-      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+      *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository needs indexing.","data":{"index_readable":false},"next_actions":[{"tool":"oneup_start","reason":"index fixture code","arguments":{"mode":"index_if_needed"}}]}}}'
         ;;
-      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*'"query":"PolicyRuleValidator"'*'"limit":5'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"structuredContent":{"status":"degraded","summary":"Found fixture search results.","data":{"results":[{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}]},"next_actions":[]}}}'
+      *'"id":4'*'"method":"tools/call"'*'"oneup_start"'*'"mode":"index_if_needed"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
         ;;
-      *'"id":4'*'"method":"tools/call"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unexpected search arguments"}}'
-        ;;
-      *'"id":5'*'"method":"tools/call"'*'"oneup_read"'*'"handles":[":abcdef123456"]'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture segment.","data":{"records":[{"status":"found","handle":":abcdef123456","segment":{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
+      *'"id":5'*'"method":"tools/call"'*'"oneup_search"'*'"query":"PolicyRuleValidator"'*'"limit":5'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"structuredContent":{"status":"degraded","summary":"Found fixture search results.","data":{"results":[{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}]},"next_actions":[]}}}'
         ;;
       *'"id":5'*'"method":"tools/call"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"unexpected read-handle arguments"}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"unexpected search arguments"}}'
         ;;
-      *'"id":6'*'"method":"tools/call"'*'"oneup_symbol"'*'"name":"PolicyRuleValidator"'*'"include":"both"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"structuredContent":{"status":"ok","summary":"Found fixture symbol evidence.","data":{"definitions":[{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}],"references":[{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}]},"next_actions":[]}}}'
+      *'"id":6'*'"method":"tools/call"'*'"oneup_get"'*'"handles":[":abcdef123456"]'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture segment.","data":{"records":[{"status":"found","handle":":abcdef123456","segment":{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
         ;;
       *'"id":6'*'"method":"tools/call"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unexpected symbol arguments"}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unexpected get arguments"}}'
         ;;
-      *'"id":7'*'"method":"tools/call"'*'"oneup_read"'*'"locations":[{"path":"src/policy.rs","line":4,"expansion":2}]'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture file-line context.","data":{"records":[{"status":"found","location":{"path":"src/policy.rs","line":4},"context":{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
+      *'"id":7'*'"method":"tools/call"'*'"oneup_symbol"'*'"name":"PolicyRuleValidator"'*'"include":"both"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"structuredContent":{"status":"ok","summary":"Found fixture symbol evidence.","data":{"definitions":[{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}],"references":[{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}]},"next_actions":[]}}}'
         ;;
       *'"id":7'*'"method":"tools/call"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"unexpected read-location arguments"}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"unexpected symbol arguments"}}'
+        ;;
+      *'"id":8'*'"method":"tools/call"'*'"oneup_context"'*'"locations":[{"path":"src/policy.rs","line":4,"expansion":2}]'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"structuredContent":{"status":"ok","summary":"Hydrated fixture file-line context.","data":{"records":[{"status":"found","location":{"path":"src/policy.rs","line":4},"context":{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {"}}]},"next_actions":[]}}}'
+        ;;
+      *'"id":8'*'"method":"tools/call"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":8,"error":{"code":-32602,"message":"unexpected context arguments"}}'
+        ;;
+      *'"id":9'*'"method":"tools/call"'*'"oneup_impact"'*'"handle":":abcdef123456"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":9,"result":{"structuredContent":{"status":"empty","summary":"No fixture impact results.","data":{"results":[]},"next_actions":[{"tool":"oneup_search","reason":"search for a narrower anchor","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+        ;;
+      *'"id":10'*'"method":"tools/call"'*'"oneup_structural"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"structuredContent":{"status":"ok","summary":"Found fixture structural matches.","data":{"results":[{"file_path":"src/policy.rs","language":"rust","pattern_name":"name","content":"PolicyRuleValidator","line_start":1,"line_end":1}]},"next_actions":[]}}}'
         ;;
     esac
   done
@@ -176,13 +185,16 @@ if [ "${1:-}" = "mcp" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_prepare"},{"name":"oneup_search"},{"name":"oneup_read"},{"name":"oneup_symbol"},{"name":"oneup_impact"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"}]}}'
         ;;
-      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+      *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository needs indexing.","data":{"index_readable":false},"next_actions":[{"tool":"oneup_start","reason":"index fixture code","arguments":{"mode":"index_if_needed"}}]}}}'
         ;;
-      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"isError":true,"structuredContent":{"status":"error","summary":"search failed","data":{},"next_actions":[]}}}'
+      *'"id":4'*'"method":"tools/call"'*'"oneup_start"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"structuredContent":{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{"index_readable":true},"next_actions":[{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{"query":"PolicyRuleValidator"}}]}}}'
+        ;;
+      *'"id":5'*'"method":"tools/call"'*'"oneup_search"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"structuredContent":{"status":"error","summary":"search failed","data":{},"next_actions":[]}}}'
         ;;
     esac
   done
@@ -293,22 +305,31 @@ if [ "${{1:-}}" = "mcp" ]; then
         printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"oneup-fixture","version":"{version}"}}}}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_prepare"}},{{"name":"oneup_search"}},{{"name":"oneup_read"}},{{"name":"oneup_symbol"}},{{"name":"oneup_impact"}}]}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_status"}},{{"name":"oneup_start"}},{{"name":"oneup_search"}},{{"name":"oneup_get"}},{{"name":"oneup_symbol"}},{{"name":"oneup_context"}},{{"name":"oneup_impact"}},{{"name":"oneup_structural"}}]}}}}'
         ;;
-      *'"id":3'*'"method":"tools/call"'*'"oneup_prepare"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{{"index_readable":true}},"next_actions":[{{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{{"query":"PolicyRuleValidator"}}}}]}}}}}}'
+      *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"missing","summary":"Fixture repository needs indexing.","data":{{"index_readable":false}},"next_actions":[{{"tool":"oneup_start","reason":"index fixture code","arguments":{{"mode":"index_if_needed"}}}}]}}}}}}'
         ;;
-      *'"id":4'*'"method":"tools/call"'*'"oneup_search"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"structuredContent":{{"status":"degraded","summary":"Found fixture search results.","data":{{"results":[{{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}}]}},"next_actions":[]}}}}}}'
+      *'"id":4'*'"method":"tools/call"'*'"oneup_start"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"structuredContent":{{"status":"degraded","summary":"Fixture repository is indexed in FTS-only mode.","data":{{"index_readable":true}},"next_actions":[{{"tool":"oneup_search","reason":"search indexed fixture code","arguments":{{"query":"PolicyRuleValidator"}}}}]}}}}}}'
         ;;
-      *'"id":5'*'"method":"tools/call"'*'"oneup_read"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture segment.","data":{{"records":[{{"status":"found","handle":":abcdef123456","segment":{{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
+      *'"id":5'*'"method":"tools/call"'*'"oneup_search"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"structuredContent":{{"status":"degraded","summary":"Found fixture search results.","data":{{"results":[{{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"score":96,"kind":"struct","breadcrumb":"PolicyRuleValidator","symbol":"PolicyRuleValidator"}}]}},"next_actions":[]}}}}}}'
         ;;
-      *'"id":6'*'"method":"tools/call"'*'"oneup_symbol"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{{"structuredContent":{{"status":"ok","summary":"Found fixture symbol evidence.","data":{{"definitions":[{{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}}],"references":[{{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}}]}},"next_actions":[]}}}}}}'
+      *'"id":6'*'"method":"tools/call"'*'"oneup_get"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture segment.","data":{{"records":[{{"status":"found","handle":":abcdef123456","segment":{{"path":"src/policy.rs","line_start":1,"line_end":7,"content":"pub struct PolicyRuleValidator;\npub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
         ;;
-      *'"id":7'*'"method":"tools/call"'*'"oneup_read"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture file-line context.","data":{{"records":[{{"status":"found","location":{{"path":"src/policy.rs","line":4}},"context":{{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
+      *'"id":7'*'"method":"tools/call"'*'"oneup_symbol"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"structuredContent":{{"status":"ok","summary":"Found fixture symbol evidence.","data":{{"definitions":[{{"path":"src/policy.rs","line":1,"handle":"abcdef123456"}}],"references":[{{"path":"src/runner.rs","line":1,"handle":"fedcba654321"}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":8'*'"method":"tools/call"'*'"oneup_context"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":8,"result":{{"structuredContent":{{"status":"ok","summary":"Hydrated fixture file-line context.","data":{{"records":[{{"status":"found","location":{{"path":"src/policy.rs","line":4}},"context":{{"path":"src/policy.rs","line_start":2,"line_end":6,"content":"pub fn validate(&self, policy: &str) -> bool {{"}}}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":9'*'"method":"tools/call"'*'"oneup_impact"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":9,"result":{{"structuredContent":{{"status":"empty","summary":"No fixture impact results.","data":{{"results":[]}},"next_actions":[{{"tool":"oneup_search","reason":"search for a narrower anchor","arguments":{{"query":"PolicyRuleValidator"}}}}]}}}}}}'
+        ;;
+      *'"id":10'*'"method":"tools/call"'*'"oneup_structural"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":10,"result":{{"structuredContent":{{"status":"ok","summary":"Found fixture structural matches.","data":{{"results":[{{"file_path":"src/policy.rs","language":"rust","pattern_name":"name","content":"PolicyRuleValidator","line_start":1,"line_end":1}}]}},"next_actions":[]}}}}}}'
         ;;
     esac
   done
@@ -842,9 +863,9 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "All setup below uses manual host configuration.",
         "curl -fsSL https://1up.rp1.run/setup.sh | bash",
         "Configure 1up MCP for this repository.",
-        "main worktree root",
-        "git rev-parse --path-format=absolute --git-common-dir",
-        "Use `MAIN_ROOT` for the MCP path and repository instruction file.",
+        "active checkout root",
+        "git rev-parse --show-toplevel",
+        "Use `SOURCE_ROOT` for the MCP path and repository instruction file.",
         "Do not try to restart this active host or verify newly added MCP tools from it.",
         "ask the user to restart/reload this host so it can load `oneup`",
         "If `1up` is not installed, install it with",
@@ -854,7 +875,7 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "CLAUDE.md",
         ".github/copilot-instructions.md",
         "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
-        "Use `oneup_prepare` when readiness is unknown",
+        "Use `oneup_status` when readiness is unknown",
         "list MCP tools",
         "### Codex",
         "### Claude Code",
@@ -864,7 +885,11 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "server identity `oneup`",
         "command `1up`",
         "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
-        "oneup_prepare",
+        "oneup_status",
+        "oneup_start",
+        "oneup_get",
+        "oneup_context",
+        "oneup_structural",
         "1up start",
         "1up status",
         "1up list",
@@ -900,6 +925,11 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md`",
         "Use the plain minimal instruction from the MCP installation guide",
         "[docs/mcp-installation.md](docs/mcp-installation.md)",
+        "oneup_status",
+        "oneup_start",
+        "oneup_get",
+        "oneup_context",
+        "oneup_structural",
     ] {
         assert!(
             readme.contains(required),
@@ -917,6 +947,8 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "Homebrew",
         "Scoop",
         "hello-agent",
+        "oneup_prepare",
+        "oneup_read",
         "1up mcp-install",
         "1up mcp install",
         "src/mcp/install",
@@ -968,11 +1000,14 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     assert_eq!(evidence["stdout_protocol_clean"], true);
     assert_eq!(evidence["presentation_free"], true);
     assert_eq!(evidence["discovery_flow"]["status"], "passed");
-    assert_eq!(evidence["response_statuses"]["prepare"], "degraded");
+    assert_eq!(evidence["response_statuses"]["status"], "missing");
+    assert_eq!(evidence["response_statuses"]["start"], "degraded");
     assert_eq!(evidence["response_statuses"]["search"], "degraded");
-    assert_eq!(evidence["response_statuses"]["read_handle"], "ok");
+    assert_eq!(evidence["response_statuses"]["get"], "ok");
     assert_eq!(evidence["response_statuses"]["symbol"], "ok");
-    assert_eq!(evidence["response_statuses"]["read_location"], "ok");
+    assert_eq!(evidence["response_statuses"]["context"], "ok");
+    assert_eq!(evidence["response_statuses"]["impact"], "empty");
+    assert_eq!(evidence["response_statuses"]["structural"], "ok");
     assert_eq!(evidence["server_command"][1], "mcp");
     assert_eq!(evidence["server_command"][2], "--path");
     assert_eq!(
@@ -981,11 +1016,14 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     );
     let tools = evidence["tools"].as_array().unwrap();
     for expected_tool in [
-        "oneup_prepare",
+        "oneup_status",
+        "oneup_start",
         "oneup_search",
-        "oneup_read",
+        "oneup_get",
         "oneup_symbol",
+        "oneup_context",
         "oneup_impact",
+        "oneup_structural",
     ] {
         assert!(
             tools.iter().any(|tool| tool == expected_tool),
@@ -994,10 +1032,14 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     }
     let exercised_tools = evidence["exercised_tools"].as_array().unwrap();
     for expected_tool in [
-        "oneup_prepare",
+        "oneup_status",
+        "oneup_start",
         "oneup_search",
-        "oneup_read",
+        "oneup_get",
         "oneup_symbol",
+        "oneup_context",
+        "oneup_impact",
+        "oneup_structural",
     ] {
         assert!(
             exercised_tools.iter().any(|tool| tool == expected_tool),
@@ -1006,11 +1048,14 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     }
     let calls = evidence["tool_calls"].as_array().unwrap();
     for expected_label in [
-        "prepare",
+        "status",
+        "start",
         "search",
-        "read_handle",
+        "get",
         "symbol",
-        "read_location",
+        "context",
+        "impact",
+        "structural",
     ] {
         assert!(
             calls.iter().any(|call| call["label"] == expected_label
@@ -1177,11 +1222,14 @@ fn archive_verification_confirms_expected_release_contents() {
         .as_array()
         .unwrap();
     for expected_tool in [
-        "oneup_prepare",
+        "oneup_status",
+        "oneup_start",
         "oneup_search",
-        "oneup_read",
+        "oneup_get",
         "oneup_symbol",
+        "oneup_context",
         "oneup_impact",
+        "oneup_structural",
     ] {
         assert!(
             tools.iter().any(|tool| tool == expected_tool),
@@ -1214,11 +1262,17 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
             "--repo",
             repo_path.to_str().unwrap(),
             "--tool",
-            "oneup_prepare",
+            "oneup_status",
+            "--tool",
+            "oneup_start",
             "--tool",
             "oneup_search",
             "--tool",
-            "oneup_read",
+            "oneup_get",
+            "--tool",
+            "oneup_context",
+            "--tool",
+            "oneup_structural",
             "--readiness",
             "ready",
             "--discovery-flow",
@@ -1248,7 +1302,7 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
             "--repo",
             repo_path.to_str().unwrap(),
             "--tool",
-            "oneup_prepare",
+            "oneup_status",
             "--readiness",
             "blocked",
             "--discovery-flow",
@@ -1300,9 +1354,12 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
     assert_eq!(evidence["hosts"]["codex"]["readiness"], "ready");
     assert_eq!(evidence["hosts"]["codex"]["discovery_flow"], "passed");
     let tools = evidence["hosts"]["codex"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool == "oneup_prepare"));
+    assert!(tools.iter().any(|tool| tool == "oneup_status"));
+    assert!(tools.iter().any(|tool| tool == "oneup_start"));
     assert!(tools.iter().any(|tool| tool == "oneup_search"));
-    assert!(tools.iter().any(|tool| tool == "oneup_read"));
+    assert!(tools.iter().any(|tool| tool == "oneup_get"));
+    assert!(tools.iter().any(|tool| tool == "oneup_context"));
+    assert!(tools.iter().any(|tool| tool == "oneup_structural"));
 
     assert_eq!(evidence["hosts"]["generic"]["status"], "recorded");
     assert_eq!(evidence["hosts"]["generic"]["readiness"], "blocked");
@@ -1368,7 +1425,7 @@ fn mcp_host_smoke_recorder_rejects_unsupported_setup_mode() {
             "--repo",
             repo_path.to_str().unwrap(),
             "--tool",
-            "oneup_prepare",
+            "oneup_status",
             "--readiness",
             "ready",
             "--discovery-flow",
@@ -1447,7 +1504,7 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
                     "setup_mode": "manual",
                     "repo_path": "/tmp/blocked-repo",
                     "tools_listed": true,
-                    "tools": ["oneup_prepare"],
+                    "tools": ["oneup_status"],
                     "readiness": "blocked",
                     "discovery_flow": "failed",
                     "recorded_at": "2026-04-09T00:00:00Z"

@@ -387,7 +387,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 format!("No indexed segments were found for `{normalized_path}`."),
                 impact_hint(
                     "reindex_or_search",
-                    "Reindex the project or choose an exact segment anchor from search results.",
+                    "Reindex the project or choose an exact handle from search results.",
                     explicit_scope,
                     None,
                 ),
@@ -461,10 +461,10 @@ impl<'a> ImpactHorizonEngine<'a> {
             SegmentPrefixLookup::NotFound => {
                 return Ok(ResolveOutcome::Refused(refused_result(
                     "anchor_not_found",
-                    format!("Segment `{id}` is not present in the current index."),
+                    format!("Handle `{id}` is not present in the current index."),
                     impact_hint(
                         "refresh_anchor",
-                        "Choose a segment id from the current index and retry.",
+                        "Choose a handle from the current index and retry.",
                         explicit_scope,
                         None,
                     ),
@@ -480,12 +480,12 @@ impl<'a> ImpactHorizonEngine<'a> {
                 return Ok(ResolveOutcome::Refused(refused_result(
                     "anchor_ambiguous",
                     format!(
-                        "Segment prefix `{id}` matches {} segments ({preview}). Pass a longer prefix or the full id.",
+                        "Handle prefix `{id}` matches {} segments ({preview}). Pass a longer prefix or the full id.",
                         matches.len()
                     ),
                     impact_hint(
                         "disambiguate_anchor",
-                        "Run `1up get <prefix>` to list candidates and retry with a longer prefix.",
+                        "Run `1up get <handle>` to list candidates and retry with a longer handle.",
                         explicit_scope,
                         None,
                     ),
@@ -497,7 +497,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         let seed = candidate_from_stored_segment(segment);
         if let Some(scope) = explicit_scope.as_deref() {
             if let Some(refusal) = out_of_scope_anchor_refusal(
-                "segment",
+                "handle",
                 &resolved_id,
                 scope,
                 std::slice::from_ref(&seed),
@@ -508,7 +508,7 @@ impl<'a> ImpactHorizonEngine<'a> {
         let prefer_high_signal_paths = !is_low_signal_path(&seed.file_path);
         Ok(ResolveOutcome::Resolved(AnchorResolution {
             resolved_anchor: resolved_anchor(
-                "segment",
+                "handle",
                 resolved_id,
                 None,
                 explicit_scope.clone(),
@@ -544,7 +544,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 format!("No indexed definitions matched symbol `{name}`."),
                 impact_hint(
                     "narrow_with_scope",
-                    "Retry with `--scope`, `--from-file`, or an exact `--from-segment` anchor.",
+                    "Retry with `--scope`, `--from-file`, or an exact `--from-handle` anchor.",
                     explicit_scope,
                     None,
                 ),
@@ -571,7 +571,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 ),
                 impact_hint(
                     "narrow_with_scope",
-                    "Retry with `--scope`, `--from-file path[:line]`, or an exact `--from-segment` anchor.",
+                    "Retry with `--scope`, `--from-file path[:line]`, or an exact `--from-handle` anchor.",
                     suggested_scope_from_candidates(&seeds).or(explicit_scope),
                     None,
                 ),
@@ -2939,6 +2939,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, ImpactStatus::Expanded);
+        assert_eq!(
+            result
+                .resolved_anchor
+                .as_ref()
+                .map(|anchor| anchor.kind.as_str()),
+            Some("handle")
+        );
         assert!(result
             .results
             .iter()

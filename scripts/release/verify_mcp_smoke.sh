@@ -71,15 +71,27 @@ import time
 from pathlib import Path
 
 EXPECTED_TOOLS = [
-    "oneup_prepare",
+    "oneup_status",
+    "oneup_start",
     "oneup_search",
-    "oneup_read",
+    "oneup_get",
     "oneup_symbol",
+    "oneup_context",
     "oneup_impact",
+    "oneup_structural",
 ]
 READINESS_STATUSES = {"missing", "indexing", "stale", "ready", "degraded", "blocked"}
 DISCOVERY_READY_STATUSES = {"ready", "degraded"}
-REQUIRED_FLOW_LABELS = ["prepare", "search", "read_handle", "symbol", "read_location"]
+REQUIRED_FLOW_LABELS = [
+    "status",
+    "start",
+    "search",
+    "get",
+    "symbol",
+    "context",
+    "impact",
+    "structural",
+]
 FIXTURE_FILES = {
     "src/policy.rs": """pub struct PolicyRuleValidator;
 
@@ -407,7 +419,7 @@ def require_fixture_segment(records):
             and "PolicyRuleValidator" in content
         ):
             return segment
-    raise SmokeFailure("oneup_read handle response did not hydrate the fixture policy source")
+    raise SmokeFailure("oneup_get response did not hydrate the fixture policy source")
 
 
 def require_fixture_symbol_evidence(envelope):
@@ -448,7 +460,23 @@ def require_fixture_location_context(records):
             and line_start <= 4 <= line_end
         ):
             return context
-    raise SmokeFailure("oneup_read location response did not hydrate fixture file-line context")
+    raise SmokeFailure("oneup_context response did not hydrate fixture file-line context")
+
+
+def require_fixture_structural_match(envelope):
+    results = envelope["data"].get("results")
+    if not isinstance(results, list) or not results:
+        raise SmokeFailure("oneup_structural did not return structured matches")
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if (
+            result.get("file_path") == "src/policy.rs"
+            and result.get("language") == "rust"
+            and result.get("content") == "PolicyRuleValidator"
+        ):
+            return
+    raise SmokeFailure("oneup_structural did not return the fixture struct match")
 
 
 try:
@@ -548,34 +576,46 @@ try:
     if missing_tools:
         raise SmokeFailure(f"tools/list is missing canonical tools: {', '.join(missing_tools)}")
 
-    prepare_result = call_tool(
+    status_result = call_tool(
         proc,
         stdout_queue,
         3,
-        "oneup_prepare",
+        "oneup_status",
+        {},
+    )
+    status_envelope = require_tool_envelope(status_result, "status", "oneup_status")
+    status_readiness = status_envelope.get("status")
+    if status_readiness not in READINESS_STATUSES:
+        raise SmokeFailure(f"oneup_status returned unsupported readiness status: {status_readiness}")
+
+    start_result = call_tool(
+        proc,
+        stdout_queue,
+        4,
+        "oneup_start",
         {"mode": "index_if_needed"},
         timeout_seconds=90,
     )
-    structured = require_tool_envelope(prepare_result, "prepare", "oneup_prepare")
+    structured = require_tool_envelope(start_result, "start", "oneup_start")
     readiness_status = structured.get("status")
     if readiness_status not in READINESS_STATUSES:
-        raise SmokeFailure(f"oneup_prepare returned unsupported readiness status: {readiness_status}")
+        raise SmokeFailure(f"oneup_start returned unsupported readiness status: {readiness_status}")
     artifact["readiness_status"] = readiness_status
 
     next_actions = structured.get("next_actions")
     if readiness_status in {"missing", "indexing", "stale", "degraded"} and not next_actions:
         raise SmokeFailure(
-            f"oneup_prepare readiness status {readiness_status} did not include actionable next steps"
+            f"oneup_start readiness status {readiness_status} did not include actionable next steps"
         )
     if readiness_status not in DISCOVERY_READY_STATUSES:
         raise SmokeFailure(
-            f"oneup_prepare did not make the fixture repository searchable: {readiness_status}"
+            f"oneup_start did not make the fixture repository searchable: {readiness_status}"
         )
 
     search_result = call_tool(
         proc,
         stdout_queue,
-        4,
+        5,
         "oneup_search",
         {"query": "PolicyRuleValidator", "limit": 5},
     )
@@ -588,45 +628,63 @@ try:
     if not isinstance(handle, str) or not handle.strip():
         raise SmokeFailure("oneup_search result is missing a stable handle")
 
-    read_handle_result = call_tool(
+    get_result = call_tool(
         proc,
         stdout_queue,
-        5,
-        "oneup_read",
+        6,
+        "oneup_get",
         {"handles": [f":{handle}"]},
     )
-    read_handle_envelope = require_tool_envelope(
-        read_handle_result,
-        "read_handle",
-        "oneup_read",
-    )
-    handle_records = require_records_data(read_handle_envelope, "oneup_read handle")
+    get_envelope = require_tool_envelope(get_result, "get", "oneup_get")
+    handle_records = require_records_data(get_envelope, "oneup_get")
     require_fixture_segment(handle_records)
 
     symbol_result = call_tool(
         proc,
         stdout_queue,
-        6,
+        7,
         "oneup_symbol",
         {"name": "PolicyRuleValidator", "include": "both"},
     )
     symbol_envelope = require_tool_envelope(symbol_result, "symbol", "oneup_symbol")
     require_fixture_symbol_evidence(symbol_envelope)
 
-    read_location_result = call_tool(
+    context_result = call_tool(
         proc,
         stdout_queue,
-        7,
-        "oneup_read",
+        8,
+        "oneup_context",
         {"locations": [{"path": "src/policy.rs", "line": 4, "expansion": 2}]},
     )
-    read_location_envelope = require_tool_envelope(
-        read_location_result,
-        "read_location",
-        "oneup_read",
-    )
-    location_records = require_records_data(read_location_envelope, "oneup_read location")
+    context_envelope = require_tool_envelope(context_result, "context", "oneup_context")
+    location_records = require_records_data(context_envelope, "oneup_context")
     require_fixture_location_context(location_records)
+
+    impact_result = call_tool(
+        proc,
+        stdout_queue,
+        9,
+        "oneup_impact",
+        {"handle": f":{handle}"},
+    )
+    require_tool_envelope(impact_result, "impact", "oneup_impact")
+
+    structural_result = call_tool(
+        proc,
+        stdout_queue,
+        10,
+        "oneup_structural",
+        {
+            "pattern": "(struct_item name: (type_identifier) @name)",
+            "language": "rust",
+        },
+    )
+    structural_envelope = require_tool_envelope(
+        structural_result,
+        "structural",
+        "oneup_structural",
+    )
+    require_fixture_structural_match(structural_envelope)
 
     seen_labels = {call["label"] for call in artifact["tool_calls"]}
     missing_labels = [label for label in REQUIRED_FLOW_LABELS if label not in seen_labels]

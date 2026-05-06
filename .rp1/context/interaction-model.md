@@ -29,11 +29,11 @@
 ### MCP Server
 
 - Entry point: `1up mcp --path <repo-or-worktree>` under server identity `oneup`.
-- Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
-- Role: primary agent-facing prepare, search, read, symbol, and context workflow; impact remains available for explicit blast-radius questions but is not required for the core discovery loop.
+- Tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural`.
+- Role: primary agent-facing status/start, search, get, symbol, context, impact, and structural workflow.
 - Output: presentation-free structured `ToolEnvelope` with `status`, `summary`, `data`, and `next_actions`; text content mirrors the summary for host display without ANSI color, spinners, or terminal table formatting.
-- Readiness modes: `check`, `index_if_missing`, `index_if_needed`, `reindex`.
-- Product terms map to current tools: readiness/status and allowed start/index behavior use `oneup_prepare` modes, and file-line context retrieval uses `oneup_read.locations`. There are no separate `oneup_status`, `oneup_start`, or `oneup_context` tools.
+- Readiness/start modes: `oneup_status` checks without indexing; `oneup_start` accepts `index_if_needed`, `index_if_missing`, and `reindex`.
+- Product terms map directly to retained tools: readiness/status uses `oneup_status`, allowed start/index behavior uses `oneup_start`, handle hydration uses `oneup_get`, and file-line context retrieval uses `oneup_context`.
 - Safety: read-only tool annotations, single configured repository root, no arbitrary command execution.
 
 ### MCP Setup And Onboarding
@@ -44,15 +44,16 @@
 - Users must reload/restart the host and approve/trust the `oneup` server when required.
 - Historical reminder fences, `hello-agent`, portable skills, and digit-leading `1up_*` aliases are no longer current onboarding surfaces.
 
-### Lean Core CLI
+### Discovery CLI
 
-- Entry points: `search`, `get`, `symbol`, `context`, `impact`, `structural`, plus `mcp` and `add-mcp` as core no-format commands.
-- `search`: ranked semantic plus FTS discovery, default `-n 3`, auto-starts daemon when registered, falls back to local search if daemon search times out.
+- Help-visible retained discovery entry points: `get`, `symbol`, `context`, and `impact`; hidden lean compatibility commands include `search` and `structural`.
+- `search`: hidden ranked semantic plus FTS discovery, default `-n 3`, auto-starts daemon when registered, falls back to local search if daemon search times out.
 - `get`: hydrates one or more full or 12-char segment handles, accepting optional leading `:` and preserving request order.
 - `symbol`: exact definitions by default, `--references` for usages, `--fuzzy` for approximate matching; empty exact results teach `--fuzzy`.
 - `context`: reads a file:line scope, rejects absolute/outside-root paths unless `--allow-outside-root` is explicit.
-- `impact`: expands likely impact from exactly one file, symbol, or segment anchor with optional `--scope`, `--depth`, and `-n`.
-- `structural`: runs tree-sitter query patterns, using the index when present and direct scanning with a warning when absent.
+- `impact`: expands likely impact from exactly one public file, symbol, or handle anchor with optional `--scope`, `--depth`, and `-n`; segment input is hidden compatibility.
+- `structural`: hidden tree-sitter query search; MCP `oneup_structural` is the retained agent-facing structural surface.
+- Retained commands default to human-readable discovery output and use `--plain` for stable lean output where supported; core discovery commands reject `--format`.
 
 ### Maintenance CLI
 
@@ -67,21 +68,21 @@
 
 - `AGENTS.md` and `CLAUDE.md` tell agents to use `oneup` MCP before broad raw search for code-discovery questions.
 - Adoption evals start an MCP server with `1up mcp --path .` and grade provider tool-call metadata.
-- Evals require canonical MCP use, read-after-search, symbol verification when completeness matters, impact use for blast-radius tasks, and explicit primary/contextual interpretation.
+- Evals require canonical MCP use, get/context after search, symbol verification when completeness matters, impact use for blast-radius tasks, and explicit primary/contextual interpretation.
 - Broad raw `grep`, `rg`, `find`, and `Glob` discovery fail the 1up variant; exact literal verification is allowed only after MCP narrows to precise files.
 
 ## User-Visible States
 
 | State | Meaning | Signals / Recovery |
 |---|---|---|
-| `ready` | The active worktree context is indexed and semantic search is available. | `oneup_prepare` suggests `oneup_search`; counts are context-scoped. |
-| `missing` | Project, index, or active context rows are absent, empty, or not usable. | `oneup_prepare` suggests explicit indexing mode. |
-| `indexing` | Index progress file reports a running job for the active context. | Poll `oneup_prepare` or `1up status` from the same worktree. |
-| `stale` | Index exists but is unreadable, stale, or schema-incompatible. | Rebuild with `oneup_prepare` mode `reindex` or `1up reindex`. |
+| `ready` | The active worktree context is indexed and semantic search is available. | `oneup_status` suggests `oneup_search`; counts are context-scoped. |
+| `missing` | Project, index, or active context rows are absent, empty, or not usable. | `oneup_status` suggests explicit `oneup_start` indexing mode. |
+| `indexing` | Index progress file reports a running job for the active context. | Poll `oneup_status` or `1up status` from the same worktree. |
+| `stale` | Index exists but is unreadable, stale, or schema-incompatible. | Rebuild with `oneup_start` mode `reindex` or `1up reindex`. |
 | `degraded` | Search can run, but embeddings are unavailable, latest index lacks embeddings, or branch context is unknown/unreadable. | Results may be FTS-only or only context-scoped rather than definitively branch-filtered; fix model/index/git state then recheck. |
-| `blocked` | MCP prepare could not make the repository ready. | Structured data explains the blocking condition and suggests corrective prepare or setup actions. |
-| `ok` / `empty` / `partial` / `degraded` | MCP operation status for search/read/symbol. | `summary`, `data`, and `next_actions` explain next step. |
-| `found` / `not_found` / `ambiguous` / `rejected` / `error` | Per-record `oneup_read` outcomes. | Ambiguous handles list matching IDs; rejected locations identify path-scope violations. |
+| `blocked` | MCP status/start could not make the repository ready. | Structured data explains the blocking condition and suggests corrective start or setup actions. |
+| `ok` / `empty` / `partial` / `degraded` | MCP operation status for search/get/context/symbol/structural. | `summary`, `data`, and `next_actions` explain next step. |
+| `found` / `not_found` / `ambiguous` / `rejected` / `error` | Per-record `oneup_get` or `oneup_context` outcomes. | Ambiguous handles list matching IDs; rejected locations identify path-scope violations. |
 | `expanded` / `expanded_scoped` | Impact returned primary likely-impact rows. | CLI rows end `~P`; MCP data contains primary `results`. |
 | `empty` / `empty_scoped` | Impact anchor resolved but no primary likely impact survived. | May include contextual guidance and a hint. |
 | `refused` | Impact expansion was unsafe or ambiguous. | Reason and hint suggest scope, segment, search, or reindex. |
@@ -94,18 +95,18 @@
 
 ### MCP Readiness Loop
 
-1. Agent calls `oneup_prepare` when readiness is unknown for the configured repo or worktree path.
+1. Agent calls `oneup_status` when readiness is unknown for the configured repo or worktree path.
 2. The tool resolves `WorktreeContext` and reports `ready`, `missing`, `indexing`, `stale`, `degraded`, or `blocked` for that `context_id`.
 3. Structured data includes state root, source root, context-scoped counts, matching progress, and matching daemon heartbeat when available.
 4. `next_actions` steer to search, explicit indexing, polling, reindexing, or setup correction.
-5. Status/start requirements are satisfied through `oneup_prepare` modes rather than separate MCP tools.
+5. If indexing or rebuilding is needed, the agent calls `oneup_start` with the suggested mode and then checks `oneup_status` again.
 
 ### MCP Discovery Loop
 
 1. Agent calls `oneup_search` with a task-specific intent query.
 2. Search returns compact handles and ranked summaries.
-3. Agent calls `oneup_read` on selected handles to hydrate source evidence.
-4. Agent calls `oneup_read.locations` for bounded file-line context around a relevant path and line.
+3. Agent calls `oneup_get` on selected handles to hydrate source evidence.
+4. Agent calls `oneup_context` for bounded file-line context around a relevant path and line.
 5. Agent calls `oneup_symbol` for definition/reference completeness when a symbol matters.
 6. Agent answers from inspected code, not from ranked search alone.
 
@@ -132,7 +133,7 @@
 
 1. User chooses setup prompt, `add-mcp`, or manual config.
 2. User verifies server identity `oneup`, command `1up`, args `mcp --path <repo-or-worktree>`, repository/worktree path, and scope.
-3. User reloads/trusts the host, lists tools, and calls `oneup_prepare`.
+3. User reloads/trusts the host, lists tools, and calls `oneup_status`.
 
 ## Output Semantics
 
@@ -150,9 +151,9 @@
 ## Cross-Surface Deltas
 
 - MCP is the primary agent integration; shell `1up ...` remains a human/manual CLI path and is not the scored agent workflow.
-- MCP summaries are host-friendly and paired with structured data; CLI core commands are terse row streams optimized for terminal piping.
+- MCP summaries are host-friendly and paired with structured data; retained CLI discovery commands default to human-readable output and expose lean `--plain` output.
 - Core discovery commands reject `--format`; maintenance commands keep `--format/-f` for scripting compatibility.
-- `oneup_read` rejects locations outside the configured repository; CLI `context` can read outside only with explicit `--allow-outside-root`.
+- `oneup_context` rejects locations outside the configured repository; CLI `context` can read outside only with explicit `--allow-outside-root`.
 - Search is ranked discovery, not proof of absence. Symbol lookup is the completeness-oriented surface.
 - Impact is advisory and trust-bounded. Primary and contextual buckets must not be collapsed in user answers.
 - Raw file tools are permitted for exact literal verification after 1up narrows scope, not as first-pass discovery.
@@ -173,4 +174,4 @@
 
 - Prior search-to-impact semantics remain valid, but the agent reminder surface moved from deleted reminder/skill files to MCP server instructions, README/docs setup guidance, and repo instruction files.
 - Prior machine-readable plain/json distinctions for core commands are replaced by a single lean CLI grammar; structured JSON now belongs to maintenance commands and MCP envelopes.
-- The new `get`/`oneup_read` hydration step is central: search is intentionally compact, and reading selected handles is now an explicit interaction step.
+- The `get`/`oneup_get` hydration step is central: search is intentionally compact, and reading selected handles is now an explicit interaction step.

@@ -5,8 +5,8 @@
 | Module | Purpose | Key Files |
 |---|---|---|
 | `src/lib.rs`, `src/main.rs` | Crate export surface and binary boot path. `main` initializes tracing, runs CLI dispatch, suppresses passive update notices for MCP/internal/update-safe paths, and leaves module ownership below the directory modules. | `src/main.rs`, `src/lib.rs` |
-| `src/cli` | User-facing command surface. Core discovery commands (`search`, `get`, `symbol`, `impact`, `context`, `structural`) render via `lean`; maintenance commands (`init`, `index`, `reindex`, `start`, `stop`, `status`, `list`, `update`) render via `output` with worktree/context metadata. Also owns `add-mcp` and `mcp` launch/setup commands. | `src/cli/mod.rs`, `src/cli/lean.rs`, `src/cli/output.rs`, `src/cli/start.rs`, `src/cli/list.rs`, `src/cli/add_mcp.rs`, `src/cli/mcp.rs` |
-| `src/mcp` | Model Context Protocol stdio server for agent-facing code discovery. Exposes readiness, ranked search, handle/location read, symbol lookup, and likely-impact tools with structured envelopes and next-action guidance. | `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
+| `src/cli` | User-facing command surface. Retained human discovery commands (`get`, `symbol`, `impact`, `context`) default to readable output and expose `--plain` lean output where supported; hidden compatibility discovery commands (`search`, `structural`) stay lean-only. Maintenance commands (`init`, `index`, `reindex`, `start`, `stop`, `status`, `list`, `update`) render via `output` with worktree/context metadata. Also owns `add-mcp` and `mcp` launch/setup commands. | `src/cli/mod.rs`, `src/cli/discovery_output.rs`, `src/cli/lean.rs`, `src/cli/output.rs`, `src/cli/start.rs`, `src/cli/list.rs`, `src/cli/add_mcp.rs`, `src/cli/mcp.rs` |
+| `src/mcp` | Model Context Protocol stdio server for agent-facing code discovery. Exposes readiness/start, ranked search, handle hydration, location context, symbol lookup, likely-impact, and structural tools with structured envelopes and next-action guidance. | `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
 | `src/search` | Retrieval and follow-up engines: hybrid semantic/FTS/symbol ranking, context retrieval, structural AST matching, symbol reference lookup, and bounded likely-impact expansion with primary/contextual trust buckets. | `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/search/symbol.rs`, `src/search/impact.rs`, `src/search/context.rs`, `src/search/structural.rs` |
 | `src/indexer` | Repository scan, parse/chunk, embed, and storage pipeline. Full and scoped runs use context-scoped `indexed_files` metadata prefiltering, context-derived segment IDs, parser-derived relation evidence, optional embeddings, progress persistence, and batched writes. | `src/indexer/pipeline.rs`, `src/indexer/parser.rs`, `src/indexer/embedder.rs`, `src/indexer/scanner.rs`, `src/indexer/chunker.rs` |
 | `src/storage` | libSQL persistence boundary. Owns schema v13, context-scoped rows, vector storage, FTS, symbols, relation descriptors, `indexed_files` manifest, tuned project-local connections, schema compatibility checks, and transactional replace/delete APIs. | `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`, `src/storage/db.rs` |
@@ -21,21 +21,22 @@
 
 | Component | File | Responsibility | Depends On |
 |---|---|---|---|
-| `Cli` / `Command` | `src/cli/mod.rs` | Clap dispatch, subcommand list, and default maintenance format resolution. Public commands include `add-mcp`, `init`, `start`, `stop`, `status`, `list`, `symbol`, `search`, `get`, `context`, `impact`, `structural`, `mcp`, `index`, `reindex`, and `update`; hidden `__worker` remains internal. | `src/cli/*`, `src/shared/types.rs` |
-| `LeanRenderer` | `src/cli/lean.rs` | Single lean grammar for agent-facing core commands, including search/symbol rows, get records, context blocks, structural snippets, and impact `~P`/`~C` channels. | `src/search/impact.rs`, `src/shared/types.rs`, `src/storage/segments.rs` |
+| `Cli` / `Command` | `src/cli/mod.rs` | Clap dispatch, visible help command list, and default maintenance format resolution. Public help shows lifecycle commands plus retained human discovery commands: `get`, `symbol`, `context`, and `impact`. Hidden commands include `add-mcp`, `init`, `search`, `structural`, `mcp`, `index`, `reindex`, `update`, and internal `__worker`. | `src/cli/*`, `src/shared/types.rs` |
+| `DiscoveryOutput` | `src/cli/discovery_output.rs` | Human-readable default rendering for retained discovery commands, including hydrated segments, symbol matches, source context, and advisory likely-impact output. | `src/cli/lean.rs`, `src/search/impact.rs`, `src/shared/types.rs`, `src/storage/segments.rs` |
+| `LeanRenderer` | `src/cli/lean.rs` | Stable lean grammar for hidden discovery commands and retained command `--plain` output, including search/symbol rows, get records, context blocks, structural snippets, and impact `~P`/`~C` channels. | `src/search/impact.rs`, `src/shared/types.rs`, `src/storage/segments.rs` |
 | `Formatter` | `src/cli/output.rs` | Human/plain/json maintenance output plus progress/watch rendering for init/index/reindex/start/stop/status/list/update, including source root, context id, branch, watch status, and last-update metadata. | `src/shared/types.rs`, `src/shared/progress.rs`, `src/shared/update.rs` |
 | `StartCommand` | `src/cli/start.rs` | Guarded daemon startup. Resolves project identity and `WorktreeContext`, prepares schema/model setup timings, avoids unnecessary foreground indexing on current context indexes, registers daemon settings, and observes final daemon pid. | `src/daemon/lifecycle.rs`, `src/daemon/registry.rs`, `src/indexer/pipeline.rs`, `src/shared/project.rs` |
 | `AddMcpCommand` | `src/cli/add_mcp.rs` | Wrapper around `bunx`/`npx add-mcp`; builds the local `1up mcp --path ...` server command and prints manual fallback snippets on setup failure. | external `add-mcp`, shell runners |
 | `McpCommand` | `src/cli/mcp.rs` | Starts the MCP stdio server for a resolved project/worktree, enforces one MCP instance per project via secure lock file, and best-effort starts the daemon for MCP search. | `src/mcp/server.rs`, `src/daemon/lifecycle.rs`, `src/shared/project.rs`, `src/shared/fs.rs` |
-| `OneupMcpServer` | `src/mcp/server.rs`, `src/mcp/tools.rs` | rmcp server implementation exposing `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact`. Adds server guidance that MCP search should precede broad grep/rg/find. | `rmcp`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
-| `McpOps` | `src/mcp/ops.rs` | Pure operation layer for context-scoped readiness classification, search execution, handle/location reads, symbol lookup, and impact exploration over the current local index. | `src/search/*`, `src/storage/*`, `src/indexer/embedder.rs`, `src/shared/project.rs` |
-| `ToolEnvelope` / `NextAction` | `src/mcp/types.rs` | MCP input/output schemas with deny-unknown-fields inputs and structured `status`, `summary`, `data`, and canonical follow-up actions. | `serde`, `schemars`, `rmcp` |
+| `OneupMcpServer` | `src/mcp/server.rs`, `src/mcp/tools.rs` | rmcp server implementation exposing the retained eight-tool inventory: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural`. Adds server guidance that MCP search should precede broad grep/rg/find. | `rmcp`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
+| `McpOps` | `src/mcp/ops.rs` | Pure operation layer for product-named readiness, start/indexing, search, handle hydration, file-line context, symbol lookup, impact exploration, and structural search over the current local index. | `src/search/*`, `src/storage/*`, `src/indexer/embedder.rs`, `src/shared/project.rs` |
+| `ToolEnvelope` / `NextAction` | `src/mcp/types.rs` | MCP input/output schemas with deny-unknown-fields inputs, retained tool constants, structured `status`, `summary`, `data`, and canonical follow-up actions. | `serde`, `schemars`, `rmcp` |
 | `HybridSearchEngine` | `src/search/hybrid.rs` | Embeds queries when possible, combines vector, FTS, and symbol candidates, falls back to FTS if vector search fails, ranks candidates, and hydrates lean search results. | `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/search/symbol.rs`, `src/indexer/embedder.rs`, `src/storage/segments.rs` |
 | `RetrievalBackend` | `src/search/retrieval.rs` | Chooses SQL vector v2 when embeddings exist and FTS-only otherwise; returns bounded candidate sets for ranking. | `src/storage/queries.rs`, `src/shared/constants.rs` |
 | `SymbolSearchEngine` | `src/search/symbol.rs` | Finds definitions/usages with exact, prefix, contains, and fuzzy fallback matching over normalized symbols. | `src/storage/queries.rs`, `src/storage/segments.rs`, `src/shared/symbols.rs` |
-| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded advisory impact from file, line, symbol, or segment anchors. Uses relation lookup tails, owner fingerprints, edge identity, path affinity, role signals, scope checks, and test-path guidance to split primary and contextual results. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs`, `src/shared/symbols.rs` |
+| `ImpactHorizonEngine` | `src/search/impact.rs` | Bounded advisory impact from file, line, symbol, or result-handle anchors. Uses relation lookup tails, owner fingerprints, edge identity, path affinity, role signals, scope checks, and test-path guidance to split primary and contextual results. | `src/storage/relations.rs`, `src/storage/segments.rs`, `src/search/symbol.rs`, `src/shared/symbols.rs` |
 | `ContextEngine` | `src/search/context.rs` | Reads source context around a location and prefers enclosing tree-sitter scopes, with explicit outside-root access handling. | `src/indexer/parser.rs`, `src/shared/types.rs` |
-| `StructuralSearchEngine` | `src/search/structural.rs` | Runs tree-sitter query patterns over files and optionally uses stored segments for candidate paths. | `tree-sitter`, `src/storage/segments.rs` |
+| `StructuralSearchEngine` | `src/search/structural.rs` | Runs tree-sitter query patterns over context-scoped candidate files and reports ok, empty, or error diagnostics for MCP structural search. | `tree-sitter`, `src/storage/segments.rs` |
 | `Pipeline` | `src/indexer/pipeline.rs` | Full/scoped indexing with WorktreeContext, metadata prefilter, deleted-file cleanup, parse worker ordering, optional embedding, context-derived segment IDs, batched file replacement, progress telemetry, and separate scan/progress roots for worktrees. | `src/indexer/{scanner,parser,chunker,embedder}.rs`, `src/storage/*`, `src/shared/types.rs` |
 | `Parser` | `src/indexer/parser.rs` | Multi-language tree-sitter parser for structural segments, complexity, roles, symbols, references, calls, conformance relations, owner/edge evidence, and text fallback decisions. | tree-sitter grammars, `src/shared/symbols.rs` |
 | `Embedder` / `EmbeddingRuntime` | `src/indexer/embedder.rs` | Verified local ONNX/tokenizer artifact lifecycle, secure model roots, download/activation, warm runtime reuse, batch embeddings, and degraded-mode status. | `ort`, `tokenizers`, `reqwest`, `sha2`, `src/shared/fs.rs` |
@@ -50,9 +51,9 @@
 ## Internal Dependency Chains
 
 - `src/main.rs` -> `src/cli` and `src/shared/update`: binary boot, dispatch, and passive update notification handling.
-- `src/cli` -> `src/search`/`src/storage`: core commands open the project-local index, validate schema, run context-scoped engines, and render lean output.
+- `src/cli` -> `src/search`/`src/storage`: core commands open the project-local index, validate schema, run context-scoped engines, and render retained human output or lean `--plain` output.
 - `src/cli/mcp.rs` -> `src/mcp`: CLI starts the stdio MCP server and best-effort daemon support.
-- `src/mcp` -> `src/search`/`src/storage`/`src/indexer`: MCP tools share local search, read, symbol, impact, and explicit indexing operations with the CLI stack.
+- `src/mcp` -> `src/search`/`src/storage`/`src/indexer`: MCP tools share local status/start, search, get, context, symbol, impact, structural, and explicit indexing operations with the CLI stack.
 - `src/search` -> `src/storage`: retrieval, symbol, context, structural, and impact engines hydrate segments and relation/symbol tables at query time.
 - `src/search` -> `src/indexer/embedder.rs`: hybrid search reuses the embedding runtime for query vectors.
 - `src/indexer` -> `src/storage`: pipeline writes context-scoped segment, vector, symbol, relation, and manifest rows through transactional storage APIs.
@@ -82,7 +83,7 @@
 |---|---:|---:|---:|
 | `src root` | 2 | 107 | 2 |
 | `src/cli` | 18 | 5,737 | 13 commands/renderers |
-| `src/mcp` | 5 | 1,892 | 5 tools + ops/types/server |
+| `src/mcp` | 5 | 1,892 | 8 tools + ops/types/server |
 | `src/search` | 10 | 7,223 | 7 engines/helpers |
 | `src/indexer` | 6 | 7,650 | 5 pipeline stages |
 | `src/storage` | 6 | 4,160 | 5 persistence components |
@@ -98,24 +99,26 @@
 
 ### CLI Boundary
 
-- Public commands: `add-mcp`, `init`, `start`, `stop`, `status`, `list`, `symbol`, `search`, `get`, `context`, `impact`, `structural`, `mcp`, `index`, `reindex`, `update`.
+- Public help-visible commands: `start`, `status`, `list`, `stop`, `get`, `symbol`, `context`, `impact`.
+- Hidden compatibility/setup/maintenance commands: `add-mcp`, `init`, `search`, `structural`, `mcp`, `index`, `reindex`, `update`.
 - Hidden internal command: `__worker`.
 - Removed boundary: prior `hello-agent` is no longer present; tests assert its removal.
-- Core command output is the lean protocol and intentionally rejects legacy format flags.
+- Retained human discovery commands default to readable output and intentionally reject legacy `--format` flags; `--plain` delegates to the lean protocol when present.
+- Hidden `search` and `structural` remain available for compatibility but are not advertised as supported P4 human commands.
 - Maintenance command output supports `plain`, `human`, and `json`; status/list/start outputs include context-aware source root, worktree, branch, watch, and update metadata, and JSON maintenance output suppresses passive update notices.
-- `impact` remains local-index only and requires exactly one anchor: segment, symbol, or file/line.
+- `impact` remains local-index only and requires exactly one public anchor: handle, symbol, or file/line; hidden segment input is compatibility-only.
 
 ### MCP Boundary
 
 - Server: `1up mcp --path <repo-or-worktree>` over stdio with one instance per project lock.
-- Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
-- Readiness modes: `check` (aliases `default`, `read`), `index_if_missing`, `index_if_needed` (alias `auto`), and `reindex`.
-- Tool output contract: presentation-free `ToolEnvelope { status, summary, data, next_actions }`; all tools attach canonical follow-up actions for prepare, search, read, symbol, and explicit impact flows.
-- Core discovery loop: readiness/status and allowed start/index behavior map to `oneup_prepare`; ranked discovery uses `oneup_search`; evidence hydration uses `oneup_read.handles`; file-line context uses `oneup_read.locations`; symbol completeness uses `oneup_symbol`.
+- Tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural`.
+- Start modes: `index_if_needed` (alias `auto`), `index_if_missing`, and `reindex`; readiness checks without indexing use `oneup_status`.
+- Tool output contract: presentation-free `ToolEnvelope { status, summary, data, next_actions }`; all tools attach canonical follow-up actions from the retained eight-tool inventory.
+- Core discovery loop: readiness/status maps to `oneup_status`; explicit start/index/reindex behavior maps to `oneup_start`; ranked discovery uses `oneup_search`; evidence hydration uses `oneup_get.handles`; file-line context uses `oneup_context.locations`; symbol completeness uses `oneup_symbol`.
 - Readiness and search counts are scoped to the resolved `WorktreeContext`, while linked worktrees keep shared state under the main worktree.
-- No P2-only alias tools were added: there is no `oneup_status`, `oneup_start`, or `oneup_context`.
-- MCP search is ranked discovery, not exhaustive proof; guidance instructs agents to hydrate with `oneup_read` before relying on results.
-- Focused MCP smoke coverage exercises prepare, search, handle read, symbol lookup, and read-location context; broader fixtures cover branch filtering, daemon refresh, impact, structural search, benchmarks, and installer behavior.
+- Removed public tools: the former combined readiness/indexing and combined read/context tools are no longer registered.
+- MCP search is ranked discovery, not exhaustive proof; guidance instructs agents to hydrate with `oneup_get` before relying on results.
+- Focused MCP smoke coverage exercises status, start, search, handle get, symbol lookup, read-location context, impact, and structural search; broader fixtures cover branch filtering, daemon refresh, benchmarks, and installer behavior.
 
 ### Search Boundary
 
@@ -144,7 +147,7 @@
 | Pattern | Modules | Why It Matters |
 |---|---|---|
 | CLI/MCP dual surface over shared engines | CLI, MCP, Search, Storage, Indexer | Agents and humans use different transports while preserving one local indexing/search contract. |
-| Lean handle handoff | CLI, MCP, Search, Storage, Tests, Evals | `search -> read/get -> impact/symbol` flows use short durable segment handles without embedding full bodies in discovery output. |
+| Lean handle handoff | CLI, MCP, Search, Storage, Tests, Evals | `search -> get/context -> impact/symbol` flows use short durable segment handles without embedding full bodies in discovery output. |
 | Candidate-first hybrid retrieval | Search, Storage, Indexer | Combines vector, FTS, and symbol candidates before hydration and ranking. |
 | Local-only impact trust buckets | Search, CLI, MCP, Storage | Keeps advisory blast-radius exploration bounded, relation-aware, and explicit about primary vs contextual confidence. |
 | Manifest-backed file prefilter | Indexer, Storage, CLI, Daemon | Skips context-specific metadata-unchanged files before content reads and reports discovered/metadata-skipped/content-read/deleted counters. |
@@ -157,7 +160,7 @@
 ## Reconciliation Notes
 
 - Confirmed: prior CLI/search/indexer/storage/daemon/shared/test/bench/eval/script module boundaries still fit the current code.
-- Refined: `src/cli` is now explicitly split between lean core-command rendering and maintenance-format rendering; `src/cli/output.rs` no longer owns core discovery result rendering.
+- Refined: `src/cli` is now explicitly split between retained human discovery rendering, lean/plain discovery rendering, and maintenance-format rendering; `src/cli/output.rs` no longer owns core discovery result rendering.
 - Added: `src/mcp` is a standalone top-level module with a real public contract and should no longer be treated as incidental daemon/CLI behavior.
 - Added: installer and release automation now include MCP setup, wrapper-first install guidance, host smoke recording, and smoke verification.
 - Contradicted: `hello-agent` should be removed from the public CLI boundary.

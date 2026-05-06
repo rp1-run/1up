@@ -50,10 +50,10 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 
 1. An agent host starts `1up mcp --path <repo-or-worktree>` directly or via `1up add-mcp` generated host configuration.
 2. The CLI resolves `state_root`, `source_root`, and `WorktreeContext`, takes a per-project MCP instance lock, auto-initializes only at an existing 1up project or git root, and best-effort starts the daemon for freshness.
-3. `rmcp` serves canonical tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact`.
-4. `oneup_prepare` classifies readiness for the active `context_id` and can explicitly index, reindex, or repair missing/degraded state through the same pipeline used by CLI indexing.
-5. Search, symbol, and impact tools open the main-worktree index locally, enforce schema v13 compatibility, and filter through the active `context_id`.
-6. Tool responses return a `ToolEnvelope` with `status`, `summary`, structured `data`, and `next_actions`; `oneup_read` hydrates handles from the DB or reads precise file locations through source-root clamping.
+3. `rmcp` serves the retained canonical tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural`.
+4. `oneup_status` classifies readiness for the active `context_id`; `oneup_start` can explicitly index, reindex, or repair missing/degraded state through the same pipeline used by CLI indexing.
+5. Search, get, context, symbol, impact, and structural tools open the main-worktree index locally, enforce schema v13 compatibility, and filter through the active `context_id` where applicable.
+6. Tool responses return a `ToolEnvelope` with `status`, `summary`, structured `data`, and `next_actions`; `oneup_get` hydrates handles from the DB and `oneup_context` reads precise file locations through source-root clamping.
 
 ### CLI Daemon-Backed Search
 
@@ -65,7 +65,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 
 ### Index Build And Refresh
 
-1. CLI, MCP prepare, or daemon refresh resolves a `WorktreeContext` and opens a tuned libSQL connection at the main-worktree state root with WAL, synchronous=NORMAL, cache, mmap, and temp-store PRAGMAs.
+1. CLI, MCP start, or daemon refresh resolves a `WorktreeContext` and opens a tuned libSQL connection at the main-worktree state root with WAL, synchronous=NORMAL, cache, mmap, and temp-store PRAGMAs.
 2. The scanner applies gitignore/global-ignore/exclude rules, default build-artifact ignores, binary extension skips, and special extensionless file recognition.
 3. Full runs load `indexed_files` and segment hashes for the active `context_id`, skip metadata-unchanged files, and detect deleted indexed paths.
 4. Scoped runs scan only changed paths, but fall back to full when ignore semantics, directories, excluded files, or ambiguous/unscoped watcher events would make a scoped update unsafe.
@@ -161,8 +161,8 @@ graph TB
 ## What Changed With MCP And Release Surface
 
 - Added first-class MCP commands and modules: `add-mcp`, `mcp`, `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, and typed MCP schemas.
-- MCP search/read/symbol/impact reuse local index/search/storage engines instead of adding a separate network service.
-- MCP prepare can explicitly create or rebuild the local index, while readiness distinguishes missing, indexing, stale, degraded, and ready states.
+- MCP search/get/context/symbol/impact/structural reuse local index/search/storage engines instead of adding a separate network service.
+- MCP status checks readiness, and MCP start can explicitly create or rebuild the local index while readiness distinguishes missing, indexing, stale, degraded, and ready states.
 - Release archive verification now performs JSON-RPC MCP smoke against every built archive and asserts canonical tools, structured content, readiness statuses, and clean stdout protocol.
 - Release evidence now models live MCP host smoke as `mcp_host_smoke.v1`, with recorded or skipped evidence per host.
 - The install and package surface is now part of the architecture: `setup.sh`, Homebrew, Scoop, release manifest, package publication record, and update manifest are all generated/validated flows.

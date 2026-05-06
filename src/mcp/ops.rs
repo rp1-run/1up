@@ -1,27 +1,30 @@
-#![allow(dead_code)]
-
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use libsql::Connection;
 use serde::Serialize;
 
+use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
+use crate::indexer::pipeline;
+use crate::mcp::types::StartMode;
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
-use crate::search::{HybridSearchEngine, SearchScope, SymbolSearchEngine};
-use crate::shared::config::{project_db_path, project_dot_dir};
+use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
+use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     ContextAccessScope, ContextResult, DaemonProjectStatus, IndexProgress, IndexState,
-    ReferenceKind, SearchResult, SegmentRole, SymbolResult, WorktreeContext,
+    ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings, StructuralSearchReport,
+    SymbolResult, WorktreeContext,
 };
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments::{
-    count_files_for_context, count_segments_for_context, get_segment_by_id, get_segment_by_prefix,
-    SegmentPrefixLookup, StoredSegment,
+    count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
+    get_segment_by_prefix_for_context, SegmentPrefixLookup, StoredSegment,
 };
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -225,6 +228,34 @@ pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
     })
 }
 
+pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
+    classify_readiness(
+        &roots.state_root,
+        &roots.source_root,
+        &roots.worktree_context,
+    )
+    .await
+}
+
+pub async fn start(roots: &McpProjectRoots, mode: StartMode) -> anyhow::Result<ReadinessPayload> {
+    let readiness = check_status(roots).await;
+    match mode {
+        StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
+            run_index_then_classify(roots, false).await
+        }
+        StartMode::IndexIfNeeded
+            if matches!(
+                readiness.status,
+                ReadinessStatus::Missing | ReadinessStatus::Degraded
+            ) =>
+        {
+            run_index_then_classify(roots, false).await
+        }
+        StartMode::Reindex => run_index_then_classify(roots, true).await,
+        _ => Ok(readiness),
+    }
+}
+
 pub async fn classify_readiness(
     state_root: &Path,
     source_root: &Path,
@@ -278,7 +309,7 @@ pub async fn classify_readiness(
     if !project_initialized || !index_present {
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No usable 1up index is available for this repository.".to_string();
-        payload.reason = Some("run oneup_prepare with an explicit indexing mode".to_string());
+        payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
         return payload;
     }
 
@@ -322,7 +353,7 @@ pub async fn classify_readiness(
     if payload.total_segments.unwrap_or(0) == 0 {
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No indexed code is available for this repository.".to_string();
-        payload.reason = Some("run oneup_prepare with an explicit indexing mode".to_string());
+        payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
         return payload;
     }
 
@@ -434,12 +465,18 @@ pub async fn run_search(
     })
 }
 
-pub async fn read_handles(state_root: &Path, handles: &[String]) -> anyhow::Result<ReadPayload> {
+pub async fn get_handles(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    handles: &[String],
+) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
     let mut records = Vec::with_capacity(handles.len());
 
     for handle in handles {
-        records.push(resolve_handle_record(&current.conn, handle).await?);
+        records.push(
+            resolve_handle_record(&current.conn, &worktree_context.context_id, handle).await?,
+        );
     }
 
     Ok(ReadPayload {
@@ -448,7 +485,7 @@ pub async fn read_handles(state_root: &Path, handles: &[String]) -> anyhow::Resu
     })
 }
 
-pub fn read_locations(
+pub fn read_context_locations(
     source_root: &Path,
     locations: &[ReadLocation],
 ) -> anyhow::Result<ReadPayload> {
@@ -521,11 +558,104 @@ pub async fn explore_impact(
     Ok(engine.explore(request).await?)
 }
 
+pub async fn search_structural(
+    state_root: &Path,
+    source_root: &Path,
+    worktree_context: &WorktreeContext,
+    pattern: &str,
+    language_filter: Option<&str>,
+) -> anyhow::Result<StructuralSearchReport> {
+    let current = open_current_index(state_root).await?;
+    let engine = StructuralSearchEngine::new_scoped(
+        source_root,
+        &current.conn,
+        &worktree_context.context_id,
+    );
+    Ok(engine.search_report(pattern, language_filter).await?)
+}
+
+async fn run_index_then_classify(
+    roots: &McpProjectRoots,
+    rebuild: bool,
+) -> anyhow::Result<ReadinessPayload> {
+    match run_index(roots, rebuild).await {
+        Ok(_) => Ok(classify_after_index(roots).await),
+        Err(err) => Ok(blocked_readiness(
+            &roots.state_root,
+            &roots.source_root,
+            &roots.worktree_context,
+            err.to_string(),
+        )),
+    }
+}
+
+async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
+    let mut payload = check_status(roots).await;
+    for _ in 0..20 {
+        if payload.status != ReadinessStatus::Stale {
+            return payload;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        payload = check_status(roots).await;
+    }
+    payload
+}
+
+async fn run_index(
+    roots: &McpProjectRoots,
+    rebuild: bool,
+) -> anyhow::Result<pipeline::PipelineStats> {
+    if project::read_project_id(&roots.state_root).is_err() {
+        project::ensure_project_id_for_auto_init(&roots.state_root)?;
+    }
+
+    let db_path = config::project_db_path(&roots.state_root);
+    let registry = Registry::load()?;
+    let indexing_config = config::resolve_indexing_config(
+        None,
+        None,
+        registry.indexing_config_for_context(&roots.worktree_context),
+    )?;
+    let mut setup = SetupTimings::new(Instant::now());
+
+    let db_start = Instant::now();
+    let db = Db::open_rw(&db_path).await?;
+    let conn = db.connect_tuned().await?;
+    if rebuild {
+        schema::rebuild(&conn).await?;
+    } else {
+        schema::prepare_for_write(&conn).await?;
+    }
+    setup.db_prepare_ms = db_start.elapsed().as_millis();
+
+    let model_start = Instant::now();
+    let mut runtime = EmbeddingRuntime::default();
+    runtime
+        .prepare_for_indexing_with_progress(indexing_config.embed_threads, false)
+        .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
+
+    pipeline::run_with_context_scope_setup_and_progress_root(
+        &conn,
+        &roots.worktree_context,
+        runtime.current_embedder(),
+        &RunScope::Full,
+        &indexing_config,
+        None,
+        false,
+        Some(setup),
+        None,
+        Some(&roots.state_root),
+    )
+    .await
+    .map_err(Into::into)
+}
+
 async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     let db_path = project_db_path(state_root);
     if !db_path.exists() {
         bail!(
-            "no current index found at {}; call oneup_prepare with an explicit indexing mode",
+            "no current index found at {}; call oneup_start with an explicit indexing mode",
             db_path.display()
         );
     }
@@ -537,7 +667,11 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     Ok(CurrentIndex { conn, _db: db })
 }
 
-async fn resolve_handle_record(conn: &Connection, raw_handle: &str) -> anyhow::Result<ReadRecord> {
+async fn resolve_handle_record(
+    conn: &Connection,
+    context_id: &str,
+    raw_handle: &str,
+) -> anyhow::Result<ReadRecord> {
     let normalized = normalize_handle(raw_handle);
     let source = ReadSource::Handle {
         raw: raw_handle.to_string(),
@@ -552,24 +686,26 @@ async fn resolve_handle_record(conn: &Connection, raw_handle: &str) -> anyhow::R
         ));
     }
 
-    if let Some(segment) = get_segment_by_id(conn, &normalized).await? {
+    if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
         return Ok(read_segment(source, segment));
     }
 
-    Ok(match get_segment_by_prefix(conn, &normalized).await? {
-        SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
-        SegmentPrefixLookup::NotFound => {
-            read_message(ReadStatus::NotFound, source, "segment handle was not found")
-        }
-        SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
-            status: ReadStatus::Ambiguous,
-            source,
-            segment: None,
-            context: None,
-            matching_handles: ids,
-            message: Some("segment handle matched multiple indexed segments".to_string()),
+    Ok(
+        match get_segment_by_prefix_for_context(conn, context_id, &normalized).await? {
+            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
+            SegmentPrefixLookup::NotFound => {
+                read_message(ReadStatus::NotFound, source, "segment handle was not found")
+            }
+            SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
+                status: ReadStatus::Ambiguous,
+                source,
+                segment: None,
+                context: None,
+                matching_handles: ids,
+                message: Some("segment handle matched multiple indexed segments".to_string()),
+            },
         },
-    })
+    )
 }
 
 fn read_location_record(source_root: &Path, location: &ReadLocation) -> ReadRecord {
@@ -867,15 +1003,17 @@ enum LocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::types::{BranchStatus, StructuralSearchStatus, WorktreeRole};
+    use crate::storage::segments::{self, SegmentInsert};
     use std::fs;
 
     #[test]
-    fn read_locations_rejects_parent_escape() {
+    fn read_context_locations_rejects_parent_escape() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
-        let payload = read_locations(
+        let payload = read_context_locations(
             &root,
             &[ReadLocation {
                 path: "../outside.rs".to_string(),
@@ -890,12 +1028,12 @@ mod tests {
     }
 
     #[test]
-    fn read_locations_rejects_zero_line_as_structured_record() {
+    fn read_context_locations_rejects_zero_line_as_structured_record() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
-        let payload = read_locations(
+        let payload = read_context_locations(
             &root,
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -915,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn read_locations_reads_repo_relative_file() {
+    fn read_context_locations_reads_repo_relative_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -925,7 +1063,7 @@ mod tests {
         )
         .unwrap();
 
-        let payload = read_locations(
+        let payload = read_context_locations(
             &root,
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -978,5 +1116,90 @@ mod tests {
         assert_eq!(references.len(), 1);
         assert_eq!(definitions[0].reference_kind, ReferenceKind::Definition);
         assert_eq!(references[0].reference_kind, ReferenceKind::Usage);
+    }
+
+    #[tokio::test]
+    async fn search_structural_uses_worktree_context_scope() {
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/active.rs"), "fn active() {}\n").unwrap();
+        fs::write(root.join("src/other.rs"), "fn other() {}\n").unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let active = test_segment("active", "src/active.rs");
+        let other = test_segment("other", "src/other.rs");
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "src/active.rs",
+            &[active],
+        )
+        .await
+        .unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-other",
+            "src/other.rs",
+            &[other],
+        )
+        .await
+        .unwrap();
+
+        let context = WorktreeContext {
+            context_id: "ctx-active".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+
+        let payload = search_structural(
+            &root,
+            &root,
+            &context,
+            "(function_item name: (identifier) @name)",
+            Some("rust"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.status, StructuralSearchStatus::Ok);
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].content, "active");
+    }
+
+    fn test_segment(id: &str, file_path: &str) -> SegmentInsert {
+        SegmentInsert {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: format!("fn {id}() {{}}"),
+            line_start: 1,
+            line_end: 1,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: format!("[\"{id}\"]"),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("hash-{id}"),
+        }
     }
 }
