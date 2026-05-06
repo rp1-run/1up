@@ -46,7 +46,11 @@ fn cmd_with_home(home: &Path) -> Command {
 }
 
 fn seed_model_download_failure(home: &Path) {
-    let model_dir = test_data_dir(home).join("models").join("all-MiniLM-L6-v2");
+    seed_model_download_failure_at_app_root(&test_data_dir(home));
+}
+
+fn seed_model_download_failure_at_app_root(app_root: &Path) {
+    let model_dir = app_root.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
     fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
 }
@@ -103,6 +107,8 @@ impl McpTestClient {
             .stderr(Stdio::null());
         if let Some(home) = &state_home {
             let home_path = home.path().canonicalize().unwrap();
+            seed_model_download_failure(&home_path);
+            seed_model_download_failure_at_app_root(&home_path.join("data").join("1up"));
             command
                 .env("HOME", &home_path)
                 .env("XDG_DATA_HOME", home_path.join("data"))
@@ -1863,8 +1869,7 @@ fn mcp_prepare_index_if_missing_builds_index_state_only() {
     let source_content = "pub fn readiness_probe() -> &'static str {\n    \"ready\"\n}\n";
     fs::write(&source_path, source_content).unwrap();
 
-    let _guard = HideModelGuard::new();
-    let mut client = McpTestClient::start(tmp.path());
+    let mut client = McpTestClient::start_with_isolated_state(tmp.path());
     let mut result = client.call_tool(
         "oneup_prepare",
         serde_json::json!({ "mode": "index_if_missing" }),
