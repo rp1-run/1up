@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use libsql::Connection;
+use sha2::{Digest, Sha256};
 
+use crate::shared::constants::DEFAULT_INDEX_CONTEXT_ID;
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::symbols::{normalize_symbolish, EDGE_IDENTITY_BARE_IDENTIFIER};
 use crate::shared::types::{ParsedRelation, ReferenceKind, SegmentRole};
@@ -82,6 +84,27 @@ pub struct SegmentInsert {
     pub file_hash: String,
 }
 
+pub(crate) fn generate_segment_id(
+    context_id: &str,
+    file_path: &str,
+    line_start: usize,
+    line_end: usize,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(context_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(file_path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(line_start.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(line_end.to_string().as_bytes());
+    let hash = hasher.finalize();
+    hash.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()[..32]
+        .to_string()
+}
+
 /// Metadata for updating the indexed-files manifest alongside segment writes.
 #[derive(Debug, Clone)]
 pub struct IndexedFileMeta {
@@ -109,17 +132,39 @@ struct SegmentSymbolInsert {
 /// Insert or replace a segment in the database.
 #[allow(dead_code)]
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
-    upsert_segment_record(conn, seg).await?;
-    relations::replace_segment_relations(conn, &seg.id, &build_segment_relation_rows(seg)).await?;
+    upsert_segment_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, seg).await
+}
+
+/// Insert or replace a segment inside one index context.
+#[allow(dead_code)]
+pub async fn upsert_segment_for_context(
+    conn: &Connection,
+    context_id: &str,
+    seg: &SegmentInsert,
+) -> Result<(), OneupError> {
+    validate_context_id(context_id)?;
+    upsert_segment_record_for_context(conn, context_id, seg).await?;
+    replace_segment_relations_for_context(
+        conn,
+        context_id,
+        &seg.id,
+        &build_segment_relation_rows(seg),
+    )
+    .await?;
 
     Ok(())
 }
 
-async fn upsert_segment_record(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
+async fn upsert_segment_record_for_context(
+    conn: &Connection,
+    context_id: &str,
+    seg: &SegmentInsert,
+) -> Result<(), OneupError> {
     conn.execute(
         queries::UPSERT_SEGMENT,
         libsql::params![
             seg.id.clone(),
+            context_id.to_string(),
             seg.file_path.clone(),
             seg.language.clone(),
             seg.block_type.clone(),
@@ -151,7 +196,7 @@ async fn upsert_segment_record(conn: &Connection, seg: &SegmentInsert) -> Result
             .map_err(|e| StorageError::Query(format!("delete segment vector failed: {e}")))?;
     }
 
-    replace_segment_symbols(conn, seg).await?;
+    replace_segment_symbols_for_context(conn, context_id, seg).await?;
 
     Ok(())
 }
@@ -164,6 +209,33 @@ pub async fn get_segments_by_file(
 ) -> Result<Vec<StoredSegment>, OneupError> {
     let mut rows = conn
         .query(queries::SELECT_SEGMENTS_BY_FILE, [file_path])
+        .await
+        .map_err(|e| StorageError::Query(format!("query segments by file failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        results.push(row_to_stored_segment(&row)?);
+    }
+    Ok(results)
+}
+
+/// Query all segments for a given file path inside one index context, ordered by line_start.
+#[allow(dead_code)]
+pub async fn get_segments_by_file_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+) -> Result<Vec<StoredSegment>, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(
+            queries::SELECT_SEGMENTS_BY_FILE_FOR_CONTEXT,
+            libsql::params![context_id, file_path],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("query segments by file failed: {e}")))?;
 
@@ -201,7 +273,7 @@ pub async fn get_segment_by_id(
 
 /// Outcome of a prefix-based segment lookup.
 ///
-/// `get` accepts both full 16-char segment ids and the 12-char display handle emitted
+/// `get` accepts both full segment ids and the 12-char display handle emitted
 /// by the lean row grammar. Using `LIKE ?||'%'` handles both shapes uniformly; the
 /// caller distinguishes unique matches from ambiguous prefixes via this enum.
 #[derive(Debug, Clone)]
@@ -229,6 +301,46 @@ pub async fn get_segment_by_prefix(
 
     let mut rows = conn
         .query(queries::SELECT_SEGMENTS_BY_PREFIX, [prefix])
+        .await
+        .map_err(|e| StorageError::Query(format!("query segment by prefix failed: {e}")))?;
+
+    let mut matches: Vec<StoredSegment> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        matches.push(row_to_stored_segment(&row)?);
+    }
+
+    match matches.len() {
+        0 => Ok(SegmentPrefixLookup::NotFound),
+        1 => Ok(SegmentPrefixLookup::Found(Box::new(
+            matches.into_iter().next().unwrap(),
+        ))),
+        _ => Ok(SegmentPrefixLookup::Ambiguous(
+            matches.into_iter().map(|seg| seg.id).collect(),
+        )),
+    }
+}
+
+/// Resolve a segment handle by prefix inside one index context.
+#[allow(dead_code)]
+pub async fn get_segment_by_prefix_for_context(
+    conn: &Connection,
+    context_id: &str,
+    prefix: &str,
+) -> Result<SegmentPrefixLookup, OneupError> {
+    if prefix.is_empty() {
+        return Ok(SegmentPrefixLookup::NotFound);
+    }
+    validate_context_id(context_id)?;
+
+    let mut rows = conn
+        .query(
+            queries::SELECT_SEGMENTS_BY_PREFIX_FOR_CONTEXT,
+            libsql::params![context_id, prefix],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("query segment by prefix failed: {e}")))?;
 
@@ -284,19 +396,39 @@ pub async fn delete_segments_by_file(
     conn: &Connection,
     file_path: &str,
 ) -> Result<u64, OneupError> {
-    let count = delete_segments_by_file_only(conn, file_path).await?;
-    delete_indexed_file(conn, file_path).await?;
+    delete_segments_by_file_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
+}
+
+/// Delete all segments for a given file path inside one index context.
+#[allow(dead_code)]
+pub async fn delete_segments_by_file_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+) -> Result<u64, OneupError> {
+    validate_context_id(context_id)?;
+    let count = delete_segments_by_file_only_for_context(conn, context_id, file_path).await?;
+    delete_indexed_file_for_context(conn, context_id, file_path).await?;
     Ok(count)
 }
 
-async fn delete_segments_by_file_only(
+async fn delete_segments_by_file_only_for_context(
     conn: &Connection,
+    context_id: &str,
     file_path: &str,
 ) -> Result<u64, OneupError> {
-    relations::delete_relations_by_file(conn, file_path).await?;
+    conn.execute(
+        queries::DELETE_SEGMENT_RELATIONS_BY_CONTEXT_AND_FILE,
+        libsql::params![context_id, file_path],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("delete segment relations by file failed: {e}")))?;
 
     let count = conn
-        .execute(queries::DELETE_SEGMENTS_BY_FILE, [file_path])
+        .execute(
+            queries::DELETE_SEGMENTS_BY_CONTEXT_AND_FILE,
+            libsql::params![context_id, file_path],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("delete segments by file failed: {e}")))?;
     Ok(count)
@@ -309,8 +441,22 @@ pub async fn get_file_hash(
     conn: &Connection,
     file_path: &str,
 ) -> Result<Option<String>, OneupError> {
+    get_file_hash_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
+}
+
+/// Get the stored file hash for a given file path in one index context.
+#[allow(dead_code)]
+pub async fn get_file_hash_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+) -> Result<Option<String>, OneupError> {
+    validate_context_id(context_id)?;
     let mut rows = conn
-        .query(queries::SELECT_FILE_HASH, [file_path])
+        .query(
+            queries::SELECT_FILE_HASH_FOR_CONTEXT,
+            libsql::params![context_id, file_path],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("query file hash failed: {e}")))?;
 
@@ -336,23 +482,62 @@ pub async fn replace_file_segments_tx(
     file_path: &str,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
-    replace_file_segments_tx_with_meta(conn, file_path, segments, None).await
+    replace_file_segments_for_context_tx(conn, DEFAULT_INDEX_CONTEXT_ID, file_path, segments).await
+}
+
+/// Replace all stored segments for a single file in one index context.
+#[allow(dead_code)]
+pub async fn replace_file_segments_for_context_tx(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    replace_file_segments_for_context_tx_with_meta(conn, context_id, file_path, segments, None)
+        .await
 }
 
 /// Replace all stored segments for a single file in one transaction, updating the manifest.
+#[allow(dead_code)]
 pub async fn replace_file_segments_tx_with_meta(
     conn: &Connection,
     file_path: &str,
     segments: &[SegmentInsert],
     manifest_meta: Option<&IndexedFileMeta>,
 ) -> Result<(), OneupError> {
+    replace_file_segments_for_context_tx_with_meta(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        file_path,
+        segments,
+        manifest_meta,
+    )
+    .await
+}
+
+/// Replace all stored segments for a single file in one index context, updating the manifest.
+pub async fn replace_file_segments_for_context_tx_with_meta(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+    segments: &[SegmentInsert],
+    manifest_meta: Option<&IndexedFileMeta>,
+) -> Result<(), OneupError> {
+    validate_context_id(context_id)?;
     validate_replace_segments(file_path, segments)?;
 
     let tx = conn.transaction().await.map_err(|e| {
         StorageError::Transaction(format!("begin file replace transaction failed: {e}"))
     })?;
 
-    replace_file_segments_in_transaction_with_meta(&tx, file_path, segments, manifest_meta).await?;
+    replace_file_segments_in_transaction_with_meta(
+        &tx,
+        context_id,
+        file_path,
+        segments,
+        manifest_meta,
+    )
+    .await?;
 
     tx.commit().await.map_err(|e| {
         StorageError::Transaction(format!("commit file replace transaction failed: {e}"))
@@ -367,6 +552,17 @@ pub async fn replace_file_batch_tx(
     conn: &Connection,
     batches: &[FileSegmentBatch<'_>],
 ) -> Result<(), OneupError> {
+    replace_file_batch_for_context_tx(conn, DEFAULT_INDEX_CONTEXT_ID, batches).await
+}
+
+/// Replace stored segments for multiple files in one index context and one transaction.
+#[allow(dead_code)]
+pub async fn replace_file_batch_for_context_tx(
+    conn: &Connection,
+    context_id: &str,
+    batches: &[FileSegmentBatch<'_>],
+) -> Result<(), OneupError> {
+    validate_context_id(context_id)?;
     validate_replace_batches(batches)?;
 
     let tx = conn.transaction().await.map_err(|e| {
@@ -376,6 +572,7 @@ pub async fn replace_file_batch_tx(
     for batch in batches {
         replace_file_segments_in_transaction_with_meta(
             &tx,
+            context_id,
             batch.file_path,
             batch.segments,
             batch.manifest_meta,
@@ -391,9 +588,20 @@ pub async fn replace_file_batch_tx(
 }
 
 /// Get all distinct file paths stored in the segments table.
+#[allow(dead_code)]
 pub async fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, OneupError> {
+    get_all_file_paths_for_context(conn, DEFAULT_INDEX_CONTEXT_ID).await
+}
+
+/// Get all distinct file paths stored in the segments table for one index context.
+#[allow(dead_code)]
+pub async fn get_all_file_paths_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<Vec<String>, OneupError> {
+    validate_context_id(context_id)?;
     let mut rows = conn
-        .query(queries::SELECT_ALL_FILE_PATHS, ())
+        .query(queries::SELECT_ALL_FILE_PATHS_FOR_CONTEXT, [context_id])
         .await
         .map_err(|e| StorageError::Query(format!("query all file paths failed: {e}")))?;
 
@@ -412,6 +620,7 @@ pub async fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, OneupE
 }
 
 /// Get distinct test-like file paths, optionally constrained to a scope prefix.
+#[allow(dead_code)]
 pub async fn get_test_file_paths(
     conn: &Connection,
     scope: Option<&str>,
@@ -432,6 +641,51 @@ pub async fn get_test_file_paths(
         }
         None => conn
             .query(queries::SELECT_TEST_FILE_PATHS_LIMITED, [limit as i64])
+            .await
+            .map_err(|e| StorageError::Query(format!("query test file paths failed: {e}")))?,
+    };
+
+    let mut paths = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
+/// Get distinct test-like file paths inside one index context, optionally constrained to a scope prefix.
+pub async fn get_test_file_paths_for_context(
+    conn: &Connection,
+    context_id: &str,
+    scope: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    let mut rows = match scope {
+        Some(scope) => {
+            conn.query(
+                queries::SELECT_SCOPED_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT,
+                libsql::params![context_id, scope, format!("{scope}/%"), limit as i64],
+            )
+            .await
+            .map_err(|e| StorageError::Query(format!("query scoped test file paths failed: {e}")))?
+        }
+        None => conn
+            .query(
+                queries::SELECT_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT,
+                libsql::params![context_id, limit as i64],
+            )
             .await
             .map_err(|e| StorageError::Query(format!("query test file paths failed: {e}")))?,
     };
@@ -538,12 +792,64 @@ pub async fn count_segments(conn: &Connection) -> Result<u64, OneupError> {
     }
 }
 
+/// Count total number of segments in a worktree context.
+pub async fn count_segments_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<u64, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(queries::COUNT_SEGMENTS_FOR_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("count context segments failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => {
+            let count: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read count failed: {e}")))?;
+            Ok(count as u64)
+        }
+        None => Ok(0),
+    }
+}
+
 /// Count distinct file paths in the segments table.
 pub async fn count_files(conn: &Connection) -> Result<u64, OneupError> {
     let mut rows = conn
         .query(queries::COUNT_FILES, ())
         .await
         .map_err(|e| StorageError::Query(format!("count files failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => {
+            let count: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read count failed: {e}")))?;
+            Ok(count as u64)
+        }
+        None => Ok(0),
+    }
+}
+
+/// Count distinct file paths in a worktree context.
+pub async fn count_files_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<u64, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(queries::COUNT_FILES_FOR_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("count context files failed: {e}")))?;
 
     match rows
         .next()
@@ -661,10 +967,30 @@ fn build_segment_relation_rows(seg: &SegmentInsert) -> Vec<RelationInsert> {
     relations::build_relation_inserts(&seg.id, &called_relations, &referenced_relations)
 }
 
-async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
+fn validate_context_id(context_id: &str) -> Result<(), OneupError> {
+    if context_id.trim().is_empty() {
+        return Err(
+            StorageError::Transaction("index context id cannot be empty".to_string()).into(),
+        );
+    }
+    if context_id.trim() != context_id {
+        return Err(StorageError::Transaction(
+            "index context id cannot contain surrounding whitespace".to_string(),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+async fn replace_segment_symbols_for_context(
+    conn: &Connection,
+    context_id: &str,
+    seg: &SegmentInsert,
+) -> Result<(), OneupError> {
     conn.execute(
-        queries::DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID,
-        [seg.id.clone()],
+        queries::DELETE_SEGMENT_SYMBOLS_BY_CONTEXT_AND_SEGMENT_ID,
+        libsql::params![context_id, seg.id.clone()],
     )
     .await
     .map_err(|e| StorageError::Query(format!("delete segment symbols failed: {e}")))?;
@@ -673,6 +999,7 @@ async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Resu
         conn.execute(
             queries::INSERT_SEGMENT_SYMBOL,
             libsql::params![
+                context_id.to_string(),
                 seg.id.clone(),
                 symbol.symbol,
                 symbol.canonical_symbol,
@@ -684,6 +1011,49 @@ async fn replace_segment_symbols(conn: &Connection, seg: &SegmentInsert) -> Resu
     }
 
     Ok(())
+}
+
+async fn replace_segment_relations_for_context(
+    conn: &Connection,
+    context_id: &str,
+    source_segment_id: &str,
+    relations: &[RelationInsert],
+) -> Result<(), OneupError> {
+    validate_relation_source_ids(source_segment_id, relations)?;
+    delete_segment_relations_by_context_and_source_segment_id(conn, context_id, source_segment_id)
+        .await?;
+    batch_insert_relations_for_context(conn, context_id, relations).await
+}
+
+fn validate_relation_source_ids(
+    source_segment_id: &str,
+    relations: &[RelationInsert],
+) -> Result<(), OneupError> {
+    for relation in relations {
+        if relation.source_segment_id != source_segment_id {
+            return Err(StorageError::Transaction(format!(
+                "relation replace for '{source_segment_id}' received row for '{}'",
+                relation.source_segment_id
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+async fn delete_segment_relations_by_context_and_source_segment_id(
+    conn: &Connection,
+    context_id: &str,
+    source_segment_id: &str,
+) -> Result<u64, OneupError> {
+    conn.execute(
+        queries::DELETE_SEGMENT_RELATIONS_BY_CONTEXT_AND_SOURCE_SEGMENT_ID,
+        libsql::params![context_id, source_segment_id],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("delete segment relations failed: {e}")))
+    .map_err(Into::into)
 }
 
 #[allow(dead_code)]
@@ -711,18 +1081,26 @@ async fn replace_file_segments_in_transaction(
     file_path: &str,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
-    replace_file_segments_in_transaction_with_meta(conn, file_path, segments, None).await
+    replace_file_segments_in_transaction_with_meta(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        file_path,
+        segments,
+        None,
+    )
+    .await
 }
 
 async fn replace_file_segments_in_transaction_with_meta(
     conn: &Connection,
+    context_id: &str,
     file_path: &str,
     segments: &[SegmentInsert],
     manifest_meta: Option<&IndexedFileMeta>,
 ) -> Result<(), OneupError> {
-    delete_segments_by_file_only(conn, file_path).await?;
+    delete_segments_by_file_only_for_context(conn, context_id, file_path).await?;
 
-    batch_upsert_segments(conn, segments).await?;
+    batch_upsert_segments_for_context(conn, context_id, segments).await?;
     batch_upsert_vectors(conn, segments).await?;
 
     let symbol_rows: Vec<(String, SegmentSymbolInsert)> = segments
@@ -733,17 +1111,18 @@ async fn replace_file_segments_in_transaction_with_meta(
                 .map(|sym| (seg.id.clone(), sym))
         })
         .collect();
-    batch_insert_symbols(conn, &symbol_rows).await?;
+    batch_insert_symbols_for_context(conn, context_id, &symbol_rows).await?;
 
     let relation_rows: Vec<RelationInsert> = segments
         .iter()
         .flat_map(build_segment_relation_rows)
         .collect();
-    relations::insert_relations(conn, &relation_rows).await?;
+    batch_insert_relations_for_context(conn, context_id, &relation_rows).await?;
 
     if let Some(meta) = manifest_meta {
-        upsert_indexed_file(
+        upsert_indexed_file_for_context(
             conn,
+            context_id,
             file_path,
             &meta.extension,
             &meta.file_hash,
@@ -752,14 +1131,23 @@ async fn replace_file_segments_in_transaction_with_meta(
         )
         .await?;
     } else if segments.is_empty() {
-        delete_indexed_file(conn, file_path).await?;
+        delete_indexed_file_for_context(conn, context_id, file_path).await?;
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 async fn batch_upsert_segments(
     conn: &Connection,
+    segments: &[SegmentInsert],
+) -> Result<(), OneupError> {
+    batch_upsert_segments_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, segments).await
+}
+
+async fn batch_upsert_segments_for_context(
+    conn: &Connection,
+    context_id: &str,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
     if segments.is_empty() {
@@ -769,7 +1157,7 @@ async fn batch_upsert_segments(
     for chunk in segments.chunks(queries::SEGMENT_CHUNK_SIZE) {
         let mut sql = String::from(
             "INSERT OR REPLACE INTO segments (\
-             id, file_path, language, block_type, content, \
+             id, context_id, file_path, language, block_type, content, \
              line_start, line_end, breadcrumb, complexity, role, \
              defined_symbols, referenced_symbols, called_symbols, \
              file_hash, created_at, updated_at\
@@ -785,11 +1173,12 @@ async fn batch_upsert_segments(
             let b = i * queries::SEGMENT_INSERT_COLS;
             write!(
                 sql,
-                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'), datetime('now'))",
-                b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12, b+13, b+14,
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'), datetime('now'))",
+                b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12, b+13, b+14, b+15,
             ).expect("write to String cannot fail");
 
             params.push(seg.id.clone().into());
+            params.push(context_id.to_string().into());
             params.push(seg.file_path.clone().into());
             params.push(seg.language.clone().into());
             params.push(seg.block_type.clone().into());
@@ -860,8 +1249,17 @@ async fn batch_upsert_vectors(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn batch_insert_symbols(
     conn: &Connection,
+    symbols: &[(String, SegmentSymbolInsert)],
+) -> Result<(), OneupError> {
+    batch_insert_symbols_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, symbols).await
+}
+
+async fn batch_insert_symbols_for_context(
+    conn: &Connection,
+    context_id: &str,
     symbols: &[(String, SegmentSymbolInsert)],
 ) -> Result<(), OneupError> {
     if symbols.is_empty() {
@@ -871,7 +1269,7 @@ async fn batch_insert_symbols(
     for chunk in symbols.chunks(queries::SYMBOL_CHUNK_SIZE) {
         let mut sql = String::from(
             "INSERT OR REPLACE INTO segment_symbols (\
-             segment_id, symbol, canonical_symbol, reference_kind, created_at\
+             context_id, segment_id, symbol, canonical_symbol, reference_kind, created_at\
              ) VALUES ",
         );
         let mut params: Vec<libsql::Value> =
@@ -884,14 +1282,16 @@ async fn batch_insert_symbols(
             let b = i * queries::SYMBOL_INSERT_COLS;
             write!(
                 sql,
-                "(?{}, ?{}, ?{}, ?{}, datetime('now'))",
+                "(?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'))",
                 b + 1,
                 b + 2,
                 b + 3,
-                b + 4
+                b + 4,
+                b + 5
             )
             .expect("write to String cannot fail");
 
+            params.push(context_id.to_string().into());
             params.push(segment_id.clone().into());
             params.push(sym.symbol.clone().into());
             params.push(sym.canonical_symbol.clone().into());
@@ -901,6 +1301,63 @@ async fn batch_insert_symbols(
         conn.execute(&sql, params)
             .await
             .map_err(|e| StorageError::Query(format!("batch insert symbols failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+async fn batch_insert_relations_for_context(
+    conn: &Connection,
+    context_id: &str,
+    relations: &[RelationInsert],
+) -> Result<(), OneupError> {
+    if relations.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in relations.chunks(queries::CONTEXT_RELATION_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT OR REPLACE INTO segment_relations (\
+             context_id, source_segment_id, relation_kind, raw_target_symbol, \
+             canonical_target_symbol, lookup_canonical_symbol, \
+             qualifier_fingerprint, edge_identity_kind, created_at\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::CONTEXT_RELATION_INSERT_COLS);
+
+        for (i, relation) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let base = i * queries::CONTEXT_RELATION_INSERT_COLS;
+            write!(
+                sql,
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, datetime('now'))",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+            )
+            .expect("write to String cannot fail");
+
+            params.push(context_id.to_string().into());
+            params.push(relation.source_segment_id.clone().into());
+            params.push(relation.relation_kind.as_str().to_string().into());
+            params.push(relation.raw_target_symbol.clone().into());
+            params.push(relation.canonical_target_symbol.clone().into());
+            params.push(relation.lookup_canonical_symbol.clone().into());
+            params.push(relation.qualifier_fingerprint.clone().into());
+            params.push(relation.edge_identity_kind.clone().into());
+        }
+
+        conn.execute(&sql, params).await.map_err(|e| {
+            StorageError::Query(format!("batch insert segment relations failed: {e}"))
+        })?;
     }
 
     Ok(())
@@ -971,11 +1428,22 @@ pub struct IndexedFileEntry {
 }
 
 /// Load the full indexed-files manifest keyed by file path.
+#[allow(dead_code)]
 pub async fn get_all_indexed_files(
     conn: &Connection,
 ) -> Result<HashMap<String, IndexedFileEntry>, OneupError> {
+    get_all_indexed_files_for_context(conn, DEFAULT_INDEX_CONTEXT_ID).await
+}
+
+/// Load one context's indexed-files manifest keyed by file path.
+#[allow(dead_code)]
+pub async fn get_all_indexed_files_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<HashMap<String, IndexedFileEntry>, OneupError> {
+    validate_context_id(context_id)?;
     let mut rows = conn
-        .query(queries::SELECT_ALL_INDEXED_FILES, ())
+        .query(queries::SELECT_ALL_INDEXED_FILES_FOR_CONTEXT, [context_id])
         .await
         .map_err(|e| StorageError::Query(format!("query all indexed files failed: {e}")))?;
 
@@ -1017,8 +1485,22 @@ pub async fn get_indexed_file(
     conn: &Connection,
     file_path: &str,
 ) -> Result<Option<IndexedFileEntry>, OneupError> {
+    get_indexed_file_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
+}
+
+/// Load a single indexed-file entry by context and path.
+#[allow(dead_code)]
+pub async fn get_indexed_file_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+) -> Result<Option<IndexedFileEntry>, OneupError> {
+    validate_context_id(context_id)?;
     let mut rows = conn
-        .query(queries::SELECT_INDEXED_FILE, [file_path])
+        .query(
+            queries::SELECT_INDEXED_FILE_FOR_CONTEXT,
+            libsql::params![context_id, file_path],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("query indexed file failed: {e}")))?;
 
@@ -1049,6 +1531,7 @@ pub async fn get_indexed_file(
 }
 
 /// Write or update an indexed-file manifest entry.
+#[allow(dead_code)]
 pub async fn upsert_indexed_file(
     conn: &Connection,
     file_path: &str,
@@ -1057,9 +1540,40 @@ pub async fn upsert_indexed_file(
     file_size: i64,
     modified_ns: i64,
 ) -> Result<(), OneupError> {
+    upsert_indexed_file_for_context(
+        conn,
+        DEFAULT_INDEX_CONTEXT_ID,
+        file_path,
+        extension,
+        file_hash,
+        file_size,
+        modified_ns,
+    )
+    .await
+}
+
+/// Write or update an indexed-file manifest entry for one context.
+#[allow(dead_code)]
+pub async fn upsert_indexed_file_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+    extension: &str,
+    file_hash: &str,
+    file_size: i64,
+    modified_ns: i64,
+) -> Result<(), OneupError> {
+    validate_context_id(context_id)?;
     conn.execute(
         queries::UPSERT_INDEXED_FILE,
-        libsql::params![file_path, extension, file_hash, file_size, modified_ns],
+        libsql::params![
+            context_id,
+            file_path,
+            extension,
+            file_hash,
+            file_size,
+            modified_ns
+        ],
     )
     .await
     .map_err(|e| StorageError::Query(format!("upsert indexed file failed: {e}")))?;
@@ -1067,10 +1581,25 @@ pub async fn upsert_indexed_file(
 }
 
 /// Remove an indexed-file manifest entry.
+#[allow(dead_code)]
 pub async fn delete_indexed_file(conn: &Connection, file_path: &str) -> Result<(), OneupError> {
-    conn.execute(queries::DELETE_INDEXED_FILE, [file_path])
-        .await
-        .map_err(|e| StorageError::Query(format!("delete indexed file failed: {e}")))?;
+    delete_indexed_file_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
+}
+
+/// Remove one context's indexed-file manifest entry.
+#[allow(dead_code)]
+pub async fn delete_indexed_file_for_context(
+    conn: &Connection,
+    context_id: &str,
+    file_path: &str,
+) -> Result<(), OneupError> {
+    validate_context_id(context_id)?;
+    conn.execute(
+        queries::DELETE_INDEXED_FILE,
+        libsql::params![context_id, file_path],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("delete indexed file failed: {e}")))?;
     Ok(())
 }
 
@@ -1106,6 +1635,24 @@ mod tests {
             called_relations: "[]".to_string(),
             file_hash: file_hash.to_string(),
         }
+    }
+
+    fn generated_test_segment(context_id: &str, file_path: &str, file_hash: &str) -> SegmentInsert {
+        let id = generate_segment_id(context_id, file_path, 1, 3);
+        test_segment(&id, file_path, file_hash)
+    }
+
+    #[test]
+    fn segment_ids_use_extended_hash_prefix() {
+        let id = generate_segment_id("ctx-main", "src/main.rs", 1, 3);
+        assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    fn context_ids_reject_surrounding_whitespace() {
+        assert!(validate_context_id("ctx-main").is_ok());
+        assert!(validate_context_id(" ctx-main").is_err());
+        assert!(validate_context_id("ctx-main ").is_err());
     }
 
     async fn symbol_rows(conn: &Connection, segment_id: &str) -> Vec<(String, String, String)> {
@@ -1161,6 +1708,44 @@ mod tests {
         }
 
         results
+    }
+
+    async fn segment_ids_for_context(
+        conn: &Connection,
+        context_id: &str,
+        file_path: &str,
+    ) -> Vec<String> {
+        let mut rows = conn
+            .query(
+                "SELECT id
+                 FROM segments
+                 WHERE context_id = ?1
+                   AND file_path = ?2
+                 ORDER BY id",
+                libsql::params![context_id, file_path],
+            )
+            .await
+            .unwrap();
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            results.push(row.get(0).unwrap());
+        }
+
+        results
+    }
+
+    async fn vector_exists(conn: &Connection, segment_id: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM segment_vectors WHERE segment_id = ?1",
+                [segment_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let count: i64 = row.get(0).unwrap();
+        count == 1
     }
 
     #[tokio::test]
@@ -1658,6 +2243,119 @@ mod tests {
                 "bare_identifier".to_string(),
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn replace_file_segments_for_context_tx_scopes_rows_by_context_and_file() {
+        let (_db, conn) = setup().await;
+        let main_context = "ctx-main";
+        let linked_context = "ctx-linked";
+        let file_path = "src/a.rs";
+        let main_segment_id = generate_segment_id(main_context, file_path, 1, 3);
+        let linked_segment_id = generate_segment_id(linked_context, file_path, 1, 3);
+
+        assert_ne!(main_segment_id, linked_segment_id);
+
+        let mut main_old = generated_test_segment(main_context, file_path, "main-old");
+        main_old.called_symbols = r#"["delete_main_relation"]"#.to_string();
+        main_old.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        let mut linked_old = generated_test_segment(linked_context, file_path, "linked-old");
+        linked_old.called_symbols = r#"["keep_linked_relation"]"#.to_string();
+        linked_old.embedding_vec = Some(serde_json::to_string(&vec![0.25f32; 384]).unwrap());
+
+        let main_meta = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "main-old".to_string(),
+            file_size: 10,
+            modified_ns: 100,
+        };
+        let linked_meta = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "linked-old".to_string(),
+            file_size: 20,
+            modified_ns: 200,
+        };
+
+        replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            main_context,
+            file_path,
+            &[main_old],
+            Some(&main_meta),
+        )
+        .await
+        .unwrap();
+        replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            linked_context,
+            file_path,
+            &[linked_old],
+            Some(&linked_meta),
+        )
+        .await
+        .unwrap();
+
+        let mut main_new = generated_test_segment(main_context, file_path, "main-new");
+        main_new.embedding_vec = Some(serde_json::to_string(&vec![0.75f32; 384]).unwrap());
+        let main_new_meta = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: "main-new".to_string(),
+            file_size: 30,
+            modified_ns: 300,
+        };
+        replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            main_context,
+            file_path,
+            &[main_new],
+            Some(&main_new_meta),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            segment_ids_for_context(&conn, main_context, file_path).await,
+            vec![main_segment_id.clone()]
+        );
+        assert_eq!(
+            segment_ids_for_context(&conn, linked_context, file_path).await,
+            vec![linked_segment_id.clone()]
+        );
+        assert!(relation_rows(&conn, &main_segment_id).await.is_empty());
+        assert!(!relation_rows(&conn, &linked_segment_id).await.is_empty());
+        assert!(vector_exists(&conn, &main_segment_id).await);
+        assert!(vector_exists(&conn, &linked_segment_id).await);
+
+        let main_manifest = get_all_indexed_files_for_context(&conn, main_context)
+            .await
+            .unwrap();
+        let linked_manifest = get_all_indexed_files_for_context(&conn, linked_context)
+            .await
+            .unwrap();
+        assert_eq!(main_manifest[file_path].file_hash, "main-new");
+        assert_eq!(linked_manifest[file_path].file_hash, "linked-old");
+
+        replace_file_segments_for_context_tx(&conn, main_context, file_path, &[])
+            .await
+            .unwrap();
+
+        assert!(segment_ids_for_context(&conn, main_context, file_path)
+            .await
+            .is_empty());
+        assert_eq!(
+            segment_ids_for_context(&conn, linked_context, file_path).await,
+            vec![linked_segment_id.clone()]
+        );
+        assert!(!vector_exists(&conn, &main_segment_id).await);
+        assert!(vector_exists(&conn, &linked_segment_id).await);
+        assert!(!get_all_indexed_files_for_context(&conn, main_context)
+            .await
+            .unwrap()
+            .contains_key(file_path));
+        assert!(get_all_indexed_files_for_context(&conn, linked_context)
+            .await
+            .unwrap()
+            .contains_key(file_path));
     }
 
     #[tokio::test]

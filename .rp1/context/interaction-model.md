@@ -28,7 +28,7 @@
 
 ### MCP Server
 
-- Entry point: `1up mcp --path <repo>` under server identity `oneup`.
+- Entry point: `1up mcp --path <repo-or-worktree>` under server identity `oneup`.
 - Tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, `oneup_impact`.
 - Role: primary agent-facing prepare, search, read, symbol, and context workflow; impact remains available for explicit blast-radius questions but is not required for the core discovery loop.
 - Output: presentation-free structured `ToolEnvelope` with `status`, `summary`, `data`, and `next_actions`; text content mirrors the summary for host display without ANSI color, spinners, or terminal table formatting.
@@ -56,10 +56,11 @@
 
 ### Maintenance CLI
 
-- Entry points: `init`, `start`, `stop`, `status`, `index`, `reindex`, `update`.
+- Entry points: `init`, `start`, `stop`, `status`, `list`, `index`, `reindex`, `update`.
 - Defaults: `start`, `stop`, `status`, and `update` default to human; `init`, `index`, and `reindex` default to plain; all accept `--format/-f`.
-- `start` registers projects, initializes when needed, indexes if no current index exists, and reports stale/newer/unreadable schema recovery separately.
-- `index` and `reindex` expose `--watch`, `--jobs`, and `--embed-threads`; progress includes phase, work counts, embeddings, parallelism, timings, scope, and prefilter details.
+- `start` registers the resolved `WorktreeContext`, initializes when needed, indexes if no current context index exists, and reports stale/newer/unreadable schema recovery separately.
+- `status` and `list` show source root, context id, main worktree, worktree role, branch, branch status, watch status, index status, and last update state where available.
+- `index` and `reindex` expose `--watch`, `--jobs`, and `--embed-threads`; progress includes phase, work counts, embeddings, context id, source root, branch metadata, parallelism, timings, scope, and prefilter details.
 - `update` has passive post-command notifications for normal commands, but suppresses them for MCP, worker, update itself, and JSON maintenance output.
 
 ### Agent Instruction And Eval Surfaces
@@ -73,11 +74,11 @@
 
 | State | Meaning | Signals / Recovery |
 |---|---|---|
-| `ready` | MCP index is current and semantic search is available. | `oneup_prepare` suggests `oneup_search`. |
-| `missing` | Project or index is absent, empty, or not usable. | `oneup_prepare` suggests explicit indexing mode. |
-| `indexing` | Index progress file reports a running index job. | Poll `oneup_prepare` or `1up status`. |
+| `ready` | The active worktree context is indexed and semantic search is available. | `oneup_prepare` suggests `oneup_search`; counts are context-scoped. |
+| `missing` | Project, index, or active context rows are absent, empty, or not usable. | `oneup_prepare` suggests explicit indexing mode. |
+| `indexing` | Index progress file reports a running job for the active context. | Poll `oneup_prepare` or `1up status` from the same worktree. |
 | `stale` | Index exists but is unreadable, stale, or schema-incompatible. | Rebuild with `oneup_prepare` mode `reindex` or `1up reindex`. |
-| `degraded` | Search can run, but embeddings are unavailable or latest index lacks embeddings. | Results may be FTS-only; fix model/index state then recheck. |
+| `degraded` | Search can run, but embeddings are unavailable, latest index lacks embeddings, or branch context is unknown/unreadable. | Results may be FTS-only or only context-scoped rather than definitively branch-filtered; fix model/index/git state then recheck. |
 | `blocked` | MCP prepare could not make the repository ready. | Structured data explains the blocking condition and suggests corrective prepare or setup actions. |
 | `ok` / `empty` / `partial` / `degraded` | MCP operation status for search/read/symbol. | `summary`, `data`, and `next_actions` explain next step. |
 | `found` / `not_found` / `ambiguous` / `rejected` / `error` | Per-record `oneup_read` outcomes. | Ambiguous handles list matching IDs; rejected locations identify path-scope violations. |
@@ -86,16 +87,18 @@
 | `refused` | Impact expansion was unsafe or ambiguous. | Reason and hint suggest scope, segment, search, or reindex. |
 | `started` / `already_running` / `startup_in_progress` / `indexed_and_started` | Start lifecycle result. | Human/plain/json start result includes message, pid, and optional index progress. |
 | `idle` / `running` / `complete` with phases | Index lifecycle state. | Phases include pending, preparing, rebuilding, loading_model, scanning, parsing, storing/embedding_and_storing, complete. |
+| `watching` / `daemon_stopped` / `source_missing` / `unsupported` / `unknown` | Daemon watch state for a registered context. | `status` and `list` include watch state plus branch/worktree and last refresh metadata. |
 | `up_to_date` / `update_available` / `yanked` / `below_minimum_safe` | Update status. | Human/plain/json update renderers include install channel and upgrade instruction when needed. |
 
 ## Feedback Loops
 
 ### MCP Readiness Loop
 
-1. Agent calls `oneup_prepare` when readiness is unknown.
-2. The tool reports `ready`, `missing`, `indexing`, `stale`, `degraded`, or `blocked`.
-3. `next_actions` steer to search, explicit indexing, polling, reindexing, or setup correction.
-4. Status/start requirements are satisfied through `oneup_prepare` modes rather than separate MCP tools.
+1. Agent calls `oneup_prepare` when readiness is unknown for the configured repo or worktree path.
+2. The tool resolves `WorktreeContext` and reports `ready`, `missing`, `indexing`, `stale`, `degraded`, or `blocked` for that `context_id`.
+3. Structured data includes state root, source root, context-scoped counts, matching progress, and matching daemon heartbeat when available.
+4. `next_actions` steer to search, explicit indexing, polling, reindexing, or setup correction.
+5. Status/start requirements are satisfied through `oneup_prepare` modes rather than separate MCP tools.
 
 ### MCP Discovery Loop
 
@@ -128,7 +131,7 @@
 ### Setup Review Loop
 
 1. User chooses setup prompt, `add-mcp`, or manual config.
-2. User verifies server identity `oneup`, command `1up`, args `mcp --path <repo>`, repository path, and scope.
+2. User verifies server identity `oneup`, command `1up`, args `mcp --path <repo-or-worktree>`, repository/worktree path, and scope.
 3. User reloads/trusts the host, lists tools, and calls `oneup_prepare`.
 
 ## Output Semantics

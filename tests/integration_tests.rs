@@ -1,4 +1,9 @@
 use assert_cmd::Command;
+use oneup::storage::{
+    db::Db,
+    schema,
+    segments::{self, IndexedFileMeta, SegmentInsert},
+};
 use predicates::prelude::*;
 use std::collections::BTreeSet;
 use std::fs;
@@ -29,6 +34,25 @@ fn test_data_dir(home: &std::path::Path) -> PathBuf {
     {
         home.join(".local").join("share").join("1up")
     }
+}
+
+fn cmd_with_home(home: &Path) -> Command {
+    let mut command = cmd();
+    command
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    command
+}
+
+fn seed_model_download_failure(home: &Path) {
+    seed_model_download_failure_at_app_root(&test_data_dir(home));
+}
+
+fn seed_model_download_failure_at_app_root(app_root: &Path) {
+    let model_dir = app_root.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
 }
 
 #[cfg(unix)]
@@ -83,6 +107,8 @@ impl McpTestClient {
             .stderr(Stdio::null());
         if let Some(home) = &state_home {
             let home_path = home.path().canonicalize().unwrap();
+            seed_model_download_failure(&home_path);
+            seed_model_download_failure_at_app_root(&home_path.join("data").join("1up"));
             command
                 .env("HOME", &home_path)
                 .env("XDG_DATA_HOME", home_path.join("data"))
@@ -276,6 +302,88 @@ fn write_running_progress(project: &Path) {
         .unwrap(),
     )
     .unwrap();
+}
+
+fn write_running_progress_for_context(project: &Path, context_id: &str) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("index_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "running",
+            "phase": "scanning",
+            "context_id": context_id,
+            "source_root": project,
+            "branch_name": "other",
+            "branch_status": "named",
+            "files_total": 1,
+            "files_scanned": 0,
+            "files_processed": 0,
+            "files_indexed": 0,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "segments_stored": 0,
+            "embeddings_enabled": true,
+            "message": "other context indexing",
+            "updated_at": "2026-04-26T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
+}
+
+fn seed_current_index_for_context(project: &Path, context_id: &str) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("project_id"),
+        "context-count-project",
+    )
+    .unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        let segment = SegmentInsert {
+            id: format!("{context_id}-segment"),
+            file_path: "src/other.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn other_context_only() {}\n".to_string(),
+            line_start: 1,
+            line_end: 1,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "source".to_string(),
+            defined_symbols: "[]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "other-context-hash".to_string(),
+        };
+        let meta = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: segment.file_hash.clone(),
+            file_size: segment.content.len() as i64,
+            modified_ns: 1,
+        };
+        segments::replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            context_id,
+            "src/other.rs",
+            &[segment],
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+    });
 }
 
 #[cfg(unix)]
@@ -663,10 +771,91 @@ fn run_core_cmd(args: &[&str]) -> (String, String, bool) {
     (stdout, stderr, output.status.success())
 }
 
+fn run_core_cmd_with_home(home: &Path, args: &[&str]) -> (String, String, bool) {
+    let output = cmd_with_home(home).args(args).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    (stdout, stderr, output.status.success())
+}
+
 fn search_rows(dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
     let (stdout, stderr, ok) = run_core_cmd(&["search", query, "--path", dir.to_str().unwrap()]);
     assert!(ok, "search failed: {stderr}");
     parse_discovery_rows(&stdout)
+}
+
+fn search_rows_with_home(home: &Path, dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
+    let (stdout, stderr, ok) =
+        run_core_cmd_with_home(home, &["search", query, "--path", dir.to_str().unwrap()]);
+    assert!(ok, "search failed: {stderr}");
+    parse_discovery_rows(&stdout)
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|err| panic!("git {args:?} failed to launch: {err}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_branch_filtering_fixture() -> (TempDir, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let main_repo = root.join("main");
+    let feature_worktree = root.join("feature-worktree");
+    fs::create_dir_all(&main_repo).unwrap();
+
+    git(&root, &["init", main_repo.to_str().unwrap()]);
+    git(
+        &main_repo,
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git(&main_repo, &["config", "user.name", "1up Test"]);
+    fs::write(
+        main_repo.join("shared.rs"),
+        "pub fn shared_branch_acceptance_marker() -> &'static str { \"shared branch acceptance sentinel\" }\n",
+    )
+    .unwrap();
+    git(&main_repo, &["add", "."]);
+    git(&main_repo, &["commit", "-m", "shared"]);
+    git(&main_repo, &["branch", "-M", "main"]);
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature-acceptance",
+            feature_worktree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    fs::write(
+        main_repo.join("main_only.rs"),
+        "pub fn main_branch_acceptance_marker() -> &'static str { \"main branch only acceptance sentinel\" }\n",
+    )
+    .unwrap();
+    git(&main_repo, &["add", "."]);
+    git(&main_repo, &["commit", "-m", "main only"]);
+
+    fs::write(
+        feature_worktree.join("feature_only.rs"),
+        "pub fn feature_branch_acceptance_marker() -> &'static str { \"feature branch only acceptance sentinel\" }\n",
+    )
+    .unwrap();
+
+    (
+        tmp,
+        main_repo.canonicalize().unwrap(),
+        feature_worktree.canonicalize().unwrap(),
+    )
 }
 
 fn symbol_rows(dir: &std::path::Path, name: &str, extra: &[&str]) -> Vec<LeanDiscoveryRow> {
@@ -1596,8 +1785,10 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
         let ready_result = ready_client.call_tool("oneup_prepare", serde_json::json!({}));
         let ready_envelope = mcp_structured(&ready_result);
         assert_mcp_response_is_presentation_free(&ready_result);
-        assert_eq!(ready_envelope["status"], "ready");
+        assert_eq!(ready_envelope["status"], "degraded");
         assert_eq!(ready_envelope["data"]["index_readable"], true);
+        assert_eq!(ready_envelope["data"]["branch_status"], "unknown");
+        assert_eq!(ready_envelope["data"]["last_update_state"], "complete");
         assert_eq!(ready_envelope["next_actions"][0]["tool"], "oneup_search");
     }
 
@@ -1620,17 +1811,65 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
 }
 
 #[test]
+fn mcp_prepare_ignores_index_progress_from_other_context() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".git")).unwrap();
+    write_running_progress_for_context(project.path(), "other-context");
+
+    let mut client = McpTestClient::start_with_isolated_state(project.path());
+    let result = client.call_tool("oneup_prepare", serde_json::json!({}));
+    let envelope = mcp_structured(&result);
+
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    assert_eq!(envelope["status"], "missing");
+    assert!(
+        envelope["data"].get("index_progress").is_none(),
+        "non-active context progress should not be exposed in readiness data: {envelope:?}"
+    );
+    assert_eq!(envelope["data"]["last_update_state"], "unknown");
+    assert_eq!(
+        envelope["next_actions"][0]["arguments"]["mode"],
+        "index_if_missing"
+    );
+}
+
+#[test]
+fn mcp_prepare_ignores_index_rows_from_other_context() {
+    let project = TempDir::new().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    fs::create_dir_all(project_root.join(".git")).unwrap();
+    seed_current_index_for_context(&project_root, "other-context");
+
+    let mut client = McpTestClient::start_with_isolated_state(&project_root);
+    let result = client.call_tool("oneup_prepare", serde_json::json!({}));
+    let envelope = mcp_structured(&result);
+
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    assert_eq!(envelope["status"], "missing");
+    assert_eq!(envelope["data"]["index_readable"], true);
+    assert_eq!(envelope["data"]["indexed_files"], 0);
+    assert_eq!(envelope["data"]["total_segments"], 0);
+    assert_eq!(
+        envelope["next_actions"][0]["arguments"]["mode"],
+        "index_if_missing"
+    );
+}
+
+#[test]
 fn mcp_prepare_index_if_missing_builds_index_state_only() {
     let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let git_dir = tmp.path().join(".git");
+    fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
 
     let source_path = tmp.path().join("src").join("lib.rs");
     let source_content = "pub fn readiness_probe() -> &'static str {\n    \"ready\"\n}\n";
     fs::write(&source_path, source_content).unwrap();
 
-    let _guard = HideModelGuard::new();
-    let mut client = McpTestClient::start(tmp.path());
+    let mut client = McpTestClient::start_with_isolated_state(tmp.path());
     let mut result = client.call_tool(
         "oneup_prepare",
         serde_json::json!({ "mode": "index_if_missing" }),
@@ -2615,7 +2854,7 @@ fn get_preserves_order_across_handles() {
 #[test]
 fn search_segment_id_round_trips_into_impact_from_segment() {
     // The lean row grammar emits a 12-char display handle (`:<prefix>`). `get`
-    // resolves that prefix back to the full 16-char segment id, which is what
+    // resolves that prefix back to the full segment id, which is what
     // `impact --from-segment` expects for its exact-anchor lookup. This pins
     // the discovery -> hydrate -> impact follow-up chain at the row-grammar
     // layer.
@@ -3600,5 +3839,96 @@ fn cli_worktree_resolves_to_main_repo_index() {
     assert!(
         !rows.is_empty(),
         "worktree-only symbol should appear after reindex from worktree"
+    );
+}
+
+#[test]
+fn branch_context_search_excludes_other_worktree_only_content() {
+    let home = TempDir::new().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let (_tmp, main_repo, feature_worktree) = create_branch_filtering_fixture();
+
+    cmd_with_home(&canonical_home)
+        .args(["init", main_repo.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+    cmd_with_home(&canonical_home)
+        .args(["index", main_repo.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+    cmd_with_home(&canonical_home)
+        .args([
+            "index",
+            feature_worktree.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let main_rows = search_rows_with_home(
+        &canonical_home,
+        &main_repo,
+        "main branch only acceptance sentinel",
+    );
+    assert!(
+        main_rows
+            .iter()
+            .any(|row| row.file_path.ends_with("main_only.rs")),
+        "main branch should find main-only content: {main_rows:?}"
+    );
+    assert!(
+        !search_rows_with_home(
+            &canonical_home,
+            &main_repo,
+            "feature branch only acceptance sentinel",
+        )
+        .iter()
+        .any(|row| row.file_path.ends_with("feature_only.rs")),
+        "main branch search must not return feature-only file rows"
+    );
+
+    let feature_rows = search_rows_with_home(
+        &canonical_home,
+        &feature_worktree,
+        "feature branch only acceptance sentinel",
+    );
+    assert!(
+        feature_rows
+            .iter()
+            .any(|row| row.file_path.ends_with("feature_only.rs")),
+        "feature branch should find feature-only content: {feature_rows:?}"
+    );
+    assert!(
+        !search_rows_with_home(
+            &canonical_home,
+            &feature_worktree,
+            "main branch only acceptance sentinel",
+        )
+        .iter()
+        .any(|row| row.file_path.ends_with("main_only.rs")),
+        "feature branch search must not return main-only file rows"
+    );
+
+    assert!(
+        search_rows_with_home(
+            &canonical_home,
+            &main_repo,
+            "shared branch acceptance sentinel"
+        )
+        .iter()
+        .any(|row| row.file_path.ends_with("shared.rs")),
+        "main branch should keep shared content discoverable"
+    );
+    assert!(
+        search_rows_with_home(
+            &canonical_home,
+            &feature_worktree,
+            "shared branch acceptance sentinel",
+        )
+        .iter()
+        .any(|row| row.file_path.ends_with("shared.rs")),
+        "feature branch should keep shared content discoverable"
     );
 }

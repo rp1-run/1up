@@ -12,13 +12,20 @@ pub const EMBEDDING_MAX_TOKENS: usize = 256;
 
 /// Default number of vector search prefilter candidates (int8 stage).
 ///
-/// Tuned to 400 for schema v12's FLOAT8 HNSW: quantization makes the top-K
+/// Tuned to 400 for schema v13's FLOAT8 HNSW: quantization makes the top-K
 /// ranking slightly noisier, so a wider candidate pool gives the RRF reranker
 /// enough coverage to recover gold segments that drift out of the top 200 but
 /// are still in the right neighbourhood. Doubling K closes the recall gap
 /// introduced by the FLOAT32 -> FLOAT8 column shift with no measurable search
 /// latency impact at repo scale (~3.3k segments).
 pub const VECTOR_PREFILTER_K: usize = 400;
+
+/// Maximum number of indexed worktree contexts used to scale vector prefiltering.
+///
+/// libSQL vector search runs against the shared vector index before context
+/// filtering, so linked worktrees dilute the active context's candidate share.
+/// Scaling by context count preserves recall while bounding worst-case latency.
+pub const VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT: usize = 8;
 
 /// RRF fusion constant.
 pub const RRF_K: f64 = 60.0;
@@ -109,7 +116,10 @@ pub const EMBED_THREADS_ENV_VAR: &str = "ONEUP_EMBED_THREADS";
 pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES";
 
 /// Schema version for database layout.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
+
+/// Context id used by legacy indexing paths until callers pass an explicit worktree context.
+pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 
 /// ONNX model filename.
 pub const MODEL_FILENAME: &str = "model.onnx";

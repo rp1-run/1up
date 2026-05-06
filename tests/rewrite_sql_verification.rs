@@ -185,6 +185,17 @@ fn create_stale_v4_index(dir: &Path) {
     });
 }
 
+fn create_stale_v12_index(dir: &Path) {
+    block_on(async {
+        let db = Db::open_rw(&db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(queries::UPSERT_META, ["schema_version", "12"])
+            .await
+            .unwrap();
+    });
+}
+
 fn create_partial_current_index(dir: &Path) {
     block_on(async {
         let db = Db::open_rw(&db_path(dir)).await.unwrap();
@@ -212,6 +223,29 @@ fn stale_schema_search_requires_explicit_reindex_guidance() {
         .failure()
         .stderr(
             predicate::str::contains("found v4")
+                .and(predicate::str::contains(format!(
+                    "expected v{SCHEMA_VERSION}"
+                )))
+                .and(predicate::str::contains("1up reindex")),
+        );
+}
+
+#[test]
+fn v12_schema_search_requires_explicit_reindex_guidance() {
+    let tmp = TempDir::new().unwrap();
+    create_stale_v12_index(tmp.path());
+
+    cmd()
+        .args([
+            "search",
+            "config loading",
+            "--path",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("found v12")
                 .and(predicate::str::contains(format!(
                     "expected v{SCHEMA_VERSION}"
                 )))

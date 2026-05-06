@@ -1,6 +1,9 @@
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+
+use crate::shared::types::{BranchStatus, DaemonRefreshState, DaemonWatchStatus, WorktreeRole};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +105,28 @@ pub struct ToolEnvelope {
     #[schemars(schema_with = "json_object_schema")]
     pub data: Value,
     pub next_actions: Vec<NextAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessContextMetadata {
+    pub context_id: String,
+    pub main_worktree_root: PathBuf,
+    pub worktree_role: WorktreeRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    pub branch_status: BranchStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    pub watch_status: DaemonWatchStatus,
+    pub last_update_state: DaemonRefreshState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

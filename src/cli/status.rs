@@ -3,12 +3,17 @@ use clap::Args;
 use std::path::Path;
 
 use crate::cli::output::{formatter_for, LifecycleState, StatusInfo};
-use crate::cli::project_status_files::{read_daemon_status, read_index_progress};
+use crate::cli::project_status_files::{
+    read_daemon_context_status, read_daemon_status_for_context, read_index_progress,
+};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::shared::config;
 use crate::shared::project;
-use crate::shared::types::{IndexProgress, IndexState, OutputFormat};
+use crate::shared::types::{
+    DaemonContextStatus, DaemonRefreshState, DaemonWatchStatus, IndexProgress, IndexState,
+    OutputFormat, WorktreeContext,
+};
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments;
@@ -32,9 +37,10 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     let resolved = crate::shared::project::resolve_project_root(Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let resolved_source_root = resolved.source_root;
+    let worktree_context = resolved.worktree_context;
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
-    let registry_entry = find_registered_project(&registry.projects, &project_root);
+    let registry_entry = find_registered_project(&registry.projects, &worktree_context);
     let registered = registry_entry.is_some();
     let source_root = registry_entry
         .map(|entry| entry.source_root().to_path_buf())
@@ -50,7 +56,9 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     let db_path = config::project_db_path(&project_root);
     let index_present = db_path.exists();
     let mut index_readable = false;
-    let daemon_status = read_daemon_status(&project_root);
+    let daemon_context_status =
+        read_daemon_context_status(&project_root, &worktree_context.context_id);
+    let daemon_status = read_daemon_status_for_context(&project_root, &worktree_context.context_id);
 
     let (indexed_files, total_segments) = {
         if db_path.exists() {
@@ -59,8 +67,18 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
                     Ok(conn) => {
                         if schema::ensure_current(&conn).await.is_ok() {
                             index_readable = true;
-                            let files = segments::count_files(&conn).await.ok();
-                            let segs = segments::count_segments(&conn).await.ok();
+                            let files = segments::count_files_for_context(
+                                &conn,
+                                &worktree_context.context_id,
+                            )
+                            .await
+                            .ok();
+                            let segs = segments::count_segments_for_context(
+                                &conn,
+                                &worktree_context.context_id,
+                            )
+                            .await
+                            .ok();
                             (files, segs)
                         } else {
                             (None, None)
@@ -75,7 +93,12 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         }
     };
 
-    let index_progress = read_index_progress(&project_root);
+    let index_progress = read_index_progress(&project_root).filter(|progress| {
+        progress
+            .context_id
+            .as_deref()
+            .is_none_or(|context_id| context_id == worktree_context.context_id.as_str())
+    });
     let lifecycle_state = derive_lifecycle_state(
         registered,
         daemon_running,
@@ -96,6 +119,27 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         project_id,
         project_root,
         source_root,
+        context_id: worktree_context.context_id.clone(),
+        main_worktree_root: worktree_context.main_worktree_root.clone(),
+        worktree_role: worktree_context.worktree_role,
+        branch_name: worktree_context.branch_name.clone(),
+        branch_ref: worktree_context.branch_ref.clone(),
+        branch_status: worktree_context.branch_status,
+        head_oid: worktree_context.head_oid.clone(),
+        watch_status: watch_status(registered, daemon_running, daemon_context_status.as_ref()),
+        last_update_state: last_update_state(
+            daemon_context_status.as_ref(),
+            index_progress.as_ref(),
+        ),
+        last_update_started_at: daemon_context_status
+            .as_ref()
+            .and_then(|status| status.last_refresh_started_at.as_ref().cloned()),
+        last_update_completed_at: daemon_context_status
+            .as_ref()
+            .and_then(|status| status.last_refresh_completed_at.as_ref().cloned()),
+        last_update_error: daemon_context_status
+            .as_ref()
+            .and_then(|status| status.last_refresh_error.clone()),
         index_present,
         index_readable,
         last_file_check_at: daemon_status.map(|status| status.last_file_check_at),
@@ -108,12 +152,53 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
 
 fn find_registered_project<'a>(
     projects: &'a [ProjectEntry],
-    project_root: &Path,
+    context: &WorktreeContext,
 ) -> Option<&'a ProjectEntry> {
-    let canonical = project::canonical_project_root(project_root);
+    let canonical = project::canonical_project_root(&context.state_root);
+    let canonical_source = project::canonical_project_root(&context.source_root);
     projects
         .iter()
-        .find(|project| project.project_root == canonical)
+        .find(|project| project.context_id.as_deref() == Some(context.context_id.as_str()))
+        .or_else(|| {
+            projects.iter().find(|project| {
+                project.project_root == canonical
+                    && project.source_root() == canonical_source.as_path()
+                    && project.branch_ref.as_deref() == context.branch_ref.as_deref()
+                    && project.branch_status() == context.branch_status
+            })
+        })
+        .or_else(|| {
+            projects
+                .iter()
+                .find(|project| project.project_root == canonical)
+        })
+}
+
+fn watch_status(
+    registered: bool,
+    daemon_running: bool,
+    status: Option<&DaemonContextStatus>,
+) -> DaemonWatchStatus {
+    status.map(|status| status.watch_status).unwrap_or_else(|| {
+        if registered && !daemon_running {
+            DaemonWatchStatus::DaemonStopped
+        } else {
+            DaemonWatchStatus::Unknown
+        }
+    })
+}
+
+fn last_update_state(
+    status: Option<&DaemonContextStatus>,
+    progress: Option<&IndexProgress>,
+) -> DaemonRefreshState {
+    status
+        .map(|status| status.last_refresh_state)
+        .unwrap_or_else(|| match progress.map(|progress| progress.state) {
+            Some(IndexState::Running) => DaemonRefreshState::Running,
+            Some(IndexState::Complete) => DaemonRefreshState::Complete,
+            _ => DaemonRefreshState::Unknown,
+        })
 }
 
 fn derive_lifecycle_state(

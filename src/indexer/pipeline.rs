@@ -108,12 +108,17 @@ struct ProgressUpdate {
 fn refresh_progress(
     stats: &mut PipelineStats,
     project_root: &Path,
+    context: &IndexRunContext,
     progress_tx: Option<&ProgressSender>,
     update: ProgressUpdate,
 ) {
     stats.progress = IndexProgress {
         state: update.state,
         phase: update.phase,
+        context_id: Some(context.context_id.clone()),
+        source_root: Some(context.source_root.clone()),
+        branch_name: context.branch_name.clone(),
+        branch_status: Some(context.branch_status),
         files_total: update.files_total,
         files_scanned: stats.files_scanned,
         files_processed: stats.files_processed,
@@ -140,18 +145,47 @@ use crate::indexer::embedder::Embedder;
 use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
-use crate::shared::constants::{EMBEDDING_DIM, HF_MODEL_REPO};
+use crate::shared::constants::{DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, HF_MODEL_REPO};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
-    IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexScopeInfo,
+    BranchStatus, IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexScopeInfo,
     IndexStageTimings, IndexState, IndexingConfig, ParsedSegment, RunScope, SetupTimings,
+    WorktreeContext,
 };
 use crate::storage::schema;
 use crate::storage::segments::{self, FileSegmentBatch, IndexedFileMeta, SegmentInsert};
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 pub type ProgressSender = Sender<IndexProgress>;
+
+#[derive(Debug, Clone)]
+struct IndexRunContext {
+    context_id: String,
+    source_root: PathBuf,
+    branch_name: Option<String>,
+    branch_status: BranchStatus,
+}
+
+impl IndexRunContext {
+    fn legacy(project_root: &Path) -> Self {
+        Self {
+            context_id: DEFAULT_INDEX_CONTEXT_ID.to_string(),
+            source_root: project_root.to_path_buf(),
+            branch_name: None,
+            branch_status: BranchStatus::Unknown,
+        }
+    }
+
+    fn from_worktree(context: &WorktreeContext) -> Self {
+        Self {
+            context_id: context.context_id.clone(),
+            source_root: context.source_root.clone(),
+            branch_name: context.branch_name.clone(),
+            branch_status: context.branch_status,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct TimingAccumulator {
@@ -184,16 +218,6 @@ fn compute_file_hash(content: &[u8]) -> String {
     hasher.update(content);
     let hash = hasher.finalize();
     hash.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn generate_segment_id(file_path: &str, line_start: usize, line_end: usize) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}:{}:{}", file_path, line_start, line_end).as_bytes());
-    let hash = hasher.finalize();
-    hash.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()[..16]
-        .to_string()
 }
 
 fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
@@ -355,11 +379,11 @@ fn indexed_metadata_matches(
 async fn prepare_full_run_inputs(
     conn: &Connection,
     project_root: &Path,
+    context_id: &str,
 ) -> Result<RunInputs, OneupError> {
     let scanned = scanner::scan_directory(project_root)?;
     let discovered_count = scanned.len();
-    let manifest = segments::get_all_indexed_files(conn).await?;
-    let stored_hashes = segments::get_all_file_hashes(conn).await?;
+    let manifest = segments::get_all_indexed_files_for_context(conn, context_id).await?;
 
     let project_root_canonical = project_root
         .canonicalize()
@@ -380,7 +404,7 @@ async fn prepare_full_run_inputs(
                 continue;
             }
             Some(entry) => Some(entry.file_hash.clone()),
-            None => stored_hashes.get(&relative_path).cloned(),
+            None => segments::get_file_hash_for_context(conn, context_id, &relative_path).await?,
         };
 
         scanned_files.push(ScannedWorkItem {
@@ -395,7 +419,7 @@ async fn prepare_full_run_inputs(
     }
 
     let manifest_paths: HashSet<&String> = manifest.keys().collect();
-    let indexed_paths: HashSet<String> = segments::get_all_file_paths(conn)
+    let indexed_paths: HashSet<String> = segments::get_all_file_paths_for_context(conn, context_id)
         .await?
         .into_iter()
         .collect();
@@ -420,6 +444,7 @@ async fn prepare_full_run_inputs(
 async fn prepare_scoped_run_inputs(
     conn: &Connection,
     project_root: &Path,
+    context_id: &str,
     changed_paths: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<ScopePreparation, OneupError> {
     if changed_paths.is_empty() {
@@ -462,14 +487,18 @@ async fn prepare_scoped_run_inputs(
             }
 
             if let Some(scanned_file) = scoped_scan_results.remove(&relative_string) {
-                if let Some(entry) = segments::get_indexed_file(conn, &relative_string).await? {
+                if let Some(entry) =
+                    segments::get_indexed_file_for_context(conn, context_id, &relative_string)
+                        .await?
+                {
                     if indexed_metadata_matches(entry.file_size, entry.modified_ns, &scanned_file) {
                         metadata_unchanged_count += 1;
                         continue;
                     }
                 }
 
-                let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
+                let stored_hash =
+                    segments::get_file_hash_for_context(conn, context_id, &relative_string).await?;
                 scanned_files.push(ScannedWorkItem {
                     sequence_id: scanned_files.len(),
                     relative_path: relative_string,
@@ -489,7 +518,8 @@ async fn prepare_scoped_run_inputs(
                 )));
             }
 
-            let stored_hash = segments::get_file_hash(conn, &relative_string).await?;
+            let stored_hash =
+                segments::get_file_hash_for_context(conn, context_id, &relative_string).await?;
             if stored_hash.is_some() {
                 return Ok(ScopePreparation::FallbackToFull(format!(
                     "path {} no longer matches scanner filters",
@@ -500,7 +530,7 @@ async fn prepare_scoped_run_inputs(
             continue;
         }
 
-        if segments::get_file_hash(conn, &relative_string)
+        if segments::get_file_hash_for_context(conn, context_id, &relative_string)
             .await?
             .is_some()
         {
@@ -584,13 +614,19 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
 }
 
 fn build_segment_insert(
+    context_id: &str,
     relative_path: &str,
     file_hash: &str,
     segment: &ParsedSegment,
     embedding_vec: Option<String>,
 ) -> SegmentInsert {
     SegmentInsert {
-        id: generate_segment_id(relative_path, segment.line_start, segment.line_end),
+        id: segments::generate_segment_id(
+            context_id,
+            relative_path,
+            segment.line_start,
+            segment.line_end,
+        ),
         file_path: relative_path.to_string(),
         language: segment.language.clone(),
         block_type: segment.block_type.clone(),
@@ -616,6 +652,7 @@ fn build_segment_insert(
 }
 
 fn build_segment_batches(
+    context_id: &str,
     parsed_files: &[ParsedWorkItem],
     embedder: Option<&mut Embedder>,
     timings: &mut TimingAccumulator,
@@ -660,6 +697,7 @@ fn build_segment_batches(
             };
 
             inserts.push(build_segment_insert(
+                context_id,
                 &file.relative_path,
                 &file.file_hash,
                 segment,
@@ -690,6 +728,7 @@ fn build_manifest_meta(file: &ParsedWorkItem) -> IndexedFileMeta {
 
 async fn replace_file_batches(
     conn: &Connection,
+    context_id: &str,
     parsed_files: &[ParsedWorkItem],
     segment_batches: &[Vec<SegmentInsert>],
 ) -> Result<(), OneupError> {
@@ -697,8 +736,9 @@ async fn replace_file_batches(
         parsed_files.iter().map(build_manifest_meta).collect();
 
     if parsed_files.len() == 1 {
-        return segments::replace_file_segments_tx_with_meta(
+        return segments::replace_file_segments_for_context_tx_with_meta(
             conn,
+            context_id,
             &parsed_files[0].relative_path,
             &segment_batches[0],
             Some(&manifest_metas[0]),
@@ -717,11 +757,12 @@ async fn replace_file_batches(
         })
         .collect();
 
-    segments::replace_file_batch_tx(conn, &file_batches).await
+    segments::replace_file_batch_for_context_tx(conn, context_id, &file_batches).await
 }
 
 async fn store_ready_files(
     conn: &Connection,
+    context_id: &str,
     ready_files: &mut Vec<ParsedWorkItem>,
     embedder: Option<&mut Embedder>,
     stats: &mut PipelineStats,
@@ -732,11 +773,11 @@ async fn store_ready_files(
     }
 
     let parsed_files = std::mem::take(ready_files);
-    let segment_batches = build_segment_batches(&parsed_files, embedder, timings)?;
+    let segment_batches = build_segment_batches(context_id, &parsed_files, embedder, timings)?;
     let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
 
     let store_started_at = Instant::now();
-    replace_file_batches(conn, &parsed_files, &segment_batches).await?;
+    replace_file_batches(conn, context_id, &parsed_files, &segment_batches).await?;
     timings.store_ms += store_started_at.elapsed().as_millis();
 
     stats.files_indexed += parsed_files.len();
@@ -746,6 +787,7 @@ async fn store_ready_files(
 
 async fn delete_removed_files(
     conn: &Connection,
+    context_id: &str,
     deleted_paths: &[String],
     batch_size: usize,
     timings: &mut TimingAccumulator,
@@ -754,7 +796,8 @@ async fn delete_removed_files(
 
     for chunk in deleted_paths.chunks(batch_size.max(1)) {
         if chunk.len() == 1 {
-            segments::replace_file_segments_tx(conn, &chunk[0], &[]).await?;
+            segments::replace_file_segments_for_context_tx(conn, context_id, &chunk[0], &[])
+                .await?;
             continue;
         }
 
@@ -766,7 +809,7 @@ async fn delete_removed_files(
                 manifest_meta: None,
             })
             .collect();
-        segments::replace_file_batch_tx(conn, &file_batches).await?;
+        segments::replace_file_batch_for_context_tx(conn, context_id, &file_batches).await?;
     }
 
     timings.store_ms += store_started_at.elapsed().as_millis();
@@ -784,6 +827,7 @@ fn current_progress_phase(stats: &PipelineStats) -> IndexPhase {
 struct FlushState<'a> {
     stats: &'a mut PipelineStats,
     project_root: &'a Path,
+    context: &'a IndexRunContext,
     files_total: usize,
     content_read_count: usize,
     parallelism: Option<IndexParallelism>,
@@ -800,6 +844,7 @@ impl FlushState<'_> {
         refresh_progress(
             self.stats,
             self.project_root,
+            self.context,
             self.progress_tx.as_ref(),
             ProgressUpdate {
                 state: IndexState::Running,
@@ -837,6 +882,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            &state.context.context_id,
                             &mut ready_files,
                             embedder,
                             state.stats,
@@ -853,6 +899,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            &state.context.context_id,
                             &mut ready_files,
                             embedder,
                             state.stats,
@@ -877,7 +924,15 @@ async fn flush_reorder_buffer(
     if !ready_files.is_empty() {
         {
             let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
-            store_ready_files(conn, &mut ready_files, embedder, state.stats, state.timings).await?;
+            store_ready_files(
+                conn,
+                &state.context.context_id,
+                &mut ready_files,
+                embedder,
+                state.stats,
+                state.timings,
+            )
+            .await?;
         }
         state.refresh(IndexPhase::Storing, true);
     }
@@ -1079,11 +1134,72 @@ pub async fn run_with_scope_setup_and_progress_root(
     daemon_fallback_reason: Option<String>,
     progress_root: Option<&Path>,
 ) -> Result<PipelineStats, OneupError> {
+    let context = IndexRunContext::legacy(project_root);
+    run_with_index_context_scope_setup_and_progress_root(
+        conn,
+        project_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        show_progress_ui,
+        setup_timings,
+        daemon_fallback_reason,
+        progress_root,
+        context,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_context_scope_setup_and_progress_root(
+    conn: &Connection,
+    context: &WorktreeContext,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
+    daemon_fallback_reason: Option<String>,
+    progress_root: Option<&Path>,
+) -> Result<PipelineStats, OneupError> {
+    run_with_index_context_scope_setup_and_progress_root(
+        conn,
+        &context.source_root,
+        embedder,
+        scope,
+        config,
+        progress_tx,
+        show_progress_ui,
+        setup_timings,
+        daemon_fallback_reason,
+        progress_root,
+        IndexRunContext::from_worktree(context),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_index_context_scope_setup_and_progress_root(
+    conn: &Connection,
+    project_root: &Path,
+    embedder: Option<&mut Embedder>,
+    scope: &RunScope,
+    config: &IndexingConfig,
+    progress_tx: Option<ProgressSender>,
+    show_progress_ui: bool,
+    setup_timings: Option<SetupTimings>,
+    daemon_fallback_reason: Option<String>,
+    progress_root: Option<&Path>,
+    context: IndexRunContext,
+) -> Result<PipelineStats, OneupError> {
     let progress_root = progress_root.unwrap_or(project_root);
     let input_prep_start = Instant::now();
     let resolution = match scope {
         RunScope::Full => {
-            let run_inputs = prepare_full_run_inputs(conn, project_root).await?;
+            let run_inputs =
+                prepare_full_run_inputs(conn, project_root, &context.context_id).await?;
             let changed_count = run_inputs.scanned_files.len();
             ScopeResolution {
                 inputs: run_inputs,
@@ -1095,7 +1211,9 @@ pub async fn run_with_scope_setup_and_progress_root(
         }
         RunScope::Paths(changed_paths) => {
             let requested_count = changed_paths.len();
-            match prepare_scoped_run_inputs(conn, project_root, changed_paths).await? {
+            match prepare_scoped_run_inputs(conn, project_root, &context.context_id, changed_paths)
+                .await?
+            {
                 ScopePreparation::Ready(run_inputs) => {
                     let changed_count = run_inputs.scanned_files.len();
                     ScopeResolution {
@@ -1112,7 +1230,8 @@ pub async fn run_with_scope_setup_and_progress_root(
                         project_root.display(),
                         reason
                     );
-                    let run_inputs = prepare_full_run_inputs(conn, project_root).await?;
+                    let run_inputs =
+                        prepare_full_run_inputs(conn, project_root, &context.context_id).await?;
                     let changed_count = run_inputs.scanned_files.len();
                     ScopeResolution {
                         inputs: run_inputs,
@@ -1130,6 +1249,7 @@ pub async fn run_with_scope_setup_and_progress_root(
     execute_run_with_inputs(
         conn,
         progress_root,
+        &context,
         embedder,
         config,
         resolution,
@@ -1145,6 +1265,7 @@ pub async fn run_with_scope_setup_and_progress_root(
 async fn execute_run_with_inputs(
     conn: &Connection,
     project_root: &Path,
+    context: &IndexRunContext,
     embedder: Option<&mut Embedder>,
     config: &IndexingConfig,
     resolution: ScopeResolution,
@@ -1201,6 +1322,7 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
+        context,
         progress_tx.as_ref(),
         ProgressUpdate {
             state: IndexState::Running,
@@ -1261,6 +1383,7 @@ async fn execute_run_with_inputs(
         let store_before_delete = timings.store_ms;
         delete_removed_files(
             conn,
+            &context.context_id,
             &deleted_paths,
             config.effective_write_batch_files(deleted_paths.len()),
             &mut timings,
@@ -1280,6 +1403,7 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
+        context,
         progress_tx.as_ref(),
         ProgressUpdate {
             state: IndexState::Running,
@@ -1309,6 +1433,7 @@ async fn execute_run_with_inputs(
         let mut flush_state = FlushState {
             stats: &mut stats,
             project_root,
+            context,
             files_total: total_files,
             content_read_count,
             parallelism: parallelism.clone(),
@@ -1423,6 +1548,7 @@ async fn execute_run_with_inputs(
     refresh_progress(
         &mut stats,
         project_root,
+        context,
         progress_tx.as_ref(),
         ProgressUpdate {
             state: IndexState::Complete,
@@ -1450,6 +1576,46 @@ mod tests {
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
         (db, conn)
+    }
+
+    fn test_worktree_context(
+        state_root: &Path,
+        source_root: &Path,
+        context_id: &str,
+        branch_name: &str,
+    ) -> WorktreeContext {
+        WorktreeContext {
+            context_id: context_id.to_string(),
+            state_root: state_root.to_path_buf(),
+            source_root: source_root.to_path_buf(),
+            main_worktree_root: state_root.to_path_buf(),
+            worktree_role: if state_root == source_root {
+                crate::shared::types::WorktreeRole::Main
+            } else {
+                crate::shared::types::WorktreeRole::Linked
+            },
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some(branch_name.to_string()),
+            branch_ref: Some(format!("refs/heads/{branch_name}")),
+            head_oid: Some(format!("{branch_name:0>40}")),
+            branch_status: BranchStatus::Named,
+        }
+    }
+
+    async fn count_context_file_segments(
+        conn: &Connection,
+        context_id: &str,
+        file_path: &str,
+    ) -> i64 {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM segments WHERE context_id = ?1 AND file_path = ?2",
+                libsql::params![context_id, file_path],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1660,6 +1826,128 @@ mod tests {
 
         let paths = segments::get_all_file_paths(&conn).await.unwrap();
         assert_eq!(paths, vec!["a.rs", "c.rs", "keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn context_scoped_runs_keep_same_relative_paths_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let linked_root = tmp.path().join("linked");
+        fs::create_dir_all(&main_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(main_root.join("shared.rs"), "pub fn main_branch() {}\n").unwrap();
+        fs::write(linked_root.join("shared.rs"), "pub fn linked_branch() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let main_context = test_worktree_context(&main_root, &main_root, "ctx-main", "main");
+        let linked_context =
+            test_worktree_context(&main_root, &linked_root, "ctx-linked", "feature");
+
+        let main_stats = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &main_context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&main_root),
+        )
+        .await
+        .unwrap();
+        let linked_stats = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &linked_context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&main_root),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(main_stats.progress.context_id.as_deref(), Some("ctx-main"));
+        assert_eq!(
+            linked_stats.progress.source_root.as_deref(),
+            Some(linked_root.as_path())
+        );
+        assert_eq!(
+            linked_stats.progress.branch_name.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(
+            linked_stats.progress.branch_status,
+            Some(BranchStatus::Named)
+        );
+        assert!(count_context_file_segments(&conn, "ctx-main", "shared.rs").await > 0);
+        assert!(count_context_file_segments(&conn, "ctx-linked", "shared.rs").await > 0);
+
+        fs::write(
+            linked_root.join("shared.rs"),
+            "pub fn linked_branch() {}\npub fn linked_only() {}\n",
+        )
+        .unwrap();
+        let scope = RunScope::from_paths([PathBuf::from("shared.rs")]).unwrap();
+        let linked_update = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &linked_context,
+            None,
+            &scope,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&main_root),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(linked_update.files_indexed, 1);
+        assert!(count_context_file_segments(&conn, "ctx-main", "shared.rs").await > 0);
+        assert!(count_context_file_segments(&conn, "ctx-linked", "shared.rs").await > 0);
+
+        fs::remove_file(linked_root.join("shared.rs")).unwrap();
+        let linked_delete = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &linked_context,
+            None,
+            &scope,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&main_root),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(linked_delete.files_deleted, 1);
+        assert!(count_context_file_segments(&conn, "ctx-main", "shared.rs").await > 0);
+        assert_eq!(
+            count_context_file_segments(&conn, "ctx-linked", "shared.rs").await,
+            0
+        );
+        assert!(
+            segments::get_all_indexed_files_for_context(&conn, "ctx-main")
+                .await
+                .unwrap()
+                .contains_key("shared.rs")
+        );
+        assert!(
+            !segments::get_all_indexed_files_for_context(&conn, "ctx-linked")
+                .await
+                .unwrap()
+                .contains_key("shared.rs")
+        );
     }
 
     #[tokio::test]
@@ -2018,11 +2306,14 @@ mod tests {
 
     #[tokio::test]
     async fn segment_ids_are_deterministic() {
-        let id1 = generate_segment_id("src/main.rs", 1, 10);
-        let id2 = generate_segment_id("src/main.rs", 1, 10);
-        let id3 = generate_segment_id("src/main.rs", 1, 11);
+        let id1 = segments::generate_segment_id(DEFAULT_INDEX_CONTEXT_ID, "src/main.rs", 1, 10);
+        let id2 = segments::generate_segment_id(DEFAULT_INDEX_CONTEXT_ID, "src/main.rs", 1, 10);
+        let id3 = segments::generate_segment_id(DEFAULT_INDEX_CONTEXT_ID, "src/main.rs", 1, 11);
+        let id4 = segments::generate_segment_id("ctx-linked", "src/main.rs", 1, 10);
+
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+        assert_ne!(id1, id4);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use libsql::{Connection, Row};
 
-use crate::shared::constants::VECTOR_PREFILTER_K;
+use crate::search::scope::SearchScope;
+use crate::shared::constants::{VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
 use crate::storage::queries;
@@ -59,41 +60,58 @@ impl CandidateRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RetrievalMode {
     SqlVectorV2,
     FtsOnly,
 }
 
+#[allow(dead_code)]
 pub struct RetrievedCandidates {
     pub vector_results: Vec<CandidateRow>,
     pub fts_results: Vec<CandidateRow>,
 }
 
+#[allow(dead_code)]
 pub enum RetrievalBackend<'a> {
     SqlVectorV2(SqlVectorV2<'a>),
     FtsOnly(FtsOnly<'a>),
 }
 
+#[allow(dead_code)]
 pub struct SqlVectorV2<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
+#[allow(dead_code)]
 pub struct FtsOnly<'a> {
     conn: &'a Connection,
+    scope: SearchScope,
 }
 
 impl<'a> RetrievalBackend<'a> {
+    #[allow(dead_code)]
     pub async fn select(
         conn: &'a Connection,
         query_embedding: Option<&[f32]>,
     ) -> Result<Self, OneupError> {
-        if query_embedding.is_some() && has_indexed_embeddings(conn).await? {
-            Ok(Self::SqlVectorV2(SqlVectorV2 { conn }))
+        Self::select_scoped(conn, query_embedding, SearchScope::default_context()).await
+    }
+
+    pub async fn select_scoped(
+        conn: &'a Connection,
+        query_embedding: Option<&[f32]>,
+        scope: SearchScope,
+    ) -> Result<Self, OneupError> {
+        if query_embedding.is_some() && has_indexed_embeddings(conn, &scope).await? {
+            Ok(Self::SqlVectorV2(SqlVectorV2 { conn, scope }))
         } else {
-            Ok(Self::FtsOnly(FtsOnly { conn }))
+            Ok(Self::FtsOnly(FtsOnly { conn, scope }))
         }
     }
 
+    #[allow(dead_code)]
     pub fn mode(&self) -> RetrievalMode {
         match self {
             Self::SqlVectorV2(_) => RetrievalMode::SqlVectorV2,
@@ -101,6 +119,7 @@ impl<'a> RetrievalBackend<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn search(
         &self,
         query: &str,
@@ -125,14 +144,15 @@ impl<'a> RetrievalBackend<'a> {
 }
 
 impl<'a> SqlVectorV2<'a> {
+    #[allow(dead_code)]
     async fn search(
         &self,
         query: &str,
         query_embedding: &[f32],
     ) -> Result<RetrievedCandidates, OneupError> {
         let (vector_results, fts_results) = tokio::try_join!(
-            fetch_vector_candidates(self.conn, query_embedding),
-            fetch_fts_candidates(self.conn, query),
+            fetch_vector_candidates(self.conn, &self.scope, query_embedding),
+            fetch_fts_candidates(self.conn, &self.scope, query),
         )?;
 
         Ok(RetrievedCandidates {
@@ -143,17 +163,24 @@ impl<'a> SqlVectorV2<'a> {
 }
 
 impl<'a> FtsOnly<'a> {
+    #[allow(dead_code)]
     async fn search(&self, query: &str) -> Result<RetrievedCandidates, OneupError> {
         Ok(RetrievedCandidates {
             vector_results: Vec::new(),
-            fts_results: fetch_fts_candidates(self.conn, query).await?,
+            fts_results: fetch_fts_candidates(self.conn, &self.scope, query).await?,
         })
     }
 }
 
-async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
+pub(crate) async fn has_indexed_embeddings(
+    conn: &Connection,
+    scope: &SearchScope,
+) -> Result<bool, OneupError> {
     let mut rows = conn
-        .query(queries::SELECT_HAS_INDEXED_EMBEDDINGS, ())
+        .query(
+            queries::SELECT_HAS_INDEXED_EMBEDDINGS_FOR_CONTEXT,
+            [scope.context_id()],
+        )
         .await
         .map_err(|e| {
             SearchError::QueryFailed(format!("failed to inspect indexed embeddings: {e}"))
@@ -169,15 +196,17 @@ async fn has_indexed_embeddings(conn: &Connection) -> Result<bool, OneupError> {
     }
 }
 
-async fn fetch_vector_candidates(
+pub(crate) async fn fetch_vector_candidates(
     conn: &Connection,
+    scope: &SearchScope,
     query_embedding: &[f32],
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let query_embedding = serialize_query_embedding(query_embedding)?;
+    let prefilter_k = vector_prefilter_k(conn).await?;
     let mut rows = conn
         .query(
-            queries::SELECT_VECTOR_CANDIDATES,
-            libsql::params![query_embedding, VECTOR_PREFILTER_K as i64],
+            queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
+            libsql::params![query_embedding, prefilter_k as i64, scope.context_id()],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
@@ -194,8 +223,40 @@ async fn fetch_vector_candidates(
     Ok(results)
 }
 
-async fn fetch_fts_candidates(
+async fn vector_prefilter_k(conn: &Connection) -> Result<usize, OneupError> {
+    let context_count = count_vector_contexts(conn).await?;
+    Ok(scaled_vector_prefilter_k(context_count))
+}
+
+async fn count_vector_contexts(conn: &Connection) -> Result<usize, OneupError> {
+    let mut rows = conn
+        .query(queries::COUNT_VECTOR_CONTEXTS, ())
+        .await
+        .map_err(|e| SearchError::QueryFailed(format!("failed to count vector contexts: {e}")))?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let count: i64 = row.get(0).map_err(|e| {
+                SearchError::QueryFailed(format!("read vector context count failed: {e}"))
+            })?;
+            Ok(usize::try_from(count.max(1)).unwrap_or(usize::MAX))
+        }
+        Ok(None) => Ok(1),
+        Err(e) => Err(SearchError::QueryFailed(format!(
+            "vector context count iteration failed: {e}"
+        ))
+        .into()),
+    }
+}
+
+fn scaled_vector_prefilter_k(context_count: usize) -> usize {
+    let scale = context_count.clamp(1, VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT);
+    VECTOR_PREFILTER_K.saturating_mul(scale)
+}
+
+pub(crate) async fn fetch_fts_candidates(
     conn: &Connection,
+    scope: &SearchScope,
     query: &str,
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let fts_query = build_fts_query(query);
@@ -205,8 +266,8 @@ async fn fetch_fts_candidates(
 
     let mut rows = conn
         .query(
-            queries::SELECT_FTS_CANDIDATES,
-            libsql::params![fts_query, VECTOR_PREFILTER_K as i64],
+            queries::SELECT_FTS_CANDIDATES_FOR_CONTEXT,
+            libsql::params![fts_query, scope.context_id(), VECTOR_PREFILTER_K as i64],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
@@ -579,11 +640,23 @@ mod tests {
 
         // Query close to seg-3's dimension. seg-3 must rank top-1 through vector_top_k.
         let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
-        let candidates = fetch_vector_candidates(&conn, &query_embedding)
-            .await
-            .unwrap();
+        let candidates =
+            fetch_vector_candidates(&conn, &SearchScope::default_context(), &query_embedding)
+                .await
+                .unwrap();
 
         assert!(!candidates.is_empty(), "vector_top_k returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");
+    }
+
+    #[test]
+    fn vector_prefilter_scales_with_context_count_up_to_bound() {
+        assert_eq!(scaled_vector_prefilter_k(0), VECTOR_PREFILTER_K);
+        assert_eq!(scaled_vector_prefilter_k(1), VECTOR_PREFILTER_K);
+        assert_eq!(scaled_vector_prefilter_k(3), VECTOR_PREFILTER_K * 3);
+        assert_eq!(
+            scaled_vector_prefilter_k(VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT + 1),
+            VECTOR_PREFILTER_K * VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT
+        );
     }
 }

@@ -4,16 +4,16 @@
 
 1up is a local-first code discovery substrate distributed as a single Rust binary. The runtime is now a layered CLI + MCP + daemon system over project-local libSQL state: short-lived CLI commands handle direct user workflows, `1up mcp` exposes agent-facing stdio tools, and an optional background daemon keeps project indexes fresh and serves warm CLI search over a guarded Unix socket. Project identity and index state live under the resolved `.1up/` state root, while linked git worktrees can use a separate source root for scanning.
 
-The search index remains schema-gated at v12: `segments`, `segment_vectors`, `segment_symbols`, `segment_relations`, `indexed_files`, FTS, and vector indexes must all match the current layout before reads proceed. Indexing fans out parse work but converges storage through transactional, batched writes. `segment_vectors.embedding_vec` uses `FLOAT8(384)` with `vector8(?)` writes and a compressed libSQL vector index; `indexed_files` enables metadata-based unchanged-file skipping before content reads. Impact remains a local read path over descriptor-backed relations rather than an extension of daemon IPC.
+The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `segment_vectors`, `segment_symbols`, `segment_relations`, `indexed_files`, FTS, and vector indexes must all match the current layout before reads proceed. Indexing fans out parse work but converges storage through transactional, batched writes. `segment_vectors.embedding_vec` uses `FLOAT8(384)` with `vector8(?)` writes and a compressed libSQL vector index; `indexed_files` enables context-scoped metadata-based unchanged-file skipping before content reads. Impact remains a local read path over descriptor-backed relations rather than an extension of daemon IPC.
 
 ## Reconciliation Notes
 
 | Prior claim | Status | Update |
 |---|---|---|
 | Layered two-process CLI + daemon model | refined | Still true for CLI search and refresh, but the architecture now has a first-class MCP stdio adapter for agent hosts. |
-| Project-local libSQL state with schema v12 | confirmed | v12 validation still requires relation evidence columns, `indexed_files`, and `FLOAT8(384)` vector storage. |
+| Project-local libSQL state with schema v13 | refined | v13 validation adds worktree/context objects and `context_id` columns while retaining relation evidence columns, `indexed_files`, and `FLOAT8(384)` vector storage. |
 | Faster indexing via tuned DB connections, manifest prefilter, and batched writes | confirmed | Current pipeline also records deleted-file cleanup and scoped fallback reasons in progress metadata. |
-| Shrunk vector index | refined | Current baseline records `index.db` at 74,584,064 bytes (~71.1 MiB) for schema v12 with `max_neighbors=32`. |
+| Shrunk vector index | confirmed | Current baseline records `index.db` at 74,584,064 bytes (~71.1 MiB) with `max_neighbors=32`. |
 | Release/distribution via GitHub releases and package channels | refined | Release evidence now treats MCP protocol smoke, package publication records, update manifests, and install-script behavior as release surfaces. |
 
 ## Key Architecture Patterns
@@ -48,43 +48,43 @@ The search index remains schema-gated at v12: `segments`, `segment_vectors`, `se
 
 ### MCP Code Discovery
 
-1. An agent host starts `1up mcp --path <repo>` directly or via `1up add-mcp` generated host configuration.
-2. The CLI resolves `state_root` and `source_root`, takes a per-project MCP instance lock, auto-initializes only at an existing 1up project or git root, and best-effort starts the daemon for freshness.
+1. An agent host starts `1up mcp --path <repo-or-worktree>` directly or via `1up add-mcp` generated host configuration.
+2. The CLI resolves `state_root`, `source_root`, and `WorktreeContext`, takes a per-project MCP instance lock, auto-initializes only at an existing 1up project or git root, and best-effort starts the daemon for freshness.
 3. `rmcp` serves canonical tools: `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact`.
-4. `oneup_prepare` classifies readiness and can explicitly index, reindex, or repair missing/degraded state through the same full-scope pipeline used by CLI indexing.
-5. Search, symbol, read, and impact tools open the current index locally, enforce schema compatibility, and return a `ToolEnvelope` with `status`, `summary`, structured `data`, and `next_actions`.
-6. `oneup_read` hydrates segment handles from the DB or reads precise file locations through project-root clamping, rejecting path traversal.
+4. `oneup_prepare` classifies readiness for the active `context_id` and can explicitly index, reindex, or repair missing/degraded state through the same pipeline used by CLI indexing.
+5. Search, symbol, and impact tools open the main-worktree index locally, enforce schema v13 compatibility, and filter through the active `context_id`.
+6. Tool responses return a `ToolEnvelope` with `status`, `summary`, structured `data`, and `next_actions`; `oneup_read` hydrates handles from the DB or reads precise file locations through source-root clamping.
 
 ### CLI Daemon-Backed Search
 
-1. CLI search resolves the project root and attempts a framed JSON request over the daemon Unix socket.
-2. The daemon accepts only same-UID peers, clamps limits, rejects oversized payloads, and sheds excess concurrency with a safe busy response.
-3. Registered projects reuse a warm `EmbeddingRuntime` when available; otherwise the daemon runs FTS-only search.
-4. Results include ranked `SearchResult` values and optional `daemon_version`.
-5. CLI falls back to local search when the daemon is unavailable, stale, or rejects the request.
+1. CLI search resolves `state_root`, `source_root`, and `WorktreeContext`, then sends `context_id` and source root in a framed JSON request over the daemon Unix socket.
+2. The daemon accepts only same-UID peers, clamps limits, rejects oversized payloads, and validates the requested context/source pair against the registry.
+3. Registered contexts reuse a warm `EmbeddingRuntime` when available; otherwise the daemon runs FTS-only search.
+4. Search runs with a `SearchScope` built from the registered worktree context, so vector, FTS, and symbol candidates are scoped to that `context_id`.
+5. Results include ranked `SearchResult` values and optional `daemon_version`; CLI falls back to context-scoped local search when the daemon is unavailable, stale, or rejects the request.
 
 ### Index Build And Refresh
 
-1. CLI, MCP prepare, or daemon refresh opens a tuned libSQL connection with WAL, synchronous=NORMAL, cache, mmap, and temp-store PRAGMAs.
+1. CLI, MCP prepare, or daemon refresh resolves a `WorktreeContext` and opens a tuned libSQL connection at the main-worktree state root with WAL, synchronous=NORMAL, cache, mmap, and temp-store PRAGMAs.
 2. The scanner applies gitignore/global-ignore/exclude rules, default build-artifact ignores, binary extension skips, and special extensionless file recognition.
-3. Full runs load `indexed_files` and segment hashes, skip metadata-unchanged files, and detect deleted indexed paths.
+3. Full runs load `indexed_files` and segment hashes for the active `context_id`, skip metadata-unchanged files, and detect deleted indexed paths.
 4. Scoped runs scan only changed paths, but fall back to full when ignore semantics, directories, excluded files, or ambiguous/unscoped watcher events would make a scoped update unsafe.
-5. Parse workers run concurrently, then ordered flushes build embeddings and persist file batches transactionally.
-6. Storage replaces file segments, vectors, symbols, relation descriptors, and manifest entries together; empty file batches delete removed files and manifest rows.
-7. Progress persists scope, prefilter, parallelism, timings, deleted-file counts, and embedding availability to `.1up/index_status.json`.
+5. Parse workers run concurrently, generate segment ids from `context_id`, path, and line range, then ordered flushes build embeddings and persist file batches transactionally.
+6. Storage replaces file segments, vectors, symbols, relation descriptors, and manifest entries for the context together; empty file batches delete removed files and manifest rows only in that context.
+7. Progress persists `context_id`, source root, branch name/status, scope, prefilter, parallelism, timings, deleted-file counts, and embedding availability to `.1up/index_status.json`.
 
 ### Daemon Refresh
 
-1. The daemon loads a locked global registry from the secure XDG data root, preserving project root, optional source root, and indexing config.
-2. `notify` watches source roots recursively and filters generated, binary, dependency, `.1up`, and `.rp1` paths.
-3. File changes queue scoped runs; ambiguous paths and unscoped watcher errors promote to full refresh with a fallback reason.
-4. Dirty runs are serialized per daemon process, and change bursts during an active run collapse into one follow-up run.
-5. Daemon heartbeat status is written to `.1up/daemon_status.json` for readiness and benchmark visibility.
+1. The daemon loads a locked global registry from the secure XDG data root, preserving project root, source root, `context_id`, main worktree, branch/ref/head status, and indexing config.
+2. `notify` watches registered source roots recursively and filters generated, binary, dependency, `.1up`, and `.rp1` paths.
+3. File changes queue scoped runs for matching contexts; ambiguous paths, branch-context changes, and unscoped watcher errors promote to full refresh with a fallback reason.
+4. Dirty runs are serialized per daemon process, and change bursts during an active run collapse into one follow-up run for that context.
+5. Legacy heartbeat status is written to `.1up/daemon_status.json`; context-aware watch, refresh, branch, and update metadata is written to `.1up/daemon_context_status.json`.
 
 ### Impact Horizon
 
 1. CLI or MCP impact accepts exactly one anchor: segment, symbol, or file/line.
-2. The engine reads the current index directly and requires schema v12 compatibility.
+2. The engine reads the current index directly and requires schema v13 compatibility.
 3. Expansion traverses `segment_relations` using canonical target, lookup target, qualifier fingerprint, and edge identity evidence.
 4. Confident structural matches become primary `results`; ambiguous, same-file, test-only, import/docs, or low-signal evidence remains contextual or yields explicit empty/refused envelopes.
 
@@ -101,12 +101,13 @@ The search index remains schema-gated at v12: `segments`, `segment_vectors`, `se
 | Area | Location | Notes |
 |---|---|---|
 | Global runtime state | `dirs::data_dir()/1up` | Daemon pid/socket, registry, model cache, update cache, startup/MCP locks. |
-| Project registry | `dirs::data_dir()/1up/projects.json` | Locked, atomically replaced, owner-only; stores project id/root, optional source root, and persisted indexing config. |
-| Project-local state | `<state_root>/.1up/` | `project_id`, `index.db`, `index_status.json`, `daemon_status.json`. |
-| Source root | `<source_root>` | Files scanned/read; may differ from state root for git worktrees. |
-| Search persistence | `segments`, `segment_vectors`, `segment_symbols`, `segments_fts` | `segment_vectors.embedding_vec` is `FLOAT8(384)`; vector SQL uses `vector8(?)`; FTS triggers mirror segment content. |
-| Impact persistence | `segment_relations` | Stores raw/canonical/lookup targets, qualifier fingerprints, and edge identity kind for bounded expansion. |
-| File manifest | `indexed_files` | Stores path, extension, content hash, file size, and mtime ns for prefiltering and deleted-file cleanup. |
+| Project registry | `dirs::data_dir()/1up/projects.json` | Locked, atomically replaced, owner-only; stores project id/root, source root, context id, main worktree, branch/ref/head metadata, and persisted indexing config. |
+| Project-local state | `<state_root>/.1up/` | `project_id`, `index.db`, `index_status.json`, legacy `daemon_status.json`, and context-aware `daemon_context_status.json`. |
+| Source root | `<source_root>` | Files scanned/read/watched; may differ from state root for linked git worktrees. |
+| Worktree context | `WorktreeContext`, `worktree_contexts` | Captures context id, state/source/main roots, worktree role, git dirs, branch name/ref/head, and branch status. |
+| Search persistence | `segments`, `segment_vectors`, `segment_symbols`, `segments_fts` | Schema v13 scopes segment and symbol rows by `context_id`; vectors join through scoped segments and use `FLOAT8(384)` with `vector8(?)`. |
+| Impact persistence | `segment_relations` | Context-scoped relation rows store raw/canonical/lookup targets, qualifier fingerprints, and edge identity kind for bounded expansion. |
+| File manifest | `indexed_files` | Context-scoped manifest storing path, extension, content hash, file size, and mtime ns for prefiltering and deleted-file cleanup. |
 | Model cache | `dirs::data_dir()/1up/models/all-MiniLM-L6-v2` | Verified/staging/current manifests plus failure marker for pinned ONNX/tokenizer artifacts. |
 | Release manifests | GitHub release assets and repo `update-manifest.json` | Drive self-update, installer, package publication, and release evidence. |
 
@@ -178,6 +179,6 @@ graph TB
 
 - `segment_vectors.embedding_vec` stores `FLOAT8(384)` vectors and uses `vector8(?)` at write/query sites.
 - `idx_segment_vectors_embedding` uses compressed neighbors with `max_neighbors=32`.
-- `SCHEMA_VERSION = 12` makes stale vector formats fail closed with `1up reindex` guidance.
+- `SCHEMA_VERSION = 13` makes stale vector/context formats fail closed with `1up reindex` guidance.
 - `VECTOR_PREFILTER_K = 400` widens the candidate pool to absorb quantization noise before reranking.
-- The pinned size baseline records 74,584,064 byte `index.db` and schema v12 for the 1up repository.
+- The pinned size baseline records 74,584,064 byte `index.db` for the 1up repository.

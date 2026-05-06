@@ -1,6 +1,24 @@
+pub const CREATE_WORKTREE_CONTEXTS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS worktree_contexts (
+    context_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    state_root TEXT NOT NULL,
+    source_root TEXT NOT NULL,
+    main_worktree_root TEXT NOT NULL,
+    worktree_role TEXT NOT NULL,
+    branch_name TEXT,
+    branch_ref TEXT,
+    branch_status TEXT NOT NULL,
+    head_oid TEXT,
+    git_dir TEXT,
+    common_git_dir TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
 pub const CREATE_SEGMENTS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segments (
     id TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL DEFAULT 'default',
     file_path TEXT NOT NULL,
     language TEXT NOT NULL,
     block_type TEXT NOT NULL,
@@ -21,6 +39,9 @@ CREATE TABLE IF NOT EXISTS segments (
 pub const CREATE_INDEX_FILE_PATH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_path ON segments(file_path)";
 
+pub const CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segments_context_file_path ON segments(context_id, file_path)";
+
 pub const CREATE_INDEX_LANGUAGE: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_language ON segments(language)";
 
@@ -37,16 +58,18 @@ CREATE TABLE IF NOT EXISTS segment_vectors (
 
 pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_symbols (
+    context_id TEXT NOT NULL DEFAULT 'default',
     segment_id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     canonical_symbol TEXT NOT NULL,
     reference_kind TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (segment_id, canonical_symbol, reference_kind)
+    PRIMARY KEY (context_id, segment_id, canonical_symbol, reference_kind)
 )";
 
 pub const CREATE_SEGMENT_RELATIONS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_relations (
+    context_id TEXT NOT NULL DEFAULT 'default',
     source_segment_id TEXT NOT NULL,
     relation_kind TEXT NOT NULL,
     raw_target_symbol TEXT NOT NULL,
@@ -56,6 +79,7 @@ CREATE TABLE IF NOT EXISTS segment_relations (
     edge_identity_kind TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (
+        context_id,
         source_segment_id,
         relation_kind,
         canonical_target_symbol,
@@ -68,29 +92,31 @@ pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
     "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(canonical_symbol, reference_kind)";
+    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(context_id, canonical_symbol, reference_kind)";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_prefix ON segment_symbols(canonical_symbol)";
+    "CREATE INDEX IF NOT EXISTS idx_segment_symbols_prefix ON segment_symbols(context_id, canonical_symbol)";
 
 pub const CREATE_INDEX_SEGMENT_RELATIONS_SOURCE: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_relations_source ON segment_relations(source_segment_id)";
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_source ON segment_relations(context_id, source_segment_id)";
 
 pub const CREATE_INDEX_SEGMENT_RELATIONS_TARGET: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_relations_target ON segment_relations(canonical_target_symbol, relation_kind)";
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_target ON segment_relations(context_id, canonical_target_symbol, relation_kind)";
 
 pub const CREATE_INDEX_SEGMENT_RELATIONS_LOOKUP_TARGET: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_relations_lookup_target ON segment_relations(lookup_canonical_symbol, relation_kind)";
+    "CREATE INDEX IF NOT EXISTS idx_segment_relations_lookup_target ON segment_relations(context_id, lookup_canonical_symbol, relation_kind)";
 
 pub const CREATE_INDEXED_FILES_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS indexed_files (
-    file_path TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL DEFAULT 'default',
+    file_path TEXT NOT NULL,
     extension TEXT NOT NULL,
     file_hash TEXT NOT NULL,
     file_size INTEGER NOT NULL,
     modified_ns INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (context_id, file_path)
 )";
 
 pub const CREATE_FTS_TABLE: &str = "
@@ -139,14 +165,17 @@ DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP INDEX IF EXISTS idx_segment_relations_source;
 DROP INDEX IF EXISTS idx_segment_relations_target;
 DROP INDEX IF EXISTS idx_segment_relations_lookup_target;
+DROP INDEX IF EXISTS idx_indexed_files_context_path;
 DROP TABLE IF EXISTS segment_vectors;
 DROP TABLE IF EXISTS segment_symbols;
 DROP TABLE IF EXISTS segment_relations;
+DROP INDEX IF EXISTS idx_segments_context_file_path;
 DROP INDEX IF EXISTS idx_segments_file_path;
 DROP INDEX IF EXISTS idx_segments_language;
 DROP INDEX IF EXISTS idx_segments_file_hash;
 DROP TABLE IF EXISTS segments;
 DROP TABLE IF EXISTS indexed_files;
+DROP TABLE IF EXISTS worktree_contexts;
 DROP TABLE IF EXISTS meta";
 
 pub const SELECT_SCHEMA_OBJECT: &str =
@@ -157,14 +186,47 @@ pub const SELECT_HAS_USER_TABLES: &str =
 
 pub const SELECT_HAS_INDEXED_EMBEDDINGS: &str = "SELECT 1 FROM segment_vectors LIMIT 1";
 
+pub const SELECT_HAS_INDEXED_EMBEDDINGS_FOR_CONTEXT: &str = "
+SELECT 1
+FROM segment_vectors AS sv
+JOIN segments AS s ON s.id = sv.segment_id
+WHERE s.context_id = ?1
+LIMIT 1";
+
+pub const COUNT_VECTOR_CONTEXTS: &str = "
+SELECT COUNT(DISTINCT s.context_id)
+FROM segment_vectors AS sv
+JOIN segments AS s ON s.id = sv.segment_id";
+
+#[allow(dead_code)]
 pub const SELECT_VECTOR_CANDIDATES: &str = "
+WITH vector_matches AS (
+    SELECT row_number() OVER () AS rank, id
+    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+)
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
-FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2) AS v
+FROM vector_matches AS v
 JOIN segment_vectors AS sv ON sv.rowid = v.id
-JOIN segments AS s ON s.id = sv.segment_id";
+JOIN segments AS s ON s.id = sv.segment_id
+ORDER BY v.rank";
 
+pub const SELECT_VECTOR_CANDIDATES_FOR_CONTEXT: &str = "
+WITH vector_matches AS (
+    SELECT row_number() OVER () AS rank, id
+    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+)
+SELECT s.id, s.file_path, s.language, s.block_type,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+FROM vector_matches AS v
+JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN segments AS s ON s.id = sv.segment_id
+WHERE s.context_id = ?3
+ORDER BY v.rank";
+
+#[allow(dead_code)]
 pub const SELECT_FTS_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
@@ -175,15 +237,26 @@ WHERE segments_fts MATCH ?1
 ORDER BY f.rank, s.rowid
 LIMIT ?2";
 
+pub const SELECT_FTS_CANDIDATES_FOR_CONTEXT: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+FROM segments_fts AS f
+JOIN segments AS s ON s.rowid = f.rowid
+WHERE segments_fts MATCH ?1
+  AND s.context_id = ?2
+ORDER BY f.rank, s.rowid
+LIMIT ?3";
+
 pub const UPSERT_SEGMENT: &str = "
 INSERT OR REPLACE INTO segments (
-    id, file_path, language, block_type, content,
+    id, context_id, file_path, language, block_type, content,
     line_start, line_end, breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
     file_hash, created_at, updated_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5,
-    ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-    ?14, datetime('now'), datetime('now')
+    ?1, ?2, ?3, ?4, ?5, ?6,
+    ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+    ?15, datetime('now'), datetime('now')
 )";
 
 pub const UPSERT_SEGMENT_VECTOR: &str = "
@@ -197,17 +270,22 @@ pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segme
 
 pub const INSERT_SEGMENT_SYMBOL: &str = "
 INSERT OR REPLACE INTO segment_symbols (
-    segment_id, symbol, canonical_symbol, reference_kind, created_at
+    context_id, segment_id, symbol, canonical_symbol, reference_kind, created_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, datetime('now')
+    ?1, ?2, ?3, ?4, ?5, datetime('now')
 )";
 
+#[allow(dead_code)]
 pub const DELETE_SEGMENT_SYMBOLS_BY_SEGMENT_ID: &str =
     "DELETE FROM segment_symbols WHERE segment_id = ?1";
+
+pub const DELETE_SEGMENT_SYMBOLS_BY_CONTEXT_AND_SEGMENT_ID: &str =
+    "DELETE FROM segment_symbols WHERE context_id = ?1 AND segment_id = ?2";
 
 #[allow(dead_code)]
 pub const INSERT_SEGMENT_RELATION: &str = "
 INSERT OR REPLACE INTO segment_relations (
+    context_id,
     source_segment_id,
     relation_kind,
     raw_target_symbol,
@@ -217,12 +295,15 @@ INSERT OR REPLACE INTO segment_relations (
     edge_identity_kind,
     created_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now')
 )";
 
 #[allow(dead_code)]
 pub const DELETE_SEGMENT_RELATIONS_BY_SOURCE_SEGMENT_ID: &str =
     "DELETE FROM segment_relations WHERE source_segment_id = ?1";
+
+pub const DELETE_SEGMENT_RELATIONS_BY_CONTEXT_AND_SOURCE_SEGMENT_ID: &str =
+    "DELETE FROM segment_relations WHERE context_id = ?1 AND source_segment_id = ?2";
 
 #[allow(dead_code)]
 pub const DELETE_SEGMENT_RELATIONS_BY_FILE: &str = "
@@ -231,6 +312,16 @@ WHERE source_segment_id IN (
     SELECT id
     FROM segments
     WHERE file_path = ?1
+)";
+
+pub const DELETE_SEGMENT_RELATIONS_BY_CONTEXT_AND_FILE: &str = "
+DELETE FROM segment_relations
+WHERE context_id = ?1
+  AND source_segment_id IN (
+    SELECT id
+    FROM segments
+    WHERE context_id = ?1
+      AND file_path = ?2
 )";
 
 #[allow(dead_code)]
@@ -252,6 +343,25 @@ ORDER BY
   raw_target_symbol
 LIMIT ?2";
 
+pub const SELECT_OUTBOUND_RELATIONS_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND source_segment_id = ?2
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  canonical_target_symbol,
+  edge_identity_kind,
+  raw_target_symbol
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_OUTBOUND_RELATIONS_BY_KIND: &str = "
 SELECT
@@ -267,6 +377,22 @@ WHERE source_segment_id = ?1
   AND relation_kind = ?2
 ORDER BY canonical_target_symbol, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
+
+pub const SELECT_OUTBOUND_RELATIONS_BY_KIND_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND source_segment_id = ?2
+  AND relation_kind = ?3
+ORDER BY canonical_target_symbol, edge_identity_kind, raw_target_symbol
+LIMIT ?4";
 
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS: &str = "
@@ -287,6 +413,25 @@ ORDER BY
   raw_target_symbol
 LIMIT ?2";
 
+pub const SELECT_INBOUND_RELATIONS_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND canonical_target_symbol = ?2
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  source_segment_id,
+  edge_identity_kind,
+  raw_target_symbol
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS_BY_KIND: &str = "
 SELECT
@@ -302,6 +447,22 @@ WHERE canonical_target_symbol = ?1
   AND relation_kind = ?2
 ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
+
+pub const SELECT_INBOUND_RELATIONS_BY_KIND_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND canonical_target_symbol = ?2
+  AND relation_kind = ?3
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
+LIMIT ?4";
 
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL: &str = "
@@ -322,6 +483,25 @@ ORDER BY
   raw_target_symbol
 LIMIT ?2";
 
+pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND lookup_canonical_symbol = ?2
+ORDER BY
+  CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
+  source_segment_id,
+  edge_identity_kind,
+  raw_target_symbol
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND: &str = "
 SELECT
@@ -338,6 +518,22 @@ WHERE lookup_canonical_symbol = ?1
 ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?3";
 
+pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND_FOR_CONTEXT: &str = "
+SELECT
+    source_segment_id,
+    relation_kind,
+    raw_target_symbol,
+    canonical_target_symbol,
+    lookup_canonical_symbol,
+    qualifier_fingerprint,
+    edge_identity_kind
+FROM segment_relations
+WHERE context_id = ?1
+  AND lookup_canonical_symbol = ?2
+  AND relation_kind = ?3
+ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
+LIMIT ?4";
+
 #[allow(dead_code)]
 pub const SELECT_SEGMENTS_BY_FILE: &str = "
 SELECT id, file_path, language, block_type, content,
@@ -348,7 +544,21 @@ FROM segments
 WHERE file_path = ?1
 ORDER BY line_start";
 
+pub const SELECT_SEGMENTS_BY_FILE_FOR_CONTEXT: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE context_id = ?1
+  AND file_path = ?2
+ORDER BY line_start";
+
+#[allow(dead_code)]
 pub const DELETE_SEGMENTS_BY_FILE: &str = "DELETE FROM segments WHERE file_path = ?1";
+
+pub const DELETE_SEGMENTS_BY_CONTEXT_AND_FILE: &str =
+    "DELETE FROM segments WHERE context_id = ?1 AND file_path = ?2";
 
 #[allow(dead_code)]
 pub const SELECT_FILE_HASH: &str = "
@@ -357,9 +567,24 @@ FROM segments
 WHERE file_path = ?1
 LIMIT 1";
 
+pub const SELECT_FILE_HASH_FOR_CONTEXT: &str = "
+SELECT DISTINCT file_hash
+FROM segments
+WHERE context_id = ?1
+  AND file_path = ?2
+LIMIT 1";
+
+#[allow(dead_code)]
 pub const SELECT_ALL_FILE_PATHS: &str = "
 SELECT DISTINCT file_path FROM segments ORDER BY file_path";
 
+pub const SELECT_ALL_FILE_PATHS_FOR_CONTEXT: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE context_id = ?1
+ORDER BY file_path";
+
+#[allow(dead_code)]
 pub const SELECT_TEST_FILE_PATHS_LIMITED: &str = "
 SELECT DISTINCT file_path
 FROM segments
@@ -377,6 +602,27 @@ WHERE lower(file_path) LIKE 'tests/%'
 ORDER BY file_path
 LIMIT ?1";
 
+pub const SELECT_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE context_id = ?1
+  AND (
+       lower(file_path) LIKE 'tests/%'
+    OR lower(file_path) LIKE '%/tests/%'
+    OR lower(file_path) LIKE '%/test/%'
+    OR lower(file_path) LIKE '%/spec/%'
+    OR lower(file_path) LIKE '%/__tests__/%'
+    OR lower(file_path) LIKE '%_test.rs'
+    OR lower(file_path) LIKE '%_spec.rs'
+    OR lower(file_path) LIKE '%.test.ts'
+    OR lower(file_path) LIKE '%.spec.ts'
+    OR lower(file_path) LIKE '%.test.js'
+    OR lower(file_path) LIKE '%.spec.js'
+  )
+ORDER BY file_path
+LIMIT ?2";
+
+#[allow(dead_code)]
 pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED: &str = "
 SELECT DISTINCT file_path
 FROM segments
@@ -396,6 +642,27 @@ WHERE (file_path = ?1 OR file_path LIKE ?2)
   )
 ORDER BY file_path
 LIMIT ?3";
+
+pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT: &str = "
+SELECT DISTINCT file_path
+FROM segments
+WHERE context_id = ?1
+  AND (file_path = ?2 OR file_path LIKE ?3)
+  AND (
+       lower(file_path) LIKE 'tests/%'
+    OR lower(file_path) LIKE '%/tests/%'
+    OR lower(file_path) LIKE '%/test/%'
+    OR lower(file_path) LIKE '%/spec/%'
+    OR lower(file_path) LIKE '%/__tests__/%'
+    OR lower(file_path) LIKE '%_test.rs'
+    OR lower(file_path) LIKE '%_spec.rs'
+    OR lower(file_path) LIKE '%.test.ts'
+    OR lower(file_path) LIKE '%.spec.ts'
+    OR lower(file_path) LIKE '%.test.js'
+    OR lower(file_path) LIKE '%.spec.js'
+  )
+ORDER BY file_path
+LIMIT ?4";
 
 #[allow(dead_code)]
 pub const SELECT_ALL_FILE_HASHES: &str = "
@@ -425,6 +692,17 @@ WHERE id LIKE ?1 || '%'
 ORDER BY id
 LIMIT 5";
 
+pub const SELECT_SEGMENTS_BY_PREFIX_FOR_CONTEXT: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE context_id = ?1
+  AND id LIKE ?2 || '%'
+ORDER BY id
+LIMIT 5";
+
 pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";
@@ -434,13 +712,19 @@ pub const DELETE_META: &str = "DELETE FROM meta WHERE key = ?1";
 
 pub const COUNT_SEGMENTS: &str = "SELECT COUNT(*) FROM segments";
 
+pub const COUNT_SEGMENTS_FOR_CONTEXT: &str = "SELECT COUNT(*) FROM segments WHERE context_id = ?1";
+
 pub const COUNT_FILES: &str = "SELECT COUNT(DISTINCT file_path) FROM segments";
+
+pub const COUNT_FILES_FOR_CONTEXT: &str =
+    "SELECT COUNT(DISTINCT file_path) FROM segments WHERE context_id = ?1";
 
 pub const SELECT_FILE_PATHS_BY_LANGUAGE: &str = "
 SELECT DISTINCT file_path FROM segments
 WHERE language = ?1
 ORDER BY file_path";
 
+#[allow(dead_code)]
 pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
        s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
@@ -456,6 +740,24 @@ ORDER BY
   s.line_start,
   ss.symbol";
 
+pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
+       s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
+       s.created_at, s.updated_at, ss.symbol
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.context_id = ?1
+  AND s.context_id = ?1
+  AND ss.reference_kind = ?2
+  AND ss.canonical_symbol = ?3
+ORDER BY
+  CASE WHEN s.block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
+  s.file_path,
+  s.line_start,
+  ss.symbol";
+
+#[allow(dead_code)]
 pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX: &str = "
 SELECT DISTINCT canonical_symbol
 FROM segment_symbols
@@ -464,6 +766,16 @@ WHERE reference_kind = ?1
 ORDER BY LENGTH(canonical_symbol), canonical_symbol
 LIMIT ?3";
 
+pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX_FOR_CONTEXT: &str = "
+SELECT DISTINCT canonical_symbol
+FROM segment_symbols
+WHERE context_id = ?1
+  AND reference_kind = ?2
+  AND canonical_symbol LIKE ?3 || '%'
+ORDER BY LENGTH(canonical_symbol), canonical_symbol
+LIMIT ?4";
+
+#[allow(dead_code)]
 pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS: &str = "
 SELECT DISTINCT canonical_symbol
 FROM segment_symbols
@@ -476,37 +788,68 @@ ORDER BY
   canonical_symbol
 LIMIT ?3";
 
+pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS_FOR_CONTEXT: &str = "
+SELECT DISTINCT canonical_symbol
+FROM segment_symbols
+WHERE context_id = ?1
+  AND reference_kind = ?2
+  AND canonical_symbol LIKE '%' || ?3 || '%'
+ORDER BY
+  CASE WHEN canonical_symbol LIKE ?3 || '%' THEN 0 ELSE 1 END,
+  ABS(LENGTH(canonical_symbol) - LENGTH(?3)),
+  LENGTH(canonical_symbol),
+  canonical_symbol
+LIMIT ?4";
+
+#[allow(dead_code)]
 pub const SELECT_ALL_INDEXED_FILES: &str = "
 SELECT file_path, extension, file_hash, file_size, modified_ns
 FROM indexed_files
 ORDER BY file_path";
 
+pub const SELECT_ALL_INDEXED_FILES_FOR_CONTEXT: &str = "
+SELECT file_path, extension, file_hash, file_size, modified_ns
+FROM indexed_files
+WHERE context_id = ?1
+ORDER BY file_path";
+
+#[allow(dead_code)]
 pub const SELECT_INDEXED_FILE: &str = "
 SELECT file_path, extension, file_hash, file_size, modified_ns
 FROM indexed_files
 WHERE file_path = ?1";
 
+pub const SELECT_INDEXED_FILE_FOR_CONTEXT: &str = "
+SELECT file_path, extension, file_hash, file_size, modified_ns
+FROM indexed_files
+WHERE context_id = ?1
+  AND file_path = ?2";
+
 pub const UPSERT_INDEXED_FILE: &str = "
 INSERT OR REPLACE INTO indexed_files (
-    file_path, extension, file_hash, file_size, modified_ns,
+    context_id, file_path, extension, file_hash, file_size, modified_ns,
     created_at, updated_at
 ) VALUES (
-    ?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now')
+    ?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now')
 )";
 
-pub const DELETE_INDEXED_FILE: &str = "DELETE FROM indexed_files WHERE file_path = ?1";
+pub const DELETE_INDEXED_FILE: &str =
+    "DELETE FROM indexed_files WHERE context_id = ?1 AND file_path = ?2";
 
 /// Maximum number of SQL parameters per statement to stay below SQLite limits.
 pub const SQLITE_MAX_PARAMS: usize = 999;
 
 /// Number of columns in a segment INSERT (positional params only, excludes datetime('now') literals).
-pub const SEGMENT_INSERT_COLS: usize = 14;
+pub const SEGMENT_INSERT_COLS: usize = 15;
 
 /// Number of columns in a segment_symbols INSERT (positional params only).
-pub const SYMBOL_INSERT_COLS: usize = 4;
+pub const SYMBOL_INSERT_COLS: usize = 5;
 
 /// Number of columns in a segment_relations INSERT (positional params only).
 pub const RELATION_INSERT_COLS: usize = 7;
+
+/// Number of columns in a context-scoped segment_relations INSERT (positional params only).
+pub const CONTEXT_RELATION_INSERT_COLS: usize = 8;
 
 /// Number of columns in a segment_vectors INSERT (positional params only).
 pub const VECTOR_INSERT_COLS: usize = 2;
@@ -515,4 +858,5 @@ pub const VECTOR_INSERT_COLS: usize = 2;
 pub const SEGMENT_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SEGMENT_INSERT_COLS;
 pub const SYMBOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SYMBOL_INSERT_COLS;
 pub const RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / RELATION_INSERT_COLS;
+pub const CONTEXT_RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / CONTEXT_RELATION_INSERT_COLS;
 pub const VECTOR_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / VECTOR_INSERT_COLS;

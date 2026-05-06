@@ -15,7 +15,7 @@ use crate::storage::segments::{
 ///
 /// `get` is the fat companion to the lean discovery grammar: `search`, `symbol`, `impact`,
 /// and `context` emit compact handles (`:<id>`) and `get` resolves those handles to the
-/// body + metadata previously embedded in fat search output. Handles may be full 16-char
+/// body + metadata previously embedded in fat search output. Handles may be full
 /// segment ids or the 12-char display prefix; both resolve through the same storage path.
 ///
 /// Output per handle, in request order: `segment <id>` header, tab-separated metadata
@@ -28,7 +28,7 @@ pub struct GetArgs {
     /// callers can pipeline multi-hit follow-ups from a single `search`. Accepts
     /// either bare ids (`a0f1e2c3d4b5`) or lean-grammar handles with the leading
     /// colon (`:a0f1e2c3d4b5`); the 12-char display prefix is resolved against the
-    /// full 16-char segment id via a storage-side prefix lookup.
+    /// full segment id via a storage-side prefix lookup.
     #[arg(required = true, num_args = 1..)]
     pub handles: Vec<String>,
 

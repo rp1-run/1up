@@ -23,6 +23,7 @@ pub struct StopArgs {
 pub async fn exec(args: StopArgs, format: OutputFormat) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
+    let worktree_context = resolved.worktree_context;
     let fmt = formatter_for(format);
 
     if !lifecycle::supports_daemon() {
@@ -41,7 +42,7 @@ pub async fn exec(args: StopArgs, format: OutputFormat) -> anyhow::Result<()> {
     let daemon_pid = lifecycle::is_daemon_running()?;
 
     let mut registry = Registry::load()?;
-    let was_registered = registry.deregister(&project_root)?;
+    let was_registered = registry.deregister_context(&worktree_context)?;
 
     if !was_registered {
         let message = match daemon_pid {

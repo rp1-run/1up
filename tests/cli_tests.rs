@@ -1,7 +1,11 @@
 use assert_cmd::prelude::CommandCargoExt;
 use assert_cmd::Command;
 use oneup::shared::constants::{SCHEMA_VERSION, VERSION};
-use oneup::storage::{db::Db, queries, schema};
+use oneup::storage::{
+    db::Db,
+    queries, schema,
+    segments::{self, IndexedFileMeta, SegmentInsert},
+};
 use predicates::prelude::*;
 use std::collections::HashSet;
 use std::fs;
@@ -138,6 +142,20 @@ fn run_start_json(home: &Path, project: &Path) -> Output {
         stdout: fs::read(stdout_path).unwrap(),
         stderr: fs::read(stderr_path).unwrap(),
     }
+}
+
+#[cfg(unix)]
+fn git(repo: &Path, args: &[&str]) {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|err| panic!("git {args:?} failed to launch: {err}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 struct DaemonCleanupGuard {
@@ -1086,6 +1104,104 @@ fn start_from_worktree_uses_main_state_and_indexes_worktree_source() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn list_and_status_show_linked_worktree_context_sharing_main_state() {
+    let _guard = HideModelGuard::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tmp_root = tmp.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+
+    let main_repo = tmp_root.join("main");
+    let worktree = tmp_root.join("linked-worktree");
+    fs::create_dir_all(&main_repo).unwrap();
+    git(&tmp_root, &["init", main_repo.to_str().unwrap()]);
+    git(
+        &main_repo,
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git(&main_repo, &["config", "user.name", "1up Test"]);
+    fs::write(
+        main_repo.join("shared.rs"),
+        "pub fn shared_worktree_metadata_marker() -> bool { true }\n",
+    )
+    .unwrap();
+    git(&main_repo, &["add", "."]);
+    git(&main_repo, &["commit", "-m", "initial"]);
+    git(&main_repo, &["branch", "-M", "main"]);
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            worktree.to_str().unwrap(),
+            "-b",
+            "linked-acceptance",
+        ],
+    );
+
+    let canonical_main = main_repo.canonicalize().unwrap();
+    let canonical_worktree = worktree.canonicalize().unwrap();
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_worktree);
+
+    let output = run_start_json(&canonical_home, &canonical_worktree);
+    assert!(
+        output.status.success(),
+        "start from linked worktree should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status = status_json(&canonical_home, &canonical_worktree);
+    assert_eq!(
+        status["project_root"].as_str(),
+        Some(canonical_main.to_str().unwrap())
+    );
+    assert_eq!(
+        status["source_root"].as_str(),
+        Some(canonical_worktree.to_str().unwrap())
+    );
+    assert_eq!(
+        status["main_worktree_root"].as_str(),
+        Some(canonical_main.to_str().unwrap())
+    );
+    assert_eq!(status["worktree_role"], "linked");
+    assert_eq!(status["branch_name"], "linked-acceptance");
+    assert_eq!(status["branch_status"], "named");
+
+    let list_output = cmd_with_home(&canonical_home)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        list_output.status.success(),
+        "list should succeed: {}",
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let list = json_stdout(&list_output);
+    let projects = list["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(
+        projects[0]["project_root"].as_str(),
+        Some(canonical_main.to_str().unwrap())
+    );
+    assert_eq!(
+        projects[0]["source_root"].as_str(),
+        Some(canonical_worktree.to_str().unwrap())
+    );
+    assert_eq!(
+        projects[0]["main_worktree_root"].as_str(),
+        Some(canonical_main.to_str().unwrap())
+    );
+    assert_eq!(projects[0]["worktree_role"], "linked");
+    assert_eq!(projects[0]["branch_name"], "linked-acceptance");
+    assert_eq!(projects[0]["branch_status"], "named");
+
+    assert!(canonical_main.join(".1up").join("project_id").exists());
+    assert!(!canonical_worktree.join(".1up").join("project_id").exists());
+}
+
 #[test]
 fn start_refuses_to_auto_initialize_non_git_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -1535,6 +1651,51 @@ fn create_current_index(dir: &Path) {
     });
 }
 
+fn seed_current_index_for_context(dir: &Path, context_id: &str) {
+    fs::create_dir_all(dir.join(".1up")).unwrap();
+    fs::write(dir.join(".1up").join("project_id"), "context-count-project").unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&project_db_path(dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        let segment = SegmentInsert {
+            id: format!("{context_id}-segment"),
+            file_path: "src/other.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "pub fn other_context_only() {}\n".to_string(),
+            line_start: 1,
+            line_end: 1,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "source".to_string(),
+            defined_symbols: "[]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "other-context-hash".to_string(),
+        };
+        let meta = IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: segment.file_hash.clone(),
+            file_size: segment.content.len() as i64,
+            modified_ns: 1,
+        };
+        segments::replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            context_id,
+            "src/other.rs",
+            &[segment],
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+    });
+}
+
 fn write_registry(home: &Path, projects: serde_json::Value) {
     let data_dir = test_data_dir(home);
     fs::create_dir_all(&data_dir).unwrap();
@@ -1603,6 +1764,84 @@ fn write_lifecycle_progress_fixture(project: &Path, project_id: &str) {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn status_and_list_ignore_daemon_status_from_other_contexts() {
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let project = project_dir.path().canonicalize().unwrap();
+    let dot_dir = project.join(".1up");
+    let legacy_check = "2026-05-01T00:05:00Z";
+    let other_context_check = "2026-05-01T00:09:00Z";
+
+    fs::create_dir_all(&dot_dir).unwrap();
+    seed_current_index_for_context(&project, "other-context");
+    fs::write(dot_dir.join("project_id"), "cross-context-project").unwrap();
+    fs::write(
+        dot_dir.join("daemon_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "last_file_check_at": legacy_check
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        dot_dir.join("daemon_context_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "contexts": {
+                "other-context": {
+                    "context_id": "other-context",
+                    "source_root": project,
+                    "watch_status": "watching",
+                    "last_file_check_at": other_context_check,
+                    "last_refresh_state": "complete",
+                    "last_refresh_completed_at": other_context_check,
+                    "branch_name": "other",
+                    "branch_status": "named"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    write_registry(
+        &canonical_home,
+        serde_json::json!([
+            {
+                "project_id": "cross-context-project",
+                "project_root": project,
+                "registered_at": "2026-05-01T00:10:00Z"
+            }
+        ]),
+    );
+
+    let status_output = cmd_with_home(&canonical_home)
+        .args(["status", project.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(status_output.status.success());
+    let status_json = json_stdout(&status_output);
+    assert_eq!(status_json["last_file_check_at"], legacy_check);
+    assert_ne!(status_json["last_file_check_at"], other_context_check);
+    assert_eq!(status_json["indexed_files"], 0);
+    assert_eq!(status_json["total_segments"], 0);
+
+    let list_output = cmd_with_home(&canonical_home)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let list_json = json_stdout(&list_output);
+    assert_eq!(list_json["projects"][0]["last_file_check_at"], legacy_check);
+    assert_ne!(
+        list_json["projects"][0]["last_file_check_at"],
+        other_context_check
+    );
+    assert_eq!(list_json["projects"][0]["index_status"], "not_built");
+    assert_eq!(list_json["projects"][0]["files"], 0);
+    assert_eq!(list_json["projects"][0]["segments"], 0);
 }
 
 #[cfg(unix)]
@@ -2203,4 +2442,125 @@ fn concurrent_first_start_reuses_project_id() {
         "registry should contain one project entry"
     );
     assert_eq!(matching[0]["project_id"].as_str(), Some(project_id.trim()));
+}
+
+#[cfg(unix)]
+#[test]
+fn watched_project_refreshes_added_edited_and_deleted_files() {
+    let _guard = HideModelGuard::new();
+    let root = tempfile::Builder::new()
+        .prefix("oneup-watch-")
+        .tempdir()
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = root.path().join("watched-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let canonical_dir = project_dir.canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    fs::write(
+        canonical_dir.join("watched.rs"),
+        "pub fn watched_refresh_before_marker() -> &'static str { \"before\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        canonical_dir.join("removed.rs"),
+        "pub fn watched_refresh_removed_marker() -> &'static str { \"removed\" }\n",
+    )
+    .unwrap();
+
+    let output = run_start_json(&canonical_home, &canonical_dir);
+    assert!(
+        output.status.success(),
+        "start should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_daemon_running(&canonical_home, &canonical_dir);
+
+    let wait_for_status = |field: &str, expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = status_json(&canonical_home, &canonical_dir);
+            if status[field].as_str() == Some(expected) {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("status field {field:?} did not become {expected:?}; last status={status}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for_status("watch_status", "watching");
+    let wait_for_refresh_complete = || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = status_json(&canonical_home, &canonical_dir);
+            if status["last_update_state"].as_str() == Some("complete")
+                && status["last_update_completed_at"].as_str().is_some()
+            {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("watched refresh did not complete; last status={status}");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
+
+    let search_stdout = |query: &str| -> (bool, String, String) {
+        let output = cmd_with_home(&canonical_home)
+            .args(["search", query, "--path", canonical_dir.to_str().unwrap()])
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let wait_for_search = |query: &str, should_find: bool| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (ok, stdout, stderr) = search_stdout(query);
+            let found = stdout.contains(query);
+            if ok && found == should_find {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "search for {query:?} did not reach expected found={should_find}; stdout={stdout} stderr={stderr}"
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    wait_for_search("watched_refresh_before_marker", true);
+    wait_for_search("watched_refresh_removed_marker", true);
+
+    fs::write(
+        canonical_dir.join("watched.rs"),
+        "pub fn watched_refresh_after_marker() -> &'static str { \"after\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        canonical_dir.join("added.rs"),
+        "pub fn watched_refresh_added_marker() -> &'static str { \"added\" }\n",
+    )
+    .unwrap();
+    fs::remove_file(canonical_dir.join("removed.rs")).unwrap();
+
+    wait_for_refresh_complete();
+    wait_for_search("watched_refresh_after_marker", true);
+    wait_for_search("watched_refresh_added_marker", true);
+    wait_for_search("watched_refresh_before_marker", false);
+    wait_for_search("watched_refresh_removed_marker", false);
+
+    let final_status = wait_for_refresh_complete();
+    assert_eq!(final_status["watch_status"], "watching");
+    assert_eq!(final_status["last_update_state"], "complete");
+    assert_eq!(final_status["index_status"], "ready");
 }

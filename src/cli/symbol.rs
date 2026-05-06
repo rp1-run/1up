@@ -4,7 +4,7 @@ use clap::Args;
 
 use crate::cli::lean;
 use crate::daemon::lifecycle;
-use crate::search::SymbolSearchEngine;
+use crate::search::{SearchScope, SymbolSearchEngine};
 use crate::shared::config::project_db_path;
 use crate::shared::project;
 use crate::storage::db::Db;
@@ -32,7 +32,10 @@ pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
+    let search_scope = SearchScope::from_worktree_context(&resolved.worktree_context);
     let db_path = project_db_path(&project_root);
+
+    warn_if_degraded_branch_context(&search_scope);
 
     if let Ok(pid) = project::read_project_id(&project_root) {
         if let Err(e) = lifecycle::ensure_daemon(&pid, &project_root, &source_root) {
@@ -51,7 +54,7 @@ pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     let conn = db.connect()?;
     schema::ensure_current(&conn).await?;
 
-    let engine = SymbolSearchEngine::new(&conn);
+    let engine = SymbolSearchEngine::new_scoped(&conn, search_scope);
     let results = if args.references {
         engine.find_references(&args.name, args.fuzzy).await?
     } else {
@@ -66,4 +69,10 @@ pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     lean::render_symbol(&mut stdout, &results)?;
     stdout.flush()?;
     Ok(())
+}
+
+fn warn_if_degraded_branch_context(scope: &SearchScope) {
+    if let Some(reason) = scope.degraded_reason() {
+        eprintln!("warning: {reason}");
+    }
 }
