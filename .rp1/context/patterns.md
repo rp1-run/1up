@@ -32,7 +32,7 @@
 ## Validation And Boundaries
 
 - Validation is concentrated at clap argument parsing, CLI request builders, MCP input schemas, filesystem gates, IPC frames, schema readiness, and transaction seams.
-- Core commands intentionally reject presentation flags; only maintenance command args expose `--format`/`-f` (`src/cli/mod.rs:102`, `src/cli/mod.rs:201`).
+- Core discovery commands intentionally reject `--format`/`-f`; retained human discovery commands expose `--plain` when they support the lean protocol (`src/cli/mod.rs`, `src/cli/get.rs`).
 - MCP input structs use `serde(deny_unknown_fields)` and explicit defaults/aliases for stable host behavior (`src/mcp/types.rs:18`).
 - Impact validates exactly one anchor and limits `line` to file anchors in both CLI and MCP paths (`src/cli/impact.rs:55`, `src/mcp/tools.rs:365`).
 - Paths are canonicalized and clamped to approved roots; secure state writes reject symlinks and unexpected leaf types (`src/shared/fs.rs:25`, `src/shared/fs.rs:82`).
@@ -42,13 +42,14 @@
 
 ## Output Contracts
 
-- Core agent-facing CLI commands emit one lean, line-oriented protocol and no format variants: `search`, `symbol`, `impact`, `context`, `structural`, and `get` (`src/cli/lean.rs`, `src/cli/mod.rs:56`).
-- Discovery rows use two ASCII spaces, integer score, `path:l1-l2`, kind, `breadcrumb::symbol`, and a `:12-char-handle`; impact rows add `~P` or `~C` (`src/cli/lean.rs:8`).
-- `get` is the fat hydration companion and preserves request order with `segment ... ---` records or `not_found` records (`src/cli/get.rs:14`, `src/cli/lean.rs:165`).
+- Retained human discovery commands (`get`, `symbol`, `context`, `impact`) default to readable output through `discovery_output`; their `--plain` mode delegates to the lean protocol (`src/cli/discovery_output.rs`, `src/cli/get.rs`).
+- Hidden compatibility discovery commands (`search`, `structural`) remain lean-only and are not presented as supported P4 human commands (`src/cli/mod.rs`, `src/cli/lean.rs`).
+- Lean discovery rows use two ASCII spaces, integer score, `path:l1-l2`, kind, `breadcrumb::symbol`, and a `:12-char-handle`; impact rows add `~P` or `~C` (`src/cli/lean.rs:8`).
+- `get` is the fat hydration companion and preserves request order with `segment ... ---` records or `not_found` records; both CLI and MCP accept handles with or without the leading colon (`src/cli/get.rs:14`, `src/cli/lean.rs:165`, `src/mcp/types.rs:48`).
 - Maintenance commands still render through `HumanFormatter`, `PlainFormatter`, and `JsonFormatter`; JSON/plain identifiers remain stable for automation (`src/cli/output.rs`, `src/cli/mod.rs:106`).
 - MCP text content mirrors the structured envelope summary, while `structuredContent` carries machine data and canonical `oneup_*` next actions (`src/mcp/tools.rs:831`, `tests/integration_tests.rs:152`).
-- MCP core discovery responses stay presentation-free: no ANSI color, spinners, or terminal table formatting in prepare, search, read, symbol, or read-location context responses.
-- MCP source context is represented through `oneup_read.locations`; status/start behavior is represented through `oneup_prepare` modes, not separate alias tools.
+- MCP core discovery responses stay presentation-free: no ANSI color, spinners, or terminal table formatting in status, start, search, get, symbol, context, impact, or structural responses.
+- MCP source context is represented through `oneup_context.locations`; handle hydration is represented through `oneup_get.handles`; readiness checks use `oneup_status`; explicit indexing/reindexing uses `oneup_start`.
 - `add-mcp` delegates to host-owned `bunx/npx add-mcp`; on failure it prints manual generic JSON and Codex TOML snippets instead of mutating host config directly (`src/cli/add_mcp.rs:48`).
 
 ## Storage And I/O

@@ -1,9 +1,12 @@
 export const ONEUP_MCP_TOOLS = [
-  "oneup_prepare",
+  "oneup_status",
+  "oneup_start",
   "oneup_search",
-  "oneup_read",
+  "oneup_get",
   "oneup_symbol",
+  "oneup_context",
   "oneup_impact",
+  "oneup_structural",
 ] as const;
 
 export type OneupMcpTool = (typeof ONEUP_MCP_TOOLS)[number];

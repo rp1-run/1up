@@ -155,20 +155,20 @@ if ! jq -e '
   def canonical_mcp_tools_present:
     (.mcp_smoke_test.tools | type == "array")
     and (.mcp_smoke_test.tools as $tools
-      | ["oneup_prepare", "oneup_search", "oneup_read", "oneup_symbol", "oneup_impact"]
+      | ["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural"]
       | all(. as $tool | $tools | index($tool)));
   def valid_readiness:
     . as $status | ["missing", "indexing", "stale", "ready", "degraded", "blocked"] | index($status) != null;
-  def valid_p2_mcp_smoke:
+  def valid_retained_mcp_smoke:
     .mcp_smoke_test as $smoke
     | ($smoke.schema == "mcp_smoke.v2")
     and ($smoke.presentation_free == true)
     and ($smoke.discovery_flow.status == "passed")
     and ($smoke.exercised_tools | type == "array")
-    and (["oneup_prepare", "oneup_search", "oneup_read", "oneup_symbol"]
+    and (["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural"]
       | all(. as $tool | ($smoke.exercised_tools | index($tool) != null)))
     and ($smoke.tool_calls | type == "array")
-    and (["prepare", "search", "read_handle", "symbol", "read_location"]
+    and (["status", "start", "search", "get", "symbol", "context", "impact", "structural"]
       | all(. as $label
         | ([$smoke.tool_calls[]
           | select(.label == $label)
@@ -177,11 +177,14 @@ if ! jq -e '
               and (.structured_content == true)
               and (.presentation_free == true))]
           | length > 0)))
-    and ($smoke.structured_content_present.prepare == true)
+    and ($smoke.structured_content_present.status == true)
+    and ($smoke.structured_content_present.start == true)
     and ($smoke.structured_content_present.search == true)
-    and ($smoke.structured_content_present.read_handle == true)
+    and ($smoke.structured_content_present.get == true)
     and ($smoke.structured_content_present.symbol == true)
-    and ($smoke.structured_content_present.read_location == true);
+    and ($smoke.structured_content_present.context == true)
+    and ($smoke.structured_content_present.impact == true)
+    and ($smoke.structured_content_present.structural == true);
   (.archive_count | numbers)
   and (.archives | type == "array")
   and ((.archives | length) == .archive_count)
@@ -195,7 +198,7 @@ if ! jq -e '
     and canonical_mcp_tools_present
     and (.mcp_smoke_test.readiness_status | valid_readiness)
     and (.mcp_smoke_test.stdout_protocol_clean == true)
-    and valid_p2_mcp_smoke
+    and valid_retained_mcp_smoke
   ] | all)
 ' "$ARCHIVE_VERIFICATION_PATH" >/dev/null 2>&1; then
   fail "archive verification summary is missing required fields"

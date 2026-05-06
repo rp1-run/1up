@@ -1,7 +1,7 @@
-//! Lean row renderer for the six core agent-facing commands.
+//! Lean row renderer for plain discovery output.
 //!
 //! The module owns the single machine-parseable shape emitted by `search`,
-//! `symbol`, `impact`, `context`, `structural`, and `get`. Each `render_*`
+//! `symbol --plain`, `impact --plain`, `context --plain`, `structural`, and `get --plain`. Each `render_*`
 //! function writes directly to a `Write` sink and borrows its inputs, so
 //! callers never pay for an intermediate `String` buffer.
 //!

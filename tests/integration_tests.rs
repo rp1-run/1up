@@ -1,4 +1,8 @@
 use assert_cmd::Command;
+use oneup::mcp::types::{
+    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START,
+    TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+};
 use oneup::storage::{
     db::Db,
     schema,
@@ -217,8 +221,8 @@ fn assert_mcp_next_actions_are_canonical(envelope: &serde_json::Value) {
             .as_str()
             .expect("next action tool must be a string");
         assert!(
-            tool.starts_with("oneup_") && !tool.starts_with("1up_"),
-            "next action should name canonical oneup_* tools only: {action:?}"
+            RETAINED_PUBLIC_TOOLS.contains(&tool),
+            "next action should name retained oneup tools only: {action:?}"
         );
     }
 }
@@ -669,10 +673,9 @@ fn run_index_json(dir: &std::path::Path, extra_args: &[&str]) -> serde_json::Val
 // Lean row grammar helpers
 // =============================================================================
 //
-// The six core commands (`search`, `symbol`, `impact`, `context`, `structural`,
-// `get`) all emit a line-oriented grammar described in design §2.2-§2.3. These
-// helpers parse that grammar just enough to assert field presence, field shape,
-// and cross-row ordering without pulling in a regex dependency.
+// Hidden discovery commands emit this grammar by default. Retained human
+// commands use it only through `--plain`, so helpers that parse these rows must
+// opt in explicitly.
 
 /// A discovery row produced by `search`, `symbol`, or `impact`:
 /// `<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>[  ~<channel>]`.
@@ -859,7 +862,7 @@ fn create_branch_filtering_fixture() -> (TempDir, PathBuf, PathBuf) {
 }
 
 fn symbol_rows(dir: &std::path::Path, name: &str, extra: &[&str]) -> Vec<LeanDiscoveryRow> {
-    let mut args: Vec<&str> = vec!["symbol", name, "--path", dir.to_str().unwrap()];
+    let mut args: Vec<&str> = vec!["symbol", name, "--plain", "--path", dir.to_str().unwrap()];
     args.extend_from_slice(extra);
     let (stdout, _stderr, ok) = run_core_cmd(&args);
     assert!(ok, "symbol lookup failed");
@@ -867,7 +870,7 @@ fn symbol_rows(dir: &std::path::Path, name: &str, extra: &[&str]) -> Vec<LeanDis
 }
 
 fn impact_output(dir: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let mut full: Vec<&str> = vec!["impact"];
+    let mut full: Vec<&str> = vec!["impact", "--plain"];
     full.extend_from_slice(args);
     full.extend_from_slice(&["--path", dir.to_str().unwrap()]);
     run_core_cmd(&full)
@@ -1436,9 +1439,9 @@ fn symbol_references_include_definitions_and_usages() {
 
 #[test]
 fn symbol_handle_roundtrips_through_get_and_impact() {
-    // The advertised flow is `symbol -> get -> impact --from-segment`. The
+    // The advertised flow is `symbol -> get -> impact --from-handle`. The
     // 12-char handle printed by `symbol` must resolve both through `get` (full
-    // segment body) and through `impact --from-segment` (anchor expansion).
+    // segment body) and through `impact --from-handle` (anchor expansion).
     let tmp = create_multi_lang_fixture();
     init_and_index(&tmp);
 
@@ -1454,8 +1457,13 @@ fn symbol_handle_roundtrips_through_get_and_impact() {
         "symbol row must carry a 12-char lean handle, got {handle:?}"
     );
 
-    let (get_out, get_err, get_ok) =
-        run_core_cmd(&["get", &handle, "--path", tmp.path().to_str().unwrap()]);
+    let (get_out, get_err, get_ok) = run_core_cmd(&[
+        "get",
+        &handle,
+        "--plain",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
     assert!(get_ok, "get failed: {get_err}");
     assert!(
         get_out.starts_with("segment "),
@@ -1468,7 +1476,7 @@ fn symbol_handle_roundtrips_through_get_and_impact() {
 
     let (impact_out, impact_err, impact_ok) = run_core_cmd(&[
         "impact",
-        "--from-segment",
+        "--from-handle",
         &handle,
         "--path",
         tmp.path().to_str().unwrap(),
@@ -1476,11 +1484,11 @@ fn symbol_handle_roundtrips_through_get_and_impact() {
     assert!(impact_ok, "impact failed: {impact_err}");
     assert!(
         !impact_out.contains("anchor_not_found"),
-        "impact --from-segment must accept the 12-char handle; got: {impact_out}"
+        "impact --from-handle must accept the 12-char handle; got: {impact_out}"
     );
     assert!(
         !impact_out.contains("anchor_ambiguous"),
-        "impact --from-segment should uniquely resolve a 12-char handle for a definition; got: {impact_out}"
+        "impact --from-handle should uniquely resolve a 12-char handle for a definition; got: {impact_out}"
     );
 }
 
@@ -1557,12 +1565,12 @@ fn mcp_initialize_advertises_primary_code_search_instructions() {
         "instructions should guide agents to use MCP before broad raw search: {instructions}"
     );
     assert!(
-        instructions.contains("oneup_read"),
-        "instructions should teach the search/read hydration flow: {instructions}"
+        instructions.contains("oneup_get"),
+        "instructions should teach the search/get hydration flow: {instructions}"
     );
     assert!(
-        instructions.contains("oneup_read locations for file-line context"),
-        "instructions should make read-location context retrieval discoverable: {instructions}"
+        instructions.contains("oneup_context"),
+        "instructions should make file-line context retrieval discoverable: {instructions}"
     );
     assert!(
         instructions.contains("Use oneup_impact only for explicit blast-radius questions"),
@@ -1614,15 +1622,12 @@ fn mcp_tools_list_default_palette_and_schemas() {
 
     assert_eq!(
         names,
-        BTreeSet::from([
-            "oneup_impact",
-            "oneup_prepare",
-            "oneup_read",
-            "oneup_search",
-            "oneup_symbol",
-        ])
+        RETAINED_PUBLIC_TOOLS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
     );
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), RETAINED_PUBLIC_TOOLS.len());
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
@@ -1631,28 +1636,44 @@ fn mcp_tools_list_default_palette_and_schemas() {
         assert!(!name.starts_with("1up_"));
         assert!(
             description.starts_with("Check ")
+                || description.starts_with("Prepare ")
                 || description.starts_with("Search ")
-                || description.starts_with("Read ")
+                || description.starts_with("Hydrate ")
+                || description.starts_with("Retrieve ")
                 || description.starts_with("Find ")
-                || description.starts_with("Explore "),
+                || description.starts_with("Explore ")
+                || description.starts_with("Run "),
             "description should front-load tool selection guidance: {description}"
         );
-        if name == "oneup_search" {
+        if name == TOOL_SEARCH {
             assert!(
                 description.contains("primary discovery path")
                     && description.contains("before raw grep, rg, find"),
                 "oneup_search description should be strong enough for tool adoption: {description}"
             );
         }
-        if name == "oneup_read" {
+        if name == TOOL_GET {
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .expect("oneup_get should expose an input schema");
+            assert!(
+                input_schema["properties"]["handles"]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Durable result handles"),
+                "handles schema should describe result-handle hydration: {input_schema:?}"
+            );
+        }
+        if name == TOOL_CONTEXT {
             assert!(
                 description.contains("file-line context") && description.contains("locations"),
-                "oneup_read description should expose read-location context retrieval: {description}"
+                "oneup_context description should expose file-line context retrieval: {description}"
             );
             let input_schema = tool
                 .get("inputSchema")
                 .or_else(|| tool.get("input_schema"))
-                .expect("oneup_read should expose an input schema");
+                .expect("oneup_context should expose an input schema");
             let locations_schema = &input_schema["properties"]["locations"];
             assert!(
                 locations_schema["description"]
@@ -1677,10 +1698,34 @@ fn mcp_tools_list_default_palette_and_schemas() {
                 "location line schema should state 1-based input: {input_schema:?}"
             );
         }
-        if name == "oneup_impact" {
+        if name == TOOL_IMPACT {
             assert!(
                 description.contains("explicit blast-radius questions"),
                 "oneup_impact description should keep impact as an explicit non-core follow-up: {description}"
+            );
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .expect("oneup_impact should expose an input schema");
+            assert!(
+                input_schema["properties"]["handle"]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Result handle"),
+                "impact schema should expose public result-handle anchors: {input_schema:?}"
+            );
+        }
+        if name == TOOL_STRUCTURAL {
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .expect("oneup_structural should expose an input schema");
+            assert!(
+                input_schema["properties"]["pattern"]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Tree-sitter query pattern"),
+                "structural schema should describe tree-sitter patterns: {input_schema:?}"
             );
         }
         assert!(
@@ -1706,15 +1751,16 @@ fn mcp_tools_list_default_palette_and_schemas() {
 }
 
 #[test]
-fn mcp_prepare_reports_readiness_states_and_next_actions() {
+fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     let missing = TempDir::new().unwrap();
     fs::create_dir_all(missing.path().join(".git")).unwrap();
     let mut missing_client = McpTestClient::start_with_isolated_state(missing.path());
-    let missing_result = missing_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let missing_result = missing_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_mcp_response_is_presentation_free(&missing_result);
     assert_eq!(missing_envelope["status"], "missing");
     assert_eq!(missing_envelope["data"]["project_initialized"], true);
+    assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_START);
     assert_eq!(
         missing_envelope["next_actions"][0]["arguments"]["mode"],
         "index_if_missing"
@@ -1724,39 +1770,18 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let indexing = TempDir::new().unwrap();
     write_running_progress(indexing.path());
     let mut indexing_client = McpTestClient::start_with_isolated_state(indexing.path());
-    let indexing_result = indexing_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let indexing_result = indexing_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let indexing_envelope = mcp_structured(&indexing_result);
     assert_mcp_response_is_presentation_free(&indexing_result);
     assert_eq!(indexing_envelope["status"], "indexing");
-    assert_eq!(
-        indexing_envelope["next_actions"][0]["tool"],
-        "oneup_prepare"
-    );
-    assert_eq!(
-        indexing_envelope["next_actions"][0]["arguments"]["mode"],
-        "check"
-    );
+    assert_eq!(indexing_envelope["next_actions"][0]["tool"], TOOL_STATUS);
 
-    let auto_result =
-        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "auto" }));
-    let auto_envelope = mcp_structured(&auto_result);
-    assert_mcp_response_is_presentation_free(&auto_result);
-    assert_eq!(auto_envelope["status"], "indexing");
-    assert_mcp_next_actions_are_canonical(auto_envelope);
-
-    let default_result =
-        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "default" }));
-    let default_envelope = mcp_structured(&default_result);
-    assert_mcp_response_is_presentation_free(&default_result);
-    assert_eq!(default_envelope["status"], "indexing");
-    assert_mcp_next_actions_are_canonical(default_envelope);
-
-    let read_result =
-        indexing_client.call_tool("oneup_prepare", serde_json::json!({ "mode": "read" }));
-    let read_envelope = mcp_structured(&read_result);
-    assert_mcp_response_is_presentation_free(&read_result);
-    assert_eq!(read_envelope["status"], "indexing");
-    assert_mcp_next_actions_are_canonical(read_envelope);
+    let start_indexing =
+        indexing_client.call_tool(TOOL_START, serde_json::json!({ "mode": "index_if_needed" }));
+    let start_indexing_envelope = mcp_structured(&start_indexing);
+    assert_mcp_response_is_presentation_free(&start_indexing);
+    assert_eq!(start_indexing_envelope["status"], "indexing");
+    assert_mcp_next_actions_are_canonical(start_indexing_envelope);
 
     let stale = TempDir::new().unwrap();
     fs::create_dir_all(stale.path().join(".1up")).unwrap();
@@ -1767,11 +1792,11 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
     )
     .unwrap();
     let mut stale_client = McpTestClient::start_with_isolated_state(stale.path());
-    let stale_result = stale_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let stale_result = stale_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let stale_envelope = mcp_structured(&stale_result);
     assert_mcp_response_is_presentation_free(&stale_result);
     assert_eq!(stale_envelope["status"], "stale");
-    assert_eq!(stale_envelope["next_actions"][0]["tool"], "oneup_prepare");
+    assert_eq!(stale_envelope["next_actions"][0]["tool"], TOOL_START);
     assert_eq!(
         stale_envelope["next_actions"][0]["arguments"]["mode"],
         "reindex"
@@ -1782,7 +1807,7 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
         let ready = create_multi_lang_fixture();
         init_and_index(&ready);
         let mut ready_client = McpTestClient::start(ready.path());
-        let ready_result = ready_client.call_tool("oneup_prepare", serde_json::json!({}));
+        let ready_result = ready_client.call_tool(TOOL_STATUS, serde_json::json!({}));
         let ready_envelope = mcp_structured(&ready_result);
         assert_mcp_response_is_presentation_free(&ready_result);
         assert_eq!(ready_envelope["status"], "degraded");
@@ -1795,7 +1820,7 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
     let degraded = create_multi_lang_fixture();
     let _guard = init_and_index_fts_only(&degraded);
     let mut degraded_client = McpTestClient::start(degraded.path());
-    let degraded_result = degraded_client.call_tool("oneup_prepare", serde_json::json!({}));
+    let degraded_result = degraded_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let degraded_envelope = mcp_structured(&degraded_result);
     assert_mcp_response_is_presentation_free(&degraded_result);
     assert_eq!(degraded_envelope["status"], "degraded");
@@ -1811,13 +1836,13 @@ fn mcp_prepare_reports_readiness_states_and_next_actions() {
 }
 
 #[test]
-fn mcp_prepare_ignores_index_progress_from_other_context() {
+fn mcp_status_ignores_index_progress_from_other_context() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join(".git")).unwrap();
     write_running_progress_for_context(project.path(), "other-context");
 
     let mut client = McpTestClient::start_with_isolated_state(project.path());
-    let result = client.call_tool("oneup_prepare", serde_json::json!({}));
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let envelope = mcp_structured(&result);
 
     assert_ne!(result["isError"], true);
@@ -1832,17 +1857,18 @@ fn mcp_prepare_ignores_index_progress_from_other_context() {
         envelope["next_actions"][0]["arguments"]["mode"],
         "index_if_missing"
     );
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
 }
 
 #[test]
-fn mcp_prepare_ignores_index_rows_from_other_context() {
+fn mcp_status_ignores_index_rows_from_other_context() {
     let project = TempDir::new().unwrap();
     let project_root = project.path().canonicalize().unwrap();
     fs::create_dir_all(project_root.join(".git")).unwrap();
     seed_current_index_for_context(&project_root, "other-context");
 
     let mut client = McpTestClient::start_with_isolated_state(&project_root);
-    let result = client.call_tool("oneup_prepare", serde_json::json!({}));
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let envelope = mcp_structured(&result);
 
     assert_ne!(result["isError"], true);
@@ -1855,10 +1881,11 @@ fn mcp_prepare_ignores_index_rows_from_other_context() {
         envelope["next_actions"][0]["arguments"]["mode"],
         "index_if_missing"
     );
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
 }
 
 #[test]
-fn mcp_prepare_index_if_missing_builds_index_state_only() {
+fn mcp_start_index_if_missing_builds_index_state_only() {
     let tmp = TempDir::new().unwrap();
     let git_dir = tmp.path().join(".git");
     fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
@@ -1871,7 +1898,7 @@ fn mcp_prepare_index_if_missing_builds_index_state_only() {
 
     let mut client = McpTestClient::start_with_isolated_state(tmp.path());
     let mut result = client.call_tool(
-        "oneup_prepare",
+        TOOL_START,
         serde_json::json!({ "mode": "index_if_missing" }),
     );
     for _ in 0..20 {
@@ -1882,7 +1909,7 @@ fn mcp_prepare_index_if_missing_builds_index_state_only() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
-        result = client.call_tool("oneup_prepare", serde_json::json!({}));
+        result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     }
     let envelope = mcp_structured(&result);
 
@@ -1904,7 +1931,7 @@ fn mcp_prepare_index_if_missing_builds_index_state_only() {
 }
 
 #[test]
-fn mcp_prepare_reports_blocked_when_indexing_cannot_auto_initialize() {
+fn mcp_start_reports_blocked_when_indexing_cannot_auto_initialize() {
     let tmp = TempDir::new().unwrap();
     fs::write(
         tmp.path().join("loose.rs"),
@@ -1914,7 +1941,7 @@ fn mcp_prepare_reports_blocked_when_indexing_cannot_auto_initialize() {
 
     let mut client = McpTestClient::start(tmp.path());
     let result = client.call_tool(
-        "oneup_prepare",
+        TOOL_START,
         serde_json::json!({ "mode": "index_if_missing" }),
     );
     let envelope = mcp_structured(&result);
@@ -1940,29 +1967,29 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     let _guard = init_and_index_fts_only(&tmp);
     let mut client = McpTestClient::start(tmp.path());
 
-    let prepare = client.call_tool("oneup_prepare", serde_json::json!({}));
-    assert_ne!(prepare["isError"], true);
-    assert_mcp_response_is_presentation_free(&prepare);
-    let prepare_envelope = mcp_structured(&prepare);
+    let status = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    assert_ne!(status["isError"], true);
+    assert_mcp_response_is_presentation_free(&status);
+    let status_envelope = mcp_structured(&status);
     assert!(
         matches!(
-            prepare_envelope["status"].as_str(),
+            status_envelope["status"].as_str(),
             Some("ready" | "degraded")
         ),
-        "prepare should be ready or degraded depending on local model cache: {prepare_envelope:?}"
+        "status should be ready or degraded depending on local model cache: {status_envelope:?}"
     );
-    assert_eq!(prepare_envelope["data"]["index_readable"], true);
+    assert_eq!(status_envelope["data"]["index_readable"], true);
     assert!(
-        prepare_envelope["next_actions"]
+        status_envelope["next_actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action["tool"] == "oneup_search"),
-        "ready or degraded prepare should lead agents to search: {prepare_envelope:?}"
+            .any(|action| action["tool"] == TOOL_SEARCH),
+        "ready or degraded status should lead agents to search: {status_envelope:?}"
     );
 
     let search = client.call_tool(
-        "oneup_search",
+        TOOL_SEARCH,
         serde_json::json!({ "query": "PolicyRuleValidator", "limit": 3 }),
     );
     assert_ne!(search["isError"], true);
@@ -1991,28 +2018,27 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert!(
         search_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_read"
-                && action["arguments"]["handles"].is_array()),
+            .any(|action| action["tool"] == TOOL_GET && action["arguments"]["handles"].is_array()),
         "search hits should offer handle hydration: {search_actions:?}"
     );
     assert!(
         search_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_read"
+            .any(|action| action["tool"] == TOOL_CONTEXT
                 && action["arguments"]["locations"].is_array()),
         "search hits should offer file-line context retrieval: {search_actions:?}"
     );
     assert!(
         search_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_symbol"),
+            .any(|action| action["tool"] == TOOL_SYMBOL),
         "search hits with symbol hints should offer symbol verification: {search_actions:?}"
     );
     assert!(
         search_actions
             .iter()
             .all(|action| action["tool"] != "oneup_impact"),
-        "impact should not be a primary P2 search next action: {search_actions:?}"
+        "impact should not be a primary search next action: {search_actions:?}"
     );
 
     let hit = &search_envelope["data"]["results"][0];
@@ -2024,7 +2050,7 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert!(hit["line_end"].as_u64().unwrap() >= hit["line_start"].as_u64().unwrap());
 
     let read_handle = client.call_tool(
-        "oneup_read",
+        TOOL_GET,
         serde_json::json!({ "handles": [format!(":{handle}")] }),
     );
     assert_mcp_response_is_presentation_free(&read_handle);
@@ -2032,11 +2058,11 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     let read_handle_text = read_handle["content"][0]["text"].as_str().unwrap();
     assert!(
         read_handle_text.contains("segment "),
-        "oneup_read text should include hydrated segment records, not only a status summary: {read_handle_text}"
+        "oneup_get text should include hydrated segment records, not only a status summary: {read_handle_text}"
     );
     assert!(
         read_handle_text.contains("PolicyRuleValidator"),
-        "oneup_read text should include hydrated source content: {read_handle_text}"
+        "oneup_get text should include hydrated source content: {read_handle_text}"
     );
     let read_handle_envelope = mcp_structured(&read_handle);
     assert_eq!(read_handle_envelope["status"], "ok");
@@ -2055,25 +2081,25 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert!(
         read_handle_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_read"
+            .any(|action| action["tool"] == TOOL_CONTEXT
                 && action["arguments"]["locations"].is_array()),
         "hydrated segments should offer surrounding file-line context: {read_handle_actions:?}"
     );
     assert!(
         read_handle_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_symbol"),
+            .any(|action| action["tool"] == TOOL_SYMBOL),
         "hydrated defining segments should offer symbol verification: {read_handle_actions:?}"
     );
     assert!(
         read_handle_actions
             .iter()
             .all(|action| action["tool"] != "oneup_impact"),
-        "impact should not be a primary P2 read next action: {read_handle_actions:?}"
+        "impact should not be a primary get next action: {read_handle_actions:?}"
     );
 
     let read_location = client.call_tool(
-        "oneup_read",
+        TOOL_CONTEXT,
         serde_json::json!({
             "locations": [{ "path": "src/policy.rs", "line": 4, "expansion": 2 }]
         }),
@@ -2082,11 +2108,11 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     let read_location_text = read_location["content"][0]["text"].as_str().unwrap();
     assert!(
         read_location_text.contains("context src/policy.rs:"),
-        "oneup_read location text should include hydrated context records: {read_location_text}"
+        "oneup_context text should include hydrated context records: {read_location_text}"
     );
     assert!(
         read_location_text.contains("validate(&self"),
-        "oneup_read location text should include source context: {read_location_text}"
+        "oneup_context text should include source context: {read_location_text}"
     );
     let read_location_envelope = mcp_structured(&read_location);
     assert_eq!(read_location_envelope["status"], "ok");
@@ -2102,7 +2128,7 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     );
 
     let symbol = client.call_tool(
-        "oneup_symbol",
+        TOOL_SYMBOL,
         serde_json::json!({ "name": "PolicyRuleValidator", "include": "both" }),
     );
     assert_mcp_response_is_presentation_free(&symbol);
@@ -2126,14 +2152,13 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert!(
         symbol_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_read"
-                && action["arguments"]["handles"].is_array()),
+            .any(|action| action["tool"] == TOOL_GET && action["arguments"]["handles"].is_array()),
         "symbol results should offer handle hydration: {symbol_actions:?}"
     );
     assert!(
         symbol_actions
             .iter()
-            .any(|action| action["tool"] == "oneup_read"
+            .any(|action| action["tool"] == TOOL_CONTEXT
                 && action["arguments"]["locations"].is_array()),
         "symbol results should offer file-line context retrieval: {symbol_actions:?}"
     );
@@ -2141,12 +2166,12 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
         symbol_actions
             .iter()
             .all(|action| action["tool"] != "oneup_impact"),
-        "impact should not be a primary P2 symbol next action: {symbol_actions:?}"
+        "impact should not be a primary symbol next action: {symbol_actions:?}"
     );
 }
 
 #[test]
-fn mcp_read_locations_returns_context_and_structured_location_failures() {
+fn mcp_context_returns_context_and_structured_location_failures() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join("src")).unwrap();
@@ -2160,7 +2185,7 @@ fn mcp_read_locations_returns_context_and_structured_location_failures() {
 
     let mut client = McpTestClient::start(&repo);
     let result = client.call_tool(
-        "oneup_read",
+        TOOL_CONTEXT,
         serde_json::json!({
             "locations": [
                 { "path": "src/policy.rs", "line": 2, "expansion": 1 },
@@ -2212,7 +2237,7 @@ fn mcp_read_locations_returns_context_and_structured_location_failures() {
     assert_mcp_next_actions_are_canonical(envelope);
 
     let failed = client.call_tool(
-        "oneup_read",
+        TOOL_CONTEXT,
         serde_json::json!({
             "locations": [
                 { "path": "src/policy.rs", "line": 0 },
@@ -2225,17 +2250,17 @@ fn mcp_read_locations_returns_context_and_structured_location_failures() {
     let failed_envelope = mcp_structured(&failed);
     assert_eq!(failed_envelope["status"], "empty");
     assert_eq!(failed_envelope["data"]["records"][0]["status"], "rejected");
-    assert_eq!(failed_envelope["next_actions"][0]["tool"], "oneup_search");
+    assert_eq!(failed_envelope["next_actions"][0]["tool"], TOOL_SEARCH);
 }
 
 #[test]
-fn mcp_read_handles_return_structured_not_found_and_ambiguous_records() {
+fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
     let tmp = create_ambiguous_handle_fixture();
     let _guard = init_and_index_fts_only(&tmp);
     let mut client = McpTestClient::start(tmp.path());
 
     let search = client.call_tool(
-        "oneup_search",
+        TOOL_SEARCH,
         serde_json::json!({ "query": "ambiguous_collision_token", "limit": 32 }),
     );
     assert_ne!(search["isError"], true);
@@ -2253,7 +2278,7 @@ fn mcp_read_handles_return_structured_not_found_and_ambiguous_records() {
     let ambiguous_prefix = ambiguous_handle_prefix(&handles);
 
     let result = client.call_tool(
-        "oneup_read",
+        TOOL_GET,
         serde_json::json!({ "handles": [ambiguous_prefix, ":does-not-exist"] }),
     );
     assert_eq!(result["isError"], true);
@@ -2271,7 +2296,75 @@ fn mcp_read_handles_return_structured_not_found_and_ambiguous_records() {
     );
     assert_eq!(records[1]["status"], "not_found");
     assert_eq!(records[1]["source"]["normalized"], "does-not-exist");
-    assert_eq!(envelope["next_actions"][0]["tool"], "oneup_search");
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
+}
+
+#[test]
+fn mcp_structural_returns_matches_and_explicit_diagnostics() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let matched = client.call_tool(
+        TOOL_STRUCTURAL,
+        serde_json::json!({
+            "pattern": "(struct_item name: (type_identifier) @name)",
+            "language": "rust"
+        }),
+    );
+    assert_ne!(matched["isError"], true);
+    assert_mcp_response_is_presentation_free(&matched);
+    let matched_envelope = mcp_structured(&matched);
+    assert_eq!(matched_envelope["status"], "ok");
+    assert!(matched_envelope["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["file_path"] == "src/policy.rs"
+            && record["content"] == "PolicyRuleValidator"));
+    assert_eq!(matched_envelope["next_actions"][0]["tool"], TOOL_CONTEXT);
+
+    let unsupported = client.call_tool(
+        TOOL_STRUCTURAL,
+        serde_json::json!({ "pattern": "(identifier) @name", "language": "haskell" }),
+    );
+    assert_eq!(unsupported["isError"], true);
+    assert_mcp_response_is_presentation_free(&unsupported);
+    let unsupported_envelope = mcp_structured(&unsupported);
+    assert_eq!(unsupported_envelope["status"], "error");
+    assert_eq!(
+        unsupported_envelope["data"]["diagnostics"][0]["kind"],
+        "unsupported_language"
+    );
+    assert!(unsupported_envelope["data"]["supported_languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|language| language == "rust"));
+
+    let invalid = client.call_tool(
+        TOOL_STRUCTURAL,
+        serde_json::json!({ "pattern": "(function_item) @fn", "language": "python" }),
+    );
+    assert_eq!(invalid["isError"], true);
+    assert_mcp_response_is_presentation_free(&invalid);
+    assert_eq!(
+        mcp_structured(&invalid)["data"]["diagnostics"][0]["kind"],
+        "invalid_pattern"
+    );
+
+    let empty = client.call_tool(
+        TOOL_STRUCTURAL,
+        serde_json::json!({ "pattern": "(enum_item) @enum", "language": "rust" }),
+    );
+    assert_ne!(empty["isError"], true);
+    assert_mcp_response_is_presentation_free(&empty);
+    let empty_envelope = mcp_structured(&empty);
+    assert_eq!(empty_envelope["status"], "empty");
+    assert!(empty_envelope["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -2281,7 +2374,7 @@ fn mcp_impact_preserves_trust_buckets_and_followups() {
     let mut client = McpTestClient::start(tmp.path());
 
     let expanded = client.call_tool(
-        "oneup_impact",
+        TOOL_IMPACT,
         serde_json::json!({ "symbol": "warm_cache_key" }),
     );
     assert_mcp_text_matches_summary(&expanded);
@@ -2302,10 +2395,37 @@ fn mcp_impact_preserves_trust_buckets_and_followups() {
             .any(|record| record["file_path"] == "src/cache/test_support.rs"),
         "impact output should preserve contextual lower-confidence guidance"
     );
-    assert_eq!(expanded_envelope["next_actions"][0]["tool"], "oneup_read");
+    assert_eq!(expanded_envelope["next_actions"][0]["tool"], TOOL_GET);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "load auth config", "limit": 5 }),
+    );
+    let handle = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["path"] == "src/auth/runtime.rs")
+        .and_then(|record| record["handle"].as_str())
+        .expect("search should return a runtime handle");
+    let handle_impact = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "handle": format!(":{handle}") }),
+    );
+    assert_ne!(handle_impact["isError"], true);
+    assert_mcp_response_is_presentation_free(&handle_impact);
+    let handle_envelope = mcp_structured(&handle_impact);
+    assert!(
+        matches!(
+            handle_envelope["status"].as_str().unwrap(),
+            "expanded" | "expanded_scoped" | "empty" | "empty_scoped"
+        ),
+        "public handle anchor should resolve to advisory impact output: {handle_envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(handle_envelope);
 
     let empty = client.call_tool(
-        "oneup_impact",
+        TOOL_IMPACT,
         serde_json::json!({ "file": "src/admin/config.rs" }),
     );
     let empty_envelope = mcp_structured(&empty);
@@ -2326,8 +2446,8 @@ fn mcp_impact_refusal_sets_is_error() {
     let mut client = McpTestClient::start(tmp.path());
 
     let result = client.call_tool(
-        "oneup_impact",
-        serde_json::json!({ "segment_id": "does-not-exist" }),
+        TOOL_IMPACT,
+        serde_json::json!({ "handle": "does-not-exist" }),
     );
 
     assert_eq!(result["isError"], true);
@@ -2341,13 +2461,13 @@ fn mcp_impact_refusal_sets_is_error() {
 }
 
 #[test]
-fn mcp_read_all_failed_handles_sets_is_error() {
+fn mcp_get_all_failed_handles_sets_is_error() {
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
     let mut client = McpTestClient::start(tmp.path());
 
     let result = client.call_tool(
-        "oneup_read",
+        TOOL_GET,
         serde_json::json!({ "handles": [":does-not-exist"] }),
     );
 
@@ -2760,8 +2880,13 @@ fn get_returns_body_for_known_handle() {
     assert!(!rows.is_empty());
     let handle = rows[0].segment_id.clone();
 
-    let (stdout, stderr, ok) =
-        run_core_cmd(&["get", &handle, "--path", tmp.path().to_str().unwrap()]);
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "get",
+        &handle,
+        "--plain",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
     assert!(ok, "get failed: {stderr}");
 
     let records = parse_get_records(&stdout);
@@ -2788,6 +2913,7 @@ fn get_tolerates_leading_colon_handle() {
     let (stdout, stderr, ok) = run_core_cmd(&[
         "get",
         &handle_with_colon,
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -2808,6 +2934,7 @@ fn get_reports_not_found_for_unknown_handle() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "get",
         "ffffffffffff",
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -2834,6 +2961,7 @@ fn get_preserves_order_across_handles() {
         &first,
         "ffffffffffff",
         &second,
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -2848,14 +2976,14 @@ fn get_preserves_order_across_handles() {
 }
 
 // =============================================================================
-// Search handle handoff: search -> impact --from-segment preserves ranking
+// Search handle handoff: search -> impact --from-handle preserves ranking
 // =============================================================================
 
 #[test]
 fn search_segment_id_round_trips_into_impact_from_segment() {
     // The lean row grammar emits a 12-char display handle (`:<prefix>`). `get`
     // resolves that prefix back to the full segment id, which is what
-    // `impact --from-segment` expects for its exact-anchor lookup. This pins
+    // `impact --from-handle` expects for its exact-anchor lookup. This pins
     // the discovery -> hydrate -> impact follow-up chain at the row-grammar
     // layer.
     let tmp = create_impact_acceptance_fixture();
@@ -2871,6 +2999,7 @@ fn search_segment_id_round_trips_into_impact_from_segment() {
     let (get_stdout, _stderr, ok) = run_core_cmd(&[
         "get",
         &handle_prefix,
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -2882,7 +3011,7 @@ fn search_segment_id_round_trips_into_impact_from_segment() {
         .expect("get should resolve the prefix to a full segment id");
     assert!(full_segment_id.starts_with(&handle_prefix));
 
-    let impact = impact_rows(tmp.path(), &["--from-segment", &full_segment_id]);
+    let impact = impact_rows(tmp.path(), &["--from-handle", &full_segment_id]);
     assert!(!impact.is_empty());
     assert!(impact
         .iter()
@@ -2895,7 +3024,7 @@ fn search_segment_id_round_trips_into_impact_from_segment() {
 
 #[test]
 fn search_segment_id_handoff_keeps_search_top_hits_stable() {
-    // The hand-off from `search` to `impact --from-segment` must not perturb
+    // The hand-off from `search` to `impact --from-handle` must not perturb
     // subsequent search ranking.
     let tmp = create_impact_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);
@@ -2904,7 +3033,7 @@ fn search_segment_id_handoff_keeps_search_top_hits_stable() {
     assert!(!before.is_empty());
 
     let segment_id = before[0].segment_id.clone();
-    let _ = impact_rows(tmp.path(), &["--from-segment", &segment_id]);
+    let _ = impact_rows(tmp.path(), &["--from-handle", &segment_id]);
     let after = search_rows(tmp.path(), "load auth config");
 
     let before_ranked: Vec<_> = before
@@ -2932,6 +3061,7 @@ fn context_retrieval_returns_enclosing_scope() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "context",
         "main.rs:4",
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -2961,6 +3091,7 @@ fn context_retrieval_python_scope() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "context",
         "utils.py:6",
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);
@@ -3041,6 +3172,7 @@ fn context_allows_absolute_in_root_path_with_explicit_override() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "context",
         &location,
+        "--plain",
         "--path",
         project_root.to_str().unwrap(),
         "--allow-outside-root",
@@ -3067,6 +3199,7 @@ fn context_allows_outside_root_with_explicit_override() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "context",
         &location,
+        "--plain",
         "--path",
         project_root.to_str().unwrap(),
         "--allow-outside-root",
@@ -3381,7 +3514,7 @@ fn add_mcp_runner_override_requires_available_runner() {
                 .and(predicate::str::contains(
                     "selected runner `npx` was not found on PATH",
                 ))
-                .and(predicate::str::contains("call `oneup_prepare`")),
+                .and(predicate::str::contains("call `oneup_status`")),
         );
 }
 
@@ -3414,7 +3547,7 @@ fn add_mcp_fallback_has_manual_snippets() {
                 .and(predicate::str::contains("Generic MCP JSON"))
                 .and(predicate::str::contains("Codex TOML"))
                 .and(predicate::str::contains("server identity `oneup`"))
-                .and(predicate::str::contains("call `oneup_prepare`"))
+                .and(predicate::str::contains("call `oneup_status`"))
                 .and(predicate::str::contains("add-mcp exited with exit code 17")),
         );
 }
@@ -3724,6 +3857,7 @@ fn cli_symbol_empty_results_emits_nothing_on_stdout() {
     let (stdout, _stderr, ok) = run_core_cmd(&[
         "symbol",
         "zznonexistentsymbolzz",
+        "--plain",
         "--path",
         tmp.path().to_str().unwrap(),
     ]);

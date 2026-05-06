@@ -5,24 +5,47 @@ use std::path::PathBuf;
 
 use crate::shared::types::{BranchStatus, DaemonRefreshState, DaemonWatchStatus, WorktreeRole};
 
+pub const TOOL_STATUS: &str = "oneup_status";
+pub const TOOL_START: &str = "oneup_start";
+pub const TOOL_SEARCH: &str = "oneup_search";
+pub const TOOL_GET: &str = "oneup_get";
+pub const TOOL_SYMBOL: &str = "oneup_symbol";
+pub const TOOL_CONTEXT: &str = "oneup_context";
+pub const TOOL_IMPACT: &str = "oneup_impact";
+pub const TOOL_STRUCTURAL: &str = "oneup_structural";
+
+pub const RETAINED_PUBLIC_TOOLS: [&str; 8] = [
+    TOOL_STATUS,
+    TOOL_START,
+    TOOL_SEARCH,
+    TOOL_GET,
+    TOOL_SYMBOL,
+    TOOL_CONTEXT,
+    TOOL_IMPACT,
+    TOOL_STRUCTURAL,
+];
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PrepareMode {
+pub enum StartMode {
     #[default]
-    #[serde(alias = "default")]
-    #[serde(alias = "read")]
-    Check,
-    IndexIfMissing,
     #[serde(alias = "auto")]
     IndexIfNeeded,
+    IndexIfMissing,
     Reindex,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PrepareInput {
+pub struct StatusInput {
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StartInput {
     #[serde(default)]
-    pub mode: PrepareMode,
+    pub mode: StartMode,
     pub path: Option<String>,
 }
 
@@ -36,9 +59,16 @@ pub struct SearchInput {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ReadInput {
+pub struct GetInput {
     #[serde(default)]
+    #[schemars(description = "Durable result handles returned by oneup_search or oneup_symbol.")]
     pub handles: Vec<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextInput {
     #[serde(default)]
     #[schemars(
         description = "Repository-scoped locations for file-line context retrieval. Use paths relative to the configured repository and 1-based line numbers."
@@ -49,9 +79,7 @@ pub struct ReadInput {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(
-    description = "A repository-contained file-line location for oneup_read context retrieval."
-)]
+#[schemars(description = "A repository-contained file-line location for oneup_context retrieval.")]
 pub struct ReadLocationInput {
     #[schemars(
         description = "File path relative to the configured repository. Absolute paths are accepted only when they stay inside that repository."
@@ -63,6 +91,19 @@ pub struct ReadLocationInput {
         description = "Optional number of fallback lines to include around the requested line when no enclosing scope is found."
     )]
     pub expansion: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralInput {
+    #[schemars(description = "Tree-sitter query pattern in S-expression syntax.")]
+    pub pattern: String,
+    #[schemars(
+        description = "Optional supported language filter such as rust, python, go, or typescript."
+    )]
+    pub language: Option<String>,
+    pub limit: Option<usize>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
@@ -88,7 +129,11 @@ pub struct SymbolInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImpactInput {
-    pub segment_id: Option<String>,
+    #[serde(alias = "segment_id")]
+    #[schemars(
+        description = "Result handle returned by oneup_search or oneup_symbol. A leading ':' is accepted. The older segment_id field name is accepted as a compatibility alias."
+    )]
+    pub handle: Option<String>,
     pub symbol: Option<String>,
     pub file: Option<String>,
     pub line: Option<usize>,

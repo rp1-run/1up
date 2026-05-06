@@ -190,12 +190,12 @@ describe("assertNoFallbackTools", () => {
 });
 
 describe("assertReadAfterSearch", () => {
-  test("passes when oneup_read hydrates a handle after search", () => {
+  test("passes when oneup_get hydrates a handle after search", () => {
     const result = assertReadAfterSearch(
       "",
       makeContext([
         toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
-        toolCall("mcp__oneup__oneup_read", { handles: [":abc123def456"] }),
+        toolCall("mcp__oneup__oneup_get", { handles: [":abc123def456"] }),
       ]),
     );
 
@@ -203,12 +203,12 @@ describe("assertReadAfterSearch", () => {
     expect(result.score).toBe(1);
   });
 
-  test("passes when oneup_read hydrates a precise location after search", () => {
+  test("passes when oneup_context hydrates a precise location after search", () => {
     const result = assertReadAfterSearch(
       "",
       makeContext([
         toolCall("mcp__oneup__oneup_search", { query: "daemon worker" }),
-        toolCall("mcp__oneup__oneup_read", {
+        toolCall("mcp__oneup__oneup_context", {
           locations: [{ path: "src/daemon/worker.rs", line: 42 }],
         }),
       ]),
@@ -225,7 +225,8 @@ describe("assertReadAfterSearch", () => {
     );
 
     expect(result.pass).toBe(false);
-    expect(result.reason).toContain("oneup_read");
+    expect(result.reason).toContain("oneup_get");
+    expect(result.reason).toContain("oneup_context");
   });
 });
 
@@ -275,7 +276,7 @@ describe("assertValidOneupMcpCalls", () => {
     const result = assertValidOneupMcpCalls(
       "",
       makeContext([
-        toolCall("mcp__oneup__oneup_prepare", { mode: "check" }),
+        toolCall("mcp__oneup__oneup_status", {}),
         toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
       ]),
     );
@@ -285,11 +286,14 @@ describe("assertValidOneupMcpCalls", () => {
 
   test("passes for every canonical oneup MCP tool name form", () => {
     const canonicalTools = [
-      "oneup_prepare",
+      "oneup_status",
+      "oneup_start",
       "oneup_search",
-      "oneup_read",
+      "oneup_get",
       "oneup_symbol",
+      "oneup_context",
       "oneup_impact",
+      "oneup_structural",
     ];
     const calls = canonicalTools.flatMap((tool) => [
       toolCall(tool, {}),
@@ -309,23 +313,19 @@ describe("assertValidOneupMcpCalls", () => {
       "",
       makeContext([
         toolCall("mcp__oneup__1up_search", { query: "daemon" }),
-        toolCall("mcp__oneup__oneup_read", { handles: [":bad"] }, true),
+        toolCall("mcp__oneup__oneup_get", { handles: [":bad"] }, true),
       ]),
     );
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("digit-leading");
-    expect(result.reason).toContain("errored MCP call oneup_read");
+    expect(result.reason).toContain("errored MCP call oneup_get");
   });
 
   test("fails on unknown oneup MCP server tools", () => {
     const result = assertValidOneupMcpCalls(
       "",
-      makeContext([
-        toolCall("mcp__oneup__oneup_structural", {
-          query: "(call_expression)",
-        }),
-      ]),
+      makeContext([toolCall("mcp__oneup__oneup_probe", {})]),
     );
 
     expect(result.pass).toBe(false);

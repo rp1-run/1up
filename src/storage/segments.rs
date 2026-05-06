@@ -729,6 +729,35 @@ pub async fn get_file_paths_by_language(
     Ok(paths)
 }
 
+/// Get all distinct file paths for a given language inside one index context.
+pub async fn get_file_paths_by_language_for_context(
+    conn: &Connection,
+    context_id: &str,
+    language: &str,
+) -> Result<Vec<String>, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(
+            queries::SELECT_FILE_PATHS_BY_LANGUAGE_FOR_CONTEXT,
+            libsql::params![context_id, language],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("query file paths by language failed: {e}")))?;
+
+    let mut paths = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let path: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 /// Set a key-value pair in the meta table.
 #[allow(dead_code)]
 pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), OneupError> {
@@ -1932,6 +1961,52 @@ mod tests {
 
         let paths = get_all_file_paths(&conn).await.unwrap();
         assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[tokio::test]
+    async fn file_paths_by_language_are_scoped_to_context() {
+        let (_db, conn) = setup().await;
+        let main_context = "ctx-main";
+        let linked_context = "ctx-linked";
+
+        let rust_main = test_segment("main-rust", "src/main.rs", "hash-main");
+        let rust_linked = test_segment("linked-rust", "src/linked.rs", "hash-linked");
+        let mut python_main = test_segment("main-python", "src/main.py", "hash-python");
+        python_main.language = "python".to_string();
+
+        replace_file_segments_for_context_tx(&conn, main_context, "src/main.rs", &[rust_main])
+            .await
+            .unwrap();
+        replace_file_segments_for_context_tx(
+            &conn,
+            linked_context,
+            "src/linked.rs",
+            &[rust_linked],
+        )
+        .await
+        .unwrap();
+        replace_file_segments_for_context_tx(&conn, main_context, "src/main.py", &[python_main])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_file_paths_by_language_for_context(&conn, main_context, "rust")
+                .await
+                .unwrap(),
+            vec!["src/main.rs"]
+        );
+        assert_eq!(
+            get_file_paths_by_language_for_context(&conn, linked_context, "rust")
+                .await
+                .unwrap(),
+            vec!["src/linked.rs"]
+        );
+        assert_eq!(
+            get_file_paths_by_language_for_context(&conn, linked_context, "python")
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]

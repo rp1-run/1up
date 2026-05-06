@@ -8,9 +8,11 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 | You know | Use |
 |---|---|
-| Readiness is uncertain | `oneup_prepare` |
+| Readiness is uncertain | `oneup_status` |
+| Indexing or rebuilding is needed | `oneup_start` with the mode suggested by status |
 | Concept, behavior, or feature area | `oneup_search` |
-| A promising handle or file location | `oneup_read` |
+| A promising handle | `oneup_get` |
+| A specific file location | `oneup_context` |
 | A known or discovered symbol needs definitions/references | `oneup_symbol` |
 | Blast radius or likely follow-up targets matter | `oneup_impact` |
 
@@ -22,9 +24,10 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 1. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
 2. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
-3. Read primary results with `oneup_read` when you need implementation details.
-4. Use `oneup_symbol` to verify direct references for important symbols.
-5. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
+3. Read primary result handles with `oneup_get` when you need implementation details.
+4. Use `oneup_context` for precise file-line context when needed.
+5. Use `oneup_symbol` to verify direct references for important symbols.
+6. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
 
 {{TASK_PROMPT}}
 

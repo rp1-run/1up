@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use clap::Args;
 
-use crate::cli::lean;
+use crate::cli::{discovery_output, lean};
 use crate::daemon::lifecycle;
 use crate::search::{SearchScope, SymbolSearchEngine};
 use crate::shared::config::project_db_path;
@@ -26,6 +26,10 @@ pub struct SymbolArgs {
     /// Project root directory (defaults to current directory)
     #[arg(long, default_value = ".")]
     pub path: String,
+
+    /// Emit the stable lean output grammar instead of human-readable output
+    #[arg(long)]
+    pub plain: bool,
 }
 
 pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
@@ -66,7 +70,17 @@ pub async fn exec(args: SymbolArgs) -> anyhow::Result<()> {
     }
 
     let mut stdout = io::stdout().lock();
-    lean::render_symbol(&mut stdout, &results)?;
+    if args.plain {
+        lean::render_symbol(&mut stdout, &results)?;
+    } else {
+        discovery_output::render_symbol(
+            &mut stdout,
+            &args.name,
+            args.references,
+            args.fuzzy,
+            &results,
+        )?;
+    }
     stdout.flush()?;
     Ok(())
 }

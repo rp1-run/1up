@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use crate::cli::lean;
+use crate::cli::{discovery_output, lean};
 use crate::daemon::lifecycle;
 use crate::search::context::{parse_location, ContextEngine};
 use crate::shared::errors::{FilesystemError, OneupError};
@@ -27,6 +27,10 @@ pub struct ContextArgs {
     /// Allow reading a canonicalized target outside the selected project root
     #[arg(long)]
     pub allow_outside_root: bool,
+
+    /// Emit the stable lean output grammar instead of human-readable output
+    #[arg(long)]
+    pub plain: bool,
 }
 
 pub async fn exec(args: ContextArgs) -> anyhow::Result<()> {
@@ -53,7 +57,11 @@ pub async fn exec(args: ContextArgs) -> anyhow::Result<()> {
         }
     };
     let mut stdout = io::stdout().lock();
-    lean::render_context(&mut stdout, &result)?;
+    if args.plain {
+        lean::render_context(&mut stdout, &result)?;
+    } else {
+        discovery_output::render_context(&mut stdout, &result)?;
+    }
     stdout.flush()?;
     Ok(())
 }

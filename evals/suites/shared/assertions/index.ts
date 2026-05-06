@@ -362,19 +362,26 @@ function toolCallIndex(calls: readonly ToolCall[], tool: OneupMcpTool): number {
   return calls.findIndex((tc) => toOneupMcpTool(tc.name) === tool);
 }
 
-function hasReadTarget(input: unknown): boolean {
+function hasGetTarget(input: unknown): boolean {
   if (!input || typeof input !== "object") {
     return false;
   }
 
   const request = input as {
     handles?: unknown;
+  };
+  return Array.isArray(request.handles) && request.handles.length > 0;
+}
+
+function hasContextTarget(input: unknown): boolean {
+  if (!input || typeof input !== "object") {
+    return false;
+  }
+
+  const request = input as {
     locations?: unknown;
   };
-  return (
-    (Array.isArray(request.handles) && request.handles.length > 0) ||
-    (Array.isArray(request.locations) && request.locations.length > 0)
-  );
+  return Array.isArray(request.locations) && request.locations.length > 0;
 }
 
 function fallbackViolations(context: EvalContext): string[] {
@@ -481,20 +488,25 @@ export function assertReadAfterSearch(
 ): GradingResult {
   const calls = getToolCalls(context);
   const searchIndex = toolCallIndex(calls, "oneup_search");
-  const readIndex = calls.findIndex(
-    (tc, index) =>
-      index > searchIndex &&
-      toOneupMcpTool(tc.name) === "oneup_read" &&
-      hasReadTarget(tc.input),
-  );
-  const pass = searchIndex !== -1 && readIndex !== -1;
+  const hydrationIndex = calls.findIndex((tc, index) => {
+    if (index <= searchIndex) {
+      return false;
+    }
+
+    const tool = toOneupMcpTool(tc.name);
+    return (
+      (tool === "oneup_get" && hasGetTarget(tc.input)) ||
+      (tool === "oneup_context" && hasContextTarget(tc.input))
+    );
+  });
+  const pass = searchIndex !== -1 && hydrationIndex !== -1;
 
   return {
     pass,
     score: pass ? 1 : 0,
     reason: pass
-      ? "Agent hydrated a search result with oneup_read"
-      : `Agent did not call oneup_read with handles or locations after oneup_search. MCP 1up calls seen: ${formatToolNames(getOneupCalls(context))}`,
+      ? "Agent hydrated a search result with oneup_get or oneup_context"
+      : `Agent did not call oneup_get with handles or oneup_context with locations after oneup_search. MCP 1up calls seen: ${formatToolNames(getOneupCalls(context))}`,
   };
 }
 

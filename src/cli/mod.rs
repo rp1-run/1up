@@ -1,5 +1,6 @@
 pub mod add_mcp;
 pub mod context;
+pub mod discovery_output;
 pub mod get;
 pub mod impact;
 pub mod index;
@@ -25,7 +26,7 @@ use crate::shared::types::OutputFormat;
 #[derive(Parser)]
 #[command(
     name = "🍄 1up",
-    about = "🍄 1up — Manage the local project lifecycle",
+    about = "🍄 1up — Manage local project lifecycle and code discovery",
     help_template = "\
 {about}
 
@@ -36,6 +37,10 @@ Commands:
   status  Show project lifecycle, daemon, and index state
   list    List registered 1up projects
   stop    Stop lifecycle activity for a project
+  get     Hydrate indexed result handles
+  symbol  Look up symbol definitions and references
+  context Read source context around a file location
+  impact  Explore advisory likely impact from a known anchor
 
 Options:
 {options}",
@@ -73,9 +78,7 @@ pub enum Command {
     #[command(hide = true)]
     Init(init::InitArgs),
 
-    /// Look up symbol definitions and references. Emits one lean row per hit
-    /// (`<score>  <path>:<l1>-<l2>  <kind>  <breadcrumb>::<symbol>  :<segment_id>`).
-    #[command(hide = true)]
+    /// Look up symbol definitions and references
     Symbol(symbol::SymbolArgs),
 
     /// Hybrid semantic + full-text search. Emits one lean row per hit
@@ -84,22 +87,13 @@ pub enum Command {
     #[command(hide = true)]
     Search(search::SearchArgs),
 
-    /// Hydrate one or more segment handles to their full indexed record. Emits
-    /// `segment <id>` header, tab-separated metadata, blank line, body, `---`
-    /// sentinel per handle in request order; unknown handles emit `not_found`.
-    #[command(hide = true)]
+    /// Hydrate one or more result handles to full indexed records
     Get(get::GetArgs),
 
-    /// Retrieve code context around a file location. Emits
-    /// `<path>:<l1>-<l2>  context  <scope_type>` header followed by numbered
-    /// body lines; no `:<segment_id>` suffix because context is read-after-pick.
-    #[command(hide = true)]
+    /// Retrieve code context around a file location
     Context(context::ContextArgs),
 
-    /// Explore probable impact from a known anchor. Emits lean rows with a
-    /// trailing `~P` (primary) or `~C` (contextual) channel tag; `refused`,
-    /// `empty`, and `empty_scoped` envelopes render as terminal status lines.
-    #[command(hide = true)]
+    /// Explore advisory likely impact from a known anchor
     Impact(impact::ImpactArgs),
 
     /// Structural AST-pattern search using tree-sitter queries. Emits one lean
@@ -242,11 +236,8 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// Core commands (`search`, `get`, `symbol`, `impact`, `context`,
-    /// `structural`, `mcp`) must not accept any presentation flag. Verifies at clap
-    /// parse time that `-f`/`--format` (and variants like `--human`/`--full`)
-    /// are rejected as unknown arguments so agents get a clean signal, not
-    /// silent coercion.
+    /// Core commands must not accept maintenance format flags. Retained human
+    /// discovery commands use `--plain` for lean output instead.
     #[test]
     fn core_commands_have_no_format_arg() {
         let core_cases: &[&[&str]] = &[
@@ -279,6 +270,24 @@ mod tests {
             assert!(
                 result.is_err(),
                 "core command accepted a format flag: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_discovery_commands_accept_plain_arg() {
+        let core_cases: &[&[&str]] = &[
+            &["1up", "symbol", "Config", "--plain"],
+            &["1up", "get", "abc123def456", "--plain"],
+            &["1up", "context", "src/main.rs:1", "--plain"],
+            &["1up", "impact", "--from-symbol", "Config", "--plain"],
+        ];
+        for argv in core_cases {
+            let result = Cli::try_parse_from(argv.iter().copied());
+            assert!(
+                result.is_ok(),
+                "retained discovery command rejected --plain: {argv:?} -> {:?}",
+                result.err()
             );
         }
     }
@@ -370,10 +379,12 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_shows_only_p1_lifecycle_commands() {
+    fn top_level_help_shows_lifecycle_and_retained_discovery_commands() {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
-        let visible_commands = ["start", "status", "list", "stop"];
+        let visible_commands = [
+            "start", "status", "list", "stop", "get", "symbol", "context", "impact",
+        ];
 
         for command_name in visible_commands {
             assert!(
@@ -386,11 +397,7 @@ mod tests {
         let hidden_commands = [
             "add-mcp",
             "init",
-            "symbol",
             "search",
-            "get",
-            "context",
-            "impact",
             "structural",
             "mcp",
             "index",

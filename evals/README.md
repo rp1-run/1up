@@ -4,9 +4,9 @@ Deterministic quality harnesses for 1up search and agent adoption.
 
 ## MCP adoption harness
 
-The 1up agent variants in `suites/1up-search/evals.yaml` and `suites/1up-impact/evals.yaml` run the local MCP server with command `1up` and args `["mcp", "--path", "."]`. Prompts instruct agents to use canonical `oneup_prepare`, `oneup_search`, `oneup_read`, `oneup_symbol`, and `oneup_impact` tool calls instead of shelling out to `1up ...`.
+The 1up agent variants in `suites/1up-search/evals.yaml` and `suites/1up-impact/evals.yaml` run the local MCP server with command `1up` and args `["mcp", "--path", "."]`. Prompts instruct agents to use canonical retained MCP tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural` instead of shelling out to `1up ...`.
 
-The shared assertions inspect provider MCP tool-call metadata. They require MCP search before discovery, handle or location hydration with `oneup_read`, symbol verification with `oneup_symbol` when completeness matters, and `oneup_impact` plus primary/contextual interpretation for impact tasks. Broad raw `grep`, `rg`, and `find` usage is a failure in the 1up variant; exact literal `grep` or `rg` verification is allowed only after MCP discovery narrows scope to precise files.
+The shared assertions inspect provider MCP tool-call metadata. They require MCP search before discovery, handle hydration with `oneup_get` or file-line context with `oneup_context`, symbol verification with `oneup_symbol` when completeness matters, and `oneup_impact` plus primary/contextual interpretation for impact tasks. Broad raw `grep`, `rg`, and `find` usage is a failure in the 1up variant; exact literal `grep` or `rg` verification is allowed only after MCP discovery narrows scope to precise files.
 
 Release readiness uses these existing suites as the MCP adoption evidence source. `scripts/release/generate_release_evidence.sh` records a retained summary JSON when one is available, or an explicit skipped reason when provider credentials, host access, or artifact retention are unavailable; no separate installation-readiness eval harness is required.
 

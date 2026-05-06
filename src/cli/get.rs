@@ -3,7 +3,7 @@ use std::path::Path;
 
 use clap::Args;
 
-use crate::cli::lean;
+use crate::cli::{discovery_output, lean};
 use crate::shared::config::project_db_path;
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -35,6 +35,10 @@ pub struct GetArgs {
     /// Project root directory (defaults to current directory)
     #[arg(long, default_value = ".")]
     pub path: String,
+
+    /// Emit the stable lean output grammar instead of human-readable output
+    #[arg(long)]
+    pub plain: bool,
 }
 
 pub async fn exec(args: GetArgs) -> anyhow::Result<()> {
@@ -59,7 +63,14 @@ pub async fn exec(args: GetArgs) -> anyhow::Result<()> {
     for raw_handle in &args.handles {
         let handle = normalize_handle(raw_handle);
         let outcome = resolve_handle(&conn, &handle).await?;
-        write_outcome(&mut stdout, &mut stderr, raw_handle, &handle, &outcome)?;
+        write_outcome(
+            &mut stdout,
+            &mut stderr,
+            raw_handle,
+            &handle,
+            &outcome,
+            args.plain,
+        )?;
     }
 
     stdout.flush()?;
@@ -105,12 +116,19 @@ fn write_outcome<W: Write, E: Write>(
     raw_handle: &str,
     handle: &str,
     outcome: &HandleOutcome,
+    plain: bool,
 ) -> anyhow::Result<()> {
     match outcome {
-        HandleOutcome::Found(segment) => lean::render_get_found(out, segment)?,
-        HandleOutcome::NotFound => lean::render_get_not_found(out, raw_handle)?,
+        HandleOutcome::Found(segment) if plain => lean::render_get_found(out, segment)?,
+        HandleOutcome::Found(segment) => discovery_output::render_get_found(out, segment)?,
+        HandleOutcome::NotFound if plain => lean::render_get_not_found(out, raw_handle)?,
+        HandleOutcome::NotFound => discovery_output::render_get_not_found(out, raw_handle)?,
         HandleOutcome::Ambiguous(ids) => {
-            lean::render_get_not_found(out, raw_handle)?;
+            if plain {
+                lean::render_get_not_found(out, raw_handle)?;
+            } else {
+                discovery_output::render_get_not_found(out, raw_handle)?;
+            }
             writeln!(
                 err,
                 "handle `{handle}` matched {} segments: {}. Provide a longer prefix.",
@@ -150,5 +168,11 @@ mod tests {
     fn get_args_accept_multiple_handles_in_order() {
         let cli = TestCli::parse_from(["test", "a0f1", "b7c2", ":c4d5"]);
         assert_eq!(cli.args.handles, vec!["a0f1", "b7c2", ":c4d5"]);
+    }
+
+    #[test]
+    fn get_args_accept_plain_mode() {
+        let cli = TestCli::parse_from(["test", "a0f1", "--plain"]);
+        assert!(cli.args.plain);
     }
 }

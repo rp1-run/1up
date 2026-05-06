@@ -237,7 +237,7 @@ fn manual_fallback_text(repo_path: &str) -> String {
          command = \"1up\"\n\
          args = [\"mcp\", \"--path\", \"{repo_path}\"]\n\
          \n\
-         After saving host-owned configuration, reload the agent host, list MCP tools, and call `oneup_prepare`."
+         After saving host-owned configuration, reload the agent host, list MCP tools, and call `oneup_status`."
     )
 }
 
@@ -318,6 +318,6 @@ mod tests {
 
         assert!(text.contains("server identity `oneup`"));
         assert!(text.contains("[\"mcp\", \"--path\", \"/tmp/repo\"]"));
-        assert!(text.contains("call `oneup_prepare`"));
+        assert!(text.contains("call `oneup_status`"));
     }
 }

@@ -724,6 +724,12 @@ SELECT DISTINCT file_path FROM segments
 WHERE language = ?1
 ORDER BY file_path";
 
+pub const SELECT_FILE_PATHS_BY_LANGUAGE_FOR_CONTEXT: &str = "
+SELECT DISTINCT file_path FROM segments
+WHERE context_id = ?1
+  AND language = ?2
+ORDER BY file_path";
+
 #[allow(dead_code)]
 pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,

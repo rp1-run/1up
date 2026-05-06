@@ -241,12 +241,14 @@ impl Drop for HideModelGuard {
 }
 
 #[test]
-fn top_level_help_shows_only_p1_lifecycle_commands() {
+fn top_level_help_shows_lifecycle_and_retained_discovery_commands() {
     let output = cmd().arg("--help").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
 
-    for visible in ["start", "status", "list", "stop"] {
+    for visible in [
+        "start", "status", "list", "stop", "get", "symbol", "context", "impact",
+    ] {
         assert!(
             stdout
                 .lines()
@@ -258,11 +260,7 @@ fn top_level_help_shows_only_p1_lifecycle_commands() {
     for hidden in [
         "add-mcp",
         "init",
-        "symbol",
         "search",
-        "get",
-        "context",
-        "impact",
         "structural",
         "mcp",
         "index",
@@ -299,7 +297,9 @@ fn worker_subcommand_hidden_from_help() {
 
 #[test]
 fn subcommand_help_works() {
-    for sub in &["start", "stop", "status", "list"] {
+    for sub in &[
+        "start", "stop", "status", "list", "get", "symbol", "context", "impact",
+    ] {
         cmd()
             .args([sub, "--help"])
             .assert()
@@ -419,6 +419,155 @@ fn status_defaults_to_human_output() {
                 .and(predicate::str::contains("Index:"))
                 .and(predicate::str::contains("daemon:").not()),
         );
+}
+
+#[test]
+fn retained_discovery_commands_cover_default_human_and_plain_output() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "pub fn fixture_symbol() -> &'static str {\n    \"fixture\"\n}\n\npub fn call_fixture() -> &'static str {\n    fixture_symbol()\n}\n",
+    )
+    .unwrap();
+
+    let _guard = HideModelGuard::new();
+    cmd()
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+    cmd()
+        .args(["index", dir.path().to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    let symbol_human = cmd()
+        .args([
+            "symbol",
+            "fixture_symbol",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(symbol_human.status.success());
+    let symbol_human_stdout = text_stdout(&symbol_human);
+    assert_no_ansi(&symbol_human_stdout);
+    assert!(symbol_human_stdout.contains("Symbols for `fixture_symbol`"));
+    assert!(symbol_human_stdout.contains("Matches:"));
+    assert!(symbol_human_stdout.contains("Handle:"));
+
+    let symbol_plain = cmd()
+        .args([
+            "symbol",
+            "fixture_symbol",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(symbol_plain.status.success());
+    let symbol_plain_stdout = text_stdout(&symbol_plain);
+    assert_no_ansi(&symbol_plain_stdout);
+    assert!(symbol_plain_stdout.contains("def:function"));
+    assert!(!symbol_plain_stdout.contains("Symbols for"));
+    let handle = symbol_plain_stdout
+        .lines()
+        .find_map(|line| line.split_whitespace().last())
+        .expect("symbol plain output should include a handle")
+        .trim_start_matches(':')
+        .to_string();
+
+    let get_human = cmd()
+        .args(["get", &handle, "--path", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(get_human.status.success());
+    let get_human_stdout = text_stdout(&get_human);
+    assert_no_ansi(&get_human_stdout);
+    assert!(get_human_stdout.contains("Segment "));
+    assert!(get_human_stdout.contains("Path: src/lib.rs"));
+
+    let get_plain = cmd()
+        .args([
+            "get",
+            &handle,
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(get_plain.status.success());
+    let get_plain_stdout = text_stdout(&get_plain);
+    assert_no_ansi(&get_plain_stdout);
+    assert!(get_plain_stdout.starts_with("segment "));
+    assert!(get_plain_stdout.contains("path\tsrc/lib.rs"));
+
+    let context_human = cmd()
+        .args([
+            "context",
+            "src/lib.rs:1",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(context_human.status.success());
+    let context_human_stdout = text_stdout(&context_human);
+    assert_no_ansi(&context_human_stdout);
+    assert!(context_human_stdout.contains("Context "));
+    assert!(context_human_stdout.contains("Scope:"));
+    assert!(context_human_stdout.contains("Language:"));
+
+    let context_plain = cmd()
+        .args([
+            "context",
+            "src/lib.rs:1",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(context_plain.status.success());
+    let context_plain_stdout = text_stdout(&context_plain);
+    assert_no_ansi(&context_plain_stdout);
+    assert!(context_plain_stdout.contains("  context  "));
+    assert!(!context_plain_stdout.contains("Context "));
+
+    let impact_human = cmd()
+        .args([
+            "impact",
+            "--from-file",
+            "src/lib.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(impact_human.status.success());
+    let impact_human_stdout = text_stdout(&impact_human);
+    assert_no_ansi(&impact_human_stdout);
+    assert!(impact_human_stdout.contains("Likely impact (advisory)"));
+    assert!(impact_human_stdout.contains("Status:"));
+
+    let impact_plain = cmd()
+        .args([
+            "impact",
+            "--from-handle",
+            &handle,
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(impact_plain.status.success());
+    let impact_plain_stdout = text_stdout(&impact_plain);
+    assert_no_ansi(&impact_plain_stdout);
+    assert!(!impact_plain_stdout.contains("Likely impact (advisory)"));
 }
 
 #[test]
