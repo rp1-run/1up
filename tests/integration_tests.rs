@@ -1620,14 +1620,22 @@ fn mcp_tools_list_default_palette_and_schemas() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(
-        names,
-        RETAINED_PUBLIC_TOOLS
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(tools.len(), RETAINED_PUBLIC_TOOLS.len());
+    let expected_names = [
+        "oneup_status",
+        "oneup_start",
+        "oneup_search",
+        "oneup_get",
+        "oneup_symbol",
+        "oneup_context",
+        "oneup_impact",
+        "oneup_structural",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(names, expected_names);
+    assert_eq!(tools.len(), expected_names.len());
+    assert!(!names.contains("oneup_prepare"));
+    assert!(!names.contains("oneup_read"));
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
@@ -1882,6 +1890,35 @@ fn mcp_status_ignores_index_rows_from_other_context() {
         "index_if_missing"
     );
     assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
+}
+
+#[test]
+fn mcp_get_ignores_handles_from_other_context() {
+    let project = TempDir::new().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    fs::create_dir_all(project_root.join(".git")).unwrap();
+    seed_current_index_for_context(&project_root, "other-context");
+
+    let mut client = McpTestClient::start_with_isolated_state(&project_root);
+    let result = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [":other-context-segment"] }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "empty");
+    assert_eq!(envelope["data"]["records"][0]["status"], "not_found");
+    assert_eq!(
+        envelope["data"]["records"][0]["source"]["normalized"],
+        "other-context-segment"
+    );
+    assert!(
+        envelope["data"]["records"][0]["segment"].is_null(),
+        "foreign-context segment should not be hydrated: {envelope:?}"
+    );
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
 }
 
 #[test]
@@ -2352,6 +2389,23 @@ fn mcp_structural_returns_matches_and_explicit_diagnostics() {
         mcp_structured(&invalid)["data"]["diagnostics"][0]["kind"],
         "invalid_pattern"
     );
+
+    let blank = client.call_tool(
+        TOOL_STRUCTURAL,
+        serde_json::json!({ "pattern": "   ", "language": "rust" }),
+    );
+    assert_eq!(blank["isError"], true);
+    assert_mcp_response_is_presentation_free(&blank);
+    let blank_envelope = mcp_structured(&blank);
+    assert_eq!(blank_envelope["status"], "error");
+    assert_eq!(
+        blank_envelope["data"]["diagnostics"][0]["kind"],
+        "invalid_pattern"
+    );
+    assert!(blank_envelope["data"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let empty = client.call_tool(
         TOOL_STRUCTURAL,

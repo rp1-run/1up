@@ -23,8 +23,8 @@ use crate::shared::types::{
 use crate::storage::db::Db;
 use crate::storage::schema;
 use crate::storage::segments::{
-    count_files_for_context, count_segments_for_context, get_segment_by_id, get_segment_by_prefix,
-    SegmentPrefixLookup, StoredSegment,
+    count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
+    get_segment_by_prefix_for_context, SegmentPrefixLookup, StoredSegment,
 };
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -465,12 +465,18 @@ pub async fn run_search(
     })
 }
 
-pub async fn get_handles(state_root: &Path, handles: &[String]) -> anyhow::Result<ReadPayload> {
+pub async fn get_handles(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    handles: &[String],
+) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
     let mut records = Vec::with_capacity(handles.len());
 
     for handle in handles {
-        records.push(resolve_handle_record(&current.conn, handle).await?);
+        records.push(
+            resolve_handle_record(&current.conn, &worktree_context.context_id, handle).await?,
+        );
     }
 
     Ok(ReadPayload {
@@ -661,7 +667,11 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     Ok(CurrentIndex { conn, _db: db })
 }
 
-async fn resolve_handle_record(conn: &Connection, raw_handle: &str) -> anyhow::Result<ReadRecord> {
+async fn resolve_handle_record(
+    conn: &Connection,
+    context_id: &str,
+    raw_handle: &str,
+) -> anyhow::Result<ReadRecord> {
     let normalized = normalize_handle(raw_handle);
     let source = ReadSource::Handle {
         raw: raw_handle.to_string(),
@@ -676,24 +686,26 @@ async fn resolve_handle_record(conn: &Connection, raw_handle: &str) -> anyhow::R
         ));
     }
 
-    if let Some(segment) = get_segment_by_id(conn, &normalized).await? {
+    if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
         return Ok(read_segment(source, segment));
     }
 
-    Ok(match get_segment_by_prefix(conn, &normalized).await? {
-        SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
-        SegmentPrefixLookup::NotFound => {
-            read_message(ReadStatus::NotFound, source, "segment handle was not found")
-        }
-        SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
-            status: ReadStatus::Ambiguous,
-            source,
-            segment: None,
-            context: None,
-            matching_handles: ids,
-            message: Some("segment handle matched multiple indexed segments".to_string()),
+    Ok(
+        match get_segment_by_prefix_for_context(conn, context_id, &normalized).await? {
+            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
+            SegmentPrefixLookup::NotFound => {
+                read_message(ReadStatus::NotFound, source, "segment handle was not found")
+            }
+            SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
+                status: ReadStatus::Ambiguous,
+                source,
+                segment: None,
+                context: None,
+                matching_handles: ids,
+                message: Some("segment handle matched multiple indexed segments".to_string()),
+            },
         },
-    })
+    )
 }
 
 fn read_location_record(source_root: &Path, location: &ReadLocation) -> ReadRecord {

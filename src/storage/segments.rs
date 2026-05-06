@@ -271,6 +271,31 @@ pub async fn get_segment_by_id(
     }
 }
 
+/// Get a single segment by its ID inside one index context.
+pub async fn get_segment_by_id_for_context(
+    conn: &Connection,
+    context_id: &str,
+    id: &str,
+) -> Result<Option<StoredSegment>, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(
+            queries::SELECT_SEGMENT_BY_ID_FOR_CONTEXT,
+            libsql::params![context_id, id],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("query segment by id failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => Ok(Some(row_to_stored_segment(&row)?)),
+        None => Ok(None),
+    }
+}
+
 /// Outcome of a prefix-based segment lookup.
 ///
 /// `get` accepts both full segment ids and the 12-char display handle emitted

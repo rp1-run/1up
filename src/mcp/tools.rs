@@ -155,7 +155,7 @@ impl OneupMcpServer {
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
 
-        match ops::get_handles(&roots.state_root, &input.handles).await {
+        match ops::get_handles(&roots.state_root, &roots.worktree_context, &input.handles).await {
             Ok(payload) => {
                 let summary = read_summary(&payload);
                 let next_actions = read_next_actions(&payload);
@@ -333,18 +333,6 @@ impl OneupMcpServer {
         &self,
         Parameters(input): Parameters<StructuralInput>,
     ) -> CallToolResult {
-        if input.pattern.trim().is_empty() {
-            return error_result(
-                "error",
-                "structural pattern cannot be empty",
-                vec![action(
-                    TOOL_STRUCTURAL,
-                    "Retry with a tree-sitter query pattern.",
-                    json!({ "pattern": "<tree-sitter query pattern>" }),
-                )],
-            );
-        }
-
         let roots = match self.roots(input.path.as_deref()) {
             Ok(roots) => roots,
             Err(err) => return error_result("error", err.to_string(), vec![]),

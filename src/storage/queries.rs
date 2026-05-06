@@ -680,6 +680,15 @@ SELECT id, file_path, language, block_type, content,
 FROM segments
 WHERE id = ?1";
 
+pub const SELECT_SEGMENT_BY_ID_FOR_CONTEXT: &str = "
+SELECT id, file_path, language, block_type, content,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE context_id = ?1
+  AND id = ?2";
+
 /// Resolve a segment handle by prefix. LIMIT 5 keeps disambiguation hints bounded
 /// while still detecting collisions beyond the first two matches.
 pub const SELECT_SEGMENTS_BY_PREFIX: &str = "
