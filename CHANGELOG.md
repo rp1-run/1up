@@ -15,6 +15,28 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.9](https://github.com/rp1-run/1up/compare/v0.1.8...v0.1.9) (2026-05-06)
+
+
+### Features
+
+* Add worktree-scoped indexing and discovery ([#39](https://github.com/rp1-run/1up/issues/39)) ([2b05ca7](https://github.com/rp1-run/1up/commit/2b05ca7159bba26e14a30c1042b9c6c00f3393f9))
+* adopt MCP for agent guidance ([#35](https://github.com/rp1-run/1up/issues/35)) ([78e64d7](https://github.com/rp1-run/1up/commit/78e64d7dff2f809ea11d1286055ba0a6b3a5c69b))
+* curl|bash install script + 1up start UX + docs cleanup ([#33](https://github.com/rp1-run/1up/issues/33)) ([21b69b0](https://github.com/rp1-run/1up/commit/21b69b05dc39b55a34ffdcd086b9c0892ceb2b3f))
+* implement streamlined MCP discovery lifecycle ([#38](https://github.com/rp1-run/1up/issues/38)) ([183fe09](https://github.com/rp1-run/1up/commit/183fe090d7974100c6b4729cdec9d86a629dfe83))
+* mcp ([#36](https://github.com/rp1-run/1up/issues/36)) ([cb841a0](https://github.com/rp1-run/1up/commit/cb841a0cbccaaba559a00c0e23d1b76a2b894e08))
+* **mcp:** implement T1 - add MCP entrypoint ([82447b9](https://github.com/rp1-run/1up/commit/82447b9921b978586b3881d0f7d548e2b52dcaa3))
+* **mcp:** implement T2 - factor MCP operation helpers ([e7cdbac](https://github.com/rp1-run/1up/commit/e7cdbac17423fc668c866237b45e4512f3ef841a))
+* **mcp:** implement T3 - add MCP tool contracts ([2af18b3](https://github.com/rp1-run/1up/commit/2af18b3e5d6363445fc84c27d026ac285062c347))
+* **mcp:** implement T4 - remove legacy agent hints ([0bc1791](https://github.com/rp1-run/1up/commit/0bc1791fd1d91464545327dd9e5c25a1ac2f9f42))
+* **mcp:** implement T5 - migrate evals to MCP ([7d1ecf9](https://github.com/rp1-run/1up/commit/7d1ecf9aa8864c7816b67d1062ae65850e647764))
+* **mcp:** implement T6 - update MCP docs ([326f631](https://github.com/rp1-run/1up/commit/326f6311e604cba93e10f8d849314f063431fa00))
+* **mcp:** implement T7 - add MCP verification coverage ([03d3e18](https://github.com/rp1-run/1up/commit/03d3e189090175a6522971db45ec1d64bd31de16))
+* **mcp:** implement VERIFY-FIX-001 - fix verification gates ([fad5b14](https://github.com/rp1-run/1up/commit/fad5b1465e69773f61704b15559e248436e8d1f0))
+* **mcp:** implement VERIFY-FIX-002 - fix verification gates ([fbd8600](https://github.com/rp1-run/1up/commit/fbd86006f8af6ebe42a68ee9427854f9cd41f62a))
+* streamline human lifecycle CLI ([#37](https://github.com/rp1-run/1up/issues/37)) ([6aa4a65](https://github.com/rp1-run/1up/commit/6aa4a65458b5e4402bf872960a0b289086b0e0ee))
+* streamline retained discovery API ([#40](https://github.com/rp1-run/1up/issues/40)) ([472e7f6](https://github.com/rp1-run/1up/commit/472e7f60bfc79324f3765ace606484aecfbd55f7))
+
 ## [0.1.8](https://github.com/rp1-run/1up/compare/v0.1.7...v0.1.8) (2026-04-19)
 
 
