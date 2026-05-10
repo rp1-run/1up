@@ -123,10 +123,8 @@ jq -n \
   --arg notes_source "CHANGELOG.md#[${VERSION}]" \
   --arg notes_url "$NOTES_URL" \
   --arg github_release "$NOTES_URL" \
-  --arg homebrew_tap "$HOMEBREW_TAP_REPO" \
-  --arg homebrew_formula "$HOMEBREW_FORMULA" \
-  --arg scoop_bucket "$SCOOP_BUCKET_REPO" \
-  --arg scoop_manifest "$SCOOP_MANIFEST_URL" \
+  --arg script_install "$SCRIPT_INSTALL_URL" \
+  --arg update_manifest "$UPDATE_MANIFEST_URL" \
   --slurpfile artifacts "$TMP_DIR/artifacts.json" \
   '{
     version: $version,
@@ -141,10 +139,8 @@ jq -n \
     notes_url: $notes_url,
     channels: {
       github_release: $github_release,
-      homebrew_tap: $homebrew_tap,
-      homebrew_formula: $homebrew_formula,
-      scoop_bucket: $scoop_bucket,
-      scoop_manifest: $scoop_manifest
+      script_install: $script_install,
+      update_manifest: $update_manifest
     },
     yanked: false,
     minimum_safe_version: null,

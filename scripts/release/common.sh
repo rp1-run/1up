@@ -3,10 +3,8 @@
 ROOT_DIR="${ONEUP_RELEASE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
 EXPECTED_SPDX="Apache-2.0"
 REPO_SLUG="${ONEUP_RELEASE_REPO_SLUG:-rp1-run/1up}"
-HOMEBREW_TAP_REPO="${ONEUP_RELEASE_HOMEBREW_TAP_REPO:-rp1-run/homebrew-tap}"
-HOMEBREW_FORMULA="${ONEUP_RELEASE_HOMEBREW_FORMULA:-brew install rp1-run/tap/1up}"
-SCOOP_BUCKET_REPO="${ONEUP_RELEASE_SCOOP_BUCKET_REPO:-rp1-run/scoop-bucket}"
-SCOOP_MANIFEST_URL="${ONEUP_RELEASE_SCOOP_MANIFEST_URL:-https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json}"
+SCRIPT_INSTALL_URL="${ONEUP_RELEASE_SCRIPT_INSTALL_URL:-https://1up.rp1.run/setup.sh}"
+UPDATE_MANIFEST_URL="${ONEUP_RELEASE_UPDATE_MANIFEST_URL:-https://raw.githubusercontent.com/${REPO_SLUG}/main/update-manifest.json}"
 
 log() {
   printf '[release-assets] %s\n' "$*" >&2

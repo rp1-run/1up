@@ -40,14 +40,7 @@ fn copy_surface(root: &Path, relative_path: &str) {
 fn build_release_fixture() -> tempfile::TempDir {
     let tempdir = tempfile::tempdir().unwrap();
 
-    for relative_path in [
-        "Cargo.toml",
-        "README.md",
-        "LICENSE",
-        "CHANGELOG.md",
-        "packaging/homebrew/1up.rb.tmpl",
-        "packaging/scoop/1up.json.tmpl",
-    ] {
+    for relative_path in ["Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md"] {
         copy_surface(tempdir.path(), relative_path);
     }
 
@@ -605,16 +598,20 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         .unwrap()
         .iter()
         .any(|artifact| artifact["target"] == "x86_64-pc-windows-msvc"));
-    assert_eq!(manifest["channels"]["homebrew_tap"], "rp1-run/homebrew-tap");
-    assert_eq!(
-        manifest["channels"]["homebrew_formula"],
-        "brew install rp1-run/tap/1up"
-    );
-    assert_eq!(manifest["channels"]["scoop_bucket"], "rp1-run/scoop-bucket");
     assert_eq!(
         manifest["channels"]["github_release"],
         format!("https://github.com/rp1-run/1up/releases/tag/{release_tag}")
     );
+    assert_eq!(
+        manifest["channels"]["script_install"],
+        "https://1up.rp1.run/setup.sh"
+    );
+    assert_eq!(
+        manifest["channels"]["update_manifest"],
+        "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+    );
+    assert!(manifest["channels"].get("homebrew_tap").is_none());
+    assert!(manifest["channels"].get("scoop_bucket").is_none());
     assert!(manifest["artifacts"]
         .as_array()
         .unwrap()
@@ -666,6 +663,14 @@ fn release_manifest_deserializes_as_update_manifest() {
     assert!(!manifest.yanked);
     assert!(manifest.minimum_safe_version.is_none());
     assert!(manifest.message.is_none());
+    assert_eq!(
+        manifest.channels.script_install.as_deref(),
+        Some("https://1up.rp1.run/setup.sh")
+    );
+    assert_eq!(
+        manifest.channels.update_manifest.as_deref(),
+        Some("https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json")
+    );
 
     for artifact in &manifest.artifacts {
         assert!(!artifact.target.is_empty());
@@ -676,159 +681,6 @@ fn release_manifest_deserializes_as_update_manifest() {
             "artifact url should contain archive name"
         );
     }
-}
-
-#[test]
-fn homebrew_formula_rendering_uses_release_manifest_urls_and_checksums() {
-    let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
-    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
-    let output_path = dist_dir.join("1up.rb");
-
-    let output = run_release_script(
-        fixture_root.path(),
-        "render_homebrew_formula.sh",
-        &[
-            "--manifest",
-            dist_dir.join("release-manifest.json").to_str().unwrap(),
-            "--output",
-            output_path.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "Homebrew rendering unexpectedly failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
-    let formula = fs::read_to_string(&output_path).unwrap();
-    let git_tag = manifest["git_tag"].as_str().unwrap();
-
-    for target in [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-gnu",
-    ] {
-        let artifact = manifest["artifacts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|artifact| artifact["target"] == target)
-            .unwrap();
-        let archive = artifact["archive"].as_str().unwrap();
-        let sha256 = artifact["sha256"].as_str().unwrap();
-        let url = format!("https://github.com/rp1-run/1up/releases/download/{git_tag}/{archive}");
-        assert!(formula.contains(&url));
-        assert!(formula.contains(sha256));
-    }
-
-    assert!(formula.contains("class Oneup < Formula"));
-    assert!(formula.contains("license \"Apache-2.0\""));
-    assert!(!formula.contains("x86_64-pc-windows-msvc.zip"));
-}
-
-#[test]
-fn scoop_manifest_rendering_uses_release_manifest_windows_asset() {
-    let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
-    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
-    let output_path = dist_dir.join("1up.json");
-
-    let output = run_release_script(
-        fixture_root.path(),
-        "render_scoop_manifest.sh",
-        &[
-            "--manifest",
-            dist_dir.join("release-manifest.json").to_str().unwrap(),
-            "--output",
-            output_path.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "Scoop rendering unexpectedly failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(dist_dir.join("release-manifest.json")).unwrap()).unwrap();
-    let scoop_manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
-    let windows_artifact = manifest["artifacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|artifact| artifact["target"] == "x86_64-pc-windows-msvc")
-        .unwrap();
-
-    assert_eq!(scoop_manifest["version"], manifest["version"]);
-    assert_eq!(scoop_manifest["license"], manifest["license"]);
-    assert_eq!(
-        scoop_manifest["url"],
-        format!(
-            "https://github.com/rp1-run/1up/releases/download/{}/{}",
-            manifest["git_tag"].as_str().unwrap(),
-            windows_artifact["archive"].as_str().unwrap()
-        )
-    );
-    assert_eq!(scoop_manifest["hash"], windows_artifact["sha256"]);
-    assert_eq!(
-        scoop_manifest["extract_dir"],
-        format!("1up-v{TEST_RELEASE_VERSION}-x86_64-pc-windows-msvc")
-    );
-    assert_eq!(scoop_manifest["bin"], "1up.exe");
-}
-
-#[test]
-fn package_publication_record_captures_repo_commit_refs() {
-    let fixture_root = build_release_fixture();
-    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
-    let dist_dir = write_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
-    let output_path = dist_dir.join("package-publication-record.json");
-
-    let output = run_release_script(
-        fixture_root.path(),
-        "write_package_publication_record.sh",
-        &[
-            "--manifest",
-            dist_dir.join("release-manifest.json").to_str().unwrap(),
-            "--homebrew-commit",
-            "deadbeef1234",
-            "--scoop-commit",
-            "feedface5678",
-            "--output",
-            output_path.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "package publication record unexpectedly failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
-    assert_eq!(record["version"], TEST_RELEASE_VERSION);
-    assert_eq!(record["git_tag"], test_release_tag());
-    assert_eq!(
-        record["packages"]["homebrew"]["repo"],
-        "rp1-run/homebrew-tap"
-    );
-    assert_eq!(record["packages"]["homebrew"]["path"], "Formula/1up.rb");
-    assert_eq!(record["packages"]["homebrew"]["commit_sha"], "deadbeef1234");
-    assert_eq!(
-        record["packages"]["homebrew"]["commit_url"],
-        "https://github.com/rp1-run/homebrew-tap/commit/deadbeef1234"
-    );
-    assert_eq!(record["packages"]["scoop"]["repo"], "rp1-run/scoop-bucket");
-    assert_eq!(record["packages"]["scoop"]["path"], "bucket/1up.json");
-    assert_eq!(record["packages"]["scoop"]["commit_sha"], "feedface5678");
-    assert_eq!(
-        record["packages"]["scoop"]["commit_url"],
-        "https://github.com/rp1-run/scoop-bucket/commit/feedface5678"
-    );
 }
 
 #[test]
@@ -1239,7 +1091,7 @@ fn archive_verification_confirms_expected_release_contents() {
 }
 
 #[test]
-fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
+fn mcp_host_smoke_recorder_writes_manual_and_skipped_hosts() {
     let fixture_root = build_release_fixture();
     let repo_path = fixture_root.path().join("repo");
     let output_path = fixture_root.path().join("mcp-host-smoke.json");
@@ -1258,7 +1110,7 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
             "--host-version",
             "codex-cli 0.125.0",
             "--setup-mode",
-            "wrapper",
+            "manual",
             "--repo",
             repo_path.to_str().unwrap(),
             "--tool",
@@ -1345,7 +1197,7 @@ fn mcp_host_smoke_recorder_writes_recorded_and_skipped_hosts() {
         evidence["hosts"]["codex"]["host_version"],
         "codex-cli 0.125.0"
     );
-    assert_eq!(evidence["hosts"]["codex"]["setup_mode"], "wrapper");
+    assert_eq!(evidence["hosts"]["codex"]["setup_mode"], "manual");
     assert_eq!(
         evidence["hosts"]["codex"]["repo_path"],
         repo_path.to_str().unwrap()
@@ -1402,7 +1254,7 @@ fn mcp_host_smoke_recorder_requires_skip_reason() {
 }
 
 #[test]
-fn mcp_host_smoke_recorder_rejects_unsupported_setup_mode() {
+fn mcp_host_smoke_recorder_rejects_removed_setup_modes() {
     let fixture_root = build_release_fixture();
     let repo_path = fixture_root.path().join("repo");
     let output_path = fixture_root.path().join("mcp-host-smoke.json");
@@ -1421,7 +1273,7 @@ fn mcp_host_smoke_recorder_rejects_unsupported_setup_mode() {
             "--host-version",
             "claude-code 1.0.0",
             "--setup-mode",
-            "native",
+            "wrapper",
             "--repo",
             repo_path.to_str().unwrap(),
             "--tool",
@@ -1434,10 +1286,10 @@ fn mcp_host_smoke_recorder_rejects_unsupported_setup_mode() {
     );
     assert!(
         !output.status.success(),
-        "host smoke unexpectedly accepted unsupported setup mode: {}",
+        "host smoke unexpectedly accepted removed setup mode: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported setup mode: native"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported setup mode: wrapper"));
 }
 
 #[test]
@@ -1591,7 +1443,16 @@ fn release_evidence_supports_explicit_skipped_eval_reason() {
         evidence["mcp_host_smoke"]["hosts"]["generic"]["readiness"],
         "blocked"
     );
-    assert_eq!(evidence["packages"]["status"], "pending");
+    assert_eq!(evidence["distribution"]["status"], "recorded");
+    assert_eq!(
+        evidence["distribution"]["script_install"],
+        "https://1up.rp1.run/setup.sh"
+    );
+    assert_eq!(
+        evidence["distribution"]["update_manifest"],
+        "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+    );
+    assert!(evidence.get("packages").is_none());
 }
 
 #[test]
@@ -1882,6 +1743,9 @@ fn ci_workflow_retains_security_check_artifact() {
 fn release_evidence_workflow_uses_retained_security_and_native_archive_verification() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/release-evidence.yml")).unwrap();
+    let update_manifest_workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/publish-update-manifest.yml"))
+            .unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("macos-26"));
@@ -1892,6 +1756,53 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
     assert!(workflow.contains("pattern: archive-verification-*"));
     assert!(workflow.contains("ubuntu-24.04-arm"));
     assert!(workflow.contains("--target \"${{ matrix.target }}\""));
+    assert!(!workflow.contains("package-publication-record"));
+    assert!(!repo_root()
+        .join(".github/workflows/publish-packages.yml")
+        .exists());
+
+    assert!(update_manifest_workflow.contains("name: publish-update-manifest"));
+    assert!(update_manifest_workflow.contains("publish update manifest to main"));
+    assert!(update_manifest_workflow.contains("verify stable update manifest"));
+    assert!(update_manifest_workflow.contains("script_install"));
+    assert!(update_manifest_workflow.contains("update_manifest"));
+    assert!(!update_manifest_workflow.contains("PACKAGE_PUBLISH_TOKEN"));
+    assert!(!update_manifest_workflow.contains("Homebrew"));
+    assert!(!update_manifest_workflow.contains("Scoop"));
+}
+
+#[test]
+fn release_runbook_omits_package_publication_gates() {
+    let runbook = fs::read_to_string(repo_root().join("RELEASE.md")).unwrap();
+
+    for retained in [
+        "Primary user install channel",
+        "Stable update metadata",
+        "archive verification notes",
+        "MCP smoke evidence for the retained `oneup_*` tools",
+        "script installer and update-manifest distribution metadata",
+        "publish-update-manifest",
+        "The final `release-evidence.json` references the GitHub Release, script installer, update manifest, archive verification, security, eval, and benchmark evidence",
+    ] {
+        assert!(
+            runbook.contains(retained),
+            "release runbook is missing retained release evidence text: {retained}"
+        );
+    }
+
+    for removed in [
+        "Homebrew",
+        "Scoop",
+        "package-publication-record",
+        "package publication repositories",
+        "package publication step",
+        "published package references",
+    ] {
+        assert!(
+            !runbook.contains(removed),
+            "release runbook should not require removed package publication gate {removed}"
+        );
+    }
 }
 
 #[test]
@@ -1927,27 +1838,6 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     assert!(workflow.contains("Get-FileHash"));
     assert!(workflow.contains("onnxruntime-win-x64-1.24.2.zip"));
     assert!(workflow.contains("Expand-Archive -LiteralPath $archivePath"));
-}
-
-#[test]
-fn publish_packages_workflow_verifies_stable_update_manifest() {
-    let workflow =
-        fs::read_to_string(repo_root().join(".github/workflows/publish-packages.yml")).unwrap();
-
-    assert!(workflow.contains("workflow_dispatch:"));
-    assert!(workflow.contains("RELEASE_TAG"));
-    assert!(workflow.contains("verify stable update manifest"));
-    assert!(workflow.contains("validate release pat"));
-    assert!(workflow.contains("RELEASE_PAT"));
-    assert!(workflow.contains("token: ${{ secrets.RELEASE_PAT }}"));
-    assert!(workflow.contains("git push origin HEAD:main"));
-    assert!(workflow.contains("seq 1 60"));
-    assert!(workflow.contains("waiting for release-manifest.json"));
-    assert!(workflow.contains("wait for stable update manifest"));
-    assert!(workflow.contains("curl --fail --silent --show-error --location"));
-    assert!(workflow.contains("jq -S"));
-    assert!(workflow.contains("diff -u"));
-    assert!(workflow.contains("UPDATE_MANIFEST_URL"));
 }
 
 #[test]

@@ -31,10 +31,8 @@
   ],
   "channels": {
     "github_release": "https://github.com/rp1-run/1up/releases/tag/v0.1.8",
-    "homebrew_tap": "rp1-run/homebrew-tap",
-    "homebrew_formula": "brew install rp1-run/tap/1up",
-    "scoop_bucket": "rp1-run/scoop-bucket",
-    "scoop_manifest": "https://github.com/rp1-run/scoop-bucket/raw/main/bucket/1up.json"
+    "script_install": "https://1up.rp1.run/setup.sh",
+    "update_manifest": "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
   },
   "yanked": false,
   "minimum_safe_version": null,

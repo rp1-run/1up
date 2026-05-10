@@ -6,7 +6,7 @@
 //! that rewrites the host to `http://127.0.0.1:<port>`. setup.sh itself
 //! is not modified; only its environment is.
 //!
-//! Matrix coverage (REQ-001..014 via feature task T4):
+//! Smoke coverage:
 //!   happy_path, idempotent_re_run, checksum_mismatch,
 //!   missing_sha256sums_warn, unsupported_platform,
 //!   unsupported_intel_macos, pinned_version, pinned_version_missing,
@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -286,6 +286,18 @@ fn handle_request(mut stream: TcpStream, root: &Path) {
             let _ = stream.write_all(body);
         }
     }
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+fn request_fixture(addr: &str, path: &str) -> std::io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(addr)?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body)?;
+    Ok(body)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -423,9 +435,8 @@ fn run_setup(input: RunInput) -> std::process::Output {
 
 #[test]
 fn setup_installs_binary_and_updates_path_on_happy_path() {
-    // REQ-001, REQ-002, REQ-006, REQ-013: happy path installs the matching
-    // binary, appends a PATH block to the detected rc, and prints
-    // `Run: 1up start` as the final stdout line.
+    // Happy path installs the matching binary, appends a PATH block to the
+    // detected rc, and prints `Run: 1up start` as the final stdout line.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
@@ -468,8 +479,8 @@ fn setup_installs_binary_and_updates_path_on_happy_path() {
 
 #[test]
 fn setup_is_idempotent_on_second_run() {
-    // REQ-007, REQ-008: second back-to-back run must replace the binary
-    // atomically and must not append a duplicate PATH block.
+    // A second back-to-back run must replace the binary atomically and must
+    // not append a duplicate PATH block.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
@@ -605,8 +616,8 @@ fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
 
 #[test]
 fn setup_fails_on_checksum_mismatch() {
-    // REQ-003: published SHA256SUMS that disagrees with the served archive
-    // must be fatal. Binary must NOT land in the install dir.
+    // Published SHA256SUMS that disagrees with the served archive must be
+    // fatal. Binary must NOT land in the install dir.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     // Build an honest fixture, then overwrite the archive bytes so the
@@ -644,7 +655,7 @@ fn setup_fails_on_checksum_mismatch() {
 
 #[test]
 fn setup_warns_and_installs_without_sha256sums() {
-    // REQ-004: missing SHA256SUMS is a warn-and-continue path.
+    // Missing SHA256SUMS is a warn-and-continue path.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), false);
@@ -676,9 +687,9 @@ fn setup_warns_and_installs_without_sha256sums() {
 
 #[test]
 fn setup_rejects_unsupported_platform() {
-    // REQ-002, REQ-010: unsupported platform exits non-zero and names the
-    // detected platform in the error. Stubs uname so the test host's real
-    // OS/arch is never detected.
+    // Unsupported platform exits non-zero and names the detected platform in
+    // the error. Stubs uname so the test host's real OS/arch is never
+    // detected.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     // No HTTP fixture needed: the script should fail in stage 2 before
@@ -708,9 +719,9 @@ fn setup_rejects_unsupported_platform() {
 
 #[test]
 fn setup_honors_pinned_version() {
-    // REQ-009: 1UP_VERSION selects the requested tag. We publish only the
-    // pinned tag's archive under the fixture, so a successful install
-    // implies the script asked for that specific archive.
+    // 1UP_VERSION selects the requested tag. We publish only the pinned tag's
+    // archive under the fixture, so a successful install implies the script
+    // asked for that specific archive.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let pinned = "v0.1.7";
@@ -783,11 +794,11 @@ fn setup_rejects_intel_macos_with_specific_message() {
 
 #[test]
 fn setup_resolves_latest_release_when_unpinned() {
-    // REQ-009 default path: the README's primary `curl | bash` invocation
-    // sets no version pin, which drives setup.sh through `resolve_tag()` and
-    // its GitHub `releases/latest` API call. This case covers that branch
-    // end-to-end -- a regression in API URL construction or `tag_name` JSON
-    // parsing would slip through every other test (all of which pin).
+    // The README's primary `curl | bash` invocation sets no version pin,
+    // which drives setup.sh through `resolve_tag()` and its GitHub
+    // `releases/latest` API call. This case covers that branch end-to-end:
+    // a regression in API URL construction or `tag_name` JSON parsing would
+    // slip through every other test, all of which pin.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
@@ -872,10 +883,10 @@ fn setup_strips_oneup_prefix_for_legacy_tags() {
 
 #[test]
 fn setup_fails_cleanly_on_missing_pinned_version() {
-    // REQ-009 negative path: pinning to a tag that has no published release
-    // asset must exit non-zero and name the missing artefact, with no binary
-    // installed. The fixture only publishes FIXTURE_TAG, so requesting any
-    // other tag drives the archive download into a 404.
+    // Pinning to a tag that has no published release asset must exit non-zero
+    // and name the missing artifact, with no binary installed. The fixture
+    // only publishes FIXTURE_TAG, so requesting any other tag drives the
+    // archive download into a 404.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
@@ -955,8 +966,8 @@ fn setup_rejects_unsafe_install_dir_characters() {
 
 #[test]
 fn setup_honors_custom_install_dir() {
-    // REQ-014: 1UP_INSTALL_DIR override lands the binary elsewhere and
-    // the rc PATH block references the same dir.
+    // 1UP_INSTALL_DIR override lands the binary elsewhere and the rc PATH
+    // block references the same dir.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let alt_dir = host_home.path().join("alt-install");
@@ -987,16 +998,14 @@ fn setup_honors_custom_install_dir() {
 }
 
 // ---------------------------------------------------------------------------
-// bash 3.2 compatibility smoke (REQ-011)
+// bash 3.2 compatibility smoke
 // ---------------------------------------------------------------------------
 
 /// Static-lint smoke that exercises setup.sh's bash 3.2 guardrails without
 /// requiring a real 3.2 runtime on every CI host: parse under the system
 /// bash with `--posix` and the script's own `set -eu`, and also run `bash
-/// -n` as a syntax check. The T4 acceptance criterion also calls for a
-/// container-backed bash 3.2 run; that gate lives in CI (`.github/
-/// workflows/ci.yml`) rather than this test crate so Cargo tests remain
-/// hermetic.
+/// -n` as a syntax check. CI complements this with a container-backed bash
+/// 3.2 parse gate so Cargo tests remain hermetic.
 #[test]
 fn setup_script_parses_without_syntax_errors() {
     let script = setup_script();
@@ -1011,8 +1020,9 @@ fn setup_script_parses_without_syntax_errors() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // Reject bashisms banned by REQ-011 via a regex sweep. `mapfile` /
-    // `readarray` / `${var,,}` / `${var^^}` / `declare -A` are all bash 4+.
+    // Reject bashisms that would break macOS bash 3.2 via a regex sweep.
+    // `mapfile` / `readarray` / `${var,,}` / `${var^^}` / `declare -A` are
+    // all bash 4+.
     let body = fs::read_to_string(&script).unwrap();
     for bad in &["mapfile ", "readarray ", "declare -A", "${!"] {
         assert!(
@@ -1046,21 +1056,26 @@ fn local_http_serves_fixture_files() {
     // Basic poll to avoid accept-race on slow CI runners.
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut body = Vec::new();
+    let mut last_error = None;
+    let path = format!(
+        "/repos/{FIXTURE_REPO}/releases/download/{FIXTURE_TAG}/{}",
+        fixture.archive_name
+    );
     while Instant::now() < deadline {
-        if let Ok(mut stream) = TcpStream::connect(&server.addr) {
-            let req = format!(
-                "GET /repos/{FIXTURE_REPO}/releases/download/{FIXTURE_TAG}/{} HTTP/1.0\r\nHost: localhost\r\n\r\n",
-                fixture.archive_name
-            );
-            stream.write_all(req.as_bytes()).unwrap();
-            stream.read_to_end(&mut body).unwrap();
-            break;
+        match request_fixture(&server.addr, &path) {
+            Ok(response) => {
+                body = response;
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(20));
+            }
         }
-        thread::sleep(Duration::from_millis(20));
     }
     let response = String::from_utf8_lossy(&body);
     assert!(
         response.starts_with("HTTP/1.1 200"),
-        "archive should be served: {response}"
+        "archive should be served: {response}; last error: {last_error:?}"
     );
 }

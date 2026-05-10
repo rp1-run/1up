@@ -6,7 +6,7 @@
 # - NO release happens until the release PR itself is merged
 # - Merging the release PR triggers: tag creation, GitHub release
 #
-# Downstream workflows (release-assets, release-evidence, publish-packages)
+# Downstream workflows (release-assets, release-evidence, publish-update-manifest)
 # trigger automatically on the created tag or release event.
 
 name: Release Please

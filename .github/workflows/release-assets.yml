@@ -153,6 +153,8 @@ jobs:
           cp scripts/install/setup.sh "${RUNNER_TEMP}/dist/setup.sh"
 
       - name: generate checksums and manifest
+        env:
+          ONEUP_RELEASE_UPDATE_MANIFEST_URL: ${{ env.UPDATE_MANIFEST_URL }}
         shell: bash
         run: |
           commit_sha=$(git rev-parse HEAD)

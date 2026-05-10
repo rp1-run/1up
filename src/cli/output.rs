@@ -2778,7 +2778,7 @@ mod tests {
             current_version: "0.1.0".to_string(),
             latest_version: "0.2.0".to_string(),
             install_channel: InstallChannel::Homebrew,
-            upgrade_instruction: "brew upgrade rp1-run/tap/1up".to_string(),
+            upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
             status: UpdateStatus::UpdateAvailable {
                 latest: "0.2.0".to_string(),
             },
@@ -2789,7 +2789,7 @@ mod tests {
         assert!(rendered.contains("Update available: 1up"));
         assert!(rendered.contains("0.2.0"));
         assert!(rendered.contains("managed by homebrew"));
-        assert!(rendered.contains("brew upgrade rp1-run/tap/1up"));
+        assert!(rendered.contains("curl -fsSL https://1up.rp1.run/setup.sh | bash"));
     }
 
     #[test]
@@ -2799,7 +2799,7 @@ mod tests {
             current_version: "0.1.0".to_string(),
             latest_version: "0.2.0".to_string(),
             install_channel: InstallChannel::Homebrew,
-            upgrade_instruction: "brew upgrade rp1-run/tap/1up".to_string(),
+            upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
             status: UpdateStatus::Yanked {
                 latest: "0.2.0".to_string(),
                 message: Some("Critical bug fix".to_string()),

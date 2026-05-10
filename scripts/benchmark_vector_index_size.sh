@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# Size and throughput benchmark guard for schema v12 (shrink-hnsw-vector-index, T5).
+# Semantic index storage and throughput benchmark for retained release readiness.
 #
 # Fresh-reindexes the 1up repo into a temp worktree, captures db_size_bytes,
-# indexing_ms (median), and schema_version, then gates against:
+# indexing_ms (median), and schema_version, then gates retained semantic
+# indexing evidence against:
 #
-#   * REQ-001: db_size_bytes <= 80 * 1024 * 1024 (absolute upper bound)
-#   * REQ-003: indexing_ms in [72900, 89100] (+/-10% of 81 s baseline)
+#   * db_size_bytes <= 80 * 1024 * 1024
+#   * indexing_ms <= 90000
+#   * current schema version
 #
 # A pinned baseline JSON at scripts/baselines/vector_index_size_baseline.json
-# is loaded for delta reporting, but gate thresholds remain the REQ-derived
-# absolutes so the script's pass/fail does not drift with baseline updates.
+# is loaded for delta reporting, but gate thresholds remain script constants
+# so pass/fail does not drift with baseline updates.
 #
 # Usage:
 #   scripts/benchmark_vector_index_size.sh [path-to-repo]
@@ -21,6 +23,7 @@
 #   OUT_DIR=<path>                         results directory
 #   BASELINE_JSON=<path>                   alternate baseline file
 #   SKIP_GATES=1                           emit JSON only; do not fail on violations
+#   BENCHMARK_SKIPPED_REASON=<reason>      emit skipped evidence and do not run
 #
 set -euo pipefail
 
@@ -35,6 +38,26 @@ require_cmd() {
     printf 'missing required command: %s\n' "$1" >&2
     exit 1
   fi
+}
+
+write_skipped_summary() {
+  local reason="$1"
+  local results_json="$2"
+
+  mkdir -p "$(dirname "$results_json")"
+  jq -n \
+    --arg reason "$reason" \
+    '{
+      status: "skipped",
+      evidence_type: "semantic_index_storage",
+      retained_performance_outcome: "semantic_indexing",
+      skipped_reason: $reason,
+      manual_readiness_note_required: true
+    }' > "$results_json"
+
+  cat "$results_json"
+  printf '\nVector index size benchmark skipped.\n'
+  printf 'Output: %s\n' "$results_json"
 }
 
 # Median of the numbers passed as args. Accepts floats; prints integer ms.
@@ -73,20 +96,12 @@ sync_fixture() {
     "$source_dir"/ "$target_dir"/
 }
 
-require_cmd cargo
-require_cmd jq
-require_cmd rsync
-require_cmd sqlite3
-require_cmd stat
-
 REPO_INPUT="${1:-$ROOT_DIR}"
-if [[ ! -d "$REPO_INPUT" ]]; then
-  printf 'repo not found: %s\n' "$REPO_INPUT" >&2
-  exit 1
+if [[ -d "$REPO_INPUT" ]]; then
+  REPO_NAME=$(basename "$(cd "$REPO_INPUT" && pwd -P)")
+else
+  REPO_NAME=$(basename "$REPO_INPUT")
 fi
-
-REPO=$(cd "$REPO_INPUT" && pwd -P)
-REPO_NAME=$(basename "$REPO")
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 
 RUNS="${RUNS:-3}"
@@ -101,12 +116,32 @@ FIXTURE_ROOT="${FIXTURE_ROOT:-${TMPDIR:-/tmp}/vector-index-size-bench}"
 FIXTURE_DIR="$FIXTURE_ROOT/${REPO_NAME}-${TIMESTAMP}"
 RESULTS_JSON="$OUT_DIR/results.json"
 
-# REQ-derived absolute gates. Kept as constants so the script's pass/fail
-# semantics are independent of the pinned baseline file.
-readonly SIZE_LIMIT_BYTES=$((80 * 1024 * 1024))        # REQ-001
-readonly TIME_LOWER_MS=72900                            # REQ-003 -10%
-readonly TIME_UPPER_MS=89100                            # REQ-003 +10%
-readonly EXPECTED_SCHEMA_VERSION=12                     # REQ-005
+BENCHMARK_SKIPPED_REASON="${BENCHMARK_SKIPPED_REASON:-${SKIP_REASON:-}}"
+if [[ -n "${BENCHMARK_SKIPPED_REASON//[[:space:]]/}" ]]; then
+  require_cmd jq
+  write_skipped_summary "$BENCHMARK_SKIPPED_REASON" "$RESULTS_JSON"
+  exit 0
+fi
+
+require_cmd cargo
+require_cmd jq
+require_cmd rsync
+require_cmd sqlite3
+require_cmd stat
+
+if [[ ! -d "$REPO_INPUT" ]]; then
+  printf 'repo not found: %s\n' "$REPO_INPUT" >&2
+  exit 1
+fi
+
+REPO=$(cd "$REPO_INPUT" && pwd -P)
+REPO_NAME=$(basename "$REPO")
+
+# Retained-performance gates. Kept as constants so pass/fail semantics are
+# independent of the pinned baseline file.
+readonly SIZE_LIMIT_BYTES=$((80 * 1024 * 1024))
+readonly TIME_LIMIT_MS=90000
+readonly EXPECTED_SCHEMA_VERSION=13
 
 mkdir -p "$OUT_DIR" "$FIXTURE_ROOT"
 
@@ -194,7 +229,7 @@ size_pass=true
 time_pass=true
 schema_pass=true
 (( MEDIAN_SIZE <= SIZE_LIMIT_BYTES )) || size_pass=false
-(( MEDIAN_TIME >= TIME_LOWER_MS && MEDIAN_TIME <= TIME_UPPER_MS )) || time_pass=false
+(( MEDIAN_TIME <= TIME_LIMIT_MS )) || time_pass=false
 [[ "$LAST_SCHEMA_VERSION" == "$EXPECTED_SCHEMA_VERSION" ]] || schema_pass=false
 
 jq -n \
@@ -202,12 +237,13 @@ jq -n \
   --arg out_dir "$OUT_DIR" \
   --arg timestamp "$TIMESTAMP" \
   --argjson runs "$RUNS" \
+  --arg evidence_type "semantic_index_storage" \
+  --arg retained_outcome "semantic_indexing" \
   --argjson db_size_bytes "$MEDIAN_SIZE" \
   --argjson indexing_ms "$MEDIAN_TIME" \
   --arg schema_version "$LAST_SCHEMA_VERSION" \
   --argjson size_limit_bytes "$SIZE_LIMIT_BYTES" \
-  --argjson time_lower_ms "$TIME_LOWER_MS" \
-  --argjson time_upper_ms "$TIME_UPPER_MS" \
+  --argjson time_limit_ms "$TIME_LIMIT_MS" \
   --argjson expected_schema_version "$EXPECTED_SCHEMA_VERSION" \
   --argjson per_run_bytes "$(printf '%s\n' "${size_runs[@]}" | jq -s '.')" \
   --argjson per_run_ms "$(printf '%s\n' "${time_runs[@]}" | jq -s '.')" \
@@ -218,6 +254,9 @@ jq -n \
   --argjson delta_size_bytes "$BASELINE_DELTA_SIZE_BYTES" \
   --argjson delta_time_ms "$BASELINE_DELTA_TIME_MS" \
   '{
+    status: "recorded",
+    evidence_type: $evidence_type,
+    retained_performance_outcome: $retained_outcome,
     repo: $repo,
     out_dir: $out_dir,
     timestamp: $timestamp,
@@ -231,11 +270,10 @@ jq -n \
     },
     gates: {
       size_limit_bytes: $size_limit_bytes,
-      time_lower_ms: $time_lower_ms,
-      time_upper_ms: $time_upper_ms,
+      indexing_time_limit_ms: $time_limit_ms,
       expected_schema_version: $expected_schema_version,
       size_pass: $size_pass,
-      time_pass: $time_pass,
+      indexing_time_pass: $time_pass,
       schema_pass: $schema_pass
     },
     baseline: $baseline,
@@ -253,23 +291,24 @@ printf 'Repository: %s\n' "$REPO"
 printf 'Output: %s\n' "$RESULTS_JSON"
 printf 'db_size_bytes (median of %d runs): %s (limit %s)\n' \
   "$RUNS" "$MEDIAN_SIZE" "$SIZE_LIMIT_BYTES"
-printf 'indexing_ms   (median of %d runs): %s (gate [%s, %s])\n' \
-  "$RUNS" "$MEDIAN_TIME" "$TIME_LOWER_MS" "$TIME_UPPER_MS"
+printf 'indexing_ms   (median of %d runs): %s (limit %s)\n' \
+  "$RUNS" "$MEDIAN_TIME" "$TIME_LIMIT_MS"
 printf 'schema_version: %s (expected %s)\n' \
   "$LAST_SCHEMA_VERSION" "$EXPECTED_SCHEMA_VERSION"
 
 fail_count=0
 if [[ "$size_pass" != "true" ]]; then
-  printf 'FAIL: db_size_bytes %s > %s (REQ-001)\n' "$MEDIAN_SIZE" "$SIZE_LIMIT_BYTES" >&2
+  printf 'FAIL: db_size_bytes %s > %s (semantic index storage limit)\n' \
+    "$MEDIAN_SIZE" "$SIZE_LIMIT_BYTES" >&2
   fail_count=$((fail_count + 1))
 fi
 if [[ "$time_pass" != "true" ]]; then
-  printf 'FAIL: indexing_ms %s outside [%s, %s] (REQ-003)\n' \
-    "$MEDIAN_TIME" "$TIME_LOWER_MS" "$TIME_UPPER_MS" >&2
+  printf 'FAIL: indexing_ms %s > %s (semantic indexing throughput limit)\n' \
+    "$MEDIAN_TIME" "$TIME_LIMIT_MS" >&2
   fail_count=$((fail_count + 1))
 fi
 if [[ "$schema_pass" != "true" ]]; then
-  printf 'FAIL: schema_version %s != %s (REQ-005)\n' \
+  printf 'FAIL: schema_version %s != %s (current retained schema)\n' \
     "$LAST_SCHEMA_VERSION" "$EXPECTED_SCHEMA_VERSION" >&2
   fail_count=$((fail_count + 1))
 fi

@@ -8,7 +8,7 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 | You know | Use |
 |---|---|
-| Readiness is uncertain | `oneup_status` |
+| Start of every eval task | `oneup_status` |
 | Indexing or rebuilding is needed | `oneup_start` with the mode suggested by status |
 | Concept, behavior, or feature area | `oneup_search` |
 | A promising search hit | `oneup_get` with the returned handle |
@@ -22,7 +22,7 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 ## Workflow
 
-1. Call `oneup_status` if index readiness is unclear.
+1. Call `oneup_status` before discovery.
 2. Call `oneup_start` only if status says indexing or rebuilding is needed.
 3. Call `oneup_search` with the task intent and a small limit.
 4. Pick the best handles and hydrate them with `oneup_get`.

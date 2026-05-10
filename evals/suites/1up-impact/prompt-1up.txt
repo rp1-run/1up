@@ -8,7 +8,7 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 | You know | Use |
 |---|---|
-| Readiness is uncertain | `oneup_status` |
+| Start of every eval task | `oneup_status` |
 | Indexing or rebuilding is needed | `oneup_start` with the mode suggested by status |
 | Concept, behavior, or feature area | `oneup_search` |
 | A promising handle | `oneup_get` |
@@ -22,12 +22,14 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 
 ## Impact Workflow
 
-1. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
-2. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
-3. Read primary result handles with `oneup_get` when you need implementation details.
-4. Use `oneup_context` for precise file-line context when needed.
-5. Use `oneup_symbol` to verify direct references for important symbols.
-6. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
+1. Call `oneup_status` before impact or discovery.
+2. Call `oneup_start` only if status says indexing or rebuilding is needed.
+3. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
+4. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
+5. Read primary result handles with `oneup_get` when you need implementation details.
+6. Use `oneup_context` for precise file-line context when needed.
+7. Use `oneup_symbol` to verify direct references for important symbols.
+8. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
 
 {{TASK_PROMPT}}
 
