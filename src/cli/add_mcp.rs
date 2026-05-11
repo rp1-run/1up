@@ -63,6 +63,7 @@ pub async fn exec(args: AddMcpArgs) -> anyhow::Result<()> {
     };
 
     let status = match Command::new(runner)
+        .current_dir(&repo_path)
         .arg("add-mcp")
         .args(add_mcp_argv(&repo_path, &args))
         .stdin(Stdio::inherit())
@@ -177,7 +178,7 @@ fn candidate_names(program: &str) -> impl Iterator<Item = OsString> + '_ {
 
 fn add_mcp_argv(repo_path: &Path, args: &AddMcpArgs) -> Vec<OsString> {
     let mut argv = vec![
-        OsString::from(server_source(repo_path)),
+        OsString::from(server_source(repo_path, args.global)),
         OsString::from("--name"),
         OsString::from("oneup"),
     ];
@@ -198,8 +199,12 @@ fn add_mcp_argv(repo_path: &Path, args: &AddMcpArgs) -> Vec<OsString> {
     argv
 }
 
-fn server_source(repo_path: &Path) -> String {
-    format!("1up mcp --path {}", shell_quote(repo_path.as_os_str()))
+fn server_source(repo_path: &Path, global: bool) -> String {
+    if global {
+        format!("1up mcp --path {}", shell_quote(repo_path.as_os_str()))
+    } else {
+        "1up mcp".to_string()
+    }
 }
 
 fn shell_quote(value: &OsStr) -> String {
@@ -226,16 +231,19 @@ fn manual_fallback_text(repo_path: &str) -> String {
     format!(
         "Manual MCP setup fallback\n\
          \n\
-         Configure server identity `oneup` with command `1up` and args:\n\
-         [\"mcp\", \"--path\", \"{repo_path}\"]\n\
+         Preferred project/workspace setup uses server identity `oneup` with command `1up` and args:\n\
+         [\"mcp\"]\n\
          \n\
-         Generic MCP JSON:\n\
-         {{\"mcpServers\":{{\"oneup\":{{\"command\":\"1up\",\"args\":[\"mcp\",\"--path\",\"{repo_path}\"]}}}}}}\n\
+         Project/workspace MCP JSON:\n\
+         {{\"mcpServers\":{{\"oneup\":{{\"command\":\"1up\",\"args\":[\"mcp\"]}}}}}}\n\
          \n\
-         Codex TOML:\n\
+         Project/workspace Codex TOML:\n\
          [mcp_servers.oneup]\n\
          command = \"1up\"\n\
-         args = [\"mcp\", \"--path\", \"{repo_path}\"]\n\
+         args = [\"mcp\"]\n\
+         \n\
+         For user-global or static host config where the server may not launch from the project directory, use explicit args instead:\n\
+         [\"mcp\", \"--path\", \"{repo_path}\"]\n\
          \n\
          After saving host-owned configuration, reload the agent host, list MCP tools, and call `oneup_status`."
     )
@@ -285,10 +293,37 @@ mod tests {
     }
 
     #[test]
-    fn add_mcp_args_include_single_server_source_and_forwarded_options() {
+    fn add_mcp_args_include_project_server_source_and_forwarded_options() {
         let args = AddMcpArgs {
             path: PathBuf::from("."),
             agents: vec!["codex".to_string(), "cursor".to_string()],
+            global: false,
+            yes: true,
+            runner: RunnerChoice::Auto,
+        };
+
+        let argv = add_mcp_argv(Path::new("/tmp/repo"), &args);
+
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("1up mcp"),
+                OsString::from("--name"),
+                OsString::from("oneup"),
+                OsString::from("--agent"),
+                OsString::from("codex"),
+                OsString::from("--agent"),
+                OsString::from("cursor"),
+                OsString::from("--yes"),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_mcp_args_include_explicit_path_for_global_scope() {
+        let args = AddMcpArgs {
+            path: PathBuf::from("."),
+            agents: Vec::new(),
             global: true,
             yes: true,
             runner: RunnerChoice::Auto,
@@ -302,10 +337,6 @@ mod tests {
                 OsString::from("1up mcp --path /tmp/repo"),
                 OsString::from("--name"),
                 OsString::from("oneup"),
-                OsString::from("--agent"),
-                OsString::from("codex"),
-                OsString::from("--agent"),
-                OsString::from("cursor"),
                 OsString::from("--global"),
                 OsString::from("--yes"),
             ]
@@ -317,6 +348,7 @@ mod tests {
         let text = manual_fallback_text("/tmp/repo");
 
         assert!(text.contains("server identity `oneup`"));
+        assert!(text.contains("[\"mcp\"]"));
         assert!(text.contains("[\"mcp\", \"--path\", \"/tmp/repo\"]"));
         assert!(text.contains("call `oneup_status`"));
     }
