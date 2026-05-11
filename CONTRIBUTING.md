@@ -15,7 +15,7 @@ Contribution and merge policy for `1up`.
 Every pull request should clearly state:
 
 - what changed
-- whether the change affects install, upgrade, release, packaging, or governance surfaces
+- whether the change affects install, upgrade, release, distribution, or governance surfaces
 - what local validation was run
 - whether follow-on release evidence is needed
 
@@ -38,7 +38,7 @@ The following evidence is not expected to block ordinary pull requests, but it s
 - `just eval-parallel --summary`
 - benchmark outputs from `just bench-parallel` or other release benchmark scripts
 - archive verification notes
-- package publication references
+- distribution metadata references
 
 If an eval or benchmark is intentionally skipped for a release, record the skipped reason explicitly.
 
@@ -58,7 +58,7 @@ On Linux, also run the documented security gate locally when your environment su
 just security-check
 ```
 
-If you touch release-facing docs or metadata, manually confirm `Cargo.toml`, `README.md`, `CHANGELOG.md`, `RELEASE.md`, `LICENSE`, and related package metadata stay aligned before relying on the CI release-consistency check.
+If you touch release-facing docs or metadata, manually confirm `Cargo.toml`, `README.md`, `CHANGELOG.md`, `RELEASE.md`, `LICENSE`, and related release metadata stay aligned before relying on the CI release-consistency check.
 
 Optional heavier validation:
 

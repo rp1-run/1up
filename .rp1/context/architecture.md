@@ -14,7 +14,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 | Project-local libSQL state with schema v13 | refined | v13 validation adds worktree/context objects and `context_id` columns while retaining relation evidence columns, `indexed_files`, and `FLOAT8(384)` vector storage. |
 | Faster indexing via tuned DB connections, manifest prefilter, and batched writes | confirmed | Current pipeline also records deleted-file cleanup and scoped fallback reasons in progress metadata. |
 | Shrunk vector index | confirmed | Current baseline records `index.db` at 74,584,064 bytes (~71.1 MiB) with `max_neighbors=32`. |
-| Release/distribution via GitHub releases and package channels | refined | Release evidence now treats MCP protocol smoke, package publication records, update manifests, and install-script behavior as release surfaces. |
+| Release/distribution via GitHub releases, setup.sh, and update manifests | refined | Release evidence now treats MCP protocol smoke, update manifests, archive verification, and install-script behavior as release surfaces. |
 
 ## Key Architecture Patterns
 
@@ -29,7 +29,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 | Candidate-first retrieval with degradation | Vector, FTS, and symbol paths rank candidates before hydration; daemon and MCP search fall back to FTS-only when embeddings are unavailable. | `src/daemon/worker.rs`, `src/mcp/ops.rs`, `src/search/hybrid.rs`, `src/storage/queries.rs` |
 | Local-only advisory impact | CLI and MCP impact open the current index locally and traverse descriptor-backed relation evidence with trust-bucketed outputs. | `src/mcp/ops.rs`, `src/search/impact.rs`, `src/storage/relations.rs` |
 | Schema-gated local state | Existing DBs fail closed unless schema objects, required columns, vector element type, and schema version match the current binary. | `src/storage/schema.rs`, `src/shared/constants.rs` |
-| Evidence-driven release surface | CI, archive verification, MCP smoke, setup-script tests, package publication records, and update manifests form the release contract. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/install/setup.sh` |
+| Evidence-driven release surface | CI, archive verification, MCP smoke, setup-script tests, and update manifests form the release contract. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/install/setup.sh` |
 
 ## Layers
 
@@ -42,7 +42,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 | Search | Execute hybrid search, symbol lookup, context reads, and impact expansion. | `src/search/*`, `src/mcp/ops.rs` | Storage, Shared, Embedder |
 | Storage | Own libSQL connections, schema validation, SQL, segment writes, relation writes, and manifest state. | `src/storage/db.rs`, `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/relations.rs` | Shared |
 | Shared | Define config paths, root resolution, secure filesystem helpers, constants, progress types, and update metadata. | `src/shared/config.rs`, `src/shared/project.rs`, `src/shared/fs.rs`, `src/shared/types.rs`, `src/shared/update.rs` | None |
-| Release/Evidence | Build, package, verify, publish, and retain release proof. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/security_check.sh`, `scripts/install/setup.sh`, `packaging/*` | GitHub Actions, package repos, release assets |
+| Release/Evidence | Build archives, verify artifacts, publish update metadata, and retain release proof. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/security_check.sh`, `scripts/install/setup.sh` | GitHub Actions, GitHub Releases, release assets |
 
 ## Main Flows
 
@@ -93,7 +93,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 1. Release Please owns version/changelog PRs and tag creation.
 2. `release-assets` validates release metadata, builds the target matrix, stages the Windows ONNX Runtime DLL, packages archives with LICENSE/README, uploads checksums, release manifest, notes, and `setup.sh`.
 3. `release-evidence` verifies archives on the target matrix, runs MCP protocol smoke for each archive, retrieves merge/security evidence, optionally includes eval/benchmark/host-smoke assets, and uploads a consolidated evidence bundle.
-4. `publish-packages` renders Homebrew and Scoop definitions, commits them to package repos, uploads a package publication record, and publishes `update-manifest.json` to `main`.
+4. `publish-update-manifest` publishes the stable `update-manifest.json` to `main` after the GitHub Release is published.
 5. `scripts/install/setup.sh` installs from GitHub Releases with platform detection, optional SHA256 verification, atomic binary replacement, and managed PATH blocks.
 
 ## Data And State
@@ -109,7 +109,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 | Impact persistence | `segment_relations` | Context-scoped relation rows store raw/canonical/lookup targets, qualifier fingerprints, and edge identity kind for bounded expansion. |
 | File manifest | `indexed_files` | Context-scoped manifest storing path, extension, content hash, file size, and mtime ns for prefiltering and deleted-file cleanup. |
 | Model cache | `dirs::data_dir()/1up/models/all-MiniLM-L6-v2` | Verified/staging/current manifests plus failure marker for pinned ONNX/tokenizer artifacts. |
-| Release manifests | GitHub release assets and repo `update-manifest.json` | Drive self-update, installer, package publication, and release evidence. |
+| Release manifests | GitHub release assets and repo `update-manifest.json` | Drive self-update, installer metadata, and release evidence. |
 
 ## Integrations
 
@@ -121,7 +121,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 | rmcp | MCP stdio server | Exposes `oneup_*` tools and JSON schemas to agent hosts. |
 | notify | File watching | Powers daemon scoped refresh and full fallback triggers. |
 | GitHub Actions / Release Please / GitHub Releases | CI, versioning, artifact publishing, release evidence | Multi-workflow release pipeline with retained evidence. |
-| Homebrew / Scoop / setup.sh / self-update | Distribution and upgrade channels | Package definitions and stable update manifest are rendered from the release manifest. |
+| setup.sh / self-update | Distribution and upgrade channels | The script installer consumes GitHub Release assets; self-update reads the stable update manifest. |
 | Promptfoo / Claude Agent SDK / Bun | Evals | Search and impact evals compare 1up MCP-assisted agents with baseline raw-search agents. |
 | cargo-audit / shellcheck / hyperfine | Gates and evidence | Security, install-script, and performance evidence feed CI/release decisions. |
 
@@ -129,7 +129,7 @@ The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `
 
 - Deployment type: single Rust binary named `1up`, with optional background daemon and optional MCP stdio server mode.
 - Runtime environment: local developer machines on macOS, Linux, and Windows; daemon/Unix-socket paths are Unix-focused with platform stubs where daemon support is unavailable.
-- Installation channels: GitHub release archives, `setup.sh`, Homebrew formula, Scoop manifest, and built-in self-update via `update-manifest.json`.
+- Installation channels: `setup.sh` backed by GitHub Release archives, plus built-in self-update via `update-manifest.json`.
 - Release matrix: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`.
 - Release gates: CI security check, release build smoke, release metadata validation, setup-script lint/integration, archive verification, MCP smoke, and optional eval/benchmark/host evidence.
 
@@ -165,7 +165,7 @@ graph TB
 - MCP status checks readiness, and MCP start can explicitly create or rebuild the local index while readiness distinguishes missing, indexing, stale, degraded, and ready states.
 - Release archive verification now performs JSON-RPC MCP smoke against every built archive and asserts canonical tools, structured content, readiness statuses, and clean stdout protocol.
 - Release evidence now models live MCP host smoke as `mcp_host_smoke.v1`, with recorded or skipped evidence per host.
-- The install and package surface is now part of the architecture: `setup.sh`, Homebrew, Scoop, release manifest, package publication record, and update manifest are all generated/validated flows.
+- The install and distribution surface is now part of the architecture: `setup.sh`, release manifest, archive verification, and update manifest are all generated/validated flows.
 
 ## What Changed With Faster Indexing
 

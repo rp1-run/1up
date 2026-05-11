@@ -89,16 +89,41 @@ impl Db {
 /// Uses `execute_batch` because `PRAGMA journal_mode=WAL` returns a result
 /// row and libSQL's `execute()` rejects statements that produce rows.
 pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> {
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA cache_size=-32768;
-         PRAGMA mmap_size=268435456;
-         PRAGMA temp_store=MEMORY;",
-    )
-    .await
-    .map_err(|e| StorageError::Connection(format!("failed to apply project PRAGMAs: {e}")))?;
-    Ok(())
+    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    let mut last_error = None;
+
+    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
+        match conn
+            .execute_batch(
+                "PRAGMA busy_timeout=5000;
+                 PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA cache_size=-32768;
+                 PRAGMA mmap_size=268435456;
+                 PRAGMA temp_store=MEMORY;",
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let err_text = err.to_string();
+                if !is_lock_error(&err_text) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
+                    return Err(StorageError::Connection(format!(
+                        "failed to apply project PRAGMAs: {err_text}"
+                    ))
+                    .into());
+                }
+                last_error = Some(err_text);
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+
+    Err(StorageError::Connection(format!(
+        "failed to apply project PRAGMAs: {}",
+        last_error.unwrap_or_else(|| "database lock retry exhausted".to_string())
+    ))
+    .into())
 }
 
 fn validate_project_db_path_for_write(path: &Path) -> Result<std::path::PathBuf, OneupError> {

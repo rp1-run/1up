@@ -130,10 +130,9 @@ jobs:
           bash scripts/release/validate_release_metadata.sh "v${version}"
 
   setup-script-lint:
-    # Shell-only lint gates for scripts/install/setup.sh. Runs fast,
-    # no Rust toolchain needed. REQ-011 (bash 3.2 compat) is covered by
-    # running the script under a pinned bash 3.2 container; REQ-012
-    # (shellcheck) runs natively on the Ubuntu runner.
+    # Shell-only lint gates for scripts/install/setup.sh. Runs fast, with no
+    # Rust toolchain needed. Bash 3.2 compatibility is covered by a pinned
+    # container parse check; shellcheck runs natively on the Ubuntu runner.
     name: setup-script-lint
     runs-on: ubuntu-24.04
     steps:
@@ -153,7 +152,7 @@ jobs:
         run: |
           # Parse setup.sh under a pinned bash 3.2 image so macOS system bash
           # stays in the supported matrix. `bash -n` gives us a hard syntax
-          # gate without needing network access at run time (REQ-011).
+          # gate without needing network access at run time.
           docker run --rm \
             -v "$PWD:/s:ro" \
             bash:3.2 \

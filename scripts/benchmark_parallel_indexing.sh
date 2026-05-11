@@ -17,6 +17,44 @@ log() {
   printf '[parallel-index-bench] %s\n' "$*" >&2
 }
 
+write_skipped_summary() {
+  local reason="$1"
+  local out_dir="$2"
+  local summary_json="$out_dir/summary.json"
+
+  mkdir -p "$out_dir"
+  jq -n \
+    --arg reason "$reason" \
+    '{
+      status: "skipped",
+      evidence_type: "retained_performance",
+      skipped_reason: $reason,
+      manual_readiness_note_required: true,
+      retained_performance_outcomes: {
+        semantic_indexing: {
+          status: "skipped",
+          command: "just bench-parallel"
+        },
+        incremental_indexing: {
+          status: "skipped",
+          command: "just bench-parallel"
+        },
+        daemon_refresh: {
+          status: "skipped",
+          command: "just bench-parallel"
+        },
+        search_latency: {
+          status: "separate_evidence",
+          command: "just bench-search-latency"
+        }
+      }
+    }' > "$summary_json"
+
+  cat "$summary_json"
+  printf '\nParallel indexing benchmark skipped.\n'
+  printf 'Output: %s\n' "$summary_json"
+}
+
 to_ms() {
   awk -v value="$1" 'BEGIN { printf "%.2f", value * 1000 }'
 }
@@ -416,6 +454,34 @@ if [[ "${1:-}" == "__run_write_heavy_case" ]]; then
 fi
 
 REPO_INPUT="${1:-$EMDASH_CACHE_DIR}"
+if [[ -d "$REPO_INPUT" ]]; then
+  REPO_NAME=$(basename "$(cd "$REPO_INPUT" && pwd -P)")
+else
+  REPO_NAME=$(basename "$REPO_INPUT")
+fi
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+
+RUNS="${RUNS:-5}"
+WARMUP="${WARMUP:-1}"
+SERIAL_JOBS="${SERIAL_JOBS:-1}"
+SERIAL_EMBED_THREADS="${SERIAL_EMBED_THREADS:-1}"
+CONSTRAINED_JOBS="${CONSTRAINED_JOBS:-2}"
+CONSTRAINED_EMBED_THREADS="${CONSTRAINED_EMBED_THREADS:-1}"
+ONEUP_BIN="${ONEUP_BIN:-$ROOT_DIR/target/release/1up}"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/parallel-index-bench/${REPO_NAME}-${TIMESTAMP}}"
+PRISTINE_DIR="$OUT_DIR/pristine"
+RUN_DIR_ROOT="$OUT_DIR/runs"
+FULL_JSON="$OUT_DIR/full-index.json"
+INCREMENTAL_JSON="$OUT_DIR/incremental-index.json"
+WRITE_HEAVY_JSON="$OUT_DIR/write-heavy-index.json"
+SUMMARY_JSON="$OUT_DIR/summary.json"
+
+BENCHMARK_SKIPPED_REASON="${BENCHMARK_SKIPPED_REASON:-${SKIP_REASON:-}}"
+if [[ -n "${BENCHMARK_SKIPPED_REASON//[[:space:]]/}" ]]; then
+  require_cmd jq
+  write_skipped_summary "$BENCHMARK_SKIPPED_REASON" "$OUT_DIR"
+  exit 0
+fi
 
 require_cmd cargo
 require_cmd git
@@ -435,22 +501,6 @@ fi
 
 REPO=$(cd "$REPO_INPUT" && pwd -P)
 REPO_NAME=$(basename "$REPO")
-TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-
-RUNS="${RUNS:-5}"
-WARMUP="${WARMUP:-1}"
-SERIAL_JOBS="${SERIAL_JOBS:-1}"
-SERIAL_EMBED_THREADS="${SERIAL_EMBED_THREADS:-1}"
-CONSTRAINED_JOBS="${CONSTRAINED_JOBS:-2}"
-CONSTRAINED_EMBED_THREADS="${CONSTRAINED_EMBED_THREADS:-1}"
-ONEUP_BIN="${ONEUP_BIN:-$ROOT_DIR/target/release/1up}"
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/parallel-index-bench/${REPO_NAME}-${TIMESTAMP}}"
-PRISTINE_DIR="$OUT_DIR/pristine"
-RUN_DIR_ROOT="$OUT_DIR/runs"
-FULL_JSON="$OUT_DIR/full-index.json"
-INCREMENTAL_JSON="$OUT_DIR/incremental-index.json"
-WRITE_HEAVY_JSON="$OUT_DIR/write-heavy-index.json"
-SUMMARY_JSON="$OUT_DIR/summary.json"
 
 TELEMETRY_DIR="$OUT_DIR/telemetry"
 mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT" "$TELEMETRY_DIR"
@@ -537,6 +587,7 @@ FULL_CONTENT_READ_TOTAL=$(printf '%s' "$TELEMETRY_JSON" | jq '[.[] | select(.lab
 jq -n \
   --arg repo "$REPO" \
   --arg out_dir "$OUT_DIR" \
+  --arg search_latency_command "just bench-search-latency" \
   --arg serial_full_ms "$SERIAL_FULL_MS" \
   --arg auto_full_ms "$AUTO_FULL_MS" \
   --arg constrained_full_ms "$CONSTRAINED_FULL_MS" \
@@ -564,10 +615,33 @@ jq -n \
   --argjson full_content_read_total "$FULL_CONTENT_READ_TOTAL" \
   --argjson telemetry "$TELEMETRY_JSON" \
   '{
+    status: "recorded",
+    evidence_type: "retained_performance",
     repo: $repo,
     out_dir: $out_dir,
     runs: $runs,
     warmup: $warmup,
+    retained_performance_outcomes: {
+      semantic_indexing: {
+        status: "recorded",
+        metric: "full_index_median_ms",
+        command: "just bench-parallel"
+      },
+      incremental_indexing: {
+        status: "recorded",
+        metric: "incremental_index_median_ms",
+        command: "just bench-parallel"
+      },
+      daemon_refresh: {
+        status: "recorded",
+        metric: "daemon_refresh_median_ms",
+        command: "just bench-parallel"
+      },
+      search_latency: {
+        status: "separate_evidence",
+        command: $search_latency_command
+      }
+    },
     full_index_median_ms: {
       serial: ($serial_full_ms | tonumber),
       auto: ($auto_full_ms | tonumber),
@@ -622,9 +696,10 @@ jq -n \
 printf 'Parallel indexing benchmark complete.\n'
 printf 'Repository: %s\n' "$REPO"
 printf 'Output: %s\n' "$OUT_DIR"
+printf 'Retained outcomes: semantic_indexing incremental_indexing daemon_refresh; search_latency via just bench-search-latency\n'
 printf 'Full reindex median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_FULL_MS" "$AUTO_FULL_MS" "$CONSTRAINED_FULL_MS"
-printf 'Scoped follow-up median ms: serial=%s auto=%s constrained=%s\n' \
+printf 'Incremental index median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_INCREMENTAL_MS" "$AUTO_INCREMENTAL_MS" "$CONSTRAINED_INCREMENTAL_MS"
 printf 'Write-heavy median ms: serial=%s auto=%s constrained=%s\n' \
   "$SERIAL_WRITE_HEAVY_MS" "$AUTO_WRITE_HEAVY_MS" "$CONSTRAINED_WRITE_HEAVY_MS"

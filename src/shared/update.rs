@@ -40,14 +40,14 @@ pub struct UpdateArtifact {
     pub url: String,
 }
 
-/// Distribution channel metadata for package manager integration.
+/// Supported release distribution metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateChannels {
     pub github_release: String,
-    pub homebrew_tap: String,
-    pub homebrew_formula: String,
-    pub scoop_bucket: String,
-    pub scoop_manifest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_install: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_manifest: Option<String>,
 }
 
 /// Cached result of the most recent update check.
@@ -195,8 +195,9 @@ fn detect_channel_from_path(path: &std::path::Path) -> InstallChannel {
 /// Returns the channel-appropriate upgrade instruction for the given install channel.
 pub fn upgrade_instruction_for_channel(channel: InstallChannel) -> String {
     match channel {
-        InstallChannel::Homebrew => "brew upgrade rp1-run/tap/1up".to_string(),
-        InstallChannel::Scoop => "scoop update 1up".to_string(),
+        InstallChannel::Homebrew | InstallChannel::Scoop => {
+            "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string()
+        }
         InstallChannel::Manual | InstallChannel::Unknown => "1up update".to_string(),
     }
 }
@@ -903,10 +904,11 @@ mod tests {
             }],
             channels: UpdateChannels {
                 github_release: "https://github.com/rp1-run/1up/releases/tag/v0.1.1".to_string(),
-                homebrew_tap: "rp1-run/tap".to_string(),
-                homebrew_formula: "1up".to_string(),
-                scoop_bucket: "rp1-run".to_string(),
-                scoop_manifest: "1up".to_string(),
+                script_install: Some("https://1up.rp1.run/setup.sh".to_string()),
+                update_manifest: Some(
+                    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+                        .to_string(),
+                ),
             },
             yanked: false,
             minimum_safe_version: None,
@@ -933,11 +935,7 @@ mod tests {
             "notes_url": "https://example.com/notes",
             "artifacts": [],
             "channels": {
-                "github_release": "https://example.com",
-                "homebrew_tap": "tap",
-                "homebrew_formula": "1up",
-                "scoop_bucket": "bucket",
-                "scoop_manifest": "1up"
+                "github_release": "https://example.com"
             }
         }"#;
 
@@ -989,7 +987,7 @@ mod tests {
     fn upgrade_instruction_for_homebrew() {
         assert_eq!(
             upgrade_instruction_for_channel(InstallChannel::Homebrew),
-            "brew upgrade rp1-run/tap/1up"
+            "curl -fsSL https://1up.rp1.run/setup.sh | bash"
         );
     }
 
@@ -997,7 +995,7 @@ mod tests {
     fn upgrade_instruction_for_scoop() {
         assert_eq!(
             upgrade_instruction_for_channel(InstallChannel::Scoop),
-            "scoop update 1up"
+            "curl -fsSL https://1up.rp1.run/setup.sh | bash"
         );
     }
 
@@ -1156,10 +1154,11 @@ mod tests {
             artifacts: vec![],
             channels: UpdateChannels {
                 github_release: "https://example.com".to_string(),
-                homebrew_tap: "rp1-run/tap".to_string(),
-                homebrew_formula: "1up".to_string(),
-                scoop_bucket: "rp1-run".to_string(),
-                scoop_manifest: "1up".to_string(),
+                script_install: Some("https://1up.rp1.run/setup.sh".to_string()),
+                update_manifest: Some(
+                    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+                        .to_string(),
+                ),
             },
             yanked: true,
             minimum_safe_version: Some("0.1.5".to_string()),
@@ -1189,10 +1188,11 @@ mod tests {
             artifacts: vec![],
             channels: UpdateChannels {
                 github_release: "https://example.com".to_string(),
-                homebrew_tap: "rp1-run/tap".to_string(),
-                homebrew_formula: "1up".to_string(),
-                scoop_bucket: "rp1-run".to_string(),
-                scoop_manifest: "1up".to_string(),
+                script_install: Some("https://1up.rp1.run/setup.sh".to_string()),
+                update_manifest: Some(
+                    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+                        .to_string(),
+                ),
             },
             yanked: false,
             minimum_safe_version: None,
@@ -1381,10 +1381,11 @@ mod tests {
             }],
             channels: UpdateChannels {
                 github_release: "https://example.com".to_string(),
-                homebrew_tap: "rp1-run/tap".to_string(),
-                homebrew_formula: "1up".to_string(),
-                scoop_bucket: "rp1-run".to_string(),
-                scoop_manifest: "1up".to_string(),
+                script_install: Some("https://1up.rp1.run/setup.sh".to_string()),
+                update_manifest: Some(
+                    "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
+                        .to_string(),
+                ),
             },
             yanked: false,
             minimum_safe_version: None,
@@ -1588,10 +1589,16 @@ mod tests {
     fn format_notification_uses_channel_upgrade_instruction() {
         let mut cache = make_cache("0.1.0", "0.1.1", false, None, None);
         cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Homebrew);
-        assert_eq!(cache.upgrade_instruction, "brew upgrade rp1-run/tap/1up");
+        assert_eq!(
+            cache.upgrade_instruction,
+            "curl -fsSL https://1up.rp1.run/setup.sh | bash"
+        );
 
         cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Scoop);
-        assert_eq!(cache.upgrade_instruction, "scoop update 1up");
+        assert_eq!(
+            cache.upgrade_instruction,
+            "curl -fsSL https://1up.rp1.run/setup.sh | bash"
+        );
 
         cache.upgrade_instruction = upgrade_instruction_for_channel(InstallChannel::Manual);
         assert_eq!(cache.upgrade_instruction, "1up update");

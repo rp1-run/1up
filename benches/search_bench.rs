@@ -652,7 +652,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    c.bench_function("symbol_lookup_exact", |b| {
+    c.bench_function("search_latency_symbol_lookup_exact", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -664,7 +664,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("symbol_lookup_partial", |b| {
+    c.bench_function("search_latency_symbol_lookup_partial", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -675,7 +675,7 @@ fn bench_symbol_lookup(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("symbol_references", |b| {
+    c.bench_function("search_latency_symbol_references", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -692,7 +692,7 @@ fn bench_fts_search(c: &mut Criterion) {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    c.bench_function("fts_search_single_term", |b| {
+    c.bench_function("search_latency_fts_single_term", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -704,7 +704,7 @@ fn bench_fts_search(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("fts_search_multi_term", |b| {
+    c.bench_function("search_latency_fts_multi_term", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -718,7 +718,7 @@ fn bench_fts_search(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("fts_search_no_results", |b| {
+    c.bench_function("search_latency_fts_no_results", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -735,7 +735,7 @@ fn bench_chunked_content_search(c: &mut Criterion) {
     let (_tmp, db_path) = setup_db_and_index();
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    c.bench_function("fts_search_chunked_config_query", |b| {
+    c.bench_function("search_latency_chunked_config_query", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -751,7 +751,7 @@ fn bench_chunked_content_search(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("fts_search_chunked_proto_query", |b| {
+    c.bench_function("search_latency_chunked_proto_query", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -764,7 +764,7 @@ fn bench_chunked_content_search(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("fts_search_chunked_sql_query", |b| {
+    c.bench_function("search_latency_chunked_sql_query", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let db = oneup::storage::db::Db::open_ro(&db_path).await.unwrap();
@@ -790,7 +790,7 @@ fn bench_retrieval_backend(c: &mut Criterion) {
         .unwrap();
     let conn = db.connect().unwrap();
 
-    c.bench_function("retrieval_sql_vector_v2_candidates", |b| {
+    c.bench_function("search_latency_sql_vector_candidates", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
@@ -807,7 +807,7 @@ fn bench_retrieval_backend(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("hybrid_sql_vector_v2_fusion", |b| {
+    c.bench_function("search_latency_hybrid_vector_fusion", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
@@ -907,7 +907,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         limit: 20,
     };
 
-    c.bench_function("impact_file_anchor", |b| {
+    c.bench_function("impact_latency_file_anchor", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -918,7 +918,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_narrow", |b| {
+    c.bench_function("impact_latency_symbol_anchor_narrow", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -929,7 +929,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_qualified_relation", |b| {
+    c.bench_function("impact_latency_symbol_anchor_qualified_relation", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -944,7 +944,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_file_anchor_primary", |b| {
+    c.bench_function("impact_latency_file_anchor_primary", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -955,7 +955,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_low_signal_primary", |b| {
+    c.bench_function("impact_latency_symbol_anchor_low_signal_primary", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -976,7 +976,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_formatter_conformance", |b| {
+    c.bench_function("impact_latency_symbol_anchor_formatter_conformance", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -988,7 +988,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_refused", |b| {
+    c.bench_function("impact_latency_symbol_anchor_refused", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -999,7 +999,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_segment_anchor_empty", |b| {
+    c.bench_function("impact_latency_segment_anchor_empty", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);
@@ -1010,7 +1010,7 @@ fn bench_impact_horizon(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("impact_symbol_anchor_empty_scoped", |b| {
+    c.bench_function("impact_latency_symbol_anchor_empty_scoped", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let engine = ImpactHorizonEngine::new(&conn);

@@ -15,7 +15,6 @@ BENCHMARK_SKIPPED_REASON=""
 ARCHIVE_VERIFICATION_PATH=""
 MCP_HOST_SMOKE_PATH=""
 MCP_HOST_SKIPPED_REASON=""
-PACKAGE_RECORD_PATH=""
 OUTPUT_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -60,10 +59,6 @@ while [[ $# -gt 0 ]]; do
       MCP_HOST_SKIPPED_REASON="${2:-}"
       shift 2
       ;;
-    --package-record)
-      PACKAGE_RECORD_PATH="${2:-}"
-      shift 2
-      ;;
     --output)
       OUTPUT_PATH="${2:-}"
       shift 2
@@ -75,7 +70,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$MANIFEST_PATH" || -z "$MERGE_GATE_PATH" || -z "$SECURITY_CHECK_PATH" || -z "$ARCHIVE_VERIFICATION_PATH" || -z "$OUTPUT_PATH" ]]; then
-  fail "usage: $(basename "$0") --manifest <path> --merge-gate <path> --security-check <path> --archive-verification <path> [--mcp-host-smoke <path> | --mcp-host-skipped-reason <reason>] [--eval-summary <path> | --eval-skipped-reason <reason>] [--benchmark-summary <path> | --benchmark-skipped-reason <reason>] [--package-record <path>] --output <path>"
+  fail "usage: $(basename "$0") --manifest <path> --merge-gate <path> --security-check <path> --archive-verification <path> [--mcp-host-smoke <path> | --mcp-host-skipped-reason <reason>] [--eval-summary <path> | --eval-skipped-reason <reason>] [--benchmark-summary <path> | --benchmark-skipped-reason <reason>] --output <path>"
 fi
 
 require_cmd jq
@@ -123,7 +118,7 @@ validate_mcp_host_evidence() {
         (.status == "recorded")
         and (.host | type == "string" and length > 0)
         and (.host_version | type == "string" and length > 0)
-        and (.setup_mode as $mode | ["wrapper", "add-mcp", "manual"] | index($mode) != null)
+        and (.setup_mode == "manual")
         and (.repo_path | type == "string" and length > 0)
         and (.tools_listed == true)
         and (.tools | type == "array" and length > 0)
@@ -208,6 +203,9 @@ manifest_version=$(manifest_value "$MANIFEST_PATH" '.version')
 manifest_tag=$(manifest_value "$MANIFEST_PATH" '.git_tag')
 manifest_commit_sha=$(manifest_value "$MANIFEST_PATH" '.commit_sha')
 notes_source=$(manifest_value "$MANIFEST_PATH" '.notes_source')
+github_release_url=$(manifest_value "$MANIFEST_PATH" '.channels.github_release')
+script_install_url=$(manifest_value "$MANIFEST_PATH" '.channels.script_install')
+update_manifest_url=$(manifest_value "$MANIFEST_PATH" '.channels.update_manifest')
 
 security_json=$(jq -n \
   --arg asset "$(basename "$SECURITY_CHECK_PATH")" \
@@ -281,31 +279,16 @@ else
     }')
 fi
 
-if [[ -n "$PACKAGE_RECORD_PATH" ]]; then
-  require_file "$PACKAGE_RECORD_PATH"
-
-  if [[ "$(jq -r '.version' "$PACKAGE_RECORD_PATH")" != "$manifest_version" ]]; then
-    fail "package publication record version does not match release manifest"
-  fi
-
-  if [[ "$(jq -r '.git_tag' "$PACKAGE_RECORD_PATH")" != "$manifest_tag" ]]; then
-    fail "package publication record tag does not match release manifest"
-  fi
-
-  packages_json=$(jq --arg asset "$(basename "$PACKAGE_RECORD_PATH")" '
-    {
-      status: "recorded",
-      record_asset: $asset,
-      homebrew: .packages.homebrew,
-      scoop: .packages.scoop
-    }' "$PACKAGE_RECORD_PATH")
-else
-  packages_json=$(jq -n '
-    {
-      status: "pending",
-      pending_reason: "Package publication runs after the GitHub Release is published."
-    }')
-fi
+distribution_json=$(jq -n \
+  --arg github_release "$github_release_url" \
+  --arg script_install "$script_install_url" \
+  --arg update_manifest "$update_manifest_url" \
+  '{
+    status: "recorded",
+    github_release: $github_release,
+    script_install: $script_install,
+    update_manifest: $update_manifest
+  }')
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
@@ -322,7 +305,7 @@ jq -n \
   --argjson benchmarks "$benchmark_json" \
   --argjson archive_verification "$archive_json" \
   --argjson mcp_host_smoke "$mcp_host_smoke_json" \
-  --argjson packages "$packages_json" \
+  --argjson distribution "$distribution_json" \
   '{
     version: $version,
     git_tag: $git_tag,
@@ -336,7 +319,7 @@ jq -n \
     benchmarks: $benchmarks,
     archive_verification: $archive_verification,
     mcp_host_smoke: $mcp_host_smoke,
-    packages: $packages
+    distribution: $distribution
   }' \
   >"$OUTPUT_PATH"
 

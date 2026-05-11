@@ -78,6 +78,8 @@ tests:
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
       - type: javascript
+        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+      - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
@@ -85,6 +87,8 @@ tests:
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+      - type: javascript
+        value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -123,6 +127,8 @@ tests:
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
       - type: javascript
+        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+      - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
@@ -130,6 +136,8 @@ tests:
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+      - type: javascript
+        value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -167,6 +175,8 @@ tests:
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
       - type: javascript
+        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+      - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
@@ -174,6 +184,8 @@ tests:
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+      - type: javascript
+        value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
@@ -210,6 +222,8 @@ tests:
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
       - type: javascript
+        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+      - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
@@ -217,6 +231,8 @@ tests:
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+      - type: javascript
+        value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
       - type: javascript
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric

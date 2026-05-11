@@ -18,9 +18,7 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::os::unix::{fs::PermissionsExt, net::UnixStream};
 
 static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -57,6 +55,27 @@ fn seed_model_download_failure_at_app_root(app_root: &Path) {
     let model_dir = app_root.join("models").join("all-MiniLM-L6-v2");
     fs::create_dir_all(&model_dir).unwrap();
     fs::write(model_dir.join(".download_failed"), "skip download in test").unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_runner(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+set -eu
+{
+  printf 'runner=%s\n' "${0##*/}"
+  i=0
+  for arg in "$@"; do
+    printf 'arg[%s]=%s\n' "$i" "$arg"
+    i=$((i + 1))
+  done
+} > "${ONEUP_FAKE_RUNNER_LOG:?}"
+exit "${ONEUP_FAKE_RUNNER_STATUS:-0}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(unix)]
@@ -388,27 +407,6 @@ fn seed_current_index_for_context(project: &Path, context_id: &str) {
         .await
         .unwrap();
     });
-}
-
-#[cfg(unix)]
-fn write_fake_runner(path: &Path) {
-    fs::write(
-        path,
-        r#"#!/bin/sh
-set -eu
-{
-  printf 'runner=%s\n' "${0##*/}"
-  i=0
-  for arg in "$@"; do
-    printf 'arg[%s]=%s\n' "$i" "$arg"
-    i=$((i + 1))
-  done
-} > "${ONEUP_FAKE_RUNNER_LOG:?}"
-exit "${ONEUP_FAKE_RUNNER_STATUS:-0}"
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 impl Drop for McpTestClient {
@@ -3493,7 +3491,7 @@ fn add_mcp_prefers_bunx_then_npx() {
 
     let log = fs::read_to_string(log_path).unwrap();
     assert!(log.contains("runner=bunx"), "unexpected runner log: {log}");
-    assert!(log.contains("arg[0]=add-mcp"));
+    assert!(log.contains("arg[0]=add-mcp"), "unexpected argv: {log}");
 }
 
 #[cfg(unix)]

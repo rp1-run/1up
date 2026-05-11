@@ -19,7 +19,7 @@ OBSERVED_TOOLS=()
 usage() {
   cat >&2 <<'USAGE'
 usage:
-  record_mcp_host_smoke.sh --output <path> --host <host> --status recorded --host-version <version> --setup-mode wrapper|add-mcp|manual --repo <path> --tool <name>... --readiness <status> --discovery-flow <status>
+  record_mcp_host_smoke.sh --output <path> --host <host> --status recorded --host-version <version> --setup-mode manual --repo <path> --tool <name>... --readiness <status> --discovery-flow <status>
   record_mcp_host_smoke.sh --output <path> --host <host> --status skipped --setup-mode skipped --reason <reason>
 
 hosts: codex, claude-code, cursor, vscode, github-copilot-cli, generic
@@ -61,7 +61,7 @@ normalize_host() {
 
 validate_setup_mode() {
   case "$1" in
-    wrapper|add-mcp|manual|skipped) ;;
+    manual|skipped) ;;
     *) fail "unsupported setup mode: $1" ;;
   esac
 }
@@ -156,7 +156,7 @@ validate_setup_mode "$SETUP_MODE"
 
 if [[ "$STATUS" == "recorded" ]]; then
   if [[ "$SETUP_MODE" == "skipped" ]]; then
-    fail "recorded host smoke evidence requires setup mode wrapper, add-mcp, or manual"
+    fail "recorded host smoke evidence requires setup mode manual"
   fi
   if [[ -z "$HOST_VERSION" || -z "$REPO_PATH" || -z "$READINESS_STATUS" || -z "$DISCOVERY_FLOW_STATUS" ]]; then
     fail "recorded host smoke evidence requires --host-version, --repo, --readiness, and --discovery-flow"

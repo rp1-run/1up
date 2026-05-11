@@ -7,6 +7,8 @@ import {
   assertImpactTrustInterpreted,
   assertNoFallbackTools,
   assertReadAfterSearch,
+  assertReadinessWorkflowUsed,
+  assertStructuredOneupMcpResponses,
   assertSymbolVerificationUsed,
   assertValidOneupMcpCalls,
   reportEfficiency,
@@ -23,7 +25,9 @@ function bash(command: string) {
   return toolCall("Bash", { command });
 }
 
-function makeContext(toolCalls: Array<ReturnType<typeof toolCall>> = []) {
+type TestToolCall = ReturnType<typeof toolCall> & { output?: unknown };
+
+function makeContext(toolCalls: TestToolCall[] = []) {
   return {
     providerResponse: {
       metadata: {
@@ -78,6 +82,85 @@ describe("assert1upImpactUsed", () => {
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("oneup_impact");
+  });
+});
+
+describe("assertReadinessWorkflowUsed", () => {
+  test("passes when status happens before retained discovery", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
+  test("passes when start happens after status", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_start", { mode: "index_if_needed" }),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("oneup_start");
+  });
+
+  test("fails when status is skipped", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([toolCall("mcp__oneup__oneup_search", { query: "daemon" })]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_status");
+  });
+
+  test("fails when discovery happens before status", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_status", {}),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("after discovery");
+  });
+
+  test("fails when start happens before status", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_start", { mode: "index_if_needed" }),
+        toolCall("mcp__oneup__oneup_status", {}),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_start");
+  });
+
+  test("fails when start remediation happens after discovery", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_start", { mode: "index_if_needed" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_start happened after discovery");
   });
 });
 
@@ -186,6 +269,117 @@ describe("assertNoFallbackTools", () => {
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("Find");
+  });
+});
+
+describe("assertStructuredOneupMcpResponses", () => {
+  test("passes when provider metadata omits MCP outputs", () => {
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([toolCall("mcp__oneup__oneup_status", {})]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("did not include captured MCP outputs");
+  });
+
+  test("passes for captured structuredContent envelopes", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: {
+            structuredContent: {
+              status: "ready",
+              summary: "The repository is ready for 1up MCP search.",
+              data: { readiness: "ready" },
+              next_actions: [
+                {
+                  tool: "oneup_search",
+                  reason: "search indexed repository",
+                  arguments: {},
+                },
+              ],
+            },
+          },
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("ToolEnvelope");
+  });
+
+  test("passes when captured provider output is text-only tool_result content", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: [
+            {
+              type: "text",
+              text: "The repository is ready for 1up MCP search.",
+            },
+          ],
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("did not include captured structured MCP outputs");
+  });
+
+  test("fails for captured outputs without structured envelope fields", () => {
+    const call = toolCall("mcp__oneup__oneup_search", { query: "daemon" });
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: {
+            structuredContent: {
+              status: "ok",
+              summary: "\u001b[32mok\u001b[0m",
+              next_actions: [{ tool: "1up_search", arguments: {} }],
+            },
+          },
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("ANSI");
+    expect(result.reason).toContain("missing data");
+    expect(result.reason).toContain("non-canonical tool");
+  });
+
+  test("fails for captured outputs with malformed envelope object fields", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: {
+            structuredContent: {
+              status: "ok",
+              summary: "ok",
+              data: null,
+              next_actions: [{ tool: "oneup_search" }],
+            },
+          },
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("data must be an object");
+    expect(result.reason).toContain("without string reason");
+    expect(result.reason).toContain("without object arguments");
   });
 });
 

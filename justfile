@@ -9,17 +9,23 @@ install:
     cp target/release/1up ~/.local/bin/1up
     codesign -f -s - ~/.local/bin/1up
 
+# Search comparison against the pinned emdash corpus.
 bench:
     cargo build --release
     @cd evals && ONEUP_BENCH_BIN=../target/release/1up bun run bench
 
+# Retained evidence for semantic indexing, incremental indexing, and daemon refresh.
 bench-parallel:
     ./scripts/benchmark_parallel_indexing.sh
 
-# Size + throughput guard for schema v12 HNSW index (shrink-hnsw-vector-index).
-# Fresh-reindexes the 1up repo and gates against REQ-001 (index.db <= 80 MiB)
-# and REQ-003 (indexing_ms in [72900, 89100]). Pinned baseline for delta
-# reporting lives at scripts/baselines/vector_index_size_baseline.json.
+# Retained Criterion evidence for local search latency.
+bench-search-latency:
+    cargo bench --bench search_bench
+
+# Fresh-reindexes the 1up repo and gates index.db <= 80 MiB,
+# indexing_ms <= 90000, and current schema. Pinned baseline for delta reporting
+# lives at scripts/baselines/vector_index_size_baseline.json.
+# Semantic index storage + throughput guard for retained release evidence.
 bench-vector-index-size *flags:
     ./scripts/benchmark_vector_index_size.sh {{flags}}
 
@@ -27,7 +33,7 @@ security-check:
     ./scripts/security_check.sh
 
 # Local verification gate. Runs formatter, linter, the full test surface,
-# and the install-script smoke introduced by the update-script feature (T4).
+# and the install-script smoke required for release readiness.
 # Uses `cargo test` (no per-suite filters) so any integration test crate added
 # later -- including the security gate's existing targets -- is picked up
 # automatically and verify cannot pass while CI fails.

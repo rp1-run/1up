@@ -4,6 +4,7 @@
  */
 
 import {
+  ONEUP_MCP_TOOLS,
   type OneupMcpTool,
   toCanonical,
   toOneupMcpTool,
@@ -66,14 +67,19 @@ function getOneupCalls(
   });
 }
 
-function getBashCommands(context: EvalContext): string[] {
-  return getToolCalls(context)
-    .filter((tc) => toCanonical(tc.name) === "shell")
-    .map((tc) => (tc.input as { command?: string })?.command ?? "")
-    .filter((cmd) => cmd.length > 0);
-}
-
 const FALLBACK_TOOLS = ["rg", "grep", "find"] as const;
+const ONEUP_DISCOVERY_TOOLS: readonly OneupMcpTool[] = [
+  "oneup_search",
+  "oneup_get",
+  "oneup_symbol",
+  "oneup_context",
+  "oneup_impact",
+  "oneup_structural",
+];
+const ONEUP_MCP_TOOL_SET = new Set<string>(ONEUP_MCP_TOOLS);
+const ANSI_ESCAPE_PATTERN = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`,
+);
 
 type FallbackTool = (typeof FALLBACK_TOOLS)[number];
 
@@ -362,6 +368,17 @@ function toolCallIndex(calls: readonly ToolCall[], tool: OneupMcpTool): number {
   return calls.findIndex((tc) => toOneupMcpTool(tc.name) === tool);
 }
 
+function firstToolCallIndex(
+  calls: readonly ToolCall[],
+  tools: readonly OneupMcpTool[],
+): number {
+  const indexes = tools
+    .map((tool) => toolCallIndex(calls, tool))
+    .filter((index) => index !== -1);
+
+  return indexes.length > 0 ? Math.min(...indexes) : -1;
+}
+
 function hasGetTarget(input: unknown): boolean {
   if (!input || typeof input !== "object") {
     return false;
@@ -434,6 +451,93 @@ function fallbackViolations(context: EvalContext): string[] {
   return violations;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function outputRecord(output: unknown): Record<string, unknown> | undefined {
+  if (isRecord(output)) {
+    return output;
+  }
+
+  return typeof output === "string" ? parseJsonRecord(output) : undefined;
+}
+
+function extractStructuredEnvelope(
+  output: unknown,
+): Record<string, unknown> | undefined {
+  const record = outputRecord(output);
+  if (!record) {
+    return undefined;
+  }
+
+  const structuredContent =
+    record.structuredContent ?? record.structured_content;
+  if (isRecord(structuredContent)) {
+    return structuredContent;
+  }
+
+  return undefined;
+}
+
+function validateEnvelope(envelope: Record<string, unknown>): string[] {
+  const problems: string[] = [];
+  const status = envelope.status;
+  const summary = envelope.summary;
+  const nextActions = envelope.next_actions;
+
+  if (typeof status !== "string" || status.length === 0) {
+    problems.push("missing string status");
+  }
+
+  if (typeof summary !== "string" || summary.length === 0) {
+    problems.push("missing string summary");
+  } else if (ANSI_ESCAPE_PATTERN.test(summary)) {
+    problems.push("summary contains ANSI terminal presentation");
+  }
+
+  if (!("data" in envelope)) {
+    problems.push("missing data");
+  } else if (!isRecord(envelope.data)) {
+    problems.push("data must be an object");
+  }
+
+  if (!Array.isArray(nextActions)) {
+    problems.push("missing next_actions array");
+  } else {
+    for (const action of nextActions) {
+      if (!isRecord(action)) {
+        problems.push("next_actions contains non-object action");
+        continue;
+      }
+
+      const tool = action.tool;
+      if (typeof tool !== "string" || !ONEUP_MCP_TOOL_SET.has(tool)) {
+        problems.push(`next_actions contains non-canonical tool ${tool}`);
+      }
+
+      if (typeof action.reason !== "string" || action.reason.length === 0) {
+        problems.push("next_actions contains action without string reason");
+      }
+
+      if (!isRecord(action.arguments)) {
+        problems.push("next_actions contains action without object arguments");
+      }
+    }
+  }
+
+  return problems;
+}
+
 export function assert1upUsed(
   _output: string,
   context: EvalContext,
@@ -447,6 +551,54 @@ export function assert1upUsed(
     reason: found
       ? "Agent invoked canonical MCP discovery tool oneup_search"
       : `Agent did not invoke oneup_search. MCP 1up calls seen: ${formatToolNames(calls)}`,
+  };
+}
+
+export function assertReadinessWorkflowUsed(
+  _output: string,
+  context: EvalContext,
+): GradingResult {
+  const calls = getToolCalls(context);
+  const statusIndex = toolCallIndex(calls, "oneup_status");
+  const startIndex = toolCallIndex(calls, "oneup_start");
+  const firstDiscoveryIndex = firstToolCallIndex(calls, ONEUP_DISCOVERY_TOOLS);
+
+  const problems: string[] = [];
+
+  if (statusIndex === -1) {
+    problems.push("missing oneup_status readiness check");
+  }
+
+  if (
+    statusIndex !== -1 &&
+    firstDiscoveryIndex !== -1 &&
+    statusIndex > firstDiscoveryIndex
+  ) {
+    problems.push("oneup_status happened after discovery");
+  }
+
+  if (startIndex !== -1 && (statusIndex === -1 || startIndex < statusIndex)) {
+    problems.push("oneup_start happened before oneup_status");
+  }
+
+  if (
+    startIndex !== -1 &&
+    firstDiscoveryIndex !== -1 &&
+    startIndex > firstDiscoveryIndex
+  ) {
+    problems.push("oneup_start happened after discovery");
+  }
+
+  const pass = problems.length === 0;
+
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? startIndex === -1
+        ? "Agent checked readiness with oneup_status before discovery"
+        : "Agent checked readiness with oneup_status and used oneup_start after status"
+      : `Agent did not follow the retained status/start readiness workflow: ${problems.join(", ")}`,
   };
 }
 
@@ -479,6 +631,53 @@ export function assertNoFallbackTools(
     reason: pass
       ? "Agent did not use raw discovery tools before oneup_search"
       : `Agent used raw discovery tools outside the allowed post-search verification path: ${[...new Set(violations)].join(", ")}`,
+  };
+}
+
+export function assertStructuredOneupMcpResponses(
+  _output: string,
+  context: EvalContext,
+): GradingResult {
+  const callsWithOutput = getOneupCalls(context).filter(
+    (tc) => tc.output !== undefined,
+  );
+
+  if (callsWithOutput.length === 0) {
+    return {
+      pass: true,
+      score: 1,
+      reason:
+        "Provider metadata did not include captured MCP outputs; tool-call assertions cover retained API use and protocol smoke validates envelope shape",
+    };
+  }
+
+  const envelopes = callsWithOutput.flatMap((tc) => {
+    const tool = toOneupMcpTool(tc.name) ?? tc.name;
+    const envelope = extractStructuredEnvelope(tc.output);
+    return envelope ? [{ tool, envelope }] : [];
+  });
+
+  if (envelopes.length === 0) {
+    return {
+      pass: true,
+      score: 1,
+      reason:
+        "Provider metadata did not include captured structured MCP outputs; tool-call assertions cover retained API use and protocol smoke validates envelope shape",
+    };
+  }
+
+  const problems = envelopes.flatMap(({ tool, envelope }) => {
+    return validateEnvelope(envelope).map((problem) => `${tool}: ${problem}`);
+  });
+
+  const pass = problems.length === 0;
+
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? "Captured oneup MCP outputs used structured ToolEnvelope fields"
+      : `Captured oneup MCP outputs were not valid structured envelopes: ${problems.join(", ")}`,
   };
 }
 
