@@ -505,6 +505,8 @@ function validateEnvelope(envelope: Record<string, unknown>): string[] {
 
   if (!("data" in envelope)) {
     problems.push("missing data");
+  } else if (!isRecord(envelope.data)) {
+    problems.push("data must be an object");
   }
 
   if (!Array.isArray(nextActions)) {
@@ -519,6 +521,14 @@ function validateEnvelope(envelope: Record<string, unknown>): string[] {
       const tool = action.tool;
       if (typeof tool !== "string" || !ONEUP_MCP_TOOL_SET.has(tool)) {
         problems.push(`next_actions contains non-canonical tool ${tool}`);
+      }
+
+      if (typeof action.reason !== "string" || action.reason.length === 0) {
+        problems.push("next_actions contains action without string reason");
+      }
+
+      if (!isRecord(action.arguments)) {
+        problems.push("next_actions contains action without object arguments");
       }
     }
   }

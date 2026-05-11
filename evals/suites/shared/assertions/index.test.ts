@@ -281,7 +281,13 @@ describe("assertStructuredOneupMcpResponses", () => {
               status: "ready",
               summary: "The repository is ready for 1up MCP search.",
               data: { readiness: "ready" },
-              next_actions: [{ tool: "oneup_search", arguments: {} }],
+              next_actions: [
+                {
+                  tool: "oneup_search",
+                  reason: "search indexed repository",
+                  arguments: {},
+                },
+              ],
             },
           },
         },
@@ -314,6 +320,31 @@ describe("assertStructuredOneupMcpResponses", () => {
     expect(result.reason).toContain("ANSI");
     expect(result.reason).toContain("missing data");
     expect(result.reason).toContain("non-canonical tool");
+  });
+
+  test("fails for captured outputs with malformed envelope object fields", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: {
+            structuredContent: {
+              status: "ok",
+              summary: "ok",
+              data: null,
+              next_actions: [{ tool: "oneup_search" }],
+            },
+          },
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("data must be an object");
+    expect(result.reason).toContain("without string reason");
+    expect(result.reason).toContain("without object arguments");
   });
 });
 
