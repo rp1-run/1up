@@ -245,10 +245,10 @@ pub enum UpdateResult {
         current_version: String,
         latest_version: String,
     },
-    ChannelManaged {
+    ScriptInstallerRequired {
         current_version: String,
         latest_version: String,
-        install_channel: InstallChannel,
+        detected_channel: InstallChannel,
         upgrade_instruction: String,
         status: UpdateStatus,
         message: Option<String>,
@@ -447,10 +447,10 @@ impl Formatter for JsonFormatter {
                 "update_available": false,
                 "message": "Already up to date.",
             })),
-            UpdateResult::ChannelManaged {
+            UpdateResult::ScriptInstallerRequired {
                 current_version,
                 latest_version,
-                install_channel,
+                detected_channel,
                 upgrade_instruction,
                 status,
                 message,
@@ -458,8 +458,8 @@ impl Formatter for JsonFormatter {
                 "current_version": current_version,
                 "latest_version": latest_version,
                 "update_available": true,
-                "install_channel": install_channel,
-                "managed": true,
+                "detected_install_channel": detected_channel,
+                "update_method": "script_install",
                 "status": render_update_status_label(status),
                 "upgrade_instruction": upgrade_instruction,
                 "message": message,
@@ -876,13 +876,13 @@ impl Formatter for HumanFormatter {
             } => {
                 format!("Already up to date (version {current_version}).")
             }
-            UpdateResult::ChannelManaged {
+            UpdateResult::ScriptInstallerRequired {
                 latest_version,
-                install_channel,
                 upgrade_instruction,
                 status,
                 message,
                 current_version,
+                ..
             } => {
                 let mut out = String::new();
                 out.push_str(&format!(
@@ -927,7 +927,7 @@ impl Formatter for HumanFormatter {
                     }
                 }
                 out.push_str(&format!(
-                    "1up is managed by {install_channel}. Run: {upgrade_instruction}\n"
+                    "Use the script installer to move to the supported update path. Run: {upgrade_instruction}\n"
                 ));
                 out
             }
@@ -1274,16 +1274,15 @@ impl Formatter for PlainFormatter {
                     "current:{current_version}\tlatest:{latest_version}\tupdate_available:false\n"
                 )
             }
-            UpdateResult::ChannelManaged {
+            UpdateResult::ScriptInstallerRequired {
                 current_version,
                 latest_version,
-                install_channel,
                 upgrade_instruction,
                 message,
                 ..
             } => {
                 let mut out = format!(
-                    "current:{current_version}\tlatest:{latest_version}\tupdate_available:true\tchannel:{install_channel}\tmanaged:true\tinstruction:{upgrade_instruction}"
+                    "current:{current_version}\tlatest:{latest_version}\tupdate_available:true\tmethod:script_install\tinstruction:{upgrade_instruction}"
                 );
                 if let Some(ref msg) = message {
                     out.push_str(&format!("\tmessage:{msg}"));
@@ -2759,6 +2758,28 @@ mod tests {
     }
 
     #[test]
+    fn json_update_result_script_installer_required_is_not_package_managed() {
+        let formatter = JsonFormatter;
+        let result = UpdateResult::ScriptInstallerRequired {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.2.0".to_string(),
+            detected_channel: InstallChannel::Homebrew,
+            upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
+            status: UpdateStatus::UpdateAvailable {
+                latest: "0.2.0".to_string(),
+            },
+            message: None,
+        };
+        let rendered = formatter.format_update_result(&result);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["update_method"], "script_install");
+        assert_eq!(value["detected_install_channel"], "homebrew");
+        assert!(value.get("managed").is_none());
+        assert!(value.get("install_channel").is_none());
+    }
+
+    #[test]
     fn plain_update_result_up_to_date() {
         let formatter = PlainFormatter;
         let result = UpdateResult::UpToDate {
@@ -2772,12 +2793,32 @@ mod tests {
     }
 
     #[test]
-    fn human_update_result_channel_managed_shows_instruction() {
-        let formatter = HumanFormatter;
-        let result = UpdateResult::ChannelManaged {
+    fn plain_update_result_script_installer_required_is_not_package_managed() {
+        let formatter = PlainFormatter;
+        let result = UpdateResult::ScriptInstallerRequired {
             current_version: "0.1.0".to_string(),
             latest_version: "0.2.0".to_string(),
-            install_channel: InstallChannel::Homebrew,
+            detected_channel: InstallChannel::Scoop,
+            upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
+            status: UpdateStatus::UpdateAvailable {
+                latest: "0.2.0".to_string(),
+            },
+            message: None,
+        };
+        let rendered = formatter.format_update_result(&result);
+
+        assert!(rendered.contains("\tmethod:script_install"));
+        assert!(!rendered.contains("managed:true"));
+        assert!(!rendered.contains("\tchannel:scoop"));
+    }
+
+    #[test]
+    fn human_update_result_script_installer_required_shows_neutral_instruction() {
+        let formatter = HumanFormatter;
+        let result = UpdateResult::ScriptInstallerRequired {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.2.0".to_string(),
+            detected_channel: InstallChannel::Homebrew,
             upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
             status: UpdateStatus::UpdateAvailable {
                 latest: "0.2.0".to_string(),
@@ -2788,17 +2829,18 @@ mod tests {
 
         assert!(rendered.contains("Update available: 1up"));
         assert!(rendered.contains("0.2.0"));
-        assert!(rendered.contains("managed by homebrew"));
+        assert!(!rendered.contains("managed by homebrew"));
+        assert!(rendered.contains("Use the script installer"));
         assert!(rendered.contains("curl -fsSL https://1up.rp1.run/setup.sh | bash"));
     }
 
     #[test]
-    fn human_update_result_channel_managed_yanked_shows_warning() {
+    fn human_update_result_script_installer_required_yanked_shows_warning() {
         let formatter = HumanFormatter;
-        let result = UpdateResult::ChannelManaged {
+        let result = UpdateResult::ScriptInstallerRequired {
             current_version: "0.1.0".to_string(),
             latest_version: "0.2.0".to_string(),
-            install_channel: InstallChannel::Homebrew,
+            detected_channel: InstallChannel::Homebrew,
             upgrade_instruction: "curl -fsSL https://1up.rp1.run/setup.sh | bash".to_string(),
             status: UpdateStatus::Yanked {
                 latest: "0.2.0".to_string(),

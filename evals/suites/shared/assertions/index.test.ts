@@ -148,6 +148,20 @@ describe("assertReadinessWorkflowUsed", () => {
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("oneup_start");
   });
+
+  test("fails when start remediation happens after discovery", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_start", { mode: "index_if_needed" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_start happened after discovery");
+  });
 });
 
 describe("assertNoFallbackTools", () => {
@@ -296,6 +310,27 @@ describe("assertStructuredOneupMcpResponses", () => {
 
     expect(result.pass).toBe(true);
     expect(result.reason).toContain("ToolEnvelope");
+  });
+
+  test("passes when captured provider output is text-only tool_result content", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: [
+            {
+              type: "text",
+              text: "The repository is ready for 1up MCP search.",
+            },
+          ],
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("did not include captured structured MCP outputs");
   });
 
   test("fails for captured outputs without structured envelope fields", () => {

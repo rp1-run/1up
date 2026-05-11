@@ -121,10 +121,10 @@ async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
 
     match channel {
         InstallChannel::Homebrew | InstallChannel::Scoop => {
-            let result = UpdateResult::ChannelManaged {
+            let result = UpdateResult::ScriptInstallerRequired {
                 current_version: VERSION.to_string(),
                 latest_version: cache.latest_version.clone(),
-                install_channel: channel,
+                detected_channel: channel,
                 upgrade_instruction: cache.upgrade_instruction.clone(),
                 status: status.clone(),
                 message: cache.message.clone(),
