@@ -16,20 +16,15 @@ Under the hood, `1up` builds a local `.1up` index from tree-sitter parsed symbol
 
 In the pinned [Product Proof](#product-proof) benchmark, `1up` finished the same code-discovery tasks **33% faster** and **25% cheaper** than raw `rg` workflows, with a **7/7 pass rate** versus **5/7** for baseline.
 
+Setup is intentionally small: install `1up` once, connect it from each project you want your agent to understand, then keep using your agent as normal. For single-project config details and host-specific examples, see [docs/mcp-installation.md](docs/mcp-installation.md).
+
 ## Start Here
 
-The whole path is:
-
-1. Install `1up` and connect your agent to the `oneup` MCP server for this repository.
-2. Keep using your agent as normal; under the hood, `1up` gives it focused local context instead of search dumps.
-
-Install `1up` once, then connect it from each project you want your agent to understand. For single-project config details and host-specific examples, see [docs/mcp-installation.md](docs/mcp-installation.md).
-
-The fastest setup is to paste the prompt below into the agent you want to configure.
+The fastest setup is to paste the prompt below into the host or harness you want to configure (for example, Claude Code).
 
 ## Option 1: Paste This Prompt Into Your Agent
 
-This is the fastest path. Open the repository in your agent host, paste this prompt, and let the agent do the setup.
+This is the fastest path. Paste this into that host or harness, and let it handle the setup.
 
 ````markdown
 # Configure 1up MCP for this repository.
@@ -87,46 +82,11 @@ Verify the install:
 1up --version
 ```
 
-Then use the manual server identity, command, and args from the next section to connect a repository or active worktree to your agent host.
+Then use the manual MCP setup reference to connect a repository or active worktree to your host or harness.
 
 ## Option 3: Manual MCP Config
 
-Manual setup is useful when a team wants to review config changes before applying them.
-
-1. Choose the config scope. Prefer project/workspace config so `1up mcp` starts in the repository and does not need a hard-coded path. Use an explicit path only for user-global or static config that may launch from a different directory.
-
-2. Add the MCP server entry. The server identity is `oneup`, the command is `1up`, and the preferred project/workspace args are `["mcp"]`.
-
-   ```json
-   {
-     "mcpServers": {
-       "oneup": {
-         "command": "1up",
-         "args": ["mcp"]
-       }
-     }
-   }
-   ```
-
-3. If configuring Codex project config, use the TOML equivalent:
-
-   ```toml
-   [mcp_servers.oneup]
-   command = "1up"
-   args = ["mcp"]
-   ```
-
-4. If you must use user-global or static config, add the repository path explicitly. For example, if your project is in `/Users/alex/code/my-app`, use `["mcp", "--path", "/Users/alex/code/my-app"]`. If you are working in a linked Git worktree, use the linked worktree path.
-
-5. Add the repository instruction hint if equivalent guidance does not already exist in `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or the host-equivalent file:
-
-   ```text
-   For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
-   ```
-
-6. Save the config, reload the host if needed, approve or trust the `oneup` server, and ask the agent to call `oneup_status`. If readiness reports a missing or stale index, the agent can call `oneup_start` with the returned mode. Connecting the server handles daemon startup where supported.
-
-7. See [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
+Manual setup is useful when a team wants to review config changes before applying them. Use the focused reference in [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
 
 ## Use 1up From The Terminal
 
@@ -225,6 +185,7 @@ Host configuration remains owned by the host itself or by the user through manua
 ## What To Expect
 
 - The first semantic run may download verified [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) model artifacts from Hugging Face.
+- The first index of a medium-size repository can take 5 to 10 minutes on a modern machine. After that, changes are indexed incrementally in the background.
 - On macOS and Linux, one background daemon can watch all registered projects. Connecting an MCP server or running `1up start` in another repository registers that project and asks the existing daemon to reload.
 - Linked Git worktrees share the main worktree `.1up` directory, but status, list, readiness, indexing, and search are scoped to the active worktree context.
 - Windows currently focuses on local indexing workflows rather than daemon-backed `start`.
