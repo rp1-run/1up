@@ -38,7 +38,7 @@
 | MCP or CLI surface changes | `interaction-model.md`, `modules.md`, `patterns.md` |
 | Impact or relation work | `concept_map.md`, `architecture.md`, `modules.md`, `interaction-model.md`, `patterns.md` |
 | Indexing, storage, schema, vector, or daemon changes | `concept_map.md`, `architecture.md`, `modules.md`, `patterns.md` |
-| Release, install, packaging, or eval changes | `architecture.md`, `modules.md`, `interaction-model.md` |
+| Release, install, distribution, or eval changes | `architecture.md`, `modules.md`, `interaction-model.md` |
 | Strategic or system-wide analysis | All files |
 
 ## Recent Learnings
@@ -68,7 +68,6 @@ src/
 tests/       # CLI/MCP/release/setup/security regression suites
 evals/       # Promptfoo/TypeScript search and MCP adoption evals
 scripts/     # Benchmarks, installer, release, security, MCP smoke automation
-packaging/   # Homebrew and Scoop templates
 ```
 
 ## Navigation

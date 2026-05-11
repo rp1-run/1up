@@ -12,9 +12,7 @@
     "Markdown",
     "YAML",
     "JSON",
-    "TOML",
-    "Ruby template",
-    "Scoop JSON template"
+    "TOML"
   ],
   "metrics": {
     "mode": "FULL",

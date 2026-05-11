@@ -15,7 +15,7 @@
 | `tests` | Black-box and focused regression coverage for CLI, MCP, daemon behavior, index/search correctness, release assets, installer script, security check, and SQL rewrite invariants. | `tests/integration_tests.rs`, `tests/cli_tests.rs`, `tests/release_assets_tests.rs`, `tests/setup_script_tests.rs`, `tests/security_check_tests.rs` |
 | `benches` | Criterion guardrails for symbol lookup, FTS, chunked content search, retrieval backend selection, and impact horizon behavior. | `benches/search_bench.rs` |
 | `evals` | TypeScript/promptfoo evaluation support for search quality, recall, MCP tool-use assertions, fixture-cache setup, and search benchmark comparisons. | `evals/suites/1up-search/recall.ts`, `evals/suites/1up-search/search-bench.ts`, `evals/suites/shared/assertions/index.ts`, `evals/suites/shared/extension.ts` |
-| `scripts`, `.lefthook`, `packaging` | Operational automation: indexing/vector benchmarks, installer, security evidence, release manifest/archive/package publication, Homebrew/Scoop rendering, MCP smoke verification/recording, and main-branch protection. | `scripts/install/setup.sh`, `scripts/security_check.sh`, `scripts/benchmark_vector_index_size.sh`, `scripts/release/`, `packaging/homebrew/1up.rb.tmpl`, `packaging/scoop/1up.json.tmpl` |
+| `scripts`, `lefthook.yml` | Operational automation: indexing/vector benchmarks, installer, security evidence, release manifest/archive evidence, update-manifest publication, MCP smoke verification/recording, and main-branch protection. | `scripts/install/setup.sh`, `scripts/security_check.sh`, `scripts/benchmark_vector_index_size.sh`, `scripts/release/`, `.github/workflows/publish-update-manifest.yml` |
 
 ## Key Components
 
@@ -93,7 +93,7 @@
 | `benches` | 1 | 1,033 | Criterion suite |
 | `evals` | 8 | 2,489 | recall, benchmark, fixture, assertion helpers |
 | `scripts` | 20 | 3,733 | benchmark/install/release/security helpers |
-| `.lefthook`, `packaging` | 3 | 77 | git hook + package templates |
+| `lefthook.yml` | 1 | 7 | git hook |
 
 ## Public Boundaries
 
