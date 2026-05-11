@@ -22,7 +22,7 @@ The easiest path is to paste the setup prompt into the agent you want to configu
 
 This is the fastest path. Open the repository in your agent host, paste this prompt, and let the agent do the setup.
 
-```markdown
+````markdown
 # Configure 1up MCP for this repository.
 
 §RULES
@@ -61,7 +61,7 @@ This is the fastest path. Open the repository in your agent host, paste this pro
 - MCP config file changed
 - repo instruction file changed
 - restart/approval message given to user, if needed
-```
+````
 
 The full ready-to-run agent prompt, human quick setup path, host-specific examples, approval guidance, troubleshooting, and manual setup guidance are in [docs/mcp-installation.md](docs/mcp-installation.md).
 
@@ -75,11 +75,7 @@ Install `1up`:
 curl -fsSL https://1up.rp1.run/setup.sh | bash
 ```
 
-The installer prints the shell rc file it updated. Source that file, or open a new shell, so `1up` is on your `PATH`:
-
-```sh
-source ~/.zshrc   # or ~/.bashrc, per the installer's final message
-```
+If the installer says it updated your shell `PATH`, follow its printed instruction or open a new shell before verifying.
 
 Verify the install:
 
