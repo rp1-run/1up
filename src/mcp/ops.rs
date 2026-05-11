@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
+use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
@@ -20,7 +22,7 @@ use crate::shared::types::{
     ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings, StructuralSearchReport,
     SymbolResult, WorktreeContext,
 };
-use crate::storage::db::Db;
+use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
@@ -434,6 +436,16 @@ pub async fn run_search(
     query: &str,
     limit: usize,
 ) -> anyhow::Result<SearchPayload> {
+    retry_on_db_lock(|| async { run_search_once(state_root, worktree_context, query, limit).await })
+        .await
+}
+
+async fn run_search_once(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<SearchPayload> {
     let current = open_current_index(state_root).await?;
     let mut runtime = EmbeddingRuntime::default();
     let embedding_status = runtime.prepare_for_search(1);
@@ -466,6 +478,15 @@ pub async fn run_search(
 }
 
 pub async fn get_handles(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    handles: &[String],
+) -> anyhow::Result<ReadPayload> {
+    retry_on_db_lock(|| async { get_handles_once(state_root, worktree_context, handles).await })
+        .await
+}
+
+async fn get_handles_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
@@ -513,6 +534,18 @@ pub async fn lookup_symbol(
         bail!("symbol name cannot be empty");
     }
 
+    retry_on_db_lock(|| {
+        let request = request.clone();
+        async move { lookup_symbol_once(state_root, worktree_context, request).await }
+    })
+    .await
+}
+
+async fn lookup_symbol_once(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    request: SymbolLookupRequest,
+) -> anyhow::Result<SymbolPayload> {
     let current = open_current_index(state_root).await?;
     let search_scope = SearchScope::from_worktree_context(worktree_context);
     let engine = SymbolSearchEngine::new_scoped(&current.conn, search_scope);
@@ -552,6 +585,18 @@ pub async fn explore_impact(
     worktree_context: &WorktreeContext,
     request: ImpactRequest,
 ) -> anyhow::Result<ImpactResultEnvelope> {
+    retry_on_db_lock(|| {
+        let request = request.clone();
+        async move { explore_impact_once(state_root, worktree_context, request).await }
+    })
+    .await
+}
+
+async fn explore_impact_once(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+    request: ImpactRequest,
+) -> anyhow::Result<ImpactResultEnvelope> {
     let current = open_current_index(state_root).await?;
     let search_scope = SearchScope::from_worktree_context(worktree_context);
     let engine = ImpactHorizonEngine::new_scoped(&current.conn, search_scope);
@@ -565,6 +610,26 @@ pub async fn search_structural(
     pattern: &str,
     language_filter: Option<&str>,
 ) -> anyhow::Result<StructuralSearchReport> {
+    retry_on_db_lock(|| async {
+        search_structural_once(
+            state_root,
+            source_root,
+            worktree_context,
+            pattern,
+            language_filter,
+        )
+        .await
+    })
+    .await
+}
+
+async fn search_structural_once(
+    state_root: &Path,
+    source_root: &Path,
+    worktree_context: &WorktreeContext,
+    pattern: &str,
+    language_filter: Option<&str>,
+) -> anyhow::Result<StructuralSearchReport> {
     let current = open_current_index(state_root).await?;
     let engine = StructuralSearchEngine::new_scoped(
         source_root,
@@ -572,6 +637,26 @@ pub async fn search_structural(
         &worktree_context.context_id,
     );
     Ok(engine.search_report(pattern, language_filter).await?)
+}
+
+async fn retry_on_db_lock<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !is_lock_error(&err.to_string()) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
+                    return Err(err);
+                }
+                tokio::time::sleep(Duration::from_millis(DB_LOCK_RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+
+    unreachable!("database lock retry loop always returns on success or final failure")
 }
 
 async fn run_index_then_classify(
