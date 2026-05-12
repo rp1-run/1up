@@ -7,6 +7,18 @@
 </p>
 
 <p align="center">
+  <img src="assets/readme/icons/lobehub/codex.svg" alt="Codex" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/claudecode.svg" alt="Claude Code" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/cursor.svg" alt="Cursor" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/githubcopilot.svg" alt="GitHub Copilot" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/mcp.svg" alt="MCP" width="28" height="28" />
+</p>
+
+<p align="center">
   Stop asking agents to guess with <code>grep</code>/<code>rg</code>. 1up provides a high-fidelity semantic layer for coding tools, replacing broad searches with focused local intelligence to navigate and trace repositories with surgical precision.
 </p>
 
@@ -18,11 +30,11 @@ In the pinned [Product Proof](#product-proof) benchmark, `1up` finished the same
 
 Setup is intentionally small: install `1up` once, connect it from each project you want your agent to understand, then keep using your agent as normal. For single-project config details and host-specific examples, see [docs/mcp-installation.md](docs/mcp-installation.md).
 
-## Start Here
+## <img src="assets/readme/icons/heroicons-solid/rocket-launch.svg" alt="" width="20" height="20"> Start Here
 
 The fastest setup is to paste the prompt below into the host or harness you want to configure (for example, Claude Code).
 
-## Option 1: Paste This Prompt Into Your Agent
+### Option 1: Paste This Prompt Into Your Agent
 
 This is the fastest path. Paste this into that host or harness, and let it handle the setup.
 
@@ -64,7 +76,7 @@ This is the fastest path. Paste this into that host or harness, and let it handl
 
 For host-specific examples, approval steps, and troubleshooting, see [docs/mcp-installation.md](docs/mcp-installation.md).
 
-## Option 2: Install 1up Yourself
+### Option 2: Install 1up Yourself
 
 Use this human quick setup path when you want to install the binary from your terminal before adding the manual MCP server entry.
 
@@ -84,11 +96,11 @@ Verify the install:
 
 Then use the manual MCP setup reference to connect a repository or active worktree to your host or harness.
 
-## Option 3: Manual MCP Config
+### Option 3: Manual MCP Config
 
 Manual setup is useful when a team wants to review config changes before applying them. Use the focused reference in [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
 
-## Use 1up From The Terminal
+## <img src="assets/readme/icons/heroicons-solid/command-line.svg" alt="" width="20" height="20"> Use 1up From The Terminal
 
 `1up` is primarily built as an agent tool, but the same index is useful from a human shell.
 
@@ -112,7 +124,7 @@ By default, these commands print readable labels and summaries. Add `--plain` wh
 
 `--plain` is only for shell scripts and terminal automation. Agents should use the `oneup_*` MCP tools through the configured `oneup` server.
 
-## What The Agent Gets
+## <img src="assets/readme/icons/heroicons-solid/wrench-screwdriver.svg" alt="" width="20" height="20"> What The Agent Gets
 
 Once connected, your agent gets one canonical MCP server named `oneup` and eight retained tools:
 
@@ -140,7 +152,7 @@ A good agent flow looks like this:
 
 `oneup_search` is for discovery, not proof of completeness. Agents should switch to `oneup_symbol` for definition and reference completeness, and they should keep `rg`, `grep`, or `find` for exact literal checks after 1up has narrowed the scope.
 
-## Architecture
+## <img src="assets/readme/icons/heroicons-solid/cube-transparent.svg" alt="" width="20" height="20"> Architecture
 
 `1up` is a single local binary with three visible pieces: an indexer, an optional daemon, and an MCP server. The indexer turns source files into a local libSQL index with FTS, vectors, symbols, source spans, and relation rows. The MCP server exposes that index as read-only `oneup_*` tools that guide agents from readiness to ranked discovery to exact evidence.
 
@@ -158,7 +170,7 @@ flowchart LR
 
 The important boundary is locality: source code, embeddings, and index state stay on the developer machine. Agent hosts talk to `1up` through MCP tools instead of receiving broad raw search dumps.
 
-## What 1up Does Locally
+## <img src="assets/readme/icons/heroicons-solid/circle-stack.svg" alt="" width="20" height="20"> What 1up Does Locally
 
 `1up` indexes the repository you configure and keeps that index local. The MCP server helps agents find relevant code without dumping huge raw search results into context.
 
@@ -182,7 +194,7 @@ It does not:
 
 Host configuration remains owned by the host itself or by the user through manual config review.
 
-## What To Expect
+## <img src="assets/readme/icons/heroicons-solid/information-circle.svg" alt="" width="20" height="20"> What To Expect
 
 - The first semantic run may download verified [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) model artifacts from Hugging Face.
 - The first index of a medium-size repository can take 5 to 10 minutes on a modern machine. After that, changes are indexed incrementally in the background.
@@ -194,7 +206,7 @@ Host configuration remains owned by the host itself or by the user through manua
 
 The install script targets macOS on Apple Silicon and Linux on arm64 or x86_64. Intel macOS and other platforms are not in the published release matrix yet.
 
-## Update 1up
+## <img src="assets/readme/icons/heroicons-solid/arrow-path.svg" alt="" width="20" height="20"> Update 1up
 
 Run:
 
@@ -210,7 +222,7 @@ To pin a specific install version:
 curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.8 bash
 ```
 
-## Product Proof
+## <img src="assets/readme/icons/heroicons-solid/chart-bar-square.svg" alt="" width="20" height="20"> Product Proof
 
 The public benchmark and eval corpus for this repo is the pinned `emdash` repository. Search comparisons use raw `rg` workflows as the baseline, not another semantic search tool.
 
@@ -239,7 +251,7 @@ Archived result (Sonnet, 2026-04-19, lean CLI; both agents forbidden from sub-ag
 
 **1up vs baseline: -33% time, -25% cost.** 1up wins time on 6 of 7 tasks and ties the 7th. Quality average: 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline. Full results and cross-run history: [`evals/results/`](evals/results/).
 
-## Project Docs
+## <img src="assets/readme/icons/heroicons-solid/book-open.svg" alt="" width="20" height="20"> Project Docs
 
 - MCP setup guide: [docs/mcp-installation.md](docs/mcp-installation.md)
 - Release history: [CHANGELOG.md](CHANGELOG.md)
@@ -247,7 +259,7 @@ Archived result (Sonnet, 2026-04-19, lean CLI; both agents forbidden from sub-ag
 - Contributor policy and merge expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Source-build and engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
 
-## Building From Source
+## <img src="assets/readme/icons/heroicons-solid/code-bracket-square.svg" alt="" width="20" height="20"> Building From Source
 
 Build from source only if you are hacking on `1up` itself:
 
@@ -259,6 +271,6 @@ cargo install --path .
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the full contributor setup.
 
-## License
+## <img src="assets/readme/icons/heroicons-solid/scale.svg" alt="" width="20" height="20"> License
 
 Apache 2.0. See [LICENSE](LICENSE).
