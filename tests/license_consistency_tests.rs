@@ -68,3 +68,25 @@ fn license_consistency_check_rejects_conflicting_readme_license_text() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("README.md license section"));
 }
+
+#[test]
+fn license_consistency_check_accepts_decorative_readme_heading_icons() {
+    let fixture_root = build_fixture_root();
+    let readme_path = fixture_root.path().join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+    fs::write(
+        &readme_path,
+        readme.replace(
+            "## License",
+            r#"## <img src="assets/readme/icons/heroicons-solid/scale.svg" alt="" width="20" height="20"> License"#,
+        ),
+    )
+    .unwrap();
+
+    let output = run_license_check(fixture_root.path());
+    assert!(
+        output.status.success(),
+        "license check unexpectedly failed for decorative heading icon: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
