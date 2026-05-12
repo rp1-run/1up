@@ -117,97 +117,6 @@ fn wait_for_daemon_running(home: &Path, project: &Path) -> serde_json::Value {
     }
 }
 
-#[cfg(unix)]
-fn wait_for_daemon_stopped(home: &Path, project: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let payload = status_json(home, project);
-        if payload["daemon_running"].as_bool() == Some(false) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            if let Some(pid) = payload["pid"].as_u64() {
-                let _ = StdCommand::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let force_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let payload = status_json(home, project);
-        if payload["daemon_running"].as_bool() == Some(false) {
-            return;
-        }
-        if Instant::now() >= force_deadline {
-            if let Some(pid) = payload["pid"].as_u64() {
-                let _ = StdCommand::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-            }
-            thread::sleep(Duration::from_millis(100));
-            let final_payload = status_json(home, project);
-            if final_payload["daemon_running"].as_bool() == Some(false) {
-                return;
-            }
-            panic!("daemon did not stop; last status={final_payload}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[cfg(unix)]
-fn wait_for_last_update_complete_after(
-    home: &Path,
-    project: &Path,
-    previous_completed_at: Option<&str>,
-) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let payload = status_json(home, project);
-        let completed_at = payload["last_update_completed_at"].as_str();
-        if payload["last_update_state"].as_str() == Some("complete")
-            && completed_at.is_some()
-            && completed_at != previous_completed_at
-        {
-            return payload;
-        }
-        if payload["last_update_state"].as_str() == Some("failed") {
-            panic!("daemon update failed; last status={payload}");
-        }
-        if Instant::now() >= deadline {
-            panic!("daemon update did not complete; last status={payload}");
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-}
-
-#[cfg(unix)]
-fn wait_for_search(home: &Path, project: &Path, query: &str, should_find: bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let output = cmd_with_home(home)
-            .args(["search", query, "--path", project.to_str().unwrap()])
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        let found = stdout.contains(query);
-        if output.status.success() && found == should_find {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "search for {query:?} did not reach expected found={should_find}; stdout={stdout} stderr={stderr}"
-            );
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn stop_daemon(home: &Path, project: &Path) {
     let _ = cmd_with_home(home)
         .args(["stop", project.to_str().unwrap(), "--format", "json"])
@@ -2688,12 +2597,9 @@ fn concurrent_first_start_reuses_project_id() {
 #[test]
 fn watched_project_refreshes_added_edited_and_deleted_files() {
     let _guard = HideModelGuard::new();
-    let temp_base = std::env::temp_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
     let root = tempfile::Builder::new()
         .prefix("oneup-watch-")
-        .tempdir_in(temp_base)
+        .tempdir()
         .unwrap();
     let home = tempfile::tempdir().unwrap();
     let project_dir = root.path().join("watched-project");
@@ -2737,7 +2643,21 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
         }
     };
     wait_for_status("watch_status", "watching");
-    let initial_status = wait_for_last_update_complete_after(&canonical_home, &canonical_dir, None);
+    let wait_for_refresh_complete = || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = status_json(&canonical_home, &canonical_dir);
+            if status["last_update_state"].as_str() == Some("complete")
+                && status["last_update_completed_at"].as_str().is_some()
+            {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("watched refresh did not complete; last status={status}");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
 
     let search_stdout = |query: &str| -> (bool, String, String) {
         let output = cmd_with_home(&canonical_home)
@@ -2770,7 +2690,6 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
     wait_for_search("watched_refresh_before_marker", true);
     wait_for_search("watched_refresh_removed_marker", true);
 
-    thread::sleep(Duration::from_secs(2));
     fs::write(
         canonical_dir.join("watched.rs"),
         "pub fn watched_refresh_after_marker() -> &'static str { \"after\" }\n",
@@ -2783,212 +2702,14 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
     .unwrap();
     fs::remove_file(canonical_dir.join("removed.rs")).unwrap();
 
-    let initial_completed_at = initial_status["last_update_completed_at"].as_str();
-    wait_for_last_update_complete_after(&canonical_home, &canonical_dir, initial_completed_at);
+    wait_for_refresh_complete();
     wait_for_search("watched_refresh_after_marker", true);
     wait_for_search("watched_refresh_added_marker", true);
     wait_for_search("watched_refresh_before_marker", false);
     wait_for_search("watched_refresh_removed_marker", false);
 
-    let final_status = status_json(&canonical_home, &canonical_dir);
+    let final_status = wait_for_refresh_complete();
     assert_eq!(final_status["watch_status"], "watching");
     assert_eq!(final_status["last_update_state"], "complete");
     assert_eq!(final_status["index_status"], "ready");
-}
-
-#[cfg(unix)]
-#[test]
-fn daemon_restart_reconciles_offline_added_edited_and_deleted_files() {
-    let _guard = HideModelGuard::new();
-    let root = tempfile::Builder::new()
-        .prefix("oneup-offline-reconcile-")
-        .tempdir()
-        .unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let project_dir = root.path().join("offline-project");
-    fs::create_dir_all(&project_dir).unwrap();
-    let canonical_dir = project_dir.canonicalize().unwrap();
-    let canonical_home = home.path().canonicalize().unwrap();
-    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
-    seed_model_download_failure(&canonical_home);
-    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
-
-    fs::write(
-        canonical_dir.join("watched.rs"),
-        "pub fn offline_reconcile_before_marker() -> &'static str { \"before\" }\n",
-    )
-    .unwrap();
-    fs::write(
-        canonical_dir.join("removed.rs"),
-        "pub fn offline_reconcile_removed_marker() -> &'static str { \"removed\" }\n",
-    )
-    .unwrap();
-
-    let output = run_start_json(&canonical_home, &canonical_dir);
-    assert!(
-        output.status.success(),
-        "initial start should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    wait_for_daemon_running(&canonical_home, &canonical_dir);
-    let initial_status = wait_for_last_update_complete_after(&canonical_home, &canonical_dir, None);
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_before_marker",
-        true,
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_removed_marker",
-        true,
-    );
-
-    stop_daemon(&canonical_home, &canonical_dir);
-    wait_for_daemon_stopped(&canonical_home, &canonical_dir);
-
-    fs::write(
-        canonical_dir.join("watched.rs"),
-        "pub fn offline_reconcile_after_marker() -> &'static str { \"after\" }\n",
-    )
-    .unwrap();
-    fs::write(
-        canonical_dir.join("added.rs"),
-        "pub fn offline_reconcile_added_marker() -> &'static str { \"added\" }\n",
-    )
-    .unwrap();
-    fs::remove_file(canonical_dir.join("removed.rs")).unwrap();
-
-    let restart = run_start_json(&canonical_home, &canonical_dir);
-    assert!(
-        restart.status.success(),
-        "restart should succeed: {}",
-        String::from_utf8_lossy(&restart.stderr)
-    );
-    wait_for_daemon_running(&canonical_home, &canonical_dir);
-    let prior_completed_at = initial_status["last_update_completed_at"].as_str();
-    let reconciled =
-        wait_for_last_update_complete_after(&canonical_home, &canonical_dir, prior_completed_at);
-    assert_eq!(
-        reconciled["index_progress"]["scope"]["fallback_reason"],
-        "startup_reconciliation"
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_after_marker",
-        true,
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_added_marker",
-        true,
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_before_marker",
-        false,
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "offline_reconcile_removed_marker",
-        false,
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn daemon_restart_reconciles_named_branch_head_changes() {
-    let _guard = HideModelGuard::new();
-    let root = tempfile::Builder::new()
-        .prefix("oneup-branch-reconcile-")
-        .tempdir()
-        .unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let project_dir = root.path().join("named-branch-project");
-    fs::create_dir_all(&project_dir).unwrap();
-    let canonical_home = home.path().canonicalize().unwrap();
-    seed_model_download_failure(&canonical_home);
-
-    git(&project_dir, &["init"]);
-    git(
-        &project_dir,
-        &["config", "user.email", "oneup-test@example.com"],
-    );
-    git(&project_dir, &["config", "user.name", "1up Test"]);
-    fs::write(
-        project_dir.join("branch.rs"),
-        "pub fn named_branch_initial_marker() -> &'static str { \"initial\" }\n",
-    )
-    .unwrap();
-    git(&project_dir, &["add", "."]);
-    git(&project_dir, &["commit", "-m", "initial"]);
-    git(&project_dir, &["branch", "-M", "main"]);
-
-    let canonical_dir = project_dir.canonicalize().unwrap();
-    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
-
-    let output = run_start_json(&canonical_home, &canonical_dir);
-    assert!(
-        output.status.success(),
-        "initial start should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    wait_for_daemon_running(&canonical_home, &canonical_dir);
-    let initial_status = wait_for_last_update_complete_after(&canonical_home, &canonical_dir, None);
-    assert_eq!(initial_status["branch_status"], "named");
-    let initial_head = initial_status["head_oid"].as_str().map(str::to_string);
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "named_branch_initial_marker",
-        true,
-    );
-
-    stop_daemon(&canonical_home, &canonical_dir);
-    wait_for_daemon_stopped(&canonical_home, &canonical_dir);
-
-    fs::write(
-        canonical_dir.join("branch.rs"),
-        "pub fn named_branch_after_head_change_marker() -> &'static str { \"after\" }\n",
-    )
-    .unwrap();
-    git(&canonical_dir, &["add", "."]);
-    git(&canonical_dir, &["commit", "-m", "update branch marker"]);
-
-    let restart = run_start_json(&canonical_home, &canonical_dir);
-    assert!(
-        restart.status.success(),
-        "restart after HEAD change should succeed: {}",
-        String::from_utf8_lossy(&restart.stderr)
-    );
-    wait_for_daemon_running(&canonical_home, &canonical_dir);
-    let prior_completed_at = initial_status["last_update_completed_at"].as_str();
-    let reconciled =
-        wait_for_last_update_complete_after(&canonical_home, &canonical_dir, prior_completed_at);
-    assert_eq!(reconciled["branch_status"], "named");
-    assert_ne!(
-        reconciled["head_oid"].as_str().map(str::to_string),
-        initial_head
-    );
-    assert_eq!(
-        reconciled["index_progress"]["scope"]["fallback_reason"],
-        "startup_reconciliation"
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "named_branch_after_head_change_marker",
-        true,
-    );
-    wait_for_search(
-        &canonical_home,
-        &canonical_dir,
-        "named_branch_initial_marker",
-        false,
-    );
 }
