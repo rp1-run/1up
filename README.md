@@ -3,69 +3,80 @@
 </p>
 
 <p align="center">
-  <strong>Local code search for coding agents.</strong>
+  <strong>Local code intelligence that helps agents finish code-discovery tasks 33% faster and 25% cheaper.</strong>
 </p>
 
 <p align="center">
-  Give Codex, Claude Code, Cursor, VS Code, and other MCP-capable agents a fast way to search, read, trace, and reason about your repository.
+  <img src="assets/readme/icons/lobehub/codex.svg" alt="Codex" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/claudecode.svg" alt="Claude Code" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/cursor.svg" alt="Cursor" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/githubcopilot.svg" alt="GitHub Copilot" width="28" height="28" />
+  &nbsp;&nbsp;
+  <img src="assets/readme/icons/lobehub/mcp.svg" alt="MCP" width="28" height="28" />
 </p>
 
-`1up` is built for agents. You install it once, connect it to the repository you want an agent to understand, and the agent gets a small set of `oneup_*` MCP tools for code discovery.
+<p align="center">
+  Stop asking agents to guess with <code>grep</code>/<code>rg</code>. 1up provides a high-fidelity semantic layer for coding tools, replacing broad searches with focused local intelligence to navigate and trace repositories with surgical precision.
+</p>
 
-When the MCP server connects, `1up` registers the repository and starts or reloads the local background daemon where supported. The agent can then call `oneup_status` to check readiness and `oneup_start` when it explicitly needs to create, refresh, or rebuild the local index.
+`1up` is a local MCP plugin for Codex, Claude Code, Cursor, VS Code, and other MCP-capable agents. Install it once, point it at a repository or linked worktree, and the agent gets eight `oneup_*` tools to check readiness, search by intent, read exact spans, verify symbols, trace impact, and inspect structure.
 
-## Start Here
+Under the hood, `1up` builds a local `.1up` index from tree-sitter parsed symbols and spans, local ONNX embeddings for vector search, full-text search, and relation metadata for impact analysis.
 
-The easiest path is to paste the setup prompt into the agent you want to configure.
+In the pinned [Product Proof](#product-proof) benchmark, `1up` finished the same code-discovery tasks **33% faster** and **25% cheaper** than raw `rg` workflows, with a **7/7 pass rate** versus **5/7** for baseline.
 
-## Option 1: Paste This Prompt Into Your Agent
+Setup is intentionally small: install `1up` once, connect it from each project you want your agent to understand, then keep using your agent as normal. For single-project config details and host-specific examples, see [docs/mcp-installation.md](docs/mcp-installation.md).
 
-This is the fastest path. Open the repository in your agent host, paste this prompt, and let the agent do the setup.
+## <img src="assets/readme/icons/heroicons-solid/rocket-launch.svg" alt="" width="20" height="20"> Start Here
 
-```markdown
+The fastest setup is to paste the prompt below into the host or harness you want to configure (for example, Claude Code).
+
+### Option 1: Paste This Prompt Into Your Agent
+
+This is the fastest path. Paste this into that host or harness, and let it handle the setup.
+
+````markdown
 # Configure 1up MCP for this repository.
 
 §RULES
-- Configure MCP directly in the host's config.
-- Use `SOURCE_ROOT` for the MCP path and repository instruction file.
-- If this checkout is a linked Git worktree, keep the linked worktree path as `SOURCE_ROOT`.
-- `1up` stores shared index state in the main worktree automatically.
+- Install or update `1up` globally.
+- Configure the `oneup` MCP server in project/workspace scope.
+- Use explicit `--path` config only when project/workspace config is not available.
+- Add the repository instruction hint only if equivalent guidance does not already exist.
 - Do not try to restart this active host or verify newly added MCP tools from it.
 
 §PROC
-1. Resolve `SOURCE_ROOT` as the active checkout root:
-   - If Git is available: run `git rev-parse --show-toplevel`.
-   - If Git resolution fails, use `pwd -P`.
-   - Do not replace a linked worktree path with the main worktree path for MCP config.
-2. Install/update `1up`:
+1. Install or update the global `1up` binary:
    - If `1up` is not installed, install it with: `curl -fsSL https://1up.rp1.run/setup.sh | bash`
    - If present: `1up update`
    - Verify: `1up --version`
-3. Add/update MCP config:
+2. Add or update project/workspace MCP config:
    - Server name: `oneup`
    - Command: `1up`
-   - Args: `["mcp", "--path", "<SOURCE_ROOT>"]`
-   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp","--path","<SOURCE_ROOT>"]}}}`
+   - Args: `["mcp"]`
+   - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp"]}}}`
    - For TOML hosts, create the equivalent `oneup` server entry.
-4. Insert this minimal 1up hint into the repo instruction file under `SOURCE_ROOT` only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
+3. Insert this minimal 1up hint into the repo instruction file only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
 
   ```markdown
   For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
   ```
 
-5. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
+4. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
 
 §OUT
-- `SOURCE_ROOT`
 - `1up --version`
 - MCP config file changed
 - repo instruction file changed
 - restart/approval message given to user, if needed
-```
+````
 
-The full ready-to-run agent prompt, human quick setup path, host-specific examples, approval guidance, troubleshooting, and manual setup guidance are in [docs/mcp-installation.md](docs/mcp-installation.md).
+For host-specific examples, approval steps, and troubleshooting, see [docs/mcp-installation.md](docs/mcp-installation.md).
 
-## Option 2: Install 1up Yourself
+### Option 2: Install 1up Yourself
 
 Use this human quick setup path when you want to install the binary from your terminal before adding the manual MCP server entry.
 
@@ -75,11 +86,7 @@ Install `1up`:
 curl -fsSL https://1up.rp1.run/setup.sh | bash
 ```
 
-The installer prints the shell rc file it updated. Source that file, or open a new shell, so `1up` is on your `PATH`:
-
-```sh
-source ~/.zshrc   # or ~/.bashrc, per the installer's final message
-```
+If the installer says it updated your shell `PATH`, follow its printed instruction or open a new shell before verifying.
 
 Verify the install:
 
@@ -87,42 +94,17 @@ Verify the install:
 1up --version
 ```
 
-Then use the manual server identity, command, and args from the next section to connect a repository or active worktree to your agent host.
+Then use the manual MCP setup reference to connect a repository or active worktree to your host or harness.
 
-## Option 3: Manual MCP Config
+### Option 3: Manual MCP Config
 
-Manual setup is useful when a team wants to review config changes before applying them.
+Manual setup is useful when a team wants to review config changes before applying them. Use the focused reference in [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
 
-The repo path is the full filesystem path to the folder this MCP server entry should search. For example, if your project is in `/Users/alex/code/my-app`, use that path in the config. If you are working in a linked Git worktree, use the linked worktree path; `1up` will keep shared state under the main worktree while indexing and searching the active worktree. A full path is safer than a relative path because your agent host may launch the MCP server from a different directory.
+## <img src="assets/readme/icons/heroicons-solid/command-line.svg" alt="" width="20" height="20"> Use 1up From The Terminal
 
-The server identity is `oneup`. The command is `1up`. The args are `["mcp", "--path", "/Users/alex/code/my-app"]`.
+`1up` is primarily built as an agent tool, but the same index is useful from a human shell.
 
-```json
-{
-  "mcpServers": {
-    "oneup": {
-      "command": "1up",
-      "args": ["mcp", "--path", "/Users/alex/code/my-app"]
-    }
-  }
-}
-```
-
-For Codex project config, the same server looks like this:
-
-```toml
-[mcp_servers.oneup]
-command = "1up"
-args = ["mcp", "--path", "/Users/alex/code/my-app"]
-```
-
-See [docs/mcp-installation.md](docs/mcp-installation.md) for Claude Code, Cursor, VS Code, Copilot, generic MCP JSON clients, approval steps, and troubleshooting.
-
-After saving config, reload the host if needed, approve or trust the `oneup` server, and ask the agent to call `oneup_status`. If readiness reports a missing or stale index, the agent can call `oneup_start` with the returned mode. Connecting the server handles daemon startup where supported.
-
-## Human Project Lifecycle
-
-When you are working from a terminal, the retained project lifecycle is:
+If you use `1up` directly from a shell, the basic loop is:
 
 ```sh
 1up start
@@ -131,7 +113,7 @@ When you are working from a terminal, the retained project lifecycle is:
 1up stop
 ```
 
-Default lifecycle output is written for humans, with readable labels and summaries. Add `--plain` for stable script-friendly text:
+By default, these commands print readable labels and summaries. Add `--plain` when you need stable script output:
 
 ```sh
 1up start --plain
@@ -142,17 +124,7 @@ Default lifecycle output is written for humans, with readable labels and summari
 
 `--plain` is only for shell scripts and terminal automation. Agents should use the `oneup_*` MCP tools through the configured `oneup` server.
 
-## Add The Agent Hint
-
-Add this minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md` to the repository instruction file your host reads:
-
-```text
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
-```
-
-Use the plain minimal instruction from the MCP installation guide; keep repository guidance focused on the canonical `oneup_*` tools.
-
-## What The Agent Gets
+## <img src="assets/readme/icons/heroicons-solid/wrench-screwdriver.svg" alt="" width="20" height="20"> What The Agent Gets
 
 Once connected, your agent gets one canonical MCP server named `oneup` and eight retained tools:
 
@@ -180,7 +152,25 @@ A good agent flow looks like this:
 
 `oneup_search` is for discovery, not proof of completeness. Agents should switch to `oneup_symbol` for definition and reference completeness, and they should keep `rg`, `grep`, or `find` for exact literal checks after 1up has narrowed the scope.
 
-## What 1up Does Locally
+## <img src="assets/readme/icons/heroicons-solid/cube-transparent.svg" alt="" width="20" height="20"> Architecture
+
+`1up` is a single local binary with three visible pieces: an indexer, an optional daemon, and an MCP server. The indexer turns source files into a local libSQL index with FTS, vectors, symbols, source spans, and relation rows. The MCP server exposes that index as read-only `oneup_*` tools that guide agents from readiness to ranked discovery to exact evidence.
+
+```mermaid
+flowchart LR
+  Repo["Repository or worktree"] --> Indexer["Indexer"]
+  Indexer --> Parsed["tree-sitter symbols, spans, relations"]
+  Indexer --> Embeddings["local ONNX embeddings"]
+  Parsed --> Store["local .1up libSQL index<br/>FTS, vectors, symbols, relations"]
+  Embeddings --> Store
+  Daemon["optional daemon"] --> Indexer
+  Store --> MCP["oneup MCP server"]
+  MCP --> Agent["Agent host<br/>Codex, Claude, Cursor, VS Code"]
+```
+
+The important boundary is locality: source code, embeddings, and index state stay on the developer machine. Agent hosts talk to `1up` through MCP tools instead of receiving broad raw search dumps.
+
+## <img src="assets/readme/icons/heroicons-solid/circle-stack.svg" alt="" width="20" height="20"> What 1up Does Locally
 
 `1up` indexes the repository you configure and keeps that index local. The MCP server helps agents find relevant code without dumping huge raw search results into context.
 
@@ -204,9 +194,10 @@ It does not:
 
 Host configuration remains owned by the host itself or by the user through manual config review.
 
-## What To Expect
+## <img src="assets/readme/icons/heroicons-solid/information-circle.svg" alt="" width="20" height="20"> What To Expect
 
-- The first semantic run may download verified `all-MiniLM-L6-v2` model artifacts.
+- The first semantic run may download verified [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) model artifacts from Hugging Face.
+- The first index of a medium-size repository can take 5 to 10 minutes on a modern machine. After that, changes are indexed incrementally in the background.
 - On macOS and Linux, one background daemon can watch all registered projects. Connecting an MCP server or running `1up start` in another repository registers that project and asks the existing daemon to reload.
 - Linked Git worktrees share the main worktree `.1up` directory, but status, list, readiness, indexing, and search are scoped to the active worktree context.
 - Windows currently focuses on local indexing workflows rather than daemon-backed `start`.
@@ -215,7 +206,7 @@ Host configuration remains owned by the host itself or by the user through manua
 
 The install script targets macOS on Apple Silicon and Linux on arm64 or x86_64. Intel macOS and other platforms are not in the published release matrix yet.
 
-## Update 1up
+## <img src="assets/readme/icons/heroicons-solid/arrow-path.svg" alt="" width="20" height="20"> Update 1up
 
 Run:
 
@@ -231,7 +222,7 @@ To pin a specific install version:
 curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.8 bash
 ```
 
-## Product Proof
+## <img src="assets/readme/icons/heroicons-solid/chart-bar-square.svg" alt="" width="20" height="20"> Product Proof
 
 The public benchmark and eval corpus for this repo is the pinned `emdash` repository. Search comparisons use raw `rg` workflows as the baseline, not another semantic search tool.
 
@@ -260,7 +251,7 @@ Archived result (Sonnet, 2026-04-19, lean CLI; both agents forbidden from sub-ag
 
 **1up vs baseline: -33% time, -25% cost.** 1up wins time on 6 of 7 tasks and ties the 7th. Quality average: 1up 0.787 vs baseline 0.705. Pass rate: 7/7 for 1up, 5/7 for baseline. Full results and cross-run history: [`evals/results/`](evals/results/).
 
-## Project Docs
+## <img src="assets/readme/icons/heroicons-solid/book-open.svg" alt="" width="20" height="20"> Project Docs
 
 - MCP setup guide: [docs/mcp-installation.md](docs/mcp-installation.md)
 - Release history: [CHANGELOG.md](CHANGELOG.md)
@@ -268,7 +259,7 @@ Archived result (Sonnet, 2026-04-19, lean CLI; both agents forbidden from sub-ag
 - Contributor policy and merge expectations: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Source-build and engineering reference: [DEVELOPMENT.md](DEVELOPMENT.md)
 
-## Building From Source
+## <img src="assets/readme/icons/heroicons-solid/code-bracket-square.svg" alt="" width="20" height="20"> Building From Source
 
 Build from source only if you are hacking on `1up` itself:
 
@@ -280,6 +271,6 @@ cargo install --path .
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the full contributor setup.
 
-## License
+## <img src="assets/readme/icons/heroicons-solid/scale.svg" alt="" width="20" height="20"> License
 
 Apache 2.0. See [LICENSE](LICENSE).

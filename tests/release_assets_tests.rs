@@ -687,71 +687,36 @@ fn release_manifest_deserializes_as_update_manifest() {
 fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
     let readme = fs::read_to_string(repo_root().join("README.md")).unwrap();
-    let order = [
-        "## Ready-To-Run Agent Prompt",
-        "## Human Quick Setup",
-        "## Install Or Update 1up",
-        "## Choose Repository Path And Scope",
-        "## Manual Host Config",
-        "## Approve Or Trust The Server",
-        "## Verify Tool Listing And Readiness",
-        "## Human Project Lifecycle",
-        "## Troubleshooting",
-        "## Safety And Permissions",
-    ];
-    let mut previous = 0;
-    for heading in order {
-        let position = guide
-            .find(heading)
-            .unwrap_or_else(|| panic!("missing guide heading {heading}"));
-        assert!(
-            position >= previous,
-            "guide heading {heading} appears out of manual-setup order"
-        );
-        previous = position;
-    }
 
     for required in [
-        "All setup below uses manual host configuration.",
-        "curl -fsSL https://1up.rp1.run/setup.sh | bash",
-        "Configure 1up MCP for this repository.",
-        "active checkout root",
-        "git rev-parse --show-toplevel",
-        "Use `SOURCE_ROOT` for the MCP path and repository instruction file.",
-        "Do not try to restart this active host or verify newly added MCP tools from it.",
-        "ask the user to restart/reload this host so it can load `oneup`",
-        "If `1up` is not installed, install it with",
-        "Insert this minimal 1up hint",
-        "Do not duplicate the hint.",
-        "AGENTS.md",
-        "CLAUDE.md",
-        ".github/copilot-instructions.md",
-        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
-        "Use `oneup_status` when readiness is unknown",
-        "list MCP tools",
+        "# MCP Installation Reference",
+        "## Server Entry",
+        "## Host Config Shapes",
+        "## After Saving Config",
+        "## Repository Instruction Hint",
+        "## Troubleshooting",
+        "## Safety",
+        "1up mcp",
+        "Server identity: `oneup`",
+        "Command: `1up`",
+        "Preferred project/workspace args: `[\"mcp\"]`",
+        "Use `--path` only for user-global or static config",
         "### Codex",
-        "### Claude Code",
-        "### Cursor",
+        "### Claude Code, Cursor, And Generic MCP JSON Clients",
         "### VS Code And Copilot",
-        "### Generic MCP JSON Client",
-        "server identity `oneup`",
-        "command `1up`",
+        "[mcp_servers.oneup]",
+        "\"mcpServers\"",
+        "\"servers\"",
+        "args = [\"mcp\"]",
+        "\"args\": [\"mcp\"]",
         "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
-        "oneup_status",
-        "oneup_start",
-        "oneup_get",
-        "oneup_context",
-        "oneup_structural",
-        "1up start",
-        "1up status",
-        "1up list",
-        "1up stop",
-        "`--plain` is not the agent protocol",
-        "Protocol Errors Or Non-JSON Stdout",
-        "Setup path: manual host config",
-        "It does not:",
-        "Execute arbitrary shell commands",
-        "Mutate host MCP configuration",
+        "\"args\": [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
+        "List MCP tools and call `oneup_status`.",
+        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
+        "MCP stdio expects protocol messages on stdout.",
+        "It does not edit files",
+        "execute arbitrary shell commands",
+        "mutate host config",
     ] {
         assert!(
             guide.contains(required),
@@ -760,32 +725,44 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     }
 
     for required in [
-        "ready-to-run agent prompt",
-        "human quick setup path",
         "curl -fsSL https://1up.rp1.run/setup.sh | bash",
-        "Manual MCP Config",
-        "server identity is `oneup`",
-        "The command is `1up`",
-        "args are `[\"mcp\", \"--path\", \"/Users/alex/code/my-app\"]`",
-        "Human Project Lifecycle",
-        "1up start",
-        "1up status",
-        "1up list",
-        "1up stop",
+        "Configure 1up MCP for this repository.",
+        "Configure the `oneup` MCP server in project/workspace scope.",
+        "Use explicit `--path` config only when project/workspace config is not available.",
+        "Do not try to restart this active host or verify newly added MCP tools from it.",
+        "ask the user to restart/reload this host so it can load `oneup`",
+        "Option 2: Install 1up Yourself",
+        "Option 3: Manual MCP Config",
+        "Server name: `oneup`",
+        "Command: `1up`",
+        "Args: `[\"mcp\"]`",
+        "[docs/mcp-installation.md](docs/mcp-installation.md)",
         "`--plain` is only for shell scripts and terminal automation",
         "Agents should use the `oneup_*` MCP tools",
-        "minimal agent-hint snippet for `AGENTS.md` or `CLAUDE.md`",
-        "Use the plain minimal instruction from the MCP installation guide",
-        "[docs/mcp-installation.md](docs/mcp-installation.md)",
-        "oneup_status",
-        "oneup_start",
-        "oneup_get",
-        "oneup_context",
-        "oneup_structural",
     ] {
         assert!(
             readme.contains(required),
             "README is missing required MCP setup text: {required}"
+        );
+    }
+
+    for required_tool in [
+        "oneup_status",
+        "oneup_start",
+        "oneup_search",
+        "oneup_get",
+        "oneup_symbol",
+        "oneup_context",
+        "oneup_impact",
+        "oneup_structural",
+    ] {
+        assert!(
+            guide.contains(required_tool),
+            "MCP installation guide is missing retained tool: {required_tool}"
+        );
+        assert!(
+            readme.contains(required_tool),
+            "README is missing retained tool: {required_tool}"
         );
     }
 

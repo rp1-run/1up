@@ -64,6 +64,7 @@ fn write_fake_runner(path: &Path) {
         r#"#!/bin/sh
 set -eu
 {
+  printf 'cwd=%s\n' "$(pwd -P)"
   printf 'runner=%s\n' "${0##*/}"
   i=0
   for arg in "$@"; do
@@ -3518,8 +3519,14 @@ fn add_mcp_prefers_bunx_then_npx() {
         .success();
 
     let log = fs::read_to_string(log_path).unwrap();
+    let canonical_repo = repo.canonicalize().unwrap();
+    assert!(
+        log.contains(&format!("cwd={}", canonical_repo.display())),
+        "unexpected runner cwd: {log}"
+    );
     assert!(log.contains("runner=bunx"), "unexpected runner log: {log}");
     assert!(log.contains("arg[0]=add-mcp"), "unexpected argv: {log}");
+    assert!(log.contains("arg[1]=1up mcp"), "unexpected argv: {log}");
 }
 
 #[cfg(unix)]
@@ -3624,9 +3631,11 @@ fn add_mcp_fallback_has_manual_snippets() {
         .failure()
         .stderr(
             predicate::str::contains("Manual MCP setup fallback")
-                .and(predicate::str::contains("Generic MCP JSON"))
-                .and(predicate::str::contains("Codex TOML"))
+                .and(predicate::str::contains("Project/workspace MCP JSON"))
+                .and(predicate::str::contains("Project/workspace Codex TOML"))
                 .and(predicate::str::contains("server identity `oneup`"))
+                .and(predicate::str::contains("[\"mcp\"]"))
+                .and(predicate::str::contains("[\"mcp\", \"--path\""))
                 .and(predicate::str::contains("call `oneup_status`"))
                 .and(predicate::str::contains("add-mcp exited with exit code 17")),
         );

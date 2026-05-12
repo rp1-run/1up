@@ -30,10 +30,21 @@ require_file() {
 
 read_markdown_section() {
   local path="$1"
-  local heading="$2"
+  local heading_text="$2"
 
-  awk -v heading="$heading" '
-    $0 == heading { in_section = 1; next }
+  awk -v heading_text="$heading_text" '
+    function normalized_h2(line, rest) {
+      if (line !~ /^##[[:space:]]+/) {
+        return ""
+      }
+      rest = line
+      sub(/^##[[:space:]]+/, "", rest)
+      gsub(/<[^>]*>[[:space:]]*/, "", rest)
+      sub(/[[:space:]]+$/, "", rest)
+      return rest
+    }
+
+    normalized_h2($0) == heading_text { in_section = 1; next }
     in_section && /^## / { exit }
     in_section { print }
   ' "$path"
@@ -54,7 +65,7 @@ elif [[ "$cargo_license" != "$EXPECTED_SPDX" ]]; then
   fail "Cargo.toml license must be ${EXPECTED_SPDX}, found ${cargo_license}"
 fi
 
-readme_license_section=$(read_markdown_section "$README_PATH" "## License")
+readme_license_section=$(read_markdown_section "$README_PATH" "License")
 if [[ -z "$readme_license_section" ]]; then
   fail "README.md is missing a License section"
 else
