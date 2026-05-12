@@ -32,6 +32,7 @@ use crate::shared::types::{
 use crate::storage::{db::Db, schema};
 
 const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
+const STARTUP_RECONCILIATION_REASON: &str = "startup_reconciliation";
 
 #[derive(Debug, Default)]
 struct ProjectRunState {
@@ -124,6 +125,7 @@ async fn run_inner() -> Result<(), OneupError> {
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
+    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
 
     let debounce = std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS);
 
@@ -174,6 +176,7 @@ async fn run_inner() -> Result<(), OneupError> {
                     error!("failed to reload projects: {e}");
                 } else {
                     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
+                    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
                 }
             }
             _ = sigterm.recv() => {
@@ -358,11 +361,12 @@ async fn load_and_watch_projects(
     let registry = Registry::load()?;
 
     for entry in &registry.projects {
-        let Some(state) = build_project_state(entry).await? else {
+        let Some(mut state) = build_project_state(entry).await? else {
             continue;
         };
 
         let source_root = state.source_root.clone();
+        mark_startup_reconciliation_pending(&mut state);
         watcher.watch(&source_root)?;
         let context_id = state.context.context_id.clone();
         projects.insert(context_id.clone(), state);
@@ -416,7 +420,8 @@ async fn reload_projects(
         let context_id = entry.context_id();
         if let Some(existing) = projects.get_mut(&context_id) {
             let entry_context = context_from_entry(entry);
-            if branch_context_changed(&existing.context, &entry_context) {
+            let branch_changed = branch_context_changed(&existing.context, &entry_context);
+            if branch_changed {
                 existing.context = entry_context;
                 mark_refresh_pending(
                     existing,
@@ -436,15 +441,24 @@ async fn reload_projects(
                     entry.project_root.display()
                 );
             }
+            if !branch_changed {
+                mark_startup_reconciliation_pending(existing);
+                info!(
+                    "queued startup reconciliation for {} ({})",
+                    existing.project_root.display(),
+                    context_id
+                );
+            }
             continue;
         }
 
-        let Some(state) = build_project_state(entry).await? else {
+        let Some(mut state) = build_project_state(entry).await? else {
             continue;
         };
 
         let entry_source_root = state.source_root.clone();
         let context_id = state.context.context_id.clone();
+        mark_startup_reconciliation_pending(&mut state);
         watcher.watch(&entry_source_root)?;
         projects.insert(context_id.clone(), state);
 
@@ -457,6 +471,14 @@ async fn reload_projects(
     }
 
     Ok(())
+}
+
+fn mark_startup_reconciliation_pending(state: &mut ProjectState) {
+    mark_refresh_pending(
+        state,
+        RunScope::Full,
+        Some(STARTUP_RECONCILIATION_REASON.to_string()),
+    );
 }
 
 async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState>, OneupError> {
@@ -1259,6 +1281,27 @@ mod tests {
         state.finish_run();
         assert!(!state.running);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn startup_reconciliation_marks_full_refresh_with_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+
+        mark_startup_reconciliation_pending(&mut state);
+
+        assert!(state.run_state.dirty);
+        assert_eq!(state.run_state.pending_scope, Some(RunScope::Full));
+        assert_eq!(
+            state.run_state.pending_fallback_reason.as_deref(),
+            Some(STARTUP_RECONCILIATION_REASON)
+        );
+        assert_eq!(state.last_refresh_state, DaemonRefreshState::Pending);
     }
 
     #[test]

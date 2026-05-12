@@ -1764,13 +1764,20 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     let missing_result = missing_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_mcp_response_is_presentation_free(&missing_result);
-    assert_eq!(missing_envelope["status"], "missing");
-    assert_eq!(missing_envelope["data"]["project_initialized"], true);
-    assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_START);
-    assert_eq!(
-        missing_envelope["next_actions"][0]["arguments"]["mode"],
-        "index_if_missing"
+    assert!(
+        missing_envelope["status"] == "missing" || missing_envelope["status"] == "indexing",
+        "fresh MCP project should be missing or already indexing after daemon auto-start; got {missing_envelope:?}"
     );
+    assert_eq!(missing_envelope["data"]["project_initialized"], true);
+    if missing_envelope["status"] == "missing" {
+        assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_START);
+        assert_eq!(
+            missing_envelope["next_actions"][0]["arguments"]["mode"],
+            "index_if_missing"
+        );
+    } else {
+        assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_STATUS);
+    }
     assert_mcp_next_actions_are_canonical(missing_envelope);
 
     let indexing = TempDir::new().unwrap();
@@ -1853,17 +1860,30 @@ fn mcp_status_ignores_index_progress_from_other_context() {
 
     assert_ne!(result["isError"], true);
     assert_mcp_response_is_presentation_free(&result);
-    assert_eq!(envelope["status"], "missing");
+    assert!(
+        envelope["status"] == "missing" || envelope["status"] == "indexing",
+        "fresh MCP project should be missing or already indexing after daemon auto-start; got {envelope:?}"
+    );
     assert!(
         envelope["data"].get("index_progress").is_none(),
         "non-active context progress should not be exposed in readiness data: {envelope:?}"
     );
-    assert_eq!(envelope["data"]["last_update_state"], "unknown");
-    assert_eq!(
-        envelope["next_actions"][0]["arguments"]["mode"],
-        "index_if_missing"
+    assert!(
+        matches!(
+            envelope["data"]["last_update_state"].as_str(),
+            Some("unknown" | "pending" | "running")
+        ),
+        "fresh MCP project should not report a completed foreign-context update: {envelope:?}"
     );
-    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
+    if envelope["status"] == "missing" {
+        assert_eq!(
+            envelope["next_actions"][0]["arguments"]["mode"],
+            "index_if_missing"
+        );
+        assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
+    } else {
+        assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
+    }
 }
 
 #[test]
@@ -1879,15 +1899,23 @@ fn mcp_status_ignores_index_rows_from_other_context() {
 
     assert_ne!(result["isError"], true);
     assert_mcp_response_is_presentation_free(&result);
-    assert_eq!(envelope["status"], "missing");
-    assert_eq!(envelope["data"]["index_readable"], true);
-    assert_eq!(envelope["data"]["indexed_files"], 0);
-    assert_eq!(envelope["data"]["total_segments"], 0);
-    assert_eq!(
-        envelope["next_actions"][0]["arguments"]["mode"],
-        "index_if_missing"
+    assert!(
+        envelope["status"] == "missing" || envelope["status"] == "indexing",
+        "fresh MCP project should be missing or already indexing after daemon auto-start; got {envelope:?}"
     );
-    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
+    if envelope["data"]["index_readable"].as_bool() == Some(true) {
+        assert_eq!(envelope["data"]["indexed_files"], 0);
+        assert_eq!(envelope["data"]["total_segments"], 0);
+    }
+    if envelope["status"] == "missing" {
+        assert_eq!(
+            envelope["next_actions"][0]["arguments"]["mode"],
+            "index_if_missing"
+        );
+        assert_eq!(envelope["next_actions"][0]["tool"], TOOL_START);
+    } else {
+        assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
+    }
 }
 
 #[test]
