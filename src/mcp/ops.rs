@@ -18,9 +18,9 @@ use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
-    ContextAccessScope, ContextResult, DaemonProjectStatus, IndexProgress, IndexState,
-    ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings, StructuralSearchReport,
-    SymbolResult, WorktreeContext,
+    ContextAccessScope, ContextResult, DaemonProjectStatus, DaemonRefreshState, IndexProgress,
+    IndexState, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
+    StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
@@ -268,10 +268,24 @@ pub async fn classify_readiness(
     let db_path = project_db_path(state_root);
     let index_present = db_path.exists();
     let index_progress = read_index_progress_for_context(state_root, &worktree_context.context_id);
-    let daemon_status = crate::cli::project_status_files::read_daemon_status_for_context(
+    let daemon_context_status = crate::cli::project_status_files::read_daemon_context_status(
         state_root,
         &worktree_context.context_id,
     );
+    let daemon_refresh_active = daemon_context_status.as_ref().is_some_and(|status| {
+        matches!(
+            status.last_refresh_state,
+            DaemonRefreshState::Pending | DaemonRefreshState::Running
+        )
+    });
+    let daemon_status = daemon_context_status
+        .as_ref()
+        .and_then(|status| {
+            status
+                .last_file_check_at
+                .map(|last_file_check_at| DaemonProjectStatus { last_file_check_at })
+        })
+        .or_else(|| crate::cli::project_status_files::read_daemon_status(state_root));
     let mut payload = ReadinessPayload {
         status: ReadinessStatus::Missing,
         summary: String::new(),
@@ -302,6 +316,7 @@ pub async fn classify_readiness(
         .index_progress
         .as_ref()
         .is_some_and(|progress| progress.state == IndexState::Running)
+        || daemon_refresh_active
     {
         payload.status = ReadinessStatus::Indexing;
         payload.summary = "Indexing is currently running.".to_string();

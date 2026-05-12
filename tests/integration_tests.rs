@@ -1764,13 +1764,20 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     let missing_result = missing_client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let missing_envelope = mcp_structured(&missing_result);
     assert_mcp_response_is_presentation_free(&missing_result);
-    assert_eq!(missing_envelope["status"], "missing");
-    assert_eq!(missing_envelope["data"]["project_initialized"], true);
-    assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_START);
-    assert_eq!(
-        missing_envelope["next_actions"][0]["arguments"]["mode"],
-        "index_if_missing"
+    assert!(
+        missing_envelope["status"] == "missing" || missing_envelope["status"] == "indexing",
+        "fresh MCP project should be missing or already indexing after daemon auto-start; got {missing_envelope:?}"
     );
+    assert_eq!(missing_envelope["data"]["project_initialized"], true);
+    if missing_envelope["status"] == "missing" {
+        assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_START);
+        assert_eq!(
+            missing_envelope["next_actions"][0]["arguments"]["mode"],
+            "index_if_missing"
+        );
+    } else {
+        assert_eq!(missing_envelope["next_actions"][0]["tool"], TOOL_STATUS);
+    }
     assert_mcp_next_actions_are_canonical(missing_envelope);
 
     let indexing = TempDir::new().unwrap();
