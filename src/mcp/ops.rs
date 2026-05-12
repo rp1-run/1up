@@ -316,7 +316,6 @@ pub async fn classify_readiness(
         .index_progress
         .as_ref()
         .is_some_and(|progress| progress.state == IndexState::Running)
-        || daemon_refresh_active
     {
         payload.status = ReadinessStatus::Indexing;
         payload.summary = "Indexing is currently running.".to_string();
@@ -324,6 +323,11 @@ pub async fn classify_readiness(
     }
 
     if !project_initialized || !index_present {
+        if daemon_refresh_active {
+            payload.status = ReadinessStatus::Indexing;
+            payload.summary = "Indexing is currently running.".to_string();
+            return payload;
+        }
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No usable 1up index is available for this repository.".to_string();
         payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
@@ -333,6 +337,11 @@ pub async fn classify_readiness(
     let db = match Db::open_ro(&db_path).await {
         Ok(db) => db,
         Err(err) => {
+            if daemon_refresh_active {
+                payload.status = ReadinessStatus::Indexing;
+                payload.summary = "Indexing is currently running.".to_string();
+                return payload;
+            }
             payload.status = ReadinessStatus::Stale;
             payload.summary = "The index exists but cannot be opened.".to_string();
             payload.reason = Some(err.to_string());
@@ -343,6 +352,11 @@ pub async fn classify_readiness(
     let conn = match db.connect() {
         Ok(conn) => conn,
         Err(err) => {
+            if daemon_refresh_active {
+                payload.status = ReadinessStatus::Indexing;
+                payload.summary = "Indexing is currently running.".to_string();
+                return payload;
+            }
             payload.status = ReadinessStatus::Stale;
             payload.summary = "The index exists but cannot be read.".to_string();
             payload.reason = Some(err.to_string());
@@ -353,6 +367,11 @@ pub async fn classify_readiness(
     payload.schema_version = schema::get_schema_version(&conn).await.ok().flatten();
 
     if let Err(err) = schema::ensure_current(&conn).await {
+        if daemon_refresh_active {
+            payload.status = ReadinessStatus::Indexing;
+            payload.summary = "Indexing is currently running.".to_string();
+            return payload;
+        }
         payload.status = ReadinessStatus::Stale;
         payload.summary = "The index schema is stale or incompatible.".to_string();
         payload.reason = Some(err.to_string());
@@ -368,6 +387,11 @@ pub async fn classify_readiness(
         .ok();
 
     if payload.total_segments.unwrap_or(0) == 0 {
+        if daemon_refresh_active {
+            payload.status = ReadinessStatus::Indexing;
+            payload.summary = "Indexing is currently running.".to_string();
+            return payload;
+        }
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No indexed code is available for this repository.".to_string();
         payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
