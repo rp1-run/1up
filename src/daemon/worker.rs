@@ -1284,6 +1284,27 @@ mod tests {
     }
 
     #[test]
+    fn startup_reconciliation_marks_full_refresh_with_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+
+        mark_startup_reconciliation_pending(&mut state);
+
+        assert!(state.run_state.dirty);
+        assert_eq!(state.run_state.pending_scope, Some(RunScope::Full));
+        assert_eq!(
+            state.run_state.pending_fallback_reason.as_deref(),
+            Some(STARTUP_RECONCILIATION_REASON)
+        );
+        assert_eq!(state.last_refresh_state, DaemonRefreshState::Pending);
+    }
+
+    #[test]
     fn mark_changed_projects_only_queues_matching_roots() {
         let tmp = tempfile::tempdir().unwrap();
         let alpha_root = tmp.path().join("alpha");

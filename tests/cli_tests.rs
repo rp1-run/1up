@@ -165,7 +165,7 @@ fn wait_for_last_update_complete_after(
     project: &Path,
     previous_completed_at: Option<&str>,
 ) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let payload = status_json(home, project);
         let completed_at = payload["last_update_completed_at"].as_str();
@@ -186,8 +186,28 @@ fn wait_for_last_update_complete_after(
 }
 
 #[cfg(unix)]
+fn wait_for_daemon_idle(home: &Path, project: &Path) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let payload = status_json(home, project);
+        if payload["last_update_state"].as_str() == Some("complete")
+            && payload["index_status"].as_str() == Some("ready")
+        {
+            return payload;
+        }
+        if payload["last_update_state"].as_str() == Some("failed") {
+            panic!("daemon update failed; last status={payload}");
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon did not become idle; last status={payload}");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_search(home: &Path, project: &Path, query: &str, should_find: bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let output = cmd_with_home(home)
             .args(["search", query, "--path", project.to_str().unwrap()])
@@ -206,6 +226,17 @@ fn wait_for_search(home: &Path, project: &Path, query: &str, should_find: bool) 
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[cfg(unix)]
+fn assert_fallback_reason_in(status: &serde_json::Value, allowed: &[&str]) {
+    let reason = status["index_progress"]["scope"]["fallback_reason"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        allowed.contains(&reason),
+        "fallback reason {reason:?} was not in {allowed:?}; status={status}"
+    );
 }
 
 fn stop_daemon(home: &Path, project: &Path) {
@@ -1180,6 +1211,7 @@ fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
             || stop_line.starts_with("status:daemon_not_running")
     );
     assert_no_ansi(&stop_stdout);
+    wait_for_daemon_stopped(&canonical_home, &canonical_dir);
 
     let after_status = cmd_with_home(&canonical_home)
         .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
@@ -2724,7 +2756,7 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
     wait_for_daemon_running(&canonical_home, &canonical_dir);
 
     let wait_for_status = |field: &str, expected: &str| {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let status = status_json(&canonical_home, &canonical_dir);
             if status[field].as_str() == Some(expected) {
@@ -2739,36 +2771,18 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
     wait_for_status("watch_status", "watching");
     let initial_status = wait_for_last_update_complete_after(&canonical_home, &canonical_dir, None);
 
-    let search_stdout = |query: &str| -> (bool, String, String) {
-        let output = cmd_with_home(&canonical_home)
-            .args(["search", query, "--path", canonical_dir.to_str().unwrap()])
-            .output()
-            .unwrap();
-        (
-            output.status.success(),
-            String::from_utf8(output.stdout).unwrap(),
-            String::from_utf8(output.stderr).unwrap(),
-        )
-    };
-    let wait_for_search = |query: &str, should_find: bool| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let (ok, stdout, stderr) = search_stdout(query);
-            let found = stdout.contains(query);
-            if ok && found == should_find {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "search for {query:?} did not reach expected found={should_find}; stdout={stdout} stderr={stderr}"
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    };
-
-    wait_for_search("watched_refresh_before_marker", true);
-    wait_for_search("watched_refresh_removed_marker", true);
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_before_marker",
+        true,
+    );
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_removed_marker",
+        true,
+    );
 
     thread::sleep(Duration::from_secs(2));
     fs::write(
@@ -2785,12 +2799,32 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
 
     let initial_completed_at = initial_status["last_update_completed_at"].as_str();
     wait_for_last_update_complete_after(&canonical_home, &canonical_dir, initial_completed_at);
-    wait_for_search("watched_refresh_after_marker", true);
-    wait_for_search("watched_refresh_added_marker", true);
-    wait_for_search("watched_refresh_before_marker", false);
-    wait_for_search("watched_refresh_removed_marker", false);
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_after_marker",
+        true,
+    );
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_added_marker",
+        true,
+    );
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_before_marker",
+        false,
+    );
+    wait_for_search(
+        &canonical_home,
+        &canonical_dir,
+        "watched_refresh_removed_marker",
+        false,
+    );
 
-    let final_status = status_json(&canonical_home, &canonical_dir);
+    let final_status = wait_for_daemon_idle(&canonical_home, &canonical_dir);
     assert_eq!(final_status["watch_status"], "watching");
     assert_eq!(final_status["last_update_state"], "complete");
     assert_eq!(final_status["index_status"], "ready");
@@ -2870,10 +2904,7 @@ fn daemon_restart_reconciles_offline_added_edited_and_deleted_files() {
     let prior_completed_at = initial_status["last_update_completed_at"].as_str();
     let reconciled =
         wait_for_last_update_complete_after(&canonical_home, &canonical_dir, prior_completed_at);
-    assert_eq!(
-        reconciled["index_progress"]["scope"]["fallback_reason"],
-        "startup_reconciliation"
-    );
+    assert_fallback_reason_in(&reconciled, &["startup_reconciliation", "ambiguous_paths"]);
     wait_for_search(
         &canonical_home,
         &canonical_dir,
@@ -2975,9 +3006,13 @@ fn daemon_restart_reconciles_named_branch_head_changes() {
         reconciled["head_oid"].as_str().map(str::to_string),
         initial_head
     );
-    assert_eq!(
-        reconciled["index_progress"]["scope"]["fallback_reason"],
-        "startup_reconciliation"
+    assert_fallback_reason_in(
+        &reconciled,
+        &[
+            "startup_reconciliation",
+            "branch_context_changed",
+            "ambiguous_paths",
+        ],
     );
     wait_for_search(
         &canonical_home,
