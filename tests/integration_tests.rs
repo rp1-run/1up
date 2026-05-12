@@ -15,6 +15,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(unix)]
@@ -219,6 +221,25 @@ impl McpTestClient {
 
 fn mcp_structured(result: &serde_json::Value) -> &serde_json::Value {
     &result["structuredContent"]
+}
+
+fn wait_for_mcp_last_update_complete(client: &mut McpTestClient) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+        let envelope = mcp_structured(&result);
+        let state = envelope["data"]["last_update_state"].as_str();
+        if state == Some("complete") {
+            return result;
+        }
+        if state == Some("failed") {
+            panic!("daemon update failed; last status={result}");
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon did not reach last_update_state=complete; last status={result}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn assert_mcp_text_matches_summary(result: &serde_json::Value) {
@@ -1821,7 +1842,7 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
         let ready = create_multi_lang_fixture();
         init_and_index(&ready);
         let mut ready_client = McpTestClient::start(ready.path());
-        let ready_result = ready_client.call_tool(TOOL_STATUS, serde_json::json!({}));
+        let ready_result = wait_for_mcp_last_update_complete(&mut ready_client);
         let ready_envelope = mcp_structured(&ready_result);
         assert_mcp_response_is_presentation_free(&ready_result);
         assert_eq!(ready_envelope["status"], "degraded");
