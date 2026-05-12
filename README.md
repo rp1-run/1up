@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Local code intelligence for coding agents.</strong>
+  <strong>Local code intelligence that helps agents finish code-discovery tasks 33% faster and 25% cheaper.</strong>
 </p>
 
 <p align="center">
