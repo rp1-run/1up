@@ -1982,11 +1982,20 @@ fn mcp_start_index_if_missing_builds_index_state_only() {
     fs::write(&source_path, source_content).unwrap();
 
     let mut client = McpTestClient::start_with_isolated_state(tmp.path());
-    client.call_tool(
+    let mut result = client.call_tool(
         TOOL_START,
         serde_json::json!({ "mode": "index_if_missing" }),
     );
-    let result = wait_for_mcp_last_update_complete(&mut client);
+    for _ in 0..20 {
+        let status = mcp_structured(&result)["status"]
+            .as_str()
+            .map(str::to_owned);
+        if status.as_deref() != Some("stale") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    }
     let envelope = mcp_structured(&result);
 
     assert_ne!(result["isError"], true);
@@ -2043,7 +2052,7 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     let _guard = init_and_index_fts_only(&tmp);
     let mut client = McpTestClient::start(tmp.path());
 
-    let status = wait_for_mcp_last_update_complete(&mut client);
+    let status = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     assert_ne!(status["isError"], true);
     assert_mcp_response_is_presentation_free(&status);
     let status_envelope = mcp_structured(&status);
