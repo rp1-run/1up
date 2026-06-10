@@ -118,7 +118,7 @@ while IFS=$'\t' read -r target archive expected_sha; do
   archive_path="$ASSETS_DIR/$archive"
   require_file "$archive_path"
 
-  checksum_entry=$(awk -v asset="$archive" '{ sub(/\r$/, "") } $2 == asset { print $1; exit }' "$CHECKSUMS_PATH")
+  checksum_entry=$(awk -v asset="$archive" '{ sub(/\r$/, "") } $2 == asset { print $1; exit }' "$CHECKSUMS_PATH" | tr -d '\r')
   if [[ -z "$checksum_entry" ]]; then
     fail "SHA256SUMS is missing an entry for ${archive}"
   fi
