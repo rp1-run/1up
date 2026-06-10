@@ -105,6 +105,9 @@ sync_repo() {
   rm -rf "$target_dir"
   mkdir -p "$target_dir"
   rsync -a --delete --exclude .git --exclude .1up --exclude target "$source_dir"/ "$target_dir"/
+  # project resolution refuses auto-init outside a git root or existing 1up
+  # project, so benchmark copies need a git marker
+  mkdir -p "$target_dir/.git"
 }
 
 ensure_emdash_fixture() {
@@ -512,7 +515,7 @@ log "capturing benchmark snapshot from $REPO"
 sync_repo "$REPO" "$PRISTINE_DIR"
 
 log "warming indexing environment"
-"$ONEUP_BIN" index "$PRISTINE_DIR" >/dev/null 2>&1
+"$ONEUP_BIN" index "$PRISTINE_DIR" >/dev/null
 rm -rf "$PRISTINE_DIR/.1up"
 
 log "benchmarking full reindex runs"
