@@ -167,7 +167,12 @@ jobs:
 
           status_json=$(./target/debug/1up status "$smoke_dir" --format json)
           printf '%s\n' "$status_json"
-          jq -e '.project_initialized == true and (.indexed_files // 0) >= 1' \
+          # `1up index` does not write a project id (init/start/MCP lifecycle
+          # owns that), so assert the index/read-back guarantees instead;
+          # verified identical on macOS.
+          jq -e '.last_update_state == "complete"
+            and (.indexed_files // 0) >= 1
+            and (.total_segments // 0) >= 1' \
             <<<"$status_json"
 
   release-consistency:
