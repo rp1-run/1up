@@ -17,6 +17,11 @@ log() {
   printf '[parallel-index-bench] %s\n' "$*" >&2
 }
 
+fail() {
+  log "$*"
+  exit 1
+}
+
 write_skipped_summary() {
   local reason="$1"
   local out_dir="$2"
@@ -81,6 +86,38 @@ metric_value() {
   jq -r --argjson idx "$result_index" '.results[$idx].median' "$json_path"
 }
 
+config_jobs() {
+  case "$1" in
+    serial) printf '%s' "$SERIAL_JOBS" ;;
+    constrained) printf '%s' "$CONSTRAINED_JOBS" ;;
+    auto) ;;
+  esac
+}
+
+config_embed_threads() {
+  case "$1" in
+    serial) printf '%s' "$SERIAL_EMBED_THREADS" ;;
+    constrained) printf '%s' "$CONSTRAINED_EMBED_THREADS" ;;
+    auto) ;;
+  esac
+}
+
+# Median for one full-reindex config as a JSON value: a number in ms when the
+# config was selected via BENCH_FULL_CONFIGS, otherwise `null`.
+full_metric_ms() {
+  local config="$1"
+  local idx=0
+  local selected
+  for selected in "${FULL_CONFIGS[@]}"; do
+    if [[ "$selected" == "$config" ]]; then
+      to_ms "$(metric_value "$FULL_JSON" "$idx")"
+      return
+    fi
+    idx=$((idx + 1))
+  done
+  printf 'null'
+}
+
 require_index_work() {
   local label="$1"
   local output_json="$2"
@@ -123,6 +160,28 @@ ensure_emdash_fixture() {
   git -C "$EMDASH_CACHE_DIR" checkout --force "$EMDASH_COMMIT" >/dev/null 2>&1
 }
 
+# Snapshot/restore keeps incremental benchmarks honest without paying for a
+# full reindex in every hyperfine --prepare: the base index is built once per
+# config, the whole run dir (including .1up state) is copied to a pristine
+# snapshot, and each prepare restores that snapshot into the same absolute
+# run dir so paths stored in the index stay valid.
+snapshot_state() {
+  local run_dir="$1"
+  local snapshot_dir="$2"
+
+  rm -rf "$snapshot_dir"
+  mkdir -p "$snapshot_dir"
+  rsync -a --delete "$run_dir"/ "$snapshot_dir"/
+}
+
+restore_state() {
+  local snapshot_dir="$1"
+  local run_dir="$2"
+
+  mkdir -p "$run_dir"
+  rsync -a --delete "$snapshot_dir"/ "$run_dir"/
+}
+
 prepare_full_case() {
   local source_dir="$1"
   local run_dir="$2"
@@ -150,12 +209,13 @@ run_full_case() {
   capture_telemetry "full:$run_dir" "$output"
 }
 
-prepare_incremental_case() {
+prepare_incremental_base() {
   local source_dir="$1"
   local run_dir="$2"
-  local oneup_bin="$3"
-  local jobs="$4"
-  local embed_threads="$5"
+  local snapshot_dir="$3"
+  local oneup_bin="$4"
+  local jobs="$5"
+  local embed_threads="$6"
 
   sync_repo "$source_dir" "$run_dir"
 
@@ -176,6 +236,15 @@ EOF
   local output
   output=$("${args[@]}")
   require_index_work "prepare-incremental:$run_dir" "$output"
+
+  snapshot_state "$run_dir" "$snapshot_dir"
+}
+
+restore_incremental_case() {
+  local snapshot_dir="$1"
+  local run_dir="$2"
+
+  restore_state "$snapshot_dir" "$run_dir"
 
   cat > "$run_dir/_1up_parallel_bench.rs" <<'EOF'
 pub fn bench_marker() -> &'static str {
@@ -208,12 +277,13 @@ run_incremental_case() {
   capture_telemetry "incremental:$run_dir" "$output"
 }
 
-prepare_write_heavy_case() {
+prepare_write_heavy_base() {
   local source_dir="$1"
   local run_dir="$2"
-  local oneup_bin="$3"
-  local jobs="$4"
-  local embed_threads="$5"
+  local snapshot_dir="$3"
+  local oneup_bin="$4"
+  local jobs="$5"
+  local embed_threads="$6"
 
   sync_repo "$source_dir" "$run_dir"
   mkdir -p "$run_dir/write_heavy"
@@ -239,6 +309,16 @@ EOF
   output=$("${args[@]}")
   require_index_work "prepare-write-heavy:$run_dir" "$output"
 
+  snapshot_state "$run_dir" "$snapshot_dir"
+}
+
+restore_write_heavy_case() {
+  local snapshot_dir="$1"
+  local run_dir="$2"
+
+  restore_state "$snapshot_dir" "$run_dir"
+
+  local idx
   for idx in $(seq 1 24); do
     cat > "$run_dir/write_heavy/file_${idx}.rs" <<EOF
 pub fn write_heavy_marker_${idx}() -> &'static str {
@@ -432,9 +512,9 @@ if [[ "${1:-}" == "__run_full_case" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "__prepare_incremental_case" ]]; then
+if [[ "${1:-}" == "__restore_incremental_case" ]]; then
   shift
-  prepare_incremental_case "$@"
+  restore_incremental_case "$@"
   exit 0
 fi
 
@@ -444,9 +524,9 @@ if [[ "${1:-}" == "__run_incremental_case" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "__prepare_write_heavy_case" ]]; then
+if [[ "${1:-}" == "__restore_write_heavy_case" ]]; then
   shift
-  prepare_write_heavy_case "$@"
+  restore_write_heavy_case "$@"
   exit 0
 fi
 
@@ -470,10 +550,18 @@ SERIAL_JOBS="${SERIAL_JOBS:-1}"
 SERIAL_EMBED_THREADS="${SERIAL_EMBED_THREADS:-1}"
 CONSTRAINED_JOBS="${CONSTRAINED_JOBS:-2}"
 CONSTRAINED_EMBED_THREADS="${CONSTRAINED_EMBED_THREADS:-1}"
+# Comma-separated subset of serial,auto,constrained for the full-reindex
+# matrix (the most expensive case). CI narrows this to `auto`; local
+# `just bench-parallel` keeps all three by default.
+BENCH_FULL_CONFIGS="${BENCH_FULL_CONFIGS:-serial,auto,constrained}"
+# When ONEUP_BIN is provided (for example a verified release binary in CI),
+# the script benchmarks it directly instead of building from source.
+ONEUP_BIN_PROVIDED="${ONEUP_BIN:-}"
 ONEUP_BIN="${ONEUP_BIN:-$ROOT_DIR/target/release/1up}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/target/parallel-index-bench/${REPO_NAME}-${TIMESTAMP}}"
 PRISTINE_DIR="$OUT_DIR/pristine"
 RUN_DIR_ROOT="$OUT_DIR/runs"
+SNAPSHOT_DIR_ROOT="$OUT_DIR/snapshots"
 FULL_JSON="$OUT_DIR/full-index.json"
 INCREMENTAL_JSON="$OUT_DIR/incremental-index.json"
 WRITE_HEAVY_JSON="$OUT_DIR/write-heavy-index.json"
@@ -486,12 +574,25 @@ if [[ -n "${BENCHMARK_SKIPPED_REASON//[[:space:]]/}" ]]; then
   exit 0
 fi
 
-require_cmd cargo
 require_cmd git
 require_cmd hyperfine
 require_cmd jq
 require_cmd perl
 require_cmd rsync
+
+FULL_CONFIGS=()
+IFS=',' read -r -a requested_full_configs <<<"$BENCH_FULL_CONFIGS"
+for config in "${requested_full_configs[@]}"; do
+  config="${config//[[:space:]]/}"
+  case "$config" in
+    serial|auto|constrained) FULL_CONFIGS+=("$config") ;;
+    '') ;;
+    *) fail "invalid BENCH_FULL_CONFIGS entry '$config' (expected serial, auto, constrained)" ;;
+  esac
+done
+if (( ${#FULL_CONFIGS[@]} == 0 )); then
+  fail "BENCH_FULL_CONFIGS selected no configs: $BENCH_FULL_CONFIGS"
+fi
 
 if [[ "$REPO_INPUT" == "$EMDASH_CACHE_DIR" ]]; then
   ensure_emdash_fixture
@@ -506,10 +607,18 @@ REPO=$(cd "$REPO_INPUT" && pwd -P)
 REPO_NAME=$(basename "$REPO")
 
 TELEMETRY_DIR="$OUT_DIR/telemetry"
-mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT" "$TELEMETRY_DIR"
+mkdir -p "$OUT_DIR" "$RUN_DIR_ROOT" "$SNAPSHOT_DIR_ROOT" "$TELEMETRY_DIR"
 
-log "building release binary"
-cargo build --release --bin 1up --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null
+if [[ -n "$ONEUP_BIN_PROVIDED" ]]; then
+  if [[ ! -x "$ONEUP_BIN" ]]; then
+    fail "ONEUP_BIN is not an executable file: $ONEUP_BIN"
+  fi
+  log "benchmarking provided binary: $ONEUP_BIN"
+else
+  require_cmd cargo
+  log "building release binary"
+  cargo build --release --bin 1up --manifest-path "$ROOT_DIR/Cargo.toml" >/dev/null
+fi
 
 log "capturing benchmark snapshot from $REPO"
 sync_repo "$REPO" "$PRISTINE_DIR"
@@ -518,48 +627,69 @@ log "warming indexing environment"
 "$ONEUP_BIN" index "$PRISTINE_DIR" >/dev/null
 rm -rf "$PRISTINE_DIR/.1up"
 
-log "benchmarking full reindex runs"
-hyperfine \
-  --export-json "$FULL_JSON" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-serial\"" \
-  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
-  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-auto\"" \
-  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
-  --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/full-constrained\"" \
-  "bash \"$0\" __run_full_case \"$RUN_DIR_ROOT/full-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
+log "benchmarking full reindex runs (configs: ${FULL_CONFIGS[*]})"
+full_bench_args=(--export-json "$FULL_JSON" --runs "$RUNS" --warmup "$WARMUP")
+for config in "${FULL_CONFIGS[@]}"; do
+  full_run_dir="$RUN_DIR_ROOT/full-$config"
+  full_bench_args+=(
+    --prepare "bash \"$0\" __prepare_full_case \"$PRISTINE_DIR\" \"$full_run_dir\""
+    "bash \"$0\" __run_full_case \"$full_run_dir\" \"$ONEUP_BIN\" \"$(config_jobs "$config")\" \"$(config_embed_threads "$config")\""
+  )
+done
+hyperfine "${full_bench_args[@]}"
+
+log "preparing incremental benchmark base indexes"
+for config in serial auto constrained; do
+  prepare_incremental_base \
+    "$PRISTINE_DIR" \
+    "$RUN_DIR_ROOT/incremental-$config" \
+    "$SNAPSHOT_DIR_ROOT/incremental-$config" \
+    "$ONEUP_BIN" \
+    "$(config_jobs "$config")" \
+    "$(config_embed_threads "$config")"
+done
 
 log "benchmarking incremental reindex runs"
 hyperfine \
   --export-json "$INCREMENTAL_JSON" \
   --runs "$RUNS" \
   --warmup "$WARMUP" \
-  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __restore_incremental_case \"$SNAPSHOT_DIR_ROOT/incremental-serial\" \"$RUN_DIR_ROOT/incremental-serial\"" \
   "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
-  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  --prepare "bash \"$0\" __restore_incremental_case \"$SNAPSHOT_DIR_ROOT/incremental-auto\" \"$RUN_DIR_ROOT/incremental-auto\"" \
   "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
-  --prepare "bash \"$0\" __prepare_incremental_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __restore_incremental_case \"$SNAPSHOT_DIR_ROOT/incremental-constrained\" \"$RUN_DIR_ROOT/incremental-constrained\"" \
   "bash \"$0\" __run_incremental_case \"$RUN_DIR_ROOT/incremental-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
+
+log "preparing write-heavy benchmark base indexes"
+for config in serial auto constrained; do
+  prepare_write_heavy_base \
+    "$PRISTINE_DIR" \
+    "$RUN_DIR_ROOT/write-heavy-$config" \
+    "$SNAPSHOT_DIR_ROOT/write-heavy-$config" \
+    "$ONEUP_BIN" \
+    "$(config_jobs "$config")" \
+    "$(config_embed_threads "$config")"
+done
 
 log "benchmarking write-heavy incremental runs"
 hyperfine \
   --export-json "$WRITE_HEAVY_JSON" \
   --runs "$RUNS" \
   --warmup "$WARMUP" \
-  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __restore_write_heavy_case \"$SNAPSHOT_DIR_ROOT/write-heavy-serial\" \"$RUN_DIR_ROOT/write-heavy-serial\"" \
   "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-serial\" \"$ONEUP_BIN\" \"$SERIAL_JOBS\" \"$SERIAL_EMBED_THREADS\"" \
-  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
+  --prepare "bash \"$0\" __restore_write_heavy_case \"$SNAPSHOT_DIR_ROOT/write-heavy-auto\" \"$RUN_DIR_ROOT/write-heavy-auto\"" \
   "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-auto\" \"$ONEUP_BIN\" \"\" \"\"" \
-  --prepare "bash \"$0\" __prepare_write_heavy_case \"$PRISTINE_DIR\" \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\"" \
+  --prepare "bash \"$0\" __restore_write_heavy_case \"$SNAPSHOT_DIR_ROOT/write-heavy-constrained\" \"$RUN_DIR_ROOT/write-heavy-constrained\"" \
   "bash \"$0\" __run_write_heavy_case \"$RUN_DIR_ROOT/write-heavy-constrained\" \"$ONEUP_BIN\" \"$CONSTRAINED_JOBS\" \"$CONSTRAINED_EMBED_THREADS\""
 
 log "benchmarking daemon refresh cycles"
 DAEMON_REFRESH_MEDIAN_MS=$(run_daemon_refresh_benchmark "$PRISTINE_DIR" "$RUN_DIR_ROOT/daemon-refresh" "$ONEUP_BIN" "$RUNS")
 
-SERIAL_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 0)")
-AUTO_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 1)")
-CONSTRAINED_FULL_MS=$(to_ms "$(metric_value "$FULL_JSON" 2)")
+SERIAL_FULL_MS=$(full_metric_ms serial)
+AUTO_FULL_MS=$(full_metric_ms auto)
+CONSTRAINED_FULL_MS=$(full_metric_ms constrained)
 SERIAL_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 0)")
 AUTO_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 1)")
 CONSTRAINED_INCREMENTAL_MS=$(to_ms "$(metric_value "$INCREMENTAL_JSON" 2)")
@@ -591,9 +721,10 @@ jq -n \
   --arg repo "$REPO" \
   --arg out_dir "$OUT_DIR" \
   --arg search_latency_command "just bench-search-latency" \
-  --arg serial_full_ms "$SERIAL_FULL_MS" \
-  --arg auto_full_ms "$AUTO_FULL_MS" \
-  --arg constrained_full_ms "$CONSTRAINED_FULL_MS" \
+  --argjson serial_full_ms "$SERIAL_FULL_MS" \
+  --argjson auto_full_ms "$AUTO_FULL_MS" \
+  --argjson constrained_full_ms "$CONSTRAINED_FULL_MS" \
+  --arg full_configs_csv "$(IFS=','; printf '%s' "${FULL_CONFIGS[*]}")" \
   --arg serial_incremental_ms "$SERIAL_INCREMENTAL_MS" \
   --arg auto_incremental_ms "$AUTO_INCREMENTAL_MS" \
   --arg constrained_incremental_ms "$CONSTRAINED_INCREMENTAL_MS" \
@@ -645,10 +776,11 @@ jq -n \
         command: $search_latency_command
       }
     },
+    full_configs: ($full_configs_csv | split(",")),
     full_index_median_ms: {
-      serial: ($serial_full_ms | tonumber),
-      auto: ($auto_full_ms | tonumber),
-      constrained: ($constrained_full_ms | tonumber)
+      serial: $serial_full_ms,
+      auto: $auto_full_ms,
+      constrained: $constrained_full_ms
     },
     incremental_index_median_ms: {
       serial: ($serial_incremental_ms | tonumber),

@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn ensure_daemon_returns_local_mode_guidance() {
-        let err = ensure_daemon("project-id", Path::new(".")).unwrap_err();
+        let err = ensure_daemon("project-id", Path::new("."), Path::new(".")).unwrap_err();
         assert!(err.to_string().contains("not supported"));
     }
 }

@@ -1,9 +1,15 @@
 name: release-evidence
 
+# Runs automatically once the release-assets workflow completes successfully,
+# so evidence generation never races partially-uploaded release assets the way
+# the previous `release: published` trigger did. The asset polling below stays
+# as a safety net.
 on:
-  release:
+  workflow_run:
+    workflows:
+      - release-assets
     types:
-      - published
+      - completed
   workflow_dispatch:
     inputs:
       tag:
@@ -42,11 +48,16 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+  # For workflow_run events triggered by a tag push of release-assets,
+  # head_branch carries the release tag.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
 
 jobs:
   verify-archives:
     name: verify archive ${{ matrix.target }}
+    # Only run on successful release-assets completions; the evidence job
+    # inherits this gate through `needs`. workflow_dispatch stays unaffected.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -153,7 +164,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y hyperfine rsync unzip jq
-          cargo install --locked cargo-audit
+
+      - name: install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cache embedding model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/1up/models
+          key: oneup-hf-model-${{ runner.os }}-all-MiniLM-L6-v2
 
       - name: download release assets
         shell: bash
@@ -341,8 +362,37 @@ jobs:
             exit 0
           fi
 
+          # Benchmark the verified release binary instead of rebuilding from
+          # source: download the checksummed linux archive for this tag and
+          # hand the extracted binary to the benchmark via ONEUP_BIN.
+          release_dir="${RUNNER_TEMP}/release"
+          archive=$(jq -r '
+            .artifacts[]
+            | select(.target == "x86_64-unknown-linux-gnu")
+            | .archive
+          ' "$release_dir/release-manifest.json")
+
+          if [[ -z "$archive" || "$archive" == "null" ]]; then
+            echo "release manifest does not contain an x86_64-unknown-linux-gnu archive" >&2
+            exit 1
+          fi
+
+          gh release download "${RELEASE_TAG}" --pattern "$archive" --dir "$release_dir" --clobber
+          (cd "$release_dir" && grep " ${archive}\$" SHA256SUMS | sha256sum -c -)
+
+          bench_bin_dir="${RUNNER_TEMP}/bench-bin"
+          mkdir -p "$bench_bin_dir"
+          tar -C "$bench_bin_dir" -xzf "$release_dir/$archive"
+
+          oneup_bin=$(find "$bench_bin_dir" -type f -name 1up | head -n 1)
+          if [[ -z "$oneup_bin" || ! -x "$oneup_bin" ]]; then
+            echo "release archive ${archive} does not contain an executable 1up binary" >&2
+            exit 1
+          fi
+
           out_dir="${RUNNER_TEMP}/benchmark"
-          OUT_DIR="$out_dir" bash scripts/benchmark_parallel_indexing.sh
+          RUNS=2 WARMUP=0 BENCH_FULL_CONFIGS=auto ONEUP_BIN="$oneup_bin" OUT_DIR="$out_dir" \
+            bash scripts/benchmark_parallel_indexing.sh
           cp "$out_dir/summary.json" "$evidence_dir/benchmark-summary.json"
           echo "summary_path=${evidence_dir}/benchmark-summary.json" >> "$GITHUB_OUTPUT"
 

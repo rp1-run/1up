@@ -1725,6 +1725,19 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
             .unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
+    assert!(
+        workflow.contains("workflow_run:") && workflow.contains("- release-assets"),
+        "release evidence must trigger on release-assets completion instead of release publication"
+    );
+    assert!(
+        workflow.contains("github.event.workflow_run.conclusion == 'success'"),
+        "automatic release evidence runs must require a successful release-assets run"
+    );
+    assert!(workflow.contains("github.event.workflow_run.head_branch"));
+    assert!(
+        !workflow.contains("github.event.release.tag_name"),
+        "release evidence must not race the release publication event for its tag"
+    );
     assert!(workflow.contains("macos-26"));
     assert!(!workflow.contains("macos-13"));
     assert!(!workflow.contains("x86_64-apple-darwin"));

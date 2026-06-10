@@ -585,12 +585,12 @@ mod tests {
         fs::create_dir_all(&project_root).unwrap();
 
         let project_id = write_project_id(&project_root).unwrap();
-        let dot_dir = config::project_dot_dir(&project_root);
-        let project_id_path = config::project_id_path(&project_root);
 
         assert_eq!(read_project_id(&project_root).unwrap(), project_id);
         #[cfg(unix)]
         {
+            let dot_dir = config::project_dot_dir(&project_root);
+            let project_id_path = config::project_id_path(&project_root);
             assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
             assert_eq!(mode_bits(&project_id_path), SECURE_STATE_FILE_MODE);
         }
@@ -662,6 +662,26 @@ mod tests {
 
         let err = write_project_id(&project_root).unwrap_err();
         assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_project_id_reports_not_initialized_for_verbatim_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        assert!(
+            project_root.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize should produce an extended-length path: {}",
+            project_root.display()
+        );
+
+        let err = read_project_id(&project_root).unwrap_err();
+
+        assert!(
+            matches!(err, OneupError::Project(ProjectError::NotInitialized)),
+            "uninitialized verbatim root must report NotInitialized, got: {err}"
+        );
     }
 
     #[test]

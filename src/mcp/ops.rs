@@ -934,7 +934,7 @@ fn read_segment(source: ReadSource, segment: StoredSegment) -> ReadRecord {
 fn read_context(source: ReadSource, source_root: &Path, context: ContextResult) -> ReadRecord {
     let path = Path::new(&context.file_path)
         .strip_prefix(source_root)
-        .map(path_string)
+        .map(relative_path_string)
         .unwrap_or_else(|_| context.file_path.clone());
 
     ReadRecord {
@@ -1111,7 +1111,16 @@ fn usize_from_i64(value: i64) -> usize {
     usize::try_from(value).unwrap_or_default()
 }
 
+/// Renders an absolute root path exactly as the OS reports it. Replacing
+/// separators here corrupts Windows extended-length prefixes
+/// (`\\?\C:\...` would become the invalid `//?/C:/...`).
 fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Normalizes a repo-relative path to forward slashes so payload paths match
+/// the `/`-separated relative paths stored in the index.
+fn relative_path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 

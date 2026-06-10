@@ -247,10 +247,12 @@ mod tests {
         let db = Db::open_rw(&db_path).await.unwrap();
         db.connect().unwrap();
 
-        let dot_dir = config::project_dot_dir(&project_root);
         assert!(db_path.exists());
         #[cfg(unix)]
-        assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
+        {
+            let dot_dir = config::project_dot_dir(&project_root);
+            assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
+        }
     }
 
     #[tokio::test]
