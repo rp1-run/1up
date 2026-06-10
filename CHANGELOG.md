@@ -15,6 +15,21 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.10](https://github.com/rp1-run/1up/compare/v0.1.9...v0.1.10) (2026-06-10)
+
+
+### Bug Fixes
+
+* reconcile daemon indexes on startup ([#43](https://github.com/rp1-run/1up/issues/43)) ([5bf9458](https://github.com/rp1-run/1up/commit/5bf94585c2bf801ad57666babb01b4f02e10679e))
+* **tests:** poll for terminal readiness in MCP indexing tests ([06c77e2](https://github.com/rp1-run/1up/commit/06c77e2d6f7f939a2614518f458528e6b1d2dc3d))
+* **tests:** poll for terminal readiness in MCP indexing tests ([#46](https://github.com/rp1-run/1up/issues/46)) ([ba92dc8](https://github.com/rp1-run/1up/commit/ba92dc85105cc6c902282d1cd6454791405aa39e))
+* **tests:** poll MCP status until last_update_state=complete ([#45](https://github.com/rp1-run/1up/issues/45)) ([f1025a0](https://github.com/rp1-run/1up/commit/f1025a09c285f06125e50212c82e73ef19913521))
+
+
+### Documentation
+
+* Improve MCP setup docs ([#42](https://github.com/rp1-run/1up/issues/42)) ([19fa9de](https://github.com/rp1-run/1up/commit/19fa9de10d52a05a6429db7720c07b3e70707ac7))
+
 ## [0.1.9](https://github.com/rp1-run/1up/compare/v0.1.8...v0.1.9) (2026-05-11)
 
 
