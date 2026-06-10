@@ -15,6 +15,20 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.11](https://github.com/rp1-run/1up/compare/v0.1.10...v0.1.11) (2026-06-10)
+
+
+### Bug Fixes
+
+* **bench:** create git marker in benchmark repo copies ([#56](https://github.com/rp1-run/1up/issues/56)) ([15135af](https://github.com/rp1-run/1up/commit/15135af716f03b39a13a64c3ab1f5e9cd60ee368))
+* **release:** hash archives in binary mode and print checksum mismatch values ([#50](https://github.com/rp1-run/1up/issues/50)) ([de743c3](https://github.com/rp1-run/1up/commit/de743c33b78e0ea158bfa71dd87c04a0e164bf84))
+* **release:** hash archives via stdin to avoid coreutils path escaping ([#51](https://github.com/rp1-run/1up/issues/51)) ([d368f8d](https://github.com/rp1-run/1up/commit/d368f8d17637a6bf1a7deea90e6ca166e63dd465))
+* **release:** include envelope details when smoke readiness is not searchable ([#53](https://github.com/rp1-run/1up/issues/53)) ([5d29dc9](https://github.com/rp1-run/1up/commit/5d29dc900dbd0d4eb26be343dd7dbf5fc32a4468))
+* **release:** record windows project-init failure as documented known issue ([#55](https://github.com/rp1-run/1up/issues/55)) ([6d655af](https://github.com/rp1-run/1up/commit/6d655af08982211a61251b99a5b535812d1beb86))
+* **release:** repair update-manifest verify context and archive cleanup race ([#47](https://github.com/rp1-run/1up/issues/47)) ([2042242](https://github.com/rp1-run/1up/commit/20422428c16cf57142fd00d136b1657b952cd7b4))
+* **release:** run MCP smoke harness in UTF-8 mode ([#52](https://github.com/rp1-run/1up/issues/52)) ([9931e32](https://github.com/rp1-run/1up/commit/9931e32f21eecbf8126e6c568ae1f50f2cd6de80))
+* **release:** strip CRs from awk-derived checksums and allow evidence tooling ref override ([#49](https://github.com/rp1-run/1up/issues/49)) ([b0adf98](https://github.com/rp1-run/1up/commit/b0adf98330d538f1afb04640c7cfc2aebef33fe5))
+
 ## [0.1.10](https://github.com/rp1-run/1up/compare/v0.1.9...v0.1.10) (2026-06-10)
 
 
