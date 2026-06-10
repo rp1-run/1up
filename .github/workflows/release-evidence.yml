@@ -32,6 +32,10 @@ on:
         description: Optional reason to skip release benchmark generation
         required: false
         type: string
+      scripts_ref:
+        description: Optional ref for the release tooling checkout when verification scripts need fixes after the tag (defaults to the release tag)
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -69,7 +73,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.scripts_ref || env.RELEASE_TAG }}
           fetch-depth: 1
 
       - name: download archive under test
@@ -139,7 +143,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.scripts_ref || env.RELEASE_TAG }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable

@@ -44,12 +44,12 @@ sha256_file() {
   local path="$1"
 
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$path" | awk '{print $1}'
+    sha256sum "$path" | awk '{print $1}' | tr -d '\r'
     return
   fi
 
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$path" | awk '{print $1}'
+    shasum -a 256 "$path" | awk '{print $1}' | tr -d '\r'
     return
   fi
 
