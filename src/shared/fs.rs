@@ -30,6 +30,9 @@ pub fn ensure_secure_dir(path: &Path, mode: u32) -> Result<PathBuf, OneupError> 
 
     for component in absolute.components() {
         current.push(component.as_os_str());
+        if is_volume_root_component(&component) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => validate_directory_metadata(&current, &metadata)?,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -338,6 +341,9 @@ fn validate_path_components(
     for (index, component) in absolute.components().enumerate() {
         let is_leaf = index + 1 == component_count;
         current.push(component.as_os_str());
+        if is_volume_root_component(&component) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
@@ -365,6 +371,15 @@ fn validate_path_components(
 enum MissingComponentBehavior {
     Error,
     ReturnNone,
+}
+
+/// Prefix and root components form the volume root: they always exist, cannot
+/// be symlinks, and are never created or permissioned by these walks. Skipping
+/// them matters on Windows, where `std::fs::canonicalize` returns
+/// extended-length paths (`\\?\C:\...`) and metadata calls on the bare
+/// `\\?\C:` prefix fail with `ERROR_INVALID_FUNCTION` (os error 1).
+fn is_volume_root_component(component: &Component) -> bool {
+    matches!(component, Component::Prefix(_) | Component::RootDir)
 }
 
 fn normalize_absolute(path: &Path) -> Result<PathBuf, OneupError> {
@@ -688,6 +703,37 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let err = remove_regular_file(&directory, &root).unwrap_err();
         assert!(err.to_string().contains("regular file"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_secure_dir_accepts_verbatim_disk_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let verbatim_root = canonical_tmp_root(tmp.path());
+        assert!(
+            verbatim_root.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize should produce an extended-length path: {}",
+            verbatim_root.display()
+        );
+
+        let target = verbatim_root.join("secure").join("nested");
+        let created = ensure_secure_dir(&target, PROJECT_STATE_DIR_MODE).unwrap();
+
+        assert_eq!(created, target);
+        assert!(target.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_regular_file_path_accepts_verbatim_disk_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical_tmp_root(tmp.path());
+        let file = root.join("state.json");
+        fs::write(&file, "{}").unwrap();
+
+        let validated = validate_regular_file_path(&file, &root).unwrap();
+
+        assert_eq!(validated, file);
     }
 
     #[test]

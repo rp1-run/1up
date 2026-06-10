@@ -664,6 +664,26 @@ mod tests {
         assert!(err.to_string().contains("symlink"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn read_project_id_reports_not_initialized_for_verbatim_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        assert!(
+            project_root.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize should produce an extended-length path: {}",
+            project_root.display()
+        );
+
+        let err = read_project_id(&project_root).unwrap_err();
+
+        assert!(
+            matches!(err, OneupError::Project(ProjectError::NotInitialized)),
+            "uninitialized verbatim root must report NotInitialized, got: {err}"
+        );
+    }
+
     #[test]
     fn resolve_project_root_finds_dot_1up_at_path() {
         let tmp = tempfile::tempdir().unwrap();

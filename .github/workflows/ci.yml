@@ -113,6 +113,52 @@ jobs:
         shell: bash
         run: cargo build --locked --release --bin 1up
 
+  windows-functional:
+    # Functional smoke for Windows path handling (issue #54). Builds a dev
+    # profile binary (no LTO release build), runs the shared::fs and
+    # shared::project unit suites that cover extended-length (\\?\C:\...)
+    # paths, then indexes a real temp directory and asserts project init,
+    # indexing, and JSON status succeed end to end.
+    name: windows-functional
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-dev-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-dev-
+
+      - name: build dev binary
+        shell: bash
+        run: cargo build --locked --bin 1up
+
+      - name: unit tests for windows path handling
+        shell: bash
+        run: cargo test --locked --lib -- shared::fs:: shared::project::
+
+      - name: functional index and status smoke
+        shell: bash
+        run: |
+          smoke_dir=$(mktemp -d)
+          mkdir -p "$smoke_dir/.git" "$smoke_dir/src"
+          printf 'pub fn windows_smoke_marker() -> u32 {\n    42\n}\n' \
+            > "$smoke_dir/src/lib.rs"
+
+          ./target/debug/1up index "$smoke_dir" --format json
+
+          status_json=$(./target/debug/1up status "$smoke_dir" --format json)
+          printf '%s\n' "$status_json"
+          jq -e '.project_initialized == true and (.indexed_files // 0) >= 1' \
+            <<<"$status_json"
+
   release-consistency:
     name: release-consistency
     runs-on: ubuntu-24.04
