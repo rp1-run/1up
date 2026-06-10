@@ -129,7 +129,7 @@ while IFS=$'\t' read -r target archive expected_sha; do
 
   actual_sha=$(sha256_file "$archive_path")
   if [[ "$actual_sha" != "$expected_sha" ]]; then
-    fail "archive checksum mismatch for ${archive}"
+    fail "archive checksum mismatch for ${archive} (expected: ${expected_sha}, actual: ${actual_sha})"
   fi
 
   package_dir="${archive%.tar.gz}"
