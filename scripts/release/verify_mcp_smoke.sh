@@ -60,7 +60,9 @@ REPO_PATH=$(cd "$REPO_PATH" && pwd -P)
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 OUTPUT_PATH=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/$(basename "$OUTPUT_PATH")
 
-if "${PYTHON_CMD[@]}" - "$BINARY_PATH" "$REPO_PATH" "$OUTPUT_PATH" <<'PY'
+# UTF-8 mode: windows python otherwise decodes child output as cp1252 and
+# fails on multibyte CLI output such as the version banner emoji.
+if PYTHONUTF8=1 "${PYTHON_CMD[@]}" - "$BINARY_PATH" "$REPO_PATH" "$OUTPUT_PATH" <<'PY'
 import json
 import os
 import queue
