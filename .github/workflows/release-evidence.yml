@@ -1,9 +1,15 @@
 name: release-evidence
 
+# Runs automatically once the release-assets workflow completes successfully,
+# so evidence generation never races partially-uploaded release assets the way
+# the previous `release: published` trigger did. The asset polling below stays
+# as a safety net.
 on:
-  release:
+  workflow_run:
+    workflows:
+      - release-assets
     types:
-      - published
+      - completed
   workflow_dispatch:
     inputs:
       tag:
@@ -42,11 +48,16 @@ permissions:
   contents: write
 
 env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+  # For workflow_run events triggered by a tag push of release-assets,
+  # head_branch carries the release tag.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
 
 jobs:
   verify-archives:
     name: verify archive ${{ matrix.target }}
+    # Only run on successful release-assets completions; the evidence job
+    # inherits this gate through `needs`. workflow_dispatch stays unaffected.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
