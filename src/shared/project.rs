@@ -585,12 +585,12 @@ mod tests {
         fs::create_dir_all(&project_root).unwrap();
 
         let project_id = write_project_id(&project_root).unwrap();
-        let dot_dir = config::project_dot_dir(&project_root);
-        let project_id_path = config::project_id_path(&project_root);
 
         assert_eq!(read_project_id(&project_root).unwrap(), project_id);
         #[cfg(unix)]
         {
+            let dot_dir = config::project_dot_dir(&project_root);
+            let project_id_path = config::project_id_path(&project_root);
             assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
             assert_eq!(mode_bits(&project_id_path), SECURE_STATE_FILE_MODE);
         }
