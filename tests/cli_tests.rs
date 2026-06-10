@@ -143,19 +143,29 @@ fn wait_for_daemon_stopped(home: &Path, project: &Path) {
             return;
         }
         if Instant::now() >= force_deadline {
-            if let Some(pid) = payload["pid"].as_u64() {
-                let _ = StdCommand::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-            }
-            thread::sleep(Duration::from_millis(100));
-            let final_payload = status_json(home, project);
-            if final_payload["daemon_running"].as_bool() == Some(false) {
-                return;
-            }
-            panic!("daemon did not stop; last status={final_payload}");
+            break;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+
+    // The daemon can restart with a new pid between reads in restart tests,
+    // and teardown straggles on loaded runners, so re-read the pid and
+    // re-send SIGKILL each attempt instead of one-shot kill + fixed grace.
+    let kill_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let payload = status_json(home, project);
+        if payload["daemon_running"].as_bool() == Some(false) {
+            return;
+        }
+        if let Some(pid) = payload["pid"].as_u64() {
+            let _ = StdCommand::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        if Instant::now() >= kill_deadline {
+            panic!("daemon did not stop; last status={payload}");
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
