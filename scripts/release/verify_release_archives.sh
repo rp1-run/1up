@@ -57,7 +57,9 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/oneup-release-verify.XXXXXX")
 ARCHIVES_JSONL="$TMP_DIR/archives.jsonl"
 
 cleanup() {
-  rm -rf "$TMP_DIR"
+  rm -rf "$TMP_DIR" 2>/dev/null \
+    || { sleep 1; rm -rf "$TMP_DIR" 2>/dev/null; } \
+    || log "warning: could not remove temp dir $TMP_DIR"
 }
 trap cleanup EXIT
 
