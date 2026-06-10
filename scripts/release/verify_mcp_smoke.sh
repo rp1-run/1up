@@ -611,7 +611,9 @@ try:
         )
     if readiness_status not in DISCOVERY_READY_STATUSES:
         raise SmokeFailure(
-            f"oneup_start did not make the fixture repository searchable: {readiness_status}"
+            "oneup_start did not make the fixture repository searchable: "
+            f"{readiness_status} (summary: {json.dumps(structured.get('summary'))}, "
+            f"data: {json.dumps(structured.get('data'))})"
         )
 
     search_result = call_tool(
