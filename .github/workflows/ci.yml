@@ -121,6 +121,7 @@ jobs:
     # indexing, and JSON status succeed end to end.
     name: windows-functional
     runs-on: windows-2022
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -147,6 +148,16 @@ jobs:
       - name: functional index and status smoke
         shell: bash
         run: |
+          # Force FTS-only indexing: this smoke verifies path and project
+          # semantics, and the embedding path (model download + dynamic ORT
+          # loading without a staged DLL) hangs dev builds on windows runners.
+          for base in "$APPDATA" "$LOCALAPPDATA"; do
+            [ -n "$base" ] || continue
+            marker_dir="$base/1up/models/all-MiniLM-L6-v2"
+            mkdir -p "$marker_dir"
+            printf 'ci-fts-only' > "$marker_dir/.download_failed"
+          done
+
           smoke_dir=$(mktemp -d)
           mkdir -p "$smoke_dir/.git" "$smoke_dir/src"
           printf 'pub fn windows_smoke_marker() -> u32 {\n    42\n}\n' \
