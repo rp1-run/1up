@@ -118,13 +118,13 @@ while IFS=$'\t' read -r target archive expected_sha; do
   archive_path="$ASSETS_DIR/$archive"
   require_file "$archive_path"
 
-  checksum_entry=$(awk -v asset="$archive" '$2 == asset { print $1; exit }' "$CHECKSUMS_PATH")
+  checksum_entry=$(awk -v asset="$archive" '{ sub(/\r$/, "") } $2 == asset { print $1; exit }' "$CHECKSUMS_PATH")
   if [[ -z "$checksum_entry" ]]; then
     fail "SHA256SUMS is missing an entry for ${archive}"
   fi
 
   if [[ "$checksum_entry" != "$expected_sha" ]]; then
-    fail "release manifest checksum for ${archive} does not match SHA256SUMS"
+    fail "release manifest checksum for ${archive} (manifest: ${expected_sha}) does not match SHA256SUMS (checksums: ${checksum_entry})"
   fi
 
   actual_sha=$(sha256_file "$archive_path")
@@ -193,7 +193,7 @@ while IFS=$'\t' read -r target archive expected_sha; do
       mcp_smoke_test: $mcp_smoke[0]
     }' \
     >>"$ARCHIVES_JSONL"
-done < <(jq -r '.artifacts[] | [.target, .archive, .sha256] | @tsv' "$MANIFEST_PATH")
+done < <(jq -r '.artifacts[] | [.target, .archive, .sha256] | @tsv' "$MANIFEST_PATH" | tr -d '\r')
 
 if [[ "$selected_count" -eq 0 ]]; then
   fail "no release artifacts matched the requested target filters"
