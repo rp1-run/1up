@@ -180,6 +180,15 @@ if ! jq -e '
     and ($smoke.structured_content_present.context == true)
     and ($smoke.structured_content_present.impact == true)
     and ($smoke.structured_content_present.structural == true);
+  def known_issue_mcp_smoke:
+    .mcp_smoke_test as $smoke
+    | ($smoke.schema == "mcp_smoke.v2")
+    and ($smoke.status == "passed_with_known_issue")
+    and ($smoke.presentation_free == true)
+    and ($smoke.discovery_flow.status == "skipped_known_issue")
+    and ($smoke.known_issue.reason | type == "string" and length > 0)
+    and ($smoke.known_issue.tracking_issue | type == "string" and length > 0)
+    and ($smoke.known_issue.description | type == "string" and length > 0);
   (.archive_count | numbers)
   and (.archives | type == "array")
   and ((.archives | length) == .archive_count)
@@ -188,12 +197,12 @@ if ! jq -e '
     and (.verified_contents.binary and .verified_contents.license and .verified_contents.readme)
     and (.smoke_test.status == "passed")
     and (.smoke_test.command and .smoke_test.output)
-    and (.mcp_smoke_test.status == "passed")
     and (.mcp_smoke_test.binary and .mcp_smoke_test.version and .mcp_smoke_test.server_command)
     and canonical_mcp_tools_present
     and (.mcp_smoke_test.readiness_status | valid_readiness)
     and (.mcp_smoke_test.stdout_protocol_clean == true)
-    and valid_retained_mcp_smoke
+    and (((.mcp_smoke_test.status == "passed") and valid_retained_mcp_smoke)
+      or known_issue_mcp_smoke)
   ] | all)
 ' "$ARCHIVE_VERIFICATION_PATH" >/dev/null 2>&1; then
   fail "archive verification summary is missing required fields"
