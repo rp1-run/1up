@@ -142,7 +142,7 @@ jobs:
 
       - name: unit tests for windows path handling
         shell: bash
-        run: cargo test --locked --lib -- shared::fs:: shared::project::
+        run: 'cargo test --locked --lib -- shared::fs:: shared::project::'
 
       - name: functional index and status smoke
         shell: bash
