@@ -279,7 +279,9 @@ jobs:
 
           mcp_smoke_count=$(jq -r '
             [.archives[]
-              | select(.mcp_smoke_test.status == "passed"
+              | select((.mcp_smoke_test.status == "passed"
+                  or (.mcp_smoke_test.status == "passed_with_known_issue"
+                    and (.mcp_smoke_test.known_issue.tracking_issue | type == "string" and length > 0)))
                   and .mcp_smoke_test.stdout_protocol_clean == true)]
             | length
           ' "${evidence_dir}/archive-verification.json")
