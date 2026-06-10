@@ -201,6 +201,19 @@ def isolated_child_env():
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("release-smoke-fts-only", encoding="utf-8")
 
+    # On windows the binary resolves its data dir through the Known Folder
+    # API, which ignores the env overrides below, so the marker must live in
+    # the runner's real profile. Gate on CI to avoid degrading a developer's
+    # real 1up state.
+    if sys.platform == "win32" and os.environ.get("GITHUB_ACTIONS") == "true":
+        for env_name in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(env_name)
+            if not base:
+                continue
+            marker = Path(base) / "1up" / "models" / "all-MiniLM-L6-v2" / ".download_failed"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("release-smoke-fts-only", encoding="utf-8")
+
     env["HOME"] = str(smoke_home)
     env["XDG_DATA_HOME"] = str(xdg_data)
     env["LOCALAPPDATA"] = str(local_app_data)
