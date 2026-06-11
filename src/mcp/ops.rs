@@ -12,6 +12,7 @@ use crate::indexer::pipeline;
 use crate::mcp::types::StartMode;
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
+use crate::search::overview;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
@@ -214,6 +215,70 @@ pub struct ContextRecord {
     pub content: String,
     pub line_start: usize,
     pub line_end: usize,
+}
+
+/// Orientation digest payload for `oneup_overview`. Section sizes are bounded
+/// by the engine caps documented in `crate::search::overview`, which keep the
+/// serialized payload within the documented budget (REQ-008).
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewPayload {
+    pub status: OperationStatus,
+    pub stats: OverviewStats,
+    pub top_symbols: Vec<OverviewTopSymbol>,
+    pub modules: Vec<OverviewModule>,
+    pub module_dependencies: Vec<OverviewModuleDependency>,
+    pub entry_points: Vec<OverviewEntryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewStats {
+    pub indexed_files: u64,
+    pub total_segments: u64,
+    pub languages: Vec<OverviewLanguage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewLanguage {
+    pub language: String,
+    pub files: u64,
+    pub segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewTopSymbol {
+    pub name: String,
+    pub handle: String,
+    pub path: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub referencing_files: u64,
+    pub definition_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewModule {
+    pub module: String,
+    pub segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewModuleDependency {
+    pub source: String,
+    pub target: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewEntryPoint {
+    pub handle: String,
+    pub path: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breadcrumb: Option<String>,
 }
 
 struct CurrentIndex {
@@ -678,6 +743,23 @@ async fn search_structural_once(
     Ok(engine.search_report(pattern, language_filter).await?)
 }
 
+pub async fn compute_overview(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+) -> anyhow::Result<OverviewPayload> {
+    retry_on_db_lock(|| async { compute_overview_once(state_root, worktree_context).await }).await
+}
+
+async fn compute_overview_once(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+) -> anyhow::Result<OverviewPayload> {
+    let current = open_current_index(state_root).await?;
+    let engine = overview::OverviewEngine::new(&current.conn);
+    let digest = engine.compute(&worktree_context.context_id).await?;
+    Ok(overview_payload(digest))
+}
+
 async fn retry_on_db_lock<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
@@ -1016,6 +1098,93 @@ fn symbol_record(result: SymbolResult) -> SymbolRecord {
         line_start: result.line_start,
         line_end: result.line_end,
         breadcrumb: result.breadcrumb,
+    }
+}
+
+fn overview_payload(digest: overview::RepositoryOverview) -> OverviewPayload {
+    // A ready index with zero segments is a valid empty digest, not an
+    // error (REQ-010); missing/unready indexes fail in open_current_index.
+    let status = if digest.stats.total_segments == 0 {
+        OperationStatus::Empty
+    } else {
+        OperationStatus::Ok
+    };
+
+    OverviewPayload {
+        status,
+        stats: OverviewStats {
+            indexed_files: digest.stats.indexed_files,
+            total_segments: digest.stats.total_segments,
+            languages: digest
+                .stats
+                .languages
+                .into_iter()
+                .map(overview_language)
+                .collect(),
+        },
+        top_symbols: digest
+            .top_symbols
+            .into_iter()
+            .map(overview_top_symbol)
+            .collect(),
+        modules: digest.modules.into_iter().map(overview_module).collect(),
+        module_dependencies: digest
+            .module_dependencies
+            .into_iter()
+            .map(overview_module_dependency)
+            .collect(),
+        entry_points: digest
+            .entry_points
+            .into_iter()
+            .map(overview_entry_point)
+            .collect(),
+    }
+}
+
+fn overview_language(stat: overview::LanguageBreakdown) -> OverviewLanguage {
+    OverviewLanguage {
+        language: stat.language,
+        files: stat.files,
+        segments: stat.segments,
+    }
+}
+
+fn overview_top_symbol(entry: overview::TopSymbolEntry) -> OverviewTopSymbol {
+    OverviewTopSymbol {
+        name: entry.name,
+        handle: entry.handle,
+        path: entry.path,
+        line_start: usize_from_i64(entry.line_start),
+        line_end: usize_from_i64(entry.line_end),
+        referencing_files: entry.referencing_files,
+        definition_count: entry.definition_count,
+    }
+}
+
+fn overview_module(entry: overview::ModuleEntry) -> OverviewModule {
+    OverviewModule {
+        module: entry.module,
+        segments: entry.segments,
+    }
+}
+
+fn overview_module_dependency(entry: overview::ModuleDependencyEntry) -> OverviewModuleDependency {
+    OverviewModuleDependency {
+        source: entry.source,
+        target: entry.target,
+        count: entry.count,
+    }
+}
+
+fn overview_entry_point(entry: overview::EntryPointEntry) -> OverviewEntryPoint {
+    OverviewEntryPoint {
+        handle: entry.handle,
+        path: entry.path,
+        line_start: usize_from_i64(entry.line_start),
+        line_end: usize_from_i64(entry.line_end),
+        role: entry.role,
+        symbol: entry.symbol,
+        breadcrumb: entry.breadcrumb,
     }
 }
 
