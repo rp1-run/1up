@@ -2143,7 +2143,7 @@ fn out_of_scope_anchor_refusal(
     ))
 }
 
-fn is_test_path(file_path: &str) -> bool {
+pub(crate) fn is_test_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
     path_in_dir(&lower, "tests")
         || path_in_dir(&lower, "test")
@@ -2182,7 +2182,7 @@ fn has_test_context_token(value: &str) -> bool {
         .any(|token| matches!(token.as_str(), "test" | "tests" | "spec" | "specs"))
 }
 
-fn is_low_signal_path(file_path: &str) -> bool {
+pub(crate) fn is_low_signal_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
     is_test_path(file_path)
         || path_in_dir(&lower, "evals")

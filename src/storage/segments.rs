@@ -922,7 +922,6 @@ pub async fn count_files_for_context(
 
 /// Per-language file and segment counts inside one index context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct LanguageStat {
     pub language: String,
     pub files: u64,
@@ -931,7 +930,6 @@ pub struct LanguageStat {
 
 /// Per-module segment count aggregated from segment file paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ModuleSegmentCount {
     pub module: String,
     pub segments: u64,
@@ -940,7 +938,6 @@ pub struct ModuleSegmentCount {
 /// A shallow orchestration/definition segment that may serve as an overview
 /// entry point. Test/low-signal path exclusion happens in the overview engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct EntryPointCandidate {
     pub segment_id: String,
     pub file_path: String,
@@ -953,7 +950,6 @@ pub struct EntryPointCandidate {
 
 /// A qualifying type definition row resolved for an overview symbol key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct QualifyingTypeDefinition {
     pub symbol_key: String,
     pub symbol: String,
@@ -966,7 +962,6 @@ pub struct QualifyingTypeDefinition {
 
 /// Per-language file and segment counts for one index context, ordered by
 /// segment count descending then language ascending.
-#[allow(dead_code)]
 pub async fn get_language_stats_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1041,7 +1036,6 @@ async fn fetch_module_segment_counts(
 
 /// Depth-1 module segment counts for one index context. The module key is the
 /// first path component; top-level files map to `(root)`.
-#[allow(dead_code)]
 pub async fn get_module_segment_counts_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1063,7 +1057,6 @@ pub async fn get_module_segment_counts_for_context(
 /// Depth-2 segment counts under one depth-1 module for the dominant-module
 /// expansion. Files directly inside the parent stay attributed to the parent
 /// module name.
-#[allow(dead_code)]
 pub async fn get_module_child_segment_counts_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1086,7 +1079,6 @@ pub async fn get_module_child_segment_counts_for_context(
 /// Shallow orchestration/definition entry-point candidates for one index
 /// context, ordered by path depth, role rank (orchestration first), path,
 /// then line start.
-#[allow(dead_code)]
 pub async fn get_entry_point_candidates_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1142,7 +1134,6 @@ pub async fn get_entry_point_candidates_for_context(
 /// Resolve qualifying type definitions for the requested overview symbol
 /// keys inside one index context, ordered by symbol key, file path, line
 /// start, then segment id.
-#[allow(dead_code)]
 pub async fn get_qualifying_type_definitions_for_context(
     conn: &Connection,
     context_id: &str,
