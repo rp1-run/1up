@@ -142,6 +142,7 @@ fn refresh_progress(
 
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
+use crate::indexer::markdown;
 use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
@@ -641,7 +642,16 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
         return ParseResultKind::Skipped(ParseSkipReason::Unchanged);
     }
 
-    let segments = if parser::use_structural_parser(&scanned_file.extension) {
+    let segments = if matches!(
+        parser::SupportedLanguage::from_extension(&scanned_file.extension),
+        Some(parser::SupportedLanguage::Markdown)
+    ) {
+        let file_stem = Path::new(&scanned_file.relative_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        markdown::parse_markdown_file(&content, file_stem)
+    } else if parser::use_structural_parser(&scanned_file.extension) {
         match parser::parse_file(&content, &scanned_file.extension) {
             Ok(segments) => segments,
             Err(err) => {
@@ -1759,6 +1769,42 @@ mod tests {
 
         let count = segments::count_segments(&conn).await.unwrap();
         assert!(count > 0);
+    }
+
+    #[test]
+    fn parse_scanned_file_routes_markdown_to_doc_segmenter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("README.md");
+        fs::write(&path, "# Title\n\nintro\n\n## Install\n\nsteps\n").unwrap();
+
+        let outcome = parse_scanned_file(ScannedWorkItem {
+            sequence_id: 0,
+            relative_path: "README.md".to_string(),
+            path,
+            extension: "md".to_string(),
+            stored_hash: None,
+            file_size: 0,
+            modified_ns: 0,
+        });
+
+        let parsed = match outcome {
+            ParseResultKind::Ready(parsed) => parsed,
+            other => panic!("expected ready parse outcome, got {other:?}"),
+        };
+        assert!(!parsed.segments.is_empty());
+        assert!(parsed
+            .segments
+            .iter()
+            .all(|segment| segment.block_type == markdown::DOC_SECTION_BLOCK_TYPE));
+        let breadcrumbs: Vec<_> = parsed
+            .segments
+            .iter()
+            .map(|segment| segment.breadcrumb.as_deref())
+            .collect();
+        assert!(
+            breadcrumbs.contains(&Some("README > Title > Install")),
+            "expected file-stem-rooted heading breadcrumb; found {breadcrumbs:?}"
+        );
     }
 
     #[tokio::test]

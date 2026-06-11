@@ -6,7 +6,6 @@ use crate::shared::symbols::EDGE_IDENTITY_DOC_MENTION;
 use crate::shared::types::{ParsedRelation, ParsedSegment, SegmentRole};
 
 /// Block type for heading-scoped markdown documentation segments.
-#[allow(dead_code)]
 pub const DOC_SECTION_BLOCK_TYPE: &str = "doc_section";
 
 /// Per-segment cap on unique doc-to-code mentions; dedupe happens first, so
@@ -42,7 +41,6 @@ struct Mention {
 /// mechanism with the section breadcrumb preserved on every piece. If the
 /// tree-sitter parse fails, falls back to plain doc chunks so coverage is
 /// never lost.
-#[allow(dead_code)]
 pub fn parse_markdown_file(content: &str, file_stem: &str) -> Vec<ParsedSegment> {
     if content.is_empty() {
         return Vec::new();

@@ -382,7 +382,9 @@ impl SupportedLanguage {
     /// Whether this language has meaningful structural segments (functions,
     /// classes, rules) that benefit from tree-sitter segmentation. Data/config
     /// formats like JSON, YAML, TOML produce too many fine-grained segments
-    /// and are better served by the text chunker.
+    /// and are better served by the text chunker. Markdown stays `false` here
+    /// because the indexing pipeline routes it to the dedicated heading-scoped
+    /// doc segmenter in `crate::indexer::markdown`, not through `parse_file`.
     pub fn has_structural_segments(&self) -> bool {
         match self {
             Self::Rust
