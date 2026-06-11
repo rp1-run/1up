@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::shared::constants::DEFAULT_INDEX_CONTEXT_ID;
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::symbols::{normalize_symbolish, EDGE_IDENTITY_BARE_IDENTIFIER};
-use crate::shared::types::{ParsedRelation, ReferenceKind, SegmentRole};
+use crate::shared::types::{ParsedRelation, ReferenceKind, SegmentRole, WorktreeContext};
 use crate::storage::queries;
 use crate::storage::relations::{self, RelationInsert};
 
@@ -822,6 +822,71 @@ pub async fn delete_meta(conn: &Connection, key: &str) -> Result<(), OneupError>
         .await
         .map_err(|e| StorageError::Query(format!("delete meta failed: {e}")))?;
     Ok(())
+}
+
+/// Record the worktree context row for an index run, including the repository
+/// head commit OID the context was indexed at (`head_oid`). Replaces any
+/// previously recorded row for the same `context_id`.
+pub async fn upsert_worktree_context(
+    conn: &Connection,
+    context: &WorktreeContext,
+    project_id: &str,
+) -> Result<(), OneupError> {
+    validate_context_id(&context.context_id)?;
+    conn.execute(
+        queries::UPSERT_WORKTREE_CONTEXT,
+        libsql::params![
+            context.context_id.clone(),
+            project_id.to_string(),
+            context.state_root.to_string_lossy().into_owned(),
+            context.source_root.to_string_lossy().into_owned(),
+            context.main_worktree_root.to_string_lossy().into_owned(),
+            context.worktree_role.as_str(),
+            context.branch_name.clone(),
+            context.branch_ref.clone(),
+            context.branch_status.as_str(),
+            context.head_oid.clone(),
+            context
+                .git_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            context
+                .common_git_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        ],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("upsert worktree context failed: {e}")))?;
+    Ok(())
+}
+
+/// Read the head commit OID recorded for a context by its last successful
+/// index run. Returns `None` when the context has never been recorded or was
+/// indexed without a known repository HEAD.
+pub async fn get_worktree_context_head_oid(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<Option<String>, OneupError> {
+    validate_context_id(context_id)?;
+    let mut rows = conn
+        .query(queries::SELECT_WORKTREE_CONTEXT_HEAD_OID, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("query worktree context head failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => {
+            let head_oid: Option<String> = row.get(0).map_err(|e| {
+                StorageError::Query(format!("read worktree context head failed: {e}"))
+            })?;
+            Ok(head_oid)
+        }
+        None => Ok(None),
+    }
 }
 
 /// Count total number of segments in the database.
@@ -1940,13 +2005,81 @@ pub async fn delete_indexed_file_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::types::{BranchStatus, WorktreeRole};
     use crate::storage::{db::Db, schema};
+    use std::path::PathBuf;
 
     async fn setup() -> (Db, Connection) {
         let db = Db::open_memory().await.unwrap();
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
         (db, conn)
+    }
+
+    fn test_worktree_context_row(context_id: &str, head_oid: Option<&str>) -> WorktreeContext {
+        WorktreeContext {
+            context_id: context_id.to_string(),
+            state_root: PathBuf::from("/tmp/state"),
+            source_root: PathBuf::from("/tmp/source"),
+            main_worktree_root: PathBuf::from("/tmp/state"),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: head_oid.map(str::to_string),
+            branch_status: BranchStatus::Named,
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_context_head_oid_write_read_roundtrip() {
+        let (_db, conn) = setup().await;
+
+        assert_eq!(
+            get_worktree_context_head_oid(&conn, "ctx-a").await.unwrap(),
+            None,
+            "unrecorded context must read back as None"
+        );
+
+        upsert_worktree_context(
+            &conn,
+            &test_worktree_context_row("ctx-a", Some("aaa111")),
+            "proj-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_worktree_context_head_oid(&conn, "ctx-a").await.unwrap(),
+            Some("aaa111".to_string())
+        );
+
+        upsert_worktree_context(
+            &conn,
+            &test_worktree_context_row("ctx-a", Some("bbb222")),
+            "proj-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_worktree_context_head_oid(&conn, "ctx-a").await.unwrap(),
+            Some("bbb222".to_string()),
+            "re-recording the same context must replace the head OID"
+        );
+
+        upsert_worktree_context(&conn, &test_worktree_context_row("ctx-b", None), "proj-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_worktree_context_head_oid(&conn, "ctx-b").await.unwrap(),
+            None,
+            "a context indexed without a known HEAD must read back as None"
+        );
+        assert_eq!(
+            get_worktree_context_head_oid(&conn, "ctx-a").await.unwrap(),
+            Some("bbb222".to_string()),
+            "contexts must stay isolated by context_id"
+        );
     }
 
     fn test_segment(id: &str, file_path: &str, file_hash: &str) -> SegmentInsert {

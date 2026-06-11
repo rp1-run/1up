@@ -2296,6 +2296,11 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     assert_eq!(degraded_envelope["status"], "degraded");
     assert_eq!(degraded_envelope["data"]["index_readable"], true);
     assert!(
+        degraded_envelope["data"].get("drifted").is_none()
+            && degraded_envelope["data"].get("indexed_at_head").is_none(),
+        "a repository indexed without a known HEAD must not report drift fields: {degraded_envelope:?}"
+    );
+    assert!(
         degraded_envelope["next_actions"]
             .as_array()
             .unwrap()
@@ -2303,6 +2308,117 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
             .any(|action| action["tool"] == "oneup_search"),
         "degraded readiness should still allow search as a next action"
     );
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git command failed to spawn");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_head_oid(dir: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse failed to spawn");
+    assert!(
+        output.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn mcp_status_reports_head_drift_and_start_clears_it() {
+    let repo = create_multi_lang_fixture();
+    git_in(repo.path(), &["init"]);
+    git_in(
+        repo.path(),
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git_in(repo.path(), &["config", "user.name", "1up Test"]);
+    git_in(repo.path(), &["add", "."]);
+    git_in(repo.path(), &["commit", "-m", "initial"]);
+    let indexed_head = git_head_oid(repo.path());
+
+    let _guard = init_and_index_fts_only(&repo);
+
+    // The MCP server is configured for a neutral project and the fixture repo
+    // is addressed per call via `path`, so no daemon ever registers or
+    // reconciles the repo and the drift observations cannot race a refresh.
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let repo_path = repo.path().to_str().unwrap();
+
+    let fresh_result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let fresh = mcp_structured(&fresh_result);
+    assert_mcp_response_is_presentation_free(&fresh_result);
+    assert_eq!(fresh["data"]["index_readable"], true);
+    assert_eq!(fresh["data"]["drifted"], false);
+    assert_eq!(fresh["data"]["indexed_at_head"], indexed_head.as_str());
+    assert_eq!(fresh["data"]["current_head"], indexed_head.as_str());
+    assert!(
+        !fresh["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["arguments"]["mode"] == "index_if_needed"),
+        "non-drifted readiness must not suggest an index_if_needed start: {fresh:?}"
+    );
+    assert_mcp_next_actions_are_canonical(fresh);
+
+    fs::write(
+        repo.path().join("drift.rs"),
+        "pub fn head_drift_marker() {}\n",
+    )
+    .unwrap();
+    git_in(repo.path(), &["add", "."]);
+    git_in(repo.path(), &["commit", "-m", "move head"]);
+    let moved_head = git_head_oid(repo.path());
+    assert_ne!(indexed_head, moved_head);
+
+    let drifted_result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let drifted = mcp_structured(&drifted_result);
+    assert_mcp_response_is_presentation_free(&drifted_result);
+    assert_eq!(drifted["data"]["drifted"], true);
+    assert_eq!(drifted["data"]["indexed_at_head"], indexed_head.as_str());
+    assert_eq!(drifted["data"]["current_head"], moved_head.as_str());
+    let drift_actions = drifted["next_actions"].as_array().unwrap();
+    assert!(
+        drift_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_START
+                && action["arguments"]["mode"] == "index_if_needed"),
+        "drifted readiness must suggest oneup_start with index_if_needed: {drifted:?}"
+    );
+    assert!(
+        drift_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_SEARCH),
+        "the drift advisory must keep the existing readiness actions: {drifted:?}"
+    );
+    assert_mcp_next_actions_are_canonical(drifted);
+
+    let start_result = client.call_tool(
+        TOOL_START,
+        serde_json::json!({ "path": repo_path, "mode": "index_if_needed" }),
+    );
+    let started = mcp_structured(&start_result);
+    assert_mcp_response_is_presentation_free(&start_result);
+    assert_eq!(started["data"]["drifted"], false);
+    assert_eq!(started["data"]["indexed_at_head"], moved_head.as_str());
+    assert_eq!(started["data"]["current_head"], moved_head.as_str());
+    assert_mcp_next_actions_are_canonical(started);
 }
 
 #[test]

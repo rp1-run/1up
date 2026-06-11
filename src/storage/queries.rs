@@ -854,6 +854,18 @@ INSERT OR REPLACE INTO indexed_files (
 pub const DELETE_INDEXED_FILE: &str =
     "DELETE FROM indexed_files WHERE context_id = ?1 AND file_path = ?2";
 
+pub const UPSERT_WORKTREE_CONTEXT: &str = "
+INSERT OR REPLACE INTO worktree_contexts (
+    context_id, project_id, state_root, source_root, main_worktree_root,
+    worktree_role, branch_name, branch_ref, branch_status, head_oid,
+    git_dir, common_git_dir, updated_at
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now')
+)";
+
+pub const SELECT_WORKTREE_CONTEXT_HEAD_OID: &str =
+    "SELECT head_oid FROM worktree_contexts WHERE context_id = ?1";
+
 /// Maximum number of SQL parameters per statement to stay below SQLite limits.
 pub const SQLITE_MAX_PARAMS: usize = 999;
 

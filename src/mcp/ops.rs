@@ -27,7 +27,8 @@ use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
-    get_segment_by_prefix_for_context, SegmentPrefixLookup, StoredSegment,
+    get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
+    StoredSegment,
 };
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -74,6 +75,12 @@ pub struct ReadinessPayload {
     pub indexed_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_segments: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_at_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drifted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,17 +317,22 @@ pub async fn start(roots: &McpProjectRoots, mode: StartMode) -> anyhow::Result<R
         StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
             run_index_then_classify(roots, false).await
         }
-        StartMode::IndexIfNeeded
-            if matches!(
-                readiness.status,
-                ReadinessStatus::Missing | ReadinessStatus::Degraded
-            ) =>
-        {
+        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => {
             run_index_then_classify(roots, false).await
         }
         StartMode::Reindex => run_index_then_classify(roots, true).await,
         _ => Ok(readiness),
     }
+}
+
+/// `index_if_needed` indexes when no usable index exists, when the index is
+/// degraded, or when the recorded indexed-at HEAD drifted from the live
+/// repository HEAD, so the drift advisory in `oneup_status` is self-serve.
+fn index_if_needed_applies(readiness: &ReadinessPayload) -> bool {
+    matches!(
+        readiness.status,
+        ReadinessStatus::Missing | ReadinessStatus::Degraded
+    ) || readiness.drifted == Some(true)
 }
 
 pub async fn classify_readiness(
@@ -362,6 +374,9 @@ pub async fn classify_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: None,
         index_progress,
         daemon_status,
@@ -451,6 +466,16 @@ pub async fn classify_readiness(
         .await
         .ok();
 
+    let recorded_head = get_worktree_context_head_oid(&conn, &worktree_context.context_id)
+        .await
+        .ok()
+        .flatten();
+    apply_head_drift(
+        &mut payload,
+        recorded_head,
+        worktree_context.head_oid.clone(),
+    );
+
     if payload.total_segments.unwrap_or(0) == 0 {
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
@@ -485,6 +510,23 @@ pub async fn classify_readiness(
     payload
 }
 
+/// Populate the advisory head-drift fields from the head OID recorded at the
+/// last successful index run and the live repository HEAD. The fields are
+/// emitted only when both sides are known; otherwise all three stay absent.
+/// Drift never changes the readiness status itself.
+fn apply_head_drift(
+    payload: &mut ReadinessPayload,
+    recorded_head: Option<String>,
+    current_head: Option<String>,
+) {
+    let (Some(recorded), Some(current)) = (recorded_head, current_head) else {
+        return;
+    };
+    payload.drifted = Some(recorded != current);
+    payload.indexed_at_head = Some(recorded);
+    payload.current_head = Some(current);
+}
+
 pub fn blocked_readiness(
     state_root: &Path,
     source_root: &Path,
@@ -509,6 +551,9 @@ pub fn blocked_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: Some(reason.into()),
         index_progress,
         daemon_status,
@@ -528,6 +573,9 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: Some(reason.into()),
         index_progress: None,
         daemon_status: None,
@@ -1308,6 +1356,79 @@ mod tests {
     use crate::shared::types::{BranchStatus, StructuralSearchStatus, WorktreeRole};
     use crate::storage::segments::{self, SegmentInsert};
     use std::fs;
+
+    fn readiness_fixture() -> ReadinessPayload {
+        blocked_readiness_for_path("repo", "fixture")
+    }
+
+    #[test]
+    fn head_drift_is_false_when_recorded_matches_current() {
+        let mut payload = readiness_fixture();
+
+        apply_head_drift(
+            &mut payload,
+            Some("abc123".to_string()),
+            Some("abc123".to_string()),
+        );
+
+        assert_eq!(payload.drifted, Some(false));
+        assert_eq!(payload.indexed_at_head.as_deref(), Some("abc123"));
+        assert_eq!(payload.current_head.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn head_drift_is_true_with_both_heads_when_oids_differ() {
+        let mut payload = readiness_fixture();
+
+        apply_head_drift(
+            &mut payload,
+            Some("abc123".to_string()),
+            Some("def456".to_string()),
+        );
+
+        assert_eq!(payload.drifted, Some(true));
+        assert_eq!(payload.indexed_at_head.as_deref(), Some("abc123"));
+        assert_eq!(payload.current_head.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn head_drift_fields_stay_absent_when_either_head_is_missing() {
+        let mut payload = readiness_fixture();
+        apply_head_drift(&mut payload, None, Some("def456".to_string()));
+        assert_eq!(payload.drifted, None);
+        assert_eq!(payload.indexed_at_head, None);
+        assert_eq!(payload.current_head, None);
+
+        let mut payload = readiness_fixture();
+        apply_head_drift(&mut payload, Some("abc123".to_string()), None);
+        assert_eq!(payload.drifted, None);
+        assert_eq!(payload.indexed_at_head, None);
+        assert_eq!(payload.current_head, None);
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("drifted").is_none());
+        assert!(value.get("indexed_at_head").is_none());
+        assert!(value.get("current_head").is_none());
+    }
+
+    #[test]
+    fn index_if_needed_triggers_on_drift_but_not_on_clean_ready() {
+        let mut readiness = readiness_fixture();
+        readiness.status = ReadinessStatus::Ready;
+        assert!(!index_if_needed_applies(&readiness));
+
+        readiness.drifted = Some(true);
+        assert!(index_if_needed_applies(&readiness));
+
+        readiness.drifted = Some(false);
+        assert!(!index_if_needed_applies(&readiness));
+
+        readiness.status = ReadinessStatus::Missing;
+        assert!(index_if_needed_applies(&readiness));
+
+        readiness.status = ReadinessStatus::Degraded;
+        assert!(index_if_needed_applies(&readiness));
+    }
 
     #[test]
     fn read_context_locations_rejects_parent_escape() {

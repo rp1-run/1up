@@ -554,7 +554,7 @@ fn readiness_context_metadata(
 }
 
 fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
-    match payload.status {
+    let mut actions = match payload.status {
         ReadinessStatus::Ready => vec![action(
             TOOL_SEARCH,
             "Start discovery with a task-specific code search.",
@@ -592,7 +592,17 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
             "Retry readiness after correcting the local repository path or project state.",
             json!({}),
         )],
+    };
+
+    if payload.drifted == Some(true) {
+        actions.push(action(
+            TOOL_START,
+            "The repository HEAD moved after the last index; refresh the index to pick up the changes.",
+            json!({ "mode": "index_if_needed" }),
+        ));
     }
+
+    actions
 }
 
 fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
@@ -1215,6 +1225,26 @@ mod tests {
             limit: None,
             path: None,
         }
+    }
+
+    #[test]
+    fn readiness_next_actions_append_index_if_needed_start_when_drifted() {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Ready;
+
+        let clean_actions = readiness_next_actions(&payload);
+        assert!(
+            !clean_actions.iter().any(|action| action.tool == TOOL_START),
+            "non-drifted ready payload must not suggest a start action"
+        );
+
+        payload.drifted = Some(true);
+        let drift_actions = readiness_next_actions(&payload);
+        assert_eq!(drift_actions.len(), clean_actions.len() + 1);
+        let appended = drift_actions.last().unwrap();
+        assert_eq!(appended.tool, TOOL_START);
+        assert_eq!(appended.arguments["mode"], "index_if_needed");
+        assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
     }
 
     #[test]

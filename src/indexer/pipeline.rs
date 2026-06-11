@@ -6,7 +6,7 @@ use std::time::Instant;
 use libsql::Connection;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
     config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME)
@@ -1244,7 +1244,7 @@ pub async fn run_with_context_scope_setup_and_progress_root(
     daemon_fallback_reason: Option<String>,
     progress_root: Option<&Path>,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_index_context_scope_setup_and_progress_root(
+    let stats = run_with_index_context_scope_setup_and_progress_root(
         conn,
         &context.source_root,
         embedder,
@@ -1257,7 +1257,27 @@ pub async fn run_with_context_scope_setup_and_progress_root(
         progress_root,
         IndexRunContext::from_worktree(context),
     )
-    .await
+    .await?;
+
+    record_indexed_head(conn, context).await;
+
+    Ok(stats)
+}
+
+/// Persist the worktree context row, including the repository head commit OID
+/// this run indexed at, so readiness checks can compare it against the live
+/// repository HEAD. Recording failure is logged instead of failing the run:
+/// the index data is already committed and the recorded head is advisory
+/// freshness metadata.
+async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
+    let project_id =
+        crate::shared::project::read_project_id(&context.state_root).unwrap_or_default();
+    if let Err(err) = segments::upsert_worktree_context(conn, context, &project_id).await {
+        warn!(
+            "failed to record indexed head for context {}: {err}",
+            context.context_id
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1681,6 +1701,64 @@ mod tests {
             head_oid: Some(format!("{branch_name:0>40}")),
             branch_status: BranchStatus::Named,
         }
+    }
+
+    #[tokio::test]
+    async fn successful_context_run_records_indexed_head_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-head", "main");
+
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            segments::get_worktree_context_head_oid(&conn, "ctx-head")
+                .await
+                .unwrap(),
+            context.head_oid,
+            "a successful run must record the head OID it indexed at"
+        );
+
+        let mut moved = context.clone();
+        moved.head_oid = Some("f".repeat(40));
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &moved,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            segments::get_worktree_context_head_oid(&conn, "ctx-head")
+                .await
+                .unwrap(),
+            moved.head_oid,
+            "a later run must replace the recorded head OID"
+        );
     }
 
     async fn count_context_file_segments(
