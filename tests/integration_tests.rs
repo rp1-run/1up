@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use oneup::mcp::types::{
-    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START,
-    TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
+    TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use oneup::storage::{
     db::Db,
@@ -423,6 +423,73 @@ fn seed_current_index_for_context(project: &Path, context_id: &str) {
             &conn,
             context_id,
             "src/other.rs",
+            &[segment],
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// Creates a current-schema index with no rows at all: the ready-but-empty
+/// state REQ-010 distinguishes from a missing/unready index.
+fn seed_ready_empty_index(project: &Path) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("project_id"),
+        "overview-empty-project",
+    )
+    .unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+    });
+}
+
+/// Inserts leak-sensitive rows for a foreign worktree context into an
+/// existing current-schema index: a distinctive language, top-level module,
+/// DEFINITION-role struct segment, and defined symbol that would surface in
+/// digest statistics, modules, entry points, or symbols if context scoping
+/// broke.
+fn seed_foreign_context_overview_rows(project: &Path, context_id: &str) {
+    block_on(async {
+        let db = Db::open_rw(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let segment = SegmentInsert {
+            id: format!("{context_id}-overview-leak"),
+            file_path: "foreignctx/leak.go".to_string(),
+            language: "go".to_string(),
+            block_type: "struct".to_string(),
+            content: "type ForeignLeakWidget struct {\n\tValue int\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"ForeignLeakWidget\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "foreign-overview-hash".to_string(),
+        };
+        let meta = IndexedFileMeta {
+            extension: "go".to_string(),
+            file_hash: segment.file_hash.clone(),
+            file_size: segment.content.len() as i64,
+            modified_ns: 1,
+        };
+        segments::replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            context_id,
+            "foreignctx/leak.go",
             &[segment],
             Some(&meta),
         )
@@ -1324,6 +1391,118 @@ pub fn boot_global_config() -> &'static str {
     tmp
 }
 
+/// Multi-directory overview fixture with fully controlled digest contents:
+/// one qualifying type (`PolicyEngine` in `src`) referenced from two `app`
+/// files plus a second language in `lib`, so statistics, top symbols, the
+/// module map, the `app -> src` dependency edge, and entry points are all
+/// exactly predictable.
+fn create_overview_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for dir in ["src", "app", "lib"] {
+        fs::create_dir_all(tmp.path().join(dir)).unwrap();
+    }
+
+    fs::write(
+        tmp.path().join("src").join("policy.rs"),
+        r#"pub struct PolicyEngine {
+    pub limit: u32,
+}
+
+impl PolicyEngine {
+    pub fn allows(&self, value: u32) -> bool {
+        value <= self.limit
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("app").join("main.rs"),
+        r#"use crate::policy::PolicyEngine;
+
+fn main() {
+    let engine = PolicyEngine { limit: 8 };
+    println!("{}", engine.allows(3));
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("app").join("wiring.rs"),
+        r#"use crate::policy::PolicyEngine;
+
+pub fn build_engine() -> PolicyEngine {
+    PolicyEngine { limit: 16 }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("lib").join("util.py"),
+        r#"def helper_limit() -> int:
+    return 8
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
+/// Cap-saturating overview fixture: 16 cross-referencing rust modules (every
+/// struct referenced from two other modules' flow files) plus a mixed-language
+/// extras module, so every digest section reaches its documented cap and the
+/// serialized payload approaches its largest realistic size.
+fn create_overview_budget_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+
+    for index in 0..16usize {
+        let module = tmp.path().join(format!("module{index:02}"));
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("types.rs"),
+            format!("pub struct DigestWidget{index:02} {{\n    pub value: u64,\n}}\n"),
+        )
+        .unwrap();
+
+        let first = (index + 1) % 16;
+        let second = (index + 2) % 16;
+        fs::write(
+            module.join("flow.rs"),
+            format!(
+                "use crate::module{first:02}::types::DigestWidget{first:02};\n\
+                 use crate::module{second:02}::types::DigestWidget{second:02};\n\n\
+                 pub fn flow{index:02}(first: &DigestWidget{first:02}, second: &DigestWidget{second:02}) -> u64 {{\n    \
+                 first.value + second.value\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let extras = tmp.path().join("extras");
+    fs::create_dir_all(&extras).unwrap();
+    fs::write(
+        extras.join("util.py"),
+        "def budget_helper():\n    return 1\n",
+    )
+    .unwrap();
+    fs::write(
+        extras.join("notes.md"),
+        "# Budget fixture\n\nOverview payload sizing notes.\n",
+    )
+    .unwrap();
+    fs::write(extras.join("config.yaml"), "budget: true\nlimit: 8192\n").unwrap();
+    fs::write(
+        extras.join("schema.sql"),
+        "CREATE TABLE budget (id TEXT PRIMARY KEY);\n",
+    )
+    .unwrap();
+
+    tmp
+}
+
 // =============================================================================
 // Indexing / storage integration
 // =============================================================================
@@ -1585,6 +1764,10 @@ fn mcp_initialize_advertises_primary_code_search_instructions() {
         "instructions should guide agents to use MCP before broad raw search: {instructions}"
     );
     assert!(
+        instructions.contains("Call oneup_overview first when starting work on an unfamiliar repository"),
+        "instructions should make orientation-first discovery via oneup_overview discoverable: {instructions}"
+    );
+    assert!(
         instructions.contains("oneup_get"),
         "instructions should teach the search/get hydration flow: {instructions}"
     );
@@ -1649,6 +1832,7 @@ fn mcp_tools_list_default_palette_and_schemas() {
         "oneup_context",
         "oneup_impact",
         "oneup_structural",
+        "oneup_overview",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -2458,6 +2642,335 @@ fn mcp_structural_returns_matches_and_explicit_diagnostics() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn mcp_overview_returns_orientation_digest_sections() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+
+    let data = &envelope["data"];
+    for section in [
+        "stats",
+        "top_symbols",
+        "modules",
+        "module_dependencies",
+        "entry_points",
+    ] {
+        assert!(
+            data.get(section).is_some(),
+            "one overview call should return the {section} section: {data:?}"
+        );
+    }
+
+    let stats = &data["stats"];
+    assert_eq!(stats["indexed_files"], 4);
+    let total_segments = stats["total_segments"].as_u64().unwrap();
+    assert!(total_segments > 0);
+    let languages = stats["languages"].as_array().unwrap();
+    let language_names = languages
+        .iter()
+        .map(|language| language["language"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(language_names, BTreeSet::from(["python", "rust"]));
+    assert_eq!(
+        languages
+            .iter()
+            .map(|language| language["files"].as_u64().unwrap())
+            .sum::<u64>(),
+        4,
+        "per-language file counts should partition the indexed files: {languages:?}"
+    );
+    assert_eq!(
+        languages
+            .iter()
+            .map(|language| language["segments"].as_u64().unwrap())
+            .sum::<u64>(),
+        total_segments,
+        "per-language segment counts should partition the indexed segments: {languages:?}"
+    );
+
+    let top_symbols = data["top_symbols"].as_array().unwrap();
+    assert_eq!(
+        top_symbols.len(),
+        1,
+        "only PolicyEngine has a qualifying type definition: {top_symbols:?}"
+    );
+    let top = &top_symbols[0];
+    assert_eq!(top["name"], "PolicyEngine");
+    assert_eq!(top["path"], "src/policy.rs");
+    assert!(
+        top["referencing_files"].as_u64().unwrap() >= 2,
+        "both app files reference PolicyEngine: {top:?}"
+    );
+    assert_eq!(top["definition_count"], 1);
+    assert!(top["line_start"].as_u64().unwrap() >= 1);
+    assert!(top["line_end"].as_u64().unwrap() >= top["line_start"].as_u64().unwrap());
+
+    let modules = data["modules"].as_array().unwrap();
+    let module_names = modules
+        .iter()
+        .map(|module| module["module"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(module_names, BTreeSet::from(["app", "lib", "src"]));
+    assert!(
+        modules
+            .iter()
+            .all(|module| module["segments"].as_u64().unwrap() > 0),
+        "every listed module should report its segment count: {modules:?}"
+    );
+
+    let dependencies = data["module_dependencies"].as_array().unwrap();
+    assert_eq!(
+        dependencies
+            .iter()
+            .map(|edge| (
+                edge["source"].as_str().unwrap(),
+                edge["target"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("app", "src")],
+        "the only cross-module reference flow is app -> src: {dependencies:?}"
+    );
+    assert_eq!(
+        dependencies[0]["count"], 2,
+        "both app files form distinct (file, symbol) dependency pairs: {dependencies:?}"
+    );
+
+    let entry_points = data["entry_points"].as_array().unwrap();
+    assert!(
+        !entry_points.is_empty(),
+        "the PolicyEngine definition should surface as an entry point"
+    );
+    for entry in entry_points {
+        assert!(
+            matches!(
+                entry["role"].as_str().unwrap(),
+                "DEFINITION" | "ORCHESTRATION"
+            ),
+            "entry points should come from the existing role classification: {entry:?}"
+        );
+        assert!(!entry["handle"].as_str().unwrap().is_empty());
+        assert!(!entry["path"].as_str().unwrap().is_empty());
+    }
+    assert!(
+        entry_points
+            .iter()
+            .any(|entry| entry["path"] == "src/policy.rs"),
+        "shallow definition segments should be listed: {entry_points:?}"
+    );
+
+    let summary = envelope["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("Indexed 4 file(s)"),
+        "summary should state headline statistics: {summary}"
+    );
+    assert!(
+        summary.contains("PolicyEngine"),
+        "summary should name the most-referenced type: {summary}"
+    );
+
+    let actions = envelope["next_actions"].as_array().unwrap();
+    let symbol_action = actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SYMBOL)
+        .expect("non-empty digest should suggest oneup_symbol on the top type");
+    assert_eq!(symbol_action["arguments"]["name"], "PolicyEngine");
+    let search_action = actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SEARCH)
+        .expect("non-empty digest should suggest oneup_search on the densest module");
+    let densest_module = modules[0]["module"].as_str().unwrap();
+    assert_eq!(
+        search_action["arguments"]["query"],
+        format!("{densest_module} module responsibilities")
+    );
+
+    let handle = top["handle"].as_str().unwrap();
+    let hydrated = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [format!(":{handle}")] }),
+    );
+    assert_ne!(hydrated["isError"], true);
+    let hydrated_envelope = mcp_structured(&hydrated);
+    assert_eq!(hydrated_envelope["data"]["records"][0]["status"], "found");
+    assert_eq!(
+        hydrated_envelope["data"]["records"][0]["segment"]["path"], "src/policy.rs",
+        "top-symbol handles should hydrate through oneup_get: {hydrated_envelope:?}"
+    );
+}
+
+#[test]
+fn mcp_overview_repeated_calls_return_byte_identical_payloads() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let first = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    let second = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(first["isError"], true);
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap(),
+        "repeated overview calls on an unchanged index should be byte-identical"
+    );
+}
+
+#[test]
+fn mcp_overview_data_payload_stays_within_documented_budget() {
+    let tmp = create_overview_budget_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    assert_ne!(result["isError"], true);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+
+    let data = &envelope["data"];
+    assert_eq!(data["top_symbols"].as_array().unwrap().len(), 10);
+    assert_eq!(data["modules"].as_array().unwrap().len(), 12);
+    assert_eq!(data["module_dependencies"].as_array().unwrap().len(), 15);
+    assert_eq!(data["entry_points"].as_array().unwrap().len(), 8);
+    assert!(data["stats"]["languages"].as_array().unwrap().len() <= 10);
+
+    let serialized = serde_json::to_string(data).unwrap();
+    assert!(
+        serialized.len() <= 8192,
+        "digest data should stay within the documented payload budget with every section cap saturated; got {} bytes",
+        serialized.len()
+    );
+}
+
+#[test]
+fn mcp_overview_ignores_rows_from_other_context() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let project_root = tmp.path().canonicalize().unwrap();
+    seed_foreign_context_overview_rows(&project_root, "other-context");
+
+    let mut client = McpTestClient::start(&project_root);
+    wait_for_mcp_last_update_complete(&mut client);
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(result["isError"], true);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+    let data = &envelope["data"];
+
+    assert_eq!(
+        data["stats"]["indexed_files"], 4,
+        "foreign-context files should not inflate active-context statistics: {data:?}"
+    );
+    assert!(
+        data["stats"]["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|language| language["language"] != "go"),
+        "foreign-context language should not leak into statistics: {data:?}"
+    );
+    assert!(
+        data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|module| module["module"] != "foreignctx"),
+        "foreign-context module should not leak into the module map: {data:?}"
+    );
+    assert!(
+        data["top_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["name"] != "ForeignLeakWidget"),
+        "foreign-context symbols should not leak into the ranking: {data:?}"
+    );
+    assert!(
+        data["entry_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| !entry["path"].as_str().unwrap().starts_with("foreignctx/")),
+        "foreign-context segments should not leak into entry points: {data:?}"
+    );
+}
+
+#[test]
+fn mcp_overview_empty_index_returns_zeroed_digest() {
+    let project = TempDir::new().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    seed_ready_empty_index(&project_root);
+
+    let mut client = McpTestClient::start_with_isolated_state(&project_root);
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(
+        result["isError"], true,
+        "a ready-but-empty index is a valid state, not an error: {result:?}"
+    );
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "empty");
+
+    let data = &envelope["data"];
+    assert_eq!(data["status"], "empty");
+    assert_eq!(data["stats"]["indexed_files"], 0);
+    assert_eq!(data["stats"]["total_segments"], 0);
+    assert!(data["stats"]["languages"].as_array().unwrap().is_empty());
+    for section in [
+        "top_symbols",
+        "modules",
+        "module_dependencies",
+        "entry_points",
+    ] {
+        assert!(
+            data[section].as_array().unwrap().is_empty(),
+            "empty digest should keep the {section} section present but empty: {data:?}"
+        );
+    }
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
+}
+
+#[test]
+fn mcp_overview_unready_index_returns_readiness_error() {
+    let configured = TempDir::new().unwrap();
+    let unready = TempDir::new().unwrap();
+    fs::create_dir_all(unready.path().join(".git")).unwrap();
+    fs::write(unready.path().join("lib.rs"), "pub fn unready_probe() {}\n").unwrap();
+
+    let mut client = McpTestClient::start_with_isolated_state(configured.path());
+    // The MCP daemon auto-start can pre-initialize an empty current-schema
+    // index for the configured repository, so the unready probe must target
+    // a separate repository the daemon has never touched.
+    let result = client.call_tool(
+        TOOL_OVERVIEW,
+        serde_json::json!({ "path": unready.path().to_str().unwrap() }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "error");
+    assert!(
+        envelope["summary"]
+            .as_str()
+            .unwrap()
+            .contains("no current index"),
+        "unready index should produce the standard readiness-style error: {envelope:?}"
+    );
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
 }
 
 #[test]
