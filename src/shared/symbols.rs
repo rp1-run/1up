@@ -4,6 +4,7 @@ pub const EDGE_IDENTITY_MEMBER_ACCESS: &str = "member_access";
 pub const EDGE_IDENTITY_METHOD_RECEIVER: &str = "method_receiver";
 pub const EDGE_IDENTITY_CONSTRUCTOR_LIKE: &str = "constructor_like";
 pub const EDGE_IDENTITY_MACRO_LIKE: &str = "macro_like";
+pub const EDGE_IDENTITY_DOC_MENTION: &str = "doc_mention";
 
 #[allow(dead_code)]
 const LOW_INFORMATION_OWNER_COMPONENTS: &[&str] = &[
@@ -107,6 +108,7 @@ pub fn normalize_edge_identity_kind(value: &str) -> String {
             EDGE_IDENTITY_CONSTRUCTOR_LIKE.to_string()
         }
         "macrolike" | "macroinvocation" => EDGE_IDENTITY_MACRO_LIKE.to_string(),
+        "docmention" => EDGE_IDENTITY_DOC_MENTION.to_string(),
         _ => EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
     }
 }
@@ -130,8 +132,8 @@ mod tests {
         clean_owner_components, normalize_edge_identity_kind, normalize_symbolish,
         owner_components_share_subsequence, owner_components_share_suffix, owner_fingerprint,
         owner_fingerprint_from_components, split_symbol_components, EDGE_IDENTITY_BARE_IDENTIFIER,
-        EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE, EDGE_IDENTITY_MEMBER_ACCESS,
-        EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
+        EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_DOC_MENTION, EDGE_IDENTITY_MACRO_LIKE,
+        EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
     };
 
     #[test]
@@ -167,6 +169,18 @@ mod tests {
 
         assert!(owner_components_share_suffix(&qualified, &file_path));
         assert!(owner_components_share_subsequence(&qualified, &subsequence));
+    }
+
+    #[test]
+    fn normalize_edge_identity_kind_preserves_doc_mention() {
+        assert_eq!(
+            normalize_edge_identity_kind("doc_mention"),
+            EDGE_IDENTITY_DOC_MENTION
+        );
+        assert_ne!(
+            normalize_edge_identity_kind("doc_mention"),
+            EDGE_IDENTITY_BARE_IDENTIFIER
+        );
     }
 
     #[test]
