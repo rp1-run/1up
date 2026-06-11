@@ -110,7 +110,7 @@ if [ "${1:-}" = "mcp" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"},{"name":"oneup_overview"}]}}'
         ;;
       *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
         printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository needs indexing.","data":{"index_readable":false},"next_actions":[{"tool":"oneup_start","reason":"index fixture code","arguments":{"mode":"index_if_needed"}}]}}}'
@@ -148,6 +148,9 @@ if [ "${1:-}" = "mcp" ]; then
       *'"id":10'*'"method":"tools/call"'*'"oneup_structural"'*)
         printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"structuredContent":{"status":"ok","summary":"Found fixture structural matches.","data":{"results":[{"file_path":"src/policy.rs","language":"rust","pattern_name":"name","content":"PolicyRuleValidator","line_start":1,"line_end":1}]},"next_actions":[]}}}'
         ;;
+      *'"id":11'*'"method":"tools/call"'*'"oneup_overview"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":11,"result":{"structuredContent":{"status":"ok","summary":"Indexed 2 file(s) and 5 segment(s) across 1 language(s); densest module is src; most-referenced type is PolicyRuleValidator.","data":{"status":"ok","stats":{"indexed_files":2,"total_segments":5,"languages":[{"language":"rust","files":2,"segments":5}]},"top_symbols":[{"name":"PolicyRuleValidator","handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"referencing_files":1,"definition_count":1}],"modules":[{"module":"src","segments":5}],"module_dependencies":[],"entry_points":[{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"role":"DEFINITION","symbol":"PolicyRuleValidator"}]},"next_actions":[{"tool":"oneup_symbol","reason":"Inspect the definition and references of the most-referenced type.","arguments":{"name":"PolicyRuleValidator"}},{"tool":"oneup_search","reason":"Start targeted discovery inside the densest module.","arguments":{"query":"src module responsibilities"}}]}}}'
+        ;;
     esac
   done
   exit 0
@@ -178,7 +181,7 @@ if [ "${1:-}" = "mcp" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"oneup-smoke-fixture","version":"0"}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"oneup_status"},{"name":"oneup_start"},{"name":"oneup_search"},{"name":"oneup_get"},{"name":"oneup_symbol"},{"name":"oneup_context"},{"name":"oneup_impact"},{"name":"oneup_structural"},{"name":"oneup_overview"}]}}'
         ;;
       *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
         printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"status":"missing","summary":"Fixture repository needs indexing.","data":{"index_readable":false},"next_actions":[{"tool":"oneup_start","reason":"index fixture code","arguments":{"mode":"index_if_needed"}}]}}}'
@@ -298,7 +301,7 @@ if [ "${{1:-}}" = "mcp" ]; then
         printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"oneup-fixture","version":"{version}"}}}}}}'
         ;;
       *'"id":2'*'"method":"tools/list"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_status"}},{{"name":"oneup_start"}},{{"name":"oneup_search"}},{{"name":"oneup_get"}},{{"name":"oneup_symbol"}},{{"name":"oneup_context"}},{{"name":"oneup_impact"}},{{"name":"oneup_structural"}}]}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"oneup_status"}},{{"name":"oneup_start"}},{{"name":"oneup_search"}},{{"name":"oneup_get"}},{{"name":"oneup_symbol"}},{{"name":"oneup_context"}},{{"name":"oneup_impact"}},{{"name":"oneup_structural"}},{{"name":"oneup_overview"}}]}}}}'
         ;;
       *'"id":3'*'"method":"tools/call"'*'"oneup_status"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"structuredContent":{{"status":"missing","summary":"Fixture repository needs indexing.","data":{{"index_readable":false}},"next_actions":[{{"tool":"oneup_start","reason":"index fixture code","arguments":{{"mode":"index_if_needed"}}}}]}}}}}}'
@@ -323,6 +326,9 @@ if [ "${{1:-}}" = "mcp" ]; then
         ;;
       *'"id":10'*'"method":"tools/call"'*'"oneup_structural"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":10,"result":{{"structuredContent":{{"status":"ok","summary":"Found fixture structural matches.","data":{{"results":[{{"file_path":"src/policy.rs","language":"rust","pattern_name":"name","content":"PolicyRuleValidator","line_start":1,"line_end":1}}]}},"next_actions":[]}}}}}}'
+        ;;
+      *'"id":11'*'"method":"tools/call"'*'"oneup_overview"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":11,"result":{{"structuredContent":{{"status":"ok","summary":"Indexed 2 file(s) and 5 segment(s) across 1 language(s); densest module is src; most-referenced type is PolicyRuleValidator.","data":{{"status":"ok","stats":{{"indexed_files":2,"total_segments":5,"languages":[{{"language":"rust","files":2,"segments":5}}]}},"top_symbols":[{{"name":"PolicyRuleValidator","handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"referencing_files":1,"definition_count":1}}],"modules":[{{"module":"src","segments":5}}],"module_dependencies":[],"entry_points":[{{"handle":"abcdef123456","path":"src/policy.rs","line_start":1,"line_end":7,"role":"DEFINITION","symbol":"PolicyRuleValidator"}}]}},"next_actions":[{{"tool":"oneup_symbol","reason":"Inspect the definition and references of the most-referenced type.","arguments":{{"name":"PolicyRuleValidator"}}}},{{"tool":"oneup_search","reason":"Start targeted discovery inside the densest module.","arguments":{{"query":"src module responsibilities"}}}}]}}}}}}'
         ;;
     esac
   done
@@ -837,6 +843,7 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
     assert_eq!(evidence["response_statuses"]["context"], "ok");
     assert_eq!(evidence["response_statuses"]["impact"], "empty");
     assert_eq!(evidence["response_statuses"]["structural"], "ok");
+    assert_eq!(evidence["response_statuses"]["overview"], "ok");
     assert_eq!(evidence["server_command"][1], "mcp");
     assert_eq!(evidence["server_command"][2], "--path");
     assert_eq!(
@@ -853,6 +860,7 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
         "oneup_context",
         "oneup_impact",
         "oneup_structural",
+        "oneup_overview",
     ] {
         assert!(
             tools.iter().any(|tool| tool == expected_tool),
@@ -869,6 +877,7 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
         "oneup_context",
         "oneup_impact",
         "oneup_structural",
+        "oneup_overview",
     ] {
         assert!(
             exercised_tools.iter().any(|tool| tool == expected_tool),
@@ -885,6 +894,7 @@ fn verify_mcp_smoke_lists_tools_and_readiness() {
         "context",
         "impact",
         "structural",
+        "overview",
     ] {
         assert!(
             calls.iter().any(|call| call["label"] == expected_label
@@ -1059,6 +1069,7 @@ fn archive_verification_confirms_expected_release_contents() {
         "oneup_context",
         "oneup_impact",
         "oneup_structural",
+        "oneup_overview",
     ] {
         assert!(
             tools.iter().any(|tool| tool == expected_tool),

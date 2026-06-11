@@ -150,7 +150,7 @@ if ! jq -e '
   def canonical_mcp_tools_present:
     (.mcp_smoke_test.tools | type == "array")
     and (.mcp_smoke_test.tools as $tools
-      | ["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural"]
+      | ["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural", "oneup_overview"]
       | all(. as $tool | $tools | index($tool)));
   def valid_readiness:
     . as $status | ["missing", "indexing", "stale", "ready", "degraded", "blocked"] | index($status) != null;
@@ -160,7 +160,7 @@ if ! jq -e '
     and ($smoke.presentation_free == true)
     and ($smoke.discovery_flow.status == "passed")
     and ($smoke.exercised_tools | type == "array")
-    and (["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural"]
+    and (["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural", "oneup_overview"]
       | all(. as $tool | ($smoke.exercised_tools | index($tool) != null)))
     and ($smoke.tool_calls | type == "array")
     and (["status", "start", "search", "get", "symbol", "context", "impact", "structural"]
