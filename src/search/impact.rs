@@ -12,8 +12,9 @@ use crate::shared::constants::{MAX_RESULTS_PER_FILE, MAX_SEARCH_RESULTS};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::symbols::{
     clean_owner_components, normalize_symbolish, split_symbol_components,
-    EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE,
-    EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
+    EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_DOC_MENTION,
+    EDGE_IDENTITY_MACRO_LIKE, EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER,
+    EDGE_IDENTITY_QUALIFIED_PATH,
 };
 use crate::shared::types::SegmentRole;
 use crate::storage::relations::{
@@ -739,6 +740,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 remaining,
             )
             .await?;
+            discard_doc_mention_relations(&mut fetched);
             remaining = remaining.saturating_sub(fetched.len());
             relations.append(&mut fetched);
         }
@@ -770,6 +772,7 @@ impl<'a> ImpactHorizonEngine<'a> {
                 *remaining,
             )
             .await?;
+            discard_doc_mention_relations(&mut fetched);
             *remaining = (*remaining).saturating_sub(fetched.len());
             relations.append(&mut fetched);
         }
@@ -1030,6 +1033,15 @@ impl<'a> ImpactHorizonEngine<'a> {
             Ok(emitted)
         }
     }
+}
+
+/// Doc-mention relations are descriptive documentation evidence, not dependency
+/// evidence. Dropping them immediately after fetch in both relation collectors
+/// keeps them out of primary impact buckets and frontier expansion at a single
+/// chokepoint; budget accounting then decrements by the retained count so
+/// docs-heavy symbols do not starve real relation budget.
+fn discard_doc_mention_relations(relations: &mut Vec<StoredRelation>) {
+    relations.retain(|relation| relation.edge_identity_kind != EDGE_IDENTITY_DOC_MENTION);
 }
 
 fn observe_candidate(
@@ -2313,6 +2325,105 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    fn doc_mention_relation(symbol: &str) -> ParsedRelation {
+        ParsedRelation {
+            symbol: symbol.to_string(),
+            edge_identity_kind: EDGE_IDENTITY_DOC_MENTION.to_string(),
+            kind: None,
+        }
+    }
+
+    fn make_doc_section_segment(
+        id: &str,
+        file_path: &str,
+        line_start: usize,
+        referenced_symbols: &[&str],
+        relations: &[ParsedRelation],
+    ) -> segments::SegmentInsert {
+        let mut segment = make_segment_with_referenced_relations(
+            SegmentFixture {
+                id,
+                file_path,
+                line_start,
+                block_type: "doc_section",
+                role: "DOCS",
+                defined_symbols: &[],
+                referenced_symbols,
+                called_symbols: &[],
+            },
+            relations,
+        );
+        segment.language = "markdown".to_string();
+        segment.content = format!("Documentation section in {file_path}");
+        segment
+    }
+
+    async fn insert_doc_mention_impact_fixture(conn: &Connection) {
+        insert_segments(
+            conn,
+            vec![
+                make_segment(SegmentFixture {
+                    id: "widget-core-def",
+                    file_path: "src/widgets/core.rs",
+                    line_start: 1,
+                    block_type: "struct",
+                    role: "DEFINITION",
+                    defined_symbols: &["WidgetCore"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment(SegmentFixture {
+                    id: "widget-core-alias",
+                    file_path: "src/runtime/alias.rs",
+                    line_start: 1,
+                    block_type: "type",
+                    role: "DEFINITION",
+                    defined_symbols: &["WidgetCore"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_segment_with_referenced_relations(
+                    SegmentFixture {
+                        id: "widget-consumer",
+                        file_path: "src/widgets/consumer.rs",
+                        line_start: 10,
+                        block_type: "function",
+                        role: "IMPLEMENTATION",
+                        defined_symbols: &["consume_widget"],
+                        referenced_symbols: &["WidgetCore"],
+                        called_symbols: &[],
+                    },
+                    &[ParsedRelation {
+                        symbol: "WidgetCore".to_string(),
+                        edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                        kind: Some(ParsedRelationKind::Reference),
+                    }],
+                ),
+                make_segment(SegmentFixture {
+                    id: "helper-def",
+                    file_path: "src/widgets/helper.rs",
+                    line_start: 1,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["helper_gadget"],
+                    referenced_symbols: &[],
+                    called_symbols: &[],
+                }),
+                make_doc_section_segment(
+                    "widget-doc",
+                    "docs/widgets.md",
+                    1,
+                    &["WidgetCore", "helper_gadget"],
+                    &[
+                        doc_mention_relation("WidgetCore"),
+                        doc_mention_relation("helper_gadget"),
+                    ],
+                ),
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3980,5 +4091,145 @@ mod tests {
         assert!(observations
             .iter()
             .all(|observation| observation.candidate.file_path.starts_with("tests/")));
+    }
+
+    #[tokio::test]
+    async fn doc_mention_edges_never_primary_never_expand_frontier() {
+        let (_db, conn) = setup().await;
+        insert_doc_mention_impact_fixture(&conn).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "WidgetCore".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert!(result
+            .results
+            .iter()
+            .any(|candidate| candidate.segment_id == "widget-consumer"));
+
+        let all_candidates: Vec<&ImpactCandidate> = result
+            .results
+            .iter()
+            .chain(result.contextual_results.iter().flatten())
+            .collect();
+        assert!(all_candidates
+            .iter()
+            .all(|candidate| candidate.segment_id != "widget-doc"));
+        assert!(all_candidates
+            .iter()
+            .all(|candidate| candidate.segment_id != "helper-def"));
+        assert!(all_candidates
+            .iter()
+            .flat_map(|candidate| candidate.reasons.iter())
+            .all(|reason| reason.from_segment_id.as_deref() != Some("widget-doc")));
+    }
+
+    #[tokio::test]
+    async fn doc_anchored_impact_does_not_expand_through_doc_mentions() {
+        let (_db, conn) = setup().await;
+        insert_doc_mention_impact_fixture(&conn).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Segment {
+                    id: "widget-doc".to_string(),
+                },
+                scope: None,
+                depth: 2,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Empty);
+        assert!(result.results.is_empty());
+        let contextual_ids: Vec<&str> = result
+            .contextual_results
+            .iter()
+            .flatten()
+            .map(|candidate| candidate.segment_id.as_str())
+            .collect();
+        assert!(!contextual_ids.contains(&"widget-core-def"));
+        assert!(!contextual_ids.contains(&"widget-core-alias"));
+        assert!(!contextual_ids.contains(&"helper-def"));
+    }
+
+    #[tokio::test]
+    async fn doc_mention_rows_do_not_consume_inbound_relation_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![
+            make_segment(SegmentFixture {
+                id: "widget-impl",
+                file_path: "src/widgets/core.rs",
+                line_start: 1,
+                block_type: "impl",
+                role: "DEFINITION",
+                defined_symbols: &["WidgetAlpha", "WidgetBeta"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }),
+            make_segment_with_called_relations(
+                SegmentFixture {
+                    id: "beta-caller",
+                    file_path: "src/widgets/runner.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["run_beta"],
+                    referenced_symbols: &[],
+                    called_symbols: &["WidgetBeta"],
+                },
+                &[ParsedRelation {
+                    symbol: "WidgetBeta".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Call),
+                }],
+            ),
+        ];
+        for idx in 0..MAX_INBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_doc_section_segment(
+                Box::leak(format!("alpha-doc-{idx}").into_boxed_str()),
+                "docs/widgets.md",
+                idx * 10 + 1,
+                &["WidgetAlpha"],
+                &[doc_mention_relation("WidgetAlpha")],
+            ));
+        }
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "WidgetAlpha".to_string(),
+                },
+                scope: None,
+                depth: 1,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ImpactStatus::Expanded);
+        assert!(result
+            .results
+            .iter()
+            .any(|candidate| candidate.segment_id == "beta-caller"));
+        assert!(result
+            .results
+            .iter()
+            .chain(result.contextual_results.iter().flatten())
+            .all(|candidate| !candidate.segment_id.starts_with("alpha-doc-")));
     }
 }
