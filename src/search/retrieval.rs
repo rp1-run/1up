@@ -1,5 +1,6 @@
 use libsql::{Connection, Row};
 
+use crate::search::ranking::tokenize_text;
 use crate::search::scope::SearchScope;
 use crate::shared::constants::{VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K};
 use crate::shared::errors::{OneupError, SearchError};
@@ -367,32 +368,73 @@ fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
+/// Maximum identifier-split and prefix variants appended to the base FTS
+/// terms. Bounds query fan-out so identifier-aware matching cannot regress
+/// FTS latency on long natural-language queries.
+const MAX_FTS_VARIANT_TERMS: usize = 16;
+
+/// Minimum cleaned-term length for emitting a prefix variant. Prefix terms
+/// let a plain query word reach the front of a concatenated identifier token
+/// (`impact` -> `impacthorizonengine`); shorter prefixes pull in too much
+/// noise for the recall they add.
+const MIN_FTS_PREFIX_TERM_CHARS: usize = 4;
+
+/// Builds an FTS5 match expression with identifier-aware variants.
+///
+/// The unicode61 tokenizer indexes `ImpactHorizonEngine` as the single token
+/// `impacthorizonengine`, which plain quoted query terms never match. On top
+/// of the base quoted terms this adds: a split-part phrase variant for
+/// CamelCase/snake_case query terms (matching identifiers mentioned as
+/// prose), and bounded prefix variants for plain words so they can match the
+/// head of concatenated identifiers. Split parts stay phrase-bound rather
+/// than OR'd individually so exact-identifier queries keep their precision.
 fn build_fts_query(query: &str) -> String {
-    let terms: Vec<&str> = query
+    let cleaned_terms: Vec<String> = query
         .split_whitespace()
         .filter(|term| term.len() >= 2)
+        .map(|term| {
+            term.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|term| !term.is_empty())
         .collect();
 
-    if terms.is_empty() {
+    if cleaned_terms.is_empty() {
         return String::new();
     }
 
-    terms
-        .iter()
-        .map(|term| {
-            let cleaned: String = term
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if cleaned.is_empty() {
-                String::new()
-            } else {
-                format!("\"{cleaned}\"")
+    let mut units: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for term in &cleaned_terms {
+        if seen.insert(term.to_lowercase()) {
+            units.push(format!("\"{term}\""));
+        }
+    }
+
+    let mut variant_count = 0;
+    for term in &cleaned_terms {
+        if variant_count >= MAX_FTS_VARIANT_TERMS {
+            break;
+        }
+
+        let parts = tokenize_text(term);
+        if parts.len() > 1 {
+            let phrase = parts.join(" ");
+            if seen.insert(phrase.clone()) {
+                units.push(format!("\"{phrase}\""));
+                variant_count += 1;
             }
-        })
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        } else if term.len() >= MIN_FTS_PREFIX_TERM_CHARS
+            && seen.insert(format!("{}*", term.to_lowercase()))
+        {
+            units.push(format!("\"{term}\" *"));
+            variant_count += 1;
+        }
+    }
+
+    units.join(" OR ")
 }
 
 #[cfg(test)]
@@ -488,6 +530,65 @@ mod tests {
         assert!(query.contains("\"the\""));
         assert!(query.contains("\"error\""));
         assert!(!query.contains("\"a\""));
+    }
+
+    #[test]
+    fn fts_query_adds_prefix_variants_for_plain_words() {
+        let query = build_fts_query("impact horizon");
+
+        assert!(query.contains("\"impact\""));
+        assert!(query.contains("\"impact\" *"));
+        assert!(query.contains("\"horizon\" *"));
+    }
+
+    #[test]
+    fn fts_query_splits_identifier_terms_into_phrase_variants() {
+        let query = build_fts_query("ImpactHorizonEngine summary_json");
+
+        assert!(query.contains("\"ImpactHorizonEngine\""));
+        assert!(query.contains("\"impact horizon engine\""));
+        assert!(query.contains("\"summary_json\""));
+        assert!(query.contains("\"summary json\""));
+    }
+
+    #[test]
+    fn fts_query_caps_added_variants() {
+        let long_query = (0..40)
+            .map(|i| format!("verylongword{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = build_fts_query(&long_query);
+
+        assert_eq!(query.matches('*').count(), MAX_FTS_VARIANT_TERMS);
+    }
+
+    #[tokio::test]
+    async fn fts_matches_camelcase_identifier_from_conceptual_query() {
+        let conn = setup().await;
+        insert_segment(
+            &conn,
+            "seg-impact-engine",
+            "src/search/impact.rs",
+            "pub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}",
+            None,
+        )
+        .await;
+
+        let candidates = fetch_fts_candidates(
+            &conn,
+            &SearchScope::default_context(),
+            "impact horizon expansion with owner aware corroboration",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.segment_id == "seg-impact-engine"),
+            "conceptual terms should reach the CamelCase token via prefix variants"
+        );
     }
 
     #[tokio::test]

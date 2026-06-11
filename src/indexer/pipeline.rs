@@ -145,7 +145,9 @@ use crate::indexer::embedder::Embedder;
 use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
-use crate::shared::constants::{DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, HF_MODEL_REPO};
+use crate::shared::constants::{
+    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
+};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
@@ -223,6 +225,73 @@ fn compute_file_hash(content: &[u8]) -> String {
 fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
     serde_json::to_string(vec)
         .map_err(|e| IndexingError::Pipeline(format!("serialize embedding: {e}")).into())
+}
+
+/// Maximum length in characters of the contextual header prepended to
+/// embedding input text.
+///
+/// The embedder truncates input from the right at `EMBEDDING_MAX_TOKENS`, so
+/// an unbounded header could crowd a segment's actual content out of the
+/// model window. 160 characters is roughly 40-80 wordpiece tokens, leaving
+/// the bulk of the 256-token budget for content.
+const EMBEDDING_HEADER_MAX_CHARS: usize = 160;
+
+/// Maximum composed embedding-input length in characters.
+///
+/// The embedder hard-truncates at `EMBEDDING_MAX_TOKENS` (256) tokens, and
+/// wordpiece tokens practically never exceed 16 characters, so clamping here
+/// only bounds tokenizer work on oversized segments without changing what
+/// the model sees.
+const EMBEDDING_INPUT_MAX_CHARS: usize = EMBEDDING_MAX_TOKENS * 16;
+
+/// Builds the text passed to the embedder for one segment.
+///
+/// Prepends a bounded `{language} {path stem} {breadcrumb} {defined symbols}`
+/// header to the segment content so tiny definition segments (3-line structs,
+/// one-line variable assignments) carry topical context into the embedding.
+/// Missing breadcrumbs and empty symbol lists are skipped. Only the embedding
+/// input changes: stored segment content and segment ids are untouched.
+fn compose_embedding_text(relative_path: &str, segment: &ParsedSegment) -> String {
+    let mut header_parts: Vec<&str> = Vec::new();
+
+    if !segment.language.is_empty() {
+        header_parts.push(segment.language.as_str());
+    }
+
+    let path_stem = Path::new(relative_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if !path_stem.is_empty() {
+        header_parts.push(path_stem);
+    }
+
+    if let Some(breadcrumb) = segment.breadcrumb.as_deref() {
+        if !breadcrumb.is_empty() {
+            header_parts.push(breadcrumb);
+        }
+    }
+
+    let symbols = segment.defined_symbols.join(" ");
+    if !symbols.is_empty() {
+        header_parts.push(symbols.as_str());
+    }
+
+    let header = truncate_chars(header_parts.join(" "), EMBEDDING_HEADER_MAX_CHARS);
+    let text = if header.is_empty() {
+        segment.content.clone()
+    } else {
+        format!("{header}\n{}", segment.content)
+    };
+
+    truncate_chars(text, EMBEDDING_INPUT_MAX_CHARS)
+}
+
+fn truncate_chars(mut text: String, max_chars: usize) -> String {
+    if let Some((idx, _)) = text.char_indices().nth(max_chars) {
+        text.truncate(idx);
+    }
+    text
 }
 
 fn should_embed_segment(seg: &ParsedSegment) -> bool {
@@ -658,17 +727,18 @@ fn build_segment_batches(
     timings: &mut TimingAccumulator,
 ) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
     let mut embeddings = if let Some(embedder) = embedder {
-        let texts: Vec<&str> = parsed_files
+        let texts: Vec<String> = parsed_files
             .iter()
             .flat_map(|file| {
                 file.segments
                     .iter()
                     .filter(|segment| should_embed_segment(segment))
-                    .map(|segment| segment.content.as_str())
+                    .map(|segment| compose_embedding_text(&file.relative_path, segment))
             })
             .collect();
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let embed_started_at = Instant::now();
-        let embeddings = embedder.embed_batch(&texts)?;
+        let embeddings = embedder.embed_batch(&text_refs)?;
         timings.embed_ms += embed_started_at.elapsed().as_millis();
         Some(embeddings.into_iter())
     } else {
@@ -2364,6 +2434,97 @@ mod tests {
             ..code_chunk
         };
         assert!(!should_embed_segment(&yaml_chunk));
+    }
+
+    fn embeddable_segment(content: &str) -> ParsedSegment {
+        ParsedSegment {
+            content: content.into(),
+            block_type: "struct".into(),
+            line_start: 159,
+            line_end: 161,
+            language: "rust".into(),
+            breadcrumb: None,
+            complexity: 0,
+            role: crate::shared::types::SegmentRole::Definition,
+            defined_symbols: Vec::new(),
+            referenced_symbols: Vec::new(),
+            referenced_relations: Vec::new(),
+            called_symbols: Vec::new(),
+            called_relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compose_embedding_text_prepends_language_stem_breadcrumb_and_symbols() {
+        let mut segment = embeddable_segment(
+            "pub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}",
+        );
+        segment.breadcrumb = Some("horizon expansion".into());
+        segment.defined_symbols = vec!["ImpactHorizonEngine".into()];
+
+        let text = compose_embedding_text("src/search/impact.rs", &segment);
+
+        assert_eq!(
+            text,
+            "rust impact horizon expansion ImpactHorizonEngine\npub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}"
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_skips_missing_breadcrumb_and_symbols() {
+        let mut segment = embeddable_segment("SUMMARY_JSON=\"$OUT_DIR/summary.json\"");
+        segment.language = "shell".into();
+
+        let text = compose_embedding_text("scripts/benchmark_parallel_indexing.sh", &segment);
+
+        assert_eq!(
+            text,
+            "shell benchmark_parallel_indexing\nSUMMARY_JSON=\"$OUT_DIR/summary.json\""
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_clamps_header_and_total_length() {
+        let mut segment = embeddable_segment(&"x".repeat(EMBEDDING_INPUT_MAX_CHARS * 2));
+        segment.breadcrumb = Some("breadcrumb ".repeat(40));
+        segment.defined_symbols = (0..40).map(|i| format!("Symbol{i}")).collect();
+
+        let text = compose_embedding_text("src/lib.rs", &segment);
+        let header = text.split('\n').next().unwrap();
+
+        assert!(header.chars().count() <= EMBEDDING_HEADER_MAX_CHARS);
+        assert!(text.chars().count() <= EMBEDDING_INPUT_MAX_CHARS);
+        assert!(
+            text.split_once('\n').unwrap().1.starts_with("xxx"),
+            "content must follow the clamped header"
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_leaves_stored_segment_untouched() {
+        let mut segment = embeddable_segment("pub struct ImpactHorizonEngine;");
+        segment.defined_symbols = vec!["ImpactHorizonEngine".into()];
+
+        let composed = compose_embedding_text("src/search/impact.rs", &segment);
+        let insert = build_segment_insert(
+            DEFAULT_INDEX_CONTEXT_ID,
+            "src/search/impact.rs",
+            "hash",
+            &segment,
+            None,
+        );
+
+        assert_ne!(composed, segment.content);
+        assert_eq!(insert.content, segment.content);
+        assert_eq!(
+            insert.id,
+            segments::generate_segment_id(
+                DEFAULT_INDEX_CONTEXT_ID,
+                "src/search/impact.rs",
+                segment.line_start,
+                segment.line_end
+            )
+        );
     }
 
     #[tokio::test]

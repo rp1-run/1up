@@ -144,7 +144,7 @@ fn compute_rrf_score(candidate: &ScoredCandidate, query: &str, intent: QueryInte
     score *= query_path_boost(query, &candidate.candidate.file_path);
     score *= query_match_boost(query, &candidate.candidate);
     score *= content_kind_boost(&candidate.candidate, intent);
-    score *= short_segment_penalty(candidate.candidate.line_count());
+    score *= short_segment_penalty(&candidate.candidate);
 
     score
 }
@@ -224,13 +224,34 @@ fn file_path_boost(path: &str) -> f64 {
     }
 }
 
-fn short_segment_penalty(line_count: usize) -> f64 {
-    if line_count <= 2 {
+/// Penalty floor for short segments that define symbols.
+///
+/// Enriched embedding inputs give 1-5 line definition segments (structs,
+/// constants, variable assignments) real topical signal, so they no longer
+/// deserve the full short-segment penalty that exists to demote contextless
+/// fragments. Plain short segments keep the original 0.6x/0.85x.
+const DEFINED_SYMBOL_PENALTY_FLOOR: f64 = 0.9;
+
+fn short_segment_penalty(candidate: &CandidateRow) -> f64 {
+    let line_count = candidate.line_count();
+    let base: f64 = if line_count <= 2 {
         0.6
     } else if line_count <= 5 {
         0.85
     } else {
         1.0
+    };
+
+    let defines_symbols = candidate
+        .defined_symbols
+        .as_ref()
+        .map(|symbols| !symbols.is_empty())
+        .unwrap_or(false);
+
+    if defines_symbols {
+        base.max(DEFINED_SYMBOL_PENALTY_FLOOR)
+    } else {
+        base
     }
 }
 
@@ -353,7 +374,10 @@ fn normalize_text(value: &str) -> String {
     tokenize_text(value).join(" ")
 }
 
-fn tokenize_text(value: &str) -> Vec<String> {
+/// Splits text into lowercase tokens on CamelCase boundaries and
+/// non-alphanumeric separators (`ImpactHorizonEngine` -> `impact`,
+/// `horizon`, `engine`; `summary_json` -> `summary`, `json`).
+pub(crate) fn tokenize_text(value: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut prev: Option<char> = None;
@@ -551,9 +575,33 @@ mod tests {
 
     #[test]
     fn short_segment_penalized() {
-        let short_penalty = short_segment_penalty(1);
-        let long_penalty = short_segment_penalty(7);
-        assert!(short_penalty < long_penalty);
+        let short = make_candidate("a.rs", 1, "function", 1);
+        let long = make_candidate("a.rs", 10, "function", 7);
+
+        assert!(short_segment_penalty(&short) < short_segment_penalty(&long));
+    }
+
+    #[test]
+    fn short_definition_segments_get_capped_penalty() {
+        let mut one_line = make_candidate("scripts/bench.sh", 453, "variable", 1);
+        one_line.defined_symbols = Some(vec!["SUMMARY_JSON".to_string()]);
+        let mut three_line = make_candidate("src/search/impact.rs", 159, "struct", 3);
+        three_line.defined_symbols = Some(vec!["ImpactHorizonEngine".to_string()]);
+
+        assert_eq!(short_segment_penalty(&one_line), 0.9);
+        assert_eq!(short_segment_penalty(&three_line), 0.9);
+    }
+
+    #[test]
+    fn plain_short_segments_keep_full_penalty() {
+        let one_line = make_candidate("a.rs", 1, "chunk", 1);
+        let four_line = make_candidate("a.rs", 10, "chunk", 4);
+        let mut long_definition = make_candidate("a.rs", 20, "function", 7);
+        long_definition.defined_symbols = Some(vec!["needle".to_string()]);
+
+        assert_eq!(short_segment_penalty(&one_line), 0.6);
+        assert_eq!(short_segment_penalty(&four_line), 0.85);
+        assert_eq!(short_segment_penalty(&long_definition), 1.0);
     }
 
     #[test]

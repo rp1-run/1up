@@ -585,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_v13() {
+    async fn prepare_for_write_initializes_v14() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -594,7 +594,7 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
         assert!(schema_object_exists(&conn, "table", "worktree_contexts")
             .await
             .unwrap());
@@ -697,17 +697,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v13_schema() {
+    async fn prepare_for_write_rejects_pre_v14_schema() {
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "12"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "13"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v12, expected v13"));
+        assert!(msg.contains("found v13, expected v14"));
         assert!(msg.contains("run `1up reindex`"));
     }
 

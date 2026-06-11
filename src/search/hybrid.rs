@@ -3,7 +3,7 @@ use libsql::Connection;
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
-use crate::search::ranking::{rank_candidates, RankedCandidate};
+use crate::search::ranking::{rank_candidates, tokenize_text, RankedCandidate};
 use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
@@ -186,10 +186,19 @@ async fn symbol_search(
     Ok(deduped)
 }
 
+/// Maximum identifier tokens extracted from a sentence-length query for the
+/// symbol stage. Keeps long queries from fanning out into many symbol
+/// lookups.
+const MAX_LONG_QUERY_SYMBOL_VARIANTS: usize = 3;
+
 fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     let words = query_words(query);
-    if words.is_empty() || words.len() > 4 || words.iter().all(|word| word.len() < 2) {
+    if words.is_empty() || words.iter().all(|word| word.len() < 2) {
         return Vec::new();
+    }
+
+    if words.len() > 4 {
+        return identifier_like_words(&words);
     }
 
     let symbolish = query.contains('_')
@@ -202,6 +211,24 @@ fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     }
 
     vec![words.join(" ")]
+}
+
+/// Extracts CamelCase/snake_case tokens from a sentence-length query so it
+/// can still engage the symbol stage for identifiers it explicitly mentions.
+/// Pure natural-language queries yield nothing and skip symbol weighting.
+fn identifier_like_words(words: &[String]) -> Vec<String> {
+    let mut variants: Vec<String> = Vec::new();
+
+    for word in words {
+        if variants.len() >= MAX_LONG_QUERY_SYMBOL_VARIANTS {
+            break;
+        }
+        if tokenize_text(word).len() > 1 && !variants.contains(word) {
+            variants.push(word.clone());
+        }
+    }
+
+    variants
 }
 
 fn query_words(query: &str) -> Vec<String> {
@@ -280,6 +307,36 @@ mod tests {
     #[test]
     fn symbol_variants_skip_non_symbolish_long_queries() {
         let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
+
+        assert!(variants.is_empty());
+    }
+
+    #[test]
+    fn symbol_variants_extract_camelcase_identifier_from_long_queries() {
+        let variants = build_symbol_variants(
+            "impact horizon expansion with ImpactHorizonEngine corroboration",
+            QueryIntent::General,
+        );
+
+        assert_eq!(variants, vec!["ImpactHorizonEngine".to_string()]);
+    }
+
+    #[test]
+    fn symbol_variants_extract_snake_case_identifier_from_long_queries() {
+        let variants = build_symbol_variants(
+            "benchmark parallel indexing script emitting summary_json output",
+            QueryIntent::General,
+        );
+
+        assert_eq!(variants, vec!["summary_json".to_string()]);
+    }
+
+    #[test]
+    fn symbol_variants_stay_empty_for_long_capitalized_natural_language() {
+        let variants = build_symbol_variants(
+            "Where does the daemon watch project files for changes",
+            QueryIntent::General,
+        );
 
         assert!(variants.is_empty());
     }

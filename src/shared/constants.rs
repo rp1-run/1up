@@ -116,7 +116,12 @@ pub const EMBED_THREADS_ENV_VAR: &str = "ONEUP_EMBED_THREADS";
 pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES";
 
 /// Schema version for database layout.
-pub const SCHEMA_VERSION: u32 = 13;
+///
+/// v14: embedding input text is composed from language, path stem,
+/// breadcrumb, and defined symbols ahead of segment content, so stored
+/// vectors from earlier versions are semantically incompatible and require
+/// `1up reindex`.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
