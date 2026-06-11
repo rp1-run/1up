@@ -1,3 +1,6 @@
+use std::fmt::Write as _;
+use std::sync::LazyLock;
+
 pub const CREATE_WORKTREE_CONTEXTS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS worktree_contexts (
     context_id TEXT PRIMARY KEY,
@@ -875,3 +878,285 @@ pub const SYMBOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SYMBOL_INSERT_COLS;
 pub const RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / RELATION_INSERT_COLS;
 pub const CONTEXT_RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / CONTEXT_RELATION_INSERT_COLS;
 pub const VECTOR_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / VECTOR_INSERT_COLS;
+
+// --- Overview digest aggregates ---------------------------------------------
+//
+// Bounded aggregate queries backing the `oneup_overview` orientation digest.
+// The symbol-ranking and module-dependency statements must apply an identical
+// filter stack (identity-bearing edge kinds, qualifying definition kinds,
+// qualifying roles, edge/block compatibility), so those fragments are defined
+// once below and the full statements are composed from them.
+//
+// HARD CONSTRAINT (design D16): every per-key or per-pair predicate is
+// pre-aggregated in a CTE grouped by the symbol key and equi-joined to the
+// relation scan. Correlated per-row subqueries or EXISTS probes against
+// `segment_symbols`/`segments` are prohibited: HYP-001 v2 measured identical
+// predicates at 0.19-0.44s in this form versus 183.8s (~400x) correlated on
+// an 81k-relation index.
+
+/// Module key used for files that live directly in the repository root.
+pub const OVERVIEW_ROOT_MODULE_KEY: &str = "(root)";
+
+/// Relation rows that carry usable target identity for aggregate ranking.
+/// `method_receiver`/`member_access` rows are excluded: their identity is only
+/// derivable through per-pair owner alignment, which a bounded aggregate
+/// cannot compute (design D13).
+pub const OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL: &str =
+    "('bare_identifier', 'qualified_path', 'constructor_like', 'macro_like')";
+
+/// Qualifying definition kinds for overview ranking: type definitions only,
+/// the shipped Branch B policy (HYP-001 v3 verdict, design D19 documented
+/// REQ-003 downscope).
+pub const OVERVIEW_QUALIFYING_TYPE_KINDS_SQL: &str =
+    "('struct', 'enum', 'trait', 'class', 'interface')";
+
+/// Roles a segment must carry for its symbol rows to qualify as definitions.
+pub const OVERVIEW_QUALIFYING_ROLES_SQL: &str = "('DEFINITION', 'IMPLEMENTATION', 'ORCHESTRATION')";
+
+/// Per-key edge-compatibility flag columns computed inside the qualifying
+/// definitions CTE. Mirrors `relation_candidate_edge_compatible` in
+/// `src/search/impact.rs`: `macro_like` edges pair only with `macro`
+/// definitions and `constructor_like` edges only with constructor-like block
+/// types; under the Branch B kind policy the macro flag is always 0, so
+/// `macro_like` edges never count toward rank.
+const OVERVIEW_EDGE_COMPATIBILITY_FLAGS_SQL: &str = "\
+MAX(CASE WHEN s.block_type = 'macro' THEN 1 ELSE 0 END) AS has_macro_definition,
+       MAX(CASE WHEN s.block_type IN ('constructor', 'class', 'struct', 'enum') THEN 1 ELSE 0 END) AS has_constructor_compatible_definition";
+
+/// Edge/definition compatibility predicate applied to each relation row
+/// against the pre-aggregated per-key flags (`bare_identifier` and
+/// `qualified_path` pair with any qualifying definition).
+const OVERVIEW_EDGE_COMPATIBILITY_PREDICATE_SQL: &str = "\
+CASE r.edge_identity_kind
+    WHEN 'macro_like' THEN qd.has_macro_definition
+    WHEN 'constructor_like' THEN qd.has_constructor_compatible_definition
+    ELSE 1
+  END = 1";
+
+/// Pre-aggregated qualifying definition CTE body: one row per symbol key with
+/// its qualifying definition count and edge-compatibility flags (D16 shape).
+fn overview_qualifying_definitions_cte_sql() -> String {
+    format!(
+        "SELECT ss.canonical_symbol AS symbol_key,
+       COUNT(*) AS definition_count,
+       {flags}
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.context_id = ?1
+  AND s.context_id = ?1
+  AND ss.reference_kind = 'definition'
+  AND s.block_type IN {kinds}
+  AND s.role IN {roles}
+GROUP BY ss.canonical_symbol",
+        flags = OVERVIEW_EDGE_COMPATIBILITY_FLAGS_SQL,
+        kinds = OVERVIEW_QUALIFYING_TYPE_KINDS_SQL,
+        roles = OVERVIEW_QUALIFYING_ROLES_SQL,
+    )
+}
+
+/// Depth-1 module key for a path column: the first path component, or
+/// `(root)` for top-level files.
+fn overview_depth1_module_expr_sql(path_column: &str) -> String {
+    format!(
+        "CASE WHEN instr({col}, '/') = 0 THEN '{root}' \
+         ELSE substr({col}, 1, instr({col}, '/') - 1) END",
+        col = path_column,
+        root = OVERVIEW_ROOT_MODULE_KEY,
+    )
+}
+
+/// Depth-2 module key for a path column: the first two path components.
+/// Files directly inside a depth-1 directory keep the depth-1 key, and
+/// top-level files map to `(root)`.
+fn overview_depth2_module_expr_sql(path_column: &str) -> String {
+    format!(
+        "CASE WHEN instr({col}, '/') = 0 THEN '{root}' \
+         WHEN instr(substr({col}, instr({col}, '/') + 1), '/') = 0 \
+             THEN substr({col}, 1, instr({col}, '/') - 1) \
+         ELSE substr({col}, 1, instr({col}, '/') + instr(substr({col}, instr({col}, '/') + 1), '/') - 1) END",
+        col = path_column,
+        root = OVERVIEW_ROOT_MODULE_KEY,
+    )
+}
+
+/// Per-language file and segment counts for one context.
+/// Params: `?1` context id, `?2` row limit.
+pub const SELECT_LANGUAGE_STATS_FOR_CONTEXT: &str = "
+SELECT language,
+       COUNT(DISTINCT file_path) AS file_count,
+       COUNT(*) AS segment_count
+FROM segments
+WHERE context_id = ?1
+GROUP BY language
+ORDER BY segment_count DESC, language ASC
+LIMIT ?2";
+
+/// Depth-1 module segment counts for one context.
+/// Params: `?1` context id, `?2` row limit.
+pub static SELECT_MODULE_SEGMENT_COUNTS_FOR_CONTEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {module} AS module,
+       COUNT(*) AS segment_count
+FROM segments
+WHERE context_id = ?1
+GROUP BY module
+ORDER BY segment_count DESC, module ASC
+LIMIT ?2",
+        module = overview_depth1_module_expr_sql("file_path"),
+    )
+});
+
+/// Depth-2 segment counts under one depth-1 module (dominant-module
+/// expansion). The prefix match is exact (`substr`), not LIKE, so module
+/// names containing wildcard characters cannot over-match.
+/// Params: `?1` context id, `?2` parent module key, `?3` row limit.
+pub static SELECT_MODULE_CHILD_SEGMENT_COUNTS_FOR_CONTEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {module} AS module,
+       COUNT(*) AS segment_count
+FROM segments
+WHERE context_id = ?1
+  AND substr(file_path, 1, length(?2) + 1) = ?2 || '/'
+GROUP BY module
+ORDER BY segment_count DESC, module ASC
+LIMIT ?3",
+        module = overview_depth2_module_expr_sql("file_path"),
+    )
+});
+
+/// Overview symbol ranking: distinct referencing source files per symbol key
+/// over identity-bearing relation rows equi-joined to the pre-aggregated
+/// qualifying definition CTE (D16). The per-key 1..=3 ambiguity rule is
+/// applied by the overview engine after Rust-side path exclusions, so this
+/// statement reports `definition_count` instead of capping on it.
+/// Params: `?1` context id, `?2` row limit (oversample).
+pub static SELECT_TOP_TYPE_SYMBOL_REFERENCES_FOR_CONTEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH qualifying_definitions AS (
+{cte}
+)
+SELECT r.lookup_canonical_symbol AS symbol_key,
+       COUNT(DISTINCT src.file_path) AS referencing_files,
+       qd.definition_count AS definition_count
+FROM segment_relations AS r
+JOIN segments AS src ON src.id = r.source_segment_id
+JOIN qualifying_definitions AS qd ON qd.symbol_key = r.lookup_canonical_symbol
+WHERE r.context_id = ?1
+  AND src.context_id = ?1
+  AND r.edge_identity_kind IN {edge_kinds}
+  AND {compatibility}
+GROUP BY symbol_key, qd.definition_count
+ORDER BY referencing_files DESC, symbol_key ASC
+LIMIT ?2",
+        cte = overview_qualifying_definitions_cte_sql(),
+        edge_kinds = OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL,
+        compatibility = OVERVIEW_EDGE_COMPATIBILITY_PREDICATE_SQL,
+    )
+});
+
+/// Directed depth-2 module dependency pairs sharing the symbol-ranking filter
+/// stack plus the SQL-side per-key qualifying-definition-count cap of 1..=3
+/// (design D18; counted pre-exclusion, a documented divergence from the
+/// top-symbols rule). Each pair counts distinct (referencing file, symbol
+/// key) combinations; self-edge dropping and test/low-signal target exclusion
+/// happen in the overview engine rollup.
+/// Params: `?1` context id, `?2` row limit.
+pub static SELECT_MODULE_DEPENDENCY_PAIRS_FOR_CONTEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH qualifying_definitions AS (
+{cte}
+),
+definition_modules AS (
+    SELECT ss.canonical_symbol AS symbol_key,
+           {target_module} AS target_module
+    FROM segment_symbols AS ss
+    JOIN segments AS s ON s.id = ss.segment_id
+    WHERE ss.context_id = ?1
+      AND s.context_id = ?1
+      AND ss.reference_kind = 'definition'
+      AND s.block_type IN {kinds}
+      AND s.role IN {roles}
+    GROUP BY ss.canonical_symbol, target_module
+)
+SELECT {source_module} AS source_module,
+       dm.target_module AS target_module,
+       COUNT(DISTINCT src.file_path || char(31) || r.lookup_canonical_symbol) AS pair_count
+FROM segment_relations AS r
+JOIN segments AS src ON src.id = r.source_segment_id
+JOIN qualifying_definitions AS qd
+  ON qd.symbol_key = r.lookup_canonical_symbol
+ AND qd.definition_count BETWEEN 1 AND 3
+JOIN definition_modules AS dm ON dm.symbol_key = r.lookup_canonical_symbol
+WHERE r.context_id = ?1
+  AND src.context_id = ?1
+  AND r.edge_identity_kind IN {edge_kinds}
+  AND {compatibility}
+GROUP BY source_module, dm.target_module
+ORDER BY pair_count DESC, source_module ASC, target_module ASC
+LIMIT ?2",
+        cte = overview_qualifying_definitions_cte_sql(),
+        target_module = overview_depth2_module_expr_sql("s.file_path"),
+        source_module = overview_depth2_module_expr_sql("src.file_path"),
+        kinds = OVERVIEW_QUALIFYING_TYPE_KINDS_SQL,
+        roles = OVERVIEW_QUALIFYING_ROLES_SQL,
+        edge_kinds = OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL,
+        compatibility = OVERVIEW_EDGE_COMPATIBILITY_PREDICATE_SQL,
+    )
+});
+
+/// Shallow orchestration/definition entry-point candidates for one context.
+/// Test/low-signal path exclusion happens in the overview engine, which is
+/// why callers oversample.
+/// Params: `?1` context id, `?2` row limit.
+pub const SELECT_ENTRY_POINT_CANDIDATES_FOR_CONTEXT: &str = "
+SELECT id, file_path, line_start, line_end, role, breadcrumb, defined_symbols
+FROM segments
+WHERE context_id = ?1
+  AND role IN ('ORCHESTRATION', 'DEFINITION')
+  AND block_type != 'chunk'
+ORDER BY
+  length(file_path) - length(replace(file_path, '/', '')) ASC,
+  CASE role WHEN 'ORCHESTRATION' THEN 0 ELSE 1 END ASC,
+  file_path ASC,
+  line_start ASC
+LIMIT ?2";
+
+/// Build the qualifying type definition resolution statement for `key_count`
+/// symbol keys (the oversampled ranking keys). Returned rows are ordered by
+/// symbol key, file path, line start, then segment id; kind-rank attribution
+/// and path exclusion happen in the overview engine.
+/// Params: `?1` context id, `?2..?(key_count + 1)` symbol keys,
+/// `?(key_count + 2)` row limit.
+pub fn select_qualifying_type_definitions_for_context_sql(key_count: usize) -> String {
+    let mut key_placeholders = String::new();
+    for index in 0..key_count {
+        if index > 0 {
+            key_placeholders.push_str(", ");
+        }
+        write!(key_placeholders, "?{}", index + 2).expect("write to String cannot fail");
+    }
+
+    format!(
+        "SELECT ss.canonical_symbol AS symbol_key,
+       ss.symbol,
+       s.id,
+       s.file_path,
+       s.line_start,
+       s.line_end,
+       s.block_type
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.context_id = ?1
+  AND s.context_id = ?1
+  AND ss.reference_kind = 'definition'
+  AND s.block_type IN {kinds}
+  AND s.role IN {roles}
+  AND ss.canonical_symbol IN ({keys})
+ORDER BY symbol_key ASC, s.file_path ASC, s.line_start ASC, s.id ASC
+LIMIT ?{limit_param}",
+        kinds = OVERVIEW_QUALIFYING_TYPE_KINDS_SQL,
+        roles = OVERVIEW_QUALIFYING_ROLES_SQL,
+        keys = key_placeholders,
+        limit_param = key_count + 2,
+    )
+}

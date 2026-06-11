@@ -920,6 +920,295 @@ pub async fn count_files_for_context(
     }
 }
 
+/// Per-language file and segment counts inside one index context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct LanguageStat {
+    pub language: String,
+    pub files: u64,
+    pub segments: u64,
+}
+
+/// Per-module segment count aggregated from segment file paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ModuleSegmentCount {
+    pub module: String,
+    pub segments: u64,
+}
+
+/// A shallow orchestration/definition segment that may serve as an overview
+/// entry point. Test/low-signal path exclusion happens in the overview engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct EntryPointCandidate {
+    pub segment_id: String,
+    pub file_path: String,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub role: String,
+    pub breadcrumb: Option<String>,
+    pub defined_symbols: String,
+}
+
+/// A qualifying type definition row resolved for an overview symbol key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct QualifyingTypeDefinition {
+    pub symbol_key: String,
+    pub symbol: String,
+    pub segment_id: String,
+    pub file_path: String,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub block_type: String,
+}
+
+/// Per-language file and segment counts for one index context, ordered by
+/// segment count descending then language ascending.
+#[allow(dead_code)]
+pub async fn get_language_stats_for_context(
+    conn: &Connection,
+    context_id: &str,
+    limit: usize,
+) -> Result<Vec<LanguageStat>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    let mut rows = conn
+        .query(
+            queries::SELECT_LANGUAGE_STATS_FOR_CONTEXT,
+            libsql::params![context_id, limit as i64],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("query language stats failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let files: i64 = row
+            .get(1)
+            .map_err(|e| StorageError::Query(format!("read file_count failed: {e}")))?;
+        let segments: i64 = row
+            .get(2)
+            .map_err(|e| StorageError::Query(format!("read segment_count failed: {e}")))?;
+        results.push(LanguageStat {
+            language: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read language failed: {e}")))?,
+            files: files as u64,
+            segments: segments as u64,
+        });
+    }
+
+    Ok(results)
+}
+
+async fn fetch_module_segment_counts(
+    conn: &Connection,
+    sql: &str,
+    params: impl libsql::params::IntoParams,
+) -> Result<Vec<ModuleSegmentCount>, OneupError> {
+    let mut rows = conn
+        .query(sql, params)
+        .await
+        .map_err(|e| StorageError::Query(format!("query module segment counts failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let segments: i64 = row
+            .get(1)
+            .map_err(|e| StorageError::Query(format!("read segment_count failed: {e}")))?;
+        results.push(ModuleSegmentCount {
+            module: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read module failed: {e}")))?,
+            segments: segments as u64,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Depth-1 module segment counts for one index context. The module key is the
+/// first path component; top-level files map to `(root)`.
+#[allow(dead_code)]
+pub async fn get_module_segment_counts_for_context(
+    conn: &Connection,
+    context_id: &str,
+    limit: usize,
+) -> Result<Vec<ModuleSegmentCount>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    fetch_module_segment_counts(
+        conn,
+        queries::SELECT_MODULE_SEGMENT_COUNTS_FOR_CONTEXT.as_str(),
+        libsql::params![context_id, limit as i64],
+    )
+    .await
+}
+
+/// Depth-2 segment counts under one depth-1 module for the dominant-module
+/// expansion. Files directly inside the parent stay attributed to the parent
+/// module name.
+#[allow(dead_code)]
+pub async fn get_module_child_segment_counts_for_context(
+    conn: &Connection,
+    context_id: &str,
+    parent_module: &str,
+    limit: usize,
+) -> Result<Vec<ModuleSegmentCount>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    fetch_module_segment_counts(
+        conn,
+        queries::SELECT_MODULE_CHILD_SEGMENT_COUNTS_FOR_CONTEXT.as_str(),
+        libsql::params![context_id, parent_module, limit as i64],
+    )
+    .await
+}
+
+/// Shallow orchestration/definition entry-point candidates for one index
+/// context, ordered by path depth, role rank (orchestration first), path,
+/// then line start.
+#[allow(dead_code)]
+pub async fn get_entry_point_candidates_for_context(
+    conn: &Connection,
+    context_id: &str,
+    limit: usize,
+) -> Result<Vec<EntryPointCandidate>, OneupError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    let mut rows = conn
+        .query(
+            queries::SELECT_ENTRY_POINT_CANDIDATES_FOR_CONTEXT,
+            libsql::params![context_id, limit as i64],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("query entry point candidates failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        results.push(EntryPointCandidate {
+            segment_id: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read id failed: {e}")))?,
+            file_path: row
+                .get(1)
+                .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?,
+            line_start: row
+                .get(2)
+                .map_err(|e| StorageError::Query(format!("read line_start failed: {e}")))?,
+            line_end: row
+                .get(3)
+                .map_err(|e| StorageError::Query(format!("read line_end failed: {e}")))?,
+            role: row
+                .get(4)
+                .map_err(|e| StorageError::Query(format!("read role failed: {e}")))?,
+            breadcrumb: row
+                .get(5)
+                .map_err(|e| StorageError::Query(format!("read breadcrumb failed: {e}")))?,
+            defined_symbols: row
+                .get(6)
+                .map_err(|e| StorageError::Query(format!("read defined_symbols failed: {e}")))?,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Resolve qualifying type definitions for the requested overview symbol
+/// keys inside one index context, ordered by symbol key, file path, line
+/// start, then segment id.
+#[allow(dead_code)]
+pub async fn get_qualifying_type_definitions_for_context(
+    conn: &Connection,
+    context_id: &str,
+    symbol_keys: &[String],
+    limit: usize,
+) -> Result<Vec<QualifyingTypeDefinition>, OneupError> {
+    if symbol_keys.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+    if symbol_keys.len() + 2 > queries::SQLITE_MAX_PARAMS {
+        return Err(StorageError::Query(format!(
+            "qualifying definition lookup for {} keys exceeds the {} parameter budget",
+            symbol_keys.len(),
+            queries::SQLITE_MAX_PARAMS
+        ))
+        .into());
+    }
+
+    let sql = queries::select_qualifying_type_definitions_for_context_sql(symbol_keys.len());
+    let mut params: Vec<libsql::Value> = Vec::with_capacity(symbol_keys.len() + 2);
+    params.push(context_id.to_string().into());
+    for symbol_key in symbol_keys {
+        params.push(symbol_key.clone().into());
+    }
+    params.push((limit as i64).into());
+
+    let mut rows = conn
+        .query(&sql, params)
+        .await
+        .map_err(|e| StorageError::Query(format!("query qualifying definitions failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        results.push(QualifyingTypeDefinition {
+            symbol_key: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read symbol_key failed: {e}")))?,
+            symbol: row
+                .get(1)
+                .map_err(|e| StorageError::Query(format!("read symbol failed: {e}")))?,
+            segment_id: row
+                .get(2)
+                .map_err(|e| StorageError::Query(format!("read id failed: {e}")))?,
+            file_path: row
+                .get(3)
+                .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?,
+            line_start: row
+                .get(4)
+                .map_err(|e| StorageError::Query(format!("read line_start failed: {e}")))?,
+            line_end: row
+                .get(5)
+                .map_err(|e| StorageError::Query(format!("read line_end failed: {e}")))?,
+            block_type: row
+                .get(6)
+                .map_err(|e| StorageError::Query(format!("read block_type failed: {e}")))?,
+        });
+    }
+
+    Ok(results)
+}
+
 #[allow(dead_code)]
 fn validate_replace_segments(
     file_path: &str,
@@ -2720,5 +3009,366 @@ mod tests {
         let seg_a = get_segments_by_file(&conn, "src/a.rs").await.unwrap();
         assert_eq!(seg_a.len(), 1);
         assert_eq!(seg_a[0].id, "old_a");
+    }
+
+    fn overview_segment(
+        id: &str,
+        file_path: &str,
+        language: &str,
+        block_type: &str,
+        role: &str,
+        line_start: i64,
+    ) -> SegmentInsert {
+        SegmentInsert {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            language: language.to_string(),
+            block_type: block_type.to_string(),
+            content: format!("segment {id}"),
+            line_start,
+            line_end: line_start + 2,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: role.to_string(),
+            defined_symbols: "[]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("hash-{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn language_stats_grouped_by_language() {
+        let (_db, conn) = setup().await;
+
+        for (id, path, language, line) in [
+            ("lang_rs_a1", "src/a.rs", "rust", 1),
+            ("lang_rs_a2", "src/a.rs", "rust", 10),
+            ("lang_rs_b", "src/b.rs", "rust", 1),
+            ("lang_go_1", "pkg/g.go", "go", 1),
+            ("lang_go_2", "pkg/g.go", "go", 10),
+            ("lang_go_3", "pkg/g.go", "go", 20),
+            ("lang_ts_1", "web/c.ts", "typescript", 1),
+            ("lang_ts_2", "web/c.ts", "typescript", 10),
+        ] {
+            upsert_segment_for_context(
+                &conn,
+                "ctx-a",
+                &overview_segment(id, path, language, "function", "IMPLEMENTATION", line),
+            )
+            .await
+            .unwrap();
+        }
+        upsert_segment_for_context(
+            &conn,
+            "ctx-b",
+            &overview_segment(
+                "lang_py",
+                "tools/x.py",
+                "python",
+                "function",
+                "IMPLEMENTATION",
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let stats = get_language_stats_for_context(&conn, "ctx-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats,
+            vec![
+                LanguageStat {
+                    language: "go".to_string(),
+                    files: 1,
+                    segments: 3,
+                },
+                LanguageStat {
+                    language: "rust".to_string(),
+                    files: 2,
+                    segments: 3,
+                },
+                LanguageStat {
+                    language: "typescript".to_string(),
+                    files: 1,
+                    segments: 2,
+                },
+            ]
+        );
+
+        let capped = get_language_stats_for_context(&conn, "ctx-a", 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].language, "go");
+        assert!(get_language_stats_for_context(&conn, "ctx-a", 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn module_segment_counts_aggregate_by_depth() {
+        let (_db, conn) = setup().await;
+
+        for (id, path, line) in [
+            ("mod_cli_1", "src/cli/a.rs", 1),
+            ("mod_cli_2", "src/cli/a.rs", 10),
+            ("mod_storage", "src/storage/b.rs", 1),
+            ("mod_main", "src/main.rs", 1),
+            ("mod_srcx", "srcx/z.rs", 1),
+            ("mod_tests", "tests/t.rs", 1),
+            ("mod_root", "README.md", 1),
+        ] {
+            upsert_segment_for_context(
+                &conn,
+                "ctx-a",
+                &overview_segment(id, path, "rust", "function", "IMPLEMENTATION", line),
+            )
+            .await
+            .unwrap();
+        }
+        upsert_segment_for_context(
+            &conn,
+            "ctx-b",
+            &overview_segment(
+                "mod_other",
+                "src/cli/q.rs",
+                "rust",
+                "function",
+                "IMPLEMENTATION",
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let depth1 = get_module_segment_counts_for_context(&conn, "ctx-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            depth1,
+            vec![
+                ModuleSegmentCount {
+                    module: "src".to_string(),
+                    segments: 4,
+                },
+                ModuleSegmentCount {
+                    module: "(root)".to_string(),
+                    segments: 1,
+                },
+                ModuleSegmentCount {
+                    module: "srcx".to_string(),
+                    segments: 1,
+                },
+                ModuleSegmentCount {
+                    module: "tests".to_string(),
+                    segments: 1,
+                },
+            ]
+        );
+
+        let children = get_module_child_segment_counts_for_context(&conn, "ctx-a", "src", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            children,
+            vec![
+                ModuleSegmentCount {
+                    module: "src/cli".to_string(),
+                    segments: 2,
+                },
+                ModuleSegmentCount {
+                    module: "src".to_string(),
+                    segments: 1,
+                },
+                ModuleSegmentCount {
+                    module: "src/storage".to_string(),
+                    segments: 1,
+                },
+            ]
+        );
+
+        let capped = get_module_segment_counts_for_context(&conn, "ctx-a", 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+        assert!(
+            get_module_child_segment_counts_for_context(&conn, "ctx-a", "src", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_point_candidates_role_and_depth_ordered() {
+        let (_db, conn) = setup().await;
+
+        for (id, path, block_type, role, line) in [
+            ("entry_main", "main.rs", "function", "ORCHESTRATION", 1),
+            ("entry_lib_1", "src/lib.rs", "function", "ORCHESTRATION", 1),
+            ("entry_lib_2", "src/lib.rs", "function", "ORCHESTRATION", 10),
+            ("entry_tests", "tests/t.rs", "function", "ORCHESTRATION", 1),
+            ("entry_def", "src/app.rs", "struct", "DEFINITION", 1),
+            ("entry_impl", "src/deep.rs", "function", "IMPLEMENTATION", 1),
+            ("entry_chunk", "notes.md", "chunk", "DEFINITION", 1),
+        ] {
+            upsert_segment_for_context(
+                &conn,
+                "ctx-a",
+                &overview_segment(id, path, "rust", block_type, role, line),
+            )
+            .await
+            .unwrap();
+        }
+
+        let candidates = get_entry_point_candidates_for_context(&conn, "ctx-a", 10)
+            .await
+            .unwrap();
+        let ordered: Vec<(&str, &str, i64)> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.file_path.as_str(),
+                    candidate.role.as_str(),
+                    candidate.line_start,
+                )
+            })
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("main.rs", "ORCHESTRATION", 1),
+                ("src/lib.rs", "ORCHESTRATION", 1),
+                ("src/lib.rs", "ORCHESTRATION", 10),
+                ("tests/t.rs", "ORCHESTRATION", 1),
+                ("src/app.rs", "DEFINITION", 1),
+            ]
+        );
+        assert_eq!(candidates[0].segment_id, "entry_main");
+        assert_eq!(candidates[0].line_end, 3);
+        assert_eq!(candidates[0].breadcrumb, None);
+
+        let capped = get_entry_point_candidates_for_context(&conn, "ctx-a", 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn qualifying_type_definitions_resolve_requested_keys() {
+        let (_db, conn) = setup().await;
+
+        let mut def_db = overview_segment(
+            "def_db",
+            "src/storage/db.rs",
+            "rust",
+            "struct",
+            "DEFINITION",
+            5,
+        );
+        def_db.defined_symbols = r#"["Db"]"#.to_string();
+        let mut def_db_test = overview_segment(
+            "def_db_test",
+            "tests/fixtures.rs",
+            "rust",
+            "struct",
+            "DEFINITION",
+            1,
+        );
+        def_db_test.defined_symbols = r#"["Db"]"#.to_string();
+        let mut def_status_enum = overview_segment(
+            "def_status_enum",
+            "src/shared/types.rs",
+            "rust",
+            "enum",
+            "DEFINITION",
+            1,
+        );
+        def_status_enum.defined_symbols = r#"["BranchStatus"]"#.to_string();
+        let mut def_status_fn = overview_segment(
+            "def_status_fn",
+            "src/daemon/registry.rs",
+            "rust",
+            "function",
+            "DEFINITION",
+            1,
+        );
+        def_status_fn.defined_symbols = r#"["branch_status"]"#.to_string();
+        for seg in [&def_db, &def_db_test, &def_status_enum, &def_status_fn] {
+            upsert_segment_for_context(&conn, "ctx-a", seg)
+                .await
+                .unwrap();
+        }
+        let mut def_db_other = overview_segment(
+            "def_db_other",
+            "src/other.rs",
+            "rust",
+            "struct",
+            "DEFINITION",
+            1,
+        );
+        def_db_other.defined_symbols = r#"["Db"]"#.to_string();
+        upsert_segment_for_context(&conn, "ctx-b", &def_db_other)
+            .await
+            .unwrap();
+
+        let keys = vec![
+            "db".to_string(),
+            "branchstatus".to_string(),
+            "missing".to_string(),
+        ];
+        let definitions = get_qualifying_type_definitions_for_context(&conn, "ctx-a", &keys, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            definitions,
+            vec![
+                QualifyingTypeDefinition {
+                    symbol_key: "branchstatus".to_string(),
+                    symbol: "BranchStatus".to_string(),
+                    segment_id: "def_status_enum".to_string(),
+                    file_path: "src/shared/types.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    block_type: "enum".to_string(),
+                },
+                QualifyingTypeDefinition {
+                    symbol_key: "db".to_string(),
+                    symbol: "Db".to_string(),
+                    segment_id: "def_db".to_string(),
+                    file_path: "src/storage/db.rs".to_string(),
+                    line_start: 5,
+                    line_end: 7,
+                    block_type: "struct".to_string(),
+                },
+                QualifyingTypeDefinition {
+                    symbol_key: "db".to_string(),
+                    symbol: "Db".to_string(),
+                    segment_id: "def_db_test".to_string(),
+                    file_path: "tests/fixtures.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    block_type: "struct".to_string(),
+                },
+            ]
+        );
+
+        assert!(
+            get_qualifying_type_definitions_for_context(&conn, "ctx-a", &[], 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let capped = get_qualifying_type_definitions_for_context(&conn, "ctx-a", &keys, 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2);
     }
 }
