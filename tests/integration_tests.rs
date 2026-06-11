@@ -3,9 +3,10 @@ use oneup::mcp::types::{
     RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
     TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
+use oneup::shared::constants::SCHEMA_VERSION;
 use oneup::storage::{
     db::Db,
-    schema,
+    queries, schema,
     segments::{self, IndexedFileMeta, SegmentInsert},
 };
 use predicates::prelude::*;
@@ -1093,6 +1094,64 @@ message PolicyRulePreview {
     tmp
 }
 
+/// Markdown structural-indexing fixture: a code definition
+/// (`render_widget_panel` in `src/widget/core.rs`), a real code reference
+/// (`src/widget/dashboard.rs`), and a structured guide
+/// (`docs/widget_guide.md`) whose nested headings produce four doc sections
+/// (`Widget Guide` 1-4, `Rendering` 5-12, `Theming` 13-14, `Accent Colors`
+/// 15-17). Inline and fenced code mentions of `render_widget_panel` attach to
+/// the `Rendering` and `Accent Colors` sections.
+fn create_markdown_docs_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src").join("widget")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("widget").join("core.rs"),
+        r#"pub fn render_widget_panel() -> &'static str {
+    "panel"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("widget").join("dashboard.rs"),
+        r#"use crate::widget::core::render_widget_panel;
+
+pub fn draw_dashboard() -> &'static str {
+    render_widget_panel()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("widget_guide.md"),
+        r#"# Widget Guide
+
+Orientation notes for the widget panel stack.
+
+## Rendering
+
+The dashboard surface calls `render_widget_panel` on every refresh tick.
+
+```rust
+let panel = render_widget_panel();
+```
+
+## Theming
+
+### Accent Colors
+
+Accent color guidance: tint palette swatches for the `render_widget_panel` chrome.
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
 fn create_ambiguous_handle_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("src");
@@ -1733,6 +1792,198 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
             "query {query:?} should keep a stable top-3 result set"
         );
     }
+}
+
+// =============================================================================
+// Markdown structural indexing — doc sections, mentions, impact, schema gate
+// =============================================================================
+
+fn count_index_rows(project: &Path, sql: &str) -> i64 {
+    let project = project.canonicalize().unwrap();
+    block_on(async {
+        let db = Db::open_ro(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get::<i64>(0).unwrap()
+    })
+}
+
+#[test]
+fn markdown_doc_topic_search_returns_heading_scoped_section_with_breadcrumb() {
+    // REQ-005: a documentation-topic query returns the heading-scoped doc
+    // section with its document-rooted breadcrumb. Runs FTS-only, which also
+    // pins degraded-path discoverability of markdown doc segments.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "accent color tint guide documentation");
+    assert!(!rows.is_empty(), "doc-topic query should return rows");
+
+    let top = &rows[0];
+    assert_eq!(top.file_path, "docs/widget_guide.md");
+    assert_eq!(top.kind, "doc_section");
+    assert_eq!(
+        (top.line_start, top.line_end),
+        (15, 17),
+        "expected the `Accent Colors` section span: {top:?}"
+    );
+    assert_eq!(
+        top.breadcrumb,
+        "widget_guide > Widget Guide > Theming > Accent Colors"
+    );
+}
+
+#[test]
+fn markdown_symbol_references_include_doc_mentions() {
+    // REQ-003: documentation mentions surface through the existing symbol
+    // reference lookup with doc-section provenance, alongside (not replacing)
+    // code usages.
+    let tmp = create_markdown_docs_fixture();
+    init_and_index(&tmp);
+
+    let rows = symbol_rows(tmp.path(), "render_widget_panel", &["--references"]);
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("def:") && r.file_path == "src/widget/core.rs"),
+        "definition row missing: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("usage:") && r.file_path == "src/widget/dashboard.rs"),
+        "code usage row missing: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.file_path == "docs/widget_guide.md"
+            && r.kind == "usage:doc_section"
+            && r.symbol == "render_widget_panel"
+            && r.breadcrumb == "widget_guide > Widget Guide > Rendering"),
+        "doc mention row with section breadcrumb missing: {rows:?}"
+    );
+}
+
+#[test]
+fn markdown_impact_excludes_doc_mentions_while_code_reference_promotes() {
+    // REQ-004 at the integration level: indexing stores doc_mention relation
+    // rows for the markdown sections, yet anchored impact never surfaces the
+    // doc segments in either trust bucket while the real code reference still
+    // promotes to primary.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let doc_mention_rows = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segment_relations r \
+         JOIN segments s ON s.id = r.source_segment_id \
+         WHERE r.edge_identity_kind = 'doc_mention' \
+         AND s.file_path = 'docs/widget_guide.md'",
+    );
+    assert!(
+        doc_mention_rows >= 2,
+        "both mentioning sections should store doc_mention relation rows, got {doc_mention_rows}"
+    );
+
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "render_widget_panel"]);
+    assert!(
+        rows.iter()
+            .any(|r| r.channel == Some('P') && r.file_path == "src/widget/dashboard.rs"),
+        "code reference should still promote to primary: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.file_path != "docs/widget_guide.md"),
+        "doc-mention edges must not appear in any impact bucket: {rows:?}"
+    );
+}
+
+#[test]
+fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
+    // REQ-005: doc sections participate in the embedding path like any other
+    // structural segment. Vector coverage is asserted only when this run
+    // actually embedded (the local model is a machine-level artifact);
+    // FTS-only discoverability is covered by the doc-topic search test.
+    let _model_guard = RestoreHiddenModelGuard::new();
+    let tmp = create_markdown_docs_fixture();
+    init_project(tmp.path());
+    let payload = run_index_json(tmp.path(), &[]);
+
+    if payload["progress"]["embeddings_enabled"] != true {
+        eprintln!(
+            "skipping vector-row assertions: embedding model unavailable in this environment"
+        );
+        return;
+    }
+
+    let doc_segments = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments WHERE block_type = 'doc_section'",
+    );
+    let doc_vectors = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments s \
+         JOIN segment_vectors v ON v.segment_id = s.id \
+         WHERE s.block_type = 'doc_section'",
+    );
+    assert!(
+        doc_segments > 0,
+        "fixture should produce doc_section segments"
+    );
+    assert_eq!(
+        doc_vectors, doc_segments,
+        "every doc_section segment should carry a vector row"
+    );
+}
+
+#[test]
+fn prior_schema_version_index_fails_closed_with_reindex_guidance() {
+    // REQ-006: a fresh index at the current schema version serves reads;
+    // downgrading the stored version to the immediate prior value (v14 at the
+    // v15 bump) fails discovery closed with explicit reindex guidance.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "accent color tint guide documentation");
+    assert!(
+        !rows.is_empty(),
+        "fresh current-version index should serve search"
+    );
+
+    let project_root = tmp.path().canonicalize().unwrap();
+    block_on(async {
+        let db = Db::open_rw(&project_root.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            ["schema_version", &(SCHEMA_VERSION - 1).to_string()],
+        )
+        .await
+        .unwrap();
+    });
+
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "search",
+        "accent color tint guide documentation",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(
+        !ok,
+        "stale prior-version index must fail closed; stdout={stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "found v{}, expected v{SCHEMA_VERSION}",
+            SCHEMA_VERSION - 1
+        )),
+        "stale-schema error should name found/expected versions: {stderr}"
+    );
+    assert!(
+        stderr.contains("1up reindex"),
+        "stale-schema error should carry reindex guidance: {stderr}"
+    );
 }
 
 // =============================================================================
