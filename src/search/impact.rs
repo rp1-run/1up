@@ -1036,10 +1036,10 @@ impl<'a> ImpactHorizonEngine<'a> {
 }
 
 /// Doc-mention relations are descriptive documentation evidence, not dependency
-/// evidence. Dropping them immediately after fetch in both relation collectors
-/// keeps them out of primary impact buckets and frontier expansion at a single
-/// chokepoint; budget accounting then decrements by the retained count so
-/// docs-heavy symbols do not starve real relation budget.
+/// evidence. The relation queries impact uses already exclude them in SQL so
+/// they never consume the bounded fetch windows; this post-fetch guard is
+/// defense in depth, keeping impact safe from doc rows even if a future query
+/// change drops that predicate.
 fn discard_doc_mention_relations(relations: &mut Vec<StoredRelation>) {
     relations.retain(|relation| relation.edge_identity_kind != EDGE_IDENTITY_DOC_MENTION);
 }
@@ -4233,5 +4233,80 @@ mod tests {
             .iter()
             .chain(result.contextual_results.iter().flatten())
             .all(|candidate| !candidate.segment_id.starts_with("alpha-doc-")));
+    }
+
+    #[tokio::test]
+    async fn heavily_documented_symbol_keeps_same_kind_references_in_budget() {
+        let (_db, conn) = setup().await;
+        let mut fixtures = vec![
+            make_segment(SegmentFixture {
+                id: "gamma-def",
+                file_path: "src/widgets/gamma.rs",
+                line_start: 1,
+                block_type: "struct",
+                role: "DEFINITION",
+                defined_symbols: &["WidgetGamma"],
+                referenced_symbols: &[],
+                called_symbols: &[],
+            }),
+            make_segment_with_referenced_relations(
+                SegmentFixture {
+                    id: "zz-gamma-consumer",
+                    file_path: "src/widgets/consumer.rs",
+                    line_start: 10,
+                    block_type: "function",
+                    role: "IMPLEMENTATION",
+                    defined_symbols: &["consume_gamma"],
+                    referenced_symbols: &["WidgetGamma"],
+                    called_symbols: &[],
+                },
+                &[ParsedRelation {
+                    symbol: "WidgetGamma".to_string(),
+                    edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+                    kind: Some(ParsedRelationKind::Reference),
+                }],
+            ),
+        ];
+        // The doc mentions share both the symbol and RelationKind::Reference
+        // with the real consumer, and their segment ids sort before it, so
+        // they fill the whole inbound fetch window whenever doc rows are
+        // allowed to consume the SQL LIMIT budget.
+        for idx in 0..MAX_INBOUND_RELATIONS_PER_HOP {
+            fixtures.push(make_doc_section_segment(
+                Box::leak(format!("gamma-doc-{idx}").into_boxed_str()),
+                "docs/gamma.md",
+                idx * 10 + 1,
+                &["WidgetGamma"],
+                &[doc_mention_relation("WidgetGamma")],
+            ));
+        }
+        insert_segments(&conn, fixtures).await;
+
+        let engine = ImpactHorizonEngine::new(&conn);
+        let result = engine
+            .explore(ImpactRequest {
+                anchor: ImpactAnchor::Symbol {
+                    name: "WidgetGamma".to_string(),
+                },
+                scope: None,
+                depth: 1,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .results
+                .iter()
+                .chain(result.contextual_results.iter().flatten())
+                .any(|candidate| candidate.segment_id == "zz-gamma-consumer"),
+            "real same-kind reference must survive doc_mention crowding: {result:?}"
+        );
+        assert!(result
+            .results
+            .iter()
+            .chain(result.contextual_results.iter().flatten())
+            .all(|candidate| !candidate.segment_id.starts_with("gamma-doc-")));
     }
 }

@@ -1642,6 +1642,157 @@ fn release_evidence_rejects_archive_verification_without_smoke_results() {
         .contains("archive verification summary is missing required fields"));
 }
 
+#[test]
+fn release_evidence_rejects_smoke_results_missing_overview_label() {
+    let Some(host_release_target) = supported_host_release_target() else {
+        return;
+    };
+    let fixture_root = build_release_fixture();
+    write_release_changelog(fixture_root.path(), TEST_RELEASE_VERSION);
+    let dist_dir = write_verifiable_release_artifacts(fixture_root.path(), TEST_RELEASE_VERSION);
+    let merge_gate_path = dist_dir.join("merge-gate.json");
+    let security_check_path = dist_dir.join("security-check.json");
+    let archive_verification_path = dist_dir.join("archive-verification.json");
+    let output_path = dist_dir.join("release-evidence.json");
+
+    fs::write(
+        &merge_gate_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workflow": "ci",
+            "run_id": 42,
+            "run_number": 7,
+            "run_url": "https://github.com/rp1-run/1up/actions/runs/42",
+            "head_sha": "abc123def456",
+            "conclusion": "success",
+            "required_checks": ["security-check"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &security_check_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "passed"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Smoke evidence covering only the original eight per-call labels: the
+    // nine-tool gate must reject it because oneup_overview was never
+    // independently re-verified.
+    let eight_labels = [
+        "status",
+        "start",
+        "search",
+        "get",
+        "symbol",
+        "context",
+        "impact",
+        "structural",
+    ];
+    let nine_tools = [
+        "oneup_status",
+        "oneup_start",
+        "oneup_search",
+        "oneup_get",
+        "oneup_symbol",
+        "oneup_context",
+        "oneup_impact",
+        "oneup_structural",
+        "oneup_overview",
+    ];
+    let tool_calls: Vec<serde_json::Value> = eight_labels
+        .iter()
+        .map(|label| {
+            serde_json::json!({
+                "label": label,
+                "name": format!("oneup_{label}"),
+                "status": "ok",
+                "structured_content": true,
+                "presentation_free": true
+            })
+        })
+        .collect();
+    let structured_content_present: serde_json::Value = eight_labels
+        .iter()
+        .map(|label| (label.to_string(), serde_json::Value::Bool(true)))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+    fs::write(
+        &archive_verification_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "generated_at": "2026-04-09T00:00:00Z",
+            "manifest_asset": "release-manifest.json",
+            "checksums_asset": "SHA256SUMS",
+            "archive_count": 1,
+            "archives": [{
+                "target": host_release_target,
+                "archive": format!(
+                    "1up-v{TEST_RELEASE_VERSION}-{host_release_target}.{}",
+                    if host_release_target.contains("windows") { "zip" } else { "tar.gz" }
+                ),
+                "sha256": "abc123",
+                "verified_contents": {
+                    "binary": "1up",
+                    "license": "LICENSE",
+                    "readme": "README.txt"
+                },
+                "smoke_test": {
+                    "status": "passed",
+                    "command": "1up --version",
+                    "output": "1up fixture"
+                },
+                "mcp_smoke_test": {
+                    "schema": "mcp_smoke.v2",
+                    "status": "passed",
+                    "binary": "1up",
+                    "version": "1up fixture",
+                    "server_command": ["1up", "mcp", "--path", "/tmp/repo"],
+                    "tools": nine_tools,
+                    "exercised_tools": nine_tools,
+                    "tool_calls": tool_calls,
+                    "structured_content_present": structured_content_present,
+                    "readiness_status": "degraded",
+                    "discovery_flow": { "status": "passed" },
+                    "stdout_protocol_clean": true,
+                    "presentation_free": true
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run_release_script(
+        fixture_root.path(),
+        "generate_release_evidence.sh",
+        &[
+            "--manifest",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--merge-gate",
+            merge_gate_path.to_str().unwrap(),
+            "--security-check",
+            security_check_path.to_str().unwrap(),
+            "--eval-skipped-reason",
+            "Hosted eval artifacts are not retained for this release candidate.",
+            "--benchmark-skipped-reason",
+            "Benchmark evidence is not retained for this release candidate.",
+            "--archive-verification",
+            archive_verification_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "release evidence unexpectedly accepted smoke results without the overview label: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("archive verification summary is missing required fields"));
+}
+
 #[cfg(unix)]
 #[test]
 fn retained_security_download_helper_uses_run_artifact() {

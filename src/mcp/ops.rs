@@ -18,7 +18,9 @@ use crate::search::overview;
 use crate::search::retrieval;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
-use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
+use crate::shared::constants::{
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
+};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
@@ -636,11 +638,6 @@ pub async fn run_search(
     retry_on_db_lock(|| async { run_search_once(state_root, worktree_context, query, limit).await })
         .await
 }
-
-/// Degraded reason emitted when the local index holds no vector rows for the
-/// active context, so search stays FTS-only without touching the embedder.
-pub(crate) const NO_INDEXED_EMBEDDINGS_REASON: &str =
-    "index contains no embeddings for this context; semantic ranking disabled (FTS-only)";
 
 async fn run_search_once(
     state_root: &Path,

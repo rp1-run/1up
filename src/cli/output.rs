@@ -570,7 +570,7 @@ impl Formatter for HumanFormatter {
             "Embeddings: {}\n",
             render_embeddings_human(progress.embeddings_enabled)
         ));
-        out.push_str(&render_embedding_outcome_human(progress));
+        out.push_str(&render_embedding_outcome_human(progress, "Vector coverage"));
         out.push_str(&format!("Updated: {}\n", progress.updated_at.to_rfc3339()));
         out
     }
@@ -755,7 +755,10 @@ impl Formatter for HumanFormatter {
                 "Embeddings: {}\n",
                 render_embeddings_human(progress.embeddings_enabled)
             ));
-            out.push_str(&render_embedding_outcome_human(progress));
+            out.push_str(&render_embedding_outcome_human(
+                progress,
+                "Last run vector coverage",
+            ));
             out.push_str(&format!(
                 "Updated: {} ({})\n",
                 render_time_ago(&progress.updated_at),
@@ -1002,7 +1005,7 @@ impl Formatter for PlainFormatter {
             progress.segments_stored,
             render_embeddings_plain(progress.embeddings_enabled),
         ));
-        out.push_str(&render_embedding_outcome_plain(progress));
+        out.push_str(&render_embedding_outcome_plain(progress, ""));
         if let Some(parallelism) = &progress.parallelism {
             out.push_str(&format!(
                 "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
@@ -1151,7 +1154,7 @@ impl Formatter for PlainFormatter {
                 progress.segments_stored,
                 render_embeddings_plain(progress.embeddings_enabled),
             ));
-            out.push_str(&render_embedding_outcome_plain(progress));
+            out.push_str(&render_embedding_outcome_plain(progress, "last_"));
             out.push_str(&format!("\tlast_processed:{}", progress.files_processed));
             if let Some(message) = progress.message.as_deref() {
                 out.push_str(&format!("\tindex_message:{}", plain_field(message)));
@@ -1603,8 +1606,10 @@ fn render_embeddings_human(enabled: bool) -> String {
 
 /// Renders the stored embedding outcome lines for an index run: the
 /// unavailable reason when the run could not honestly claim embeddings, and
-/// stored-vector coverage when the run measured it.
-fn render_embedding_outcome_human(progress: &IndexProgress) -> String {
+/// stored-vector coverage when the run measured it. `coverage_label`
+/// qualifies the coverage line so status output, which already reports live
+/// DB coverage under `Vector coverage:`, never emits two identical labels.
+fn render_embedding_outcome_human(progress: &IndexProgress, coverage_label: &str) -> String {
     let mut out = String::new();
     if let Some(reason) = progress.embedding_unavailable_reason.as_deref() {
         out.push_str(&format!("Embedding status: {}\n", reason.yellow()));
@@ -1612,7 +1617,7 @@ fn render_embedding_outcome_human(progress: &IndexProgress) -> String {
     if let (Some(vectors), Some(embeddable)) = (progress.vector_rows, progress.embeddable_segments)
     {
         out.push_str(&format!(
-            "Vector coverage: {vectors}/{embeddable} embeddable segments\n"
+            "{coverage_label}: {vectors}/{embeddable} embeddable segments\n"
         ));
     }
     out
@@ -1679,7 +1684,11 @@ fn render_embeddings_plain(enabled: bool) -> &'static str {
 }
 
 /// Plain-format counterpart of [`render_embedding_outcome_human`].
-fn render_embedding_outcome_plain(progress: &IndexProgress) -> String {
+/// `coverage_key_prefix` keeps the status record collision-free: the index
+/// summary emits the stable `vector_rows`/`embeddable_segments` identifiers,
+/// while the status record prefixes its progress-sourced copies with `last_`
+/// because it already emits those keys from live DB counts.
+fn render_embedding_outcome_plain(progress: &IndexProgress, coverage_key_prefix: &str) -> String {
     let mut out = String::new();
     if let Some(reason) = progress.embedding_unavailable_reason.as_deref() {
         out.push_str(&format!(
@@ -1690,7 +1699,7 @@ fn render_embedding_outcome_plain(progress: &IndexProgress) -> String {
     if let (Some(vectors), Some(embeddable)) = (progress.vector_rows, progress.embeddable_segments)
     {
         out.push_str(&format!(
-            "\tvector_rows:{vectors}\tembeddable_segments:{embeddable}"
+            "\t{coverage_key_prefix}vector_rows:{vectors}\t{coverage_key_prefix}embeddable_segments:{embeddable}"
         ));
     }
     out
@@ -2383,10 +2392,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plain_status_renders_last_work_and_total_duration() {
-        let formatter = PlainFormatter;
-        let rendered = formatter.format_status(&StatusInfo {
+    fn sample_status() -> StatusInfo {
+        StatusInfo {
             lifecycle_state: LifecycleState::Active,
             registered: true,
             daemon_running: true,
@@ -2415,7 +2422,13 @@ mod tests {
             index_readable: true,
             last_file_check_at: Some(sample_progress().updated_at),
             index_progress: Some(sample_progress()),
-        });
+        }
+    }
+
+    #[test]
+    fn plain_status_renders_last_work_and_total_duration() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_status(&sample_status());
 
         assert!(rendered.starts_with("lifecycle:active\tregistered:true\tdaemon:running"));
         assert!(rendered.contains("project_root:/repo"));
@@ -2433,6 +2446,58 @@ mod tests {
         assert!(!rendered.contains("last_file_check_ago"));
         assert!(!rendered.contains("\tago:"));
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn plain_status_emits_live_and_last_run_vector_keys_once_each() {
+        let formatter = PlainFormatter;
+        let mut status = sample_status();
+        status.vector_rows = Some(9);
+        status.embeddable_segments = Some(10);
+
+        let rendered = formatter.format_status(&status);
+
+        assert_eq!(
+            rendered.matches("\tvector_rows:").count(),
+            1,
+            "live vector_rows must appear exactly once: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("\tembeddable_segments:").count(),
+            1,
+            "live embeddable_segments must appear exactly once: {rendered}"
+        );
+        assert!(rendered.contains("\tvector_rows:9"));
+        assert!(rendered.contains("\tembeddable_segments:10"));
+        assert!(rendered.contains("\tlast_vector_rows:14"));
+        assert!(rendered.contains("\tlast_embeddable_segments:14"));
+    }
+
+    #[test]
+    fn human_status_qualifies_last_run_vector_coverage() {
+        let formatter = HumanFormatter;
+        let mut status = sample_status();
+        status.vector_rows = Some(9);
+        status.embeddable_segments = Some(10);
+
+        let rendered = formatter.format_status(&status);
+
+        assert_eq!(
+            rendered.matches("Vector coverage:").count(),
+            1,
+            "the live coverage line must be the only identically-labeled one: {rendered}"
+        );
+        assert!(rendered.contains("Vector coverage: 9/10 embeddable segments"));
+        assert!(rendered.contains("Last run vector coverage: 14/14 embeddable segments"));
+    }
+
+    #[test]
+    fn plain_index_summary_keeps_unprefixed_vector_keys() {
+        let formatter = PlainFormatter;
+        let rendered = formatter.format_index_summary("indexed", &sample_progress());
+
+        assert!(rendered.contains("\tvector_rows:14\tembeddable_segments:14"));
+        assert!(!rendered.contains("last_vector_rows"));
     }
 
     #[test]

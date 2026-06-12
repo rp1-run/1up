@@ -1,4 +1,7 @@
+mod common;
+
 use assert_cmd::Command;
+use common::{HideModelGuard, MODEL_MUTEX};
 use oneup::mcp::types::{
     RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
     TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
@@ -15,15 +18,12 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, net::UnixStream};
-
-static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
 fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
@@ -506,91 +506,6 @@ impl Drop for McpTestClient {
     }
 }
 
-/// RAII guard that temporarily hides the embedding model to force FTS-only mode.
-/// On drop, the model is restored. This works around a pre-existing vector
-/// dimension mismatch bug in the int8 search path. Holds a mutex to prevent
-/// concurrent test interference.
-struct HideModelGuard {
-    model_path: PathBuf,
-    hidden_path: PathBuf,
-    current_path: PathBuf,
-    hidden_current_path: PathBuf,
-    verified_path: PathBuf,
-    hidden_verified_path: PathBuf,
-    marker_path: PathBuf,
-    active: bool,
-    current_active: bool,
-    verified_active: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl HideModelGuard {
-    fn new() -> Self {
-        let lock = MODEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-        let model_dir = dirs::data_dir()
-            .unwrap()
-            .join("1up")
-            .join("models")
-            .join("all-MiniLM-L6-v2");
-        let _ = fs::create_dir_all(&model_dir);
-        let model_path = model_dir.join("model.onnx");
-        let hidden_path = model_dir.join("model.onnx.hidden_by_test");
-        let current_path = model_dir.join("current.json");
-        let hidden_current_path = model_dir.join("current.json.hidden_by_test");
-        let verified_path = model_dir.join("verified");
-        let hidden_verified_path = model_dir.join("verified.hidden_by_test");
-        let marker_path = model_dir.join(".download_failed");
-
-        let active = model_path.exists();
-        if active {
-            fs::rename(&model_path, &hidden_path).unwrap();
-        }
-        let current_active = current_path.exists();
-        if current_active {
-            fs::rename(&current_path, &hidden_current_path).unwrap();
-        }
-        // Hide the verified artifact store too: resolution self-heals from
-        // intact verified artifacts when the pointer is missing, so leaving
-        // it visible would re-enable the model under this guard.
-        let verified_active = verified_path.exists();
-        if verified_active {
-            fs::rename(&verified_path, &hidden_verified_path).unwrap();
-        }
-        // Create download failure marker to prevent auto-download during tests
-        let _ = fs::write(&marker_path, "hidden_by_test");
-
-        Self {
-            model_path,
-            hidden_path,
-            current_path,
-            hidden_current_path,
-            verified_path,
-            hidden_verified_path,
-            marker_path,
-            active,
-            current_active,
-            verified_active,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for HideModelGuard {
-    fn drop(&mut self) {
-        if self.active && self.hidden_path.exists() {
-            let _ = fs::rename(&self.hidden_path, &self.model_path);
-        }
-        if self.current_active && self.hidden_current_path.exists() {
-            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
-        }
-        if self.verified_active && self.hidden_verified_path.exists() {
-            let _ = fs::rename(&self.hidden_verified_path, &self.verified_path);
-        }
-        let _ = fs::remove_file(&self.marker_path);
-    }
-}
-
 struct RestoreHiddenModelGuard {
     model_path: PathBuf,
     hidden_path: PathBuf,
@@ -918,7 +833,7 @@ fn search_rows_with_home(home: &Path, dir: &std::path::Path, query: &str) -> Vec
     parse_discovery_rows(&stdout)
 }
 
-fn git(repo: &std::path::Path, args: &[&str]) {
+fn git_output(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -929,6 +844,11 @@ fn git(repo: &std::path::Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    git_output(repo, args);
 }
 
 fn create_branch_filtering_fixture() -> (TempDir, PathBuf, PathBuf) {
@@ -2634,44 +2554,22 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     );
 }
 
-fn git_in(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("git command failed to spawn");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn git_head_oid(dir: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .expect("git rev-parse failed to spawn");
-    assert!(
-        output.status.success(),
-        "git rev-parse HEAD failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = git_output(dir, &["rev-parse", "HEAD"]);
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 #[test]
 fn mcp_status_reports_head_drift_and_start_clears_it() {
     let repo = create_multi_lang_fixture();
-    git_in(repo.path(), &["init"]);
-    git_in(
+    git(repo.path(), &["init"]);
+    git(
         repo.path(),
         &["config", "user.email", "oneup-test@example.com"],
     );
-    git_in(repo.path(), &["config", "user.name", "1up Test"]);
-    git_in(repo.path(), &["add", "."]);
-    git_in(repo.path(), &["commit", "-m", "initial"]);
+    git(repo.path(), &["config", "user.name", "1up Test"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "initial"]);
     let indexed_head = git_head_oid(repo.path());
 
     let _guard = init_and_index_fts_only(&repo);
@@ -2706,8 +2604,8 @@ fn mcp_status_reports_head_drift_and_start_clears_it() {
         "pub fn head_drift_marker() {}\n",
     )
     .unwrap();
-    git_in(repo.path(), &["add", "."]);
-    git_in(repo.path(), &["commit", "-m", "move head"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "move head"]);
     let moved_head = git_head_oid(repo.path());
     assert_ne!(indexed_head, moved_head);
 

@@ -431,14 +431,16 @@ pub fn is_model_available() -> bool {
 }
 
 /// Resolves model availability for status surfaces without initializing an
-/// inference session.
+/// inference session and without writing to the model directory.
 ///
-/// Returns `None` when a verified artifact resolves (repairing or activating
-/// persisted state exactly like the search path would), and the unavailable
-/// reason otherwise. Status and search consume the same resolution, so they
-/// cannot disagree about model availability.
+/// Returns `None` when a verified artifact would resolve, and the unavailable
+/// reason otherwise. Status calls stay read-only: this peeks at persisted
+/// state and reaches the same availability verdict the prepare paths would,
+/// while pointer repair and the one-time legacy import stay gated to the
+/// indexing and start paths. Status and search therefore still agree about
+/// model availability; self-healing simply happens on the next prepare call.
 pub fn model_unavailable_reason_for_status() -> Option<EmbeddingUnavailableReason> {
-    let model_root = match ensure_secure_model_root() {
+    let model_root = match model_dir() {
         Ok(dir) => dir,
         Err(err) => {
             return Some(EmbeddingUnavailableReason::ModelDirUnavailable(
@@ -447,7 +449,13 @@ pub fn model_unavailable_reason_for_status() -> Option<EmbeddingUnavailableReaso
         }
     };
 
-    match resolve_model_state(&model_root) {
+    model_unavailable_reason_for_status_at(&model_root)
+}
+
+/// Read-only core of [`model_unavailable_reason_for_status`], split out so
+/// tests can pin the no-write guarantee against a temp model root.
+fn model_unavailable_reason_for_status_at(model_root: &Path) -> Option<EmbeddingUnavailableReason> {
+    match peek_model_state(model_root) {
         Ok(ModelResolution::Active(_)) => None,
         Ok(ModelResolution::Unverifiable(detail)) => {
             Some(EmbeddingUnavailableReason::ArtifactsUnverifiable(detail))
@@ -869,6 +877,37 @@ fn resolve_model_state(model_root: &Path) -> Result<ModelResolution, OneupError>
     }
 }
 
+/// Read-only counterpart of [`resolve_model_state`] for status surfaces:
+/// reaches the same availability verdict the prepare paths would, but never
+/// writes. Pointer repair and the one-time legacy import (~90MB copy) stay
+/// gated to the indexing and start paths, which call
+/// [`resolve_model_state`].
+fn peek_model_state(model_root: &Path) -> Result<ModelResolution, OneupError> {
+    let pointer_detail = match try_load_active_artifact_dir(model_root)? {
+        ActivePointerState::Active(dir) => return Ok(ModelResolution::Active(dir)),
+        ActivePointerState::Broken(detail) => Some(detail),
+        ActivePointerState::Missing => None,
+    };
+
+    if let Some((_, artifact_dir)) = find_intact_verified_artifact(model_root) {
+        return Ok(ModelResolution::Active(artifact_dir));
+    }
+
+    match verify_legacy_artifacts(model_root)? {
+        LegacyArtifactState::Verified => Ok(ModelResolution::Active(model_root.to_path_buf())),
+        LegacyArtifactState::Unverifiable(legacy_detail) => {
+            Ok(ModelResolution::Unverifiable(match pointer_detail {
+                Some(pointer_detail) => format!("{pointer_detail}; {legacy_detail}"),
+                None => legacy_detail,
+            }))
+        }
+        LegacyArtifactState::Absent => match pointer_detail {
+            Some(detail) => Ok(ModelResolution::Unverifiable(detail)),
+            None => Ok(ModelResolution::Missing),
+        },
+    }
+}
+
 fn resolve_model_dir_without_download(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
     Ok(match resolve_model_state(model_root)? {
         ModelResolution::Active(dir) => Some(dir),
@@ -957,11 +996,20 @@ fn try_load_active_artifact_dir(model_root: &Path) -> Result<ActivePointerState,
 fn repair_pointer_from_verified_artifacts(
     model_root: &Path,
 ) -> Result<Option<PathBuf>, OneupError> {
+    match find_intact_verified_artifact(model_root) {
+        Some((artifact_id, artifact_dir)) => {
+            write_active_artifact_pointer(model_root, &artifact_id)?;
+            Ok(Some(artifact_dir))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Locates a verified artifact whose manifest matches the pinned model and
+/// whose files digest-verify, without touching persisted state.
+fn find_intact_verified_artifact(model_root: &Path) -> Option<(String, PathBuf)> {
     let verified_root = verified_dir_path(model_root);
-    let entries = match fs::read_dir(&verified_root) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
+    let entries = fs::read_dir(&verified_root).ok()?;
 
     for entry in entries.flatten() {
         let artifact_id = match entry.file_name().into_string() {
@@ -991,14 +1039,22 @@ fn repair_pointer_from_verified_artifacts(
             continue;
         }
 
-        write_active_artifact_pointer(model_root, &artifact_id)?;
-        return Ok(Some(artifact_dir));
+        return Some((artifact_id, artifact_dir));
     }
 
-    Ok(None)
+    None
 }
 
-fn try_activate_legacy_artifacts(model_root: &Path) -> Result<LegacyActivation, OneupError> {
+/// Read-only digest verification of the legacy flat-file artifact layout.
+enum LegacyArtifactState {
+    Verified,
+    /// Legacy files are present (fully or partially) but failed verification.
+    Unverifiable(String),
+    /// No complete legacy file set exists.
+    Absent,
+}
+
+fn verify_legacy_artifacts(model_root: &Path) -> Result<LegacyArtifactState, OneupError> {
     let legacy_paths: Vec<PathBuf> = EXPECTED_ARTIFACT_FILES
         .iter()
         .map(|artifact| model_root.join(artifact.filename))
@@ -1007,19 +1063,35 @@ fn try_activate_legacy_artifacts(model_root: &Path) -> Result<LegacyActivation, 
     // missing files are an absence to be downloaded through the marker-gated
     // path, while wrong content on a complete set is a verification failure.
     if legacy_paths.iter().any(|path| !path.exists()) {
-        return Ok(LegacyActivation::Absent);
+        return Ok(LegacyArtifactState::Absent);
     }
 
     for (artifact, path) in EXPECTED_ARTIFACT_FILES.iter().zip(legacy_paths.iter()) {
         let digest = sha256_digest_file(path)?;
         if digest != artifact.sha256 {
-            return Ok(LegacyActivation::Unverifiable(format!(
+            return Ok(LegacyArtifactState::Unverifiable(format!(
                 "legacy {} failed digest verification",
                 artifact.label
             )));
         }
     }
 
+    Ok(LegacyArtifactState::Verified)
+}
+
+fn try_activate_legacy_artifacts(model_root: &Path) -> Result<LegacyActivation, OneupError> {
+    match verify_legacy_artifacts(model_root)? {
+        LegacyArtifactState::Verified => {}
+        LegacyArtifactState::Unverifiable(detail) => {
+            return Ok(LegacyActivation::Unverifiable(detail))
+        }
+        LegacyArtifactState::Absent => return Ok(LegacyActivation::Absent),
+    }
+
+    let legacy_paths: Vec<PathBuf> = EXPECTED_ARTIFACT_FILES
+        .iter()
+        .map(|artifact| model_root.join(artifact.filename))
+        .collect();
     let artifact_id = format!(
         "v{}-{}",
         MODEL_ARTIFACT_MANIFEST_VERSION,
@@ -1631,6 +1703,100 @@ mod tests {
         assert!(
             current_manifest_path(&model_root).exists(),
             "repair must persist a fresh pointer"
+        );
+    }
+
+    #[test]
+    fn status_reason_check_does_not_repair_missing_pointer() {
+        // Status surfaces must stay read-only: a missing pointer with an
+        // intact verified artifact reports the model as available without
+        // persisting a repaired pointer (that write belongs to the indexing
+        // and start paths).
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let runtime_dir = runtime_model_dir();
+        std::fs::copy(
+            runtime_dir.join(MODEL_FILENAME),
+            model_root.join(MODEL_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(TOKENIZER_FILENAME),
+            model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+        resolve_model_dir_without_download(&model_root)
+            .unwrap()
+            .expect("legacy artifacts should activate");
+        std::fs::remove_file(model_root.join(MODEL_FILENAME)).unwrap();
+        std::fs::remove_file(model_root.join(TOKENIZER_FILENAME)).unwrap();
+        std::fs::remove_file(current_manifest_path(&model_root)).unwrap();
+
+        let reason = model_unavailable_reason_for_status_at(&model_root);
+
+        assert!(
+            reason.is_none(),
+            "an intact verified artifact must report the model as available, got {reason:?}"
+        );
+        assert!(
+            !current_manifest_path(&model_root).exists(),
+            "a status call must not persist a repaired pointer"
+        );
+    }
+
+    #[test]
+    fn status_reason_check_does_not_import_legacy_artifacts() {
+        // Status surfaces must stay read-only: valid legacy flat files report
+        // the model as available without the ~90MB copy into the verified
+        // store or any pointer write (those belong to the indexing and start
+        // paths).
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let runtime_dir = runtime_model_dir();
+        std::fs::copy(
+            runtime_dir.join(MODEL_FILENAME),
+            model_root.join(MODEL_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(TOKENIZER_FILENAME),
+            model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+
+        let reason = model_unavailable_reason_for_status_at(&model_root);
+
+        assert!(
+            reason.is_none(),
+            "verified legacy artifacts must report the model as available, got {reason:?}"
+        );
+        assert!(
+            !current_manifest_path(&model_root).exists(),
+            "a status call must not write an active-artifact pointer"
+        );
+        assert!(
+            !verified_dir_path(&model_root).exists(),
+            "a status call must not import legacy artifacts into the verified store"
+        );
+        assert!(
+            !staging_dir_path(&model_root).exists(),
+            "a status call must not stage artifact copies"
         );
     }
 

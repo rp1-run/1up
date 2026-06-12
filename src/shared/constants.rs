@@ -96,6 +96,13 @@ pub const MAX_DAEMON_IN_FLIGHT_REQUESTS: usize = 8;
 /// Maximum results per file in search output.
 pub const MAX_RESULTS_PER_FILE: usize = 3;
 
+/// Degraded-search reason emitted when the local index holds no vector rows
+/// for the active context, so search stays FTS-only without touching the
+/// embedder. Shared by the CLI and MCP vectorless gates so degraded-mode
+/// wording cannot drift between surfaces.
+pub const NO_INDEXED_EMBEDDINGS_REASON: &str =
+    "index contains no embeddings for this context; semantic ranking disabled (FTS-only)";
+
 /// Default context expansion window (lines) when tree-sitter is unavailable.
 pub const CONTEXT_FALLBACK_LINES: usize = 50;
 

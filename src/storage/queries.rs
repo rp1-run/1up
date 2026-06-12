@@ -398,6 +398,7 @@ SELECT
 FROM segment_relations
 WHERE context_id = ?1
   AND source_segment_id = ?2
+  AND edge_identity_kind != 'doc_mention'
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   canonical_target_symbol,
@@ -434,6 +435,7 @@ FROM segment_relations
 WHERE context_id = ?1
   AND source_segment_id = ?2
   AND relation_kind = ?3
+  AND edge_identity_kind != 'doc_mention'
 ORDER BY canonical_target_symbol, edge_identity_kind, raw_target_symbol
 LIMIT ?4";
 
@@ -538,6 +540,7 @@ SELECT
 FROM segment_relations
 WHERE context_id = ?1
   AND lookup_canonical_symbol = ?2
+  AND edge_identity_kind != 'doc_mention'
 ORDER BY
   CASE WHEN relation_kind = 'call' THEN 0 ELSE 1 END,
   source_segment_id,
@@ -574,6 +577,7 @@ FROM segment_relations
 WHERE context_id = ?1
   AND lookup_canonical_symbol = ?2
   AND relation_kind = ?3
+  AND edge_identity_kind != 'doc_mention'
 ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
 LIMIT ?4";
 

@@ -8,7 +8,7 @@ use crate::daemon::{lifecycle, search_service};
 use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
 use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config::project_db_path;
-use crate::shared::constants::VERSION;
+use crate::shared::constants::{NO_INDEXED_EMBEDDINGS_REASON, VERSION};
 use crate::shared::project;
 use crate::shared::types::SearchResult;
 use crate::storage::db::Db;
@@ -125,7 +125,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             engine.fts_only_search(&args.query, args.limit).await?
         }
     } else {
-        eprintln!("warning: semantic embeddings unavailable; search is degraded to FTS-only mode");
+        eprintln!("warning: {NO_INDEXED_EMBEDDINGS_REASON}");
         let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope.clone());
         engine.fts_only_search(&args.query, args.limit).await?
     };

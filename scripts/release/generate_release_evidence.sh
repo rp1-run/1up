@@ -163,7 +163,7 @@ if ! jq -e '
     and (["oneup_status", "oneup_start", "oneup_search", "oneup_get", "oneup_symbol", "oneup_context", "oneup_impact", "oneup_structural", "oneup_overview"]
       | all(. as $tool | ($smoke.exercised_tools | index($tool) != null)))
     and ($smoke.tool_calls | type == "array")
-    and (["status", "start", "search", "get", "symbol", "context", "impact", "structural"]
+    and (["status", "start", "search", "get", "symbol", "context", "impact", "structural", "overview"]
       | all(. as $label
         | ([$smoke.tool_calls[]
           | select(.label == $label)
@@ -179,7 +179,8 @@ if ! jq -e '
     and ($smoke.structured_content_present.symbol == true)
     and ($smoke.structured_content_present.context == true)
     and ($smoke.structured_content_present.impact == true)
-    and ($smoke.structured_content_present.structural == true);
+    and ($smoke.structured_content_present.structural == true)
+    and ($smoke.structured_content_present.overview == true);
   def known_issue_mcp_smoke:
     .mcp_smoke_test as $smoke
     | ($smoke.schema == "mcp_smoke.v2")

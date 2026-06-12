@@ -157,6 +157,9 @@ pub async fn get_outbound_relations(
     .await
 }
 
+/// Outbound relation lookup for one source segment. Doc-mention rows are
+/// excluded in SQL so documentation evidence never consumes the bounded
+/// fetch window (`LIMIT`) that impact budgets rely on.
 pub async fn get_outbound_relations_for_context(
     conn: &Connection,
     context_id: &str,
@@ -275,6 +278,9 @@ pub async fn get_inbound_relations_by_lookup_symbol(
     .await
 }
 
+/// Inbound relation lookup by canonical symbol tail. Doc-mention rows are
+/// excluded in SQL so a heavily documented symbol cannot evict real code
+/// references from the bounded fetch window (`LIMIT`).
 pub async fn get_inbound_relations_by_lookup_symbol_for_context(
     conn: &Connection,
     context_id: &str,

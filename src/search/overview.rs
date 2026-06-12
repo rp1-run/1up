@@ -49,6 +49,8 @@ pub const MODULE_DEPENDENCY_PAIR_OVERSAMPLE: usize = 256;
 
 /// Upper bound on qualifying definition rows resolved for the oversampled
 /// symbol keys, so the lookup stays bounded without loading full tables.
+/// Keys whose fetched rows fall short of their SQL-reported definition count
+/// are treated as truncated and skipped as ambiguous, never misattributed.
 pub const DEFINITION_RESOLUTION_LIMIT: usize = 1024;
 
 /// A symbol key qualifies for the top-types section only while its
@@ -212,9 +214,11 @@ impl<'a> OverviewEngine<'a> {
 
     /// Most-referenced types: SQL ranks oversampled keys by distinct
     /// referencing files (DESC, then key ASC); the engine resolves their
-    /// qualifying definitions, applies path exclusions BEFORE the ambiguity
-    /// count, skips keys outside the `1..=AMBIGUITY_DEFINITION_LIMIT`
-    /// post-exclusion range, and attributes each survivor kind-rank-first.
+    /// qualifying definitions, skips any key whose definitions may have been
+    /// cut by `DEFINITION_RESOLUTION_LIMIT`, applies path exclusions BEFORE
+    /// the ambiguity count, skips keys outside the
+    /// `1..=AMBIGUITY_DEFINITION_LIMIT` post-exclusion range, and attributes
+    /// each survivor kind-rank-first.
     async fn compute_top_symbols(
         &self,
         context_id: &str,
@@ -241,11 +245,17 @@ impl<'a> OverviewEngine<'a> {
         )
         .await?;
 
+        // Per-key fetched rows are counted BEFORE path exclusion so they are
+        // comparable with the SQL-reported pre-exclusion definition counts;
         // `is_low_signal_path` subsumes `is_test_path`, covering both
         // documented exclusion classes in one check.
+        let mut fetched_counts_by_key: BTreeMap<String, u64> = BTreeMap::new();
         let mut definitions_by_key: BTreeMap<String, Vec<QualifyingTypeDefinition>> =
             BTreeMap::new();
         for definition in definitions {
+            *fetched_counts_by_key
+                .entry(definition.symbol_key.clone())
+                .or_insert(0) += 1;
             if is_low_signal_path(&definition.file_path) {
                 continue;
             }
@@ -259,6 +269,18 @@ impl<'a> OverviewEngine<'a> {
         for ranked_key in &ranked {
             if entries.len() == TOP_SYMBOL_CAP {
                 break;
+            }
+            // The global resolution LIMIT can truncate alphabetically-late
+            // keys. A key whose fetched rows fall short of its SQL-reported
+            // definition count may be missing definitions, so its ambiguity
+            // gate cannot be trusted: skip it as ambiguous rather than
+            // misattribute a partial fetch.
+            let fetched = fetched_counts_by_key
+                .get(&ranked_key.symbol_key)
+                .copied()
+                .unwrap_or(0);
+            if fetched < ranked_key.definition_count {
+                continue;
             }
             let Some(candidates) = definitions_by_key.get(&ranked_key.symbol_key) else {
                 continue;
@@ -1012,6 +1034,77 @@ mod tests {
             .entry_points
             .iter()
             .all(|entry| !entry.path.starts_with("lib/")));
+    }
+
+    #[tokio::test]
+    async fn overview_skips_keys_truncated_by_the_definition_resolution_limit() {
+        let (_db, conn) = setup().await;
+        // Enough qualifying definitions to overflow DEFINITION_RESOLUTION_LIMIT:
+        // the filler key consumes nearly the whole fetch (ordered by symbol key
+        // ASC), so the alphabetically-late key with four real definitions has
+        // all but one row cut. Without truncation detection that key passes
+        // the ambiguity gate on its partial fetch and is misattributed.
+        let mut segments = vec![definition(
+            "def_anchor",
+            "src/anchor.rs",
+            "struct",
+            "AaaAnchor",
+        )];
+        for idx in 0..(DEFINITION_RESOLUTION_LIMIT - 2) {
+            segments.push(definition(
+                &format!("def_filler_{idx:04}"),
+                &format!("src/filler/f{idx:04}.rs"),
+                "struct",
+                "AabFiller",
+            ));
+        }
+        for (idx, path) in [
+            "src/late/a.rs",
+            "src/late/b.rs",
+            "src/late/c.rs",
+            "src/late/d.rs",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            segments.push(definition(
+                &format!("def_late_{idx}"),
+                path,
+                "struct",
+                "ZzzLate",
+            ));
+        }
+        segments.extend([
+            referencing(
+                "ref_anchor_1",
+                "src/r1.rs",
+                vec![bare("AaaAnchor"), bare("ZzzLate")],
+            ),
+            referencing(
+                "ref_anchor_2",
+                "src/r2.rs",
+                vec![bare("AaaAnchor"), bare("ZzzLate")],
+            ),
+            referencing(
+                "ref_anchor_3",
+                "src/r3.rs",
+                vec![bare("AaaAnchor"), bare("AabFiller")],
+            ),
+        ]);
+        insert_all(&conn, "ctx-a", segments).await;
+
+        let overview = compute(&conn, "ctx-a").await;
+
+        assert_eq!(
+            overview
+                .top_symbols
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AaaAnchor"],
+            "a key whose definitions may have been cut by the resolution limit \
+             must be skipped as ambiguous, not misattributed"
+        );
     }
 
     #[tokio::test]
