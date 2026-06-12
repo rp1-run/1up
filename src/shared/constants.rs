@@ -117,11 +117,11 @@ pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES
 
 /// Schema version for database layout.
 ///
-/// v15: markdown is segmented into heading-scoped doc sections with
-/// breadcrumbs and doc-mention relations instead of blind fixed-window
-/// chunks, so indexes built at earlier versions hold an incompatible
-/// segmentation shape and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 15;
+/// v16: markdown heading breadcrumbs store cleaned heading text (inline
+/// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
+/// and the embedding text composed from them change shape, so indexes built
+/// at earlier versions are incompatible and require `1up reindex`.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";

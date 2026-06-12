@@ -379,15 +379,46 @@ const MAX_FTS_VARIANT_TERMS: usize = 16;
 /// noise for the recall they add.
 const MIN_FTS_PREFIX_TERM_CHARS: usize = 4;
 
+/// Minimum plain-word length for emitting a stem-prefix variant. Shorter
+/// words rarely carry the inflectional suffixes this targets, and their
+/// stems are too short to stay selective as prefixes.
+const MIN_FTS_STEM_TERM_CHARS: usize = 5;
+
+/// Common English inflection suffixes stripped to form stem-prefix variants,
+/// checked in order with first match winning when the remaining stem is long
+/// enough.
+const FTS_STEM_SUFFIXES: &[&str] = &["ed", "ing", "es", "s"];
+
+/// Returns the stem-prefix variant for a plain query word: `composed` yields
+/// `compos` (reaching the indexed token `compose`) and `embeddings` yields
+/// `embedding`. Only alphabetic words of at least [`MIN_FTS_STEM_TERM_CHARS`]
+/// stem, and the stem must keep [`MIN_FTS_PREFIX_TERM_CHARS`] so it stays a
+/// selective prefix.
+fn stem_prefix(term: &str) -> Option<String> {
+    if term.chars().count() < MIN_FTS_STEM_TERM_CHARS
+        || !term.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+
+    let lower = term.to_lowercase();
+    FTS_STEM_SUFFIXES.iter().find_map(|suffix| {
+        let stem = lower.strip_suffix(suffix)?;
+        (stem.len() >= MIN_FTS_PREFIX_TERM_CHARS).then(|| stem.to_string())
+    })
+}
+
 /// Builds an FTS5 match expression with identifier-aware variants.
 ///
 /// The unicode61 tokenizer indexes `ImpactHorizonEngine` as the single token
 /// `impacthorizonengine`, which plain quoted query terms never match. On top
 /// of the base quoted terms this adds: a split-part phrase variant for
 /// CamelCase/snake_case query terms (matching identifiers mentioned as
-/// prose), and bounded prefix variants for plain words so they can match the
-/// head of concatenated identifiers. Split parts stay phrase-bound rather
-/// than OR'd individually so exact-identifier queries keep their precision.
+/// prose), bounded prefix variants for plain words so they can match the
+/// head of concatenated identifiers, and stem-prefix variants for inflected
+/// plain words (`composed` -> `compos`*) so natural-language inflections
+/// reach stem-named identifiers. Split parts stay phrase-bound rather than
+/// OR'd individually so exact-identifier queries keep their precision.
 fn build_fts_query(query: &str) -> String {
     let cleaned_terms: Vec<String> = query
         .split_whitespace()
@@ -426,11 +457,25 @@ fn build_fts_query(query: &str) -> String {
                 units.push(format!("\"{phrase}\""));
                 variant_count += 1;
             }
-        } else if term.len() >= MIN_FTS_PREFIX_TERM_CHARS
+            continue;
+        }
+
+        if term.len() >= MIN_FTS_PREFIX_TERM_CHARS
             && seen.insert(format!("{}*", term.to_lowercase()))
         {
             units.push(format!("\"{term}\" *"));
             variant_count += 1;
+        }
+
+        if variant_count >= MAX_FTS_VARIANT_TERMS {
+            break;
+        }
+
+        if let Some(stem) = stem_prefix(term) {
+            if seen.insert(format!("{stem}*")) {
+                units.push(format!("\"{stem}\" *"));
+                variant_count += 1;
+            }
         }
     }
 
@@ -549,6 +594,66 @@ mod tests {
         assert!(query.contains("\"impact horizon engine\""));
         assert!(query.contains("\"summary_json\""));
         assert!(query.contains("\"summary json\""));
+    }
+
+    #[test]
+    fn fts_query_adds_stem_prefix_variants_for_inflected_words() {
+        let query = build_fts_query("embeddings composed indexing");
+
+        assert!(query.contains("\"embedding\" *"), "missing stem in {query}");
+        assert!(query.contains("\"compos\" *"), "missing stem in {query}");
+        assert!(query.contains("\"index\" *"), "missing stem in {query}");
+        assert!(
+            query.contains("\"embeddings\" *"),
+            "base prefix variant should stay alongside the stem: {query}"
+        );
+    }
+
+    #[test]
+    fn fts_query_skips_stems_for_short_or_identifier_words() {
+        let query = build_fts_query("goes summary_json table");
+
+        assert!(
+            !query.contains("\"go\" *"),
+            "short words must not stem: {query}"
+        );
+        assert!(
+            !query.contains("\"goe\" *"),
+            "short words must not stem: {query}"
+        );
+        assert!(query.contains("\"summary json\""));
+        assert!(
+            !query.contains("\"tabl\" *"),
+            "suffix-free words must not stem: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_matches_snake_case_identifier_from_inflected_query() {
+        let conn = setup().await;
+        insert_segment(
+            &conn,
+            "seg-compose-embedding",
+            "src/indexer/pipeline.rs",
+            "fn compose_embedding_text(relative_path: &str) -> String {\n    relative_path.to_string()\n}",
+            None,
+        )
+        .await;
+
+        let candidates = fetch_fts_candidates(
+            &conn,
+            &SearchScope::default_context(),
+            "where are embeddings composed before indexing",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.segment_id == "seg-compose-embedding"),
+            "inflected query words should reach snake_case tokens via stem-prefix variants"
+        );
     }
 
     #[test]

@@ -521,8 +521,79 @@ fn section_heading_node<'a>(section: &Node<'a>) -> Option<Node<'a>> {
 fn heading_text(section: &Node, source: &[u8]) -> Option<String> {
     let heading = section_heading_node(section)?;
     let content_node = heading.child_by_field_name("heading_content")?;
-    let text = content_node.utf8_text(source).ok()?.trim();
-    (!text.is_empty()).then(|| text.to_string())
+    let raw = content_node.utf8_text(source).ok()?;
+    clean_heading_text(raw)
+}
+
+/// Cleans raw heading content for breadcrumb use: inline HTML tags are
+/// dropped, markdown links and images keep their visible text without the
+/// destination, and whitespace runs collapse to single spaces. Headings
+/// whose visible text is only markup yield no breadcrumb component.
+fn clean_heading_text(raw: &str) -> Option<String> {
+    let visible = markdown_link_text(&strip_html_tags(raw));
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// Removes HTML tag spans. A `<` only opens a tag when followed by a tag
+/// name, `/`, or `!`, so literal less-than text survives. An unterminated
+/// tag drops the remainder of the heading, failing toward cleanliness.
+fn strip_html_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let opens_tag = c == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == '/' || *next == '!');
+        if opens_tag {
+            for tag_char in chars.by_ref() {
+                if tag_char == '>' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Rewrites markdown links and images to their visible text: `[text](dest)`
+/// becomes `text` and `![alt](dest)` becomes `alt`.
+fn markdown_link_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let open = match chars[i] {
+            '[' => Some(i),
+            '!' if chars.get(i + 1) == Some(&'[') => Some(i + 1),
+            _ => None,
+        };
+        if let Some(open) = open {
+            if let Some((label_end, dest_end)) = link_spans(&chars, open) {
+                out.extend(&chars[open + 1..label_end]);
+                i = dest_end + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Finds the `]` closing a link label at `open` and the `)` closing its
+/// immediately following destination, or `None` when the shape is not a
+/// markdown link.
+fn link_spans(chars: &[char], open: usize) -> Option<(usize, usize)> {
+    let label_end = (open + 1..chars.len()).find(|&i| chars[i] == ']')?;
+    if chars.get(label_end + 1) != Some(&'(') {
+        return None;
+    }
+    let dest_end = (label_end + 2..chars.len()).find(|&i| chars[i] == ')')?;
+    Some((label_end, dest_end))
 }
 
 fn child_sections<'a>(section: &Node<'a>) -> Vec<Node<'a>> {
@@ -715,6 +786,55 @@ mod tests {
                 "split pieces must cover the section without gaps"
             );
         }
+    }
+
+    #[test]
+    fn heading_inline_html_stripped_from_breadcrumb() {
+        let content = "# <img src=\"assets/logo.png\" alt=\"logo\"> Start Here\n\nintro body\n";
+        let segments = parse_markdown_file(content, "README");
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].breadcrumb.as_deref(),
+            Some("README > Start Here")
+        );
+    }
+
+    #[test]
+    fn heading_markdown_links_keep_visible_text() {
+        let content = "# Guide\n\n## [Quick Start](docs/start.md) <a name=\"qs\"></a>\n\nsteps\n";
+        let segments = parse_markdown_file(content, "DOC");
+
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.breadcrumb.as_deref() == Some("DOC > Guide > Quick Start")),
+            "found {:?}",
+            segments
+                .iter()
+                .map(|s| s.breadcrumb.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn heading_whitespace_collapses_after_tag_removal() {
+        let content = "# Title <br>   Badge   Row\n\nbody\n";
+        let segments = parse_markdown_file(content, "README");
+
+        assert_eq!(
+            segments[0].breadcrumb.as_deref(),
+            Some("README > Title Badge Row")
+        );
+    }
+
+    #[test]
+    fn heading_with_only_markup_adds_no_breadcrumb_component() {
+        let content = "# <img src=\"assets/logo.png\">\n\nbody\n";
+        let segments = parse_markdown_file(content, "README");
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].breadcrumb.as_deref(), Some("README"));
     }
 
     #[test]

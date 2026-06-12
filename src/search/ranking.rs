@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use crate::indexer::markdown::DOC_SECTION_BLOCK_TYPE;
 use crate::search::intent::QueryIntent;
 use crate::search::retrieval::CandidateRow;
 use crate::shared::constants::{
@@ -141,9 +142,11 @@ fn compute_rrf_score(candidate: &ScoredCandidate, query: &str, intent: QueryInte
 
     score *= intent_boost(&candidate.candidate, query, intent);
     score *= file_path_boost(&candidate.candidate.file_path);
+    score *= test_path_query_dampening(query, intent, &candidate.candidate.file_path);
     score *= query_path_boost(query, &candidate.candidate.file_path);
     score *= query_match_boost(query, &candidate.candidate);
-    score *= content_kind_boost(&candidate.candidate, intent);
+    score *= breadcrumb_relevance_boost(query, &candidate.candidate);
+    score *= content_kind_boost(query, &candidate.candidate, intent);
     score *= short_segment_penalty(&candidate.candidate);
 
     score
@@ -211,14 +214,43 @@ fn intent_boost(result: &CandidateRow, query: &str, intent: QueryIntent) -> f64 
     }
 }
 
+/// Test-tier path classification. Test/spec suites, bench harnesses, and
+/// fixture data all describe code under test rather than the implementation
+/// itself, so they share one path-penalty tier.
+fn is_test_like_path(lower_path: &str) -> bool {
+    ["test", "spec", "bench", "fixture"]
+        .iter()
+        .any(|marker| lower_path.contains(marker))
+}
+
 fn file_path_boost(path: &str) -> f64 {
     let lower = path.to_lowercase();
-    if lower.contains("test") || lower.contains("spec") || lower.contains("__test") {
+    if is_test_like_path(&lower) {
         0.7
     } else if lower.contains("doc") || lower.contains("readme") {
         0.8
     } else if lower.contains("vendor") || lower.contains("node_modules") {
         0.5
+    } else {
+        1.0
+    }
+}
+
+/// Extra dampening for test-tier paths on natural-language conceptual
+/// queries. Descriptive snake_case test/bench names read like sentences, so
+/// identifier-split FTS matching hands them near-perfect term coverage that
+/// the base 0.7 tier penalty cannot offset; combined they land at ~0.5 so
+/// implementation code wins conceptual queries. Usage-intent queries keep
+/// the full tier weight because tests are legitimate usage evidence.
+const NL_QUERY_TEST_PATH_DAMPENING: f64 = 0.72;
+
+fn test_path_query_dampening(query: &str, intent: QueryIntent, path: &str) -> f64 {
+    if matches!(intent, QueryIntent::Usage) || !is_natural_language_query(query) {
+        return 1.0;
+    }
+
+    if is_test_like_path(&path.to_lowercase()) {
+        NL_QUERY_TEST_PATH_DAMPENING
     } else {
         1.0
     }
@@ -290,7 +322,54 @@ fn query_match_boost(query: &str, result: &CandidateRow) -> f64 {
     score
 }
 
-fn content_kind_boost(result: &CandidateRow, intent: QueryIntent) -> f64 {
+/// Per-matched-term step and cap for the breadcrumb-relevance boost.
+const BREADCRUMB_TERM_BOOST_STEP: f64 = 0.08;
+const BREADCRUMB_BOOST_TERM_CAP: usize = 3;
+
+/// Counts query terms found in the segment breadcrumb, returning
+/// `(matched, total)` over the stop-word-filtered query terms.
+fn breadcrumb_matched_terms(query: &str, result: &CandidateRow) -> (usize, usize) {
+    let terms = query_terms(query);
+    let total = terms.len();
+    if total == 0 {
+        return (0, 0);
+    }
+
+    let Some(breadcrumb) = result.breadcrumb.as_deref() else {
+        return (0, total);
+    };
+
+    let breadcrumb_tokens: HashSet<String> = tokenize_text(breadcrumb).into_iter().collect();
+    let matched = terms
+        .iter()
+        .filter(|term| breadcrumb_tokens.contains(term.as_str()))
+        .count();
+
+    (matched, total)
+}
+
+/// Boosts hits whose breadcrumb (document/heading path or enclosing symbol
+/// chain) overlaps the query terms; the breadcrumb names what a segment is
+/// about, so overlap there is a stronger topical signal than body matches.
+fn breadcrumb_relevance_boost(query: &str, result: &CandidateRow) -> f64 {
+    let (matched, _) = breadcrumb_matched_terms(query, result);
+    1.0 + BREADCRUMB_TERM_BOOST_STEP * matched.min(BREADCRUMB_BOOST_TERM_CAP) as f64
+}
+
+/// A doc section whose breadcrumb matches at least two query terms, or at
+/// least half of them, is the documentation the query asks about; without
+/// this the 0.72 markdown penalty compounds with the 0.8 doc-path penalty
+/// and buries on-topic README sections below weak code matches.
+fn doc_breadcrumb_neutralizes_markdown_penalty(query: &str, result: &CandidateRow) -> bool {
+    if result.block_type != DOC_SECTION_BLOCK_TYPE {
+        return false;
+    }
+
+    let (matched, total) = breadcrumb_matched_terms(query, result);
+    matched >= 2 || (matched >= 1 && matched * 2 >= total)
+}
+
+fn content_kind_boost(query: &str, result: &CandidateRow, intent: QueryIntent) -> f64 {
     let lower_path = result.file_path.to_lowercase();
     let is_markdown = result.language.eq_ignore_ascii_case("markdown")
         || lower_path.ends_with(".md")
@@ -299,6 +378,7 @@ fn content_kind_boost(result: &CandidateRow, intent: QueryIntent) -> f64 {
     if is_markdown {
         match intent {
             QueryIntent::Docs => 1.15,
+            _ if doc_breadcrumb_neutralizes_markdown_penalty(query, result) => 1.0,
             _ => 0.72,
         }
     } else {
@@ -566,6 +646,119 @@ mod tests {
     }
 
     #[test]
+    fn bench_and_fixture_paths_share_test_tier_penalty() {
+        assert_eq!(file_path_boost("benches/search_bench.rs"), 0.7);
+        assert_eq!(file_path_boost("evals/fixtures/sample_repo.rs"), 0.7);
+        assert_eq!(file_path_boost("src/search/impact.rs"), 1.0);
+    }
+
+    #[test]
+    fn natural_language_queries_dampen_test_tier_paths_to_half_weight() {
+        let query = "blast radius expansion trust buckets";
+        let test_path = "tests/integration_tests.rs";
+
+        let dampening = test_path_query_dampening(query, QueryIntent::General, test_path);
+        let net = dampening * file_path_boost(test_path);
+        assert!(dampening < 1.0);
+        assert!(
+            (0.45..=0.55).contains(&net),
+            "net test-path weight should land near 0.5, got {net}"
+        );
+
+        assert_eq!(
+            test_path_query_dampening(query, QueryIntent::General, "src/search/impact.rs"),
+            1.0
+        );
+        assert_eq!(
+            test_path_query_dampening(query, QueryIntent::Usage, test_path),
+            1.0,
+            "usage-intent queries should still surface tests at full tier weight"
+        );
+        assert_eq!(
+            test_path_query_dampening("PolicyRuleValidator", QueryIntent::General, test_path),
+            1.0,
+            "symbol-shaped queries are not natural language and must not dampen"
+        );
+    }
+
+    #[test]
+    fn doc_section_breadcrumb_overlap_neutralizes_markdown_penalty() {
+        let query = "windows daemon support";
+
+        let mut on_topic = make_candidate("README.md", 10, "doc_section", 4);
+        on_topic.role = Some(SegmentRole::Docs);
+        on_topic.breadcrumb = Some("README > Windows daemon support".to_string());
+
+        let mut plain_chunk = make_candidate("README.md", 30, "chunk", 4);
+        plain_chunk.role = Some(SegmentRole::Docs);
+        plain_chunk.breadcrumb = Some("README > Windows daemon support".to_string());
+
+        let mut partial = make_candidate("README.md", 50, "doc_section", 4);
+        partial.role = Some(SegmentRole::Docs);
+        partial.breadcrumb = Some("README > daemon internals".to_string());
+
+        assert_eq!(
+            content_kind_boost(query, &on_topic, QueryIntent::General),
+            1.0
+        );
+        assert_eq!(
+            content_kind_boost(query, &plain_chunk, QueryIntent::General),
+            0.72,
+            "only doc_section segments earn the neutralization"
+        );
+        assert_eq!(
+            content_kind_boost(query, &partial, QueryIntent::General),
+            0.72,
+            "one of three terms is below both thresholds"
+        );
+        assert_eq!(
+            content_kind_boost("daemon", &on_topic, QueryIntent::General),
+            1.0,
+            "a single-term query fully covered by the breadcrumb neutralizes"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_overlap_boosts_relevance() {
+        let query = "windows daemon support";
+
+        let mut on_topic = make_candidate("docs/guide.md", 1, "doc_section", 6);
+        on_topic.breadcrumb = Some("guide > Windows daemon support".to_string());
+        let mut off_topic = make_candidate("docs/guide.md", 20, "doc_section", 6);
+        off_topic.breadcrumb = Some("guide > Release process".to_string());
+
+        assert!(
+            breadcrumb_relevance_boost(query, &on_topic)
+                > breadcrumb_relevance_boost(query, &off_topic)
+        );
+        assert_eq!(breadcrumb_relevance_boost(query, &off_topic), 1.0);
+    }
+
+    #[test]
+    fn conceptual_query_prefers_implementation_over_descriptive_bench_name() {
+        let mut bench = make_candidate("benches/search_bench.rs", 836, "function", 12);
+        bench.role = Some(SegmentRole::Implementation);
+        bench.defined_symbols = Some(vec!["bench_impact_horizon".to_string()]);
+        bench.breadcrumb = Some("bench_impact_horizon".to_string());
+
+        let mut engine = make_candidate("src/search/impact.rs", 159, "struct", 8);
+        engine.defined_symbols = Some(vec!["ImpactHorizonEngine".to_string()]);
+        engine.breadcrumb = Some("ImpactHorizonEngine".to_string());
+
+        // The descriptive bench name wins the FTS stage on raw term coverage.
+        let ranked = rank_candidates(
+            vec![],
+            vec![bench, engine],
+            vec![],
+            "impact horizon",
+            QueryIntent::General,
+            10,
+        );
+
+        assert_eq!(ranked[0].candidate.file_path, "src/search/impact.rs");
+    }
+
+    #[test]
     fn intent_boosts_definitions() {
         let result = make_candidate("a.rs", 1, "function", 3);
         let general_boost = intent_boost(&result, "foo", QueryIntent::General);
@@ -648,8 +841,10 @@ mod tests {
         config.breadcrumb = Some("request signing secret".to_string());
         config.defined_symbols = Some(vec!["request_signing_secret".to_string()]);
 
-        let docs_penalty = content_kind_boost(&markdown, QueryIntent::General);
-        let config_penalty = content_kind_boost(&config, QueryIntent::General);
+        let docs_penalty =
+            content_kind_boost("request signing secret", &markdown, QueryIntent::General);
+        let config_penalty =
+            content_kind_boost("request signing secret", &config, QueryIntent::General);
         let docs_boost = query_match_boost("request signing secret", &markdown);
         let config_boost = query_match_boost("request signing secret", &config);
 

@@ -1017,6 +1017,8 @@ fn create_search_acceptance_fixture() -> TempDir {
     fs::create_dir_all(tmp.path().join("docs")).unwrap();
     fs::create_dir_all(tmp.path().join("proto")).unwrap();
     fs::create_dir_all(tmp.path().join("sql")).unwrap();
+    fs::create_dir_all(tmp.path().join("benches")).unwrap();
+    fs::create_dir_all(tmp.path().join("tests")).unwrap();
 
     fs::write(
         tmp.path().join("src").join("policy.rs"),
@@ -1087,6 +1089,100 @@ message PolicyRulePreview {
     id TEXT PRIMARY KEY,
     validator_name TEXT NOT NULL
 );
+"#,
+    )
+    .unwrap();
+
+    // Bench-named file vs real implementation: the descriptive bench name
+    // carries both query terms, the engine carries them only inside one
+    // CamelCase token.
+    fs::write(
+        tmp.path().join("src").join("horizon.rs"),
+        r#"pub struct ImpactHorizonEngine {
+    pub max_depth: usize,
+}
+
+impl ImpactHorizonEngine {
+    pub fn expand_horizon(&self) -> usize {
+        self.max_depth + 1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("benches").join("horizon_bench.rs"),
+        r#"pub fn bench_impact_horizon() -> usize {
+    let engine_depth = 4;
+    engine_depth + 1
+}
+"#,
+    )
+    .unwrap();
+
+    // Descriptive test name vs implementation: the snake_case test name is a
+    // sentence with near-perfect term coverage for the conceptual query.
+    fs::write(
+        tmp.path().join("src").join("blast_radius.rs"),
+        r#"pub struct BlastRadiusReport {
+    pub expansion_depth: usize,
+}
+
+/// Folds expansion results into trust buckets for the blast radius report.
+pub fn aggregate_bucket(report: &BlastRadiusReport) -> usize {
+    report.expansion_depth + 1
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("tests").join("integration_checks.rs"),
+        r#"pub fn blast_radius_expansion_preserves_trust_buckets_and_followups() {
+    assert!(true);
+}
+"#,
+    )
+    .unwrap();
+
+    // Inflected query vs stem-named symbol: reachable only through
+    // stem-prefix FTS variants (`composed` -> compos*).
+    fs::write(
+        tmp.path().join("src").join("embedding_pipeline.rs"),
+        r#"/// Builds the embedding input for one segment before the indexer stores it.
+pub fn compose_embedding_text(language: &str, crumb: &str) -> String {
+    format!("{language} {crumb}")
+}
+"#,
+    )
+    .unwrap();
+
+    // Heading-matched doc query: the README section competes with a code
+    // file that partially matches, and its H1 carries inline HTML noise.
+    fs::write(
+        tmp.path().join("src").join("daemon_worker.rs"),
+        r#"/// Runs the daemon worker loop with watch support.
+pub fn spawn_daemon_worker() -> bool {
+    true
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("README.md"),
+        r#"# <img src="assets/logo.png" alt="logo"> Acceptance Project
+
+Intro paragraph.
+
+## Start Here
+
+Setup notes.
+
+## Windows daemon support
+
+The daemon runs as a background service on Windows hosts.
 "#,
     )
     .unwrap();
@@ -1770,6 +1866,20 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
         ("validate incoming request signatures", "src/signatures.rs"),
         ("PolicyRulePreview", "proto/policy_rules.proto"),
         ("policy_rules_preview table", "sql/policy_rules.sql"),
+        // Bench-named file must not outrank the implementation on a
+        // conceptual natural-language query.
+        ("impact horizon", "src/horizon.rs"),
+        // Descriptive snake_case test name must not outrank the
+        // implementation on a conceptual natural-language query.
+        (
+            "blast radius expansion trust buckets",
+            "src/blast_radius.rs",
+        ),
+        // Inflected natural-language words must reach stem-named symbols.
+        (
+            "where are embeddings composed before indexing",
+            "src/embedding_pipeline.rs",
+        ),
     ];
 
     for (query, expected_top_path) in cases {
@@ -1792,6 +1902,24 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
             "query {query:?} should keep a stable top-3 result set"
         );
     }
+
+    // Heading-matched doc query: the README doc_section must stay in the
+    // top-3 despite the compounded markdown and readme-path penalties, and
+    // its breadcrumb must carry cleaned heading text without the H1's
+    // inline HTML noise.
+    let rows = search_rows(tmp.path(), "windows daemon support");
+    let doc_hit = rows
+        .iter()
+        .take(3)
+        .find(|row| row.kind == "doc_section")
+        .unwrap_or_else(|| {
+            panic!("heading-matched doc query should keep a doc_section in the top-3: {rows:?}")
+        });
+    assert_eq!(doc_hit.file_path, "README.md");
+    assert_eq!(
+        doc_hit.breadcrumb,
+        "README > Acceptance Project > Windows daemon support"
+    );
 }
 
 // =============================================================================
@@ -1938,8 +2066,8 @@ fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
 #[test]
 fn prior_schema_version_index_fails_closed_with_reindex_guidance() {
     // REQ-006: a fresh index at the current schema version serves reads;
-    // downgrading the stored version to the immediate prior value (v14 at the
-    // v15 bump) fails discovery closed with explicit reindex guidance.
+    // downgrading the stored version to the immediate prior value (v15 at the
+    // v16 bump) fails discovery closed with explicit reindex guidance.
     let tmp = create_markdown_docs_fixture();
     let _guard = init_and_index_fts_only(&tmp);
 
