@@ -95,6 +95,13 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
                 eprintln!("warning: embedding model not found; search is degraded to FTS-only mode. Run `1up index` to download the model and enable semantic search");
             }
+            EmbeddingLoadStatus::Unavailable(
+                EmbeddingUnavailableReason::ArtifactsUnverifiable(err),
+            ) => {
+                eprintln!(
+                    "warning: embedding model artifacts failed verification ({err}); search is degraded to FTS-only mode. Run `1up index` to re-download the model"
+                );
+            }
             EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(
                 err,
             ))

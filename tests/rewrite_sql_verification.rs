@@ -19,9 +19,12 @@ struct HideModelGuard {
     hidden_path: PathBuf,
     current_path: PathBuf,
     hidden_current_path: PathBuf,
+    verified_path: PathBuf,
+    hidden_verified_path: PathBuf,
     marker_path: PathBuf,
     active: bool,
     current_active: bool,
+    verified_active: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -39,6 +42,8 @@ impl HideModelGuard {
         let hidden_path = model_dir.join("model.onnx.hidden_by_test");
         let current_path = model_dir.join("current.json");
         let hidden_current_path = model_dir.join("current.json.hidden_by_test");
+        let verified_path = model_dir.join("verified");
+        let hidden_verified_path = model_dir.join("verified.hidden_by_test");
         let marker_path = model_dir.join(".download_failed");
 
         let active = model_path.exists();
@@ -49,6 +54,13 @@ impl HideModelGuard {
         if current_active {
             fs::rename(&current_path, &hidden_current_path).unwrap();
         }
+        // Hide the verified artifact store too: resolution self-heals from
+        // intact verified artifacts when the pointer is missing, so leaving
+        // it visible would re-enable the model under this guard.
+        let verified_active = verified_path.exists();
+        if verified_active {
+            fs::rename(&verified_path, &hidden_verified_path).unwrap();
+        }
         let _ = fs::write(&marker_path, "hidden_by_test");
 
         Self {
@@ -56,9 +68,12 @@ impl HideModelGuard {
             hidden_path,
             current_path,
             hidden_current_path,
+            verified_path,
+            hidden_verified_path,
             marker_path,
             active,
             current_active,
+            verified_active,
             _lock: lock,
         }
     }
@@ -71,6 +86,9 @@ impl Drop for HideModelGuard {
         }
         if self.current_active && self.hidden_current_path.exists() {
             let _ = fs::rename(&self.hidden_current_path, &self.current_path);
+        }
+        if self.verified_active && self.hidden_verified_path.exists() {
+            let _ = fs::rename(&self.hidden_verified_path, &self.verified_path);
         }
         let _ = fs::remove_file(&self.marker_path);
     }

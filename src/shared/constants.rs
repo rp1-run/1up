@@ -10,6 +10,24 @@ pub const EMBEDDING_BATCH_SIZE: usize = 32;
 /// Maximum token length for the embedding model.
 pub const EMBEDDING_MAX_TOKENS: usize = 256;
 
+/// Chunk-segment languages excluded from embedding.
+///
+/// Structural segments always embed; text-chunked configuration and data
+/// formats carry little semantic signal per token. This list is shared by the
+/// pipeline's embed decision and the storage coverage counters so reported
+/// vector coverage always matches what the pipeline would embed.
+pub const NON_EMBEDDABLE_CHUNK_LANGUAGES: [&str; 9] = [
+    "json",
+    "yaml",
+    "toml",
+    "protobuf",
+    "terraform",
+    "sql",
+    "config",
+    "makefile",
+    "dockerfile",
+];
+
 /// Default number of vector search prefilter candidates (int8 stage).
 ///
 /// Tuned to 400 for schema v13's FLOAT8 HNSW: quantization makes the top-K

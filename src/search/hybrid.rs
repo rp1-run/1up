@@ -35,18 +35,45 @@ impl<'a> HybridSearchEngine<'a> {
         }
     }
 
+    /// Hybrid search with lazy query embedding: the lexical stages, the
+    /// exact-lexical short-circuit, and the cheap vector-presence probe all
+    /// run before the query is ever embedded, so an index without vector rows
+    /// never exercises the embedder.
     pub async fn search(
         &mut self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        let query_embedding = self.embed_query(query);
-        execute_search(
+        if query.trim().is_empty() {
+            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+        }
+
+        let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
+        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+
+        let should_fetch_vector = self.embedder.is_some()
+            && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
+            && retrieval::has_indexed_embeddings(self.conn, &self.scope).await?;
+        let vector_results = if should_fetch_vector {
+            match self.embed_query(query) {
+                Some(embedding) => {
+                    fetch_vector_candidates_with_degrade(self.conn, &self.scope, &embedding).await
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        rank_and_hydrate(
             self.conn,
-            &self.scope,
+            vector_results,
+            fts_results,
+            symbol_results,
             query,
+            intent,
             limit,
-            query_embedding.as_deref(),
         )
         .await
     }
@@ -56,7 +83,24 @@ impl<'a> HybridSearchEngine<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        execute_search(self.conn, &self.scope, query, limit, None).await
+        if query.trim().is_empty() {
+            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+        }
+
+        let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
+        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+
+        rank_and_hydrate(
+            self.conn,
+            Vec::new(),
+            fts_results,
+            symbol_results,
+            query,
+            intent,
+            limit,
+        )
+        .await
     }
 
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
@@ -74,45 +118,32 @@ impl<'a> HybridSearchEngine<'a> {
     }
 }
 
-async fn execute_search(
+async fn fetch_vector_candidates_with_degrade(
     conn: &Connection,
     scope: &SearchScope,
-    query: &str,
-    limit: usize,
-    query_embedding: Option<&[f32]>,
-) -> Result<Vec<SearchResult>, OneupError> {
-    if query.trim().is_empty() {
-        return Err(SearchError::InvalidQuery("empty query".to_string()).into());
-    }
-
-    let intent = detect_intent(query);
-    let symbol_results = symbol_search(conn, scope, query, intent).await?;
-    let fts_results = retrieval::fetch_fts_candidates(conn, scope, query).await?;
-    let should_fetch_vector = query_embedding.is_some()
-        && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
-        && retrieval::has_indexed_embeddings(conn, scope).await?;
-
-    let vector_results = if should_fetch_vector {
-        match retrieval::fetch_vector_candidates(
-            conn,
-            scope,
-            query_embedding.expect("checked above"),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(err) => {
-                eprintln!(
+    query_embedding: &[f32],
+) -> Vec<CandidateRow> {
+    match retrieval::fetch_vector_candidates(conn, scope, query_embedding).await {
+        Ok(results) => results,
+        Err(err) => {
+            eprintln!(
                 "warning: vector retrieval failed ({err}); search is degraded to FTS-only mode for this query"
             );
-                tracing::debug!("vector retrieval failed: {err}");
-                Vec::new()
-            }
+            tracing::debug!("vector retrieval failed: {err}");
+            Vec::new()
         }
-    } else {
-        Vec::new()
-    };
+    }
+}
 
+async fn rank_and_hydrate(
+    conn: &Connection,
+    vector_results: Vec<CandidateRow>,
+    fts_results: Vec<CandidateRow>,
+    symbol_results: Vec<CandidateRow>,
+    query: &str,
+    intent: QueryIntent,
+    limit: usize,
+) -> Result<Vec<SearchResult>, OneupError> {
     if vector_results.is_empty() && fts_results.is_empty() && symbol_results.is_empty() {
         return Ok(Vec::new());
     }

@@ -100,6 +100,8 @@ pub struct StatusInfo {
     pub project_initialized: bool,
     pub indexed_files: Option<u64>,
     pub total_segments: Option<u64>,
+    pub vector_rows: Option<u64>,
+    pub embeddable_segments: Option<u64>,
     pub project_id: Option<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
@@ -374,6 +376,8 @@ impl Formatter for JsonFormatter {
             "project_initialized": status.project_initialized,
             "indexed_files": status.indexed_files,
             "total_segments": status.total_segments,
+            "vector_rows": status.vector_rows,
+            "embeddable_segments": status.embeddable_segments,
             "project_id": &status.project_id,
             "project_root": &status.project_root,
             "source_root": &status.source_root,
@@ -566,6 +570,7 @@ impl Formatter for HumanFormatter {
             "Embeddings: {}\n",
             render_embeddings_human(progress.embeddings_enabled)
         ));
+        out.push_str(&render_embedding_outcome_human(progress));
         out.push_str(&format!("Updated: {}\n", progress.updated_at.to_rfc3339()));
         out
     }
@@ -657,6 +662,19 @@ impl Formatter for HumanFormatter {
         if let Some(segs) = status.total_segments {
             out.push_str(&format!("Total segments: {segs}\n"));
         }
+        if let (Some(vectors), Some(embeddable)) = (status.vector_rows, status.embeddable_segments)
+        {
+            if vectors == 0 && embeddable > 0 {
+                out.push_str(&format!(
+                    "Vector coverage: {vectors}/{embeddable} embeddable segments {}\n",
+                    "(no stored vectors; semantic search degraded)".yellow()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "Vector coverage: {vectors}/{embeddable} embeddable segments\n"
+                ));
+            }
+        }
         if let Some(progress) = &status.index_progress {
             let work = WorkSummary::from(progress);
             out.push_str(&format!(
@@ -737,6 +755,7 @@ impl Formatter for HumanFormatter {
                 "Embeddings: {}\n",
                 render_embeddings_human(progress.embeddings_enabled)
             ));
+            out.push_str(&render_embedding_outcome_human(progress));
             out.push_str(&format!(
                 "Updated: {} ({})\n",
                 render_time_ago(&progress.updated_at),
@@ -983,6 +1002,7 @@ impl Formatter for PlainFormatter {
             progress.segments_stored,
             render_embeddings_plain(progress.embeddings_enabled),
         ));
+        out.push_str(&render_embedding_outcome_plain(progress));
         if let Some(parallelism) = &progress.parallelism {
             out.push_str(&format!(
                 "\tjobs_configured:{}\tjobs_effective:{}\tembed_threads:{}",
@@ -1110,6 +1130,12 @@ impl Formatter for PlainFormatter {
         if let Some(segs) = status.total_segments {
             out.push_str(&format!("\tsegments:{segs}"));
         }
+        if let Some(vectors) = status.vector_rows {
+            out.push_str(&format!("\tvector_rows:{vectors}"));
+        }
+        if let Some(embeddable) = status.embeddable_segments {
+            out.push_str(&format!("\tembeddable_segments:{embeddable}"));
+        }
         if let Some(progress) = &status.index_progress {
             let work = WorkSummary::from(progress);
             out.push_str(&format!(
@@ -1125,6 +1151,7 @@ impl Formatter for PlainFormatter {
                 progress.segments_stored,
                 render_embeddings_plain(progress.embeddings_enabled),
             ));
+            out.push_str(&render_embedding_outcome_plain(progress));
             out.push_str(&format!("\tlast_processed:{}", progress.files_processed));
             if let Some(message) = progress.message.as_deref() {
                 out.push_str(&format!("\tindex_message:{}", plain_field(message)));
@@ -1574,6 +1601,23 @@ fn render_embeddings_human(enabled: bool) -> String {
     }
 }
 
+/// Renders the stored embedding outcome lines for an index run: the
+/// unavailable reason when the run could not honestly claim embeddings, and
+/// stored-vector coverage when the run measured it.
+fn render_embedding_outcome_human(progress: &IndexProgress) -> String {
+    let mut out = String::new();
+    if let Some(reason) = progress.embedding_unavailable_reason.as_deref() {
+        out.push_str(&format!("Embedding status: {}\n", reason.yellow()));
+    }
+    if let (Some(vectors), Some(embeddable)) = (progress.vector_rows, progress.embeddable_segments)
+    {
+        out.push_str(&format!(
+            "Vector coverage: {vectors}/{embeddable} embeddable segments\n"
+        ));
+    }
+    out
+}
+
 fn render_duration_ms(duration_ms: u128) -> String {
     format!("{duration_ms}ms")
 }
@@ -1632,6 +1676,24 @@ fn render_embeddings_plain(enabled: bool) -> &'static str {
     } else {
         "disabled"
     }
+}
+
+/// Plain-format counterpart of [`render_embedding_outcome_human`].
+fn render_embedding_outcome_plain(progress: &IndexProgress) -> String {
+    let mut out = String::new();
+    if let Some(reason) = progress.embedding_unavailable_reason.as_deref() {
+        out.push_str(&format!(
+            "\tembedding_unavailable_reason:{}",
+            plain_field(reason)
+        ));
+    }
+    if let (Some(vectors), Some(embeddable)) = (progress.vector_rows, progress.embeddable_segments)
+    {
+        out.push_str(&format!(
+            "\tvector_rows:{vectors}\tembeddable_segments:{embeddable}"
+        ));
+    }
+    out
 }
 
 fn render_optional_pid_plain(pid: Option<u32>) -> String {
@@ -2081,6 +2143,9 @@ mod tests {
             files_deleted: 1,
             segments_stored: 14,
             embeddings_enabled: true,
+            embedding_unavailable_reason: None,
+            vector_rows: Some(14),
+            embeddable_segments: Some(14),
             message: Some("Processed 6 files".to_string()),
             parallelism: Some(IndexParallelism {
                 jobs_configured: 4,
@@ -2329,6 +2394,8 @@ mod tests {
             project_initialized: true,
             indexed_files: Some(3),
             total_segments: Some(14),
+            vector_rows: Some(14),
+            embeddable_segments: Some(14),
             project_id: Some("project-123".to_string()),
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
@@ -2379,6 +2446,8 @@ mod tests {
             project_initialized: false,
             indexed_files: None,
             total_segments: None,
+            vector_rows: None,
+            embeddable_segments: None,
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
@@ -2418,6 +2487,8 @@ mod tests {
             project_initialized: false,
             indexed_files: None,
             total_segments: None,
+            vector_rows: None,
+            embeddable_segments: None,
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),

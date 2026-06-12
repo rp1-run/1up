@@ -937,6 +937,62 @@ pub async fn count_segments_for_context(
     }
 }
 
+/// Count stored vector rows for segments in a worktree context.
+pub async fn count_vector_rows_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<u64, OneupError> {
+    validate_context_id(context_id)?;
+    count_single_value(
+        conn,
+        queries::COUNT_VECTOR_ROWS_FOR_CONTEXT,
+        context_id,
+        "count context vector rows",
+    )
+    .await
+}
+
+/// Count segments the pipeline would embed in a worktree context.
+pub async fn count_embeddable_segments_for_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<u64, OneupError> {
+    validate_context_id(context_id)?;
+    count_single_value(
+        conn,
+        queries::COUNT_EMBEDDABLE_SEGMENTS_FOR_CONTEXT.as_str(),
+        context_id,
+        "count context embeddable segments",
+    )
+    .await
+}
+
+async fn count_single_value(
+    conn: &Connection,
+    sql: &str,
+    context_id: &str,
+    label: &str,
+) -> Result<u64, OneupError> {
+    let mut rows = conn
+        .query(sql, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("{label} failed: {e}")))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => {
+            let count: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read count failed: {e}")))?;
+            Ok(count as u64)
+        }
+        None => Ok(0),
+    }
+}
+
 /// Count distinct file paths in the segments table.
 pub async fn count_files(conn: &Connection) -> Result<u64, OneupError> {
     let mut rows = conn
@@ -1555,7 +1611,7 @@ async fn batch_upsert_segments_for_context(
 
     for chunk in segments.chunks(queries::SEGMENT_CHUNK_SIZE) {
         let mut sql = String::from(
-            "INSERT OR REPLACE INTO segments (\
+            "INSERT INTO segments (\
              id, context_id, file_path, language, block_type, content, \
              line_start, line_end, breadcrumb, complexity, role, \
              defined_symbols, referenced_symbols, called_symbols, \
@@ -1593,6 +1649,8 @@ async fn batch_upsert_segments_for_context(
             params.push(seg.file_hash.clone().into());
         }
 
+        sql.push_str(queries::SEGMENT_UPSERT_CONFLICT_CLAUSE);
+
         conn.execute(&sql, params)
             .await
             .map_err(|e| StorageError::Query(format!("batch upsert segments failed: {e}")))?;
@@ -1616,7 +1674,7 @@ async fn batch_upsert_vectors(
 
     for chunk in vec_segments.chunks(queries::VECTOR_CHUNK_SIZE) {
         let mut sql = String::from(
-            "INSERT OR REPLACE INTO segment_vectors (\
+            "INSERT INTO segment_vectors (\
              segment_id, embedding_vec, created_at, updated_at\
              ) VALUES ",
         );
@@ -1639,6 +1697,8 @@ async fn batch_upsert_vectors(
             params.push(seg.id.clone().into());
             params.push(seg.embedding_vec.clone().unwrap().into());
         }
+
+        sql.push_str(queries::VECTOR_UPSERT_CONFLICT_CLAUSE);
 
         conn.execute(&sql, params)
             .await
@@ -2660,6 +2720,170 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let stored: i64 = row.get(0).unwrap();
         assert_eq!(stored, 100);
+    }
+
+    async fn count_rows(conn: &Connection, sql: &str) -> i64 {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    fn embedded_segment(id: &str, file_path: &str, file_hash: &str, fill: f32) -> SegmentInsert {
+        let mut seg = test_segment(id, file_path, file_hash);
+        seg.embedding_vec = Some(serde_json::to_string(&vec![fill; 384]).unwrap());
+        seg
+    }
+
+    #[tokio::test]
+    async fn vector_rows_survive_replace_reruns_and_conflicting_segment_rewrites() {
+        // Defect A regression. `segments_vector_ad` fires AFTER DELETE on
+        // segments, and REPLACE-style conflict resolution deletes conflicting
+        // rows whenever `recursive_triggers` is ON, cascade-deleting freshly
+        // written vector rows. The segment writes must therefore use
+        // ON CONFLICT DO UPDATE, which keeps vectors intact under both
+        // recursive-trigger modes. This replays the real CLI write path
+        // (delete -> batched segment upsert -> batched vector upsert), then a
+        // re-run, then a conflicting rewrite of the same segment rows.
+        let (_db, conn) = setup().await;
+        conn.execute("PRAGMA recursive_triggers = ON", ())
+            .await
+            .unwrap();
+
+        let file_a = [
+            embedded_segment("vec_a_1", "src/a.rs", "hash-a", 0.25),
+            embedded_segment("vec_a_2", "src/a.rs", "hash-a", 0.5),
+        ];
+        let file_b = [embedded_segment("vec_b_1", "src/b.rs", "hash-b", 0.75)];
+        let batches = [
+            FileSegmentBatch {
+                file_path: "src/a.rs",
+                segments: &file_a,
+                manifest_meta: None,
+            },
+            FileSegmentBatch {
+                file_path: "src/b.rs",
+                segments: &file_b,
+                manifest_meta: None,
+            },
+        ];
+
+        replace_file_batch_tx(&conn, &batches).await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await,
+            3,
+            "fresh replace must store one vector row per embedded segment"
+        );
+
+        replace_file_batch_tx(&conn, &batches).await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await,
+            3,
+            "a re-run over the same files must keep vector rows intact"
+        );
+
+        // A subsequent statement that rewrites the same segment rows without
+        // a preceding delete (the conflict path) must not cascade-delete the
+        // already-stored vectors.
+        let rewrite = [
+            test_segment("vec_a_1", "src/a.rs", "hash-a2"),
+            test_segment("vec_a_2", "src/a.rs", "hash-a2"),
+        ];
+        batch_upsert_segments(&conn, &rewrite).await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await,
+            3,
+            "conflicting segment rewrites must never cascade-delete vector rows"
+        );
+
+        let mut rows = conn
+            .query(queries::SELECT_HAS_INDEXED_EMBEDDINGS, ())
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "embeddings probe must still see vector rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_segment_upsert_conflict_keeps_vector_row() {
+        // Defect A regression for the single-row upsert statement: a repeat
+        // upsert of an existing segment id (conflict path) with an embedding
+        // must keep exactly one live vector row under recursive triggers.
+        let (_db, conn) = setup().await;
+        conn.execute("PRAGMA recursive_triggers = ON", ())
+            .await
+            .unwrap();
+
+        let seg = embedded_segment("conflict_seg", "src/a.rs", "hash-1", 0.5);
+        upsert_segment(&conn, &seg).await.unwrap();
+        assert!(vector_exists(&conn, "conflict_seg").await);
+
+        let updated = embedded_segment("conflict_seg", "src/a.rs", "hash-2", 0.75);
+        upsert_segment(&conn, &updated).await.unwrap();
+        assert!(
+            vector_exists(&conn, "conflict_seg").await,
+            "vector row must survive a conflicting single-segment upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_counters_report_vector_rows_against_embeddable_segments() {
+        // Defect C support: status surfaces report stored-vector coverage,
+        // so the counters must mirror the pipeline's embed decision
+        // (structural segments and embeddable chunks count; excluded chunk
+        // languages do not).
+        let (_db, conn) = setup().await;
+        let context = "ctx-coverage";
+
+        let embedded = {
+            let mut seg = embedded_segment("cov_fn", "src/a.rs", "h", 0.5);
+            seg.block_type = "function".to_string();
+            seg
+        };
+        let unembedded_function = {
+            let mut seg = test_segment("cov_fn_plain", "src/a.rs", "h");
+            seg.block_type = "function".to_string();
+            seg
+        };
+        let json_chunk = {
+            let mut seg = test_segment("cov_json", "config/data.json", "h");
+            seg.block_type = "chunk".to_string();
+            seg.language = "json".to_string();
+            seg
+        };
+
+        replace_file_segments_for_context_tx(
+            &conn,
+            context,
+            "src/a.rs",
+            &[embedded, unembedded_function],
+        )
+        .await
+        .unwrap();
+        replace_file_segments_for_context_tx(&conn, context, "config/data.json", &[json_chunk])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_vector_rows_for_context(&conn, context).await.unwrap(),
+            1,
+            "only the segment written with an embedding has a vector row"
+        );
+        assert_eq!(
+            count_embeddable_segments_for_context(&conn, context)
+                .await
+                .unwrap(),
+            2,
+            "structural segments count as embeddable; excluded chunk languages do not"
+        );
+        assert_eq!(
+            count_vector_rows_for_context(&conn, "ctx-other")
+                .await
+                .unwrap(),
+            0,
+            "coverage stays scoped to the requested context"
+        );
     }
 
     #[tokio::test]

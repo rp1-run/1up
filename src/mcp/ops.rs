@@ -7,12 +7,15 @@ use libsql::Connection;
 use serde::Serialize;
 
 use crate::daemon::registry::Registry;
-use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
+use crate::indexer::embedder::{
+    self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
+};
 use crate::indexer::pipeline;
 use crate::mcp::types::StartMode;
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::overview;
+use crate::search::retrieval;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
@@ -26,7 +29,8 @@ use crate::shared::types::{
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
-    count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
+    count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
+    count_vector_rows_for_context, get_segment_by_id_for_context,
     get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
     StoredSegment,
 };
@@ -75,6 +79,10 @@ pub struct ReadinessPayload {
     pub indexed_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_segments: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embeddable_segments: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexed_at_head: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +382,8 @@ pub async fn classify_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
         indexed_at_head: None,
         current_head: None,
         drifted: None,
@@ -465,6 +475,13 @@ pub async fn classify_readiness(
     payload.total_segments = count_segments_for_context(&conn, &worktree_context.context_id)
         .await
         .ok();
+    payload.vector_rows = count_vector_rows_for_context(&conn, &worktree_context.context_id)
+        .await
+        .ok();
+    payload.embeddable_segments =
+        count_embeddable_segments_for_context(&conn, &worktree_context.context_id)
+            .await
+            .ok();
 
     let recorded_head = get_worktree_context_head_oid(&conn, &worktree_context.context_id)
         .await
@@ -492,7 +509,12 @@ pub async fn classify_readiness(
         .index_progress
         .as_ref()
         .is_some_and(|progress| !progress.embeddings_enabled);
-    let embedding_reason = embedding_unavailable_reason(&embedding_status_for_search());
+    let progress_reason = payload
+        .index_progress
+        .as_ref()
+        .and_then(|progress| progress.embedding_unavailable_reason.clone());
+    let embedding_reason = embedder::model_unavailable_reason_for_status()
+        .map(|reason| unavailable_reason_text(&reason));
 
     if progress_without_embeddings || embedding_reason.is_some() {
         payload.status = ReadinessStatus::Degraded;
@@ -500,8 +522,27 @@ pub async fn classify_readiness(
             "The index is readable, but semantic embeddings are unavailable.".to_string();
         payload.reason = Some(
             embedding_reason
+                .or(progress_reason)
                 .unwrap_or_else(|| "latest index was built without embeddings".to_string()),
         );
+        return payload;
+    }
+
+    // The model is claimed available, so a context with embeddable segments
+    // but zero stored vector rows means the index and the claim disagree:
+    // report it as degraded instead of ready.
+    let zero_vector_coverage = matches!(
+        (payload.vector_rows, payload.embeddable_segments),
+        (Some(0), Some(embeddable)) if embeddable > 0
+    );
+    if zero_vector_coverage {
+        payload.status = ReadinessStatus::Degraded;
+        payload.summary =
+            "The index is readable, but semantic embeddings are unavailable.".to_string();
+        payload.reason = Some(format!(
+            "embedding model is available but the index stores no vector rows for this context (0 of {} embeddable segments); run oneup_start with mode \"reindex\"",
+            payload.embeddable_segments.unwrap_or(0)
+        ));
         return payload;
     }
 
@@ -551,6 +592,8 @@ pub fn blocked_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
         indexed_at_head: None,
         current_head: None,
         drifted: None,
@@ -573,6 +616,8 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
         indexed_at_head: None,
         current_head: None,
         drifted: None,
@@ -592,6 +637,11 @@ pub async fn run_search(
         .await
 }
 
+/// Degraded reason emitted when the local index holds no vector rows for the
+/// active context, so search stays FTS-only without touching the embedder.
+pub(crate) const NO_INDEXED_EMBEDDINGS_REASON: &str =
+    "index contains no embeddings for this context; semantic ranking disabled (FTS-only)";
+
 async fn run_search_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
@@ -599,22 +649,35 @@ async fn run_search_once(
     limit: usize,
 ) -> anyhow::Result<SearchPayload> {
     let current = open_current_index(state_root).await?;
-    let mut runtime = EmbeddingRuntime::default();
-    let embedding_status = runtime.prepare_for_search(1);
     let search_scope = SearchScope::from_worktree_context(worktree_context);
-    let degraded_reason = combine_degraded_reasons(
-        embedding_unavailable_reason(&embedding_status),
-        search_scope.degraded_reason(),
-    );
 
-    let results = if embedding_status.is_available() {
-        let mut engine =
-            HybridSearchEngine::new_scoped(&current.conn, runtime.current_embedder(), search_scope);
-        engine.search(query, limit).await?
+    // Cheap vector-presence gate first: when the index holds no embeddings
+    // for this context, the embedding model must never be initialized.
+    let has_vectors = retrieval::has_indexed_embeddings(&current.conn, &search_scope).await?;
+    let (results, embedding_reason) = if has_vectors {
+        let mut runtime = EmbeddingRuntime::default();
+        let embedding_status = runtime.prepare_for_search(1);
+        let embedding_reason = embedding_unavailable_reason(&embedding_status);
+        let results = if embedding_status.is_available() {
+            let mut engine = HybridSearchEngine::new_scoped(
+                &current.conn,
+                runtime.current_embedder(),
+                search_scope.clone(),
+            );
+            engine.search(query, limit).await?
+        } else {
+            let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
+            engine.fts_only_search(query, limit).await?
+        };
+        (results, embedding_reason)
     } else {
-        let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope);
-        engine.fts_only_search(query, limit).await?
+        let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
+        let results = engine.fts_only_search(query, limit).await?;
+        (results, Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()))
     };
+
+    let degraded_reason =
+        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason());
 
     let status = match degraded_reason {
         Some(_) => OperationStatus::Degraded,
@@ -1288,30 +1351,32 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
     })
 }
 
-fn embedding_status_for_search() -> EmbeddingLoadStatus {
-    let mut runtime = EmbeddingRuntime::default();
-    runtime.prepare_for_search(1)
-}
-
 fn embedding_unavailable_reason(status: &EmbeddingLoadStatus) -> Option<String> {
     match status {
         EmbeddingLoadStatus::Warm
         | EmbeddingLoadStatus::Loaded
         | EmbeddingLoadStatus::Downloaded => None,
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
-            Some("embedding model is missing".to_string())
+        EmbeddingLoadStatus::Unavailable(reason) => Some(unavailable_reason_text(reason)),
+    }
+}
+
+fn unavailable_reason_text(reason: &EmbeddingUnavailableReason) -> String {
+    match reason {
+        EmbeddingUnavailableReason::ModelMissing => "embedding model is missing".to_string(),
+        EmbeddingUnavailableReason::PreviousDownloadFailed => {
+            "embedding model download previously failed".to_string()
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
-            Some("embedding model download previously failed".to_string())
+        EmbeddingUnavailableReason::ModelDirUnavailable(err) => {
+            format!("embedding model directory is unavailable: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err)) => {
-            Some(format!("embedding model directory is unavailable: {err}"))
+        EmbeddingUnavailableReason::LoadFailed(err) => {
+            format!("embedding model failed to load: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
-            Some(format!("embedding model failed to load: {err}"))
+        EmbeddingUnavailableReason::DownloadFailed(err) => {
+            format!("embedding model download failed: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
-            Some(format!("embedding model download failed: {err}"))
+        EmbeddingUnavailableReason::ArtifactsUnverifiable(err) => {
+            format!("embedding model artifacts failed verification: {err}")
         }
     }
 }
@@ -1602,6 +1667,61 @@ mod tests {
         assert_eq!(payload.status, StructuralSearchStatus::Ok);
         assert_eq!(payload.results.len(), 1);
         assert_eq!(payload.results[0].content, "active");
+    }
+
+    #[tokio::test]
+    async fn search_without_indexed_vectors_stays_fts_only_with_explicit_reason() {
+        // Defect C query-side regression: when the index holds no vector rows
+        // for the active context, local search must take the FTS-only branch
+        // that never constructs an embedding runtime, and it must report the
+        // explicit degraded reason instead of silently downgrading.
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "src/active.rs",
+            &[test_segment("vectorless_needle", "src/active.rs")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let context = WorktreeContext {
+            context_id: "ctx-active".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        };
+
+        let payload = run_search(&root, &context, "vectorless_needle", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(payload.status, OperationStatus::Degraded);
+        assert_eq!(
+            payload.degraded_reason.as_deref(),
+            Some(NO_INDEXED_EMBEDDINGS_REASON),
+            "the FTS-only path must carry the explicit no-embeddings reason"
+        );
+        assert!(
+            !payload.results.is_empty(),
+            "FTS-only search should still return lexical hits"
+        );
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {

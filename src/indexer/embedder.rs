@@ -183,6 +183,9 @@ pub enum EmbeddingUnavailableReason {
     ModelDirUnavailable(String),
     LoadFailed(String),
     DownloadFailed(String),
+    /// Model state exists on disk but failed verification and could not be
+    /// repaired locally; re-indexing re-downloads a verified artifact.
+    ArtifactsUnverifiable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,9 +263,23 @@ impl EmbeddingRuntime {
             }
         };
 
-        match resolve_model_dir_without_download(&model_root) {
-            Ok(Some(dir)) => return self.prepare_from_model_dir(&dir, embed_threads),
-            Ok(None) => {}
+        match resolve_model_state(&model_root) {
+            Ok(ModelResolution::Active(dir)) => {
+                return self.prepare_from_model_dir(&dir, embed_threads)
+            }
+            Ok(ModelResolution::Unverifiable(detail)) => {
+                // Artifacts are present but failed verification: re-download a
+                // verified set instead of silently indexing without embeddings.
+                // The download-failure marker only gates downloads for absent
+                // models; unverifiable state always warrants a repair attempt.
+                tracing::warn!(
+                    "model artifacts present but unverifiable ({detail}); re-downloading"
+                );
+                return self
+                    .prepare_with_download(&model_root, embed_threads, show_progress_ui)
+                    .await;
+            }
+            Ok(ModelResolution::Missing) => {}
             Err(err) => {
                 self.cache.clear();
                 return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
@@ -293,9 +310,15 @@ impl EmbeddingRuntime {
             }
         };
 
-        let model_dir = match resolve_model_dir_without_download(&model_root) {
-            Ok(Some(dir)) => dir,
-            Ok(None) => {
+        let model_dir = match resolve_model_state(&model_root) {
+            Ok(ModelResolution::Active(dir)) => dir,
+            Ok(ModelResolution::Unverifiable(detail)) => {
+                self.cache.clear();
+                return EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::ArtifactsUnverifiable(detail),
+                );
+            }
+            Ok(ModelResolution::Missing) => {
                 self.cache.clear();
                 return EmbeddingLoadStatus::Unavailable(if is_download_failed() {
                     EmbeddingUnavailableReason::PreviousDownloadFailed
@@ -391,7 +414,8 @@ pub struct Embedder {
 /// Reports whether the embedding model files are present on disk.
 ///
 /// Returns `false` if neither an active verified artifact nor a hash-validated
-/// legacy flat-file cache is available.
+/// legacy flat-file cache is available. Read-only: unlike the prepare paths,
+/// this never activates or repairs persisted state.
 #[allow(dead_code)]
 pub fn is_model_available() -> bool {
     let model_root = match model_dir() {
@@ -399,7 +423,42 @@ pub fn is_model_available() -> bool {
         Err(_) => return false,
     };
 
-    has_active_verified_artifact(&model_root) || legacy_artifacts_match_expected(&model_root)
+    has_active_verified_artifact(&model_root)
+        || EXPECTED_ARTIFACT_FILES.iter().all(|artifact| {
+            let path = model_root.join(artifact.filename);
+            path.exists() && sha256_digest_file(&path).is_ok_and(|digest| digest == artifact.sha256)
+        })
+}
+
+/// Resolves model availability for status surfaces without initializing an
+/// inference session.
+///
+/// Returns `None` when a verified artifact resolves (repairing or activating
+/// persisted state exactly like the search path would), and the unavailable
+/// reason otherwise. Status and search consume the same resolution, so they
+/// cannot disagree about model availability.
+pub fn model_unavailable_reason_for_status() -> Option<EmbeddingUnavailableReason> {
+    let model_root = match ensure_secure_model_root() {
+        Ok(dir) => dir,
+        Err(err) => {
+            return Some(EmbeddingUnavailableReason::ModelDirUnavailable(
+                err.to_string(),
+            ))
+        }
+    };
+
+    match resolve_model_state(&model_root) {
+        Ok(ModelResolution::Active(_)) => None,
+        Ok(ModelResolution::Unverifiable(detail)) => {
+            Some(EmbeddingUnavailableReason::ArtifactsUnverifiable(detail))
+        }
+        Ok(ModelResolution::Missing) => Some(if is_download_failed() {
+            EmbeddingUnavailableReason::PreviousDownloadFailed
+        } else {
+            EmbeddingUnavailableReason::ModelMissing
+        }),
+        Err(err) => Some(EmbeddingUnavailableReason::LoadFailed(err.to_string())),
+    }
 }
 
 /// Reports whether a previous download attempt failed.
@@ -741,42 +800,114 @@ fn manifest_path(model_root: &Path, artifact_id: &str) -> PathBuf {
 }
 
 fn has_active_verified_artifact(model_root: &Path) -> bool {
-    try_load_active_artifact_dir(model_root)
-        .map(|dir| dir.is_some())
-        .unwrap_or(false)
+    matches!(
+        try_load_active_artifact_dir(model_root),
+        Ok(ActivePointerState::Active(_))
+    )
 }
 
-fn legacy_artifacts_match_expected(model_root: &Path) -> bool {
-    EXPECTED_ARTIFACT_FILES.iter().all(|artifact| {
-        let path = model_root.join(artifact.filename);
-        path.exists() && sha256_digest_file(&path).is_ok_and(|digest| digest == artifact.sha256)
-    })
+/// Outcome of resolving the embedding model from persisted local state,
+/// without downloading.
+#[derive(Debug)]
+enum ModelResolution {
+    /// A verified artifact is active (or was just repaired/activated) and
+    /// resolution persisted state so later processes resolve in milliseconds.
+    Active(PathBuf),
+    /// Model state exists on disk but failed verification. Callers must
+    /// re-verify or re-download instead of silently treating the model as
+    /// absent: indexing re-downloads, search reports an explicit reason.
+    Unverifiable(String),
+    /// No model state exists locally.
+    Missing,
+}
+
+/// State of the persisted active-artifact pointer chain.
+enum ActivePointerState {
+    Active(PathBuf),
+    /// Pointer, manifest, or artifact files exist but the chain is broken.
+    Broken(String),
+    /// No pointer file exists.
+    Missing,
+}
+
+/// Outcome of importing legacy flat-file artifacts into the verified store.
+enum LegacyActivation {
+    Activated(PathBuf),
+    /// Legacy files are present (fully or partially) but failed verification.
+    Unverifiable(String),
+    /// No legacy files exist.
+    Absent,
+}
+
+/// Resolves the model directory from persisted state, repairing recoverable
+/// breakage along the way. Resolution is deterministic and idempotent: every
+/// successful path ends with a valid pointer + verified artifact on disk, so
+/// indexing and search processes always agree on model availability.
+fn resolve_model_state(model_root: &Path) -> Result<ModelResolution, OneupError> {
+    let pointer_detail = match try_load_active_artifact_dir(model_root)? {
+        ActivePointerState::Active(dir) => return Ok(ModelResolution::Active(dir)),
+        ActivePointerState::Broken(detail) => Some(detail),
+        ActivePointerState::Missing => None,
+    };
+
+    if let Some(repaired_dir) = repair_pointer_from_verified_artifacts(model_root)? {
+        return Ok(ModelResolution::Active(repaired_dir));
+    }
+
+    match try_activate_legacy_artifacts(model_root)? {
+        LegacyActivation::Activated(dir) => Ok(ModelResolution::Active(dir)),
+        LegacyActivation::Unverifiable(legacy_detail) => {
+            Ok(ModelResolution::Unverifiable(match pointer_detail {
+                Some(pointer_detail) => format!("{pointer_detail}; {legacy_detail}"),
+                None => legacy_detail,
+            }))
+        }
+        LegacyActivation::Absent => match pointer_detail {
+            Some(detail) => Ok(ModelResolution::Unverifiable(detail)),
+            None => Ok(ModelResolution::Missing),
+        },
+    }
 }
 
 fn resolve_model_dir_without_download(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
-    if let Some(active_dir) = try_load_active_artifact_dir(model_root)? {
-        return Ok(Some(active_dir));
-    }
-
-    try_activate_legacy_artifacts(model_root)
+    Ok(match resolve_model_state(model_root)? {
+        ModelResolution::Active(dir) => Some(dir),
+        ModelResolution::Unverifiable(_) | ModelResolution::Missing => None,
+    })
 }
 
-fn try_load_active_artifact_dir(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
+fn try_load_active_artifact_dir(model_root: &Path) -> Result<ActivePointerState, OneupError> {
     let current_path = current_manifest_path(model_root);
+    if !current_path.exists() {
+        return Ok(ActivePointerState::Missing);
+    }
     let current_bytes = match read_validated_file(&current_path, model_root) {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
+        Err(err) => {
+            return Ok(ActivePointerState::Broken(format!(
+                "active model pointer is unreadable: {err}"
+            )))
+        }
     };
     let current: ActiveArtifactPointer =
         match serde_json::from_slice::<ActiveArtifactPointer>(&current_bytes) {
             Ok(pointer) if pointer.is_valid() => pointer,
-            _ => return Ok(None),
+            _ => {
+                return Ok(ActivePointerState::Broken(
+                    "active model pointer is invalid".to_string(),
+                ))
+            }
         };
 
     let manifest_bytes =
         match read_validated_file(&manifest_path(model_root, &current.artifact_id), model_root) {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(None),
+            Err(err) => {
+                return Ok(ActivePointerState::Broken(format!(
+                    "manifest for active model artifact '{}' is unreadable: {err}",
+                    current.artifact_id
+                )))
+            }
         };
     let manifest: VerifiedArtifactManifest =
         match serde_json::from_slice::<VerifiedArtifactManifest>(&manifest_bytes) {
@@ -785,7 +916,12 @@ fn try_load_active_artifact_dir(model_root: &Path) -> Result<Option<PathBuf>, On
             {
                 manifest
             }
-            _ => return Ok(None),
+            _ => {
+                return Ok(ActivePointerState::Broken(format!(
+                    "manifest for active model artifact '{}' does not match the pinned model",
+                    current.artifact_id
+                )))
+            }
         };
 
     let artifact_dir = artifact_dir_path(model_root, &manifest.artifact_id);
@@ -803,26 +939,84 @@ fn try_load_active_artifact_dir(model_root: &Path) -> Result<Option<PathBuf>, On
             })
             .is_err()
         {
-            return Ok(None);
+            return Ok(ActivePointerState::Broken(format!(
+                "active model artifact '{}' is missing {}",
+                manifest.artifact_id, artifact.filename
+            )));
         }
     }
 
-    Ok(Some(artifact_dir))
+    Ok(ActivePointerState::Active(artifact_dir))
 }
 
-fn try_activate_legacy_artifacts(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
+/// Re-points `current.json` at an intact verified artifact when the pointer
+/// chain is missing or broken. Candidates are digest-verified against the
+/// pinned constants before re-pointing, so a successful repair restores the
+/// exact same guarantees as a fresh activation. Runs only on broken state;
+/// healthy resolution never pays the hashing cost.
+fn repair_pointer_from_verified_artifacts(
+    model_root: &Path,
+) -> Result<Option<PathBuf>, OneupError> {
+    let verified_root = verified_dir_path(model_root);
+    let entries = match fs::read_dir(&verified_root) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+
+    for entry in entries.flatten() {
+        let artifact_id = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let artifact_dir = artifact_dir_path(model_root, &artifact_id);
+
+        let manifest_bytes =
+            match read_validated_file(&manifest_path(model_root, &artifact_id), model_root) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+        let manifest_ok = serde_json::from_slice::<VerifiedArtifactManifest>(&manifest_bytes)
+            .is_ok_and(|manifest| {
+                manifest.artifact_id == artifact_id && manifest.matches_expected()
+            });
+        if !manifest_ok {
+            continue;
+        }
+
+        let digests_ok = EXPECTED_ARTIFACT_FILES.iter().all(|artifact| {
+            sha256_digest_file(&artifact_dir.join(artifact.filename))
+                .is_ok_and(|digest| digest == artifact.sha256)
+        });
+        if !digests_ok {
+            continue;
+        }
+
+        write_active_artifact_pointer(model_root, &artifact_id)?;
+        return Ok(Some(artifact_dir));
+    }
+
+    Ok(None)
+}
+
+fn try_activate_legacy_artifacts(model_root: &Path) -> Result<LegacyActivation, OneupError> {
     let legacy_paths: Vec<PathBuf> = EXPECTED_ARTIFACT_FILES
         .iter()
         .map(|artifact| model_root.join(artifact.filename))
         .collect();
+    // An incomplete flat-file cache is treated as absent, not unverifiable:
+    // missing files are an absence to be downloaded through the marker-gated
+    // path, while wrong content on a complete set is a verification failure.
     if legacy_paths.iter().any(|path| !path.exists()) {
-        return Ok(None);
+        return Ok(LegacyActivation::Absent);
     }
 
     for (artifact, path) in EXPECTED_ARTIFACT_FILES.iter().zip(legacy_paths.iter()) {
         let digest = sha256_digest_file(path)?;
         if digest != artifact.sha256 {
-            return Ok(None);
+            return Ok(LegacyActivation::Unverifiable(format!(
+                "legacy {} failed digest verification",
+                artifact.label
+            )));
         }
     }
 
@@ -845,7 +1039,7 @@ fn try_activate_legacy_artifacts(model_root: &Path) -> Result<Option<PathBuf>, O
         let _ = fs::remove_dir_all(cleanup_path);
     }
 
-    copy_result.map(Some)
+    copy_result.map(LegacyActivation::Activated)
 }
 
 async fn download_and_activate_verified_artifacts(
@@ -1032,6 +1226,12 @@ fn activate_staged_artifact(
     })?;
     sync_directory(&verified_root)?;
 
+    write_active_artifact_pointer(model_root, artifact_id)?;
+
+    Ok(final_dir)
+}
+
+fn write_active_artifact_pointer(model_root: &Path, artifact_id: &str) -> Result<(), OneupError> {
     let current = ActiveArtifactPointer::new(artifact_id.to_string());
     let current_bytes = serde_json::to_vec_pretty(&current).map_err(|err| {
         EmbeddingError::DownloadFailed(format!("serialize current manifest: {err}"))
@@ -1043,8 +1243,7 @@ fn activate_staged_artifact(
         XDG_STATE_DIR_MODE,
         SECURE_STATE_FILE_MODE,
     )?;
-
-    Ok(final_dir)
+    Ok(())
 }
 
 fn write_stage_file(path: &Path, contents: &[u8]) -> Result<(), OneupError> {
@@ -1144,6 +1343,22 @@ mod tests {
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
         std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
+    }
+
+    fn legacy_label(activation: &LegacyActivation) -> &'static str {
+        match activation {
+            LegacyActivation::Activated(_) => "Activated",
+            LegacyActivation::Unverifiable(_) => "Unverifiable",
+            LegacyActivation::Absent => "Absent",
+        }
+    }
+
+    fn resolution_label(resolution: &ModelResolution) -> &'static str {
+        match resolution {
+            ModelResolution::Active(_) => "Active",
+            ModelResolution::Unverifiable(_) => "Unverifiable",
+            ModelResolution::Missing => "Missing",
+        }
     }
 
     fn runtime_model_dir() -> PathBuf {
@@ -1268,9 +1483,13 @@ mod tests {
         std::fs::write(model_root.join(MODEL_FILENAME), &live_model).unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), &live_tokenizer).unwrap();
 
-        let activated = try_activate_legacy_artifacts(&model_root)
-            .unwrap()
-            .expect("legacy artifacts should import");
+        let activated = match try_activate_legacy_artifacts(&model_root).unwrap() {
+            LegacyActivation::Activated(dir) => dir,
+            other => panic!(
+                "legacy artifacts should import, got {}",
+                legacy_label(&other)
+            ),
+        };
         let current: ActiveArtifactPointer =
             serde_json::from_slice(&std::fs::read(current_manifest_path(&model_root)).unwrap())
                 .unwrap();
@@ -1321,8 +1540,134 @@ mod tests {
             serde_json::from_slice(&std::fs::read(current_manifest_path(&model_root)).unwrap())
                 .unwrap();
 
-        assert!(result.is_none());
+        assert!(
+            matches!(result, LegacyActivation::Unverifiable(_)),
+            "tampered legacy artifacts must resolve as unverifiable, got {}",
+            legacy_label(&result)
+        );
         assert_eq!(current.artifact_id, active_id);
+    }
+
+    #[test]
+    fn legacy_activation_persists_state_for_pointer_based_resolution() {
+        // Defect B regression: one successful legacy activation must persist
+        // pointer + verified artifact so subsequent processes resolve via that
+        // state alone, without the legacy flat files (and without re-hashing
+        // them).
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let runtime_dir = runtime_model_dir();
+        std::fs::copy(
+            runtime_dir.join(MODEL_FILENAME),
+            model_root.join(MODEL_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(TOKENIZER_FILENAME),
+            model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+
+        let first = resolve_model_dir_without_download(&model_root)
+            .unwrap()
+            .expect("legacy artifacts should activate");
+        assert!(current_manifest_path(&model_root).exists());
+
+        std::fs::remove_file(model_root.join(MODEL_FILENAME)).unwrap();
+        std::fs::remove_file(model_root.join(TOKENIZER_FILENAME)).unwrap();
+
+        let second = resolve_model_dir_without_download(&model_root)
+            .unwrap()
+            .expect("persisted state should keep resolving after legacy files are gone");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn missing_pointer_repairs_from_intact_verified_artifact() {
+        // Defect B regression: a deleted/torn pointer with an intact verified
+        // artifact must repair and resolve instead of silently reporting no
+        // model while verified files sit on disk.
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let runtime_dir = runtime_model_dir();
+        std::fs::copy(
+            runtime_dir.join(MODEL_FILENAME),
+            model_root.join(MODEL_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(TOKENIZER_FILENAME),
+            model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+
+        let activated = resolve_model_dir_without_download(&model_root)
+            .unwrap()
+            .expect("legacy artifacts should activate");
+        std::fs::remove_file(model_root.join(MODEL_FILENAME)).unwrap();
+        std::fs::remove_file(model_root.join(TOKENIZER_FILENAME)).unwrap();
+        std::fs::remove_file(current_manifest_path(&model_root)).unwrap();
+
+        let repaired = resolve_model_dir_without_download(&model_root)
+            .unwrap()
+            .expect("intact verified artifact should repair the missing pointer");
+        assert_eq!(activated, repaired);
+        assert!(
+            current_manifest_path(&model_root).exists(),
+            "repair must persist a fresh pointer"
+        );
+    }
+
+    #[test]
+    fn unverifiable_artifacts_resolve_to_explicit_unverifiable_state() {
+        // Defect B regression: present-but-unverifiable artifacts must not be
+        // silently reported as missing. Indexing re-downloads on this state
+        // and search surfaces an explicit reason.
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        write_fake_model_files(&model_root, b"tampered-model", b"tampered-tokenizer");
+        let tampered = resolve_model_state(&model_root).unwrap();
+        assert!(
+            matches!(tampered, ModelResolution::Unverifiable(_)),
+            "tampered legacy files must resolve as unverifiable, got {}",
+            resolution_label(&tampered)
+        );
+
+        // An incomplete flat-file cache is an absence (marker-gated download
+        // path), not a verification failure.
+        std::fs::remove_file(model_root.join(TOKENIZER_FILENAME)).unwrap();
+        let partial = resolve_model_state(&model_root).unwrap();
+        assert!(
+            matches!(partial, ModelResolution::Missing),
+            "incomplete legacy files must resolve as missing, got {}",
+            resolution_label(&partial)
+        );
+
+        std::fs::remove_file(model_root.join(MODEL_FILENAME)).unwrap();
+        let absent = resolve_model_state(&model_root).unwrap();
+        assert!(
+            matches!(absent, ModelResolution::Missing),
+            "an empty model root must resolve as missing, got {}",
+            resolution_label(&absent)
+        );
     }
 
     #[test]

@@ -60,36 +60,39 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         read_daemon_context_status(&project_root, &worktree_context.context_id);
     let daemon_status = read_daemon_status_for_context(&project_root, &worktree_context.context_id);
 
-    let (indexed_files, total_segments) = {
+    let (indexed_files, total_segments, vector_rows, embeddable_segments) = {
         if db_path.exists() {
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
                         if schema::ensure_current(&conn).await.is_ok() {
                             index_readable = true;
-                            let files = segments::count_files_for_context(
-                                &conn,
-                                &worktree_context.context_id,
-                            )
-                            .await
-                            .ok();
-                            let segs = segments::count_segments_for_context(
-                                &conn,
-                                &worktree_context.context_id,
-                            )
-                            .await
-                            .ok();
-                            (files, segs)
+                            let context_id = &worktree_context.context_id;
+                            let files = segments::count_files_for_context(&conn, context_id)
+                                .await
+                                .ok();
+                            let segs = segments::count_segments_for_context(&conn, context_id)
+                                .await
+                                .ok();
+                            let vectors =
+                                segments::count_vector_rows_for_context(&conn, context_id)
+                                    .await
+                                    .ok();
+                            let embeddable =
+                                segments::count_embeddable_segments_for_context(&conn, context_id)
+                                    .await
+                                    .ok();
+                            (files, segs, vectors, embeddable)
                         } else {
-                            (None, None)
+                            (None, None, None, None)
                         }
                     }
-                    Err(_) => (None, None),
+                    Err(_) => (None, None, None, None),
                 },
-                Err(_) => (None, None),
+                Err(_) => (None, None, None, None),
             }
         } else {
-            (None, None)
+            (None, None, None, None)
         }
     };
 
@@ -116,6 +119,8 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         project_initialized,
         indexed_files,
         total_segments,
+        vector_rows,
+        embeddable_segments,
         project_id,
         project_root,
         source_root,

@@ -251,8 +251,14 @@ WHERE segments_fts MATCH ?1
 ORDER BY f.rank, s.rowid
 LIMIT ?3";
 
+/* KEEP: segments writes must stay ON CONFLICT DO UPDATE, never INSERT OR
+REPLACE. REPLACE resolves conflicts by deleting the existing row, which fires
+`segments_vector_ad` under `PRAGMA recursive_triggers=ON` (cascade-deleting
+the segment's vector row) and skips the FTS delete trigger under the default
+OFF (leaving stale external-content FTS entries). DO UPDATE keeps the rowid
+stable and routes through `segments_au`, which is correct in both modes. */
 pub const UPSERT_SEGMENT: &str = "
-INSERT OR REPLACE INTO segments (
+INSERT INTO segments (
     id, context_id, file_path, language, block_type, content,
     line_start, line_end, breadcrumb, complexity, role, defined_symbols, referenced_symbols, called_symbols,
     file_hash, created_at, updated_at
@@ -260,14 +266,33 @@ INSERT OR REPLACE INTO segments (
     ?1, ?2, ?3, ?4, ?5, ?6,
     ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
     ?15, datetime('now'), datetime('now')
-)";
+)
+ON CONFLICT(id) DO UPDATE SET
+    context_id = excluded.context_id,
+    file_path = excluded.file_path,
+    language = excluded.language,
+    block_type = excluded.block_type,
+    content = excluded.content,
+    line_start = excluded.line_start,
+    line_end = excluded.line_end,
+    breadcrumb = excluded.breadcrumb,
+    complexity = excluded.complexity,
+    role = excluded.role,
+    defined_symbols = excluded.defined_symbols,
+    referenced_symbols = excluded.referenced_symbols,
+    called_symbols = excluded.called_symbols,
+    file_hash = excluded.file_hash,
+    updated_at = datetime('now')";
 
 pub const UPSERT_SEGMENT_VECTOR: &str = "
-INSERT OR REPLACE INTO segment_vectors (
+INSERT INTO segment_vectors (
     segment_id, embedding_vec, created_at, updated_at
 ) VALUES (
     ?1, vector8(?2), datetime('now'), datetime('now')
-)";
+)
+ON CONFLICT(segment_id) DO UPDATE SET
+    embedding_vec = excluded.embedding_vec,
+    updated_at = datetime('now')";
 
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
 
@@ -731,6 +756,28 @@ pub const COUNT_FILES: &str = "SELECT COUNT(DISTINCT file_path) FROM segments";
 pub const COUNT_FILES_FOR_CONTEXT: &str =
     "SELECT COUNT(DISTINCT file_path) FROM segments WHERE context_id = ?1";
 
+pub const COUNT_VECTOR_ROWS_FOR_CONTEXT: &str = "
+SELECT COUNT(*)
+FROM segment_vectors AS sv
+JOIN segments AS s ON s.id = sv.segment_id
+WHERE s.context_id = ?1";
+
+/// Counts the segments the pipeline would embed for one context, mirroring
+/// `should_embed_segment`: structural segments always count, text chunks
+/// count unless their language is in `NON_EMBEDDABLE_CHUNK_LANGUAGES`.
+pub static COUNT_EMBEDDABLE_SEGMENTS_FOR_CONTEXT: LazyLock<String> = LazyLock::new(|| {
+    let excluded = crate::shared::constants::NON_EMBEDDABLE_CHUNK_LANGUAGES
+        .iter()
+        .map(|language| format!("'{language}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT COUNT(*) FROM segments \
+         WHERE context_id = ?1 \
+           AND NOT (block_type = 'chunk' AND language IN ({excluded}))"
+    )
+});
+
 pub const SELECT_FILE_PATHS_BY_LANGUAGE: &str = "
 SELECT DISTINCT file_path FROM segments
 WHERE language = ?1
@@ -865,6 +912,35 @@ INSERT OR REPLACE INTO worktree_contexts (
 
 pub const SELECT_WORKTREE_CONTEXT_HEAD_OID: &str =
     "SELECT head_oid FROM worktree_contexts WHERE context_id = ?1";
+
+/// Conflict clause appended to chunked multi-row segment inserts. Mirrors
+/// `UPSERT_SEGMENT`: DO UPDATE (never REPLACE) so conflict resolution cannot
+/// delete rows and fire `segments_vector_ad` or bypass the FTS triggers.
+pub const SEGMENT_UPSERT_CONFLICT_CLAUSE: &str = "
+ON CONFLICT(id) DO UPDATE SET
+    context_id = excluded.context_id,
+    file_path = excluded.file_path,
+    language = excluded.language,
+    block_type = excluded.block_type,
+    content = excluded.content,
+    line_start = excluded.line_start,
+    line_end = excluded.line_end,
+    breadcrumb = excluded.breadcrumb,
+    complexity = excluded.complexity,
+    role = excluded.role,
+    defined_symbols = excluded.defined_symbols,
+    referenced_symbols = excluded.referenced_symbols,
+    called_symbols = excluded.called_symbols,
+    file_hash = excluded.file_hash,
+    updated_at = datetime('now')";
+
+/// Conflict clause appended to chunked multi-row vector inserts. Mirrors
+/// `UPSERT_SEGMENT_VECTOR`: updating in place avoids delete/reinsert churn in
+/// the DiskANN vector index shadow tables.
+pub const VECTOR_UPSERT_CONFLICT_CLAUSE: &str = "
+ON CONFLICT(segment_id) DO UPDATE SET
+    embedding_vec = excluded.embedding_vec,
+    updated_at = datetime('now')";
 
 /// Maximum number of SQL parameters per statement to stay below SQLite limits.
 pub const SQLITE_MAX_PARAMS: usize = 999;

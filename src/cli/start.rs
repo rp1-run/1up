@@ -61,6 +61,11 @@ fn model_status_message(status: &EmbeddingLoadStatus) -> String {
         | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
             format!("Embedding model failed to load ({err})")
         }
+        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ArtifactsUnverifiable(
+            err,
+        )) => {
+            format!("Embedding model artifacts failed verification ({err})")
+        }
         EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
             "Embedding model unavailable".to_string()
         }

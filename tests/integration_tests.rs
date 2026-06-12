@@ -515,9 +515,12 @@ struct HideModelGuard {
     hidden_path: PathBuf,
     current_path: PathBuf,
     hidden_current_path: PathBuf,
+    verified_path: PathBuf,
+    hidden_verified_path: PathBuf,
     marker_path: PathBuf,
     active: bool,
     current_active: bool,
+    verified_active: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -535,6 +538,8 @@ impl HideModelGuard {
         let hidden_path = model_dir.join("model.onnx.hidden_by_test");
         let current_path = model_dir.join("current.json");
         let hidden_current_path = model_dir.join("current.json.hidden_by_test");
+        let verified_path = model_dir.join("verified");
+        let hidden_verified_path = model_dir.join("verified.hidden_by_test");
         let marker_path = model_dir.join(".download_failed");
 
         let active = model_path.exists();
@@ -545,6 +550,13 @@ impl HideModelGuard {
         if current_active {
             fs::rename(&current_path, &hidden_current_path).unwrap();
         }
+        // Hide the verified artifact store too: resolution self-heals from
+        // intact verified artifacts when the pointer is missing, so leaving
+        // it visible would re-enable the model under this guard.
+        let verified_active = verified_path.exists();
+        if verified_active {
+            fs::rename(&verified_path, &hidden_verified_path).unwrap();
+        }
         // Create download failure marker to prevent auto-download during tests
         let _ = fs::write(&marker_path, "hidden_by_test");
 
@@ -553,9 +565,12 @@ impl HideModelGuard {
             hidden_path,
             current_path,
             hidden_current_path,
+            verified_path,
+            hidden_verified_path,
             marker_path,
             active,
             current_active,
+            verified_active,
             _lock: lock,
         }
     }
@@ -568,6 +583,9 @@ impl Drop for HideModelGuard {
         }
         if self.current_active && self.hidden_current_path.exists() {
             let _ = fs::rename(&self.hidden_current_path, &self.current_path);
+        }
+        if self.verified_active && self.hidden_verified_path.exists() {
+            let _ = fs::rename(&self.hidden_verified_path, &self.verified_path);
         }
         let _ = fs::remove_file(&self.marker_path);
     }
@@ -2060,6 +2078,52 @@ fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
     assert_eq!(
         doc_vectors, doc_segments,
         "every doc_section segment should carry a vector row"
+    );
+}
+
+#[test]
+fn fresh_index_stores_vector_rows_for_source_segments_when_embeddings_enabled() {
+    // Defect A regression: a fresh index run with a working embedder must
+    // persist vector rows for source-code segments through the real CLI
+    // pipeline path. Counts are read through libsql: stock SQLite tooling
+    // satisfies COUNT(*) from the DiskANN expression-index btree, which
+    // libsql leaves empty, and therefore under-reports stored vectors as 0.
+    let _model_guard = RestoreHiddenModelGuard::new();
+    let tmp = create_multi_lang_fixture();
+    init_project(tmp.path());
+    let payload = run_index_json(tmp.path(), &[]);
+
+    if payload["progress"]["embeddings_enabled"] != true {
+        eprintln!(
+            "skipping vector-row assertions: embedding model unavailable in this environment"
+        );
+        return;
+    }
+
+    let vector_rows = count_index_rows(tmp.path(), "SELECT COUNT(*) FROM segment_vectors");
+    let embeddable_segments = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments WHERE NOT (block_type = 'chunk' AND language IN \
+         ('json','yaml','toml','protobuf','terraform','sql','config','makefile','dockerfile'))",
+    );
+
+    assert!(
+        vector_rows > 0,
+        "a fresh index with a working embedder must store vector rows"
+    );
+    assert_eq!(
+        vector_rows, embeddable_segments,
+        "every embeddable segment should carry a vector row"
+    );
+    assert_eq!(
+        payload["progress"]["vector_rows"].as_i64(),
+        Some(vector_rows),
+        "reported vector coverage must match the stored rows"
+    );
+    assert_eq!(
+        payload["progress"]["embeddable_segments"].as_i64(),
+        Some(embeddable_segments),
+        "reported embeddable count must match the stored segments"
     );
 }
 

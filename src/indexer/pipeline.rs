@@ -127,6 +127,9 @@ fn refresh_progress(
         files_deleted: stats.files_deleted,
         segments_stored: stats.segments_stored,
         embeddings_enabled: stats.embeddings_generated,
+        embedding_unavailable_reason: stats.embedding_unavailable_reason.clone(),
+        vector_rows: stats.vector_rows,
+        embeddable_segments: stats.embeddable_segments,
         message: pipeline_progress_message(stats, update.phase, update.files_total),
         parallelism: update.parallelism,
         timings: update.timings,
@@ -148,6 +151,7 @@ use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{
     DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
+    NON_EMBEDDABLE_CHUNK_LANGUAGES,
 };
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::progress::{ProgressState, ProgressUi};
@@ -300,18 +304,7 @@ fn should_embed_segment(seg: &ParsedSegment) -> bool {
         return true;
     }
 
-    !matches!(
-        seg.language.as_str(),
-        "json"
-            | "yaml"
-            | "toml"
-            | "protobuf"
-            | "terraform"
-            | "sql"
-            | "config"
-            | "makefile"
-            | "dockerfile"
-    )
+    !NON_EMBEDDABLE_CHUNK_LANGUAGES.contains(&seg.language.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -865,6 +858,47 @@ async fn store_ready_files(
     Ok(())
 }
 
+/// Reconciles the reported embedding state with what the database actually
+/// holds for this context. A run that had a working embedder but left a
+/// context with embeddable segments and zero stored vector rows must not
+/// report embeddings as enabled; it reports `embeddings_generated: false`
+/// with an explicit reason instead. Count failures are advisory: the indexed
+/// data is already committed, so they log a warning and leave coverage unset.
+async fn verify_stored_embedding_outcome(
+    conn: &Connection,
+    context_id: &str,
+    stats: &mut PipelineStats,
+) {
+    let vector_rows = match segments::count_vector_rows_for_context(conn, context_id).await {
+        Ok(count) => count,
+        Err(err) => {
+            warn!("failed to count stored vector rows for context {context_id}: {err}");
+            return;
+        }
+    };
+    let embeddable_segments =
+        match segments::count_embeddable_segments_for_context(conn, context_id).await {
+            Ok(count) => count,
+            Err(err) => {
+                warn!("failed to count embeddable segments for context {context_id}: {err}");
+                return;
+            }
+        };
+
+    stats.vector_rows = Some(vector_rows);
+    stats.embeddable_segments = Some(embeddable_segments);
+
+    if stats.embeddings_generated && embeddable_segments > 0 && vector_rows == 0 {
+        warn!(
+            "embedder was available but context {context_id} stored 0 vector rows for {embeddable_segments} embeddable segments; reporting embeddings as unavailable"
+        );
+        stats.embeddings_generated = false;
+        stats.embedding_unavailable_reason = Some(format!(
+            "embedder was available but no vector rows were stored ({embeddable_segments} embeddable segments); run `1up reindex` to rebuild"
+        ));
+    }
+}
+
 async fn delete_removed_files(
     conn: &Connection,
     context_id: &str,
@@ -1029,7 +1063,13 @@ pub struct PipelineStats {
     pub files_skipped: usize,
     pub files_deleted: usize,
     pub segments_stored: usize,
+    /// Reflects the stored outcome, not embedder presence: true only when the
+    /// run had an embedder and the context's stored vector coverage is
+    /// consistent with it (see `verify_stored_embedding_outcome`).
     pub embeddings_generated: bool,
+    pub embedding_unavailable_reason: Option<String>,
+    pub vector_rows: Option<u64>,
+    pub embeddable_segments: Option<u64>,
     pub progress: IndexProgress,
 }
 
@@ -1043,6 +1083,9 @@ impl Default for PipelineStats {
             files_deleted: 0,
             segments_stored: 0,
             embeddings_generated: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
             progress: IndexProgress::pending(),
         }
     }
@@ -1408,6 +1451,8 @@ async fn execute_run_with_inputs(
 
     if !has_embedder {
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+        stats.embedding_unavailable_reason =
+            Some("embedding model unavailable; indexed without embeddings".to_string());
     } else {
         schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
     }
@@ -1614,6 +1659,8 @@ async fn execute_run_with_inputs(
         "parse stage complete: {} files processed in {}ms",
         content_read_count, timings.parse_ms
     );
+
+    verify_stored_embedding_outcome(conn, &context.context_id, &mut stats).await;
 
     progress_ui.success_with(format!(
         "Processed {} files: {} indexed, {} skipped, {} deleted, {} segments",
@@ -1847,6 +1894,90 @@ mod tests {
 
         let count = segments::count_segments(&conn).await.unwrap();
         assert!(count > 0);
+    }
+
+    #[tokio::test]
+    async fn run_without_embedder_reports_reason_and_stored_vector_coverage() {
+        // Defect C regression: an index run without a usable embedder must
+        // report an explicit unavailable reason and the measured stored
+        // coverage (zero vector rows over a positive embeddable count), both
+        // in stats and in the persisted progress contract.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn coverage_probe() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+
+        assert!(!stats.embeddings_generated);
+        assert!(
+            stats
+                .embedding_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unavailable")),
+            "missing embedder must carry an explicit reason, got {:?}",
+            stats.embedding_unavailable_reason
+        );
+        assert_eq!(stats.vector_rows, Some(0));
+        assert!(stats.embeddable_segments.is_some_and(|count| count > 0));
+
+        assert!(!stats.progress.embeddings_enabled);
+        assert_eq!(
+            stats.progress.embedding_unavailable_reason,
+            stats.embedding_unavailable_reason
+        );
+        assert_eq!(stats.progress.vector_rows, Some(0));
+        assert_eq!(
+            stats.progress.embeddable_segments,
+            stats.embeddable_segments
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_stored_embedding_outcome_flips_dishonest_embedding_claims() {
+        // Defect C regression: a run claiming embeddings while the context
+        // stores zero vector rows for embeddable segments must be reported as
+        // embeddings unavailable with an explicit reason.
+        let (_db, conn) = setup().await;
+        let context_id = "ctx-honesty";
+        let insert = segments::SegmentInsert {
+            id: segments::generate_segment_id(context_id, "src/a.rs", 1, 3),
+            file_path: "src/a.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn honesty_probe() {}".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"honesty_probe\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash".to_string(),
+        };
+        segments::replace_file_segments_for_context_tx(&conn, context_id, "src/a.rs", &[insert])
+            .await
+            .unwrap();
+
+        let mut stats = PipelineStats {
+            embeddings_generated: true,
+            ..PipelineStats::default()
+        };
+        verify_stored_embedding_outcome(&conn, context_id, &mut stats).await;
+
+        assert!(
+            !stats.embeddings_generated,
+            "zero stored vectors with embeddable segments must not report embeddings as enabled"
+        );
+        assert!(stats
+            .embedding_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no vector rows")));
+        assert_eq!(stats.vector_rows, Some(0));
+        assert!(stats.embeddable_segments.is_some_and(|count| count > 0));
     }
 
     #[test]
