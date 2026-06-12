@@ -1407,6 +1407,7 @@ fn candidate_from_stored_segment(segment: StoredSegment) -> CandidateRow {
         defined_symbols,
         referenced_symbols,
         called_symbols,
+        content: segment.content,
     }
 }
 
@@ -4079,6 +4080,7 @@ mod tests {
             defined_symbols: Some(vec!["load_config".to_string()]),
             referenced_symbols: None,
             called_symbols: None,
+            content: String::new(),
         };
         let seed_ids = HashSet::from(["load-config".to_string()]);
 

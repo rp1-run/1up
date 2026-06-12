@@ -30,13 +30,31 @@ pub const NON_EMBEDDABLE_CHUNK_LANGUAGES: [&str; 9] = [
 
 /// Default number of vector search prefilter candidates (int8 stage).
 ///
-/// Tuned to 400 for schema v13's FLOAT8 HNSW: quantization makes the top-K
+/// Tuned to 400 for schema v13's FLOAT8 vectors: quantization makes the top-K
 /// ranking slightly noisier, so a wider candidate pool gives the RRF reranker
 /// enough coverage to recover gold segments that drift out of the top 200 but
-/// are still in the right neighbourhood. Doubling K closes the recall gap
+/// are still in the right neighbourhood. Doubling K closed the recall gap
 /// introduced by the FLOAT32 -> FLOAT8 column shift with no measurable search
-/// latency impact at repo scale (~3.3k segments).
+/// latency impact. The constant serves both vector paths: it is the LIMIT of
+/// the exhaustive-scan path (where candidate cost is one sort, so 400 keeps
+/// the reranker pool identical to the index path) and the per-context K for
+/// the approximate index path above
+/// [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`], where it remains the
+/// recall/latency tradeoff originally tuned for quantization noise.
 pub const VECTOR_PREFILTER_K: usize = 400;
+
+/// Maximum context-scoped vector count served by the exhaustive-scan path.
+///
+/// The disk-based approximate vector index answers `vector_top_k` by beam
+/// traversal over a neighbor graph, which is read-heavy and pathologically
+/// slow at small corpus sizes (observed: ~7s single-thread CPU for one query
+/// over ~4.5k vectors). An exhaustive scan is mathematically trivial at this
+/// scale: 16384 x 384 int8 dot products is ~6.3M multiply-accumulates, well
+/// under 10ms, and it is exact rather than approximate. Below this bound
+/// vector candidates come from a full `vector_distance_cos` scan over the
+/// context's vectors; above it the graph traversal amortizes and the
+/// `vector_top_k` index path takes over.
+pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 16384;
 
 /// Maximum number of indexed worktree contexts used to scale vector prefiltering.
 ///

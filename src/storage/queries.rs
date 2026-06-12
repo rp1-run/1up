@@ -209,7 +209,7 @@ WITH vector_matches AS (
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
 JOIN segment_vectors AS sv ON sv.rowid = v.id
 JOIN segments AS s ON s.id = sv.segment_id
@@ -222,18 +222,33 @@ WITH vector_matches AS (
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
 JOIN segment_vectors AS sv ON sv.rowid = v.id
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?3
 ORDER BY v.rank";
 
+/* KEEP: the exhaustive path must not touch idx_segment_vectors_embedding.
+Below VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS a full ordered scan over the
+context's vectors is both exact and orders of magnitude faster than beam
+traversal over the disk-based approximate index, which the profiling for the
+small-corpus latency fix showed spending seconds in read-heavy graph walks. */
+pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
+FROM segment_vectors AS sv
+JOIN segments AS s ON s.id = sv.segment_id
+WHERE s.context_id = ?2
+ORDER BY vector_distance_cos(sv.embedding_vec, vector8(?1)), s.id
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_FTS_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM segments_fts AS f
 JOIN segments AS s ON s.rowid = f.rowid
 WHERE segments_fts MATCH ?1
@@ -243,7 +258,7 @@ LIMIT ?2";
 pub const SELECT_FTS_CANDIDATES_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM segments_fts AS f
 JOIN segments AS s ON s.rowid = f.rowid
 WHERE segments_fts MATCH ?1

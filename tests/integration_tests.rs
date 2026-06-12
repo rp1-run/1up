@@ -893,6 +893,24 @@ fn search_rows(dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
     parse_discovery_rows(&stdout)
 }
 
+fn search_rows_with_limit(
+    dir: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Vec<LeanDiscoveryRow> {
+    let limit = limit.to_string();
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "search",
+        query,
+        "-n",
+        &limit,
+        "--path",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(ok, "search failed: {stderr}");
+    parse_discovery_rows(&stdout)
+}
+
 fn search_rows_with_home(home: &Path, dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
     let (stdout, stderr, ok) =
         run_core_cmd_with_home(home, &["search", query, "--path", dir.to_str().unwrap()]);
@@ -1164,6 +1182,41 @@ pub fn aggregate_bucket(report: &BlastRadiusReport) -> usize {
     )
     .unwrap();
 
+    // In-file `#[cfg(test)] mod tests` vs implementation: the descriptive
+    // test fn name carries near-perfect term coverage for the conceptual
+    // query, lives in a src path, and is only classifiable through its
+    // `tests` breadcrumb component.
+    fs::write(
+        tmp.path().join("src").join("refinement.rs"),
+        r#"pub struct Margin {
+    pub pool_size: usize,
+}
+
+/// Applies the refinement margin while shrinking the candidate pool.
+pub fn shrink_pool(margin: &Margin) -> usize {
+    margin.pool_size.saturating_sub(1)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("pool_state.rs"),
+        r#"pub fn pool_state_label() -> &'static str {
+    "pool"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn refinement_margin_shrinks_candidate_pool_state() {
+        assert_eq!(super::pool_state_label(), "pool");
+    }
+}
+"#,
+    )
+    .unwrap();
+
     // Inflected query vs stem-named symbol: reachable only through
     // stem-prefix FTS variants (`composed` -> compos*).
     fs::write(
@@ -1188,6 +1241,53 @@ pub fn spawn_daemon_worker() -> bool {
     )
     .unwrap();
 
+    // Content-only doc relevance: the "What To Expect" heading shares no
+    // terms with the cadence query, so only its body can prove relevance.
+    // The code competitors below give the query a populated result list
+    // whose middle tier (docs-path text chunks) would bury a doubly
+    // penalized doc section.
+    fs::write(
+        tmp.path().join("src").join("snapshot_refresh.rs"),
+        r#"/// Plans the next snapshot refresh for a capture window.
+pub fn snapshot_refresh_planner(window: usize) -> usize {
+    window + 1
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cadence.rs"),
+        r#"/// Computes the offline cadence window between captures.
+pub fn offline_cadence_window(base: usize) -> usize {
+    base * 2
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("snapshot_store.rs"),
+        r#"/// Stores one offline snapshot per capture run.
+pub fn offline_snapshot_store(slot: usize) -> usize {
+    slot.max(1)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("runtime_notes.txt"),
+        "runtime notes\nkeep one offline snapshot per machine\nreview the snapshot before rotation\n",
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("startup_notes.txt"),
+        "startup notes\nrefresh happens on a steady cadence\nkeep the cadence aligned with capture\n",
+    )
+    .unwrap();
+
     fs::write(
         tmp.path().join("README.md"),
         r#"# <img src="assets/logo.png" alt="logo"> Acceptance Project
@@ -1197,6 +1297,13 @@ Intro paragraph.
 ## Start Here
 
 Setup notes.
+
+## What To Expect
+
+Each offline snapshot gets a refresh on a fixed cadence.
+
+Background sweeps stay quiet and never require manual
+restarts between sessions.
 
 ## Windows daemon support
 
@@ -1893,6 +2000,13 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
             "blast radius expansion trust buckets",
             "src/blast_radius.rs",
         ),
+        // In-file `#[cfg(test)] mod tests` segments live in src paths, so
+        // only their `tests` breadcrumb component can keep the descriptive
+        // test fn from outranking the implementation.
+        (
+            "refinement margin shrinks candidate pool",
+            "src/refinement.rs",
+        ),
         // Inflected natural-language words must reach stem-named symbols.
         (
             "where are embeddings composed before indexing",
@@ -1922,9 +2036,9 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
     }
 
     // Heading-matched doc query: the README doc_section must stay in the
-    // top-3 despite the compounded markdown and readme-path penalties, and
-    // its breadcrumb must carry cleaned heading text without the H1's
-    // inline HTML noise.
+    // top-3 despite the markdown and readme-path penalties, and its
+    // breadcrumb must carry cleaned heading text without the H1's inline
+    // HTML noise.
     let rows = search_rows(tmp.path(), "windows daemon support");
     let doc_hit = rows
         .iter()
@@ -1937,6 +2051,24 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
     assert_eq!(
         doc_hit.breadcrumb,
         "README > Acceptance Project > Windows daemon support"
+    );
+
+    // Content-matched doc query: the "What To Expect" heading shares no
+    // query terms, so breadcrumb neutralization cannot fire; strong body
+    // coverage plus non-stacking markdown/docs-path penalties must still
+    // carry the section into the top-5 over the docs-path text chunks.
+    let rows = search_rows_with_limit(tmp.path(), "offline snapshot refresh cadence", 10);
+    let doc_hit = rows
+        .iter()
+        .take(5)
+        .find(|row| row.kind == "doc_section")
+        .unwrap_or_else(|| {
+            panic!("content-matched doc query should put a doc_section in the top-5: {rows:?}")
+        });
+    assert_eq!(doc_hit.file_path, "README.md");
+    assert_eq!(
+        doc_hit.breadcrumb,
+        "README > Acceptance Project > What To Expect"
     );
 }
 

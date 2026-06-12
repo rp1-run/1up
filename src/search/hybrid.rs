@@ -597,6 +597,7 @@ mod tests {
             defined_symbols: None,
             referenced_symbols: None,
             called_symbols: None,
+            content: String::new(),
         }
     }
 }

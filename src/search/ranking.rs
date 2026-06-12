@@ -141,12 +141,11 @@ fn compute_rrf_score(candidate: &ScoredCandidate, query: &str, intent: QueryInte
     let mut score = vector_score + fts_score + symbol_score;
 
     score *= intent_boost(&candidate.candidate, query, intent);
-    score *= file_path_boost(&candidate.candidate.file_path);
-    score *= test_path_query_dampening(query, intent, &candidate.candidate.file_path);
+    score *= path_and_content_kind_boost(query, &candidate.candidate, intent);
+    score *= test_tier_query_dampening(query, intent, &candidate.candidate);
     score *= query_path_boost(query, &candidate.candidate.file_path);
     score *= query_match_boost(query, &candidate.candidate);
     score *= breadcrumb_relevance_boost(query, &candidate.candidate);
-    score *= content_kind_boost(query, &candidate.candidate, intent);
     score *= short_segment_penalty(&candidate.candidate);
 
     score
@@ -223,11 +222,33 @@ fn is_test_like_path(lower_path: &str) -> bool {
         .any(|marker| lower_path.contains(marker))
 }
 
-fn file_path_boost(path: &str) -> f64 {
-    let lower = path.to_lowercase();
-    if is_test_like_path(&lower) {
-        0.7
-    } else if lower.contains("doc") || lower.contains("readme") {
+/// In-file test modules (`#[cfg(test)] mod tests`) live inside src files, so
+/// path classification alone misses them; their segments carry a `tests`
+/// breadcrumb component instead. Components split on breadcrumb separators
+/// (`::` scope chains, `>` heading chains, path-like `/` and `.`,
+/// whitespace) so an implementation symbol such as `run_tests` never
+/// matches.
+fn breadcrumb_has_tests_component(breadcrumb: &str) -> bool {
+    breadcrumb
+        .split(|c: char| matches!(c, ':' | '>' | '/' | '.') || c.is_whitespace())
+        .any(|component| component.eq_ignore_ascii_case("tests"))
+}
+
+fn is_test_tier_candidate(candidate: &CandidateRow) -> bool {
+    is_test_like_path(&candidate.file_path.to_lowercase())
+        || candidate
+            .breadcrumb
+            .as_deref()
+            .is_some_and(breadcrumb_has_tests_component)
+}
+
+fn file_path_boost(candidate: &CandidateRow) -> f64 {
+    if is_test_tier_candidate(candidate) {
+        return 0.7;
+    }
+
+    let lower = candidate.file_path.to_lowercase();
+    if lower.contains("doc") || lower.contains("readme") {
         0.8
     } else if lower.contains("vendor") || lower.contains("node_modules") {
         0.5
@@ -236,21 +257,21 @@ fn file_path_boost(path: &str) -> f64 {
     }
 }
 
-/// Extra dampening for test-tier paths on natural-language conceptual
+/// Extra dampening for test-tier candidates on natural-language conceptual
 /// queries. Descriptive snake_case test/bench names read like sentences, so
 /// identifier-split FTS matching hands them near-perfect term coverage that
 /// the base 0.7 tier penalty cannot offset; combined they land at ~0.5 so
 /// implementation code wins conceptual queries. Usage-intent queries keep
 /// the full tier weight because tests are legitimate usage evidence.
-const NL_QUERY_TEST_PATH_DAMPENING: f64 = 0.72;
+const NL_QUERY_TEST_TIER_DAMPENING: f64 = 0.72;
 
-fn test_path_query_dampening(query: &str, intent: QueryIntent, path: &str) -> f64 {
+fn test_tier_query_dampening(query: &str, intent: QueryIntent, candidate: &CandidateRow) -> f64 {
     if matches!(intent, QueryIntent::Usage) || !is_natural_language_query(query) {
         return 1.0;
     }
 
-    if is_test_like_path(&path.to_lowercase()) {
-        NL_QUERY_TEST_PATH_DAMPENING
+    if is_test_tier_candidate(candidate) {
+        NL_QUERY_TEST_TIER_DAMPENING
     } else {
         1.0
     }
@@ -357,9 +378,8 @@ fn breadcrumb_relevance_boost(query: &str, result: &CandidateRow) -> f64 {
 }
 
 /// A doc section whose breadcrumb matches at least two query terms, or at
-/// least half of them, is the documentation the query asks about; without
-/// this the 0.72 markdown penalty compounds with the 0.8 doc-path penalty
-/// and buries on-topic README sections below weak code matches.
+/// least half of them, is the documentation the query asks about; the
+/// heading names the section's topic, so overlap there is strong evidence.
 fn doc_breadcrumb_neutralizes_markdown_penalty(query: &str, result: &CandidateRow) -> bool {
     if result.block_type != DOC_SECTION_BLOCK_TYPE {
         return false;
@@ -367,6 +387,32 @@ fn doc_breadcrumb_neutralizes_markdown_penalty(query: &str, result: &CandidateRo
 
     let (matched, total) = breadcrumb_matched_terms(query, result);
     matched >= 2 || (matched >= 1 && matched * 2 >= total)
+}
+
+/// A doc section whose own body covers the query strongly is documentation
+/// the query asks about even when its heading shares no query terms (for
+/// example a "What To Expect" section answering a platform-support query).
+/// Body text is looser evidence than a heading, so unlike the breadcrumb
+/// rule both arms must hold: at least two matched terms and at least half
+/// the query. A single matched body term never lifts the penalty.
+fn doc_content_coverage_lifts_markdown_penalty(query: &str, result: &CandidateRow) -> bool {
+    if result.block_type != DOC_SECTION_BLOCK_TYPE {
+        return false;
+    }
+
+    let terms = query_terms(query);
+    let total = terms.len();
+    if total == 0 {
+        return false;
+    }
+
+    let content_tokens: HashSet<String> = tokenize_text(&result.content).into_iter().collect();
+    let matched = terms
+        .iter()
+        .filter(|term| content_tokens.contains(term.as_str()))
+        .count();
+
+    matched >= 2 && matched * 2 >= total
 }
 
 fn content_kind_boost(query: &str, result: &CandidateRow, intent: QueryIntent) -> f64 {
@@ -378,11 +424,33 @@ fn content_kind_boost(query: &str, result: &CandidateRow, intent: QueryIntent) -
     if is_markdown {
         match intent {
             QueryIntent::Docs => 1.15,
-            _ if doc_breadcrumb_neutralizes_markdown_penalty(query, result) => 1.0,
+            _ if doc_breadcrumb_neutralizes_markdown_penalty(query, result)
+                || doc_content_coverage_lifts_markdown_penalty(query, result) =>
+            {
+                1.0
+            }
             _ => 0.72,
         }
     } else {
         1.0
+    }
+}
+
+/// Combines the path-tier and content-kind multipliers. For doc_section
+/// segments the markdown content-kind penalty and the docs-path penalty
+/// carry the same evidence -- "this is documentation" -- so stacking them
+/// multiplicatively double-counts it (0.72 x 0.8 = 0.576) and buries doc
+/// sections whose relevance lives in their content; only the stronger
+/// penalty applies. Boost factors (>= 1.0) and every other segment kind
+/// keep independent multiplicative composition.
+fn path_and_content_kind_boost(query: &str, candidate: &CandidateRow, intent: QueryIntent) -> f64 {
+    let path_factor = file_path_boost(candidate);
+    let kind_factor = content_kind_boost(query, candidate, intent);
+
+    if candidate.block_type == DOC_SECTION_BLOCK_TYPE && path_factor < 1.0 && kind_factor < 1.0 {
+        path_factor.min(kind_factor)
+    } else {
+        path_factor * kind_factor
     }
 }
 
@@ -584,6 +652,7 @@ mod tests {
             defined_symbols: None,
             referenced_symbols: None,
             called_symbols: None,
+            content: String::new(),
         }
     }
 
@@ -640,25 +709,72 @@ mod tests {
         let normal = make_candidate("src/main.rs", 1, "function", 7);
         let test = make_candidate("tests/test_main.rs", 1, "function", 7);
 
-        let boost_normal = file_path_boost(&normal.file_path);
-        let boost_test = file_path_boost(&test.file_path);
+        let boost_normal = file_path_boost(&normal);
+        let boost_test = file_path_boost(&test);
         assert!(boost_normal > boost_test);
     }
 
     #[test]
     fn bench_and_fixture_paths_share_test_tier_penalty() {
-        assert_eq!(file_path_boost("benches/search_bench.rs"), 0.7);
-        assert_eq!(file_path_boost("evals/fixtures/sample_repo.rs"), 0.7);
-        assert_eq!(file_path_boost("src/search/impact.rs"), 1.0);
+        let bench = make_candidate("benches/search_bench.rs", 1, "function", 7);
+        let fixture = make_candidate("evals/fixtures/sample_repo.rs", 1, "function", 7);
+        let implementation = make_candidate("src/search/impact.rs", 1, "function", 7);
+
+        assert_eq!(file_path_boost(&bench), 0.7);
+        assert_eq!(file_path_boost(&fixture), 0.7);
+        assert_eq!(file_path_boost(&implementation), 1.0);
+    }
+
+    #[test]
+    fn breadcrumb_tests_component_classification() {
+        assert!(breadcrumb_has_tests_component("tests"));
+        assert!(breadcrumb_has_tests_component("tests::inner"));
+        assert!(breadcrumb_has_tests_component("outer::tests"));
+        assert!(breadcrumb_has_tests_component("README > Tests"));
+        assert!(
+            !breadcrumb_has_tests_component("run_tests"),
+            "implementation symbols containing `tests` are not test modules"
+        );
+        assert!(!breadcrumb_has_tests_component("Testing"));
+        assert!(!breadcrumb_has_tests_component("ImpactHorizonEngine"));
+    }
+
+    #[test]
+    fn in_file_test_module_breadcrumb_joins_test_tier() {
+        let query = "refinement margin shrinks candidate pool";
+
+        let mut in_file_test = make_candidate("src/search/ranking.rs", 600, "function", 8);
+        in_file_test.breadcrumb = Some("tests".to_string());
+
+        let mut implementation = make_candidate("src/search/ranking.rs", 100, "function", 8);
+        implementation.breadcrumb = Some("compute_rrf_score".to_string());
+
+        assert_eq!(file_path_boost(&in_file_test), 0.7);
+        assert_eq!(file_path_boost(&implementation), 1.0);
+
+        assert_eq!(
+            test_tier_query_dampening(query, QueryIntent::General, &in_file_test),
+            NL_QUERY_TEST_TIER_DAMPENING
+        );
+        assert_eq!(
+            test_tier_query_dampening(query, QueryIntent::General, &implementation),
+            1.0
+        );
+        assert_eq!(
+            test_tier_query_dampening(query, QueryIntent::Usage, &in_file_test),
+            1.0,
+            "usage-intent queries should still surface in-file tests at full tier weight"
+        );
     }
 
     #[test]
     fn natural_language_queries_dampen_test_tier_paths_to_half_weight() {
         let query = "blast radius expansion trust buckets";
-        let test_path = "tests/integration_tests.rs";
+        let test_candidate = make_candidate("tests/integration_tests.rs", 1, "function", 7);
+        let impl_candidate = make_candidate("src/search/impact.rs", 1, "function", 7);
 
-        let dampening = test_path_query_dampening(query, QueryIntent::General, test_path);
-        let net = dampening * file_path_boost(test_path);
+        let dampening = test_tier_query_dampening(query, QueryIntent::General, &test_candidate);
+        let net = dampening * file_path_boost(&test_candidate);
         assert!(dampening < 1.0);
         assert!(
             (0.45..=0.55).contains(&net),
@@ -666,16 +782,16 @@ mod tests {
         );
 
         assert_eq!(
-            test_path_query_dampening(query, QueryIntent::General, "src/search/impact.rs"),
+            test_tier_query_dampening(query, QueryIntent::General, &impl_candidate),
             1.0
         );
         assert_eq!(
-            test_path_query_dampening(query, QueryIntent::Usage, test_path),
+            test_tier_query_dampening(query, QueryIntent::Usage, &test_candidate),
             1.0,
             "usage-intent queries should still surface tests at full tier weight"
         );
         assert_eq!(
-            test_path_query_dampening("PolicyRuleValidator", QueryIntent::General, test_path),
+            test_tier_query_dampening("PolicyRuleValidator", QueryIntent::General, &test_candidate),
             1.0,
             "symbol-shaped queries are not natural language and must not dampen"
         );
@@ -716,6 +832,107 @@ mod tests {
             1.0,
             "a single-term query fully covered by the breadcrumb neutralizes"
         );
+    }
+
+    #[test]
+    fn doc_section_content_coverage_lifts_markdown_penalty() {
+        let query = "watch mode background index";
+        let body = "Watch mode keeps the background index fresh on supported hosts.";
+
+        let mut covered = make_candidate("README.md", 10, "doc_section", 4);
+        covered.role = Some(SegmentRole::Docs);
+        covered.breadcrumb = Some("README > What To Expect".to_string());
+        covered.content = body.to_string();
+
+        let mut chunk = make_candidate("README.md", 30, "chunk", 4);
+        chunk.role = Some(SegmentRole::Docs);
+        chunk.breadcrumb = Some("README > What To Expect".to_string());
+        chunk.content = body.to_string();
+
+        let mut weak = make_candidate("README.md", 50, "doc_section", 4);
+        weak.role = Some(SegmentRole::Docs);
+        weak.breadcrumb = Some("README > Start Here".to_string());
+        weak.content = "Setup notes mention the index once.".to_string();
+
+        assert_eq!(
+            content_kind_boost(query, &covered, QueryIntent::General),
+            1.0,
+            "strong body coverage lifts the markdown penalty without heading overlap"
+        );
+        assert_eq!(
+            content_kind_boost(query, &chunk, QueryIntent::General),
+            0.72,
+            "only doc_section segments earn the content-coverage lift"
+        );
+        assert_eq!(
+            content_kind_boost(query, &weak, QueryIntent::General),
+            0.72,
+            "one matched body term is not strong coverage"
+        );
+        assert_eq!(
+            content_kind_boost("index", &covered, QueryIntent::General),
+            0.72,
+            "single-term queries never lift via body text"
+        );
+    }
+
+    #[test]
+    fn doc_section_penalties_do_not_stack() {
+        let query = "policy rule preview enabled";
+
+        let mut off_topic_section = make_candidate("README.md", 10, "doc_section", 4);
+        off_topic_section.role = Some(SegmentRole::Docs);
+        off_topic_section.breadcrumb = Some("README > Release notes".to_string());
+        off_topic_section.content = "Unrelated release commentary.".to_string();
+
+        let mut off_topic_chunk = make_candidate("README.md", 30, "chunk", 4);
+        off_topic_chunk.role = Some(SegmentRole::Docs);
+        off_topic_chunk.breadcrumb = Some("README > Release notes".to_string());
+        off_topic_chunk.content = "Unrelated release commentary.".to_string();
+
+        assert_eq!(
+            path_and_content_kind_boost(query, &off_topic_section, QueryIntent::General),
+            0.72,
+            "doc sections take only the stronger of the markdown and docs-path penalties"
+        );
+        assert_eq!(
+            path_and_content_kind_boost(query, &off_topic_chunk, QueryIntent::General),
+            0.8 * 0.72,
+            "non-section markdown keeps independent multiplicative composition"
+        );
+        assert_eq!(
+            path_and_content_kind_boost(query, &off_topic_section, QueryIntent::Docs),
+            0.8 * 1.15,
+            "boost factors still compose multiplicatively for doc sections"
+        );
+    }
+
+    #[test]
+    fn conceptual_query_prefers_implementation_over_descriptive_in_file_test_name() {
+        let mut in_file_test = make_candidate("src/pool_state.rs", 40, "function", 5);
+        in_file_test.role = Some(SegmentRole::Implementation);
+        in_file_test.breadcrumb = Some("tests".to_string());
+        in_file_test.defined_symbols = Some(vec![
+            "refinement_margin_shrinks_candidate_pool_state".to_string()
+        ]);
+
+        let mut implementation = make_candidate("src/refinement.rs", 5, "function", 6);
+        implementation.defined_symbols = Some(vec!["shrink_candidate_pool".to_string()]);
+        implementation.breadcrumb = Some("shrink_candidate_pool".to_string());
+
+        // The descriptive in-file test name wins the FTS stage on raw term
+        // coverage; the tests-module breadcrumb must hand the win back to the
+        // implementation.
+        let ranked = rank_candidates(
+            vec![],
+            vec![in_file_test, implementation],
+            vec![],
+            "refinement margin shrinks candidate pool",
+            QueryIntent::General,
+            10,
+        );
+
+        assert_eq!(ranked[0].candidate.file_path, "src/refinement.rs");
     }
 
     #[test]
