@@ -47,6 +47,7 @@ run_step() {
   local command_text
   local stdout_excerpt=""
   local stderr_excerpt=""
+  local excerpt_lines=20
 
   command_text=$(command_string "$@")
 
@@ -58,14 +59,23 @@ run_step() {
     status="failed"
     OVERALL_STATUS="failed"
     FAILED_STEPS+=("$label")
+    excerpt_lines=100
     log "failed ${label} (exit=${exit_code})"
+    # Surface the failure in the CI log directly: the evidence JSON keeps
+    # only an excerpt, and truncated diagnostics have made past CI failures
+    # undiagnosable after the runner was recycled.
+    log "----- ${label}: last ${excerpt_lines} stdout lines -----"
+    tail -n "$excerpt_lines" "$stdout_path" >&2 || true
+    log "----- ${label}: last ${excerpt_lines} stderr lines -----"
+    tail -n "$excerpt_lines" "$stderr_path" >&2 || true
+    log "----- ${label}: end of failure output -----"
   fi
 
   if [[ -s "$stdout_path" ]]; then
-    stdout_excerpt=$(tail -n 20 "$stdout_path")
+    stdout_excerpt=$(tail -n "$excerpt_lines" "$stdout_path")
   fi
   if [[ -s "$stderr_path" ]]; then
-    stderr_excerpt=$(tail -n 20 "$stderr_path")
+    stderr_excerpt=$(tail -n "$excerpt_lines" "$stderr_path")
   fi
 
   jq -n \

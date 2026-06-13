@@ -158,6 +158,12 @@ pub const EMBED_THREADS_ENV_VAR: &str = "ONEUP_EMBED_THREADS";
 /// Environment variable for storage writer batch sizing.
 pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES";
 
+/// Environment variable that disables embedding model auto-download when set
+/// to any non-empty value other than `0`. CI sets this so test suites stay
+/// hermetic: no spawned `1up` process may reach the network for model
+/// artifacts, and model availability cannot flip mid-suite.
+pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS";
+
 /// Schema version for database layout.
 ///
 /// v16: markdown heading breadcrumbs store cleaned heading text (inline

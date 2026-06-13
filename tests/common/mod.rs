@@ -19,10 +19,54 @@ pub struct HideModelGuard {
     verified_path: PathBuf,
     hidden_verified_path: PathBuf,
     marker_path: PathBuf,
+    marker_preexisting: Option<Vec<u8>>,
     active: bool,
     current_active: bool,
     verified_active: bool,
     _lock: MutexGuard<'static, ()>,
+}
+
+/// Hides `real` at `hidden`, tolerating state leaked by a previous
+/// interrupted run. If only the hidden copy exists, the prior run died with
+/// the artifact hidden: restore it first so this guard sees the honest
+/// pre-test state. If both exist, the hidden copy is a stale duplicate;
+/// drop it so a directory rename cannot fail with `DirectoryNotEmpty` and
+/// brick every later guard (a mid-construction panic here leaks the
+/// already-hidden artifacts because `Drop` never runs).
+fn hide_artifact(real: &std::path::Path, hidden: &std::path::Path) -> bool {
+    if hidden.exists() {
+        if real.exists() {
+            let _ = if hidden.is_dir() {
+                fs::remove_dir_all(hidden)
+            } else {
+                fs::remove_file(hidden)
+            };
+        } else {
+            let _ = fs::rename(hidden, real);
+        }
+    }
+    let active = real.exists();
+    if active {
+        fs::rename(real, hidden).unwrap();
+    }
+    active
+}
+
+/// Restores `real` from `hidden`, replacing any artifact recreated while
+/// the guard was active (e.g. by a straggling daemon) so the original wins
+/// and no `*.hidden_by_test` state survives the guard.
+fn restore_artifact(real: &std::path::Path, hidden: &std::path::Path) {
+    if !hidden.exists() {
+        return;
+    }
+    if real.exists() {
+        let _ = if real.is_dir() {
+            fs::remove_dir_all(real)
+        } else {
+            fs::remove_file(real)
+        };
+    }
+    let _ = fs::rename(hidden, real);
 }
 
 impl HideModelGuard {
@@ -43,22 +87,18 @@ impl HideModelGuard {
         let hidden_verified_path = model_dir.join("verified.hidden_by_test");
         let marker_path = model_dir.join(".download_failed");
 
-        let active = model_path.exists();
-        if active {
-            fs::rename(&model_path, &hidden_path).unwrap();
-        }
-        let current_active = current_path.exists();
-        if current_active {
-            fs::rename(&current_path, &hidden_current_path).unwrap();
-        }
+        let active = hide_artifact(&model_path, &hidden_path);
+        let current_active = hide_artifact(&current_path, &hidden_current_path);
         // Hide the verified artifact store too: resolution self-heals from
         // intact verified artifacts when the pointer is missing, so leaving
         // it visible would re-enable the model under this guard.
-        let verified_active = verified_path.exists();
-        if verified_active {
-            fs::rename(&verified_path, &hidden_verified_path).unwrap();
-        }
-        // Create download failure marker to prevent auto-download during tests
+        let verified_active = hide_artifact(&verified_path, &hidden_verified_path);
+        // Create download failure marker to prevent auto-download during
+        // tests. Record any pre-existing marker first: on model-less
+        // machines (CI) an organic marker is what keeps the rest of the
+        // suite download-free, so Drop must restore it rather than delete
+        // it and re-arm auto-download for later tests.
+        let marker_preexisting = fs::read(&marker_path).ok();
         let _ = fs::write(&marker_path, "hidden_by_test");
 
         Self {
@@ -69,6 +109,7 @@ impl HideModelGuard {
             verified_path,
             hidden_verified_path,
             marker_path,
+            marker_preexisting,
             active,
             current_active,
             verified_active,
@@ -79,15 +120,22 @@ impl HideModelGuard {
 
 impl Drop for HideModelGuard {
     fn drop(&mut self) {
-        if self.active && self.hidden_path.exists() {
-            let _ = fs::rename(&self.hidden_path, &self.model_path);
+        if self.active {
+            restore_artifact(&self.model_path, &self.hidden_path);
         }
-        if self.current_active && self.hidden_current_path.exists() {
-            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
+        if self.current_active {
+            restore_artifact(&self.current_path, &self.hidden_current_path);
         }
-        if self.verified_active && self.hidden_verified_path.exists() {
-            let _ = fs::rename(&self.hidden_verified_path, &self.verified_path);
+        if self.verified_active {
+            restore_artifact(&self.verified_path, &self.hidden_verified_path);
         }
-        let _ = fs::remove_file(&self.marker_path);
+        match &self.marker_preexisting {
+            Some(content) => {
+                let _ = fs::write(&self.marker_path, content);
+            }
+            None => {
+                let _ = fs::remove_file(&self.marker_path);
+            }
+        }
     }
 }

@@ -1088,12 +1088,23 @@ fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
     let project_id = project_id.trim();
     assert!(!project_id.is_empty());
 
-    let started_status = cmd_with_home(&canonical_home)
-        .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
-        .output()
-        .unwrap();
-    assert!(started_status.status.success());
-    let started_status_stdout = text_stdout(&started_status);
+    // The daemon schedules a reconcile pass at startup, during which status
+    // reports index:indexing; poll until that pass settles instead of
+    // asserting the first read (raced on loaded CI runners).
+    let settle_deadline = Instant::now() + Duration::from_secs(20);
+    let started_status_stdout = loop {
+        let started_status = cmd_with_home(&canonical_home)
+            .args(["status", canonical_dir.to_str().unwrap(), "--plain"])
+            .output()
+            .unwrap();
+        assert!(started_status.status.success());
+        let stdout = text_stdout(&started_status);
+        let line = stdout.lines().next().unwrap();
+        if line.contains("\tindex:ready\t") || Instant::now() >= settle_deadline {
+            break stdout;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     let started_status_line = started_status_stdout.lines().next().unwrap();
     assert!(
         started_status_line.starts_with("lifecycle:active")
@@ -1104,7 +1115,10 @@ fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
     assert!(started_status_line.contains("\tregistered:true\t"));
     assert!(started_status_line.contains("\tproject_initialized:true\t"));
     assert!(started_status_line.contains(&format!("\tproject_id:{project_id}\t")));
-    assert!(started_status_line.contains("\tindex:ready\t"));
+    assert!(
+        started_status_line.contains("\tindex:ready\t"),
+        "status should settle to index:ready after start; got {started_status_line:?}"
+    );
     assert_no_ansi(&started_status_stdout);
 
     let registered_list = cmd_with_home(&canonical_home)

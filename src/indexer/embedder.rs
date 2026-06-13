@@ -14,8 +14,8 @@ use crate::shared::config::{
     model_verified_dir, verified_model_artifact_dir, verified_model_manifest_path,
 };
 use crate::shared::constants::{
-    EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_BASE_URL, HF_MODEL_REPO,
-    MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
+    DISABLE_MODEL_DOWNLOADS_ENV_VAR, EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
+    HF_BASE_URL, HF_MODEL_REPO, MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
     MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME,
     MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
@@ -478,6 +478,16 @@ pub fn is_download_failed() -> bool {
         Ok(path) => path.exists(),
         Err(_) => false,
     }
+}
+
+/// Reports whether model auto-download is disabled via
+/// [`DISABLE_MODEL_DOWNLOADS_ENV_VAR`].
+fn model_downloads_disabled() -> bool {
+    model_downloads_disabled_value(std::env::var_os(DISABLE_MODEL_DOWNLOADS_ENV_VAR))
+}
+
+fn model_downloads_disabled_value(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|raw| !raw.is_empty() && raw != "0")
 }
 
 /// Writes a download failure marker to prevent automatic retry.
@@ -1118,6 +1128,13 @@ async fn download_and_activate_verified_artifacts(
     model_root: &Path,
     show_progress_ui: bool,
 ) -> Result<PathBuf, OneupError> {
+    if model_downloads_disabled() {
+        return Err(EmbeddingError::DownloadFailed(format!(
+            "model auto-download disabled via {DISABLE_MODEL_DOWNLOADS_ENV_VAR}"
+        ))
+        .into());
+    }
+
     let artifact_id = format!(
         "v{}-{}",
         MODEL_ARTIFACT_MANIFEST_VERSION,
@@ -1459,6 +1476,17 @@ mod tests {
 
         std::fs::remove_file(&marker_path).unwrap();
         assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn model_downloads_disabled_value_semantics() {
+        use std::ffi::OsString;
+
+        assert!(!model_downloads_disabled_value(None));
+        assert!(!model_downloads_disabled_value(Some(OsString::from(""))));
+        assert!(!model_downloads_disabled_value(Some(OsString::from("0"))));
+        assert!(model_downloads_disabled_value(Some(OsString::from("1"))));
+        assert!(model_downloads_disabled_value(Some(OsString::from("true"))));
     }
 
     #[test]
