@@ -1,179 +1,165 @@
-# 1up - Concept Map
+---
+scope: kbRoot
+path_pattern: "concept_map.md"
+producer: knowledge-base
+type: document
+description: "Domain concepts, terminology glossary, and cross-references for a single-project codebase."
+strictness: strict
+---
+# Domain Concepts & Terminology
 
-## Reconciliation Notes
+**Project**: 1up (`oneup`) — v0.1.11
+**Domain**: Local code-discovery engine — a tree-sitter + embedding index over a repository, exposed to agents through nine read-only/lifecycle MCP tools so that semantic search, symbol lookup, file-line context, structural queries, likely-impact analysis, and a repository orientation digest become the primary code-discovery path before raw grep/find.
 
-| Prior Claim | Status | Update |
-|---|---|---|
-| Schema v13 stores `segment_vectors.embedding_vec` as `FLOAT8(384)` and uses `vector8(?)`. | confirmed | Current schema/query/storage paths still declare `FLOAT8(384)`, `compress_neighbors=float8`, `max_neighbors=32`, and typed `vector8(?)` insert/query sites. |
-| Impact Horizon separates primary likely impact from contextual guidance. | confirmed | `ImpactResultEnvelope.results` and `contextual_results` remain separate; relation scoring still gates primary promotion through owner, edge, path, role, and ambiguity checks. |
-| Search emits a machine follow-up segment handle. | refined | `SearchResult.segment_id` is now required in the current shared contract, while display surfaces may shorten it to a 12-char `:<handle>` prefix accepted by get/impact follow-up. |
-| Project state lives at the project root. | refined | Current project resolution separates `state_root` from `source_root`, especially for linked worktrees and MCP/daemon flows. |
-| Eval and benchmark harnesses gate retrieval/storage changes. | untested | Preserved from prior KB; eval files were outside this pass's assigned concept set. |
-| MCP is not modeled in the prior concept map. | contradicted-by-new-evidence | MCP is now a first-class code-discovery surface with stdio serving, status/start, search, get, symbol, context, impact, and structural tools. |
+## Core Business Concepts
 
-## Core Concepts
+### Segment
+**Definition**: The fundamental indexed unit of code. A segment is one tree-sitter (or text-chunker) block with a deterministic id, file span, language, block type, role, defined/referenced/called symbols, complexity, an optional breadcrumb, and an optional quantized embedding row.
+**Implementation**: [`src/shared/types.rs`] (`ParsedSegment`, `SegmentRole`), [`src/storage/schema.rs`] (`segments` table)
+**Key Properties**:
+- `segment_id`: Deterministic, durable handle used for every exact follow-up across tools.
+- `role`: One of `DEFINITION`, `IMPLEMENTATION`, `ORCHESTRATION`, `IMPORT`, `DOCS`; drives intent boosts, impact role boosts, and overview entry-point ranking.
+- `block_type` / `language`: Structural kind (e.g. `struct`, `function`, `doc_section`) and one of sixteen supported languages.
+- `defined_symbols` / `referenced_symbols` / `called_symbols`: Symbol evidence stored on the segment and surfaced by `oneup_get`.
 
-| Concept | Type | Meaning | Primary Evidence |
-|---|---|---|---|
-| `Segment` | Entity | Fundamental indexed code block with deterministic id, file span, language, block type, role, symbols, relations, and optional vector row. | `src/shared/types.rs`, `src/storage/segments.rs` |
-| `Segment Handle` | Value object | A segment id used for exact follow-up; MCP and lean rows display a short `:<12-char>` prefix, and get lookup resolves full or unique prefix handles. | `src/storage/segments.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs` |
-| `SearchResult` | Entity | Ranked hydrated discovery result carrying a required `segment_id`, integer score, path/span/kind, breadcrumb, content, and optional defined symbols. | `src/shared/types.rs`, `src/search/hybrid.rs` |
-| `CandidateRow` | Internal entity | Lightweight retrieval/ranking candidate selected before full segment hydration. | `src/search/retrieval.rs`, `src/search/ranking.rs` |
-| `QueryIntent` | Value object | Query classifier (`Definition`, `Flow`, `Usage`, `Docs`, `General`) that influences symbol variant search and rank boosts. | `src/search/intent.rs`, `src/search/ranking.rs` |
-| `Hybrid Search` | Process | Candidate-first discovery combining vector, FTS, and exact/fuzzy symbol candidates through RRF ranking before hydration. | `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs` |
-| `Symbol Lookup` | Process | Canonical exact/fuzzy definition and usage lookup over `segment_symbols`, with definitions deduped from usage results. | `src/search/symbol.rs`, `src/storage/queries.rs` |
-| `Context Retrieval` | Process | Read-after-pick source hydration that returns the smallest tree-sitter enclosing scope or a bounded line fallback. | `src/search/context.rs`, `src/mcp/ops.rs` |
-| `Structural Search` | Process | Tree-sitter query execution over indexed or scanned files for AST-pattern matches. | `src/search/structural.rs` |
-| `Impact Horizon` | Process | Local-only bounded likely-impact exploration from exactly one anchor. | `src/search/impact.rs`, `src/mcp/tools.rs` |
-| `ImpactAnchor` | Value object | Exact-one-anchor request model: file/line, symbol, or segment id. | `src/search/impact.rs`, `src/mcp/types.rs`, `src/mcp/tools.rs` |
-| `ImpactCandidate` | Entity | Ranked likely-impact segment with hop distance, advisory score, reason evidence, and role/symbol metadata. | `src/search/impact.rs` |
-| `Contextual Guidance` | Contract concept | Lower-confidence impact support kept outside primary results, including same-file/test heuristics and demoted relation matches. | `src/search/impact.rs` |
-| `ImpactResultEnvelope` | Value object | Shared impact output envelope for `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, and `refused`, with optional contextual results, hint, and refusal. | `src/search/impact.rs` |
-| `ParsedRelation` | Value object | Parser-extracted call/reference/conformance relation with raw symbol and normalized edge identity. | `src/shared/types.rs`, `src/indexer/parser.rs` |
-| `SegmentRelation` | Entity | Persisted unresolved relation edge keyed by source segment plus raw/canonical/lookup/qualifier/edge evidence. | `src/storage/relations.rs`, `src/storage/schema.rs` |
-| `RelationTargetDescriptor` | Value object | Normalized target descriptor that splits a raw relation into canonical symbol, lookup tail, and qualifier fingerprint. | `src/storage/relations.rs` |
-| `Indexed Files Manifest` | Entity | Per-file manifest (`indexed_files`) storing path, extension, hash, size, and mtime for metadata prefiltering and deletion detection. | `src/storage/schema.rs`, `src/storage/segments.rs`, `src/indexer/pipeline.rs` |
-| `Indexing Pipeline` | Process | Scans, metadata-prefilters, parses/chunks, embeds, batches, stores, and deletes repository segments transactionally. | `src/indexer/pipeline.rs`, `src/indexer/scanner.rs` |
-| `RunScope` | Value object | Index run scope: full repository or a set of changed paths, with fallback to full when scoped correctness is ambiguous. | `src/shared/types.rs`, `src/indexer/pipeline.rs`, `src/daemon/worker.rs` |
-| `IndexProgress` | Contract concept | Persisted progress/status telemetry with phase, counts, parallelism, timings, scope, and prefilter counters. | `src/shared/types.rs`, `src/indexer/pipeline.rs` |
-| `EmbeddingRuntime` | Service | Warm embedding runtime cache for indexing/search that can load/download verified artifacts for indexing and degrade search without downloading. | `src/indexer/embedder.rs`, `src/daemon/worker.rs` |
-| `Verified Model Artifact` | Entity | Hash-pinned ONNX/tokenizer artifact set activated through staging, manifest, and current pointer files under secure XDG state. | `src/indexer/embedder.rs`, `src/shared/constants.rs` |
-| `Segment Vector` | Entity | Quantized embedding row stored as `FLOAT8(384)` in `segment_vectors.embedding_vec`. | `src/storage/queries.rs`, `src/storage/schema.rs` |
-| `Vector Index` | Entity | libSQL vector index over segment vectors using cosine distance, `compress_neighbors=float8`, and `max_neighbors=32`. | `src/storage/queries.rs` |
-| `Schema Version` | Value object | Monotonic schema integer (`SCHEMA_VERSION = 12`) validated before reads/writes; mismatches fail closed with `1up reindex` guidance. | `src/shared/constants.rs`, `src/storage/schema.rs` |
-| `Daemon Search IPC` | Interface | Same-UID Unix-socket framed JSON search protocol with bounded payloads, query sanitization, busy/unavailable responses, and optional daemon version metadata. | `src/daemon/search_service.rs`, `src/daemon/worker.rs` |
-| `Daemon Project Run State` | State model | Per-project dirty/running/pending scope tracker that collapses file-watch bursts and records full-scope fallback reasons. | `src/daemon/worker.rs` |
-| `ResolvedProject` | Value object | Worktree-aware root pair: `state_root` owns `.1up` state and daemon registry, while `source_root` supplies files to scan/read. | `src/shared/project.rs`, `src/mcp/ops.rs` |
-| `MCP Stdio Server` | Interface | Agent-facing stdio MCP server exposing 1up tools and instructions that make 1up the primary local code-discovery path. | `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/cli/mcp.rs` |
-| `ToolEnvelope` | Contract concept | Uniform MCP response shape: `status`, `summary`, structured `data`, and typed `next_actions`. | `src/mcp/types.rs`, `src/mcp/tools.rs` |
-| `ReadinessPayload` | Contract concept | MCP readiness state summarizing initialization, schema/index readability, counts, progress, daemon heartbeat, and degraded embedding state. | `src/mcp/ops.rs` |
-| `Recall Eval Harness` | Process | Prior KB concept for cold recall/size gating of retrieval and vector-storage changes. Preserved but not revalidated in this pass. | prior KB, `evals/` |
+**Business Rules**:
+- Discovery surfaces emit only lean fields; full symbol/role/complexity detail is hydrated by `oneup_get`, never by ranked search.
+- Segments excluded from embedding (the `NON_EMBEDDABLE_CHUNK_LANGUAGES` set: json, yaml, toml, protobuf, terraform, sql, config, makefile, dockerfile) are FTS-only.
 
-## Terminology
+### Segment Handle
+**Definition**: A segment id used as a durable cross-tool reference. MCP surfaces display a leading-colon, 12-character prefix; `oneup_get` and `oneup_impact` resolve a full id or a unique prefix, and report ambiguity when a prefix matches multiple segments.
+**Relationships**:
+- Produced by `oneup_search` and `oneup_symbol`; consumed by `oneup_get` and `ImpactAnchor::Segment`.
+- `oneup_impact` accepts the older `segment_id` field name as a compatibility alias for `handle`.
 
-| Term | Meaning |
-|---|---|
-| `oneup_status` | MCP readiness tool that checks the configured repository without indexing. |
-| `oneup_start` | MCP lifecycle tool that can create, refresh, or rebuild the local index; modes are `index_if_needed`, `index_if_missing`, and `reindex`. |
-| `oneup_search` | MCP ranked discovery tool backed by Hybrid Search; returns handles and may mark results degraded when embeddings are unavailable. |
-| `oneup_get` | MCP hydration tool for segment handles; returns segment records in request order. |
-| `oneup_symbol` | MCP completeness tool for symbol definitions, references, or both. |
-| `oneup_context` | MCP file-line context tool for repo-contained source locations. |
-| `oneup_impact` | MCP likely-impact tool that maps one handle/symbol/file anchor into `ImpactRequest`. |
-| `oneup_structural` | MCP tree-sitter structural search tool with explicit ok, empty, and error diagnostics. |
-| `next_actions` | MCP follow-up hints that name another 1up tool and structured arguments. |
-| `handle` | MCP-visible segment identifier, normally rendered with a leading colon and shortened for display. |
-| `state_root` | Root where `.1up/` state, index DB, project id, daemon status, and registry identity live. |
-| `source_root` | Root whose files are scanned, indexed, watched, and read; can differ from `state_root` for linked worktrees. |
-| `readiness status` | MCP readiness enum: `ready`, `missing`, `indexing`, `stale`, `degraded`. |
-| `operation status` | MCP operation enum: `ok`, `empty`, `partial`, `degraded`. |
-| `get/context status` | Per-record get/context enum: `found`, `not_found`, `ambiguous`, `rejected`, `error`. |
-| `degraded search` | Search path where semantic embeddings are unavailable and FTS-only retrieval is used. |
-| `segment_id` | Required machine-readable segment id on current `SearchResult` and `SymbolResult`; prefix lookup supports shorter handles. |
-| `SegmentRole` | Parser role vocabulary: `DEFINITION`, `IMPLEMENTATION`, `ORCHESTRATION`, `IMPORT`, `DOCS`. |
-| `lookup_canonical_symbol` | Normalized tail symbol used for bounded relation target lookup. |
-| `qualifier_fingerprint` | Normalized non-tail owner tokens used to align relation targets with paths/breadcrumbs/owners. |
-| `edge_identity_kind` | Relation-form vocabulary such as `qualified_path`, `member_access`, `method_receiver`, `constructor_like`, `macro_like`, or `bare_identifier`. |
-| `conformance relation` | Relation kind for inheritance/implements/trait conformance extracted from Rust, TypeScript, and Java constructs. |
-| `definition_owner_fingerprint` | Impact-time owner tokens derived from candidate path, breadcrumb, and defined symbols. |
-| `corroboration signal` | Structural support signal required before ambiguous relation matches become primary impact results. |
-| `ambiguity margin` | Confidence gap required for the best relation candidate to beat the runner-up. |
-| `metadata_skipped` | Prefilter count for indexed files skipped because size and mtime matched the manifest. |
-| `content_read` | Prefilter count for files that passed metadata screening and were actually read/parsed. |
-| `MCP instance lock` | Per-project Unix lock preventing multiple stdio MCP server instances for one state root. |
-| `FLOAT8(384)` | libSQL int8-quantized 384-dim vector column type used by schema v13. |
-| `vector8(?)` | Typed libSQL constructor required for reads/writes against `FLOAT8` vector columns. |
-| `VECTOR_PREFILTER_K` | Candidate prefilter count (`400`) used by vector/FTS retrieval before RRF reranking. |
-| `gold corpus` | Prior KB term for version-neutral recall ground truth keyed by durable anchors, not transient segment ids. |
+### WorktreeContext
+**Definition**: The worktree-aware identity for a run. It carries a `context_id` (the scoping key), `state_root`, `source_root`, `main_worktree_root`, `worktree_role`, branch name/ref/status, and HEAD oid.
+**Implementation**: [`src/shared/types.rs`], [`src/mcp/ops.rs`] (`McpProjectRoots`)
+**Relationships**:
+- `state_root` owns `.1up` state, the index DB, project id, daemon status, and registry identity; `source_root` is the tree that is scanned, indexed, watched, and read. They differ for linked worktrees.
+- `SearchScope::from_worktree_context` derives the `context_id` + `branch_status` used to filter every storage read, so linked worktrees stay isolated inside one shared database.
 
-## Relationships
+### SearchResult
+**Definition**: A lean, hydrated discovery row returned by hybrid or FTS-only search.
+**Implementation**: [`src/shared/types.rs`], [`src/search/hybrid.rs`]
+**Key Properties**:
+- `segment_id`: Required handle (always present in the current shared contract).
+- `score`: Integer in `[0,100]`, a monotonic normalization of the raw RRF score.
+- `file_path` / `line_number` / `line_end` / `block_type` / `language`: Location and kind; `breadcrumb` and `defined_symbols` are optional.
 
-- `MCP Stdio Server` exposes `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural` as tool-router methods on `OneupMcpServer`.
-- `ToolEnvelope` wraps every MCP payload and uses `next_actions` to encode the expected status/start/search -> get/context -> symbol/impact/structural workflow.
-- `ResolvedProject` feeds MCP, daemon, and indexing flows with distinct `state_root` and `source_root` responsibilities.
-- `oneup_status` checks readiness, and `oneup_start` can create/rebuild the local index through `Db`, `schema`, `EmbeddingRuntime`, and the `Indexing Pipeline`.
-- `oneup_search` calls `Hybrid Search`; `oneup_get` hydrates `Segment Handle` values through storage; `oneup_context` reads file locations through `Context Retrieval`.
-- `Hybrid Search` combines vector, FTS, and symbol candidates into `CandidateRow` values, ranks them, then hydrates `SearchResult` from `Segment` rows.
-- `SearchResult.segment_id` and `SymbolResult.segment_id` provide exact handles for `oneup_get` and `ImpactAnchor::Segment`.
-- `Indexing Pipeline` turns parser/chunker output into `SegmentInsert` batches, `Segment Vector` rows, `segment_symbols`, `SegmentRelation` rows, and `Indexed Files Manifest` rows.
-- `ParsedRelation` rows become `SegmentRelation` records through `RelationTargetDescriptor` normalization.
-- `Impact Horizon` resolves relation targets through `lookup_canonical_symbol`, scores owner/edge/path/role evidence, and separates primary `results` from `contextual_results`.
-- `Daemon Project Run State` supplies scoped/full `RunScope` values and fallback reasons into `Indexing Pipeline` progress telemetry.
-- `Schema Version` gates all current storage reads and writes; stale or incomplete schemas produce reindex-required errors.
+### Relation (ParsedRelation / SegmentRelation)
+**Definition**: A directed dependency edge extracted from source. The parser emits a `ParsedRelation` (raw symbol, edge-identity kind, optional kind); storage persists it as an unresolved `SegmentRelation` keyed by the source segment, with raw/canonical/lookup-canonical/qualifier-fingerprint/edge-identity evidence, resolved lazily at impact time.
+**Implementation**: [`src/indexer/parser.rs`], [`src/storage/relations.rs`], [`src/storage/schema.rs`]
+**Business Rules**:
+- A `RelationTargetDescriptor` normalizes the raw symbol into `canonical_target_symbol`, `lookup_canonical_symbol` (tail), and `qualifier_fingerprint` (owner tokens) for bounded lookup and owner alignment.
+- `doc_mention` edges (code identifiers mentioned in documentation) are descriptive evidence and are excluded from impact dependency traversal.
 
-## Recurrent Patterns
+## Technical Concepts
 
-| Pattern | Context | Application |
-|---|---|---|
-| Search-before-get workflow | MCP and lean CLI | Discovery returns handles first; callers hydrate selected records with `oneup_get`/`get` before relying on content. |
-| Structured follow-up guidance | MCP tools | Every tool result carries `next_actions` rather than leaving agents to infer the next command. |
-| State/source root split | Project resolution | Worktree-aware operations store state in the main repo while indexing/reading the active source tree. |
-| Candidate-first retrieval | Search | Vector, FTS, and symbol paths produce lightweight candidates before full segment hydration. |
-| RRF with intent boosts | Ranking | Reciprocal rank fusion is adjusted by query intent, path, text-match, content kind, and short-segment penalties. |
-| Graceful semantic degradation | Search, MCP, Daemon | Missing/load-failed embeddings fall back to FTS-only search and readiness/status explains degradation. |
-| Descriptor-backed relation resolution | Impact/storage | Indexing stores unresolved relation descriptors; impact resolves bounded candidate definitions only for active seeds. |
-| Trust bucket separation | Impact | Confident relation-backed likely impact stays primary; weak or heuristic guidance stays contextual or empty. |
-| Manifest-backed prefilter | Indexing | Size/mtime matching skips file reads, while content hash remains the correctness backstop when metadata changes. |
-| Batched transactional writes | Storage | Segment, vector, symbol, relation, and manifest mutations use chunked multi-value inserts inside file-batch transactions. |
-| Force-reindex schema evolution | Storage | Breaking storage changes bump `SCHEMA_VERSION`; no in-place migration is attempted. |
-| Secure local state | Project/storage/daemon/MCP | `.1up`, XDG state, model artifacts, DB paths, sockets, and lock files are validated or permissioned before use. |
-| Bounded daemon concurrency | Daemon IPC | Search requests are limited by a semaphore and return busy/unavailable responses under saturation. |
+### Hybrid Search
+**Purpose**: Candidate-first ranked discovery that fuses three retrieval signals into one ordered result set, then hydrates only the survivors.
+**Implementation**: [`src/search/hybrid.rs`], [`src/search/ranking.rs`], [`src/search/retrieval.rs`]
+**Usage Examples**:
+```text
+oneup_search "where are embeddings composed before indexing"
+  -> vector candidates (if embeddings present) + FTS candidates + symbol candidates
+  -> weighted RRF fusion + boosts/penalties
+  -> dedupe overlaps, cap per file (3), hydrate top-N SearchResults
+```
+- **Lazy embedding**: lexical stages, the exact-lexical short-circuit, and a cheap vector-presence probe all run before the query is ever embedded, so an index with no vectors never exercises the embedder.
+- **Exact-lexical short-circuit**: a single-token, identifier-shaped query (containing `_ : / . - #` or ≥ 24 chars) with a symbol/FTS hit skips the vector stage to keep exact-identifier lookups precise.
 
-## Bounded Contexts
+### Vector Search Path (corpus-adaptive)
+**Description**: The nearest-neighbour stage chooses one of two modes by context vector count: an exact `vector_distance_cos` exhaustive scan at or below `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS` (16384), or the approximate `vector_top_k` index above it.
+**Input/Output**: Query embedding (384-dim) → ranked `CandidateRow`s.
+**Performance**: The exhaustive scan is exact and trivially fast at small corpora where graph traversal is read-bound; the approximate index amortizes above the threshold. The candidate pool (`VECTOR_PREFILTER_K` = 400) scales by indexed-context count up to a bound (8) so linked worktrees do not dilute recall.
 
-### MCP Code Discovery
+### RRF Ranking
+**Description**: Reciprocal-rank fusion (`RRF_K` = 60) with per-source weights — vector 1.5, symbol 4.0, FTS implicitly 1.0 — followed by multiplicative boosts and penalties.
+**Implementation**: [`src/search/ranking.rs`]
+- Boosts/penalties: query-intent role boost, path-tier × content-kind, test-tier dampening, query-path overlap, query-term match, breadcrumb relevance, and a short-segment penalty.
+- **Test-tier dampening**: natural-language conceptual queries stack an extra `0.72×` on the `0.7` test/bench/fixture path tier (Usage intent exempt) so implementation code beats descriptive test names.
+- **Doc-section penalty non-stacking**: for `doc_section` segments the markdown content-kind penalty and docs-path penalty carry the same evidence, so only the stronger applies.
+- **Defined-symbol penalty floor**: short segments that define symbols keep a `0.9` floor instead of the full `0.6/0.85` short-segment penalty.
 
-- Owns stdio server instructions, tool schemas, envelopes, summaries, and next-action choreography for agent-facing discovery.
-- Delegates actual status/start, search, get, context, symbol, impact, and structural work to search/storage/indexing/shared modules.
+### FTS Query Builder (identifier-aware)
+**Description**: Builds an FTS5 MATCH expression with identifier-aware variants so plain prose can reach concatenated tokens.
+**Implementation**: [`src/search/retrieval.rs`]
+**Input/Output**: Raw query → quoted base terms plus split-phrase variants (CamelCase/snake_case), bounded prefix variants, and stem-prefix variants for inflected words, capped at `MAX_FTS_VARIANT_TERMS` (16). Split parts stay phrase-bound so exact-identifier precision is preserved.
 
-### Search Discovery
+### Impact Horizon
+**Description**: Local-only, bounded likely-impact exploration from exactly one anchor (handle, symbol, or file[:line]). It walks outbound/inbound relations plus same-file and test heuristics, scores corroboration, and splits results into primary vs contextual buckets.
+**Implementation**: [`src/search/impact.rs`], [`src/mcp/tools.rs`]
+**Input/Output**: `ImpactRequest{anchor, scope, depth, limit}` → `ImpactResultEnvelope{status, resolved_anchor, results, contextual_results, hint, refusal}` where status is `expanded`, `expanded_scoped`, `empty`, `empty_scoped`, or `refused`.
+- A relation target is scored by blending symbol score, owner alignment, edge-identity score, path affinity, and role score under an owner gate and a signal multiplier.
+- Promotion to **primary** requires at least two corroboration signals and clearing the ambiguity margin; otherwise the candidate stays **contextual**. Symbol anchors that match too broadly are refused with a narrowing hint; impact is advisory and does not run through daemon IPC.
 
-- Owns hybrid retrieval, query intent, ranking, symbol lookup, context retrieval, and structural pattern search.
-- Does not claim exhaustive dependency truth; ranked discovery must be followed by read/symbol checks when completeness matters.
+### Repository Overview
+**Description**: A deterministic, size-bounded orientation digest for one context: stats (files/segments/languages), most-referenced types, a module map, cross-module dependency edges, and entry points. It is a pure read path over bounded SQL aggregates — no schema changes, no embeddings, no persisted artifacts — and recomputes identically on an unchanged index.
+**Implementation**: [`src/search/overview.rs`] (`OverviewEngine`, `RepositoryOverview`), [`src/mcp/ops.rs`] (`OverviewPayload`)
+- Top types rank by distinct referencing files with ambiguity skipping and truncation detection; the dominant module expands one level when it holds ≥ 60% of segments and has true children; module and dependency-edge granularity always agree.
 
-### Impact Analysis
+### MCP Tool Surface
+**Purpose**: Make 1up the primary local code-discovery path for agents, with structured envelopes and explicit follow-up choreography.
+**Implementation**: [`src/mcp/tools.rs`] (`OneupMcpServer`), [`src/mcp/types.rs`] (`RETAINED_PUBLIC_TOOLS`, `ToolEnvelope`, `NextAction`), [`src/mcp/ops.rs`]
+**Usage Examples**:
+```text
+nine retained tools:
+  oneup_status     readiness without indexing
+  oneup_start      create / refresh / rebuild the index (index_if_needed | index_if_missing | reindex)
+  oneup_overview   deterministic orientation digest (recommended first call on an unfamiliar repo)
+  oneup_search     ranked semantic + lexical + symbol discovery -> handles
+  oneup_get        hydrate selected handles -> full segments
+  oneup_context    repository-scoped file-line context
+  oneup_symbol     definitions / references / both (optional fuzzy)
+  oneup_impact     likely-impact from one handle/symbol/file anchor
+  oneup_structural tree-sitter S-expression query over indexed source
+```
+- Every tool returns a `ToolEnvelope{status, summary, data, next_actions}`. `next_actions` name a retained tool plus JSON arguments and are debug-asserted to never point outside `RETAINED_PUBLIC_TOOLS`, encoding the `status`/`start`/`overview` → `search` → `get`/`context` → `symbol`/`impact`/`structural` workflow.
 
-- Owns local likely-impact expansion, anchor validation, refusal/empty semantics, relation scoring, and primary/contextual separation.
-- Does not run through daemon IPC and remains advisory.
+### Schema, Storage, and Model Artifacts
+**Purpose**: Persist the index graph and validate compatibility; activate hash-pinned embedding artifacts safely.
+**Implementation**: [`src/storage/schema.rs`], [`src/storage/relations.rs`], [`src/indexer/embedder.rs`], [`src/shared/constants.rs`]
+- `SCHEMA_VERSION` = 16, validated before every read/write. Older indexes fail closed with reindex guidance; newer indexes fail with upgrade guidance. There is no in-place migration — breaking changes bump the version and force `1up reindex`.
+- Schema objects include `worktree_contexts`, `segments`, `segment_vectors`, `segment_symbols`, `segment_relations`, `indexed_files`, `segments_fts`, and `meta`; the symbol and FTS tables are trigger-maintained.
+- Embeddings are int8-quantized 384-dim rows stored as `FLOAT8(384)` in `segment_vectors.embedding_vec`, written/read through the typed `vector8(?)` constructor.
+- The model (all-MiniLM-L6-v2) is activated via a `.staging` → `verified` manifest → `current.json` pointer flow under owner-only XDG state, with compiled-in SHA-256 digests; CI sets `ONEUP_DISABLE_MODEL_DOWNLOADS` to keep test suites hermetic.
 
-### Indexing And Embeddings
+## Terminology Glossary
 
-- Owns scan, parse/chunk, embedding preparation, metadata prefiltering, scoped/full fallback, progress telemetry, and batched storage writes.
-- Search can operate without embeddings; indexing is where downloads and model compatibility checks occur.
+### Business Terms
+- **context_id**: Worktree-context scoping key; every storage query filters to the active `context_id` so linked worktrees stay isolated in one shared database.
+- **state_root**: Root holding `.1up` state, the index DB, project id, daemon status, and registry identity.
+- **source_root**: Root whose files are scanned, indexed, watched, and read; can differ from `state_root` for linked worktrees.
+- **readiness status**: MCP readiness enum — `ready`, `missing`, `indexing`, `stale`, `degraded`, `blocked`.
+- **operation status**: MCP per-operation enum — `ok`, `empty`, `partial`, `degraded`.
+- **get/context status**: Per-record read enum — `found`, `not_found`, `ambiguous`, `rejected`, `error`.
+- **head drift**: Advisory readiness signal comparing the indexed-at HEAD with the live HEAD; `drifted = true` makes `index_if_needed` self-serve but never changes readiness status on its own.
+- **degraded search**: Search path where embeddings are unavailable (missing model or no indexed vectors), so FTS-only retrieval runs and an explicit reason is reported.
+- **trust bucket**: The primary-vs-contextual split in impact; confident corroborated relation impact stays primary, weak or heuristic guidance stays contextual or empty.
 
-### Index Graph Storage
+### Technical Terms
+- **Hybrid Search**: Candidate-first fusion of vector, FTS, and symbol candidates via weighted RRF before hydration. See [`src/search/hybrid.rs`].
+- **RRF weights**: `RRF_K` = 60, `VECTOR_WEIGHT` = 1.5, `SYMBOL_WEIGHT` = 4.0 (FTS implicitly 1.0).
+- **exhaustive scan vs ANN index**: The two vector stages — exact `vector_distance_cos` at or below 16384 context vectors, approximate `vector_top_k` above it.
+- **VECTOR_PREFILTER_K**: Candidate prefilter count (400), scaled by indexed-context count up to `VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT` (8).
+- **exact-lexical short-circuit**: Identifier-shaped single-token queries with a hit skip the vector stage to preserve precision and avoid embedding.
+- **QueryIntent**: Query classifier (`Definition`, `Flow`, `Usage`, `Docs`, `General`) from keyword signal counts; influences symbol-variant search and rank boosts.
+- **edge identity kind**: Relation-form vocabulary — `bare_identifier`, `qualified_path`, `member_access`, `method_receiver`, `constructor_like`, `macro_like`, `doc_mention`.
+- **lookup_canonical_symbol**: Normalized tail symbol used for bounded relation target lookup and the `segment_relations` lookup-target index.
+- **qualifier_fingerprint**: Normalized non-tail owner tokens used to align relation targets with definition owners (owner alignment).
+- **corroboration signals**: Count of structural supports (exact identity, owner alignment, edge identity, path affinity, role) required (≥ 2) before an ambiguous relation match becomes primary impact.
+- **conformance relation**: Inheritance/implements/trait-conformance relation kind; weighted slightly above calls in impact.
+- **doc_mention relation**: Edge for a code identifier mentioned in documentation; descriptive evidence, excluded from impact traversal.
+- **metadata_skipped / content_read**: Prefilter counters — files skipped because size + mtime matched the manifest vs files actually read and parsed.
+- **low-signal / test path**: Path classes demoted or excluded — `is_test_path` (tests/spec/`__tests__`/`_test` suffixes) and `is_low_signal_path` (adds evals/benches/examples/vendor/node_modules).
+- **doc_section**: Block type for a heading-scoped markdown documentation segment (role `DOCS`) with a document-rooted breadcrumb.
+- **ToolEnvelope / next_actions**: Uniform MCP response (`status`, `summary`, `data`, `next_actions`); follow-up hints naming a retained tool and arguments.
+- **SCHEMA_VERSION**: Monotonic schema integer (currently 16); mismatches fail closed with reindex or upgrade guidance.
 
-- Owns schema v13, segments, vectors, symbols, relations, indexed-file manifest rows, meta records, and DB path validation.
-- Uses force-reindex for incompatible schema/model changes.
-
-### Daemon Coordination
-
-- Owns file watching, registry-driven projects, source-root watching, dirty run coalescing, heartbeat persistence, and bounded search IPC.
-- Does not own MCP stdio transport, but MCP can auto-start the daemon when safe.
-
-### Project Identity And Roots
-
-- Owns project id creation, secure `.1up` state, auto-init safety, linked-worktree detection, and state/source root resolution.
-- Automatic creation is refused outside an existing 1up project or git root.
-
-### Eval And Benchmarks
-
-- Preserved prior context for recall/size/latency gates; not revalidated by the assigned files in this pass.
-
-## Cross-Cutting Concerns
-
-- Compatibility: public surfaces evolve through stable structs/enums and additive fields where possible; storage incompatibility is handled by schema version checks.
-- Ambiguity management: impact refuses broad anchors; handle prefix get calls report ambiguity; MCP context locations reject path escapes.
-- Advisory semantics: impact scores and reasons are likely-impact guidance, not exact dependency truth.
-- Performance: metadata prefiltering, write batching, tuned PRAGMAs, warm embedding runtime, bounded vector prefiltering, and daemon request limits protect interactive latency.
-- Security: same-UID daemon IPC, secure socket/file modes, validated project DB paths, repo-contained location reads, and verified model artifact hashes defend local state boundaries.
-- Observability: `IndexProgress`, daemon heartbeat, readiness payloads, setup timings, scope info, and prefilter counters make local state inspectable.
-- Degradation transparency: missing embeddings, stale schemas, unreadable indexes, and busy/unavailable daemon states surface explicit statuses and retry guidance.
-
-## Novelty Scan Findings
-
-- MCP is now a reusable domain boundary, not just a wrapper: it defines typed inputs, structured envelopes, summaries, and tool-to-tool workflows.
-- `SearchResult.segment_id` has moved from optional/additive prior wording to a required current handle in shared search results.
-- Project resolution now has durable state/source root semantics that future worktree, daemon, and MCP changes must preserve.
-- Search has an explicit intent/ranking layer beyond vector + FTS; future rank changes should account for `QueryIntent`, symbol candidates, per-file caps, and content-kind/path boosts.
-- Embedding availability is a first-class readiness/degradation axis across MCP, daemon, indexing, and search.
+## Cross-References
+- **Search & retrieval pipeline (hybrid → ranking → vector path)**: See [architecture.md] and [modules.md#search]
+- **Index graph storage & schema v16**: See [modules.md#storage] and [architecture.md]
+- **Indexing, embeddings, and model artifacts**: See [modules.md#indexer]
+- **MCP tool surface, envelopes, and readiness**: See [modules.md#mcp]
+- **Ranking, impact corroboration, and degradation patterns**: See [patterns.md]

@@ -1,184 +1,244 @@
-# 1up - Architecture
+---
+scope: kbRoot
+path_pattern: "architecture.md"
+producer: knowledge-base
+type: document
+description: "System architecture with diagrams, component relationships, data flows, security, and deployment for a single-project codebase."
+strictness: strict
+---
+# System Architecture
 
-## Summary
+**Project**: 1up (Cargo package `oneup`, binary `1up`)
+**Architecture Pattern**: Layered CLI + MCP + daemon over project-local libSQL state
+**Last Updated**: 2026-06-15
 
-1up is a local-first code discovery substrate distributed as a single Rust binary. The runtime is now a layered CLI + MCP + daemon system over project-local libSQL state: short-lived CLI commands handle direct user workflows, `1up mcp` exposes agent-facing stdio tools, and an optional background daemon keeps project indexes fresh and serves warm CLI search over a guarded Unix socket. Project identity and index state live under the resolved `.1up/` state root, while linked git worktrees can use a separate source root for scanning.
-
-The search index remains schema-gated at v13: `worktree_contexts`, `segments`, `segment_vectors`, `segment_symbols`, `segment_relations`, `indexed_files`, FTS, and vector indexes must all match the current layout before reads proceed. Indexing fans out parse work but converges storage through transactional, batched writes. `segment_vectors.embedding_vec` uses `FLOAT8(384)` with `vector8(?)` writes and a compressed libSQL vector index; `indexed_files` enables context-scoped metadata-based unchanged-file skipping before content reads. Impact remains a local read path over descriptor-backed relations rather than an extension of daemon IPC.
+1up is a local-first code discovery substrate distributed as a single Rust binary. The runtime is a layered system over project-local libSQL state: short-lived CLI commands handle direct user workflows, `1up mcp` exposes agent-facing stdio tools, and an optional background daemon keeps project indexes fresh and serves warm CLI search over a guarded Unix socket. Project identity and index state live under the resolved `.1up/` state root, while linked git worktrees use a separate source root for scanning. The CLI also exposes a visible, opt-in `doctor` maintenance command for cleaning legacy 1up hints out of user instruction files, gated by a project-root-clamped atomic writer. The search index is schema-gated at v16: worktree, segment, vector, symbol, relation, and manifest objects, plus FTS and vector indexes, must all match the current layout before reads proceed.
 
 ## Reconciliation Notes
 
 | Prior claim | Status | Update |
 |---|---|---|
-| Layered two-process CLI + daemon model | refined | Still true for CLI search and refresh, but the architecture now has a first-class MCP stdio adapter for agent hosts. |
-| Project-local libSQL state with schema v13 | refined | v13 validation adds worktree/context objects and `context_id` columns while retaining relation evidence columns, `indexed_files`, and `FLOAT8(384)` vector storage. |
-| Faster indexing via tuned DB connections, manifest prefilter, and batched writes | confirmed | Current pipeline also records deleted-file cleanup and scoped fallback reasons in progress metadata. |
-| Shrunk vector index | confirmed | Current baseline records `index.db` at 74,584,064 bytes (~71.1 MiB) with `max_neighbors=32`. |
-| Release/distribution via GitHub releases, setup.sh, and update manifests | refined | Release evidence now treats MCP protocol smoke, update manifests, archive verification, and install-script behavior as release surfaces. |
+| Layered two-process CLI + daemon model with first-class MCP adapter | confirmed | CLI commands, `1up mcp` stdio tools, and daemon refresh/search remain three distinct entry surfaces over shared project state. |
+| Project-local libSQL state at schema v13 | refined | `SCHEMA_VERSION` is now 16. v16 changes markdown heading breadcrumbs to store cleaned heading text, changing breadcrumb shape and composed embedding text, so pre-v16 indexes fail closed with `1up reindex`. `ensure_current` rejects v15 and below. |
+| Canonical MCP tool set of 8 `oneup_*` tools | refined | Now 9 retained tools: `oneup_overview` was added (deterministic repository orientation digest). `RETAINED_PUBLIC_TOOLS` is the shared source of truth; `oneup_prepare`/`oneup_read` are now legacy/stale tokens. |
+| Shrunk vector index pinned at 74,584,064 bytes (~71.1 MiB) | refined | The active CI/release guard (`justfile` `bench-vector-index-size`) gates `index.db` <= 80 MiB and `indexing_ms` <= 90000 with current schema; the older exact byte baseline is stale. `FLOAT8(384)`/`vector8(?)` storage and `VECTOR_PREFILTER_K=400` are unchanged. |
+| Evidence-driven release surface (CI, archive verify, MCP smoke, setup.sh, update manifests) | refined | `publish-update-manifest` now has a paired `verify-update-manifest` job that re-fetches the published manifest and diffs it against the release manifest. Manifest version transitively tracks `CARGO_PKG_VERSION` because `validate_release_metadata.sh` and `generate_release_manifest.sh` fail unless `Cargo.toml` version == release tag. |
+| Schema-gated local state fails closed on mismatch | confirmed | `ensure_current` still validates schema version, required tables/indexes/triggers, `segment_vectors.embedding_vec`, `context_id` columns, and relation evidence columns. |
+| Secure filesystem helpers clamp writes to `.1up` state root | refined | `fs.rs` adds `atomic_replace_within_project_root`: a second atomic writer clamped to the user's project root (not `.1up`) that preserves the target file's existing permission mode, rejects symlink leaves and out-of-root parents, and is used only by the new `doctor` command. |
 
-## Key Architecture Patterns
-
-| Pattern | Meaning | Evidence |
-|---|---|---|
-| Layered CLI + MCP + daemon | CLI commands, MCP tools, and daemon refresh/search are separate entry surfaces over shared project state and storage. | `src/cli/mod.rs`, `src/cli/mcp.rs`, `src/mcp/server.rs`, `src/daemon/worker.rs` |
-| Agent-facing MCP adapter | `1up mcp --path` serves rmcp stdio tools with structured envelopes, summaries, payloads, and suggested next actions. | `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs` |
-| Idempotent guarded startup | Daemon startup and MCP instances use owner-only state, lock files, registry reloads, and non-destructive contention handling. | `src/daemon/lifecycle.rs`, `src/cli/mcp.rs`, `src/daemon/registry.rs`, `src/shared/fs.rs` |
-| Split state/source roots | Linked worktrees store `.1up/` state at the main worktree while scanning source from the active worktree. | `src/shared/project.rs`, `src/indexer/pipeline.rs` |
-| Staged single-writer indexing | Parse work can run in parallel, but segment, symbol, relation, vector, and manifest writes flush through ordered transactional batches. | `src/indexer/pipeline.rs`, `src/storage/segments.rs` |
-| Metadata-first incremental indexing | Full and scoped runs compare file size and mtime from `indexed_files` before content reads, with content hashes as the correctness backstop. | `src/indexer/pipeline.rs`, `src/storage/segments.rs`, `src/storage/queries.rs` |
-| Candidate-first retrieval with degradation | Vector, FTS, and symbol paths rank candidates before hydration; daemon and MCP search fall back to FTS-only when embeddings are unavailable. | `src/daemon/worker.rs`, `src/mcp/ops.rs`, `src/search/hybrid.rs`, `src/storage/queries.rs` |
-| Local-only advisory impact | CLI and MCP impact open the current index locally and traverse descriptor-backed relation evidence with trust-bucketed outputs. | `src/mcp/ops.rs`, `src/search/impact.rs`, `src/storage/relations.rs` |
-| Schema-gated local state | Existing DBs fail closed unless schema objects, required columns, vector element type, and schema version match the current binary. | `src/storage/schema.rs`, `src/shared/constants.rs` |
-| Evidence-driven release surface | CI, archive verification, MCP smoke, setup-script tests, and update manifests form the release contract. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/install/setup.sh` |
-
-## Layers
-
-| Layer | Purpose | Key Components | Depends On |
-|---|---|---|---|
-| CLI | Parse user commands, choose output contracts, dispatch index/search/status/update/MCP workflows. | `src/cli/mod.rs`, `src/main.rs` | Shared, Daemon, Indexer, Search, Storage, MCP |
-| MCP | Expose code discovery tools to agent hosts over stdio with structured responses and next-action guidance. | `src/cli/mcp.rs`, `src/cli/add_mcp.rs`, `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs` | Shared, Indexer, Search, Storage, Daemon lifecycle |
-| Daemon | Maintain watched project indexes and serve warm CLI search through bounded local IPC. | `src/daemon/worker.rs`, `src/daemon/lifecycle.rs`, `src/daemon/search_service.rs`, `src/daemon/watcher.rs`, `src/daemon/registry.rs` | Indexer, Search, Storage, Shared |
-| Indexer | Scan, parse, chunk, embed, prefilter, and persist repository files. | `src/indexer/pipeline.rs`, `src/indexer/scanner.rs` | Storage, Shared, tree-sitter, ONNX embedder |
-| Search | Execute hybrid search, symbol lookup, context reads, and impact expansion. | `src/search/*`, `src/mcp/ops.rs` | Storage, Shared, Embedder |
-| Storage | Own libSQL connections, schema validation, SQL, segment writes, relation writes, and manifest state. | `src/storage/db.rs`, `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/relations.rs` | Shared |
-| Shared | Define config paths, root resolution, secure filesystem helpers, constants, progress types, and update metadata. | `src/shared/config.rs`, `src/shared/project.rs`, `src/shared/fs.rs`, `src/shared/types.rs`, `src/shared/update.rs` | None |
-| Release/Evidence | Build archives, verify artifacts, publish update metadata, and retain release proof. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/security_check.sh`, `scripts/install/setup.sh` | GitHub Actions, GitHub Releases, release assets |
-
-## Main Flows
-
-### MCP Code Discovery
-
-1. An agent host starts `1up mcp --path <repo-or-worktree>` directly or via `1up add-mcp` generated host configuration.
-2. The CLI resolves `state_root`, `source_root`, and `WorktreeContext`, takes a per-project MCP instance lock, auto-initializes only at an existing 1up project or git root, and best-effort starts the daemon for freshness.
-3. `rmcp` serves the retained canonical tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, and `oneup_structural`.
-4. `oneup_status` classifies readiness for the active `context_id`; `oneup_start` can explicitly index, reindex, or repair missing/degraded state through the same pipeline used by CLI indexing.
-5. Search, get, context, symbol, impact, and structural tools open the main-worktree index locally, enforce schema v13 compatibility, and filter through the active `context_id` where applicable.
-6. Tool responses return a `ToolEnvelope` with `status`, `summary`, structured `data`, and `next_actions`; `oneup_get` hydrates handles from the DB and `oneup_context` reads precise file locations through source-root clamping.
-
-### CLI Daemon-Backed Search
-
-1. CLI search resolves `state_root`, `source_root`, and `WorktreeContext`, then sends `context_id` and source root in a framed JSON request over the daemon Unix socket.
-2. The daemon accepts only same-UID peers, clamps limits, rejects oversized payloads, and validates the requested context/source pair against the registry.
-3. Registered contexts reuse a warm `EmbeddingRuntime` when available; otherwise the daemon runs FTS-only search.
-4. Search runs with a `SearchScope` built from the registered worktree context, so vector, FTS, and symbol candidates are scoped to that `context_id`.
-5. Results include ranked `SearchResult` values and optional `daemon_version`; CLI falls back to context-scoped local search when the daemon is unavailable, stale, or rejects the request.
-
-### Index Build And Refresh
-
-1. CLI, MCP start, or daemon refresh resolves a `WorktreeContext` and opens a tuned libSQL connection at the main-worktree state root with WAL, synchronous=NORMAL, cache, mmap, and temp-store PRAGMAs.
-2. The scanner applies gitignore/global-ignore/exclude rules, default build-artifact ignores, binary extension skips, and special extensionless file recognition.
-3. Full runs load `indexed_files` and segment hashes for the active `context_id`, skip metadata-unchanged files, and detect deleted indexed paths.
-4. Scoped runs scan only changed paths, but fall back to full when ignore semantics, directories, excluded files, or ambiguous/unscoped watcher events would make a scoped update unsafe.
-5. Parse workers run concurrently, generate segment ids from `context_id`, path, and line range, then ordered flushes build embeddings and persist file batches transactionally.
-6. Storage replaces file segments, vectors, symbols, relation descriptors, and manifest entries for the context together; empty file batches delete removed files and manifest rows only in that context.
-7. Progress persists `context_id`, source root, branch name/status, scope, prefilter, parallelism, timings, deleted-file counts, and embedding availability to `.1up/index_status.json`.
-
-### Daemon Refresh
-
-1. The daemon loads a locked global registry from the secure XDG data root, preserving project root, source root, `context_id`, main worktree, branch/ref/head status, and indexing config.
-2. `notify` watches registered source roots recursively and filters generated, binary, dependency, `.1up`, and `.rp1` paths.
-3. File changes queue scoped runs for matching contexts; ambiguous paths, branch-context changes, and unscoped watcher errors promote to full refresh with a fallback reason.
-4. Dirty runs are serialized per daemon process, and change bursts during an active run collapse into one follow-up run for that context.
-5. Legacy heartbeat status is written to `.1up/daemon_status.json`; context-aware watch, refresh, branch, and update metadata is written to `.1up/daemon_context_status.json`.
-
-### Impact Horizon
-
-1. CLI or MCP impact accepts exactly one anchor: segment, symbol, or file/line.
-2. The engine reads the current index directly and requires schema v13 compatibility.
-3. Expansion traverses `segment_relations` using canonical target, lookup target, qualifier fingerprint, and edge identity evidence.
-4. Confident structural matches become primary `results`; ambiguous, same-file, test-only, import/docs, or low-signal evidence remains contextual or yields explicit empty/refused envelopes.
-
-### Release And Update
-
-1. Release Please owns version/changelog PRs and tag creation.
-2. `release-assets` validates release metadata, builds the target matrix, stages the Windows ONNX Runtime DLL, packages archives with LICENSE/README, uploads checksums, release manifest, notes, and `setup.sh`.
-3. `release-evidence` verifies archives on the target matrix, runs MCP protocol smoke for each archive, retrieves merge/security evidence, optionally includes eval/benchmark/host-smoke assets, and uploads a consolidated evidence bundle.
-4. `publish-update-manifest` publishes the stable `update-manifest.json` to `main` after the GitHub Release is published.
-5. `scripts/install/setup.sh` installs from GitHub Releases with platform detection, optional SHA256 verification, atomic binary replacement, and managed PATH blocks.
-
-## Data And State
-
-| Area | Location | Notes |
-|---|---|---|
-| Global runtime state | `dirs::data_dir()/1up` | Daemon pid/socket, registry, model cache, update cache, startup/MCP locks. |
-| Project registry | `dirs::data_dir()/1up/projects.json` | Locked, atomically replaced, owner-only; stores project id/root, source root, context id, main worktree, branch/ref/head metadata, and persisted indexing config. |
-| Project-local state | `<state_root>/.1up/` | `project_id`, `index.db`, `index_status.json`, legacy `daemon_status.json`, and context-aware `daemon_context_status.json`. |
-| Source root | `<source_root>` | Files scanned/read/watched; may differ from state root for linked git worktrees. |
-| Worktree context | `WorktreeContext`, `worktree_contexts` | Captures context id, state/source/main roots, worktree role, git dirs, branch name/ref/head, and branch status. |
-| Search persistence | `segments`, `segment_vectors`, `segment_symbols`, `segments_fts` | Schema v13 scopes segment and symbol rows by `context_id`; vectors join through scoped segments and use `FLOAT8(384)` with `vector8(?)`. |
-| Impact persistence | `segment_relations` | Context-scoped relation rows store raw/canonical/lookup targets, qualifier fingerprints, and edge identity kind for bounded expansion. |
-| File manifest | `indexed_files` | Context-scoped manifest storing path, extension, content hash, file size, and mtime ns for prefiltering and deleted-file cleanup. |
-| Model cache | `dirs::data_dir()/1up/models/all-MiniLM-L6-v2` | Verified/staging/current manifests plus failure marker for pinned ONNX/tokenizer artifacts. |
-| Release manifests | GitHub release assets and repo `update-manifest.json` | Drive self-update, installer metadata, and release evidence. |
-
-## Integrations
-
-| Integration | Purpose | Notes |
-|---|---|---|
-| libSQL | Embedded local index storage | Shared by CLI, MCP, daemon, search, impact, and indexing. |
-| ONNX Runtime / Hugging Face artifacts | Local embedding inference | Non-Windows uses downloaded static runtime; Windows loads the DLL dynamically and release assets stage the DLL. |
-| tree-sitter | Structured parsing | Produces segments, symbols, roles, and relation metadata. |
-| rmcp | MCP stdio server | Exposes `oneup_*` tools and JSON schemas to agent hosts. |
-| notify | File watching | Powers daemon scoped refresh and full fallback triggers. |
-| GitHub Actions / Release Please / GitHub Releases | CI, versioning, artifact publishing, release evidence | Multi-workflow release pipeline with retained evidence. |
-| setup.sh / self-update | Distribution and upgrade channels | The script installer consumes GitHub Release assets; self-update reads the stable update manifest. |
-| Promptfoo / Claude Agent SDK / Bun | Evals | Search and impact evals compare 1up MCP-assisted agents with baseline raw-search agents. |
-| cargo-audit / shellcheck / hyperfine | Gates and evidence | Security, install-script, and performance evidence feed CI/release decisions. |
-
-## Deployment Model
-
-- Deployment type: single Rust binary named `1up`, with optional background daemon and optional MCP stdio server mode.
-- Runtime environment: local developer machines on macOS, Linux, and Windows; daemon/Unix-socket paths are Unix-focused with platform stubs where daemon support is unavailable.
-- Installation channels: `setup.sh` backed by GitHub Release archives, plus built-in self-update via `update-manifest.json`.
-- Release matrix: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`.
-- Release gates: CI security check, release build smoke, release metadata validation, setup-script lint/integration, archive verification, MCP smoke, and optional eval/benchmark/host evidence.
-
-## Diagram
+## High-Level Architecture
 
 ```mermaid
 graph TB
     User[User] --> CLI[1up CLI]
     Host[Agent Host] --> MCP[MCP stdio server]
+    User -->|doctor clean-hints| Doctor[doctor and hint_cleanup]
+    Doctor -->|reads tool set| Retained[RETAINED_PUBLIC_TOOLS]
+    MCP -->|exposes| Retained
+    Doctor -->|clamped atomic edit| Instr[Instruction files]
     CLI --> Project[Project resolver]
     MCP --> Project
-    Project --> State[(Project .1up state)]
+    Project --> State[dot-1up state root]
     Project --> Source[Source root]
     CLI -->|search IPC| Daemon[Daemon worker]
     MCP -->|auto start| Daemon
-    Daemon -->|watch refresh| Indexer[Indexer pipeline]
+    Daemon -->|notify watch refresh| Indexer[Indexer pipeline]
     CLI -->|index reindex| Indexer
-    MCP -->|prepare index| Indexer
-    Indexer --> Storage[(libSQL index.db)]
+    MCP -->|start repair| Indexer
+    Indexer --> Storage[libSQL index db v16]
     CLI --> Search[Search engines]
     MCP --> Search
+    MCP --> Overview[Overview digest]
     Search --> Storage
+    Overview --> Storage
     CLI --> Impact[Impact horizon]
     MCP --> Impact
     Impact --> Storage
-    Storage --> Tables[segments vectors symbols relations indexed_files]
+    Storage --> Tables[segments vectors symbols relations manifest fts]
+    Release[Release workflows] -->|version-checked| Manifest[update-manifest json]
+    CLI -->|self-update| Manifest
 ```
 
-## What Changed With MCP And Release Surface
+## Key Architecture Patterns
 
-- Added first-class MCP commands and modules: `add-mcp`, `mcp`, `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, and typed MCP schemas.
-- MCP search/get/context/symbol/impact/structural reuse local index/search/storage engines instead of adding a separate network service.
-- MCP status checks readiness, and MCP start can explicitly create or rebuild the local index while readiness distinguishes missing, indexing, stale, degraded, and ready states.
-- Release archive verification now performs JSON-RPC MCP smoke against every built archive and asserts canonical tools, structured content, readiness statuses, and clean stdout protocol.
-- Release evidence now models live MCP host smoke as `mcp_host_smoke.v1`, with recorded or skipped evidence per host.
-- The install and distribution surface is now part of the architecture: `setup.sh`, release manifest, archive verification, and update manifest are all generated/validated flows.
+| Pattern | Meaning | Evidence |
+|---|---|---|
+| Layered CLI + MCP + daemon | CLI commands, MCP stdio tools, and daemon refresh/search are separate entry surfaces over shared project state, storage, search, and indexer engines. | `src/main.rs`, `src/cli/mod.rs`, `src/cli/mcp.rs`, `src/mcp/server.rs`, `src/daemon/worker.rs` |
+| Agent-facing MCP adapter with structured envelopes | `1up mcp --path` serves rmcp stdio tools returning a `ToolEnvelope` (status, summary, structured data, next_actions); server instructions are budgeted to survive a 2KB truncation. | `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs`, `src/mcp/server.rs` |
+| Retained-tool source of truth shared across surfaces | The live MCP tool set (`RETAINED_PUBLIC_TOOLS`, 9 `oneup_*` tools) is the single authority for both MCP exposure and for classifying which `oneup_*` tokens in user instruction files are stale. | `src/mcp/types.rs`, `src/cli/hint_cleanup.rs`, `src/mcp/tools.rs` |
+| Opt-in, default-OFF instruction-file hygiene | `1up doctor --clean-hints` is a read-only preview by default; mutation requires `--apply` and is restricted to a 1up-owned HTML-comment fenced span. Unfenced stale tokens are detect-and-advise only. | `src/cli/doctor.rs`, `src/cli/hint_cleanup.rs`, `src/cli/mod.rs` |
+| Project-root-clamped atomic write | Edits to user files outside `.1up` go through a clamp to the project root, symlink-leaf rejection, out-of-root parent rejection, mode preservation, temp-write, fsync, and atomic rename. | `src/shared/fs.rs` (`atomic_replace_within_project_root`) |
+| Idempotent guarded startup | Daemon startup and MCP instances use owner-only state, exclusive flocks, registry reloads, and non-destructive contention handling. | `src/daemon/lifecycle.rs`, `src/cli/mcp.rs`, `src/daemon/registry.rs`, `src/shared/fs.rs` |
+| Split state/source roots | Linked git worktrees store `.1up/` state at the main worktree while scanning source from the active worktree; a `context_id` binds the pair. | `src/shared/project.rs`, `src/indexer/pipeline.rs` |
+| Staged single-writer indexing | Parse work runs in parallel, but segment, symbol, relation, vector, and manifest writes flush through ordered transactional batches. | `src/indexer/pipeline.rs`, `src/storage/segments.rs` |
+| Metadata-first incremental indexing | Full and scoped runs compare file size and mtime from `indexed_files` before content reads, with content hashes as the correctness backstop. | `src/indexer/pipeline.rs`, `src/storage/queries.rs` |
+| Candidate-first retrieval with degradation | Vector, FTS, and symbol paths produce candidates that are RRF-fused and reranked before hydration; daemon and MCP search fall back to FTS-only when embeddings are unavailable. | `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/daemon/worker.rs`, `src/mcp/ops.rs` |
+| Deterministic repository orientation digest | `oneup_overview` computes a size-bounded, deterministically-ordered digest (stats, most-referenced types, module map, cross-module deps, entry points) over the active context. | `src/search/overview.rs`, `src/mcp/tools.rs` |
+| Local-only advisory impact | CLI and MCP impact open the current index locally and traverse descriptor-backed `segment_relations` evidence with trust-bucketed primary vs contextual outputs. | `src/search/impact.rs`, `src/storage/relations.rs`, `src/mcp/ops.rs` |
+| Schema-gated local state | Existing DBs fail closed unless schema version, required objects, vector column, `context_id` columns, and relation evidence columns match the current binary. | `src/storage/schema.rs`, `src/shared/constants.rs` |
+| Evidence-driven release surface | Security gate, release-build smoke, release-metadata validation, archive verification with MCP smoke, update-manifest publish+verify, and the install script form the release contract. | `.github/workflows/*.yml`, `scripts/release/*.sh`, `scripts/security_check.sh`, `scripts/install/setup.sh`, `justfile` |
 
-## What Changed With Faster Indexing
+## Component Architecture
 
-- Tuned libSQL connections through `connect_tuned` and current schema preparation.
-- Added metadata prefilter and deleted-file cleanup through `indexed_files`.
-- Preserved correctness with content-hash checks after metadata prefiltering.
-- Batches segment, vector, symbol, relation, and manifest writes inside transactional file-batch replacement.
-- Progress now reports setup timings, input preparation, scope, prefilter, parallelism, and deleted-file counts.
+### CLI Layer
+**Purpose**: Parse user commands, resolve output contracts, and dispatch lifecycle, index, search, status, update, doctor, and MCP workflows.
+**Location**: `src/main.rs`, `src/cli/mod.rs`
+**Responsibilities**:
+- Route subcommands and resolve `--format`/`--plain` output contracts (visible commands: `start`, `status`, `list`, `stop`, `get`, `symbol`, `context`, `impact`, `doctor`).
+- Suppress passive update notifications for `mcp`, `__worker`, `update`, and JSON-output maintenance commands.
 
-## What Changed With Shrunk Vector Index
+**Dependencies**:
+- Internal: Shared, Daemon, Indexer, Search, Storage, MCP.
+- External: `clap`, `tokio`, `tracing-subscriber`.
 
-- `segment_vectors.embedding_vec` stores `FLOAT8(384)` vectors and uses `vector8(?)` at write/query sites.
-- `idx_segment_vectors_embedding` uses compressed neighbors with `max_neighbors=32`.
-- `SCHEMA_VERSION = 13` makes stale vector/context formats fail closed with `1up reindex` guidance.
-- `VECTOR_PREFILTER_K = 400` widens the candidate pool to absorb quantization noise before reranking.
-- The pinned size baseline records 74,584,064 byte `index.db` for the 1up repository.
+### Instruction-File Hygiene (doctor)
+**Purpose**: Opt-in, default-OFF detection and cleanup of legacy 1up hints in user instruction files.
+**Location**: `src/cli/doctor.rs`, `src/cli/hint_cleanup.rs`
+**Key Patterns**: Pure filesystem-free classifier; fence-only auto-remove under `--apply`; detect-and-advise for unfenced stale tokens.
+**Responsibilities**:
+- Scan `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md` for a 1up-owned `<!-- 1up:hint:begin -->`/`<!-- 1up:hint:end -->` fence and for `oneup_*` tokens absent from `RETAINED_PUBLIC_TOOLS`.
+- With `--apply`, remove only the owned fenced span byte-exactly via `atomic_replace_within_project_root`; never edit unfenced content.
+
+**Dependencies**:
+- Internal: Shared (`atomic_replace_within_project_root`), MCP types (`RETAINED_PUBLIC_TOOLS`).
+
+### MCP Layer
+**Purpose**: Expose code discovery tools to agent hosts over stdio with structured envelopes and next-action guidance.
+**Location**: `src/cli/mcp.rs`, `src/mcp/server.rs`, `src/mcp/tools.rs`, `src/mcp/ops.rs`, `src/mcp/types.rs`
+**Key Patterns**: Per-project instance flock; local engine reuse (no separate network service); 2KB-budgeted server instructions.
+**Interface** (9 retained tools):
+```rust
+pub const RETAINED_PUBLIC_TOOLS: [&str; 9] = [
+    TOOL_STATUS,    // oneup_status
+    TOOL_START,     // oneup_start
+    TOOL_SEARCH,    // oneup_search
+    TOOL_GET,       // oneup_get
+    TOOL_SYMBOL,    // oneup_symbol
+    TOOL_CONTEXT,   // oneup_context
+    TOOL_IMPACT,    // oneup_impact
+    TOOL_STRUCTURAL,// oneup_structural
+    TOOL_OVERVIEW,  // oneup_overview
+];
+```
+
+### Daemon Layer
+**Purpose**: Maintain watched project indexes and serve warm CLI search through bounded local IPC.
+**Location**: `src/daemon/worker.rs`, `src/daemon/lifecycle.rs`, `src/daemon/search_service.rs`, `src/daemon/watcher.rs`, `src/daemon/registry.rs`, `src/daemon/ipc.rs`
+**Key Patterns**: Single daemon lock; `notify`-driven scoped refresh with full fallback; per-process serialized dirty runs; same-UID-only IPC peers.
+**Configuration**: Owner-only XDG state root; framed JSON requests bounded by `MAX_DAEMON_REQUEST_BYTES` and `MAX_DAEMON_IN_FLIGHT_REQUESTS`; platform stubs (`lifecycle_stub.rs`, `search_service_stub.rs`, `worker_stub.rs`) where daemon support is unavailable.
+
+### Indexer Layer
+**Purpose**: Scan, parse, chunk, embed, prefilter, and persist repository files.
+**Location**: `src/indexer/pipeline.rs`, `src/indexer/scanner.rs`, `src/indexer/parser.rs`, `src/indexer/markdown.rs`, `src/indexer/chunker.rs`, `src/indexer/embedder.rs`
+**Dependencies**: Storage, Shared, tree-sitter (~17 grammars), ONNX embedder (all-MiniLM-L6-v2, 384-dim).
+
+### Search Layer
+**Purpose**: Execute hybrid search, ranking, symbol lookup, context reads, structural queries, impact expansion, and the overview digest.
+**Location**: `src/search/hybrid.rs`, `src/search/retrieval.rs`, `src/search/ranking.rs`, `src/search/symbol.rs`, `src/search/context.rs`, `src/search/structural.rs`, `src/search/impact.rs`, `src/search/overview.rs`, `src/search/scope.rs`
+**Key Patterns**: RRF fusion (`RRF_K=60`, `VECTOR_WEIGHT=1.5`, `SYMBOL_WEIGHT=4.0`); vector exhaustive-scan path below `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS=16384`, approximate index path above.
+
+### Storage Layer
+**Purpose**: Own libSQL connections, schema validation, SQL, segment writes, relation writes, and manifest state.
+**Location**: `src/storage/db.rs`, `src/storage/schema.rs`, `src/storage/queries.rs`, `src/storage/segments.rs`, `src/storage/relations.rs`
+**Key Patterns**: Tuned connections (WAL, `synchronous=NORMAL`, cache, mmap, temp-store); fail-closed schema gating at `SCHEMA_VERSION=16`.
+
+### Shared Layer
+**Purpose**: Define config paths, root/worktree resolution, secure filesystem helpers, constants, progress types, symbols, and update metadata.
+**Location**: `src/shared/config.rs`, `src/shared/project.rs`, `src/shared/fs.rs`, `src/shared/types.rs`, `src/shared/constants.rs`, `src/shared/symbols.rs`, `src/shared/progress.rs`, `src/shared/update.rs`, `src/shared/errors.rs`
+**Dependencies**: None internal (foundation layer).
+
+## Data Flow
+
+### MCP Code Discovery (primary agent flow)
+```mermaid
+sequenceDiagram
+    participant Host as Agent Host
+    participant CLI as 1up mcp
+    participant Resolver as Project resolver
+    participant Server as rmcp server
+    participant Engines as Search and Storage
+
+    Host->>CLI: start 1up mcp --path repo
+    CLI->>Resolver: resolve state_root source_root context
+    CLI->>CLI: take per-project instance flock
+    CLI->>Engines: best-effort auto-init and start daemon
+    CLI->>Server: serve_stdio
+    Host->>Server: call oneup tool
+    Server->>Engines: open index enforce schema v16 filter context_id
+    Engines-->>Server: results or readiness
+    Server-->>Host: ToolEnvelope status summary data next_actions
+```
+
+### Index Build and Refresh
+1. CLI, MCP start, or daemon refresh resolves a `WorktreeContext` and opens a tuned libSQL connection.
+2. The scanner applies gitignore/global-ignore/exclude rules, build-artifact and binary skips, and special extensionless recognition.
+3. Full runs load `indexed_files` and segment hashes, skip metadata-unchanged files, and detect deleted paths; scoped runs scan only changed paths and fall back to full when scoped semantics are unsafe.
+4. Parse workers run concurrently; ordered flushes build embeddings and persist file batches transactionally.
+5. Storage replaces segments, vectors, symbols, relation descriptors, and manifest rows per context together; empty batches delete removed rows.
+6. Progress persists `context_id`, source root, branch status, scope, prefilter, parallelism, timings, deleted-file counts, and embedding availability to `.1up/index_status.json`.
+
+### CLI Daemon-Backed Search
+CLI search sends a framed JSON request (`context_id` + source root) over the daemon Unix socket. The daemon accepts only same-UID peers, clamps limits, rejects oversized payloads, validates the context/source pair against the registry, reuses a warm `EmbeddingRuntime` (or FTS-only), and returns ranked `SearchResult` values. The CLI falls back to context-scoped local search when the daemon is unavailable, stale, or rejects the request.
+
+### Doctor Hint Cleanup
+`hint_cleanup::classify` locates a 1up-owned fence and scans for stale `oneup_*` tokens. Without `--apply` it is a read-only preview. With `--apply` and an owned fence, `atomic_replace_within_project_root` removes only the fenced span (byte-exact elsewhere, mode preserved). Unfenced stale tokens are reported as advisories and never edited.
+
+### Release and Update
+Release Please owns version/changelog PRs and tags. `validate_release_metadata.sh` and `generate_release_manifest.sh` fail unless `Cargo.toml` version == release tag. `release-assets` builds the target matrix, stages the Windows ONNX DLL, and uploads archives, checksums, release manifest, notes, and `setup.sh`. `verify_release_archives.sh` runs JSON-RPC MCP smoke against every archive (asserting canonical tools, structured content, readiness, and that the reported version matches the manifest). `publish-update-manifest` regenerates `update-manifest.json` from the release manifest and pushes to `main`; a paired `verify-update-manifest` job re-fetches and diffs published vs expected.
+
+## Integration Points
+
+### External Services
+- **libSQL** (`libsql` 0.9 core): embedded local index storage shared by CLI, MCP, daemon, search, impact, and indexing.
+- **ONNX Runtime / Hugging Face** (`ort` 2.0.0-rc.12): local embedding inference; non-Windows links the downloaded static runtime, Windows loads the DLL dynamically. Model `model.onnx` and `tokenizer.json` are pinned by SHA-256; `ONEUP_DISABLE_MODEL_DOWNLOADS` forces hermetic FTS-only in CI.
+- **tree-sitter** (0.26 + ~17 grammars): structured parsing for segments, symbols, roles, relations, and structural queries.
+- **rmcp** (1.5): MCP stdio server exposing 9 `oneup_*` tools and JSON schemas; instructions budgeted under 2KB.
+- **notify** (7): file watching for daemon scoped refresh and full-fallback triggers.
+- **GitHub Actions / Release Please / GitHub Releases**: CI, versioning, artifact publishing, manifest publish/verify, and release evidence.
+- **setup.sh / self-update**: distribution and upgrade channels; self-update reads `update-manifest.json` gated by `ONEUP_UPDATE_MANIFEST_URL`.
+- **Promptfoo / Claude Agent SDK / Bun**: search/impact evals and the recall@k harness comparing 1up MCP-assisted agents against baseline raw-search agents.
+
+### Internal Communication
+- **Service-to-service**: CLI to daemon over a framed JSON Unix socket protocol (`src/daemon/ipc.rs`, `src/daemon/search_service.rs`); MCP and CLI otherwise reuse local search/storage engines in-process rather than over a network.
+- **Event handling**: `notify` filesystem events drive debounced (`WATCHER_DEBOUNCE_MS=500`) scoped refresh, with branch-context changes and ambiguous paths promoting to full refresh.
+
+## Security Architecture
+
+### Authentication
+- **Method**: No network auth surface; the daemon socket authenticates by OS peer credentials.
+- **Flow**: The daemon accepts only same-UID peer connections and rejects others.
+
+### Authorization
+- **Model**: Filesystem ownership and exclusive locks. Owner-only modes (`0o700` dirs, `0o600` files/sockets) on XDG state, project `.1up`, and the daemon socket.
+- **Implementation**: Exclusive flocks for the daemon and per-project MCP instances; context/source pairs validated against the locked registry before serving.
+
+### Data Protection
+- **Encryption**: None at rest (local developer-machine index); integrity for distributed artifacts via pinned SHA-256 on the embedding model/tokenizer and optional SHA-256 verification on install/self-update.
+- **Sensitive data / path safety**: `src/shared/fs.rs` clamps all sensitive writes to an approved root, rejects symlink components and leaves, normalizes paths, and writes via temp + fsync + atomic rename. `atomic_replace` clamps to `.1up`; `atomic_replace_within_project_root` clamps to the user's project root and preserves the existing file mode.
+
+## Performance Considerations
+
+### Bottlenecks
+- Vector graph traversal is read-heavy and slow at small corpus sizes, so an exhaustive `vector_distance_cos` scan is used below `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS=16384`.
+- Linked worktrees dilute the shared vector index, mitigated by scaling prefilter candidates by context count (`VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT=8`).
+
+### Scalability
+- **Indexing**: parallel parse workers (`ONEUP_INDEX_JOBS`), bounded embed threads (`MAX_AUTO_EMBED_THREADS=4`, `ONEUP_EMBED_THREADS`), and auto-sized transactional write batches (`ONEUP_INDEX_WRITE_BATCH_FILES`).
+- **Retrieval**: candidate prefilter (`VECTOR_PREFILTER_K=400`) feeding RRF fusion and reranking; warm `EmbeddingRuntime` reuse in the daemon.
+- **Storage**: `FLOAT8(384)` quantized vectors with a compressed neighbor index (`max_neighbors=32`).
+
+### Monitoring
+- Index progress and timings in `.1up/index_status.json`; daemon heartbeat in `.1up/daemon_status.json` and context-aware state in `.1up/daemon_context_status.json`.
+- Release evidence: security gate JSON, archive/MCP smoke, and benches gating `index.db` <= 80 MiB and `indexing_ms` <= 90000 (`justfile` `bench-vector-index-size`), plus search-latency Criterion benches.
+
+## Deployment Architecture
+
+### Environments
+- **Development**: `just install` builds the release binary and copies it to `~/.local/bin`; `just verify` runs fmt, clippy, the full test surface, and `setup.sh` lint/smoke.
+- **Staging**: not applicable (no hosted service); evals and benches run locally and in CI as release evidence.
+- **Production**: end-user developer machines on macOS, Linux, and Windows running the single `1up` binary, with an optional background daemon and optional MCP stdio server mode.
+
+### Infrastructure
+- **Hosting**: none; local-first single binary. Daemon/Unix-socket paths are Unix-focused with platform stubs where unavailable.
+- **Database**: embedded libSQL `index.db` under `<state_root>/.1up/`; a locked, owner-only global registry (`projects.json`) under `dirs::data_dir()/1up/`.
+- **Networking / distribution**: GitHub Releases (semantic versioning via Release Please); `setup.sh` installer with platform detection, optional SHA-256 verification, atomic binary replacement, and managed PATH blocks; built-in self-update through the version-checked `update-manifest.json`. Release matrix: `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
