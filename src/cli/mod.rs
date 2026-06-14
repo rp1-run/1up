@@ -43,6 +43,7 @@ Commands:
   symbol  Look up symbol definitions and references
   context Read source context around a file location
   impact  Explore advisory likely impact from a known anchor
+  doctor  Diagnose and optionally clean legacy 1up hints in instruction files
 
 Options:
 {options}",
@@ -117,7 +118,35 @@ pub enum Command {
     Reindex(reindex::ReindexArgs),
 
     /// Diagnose and optionally clean legacy 1up hints in project instruction files
-    #[command(hide = true)]
+    #[command(long_about = "\
+Diagnose and optionally clean legacy 1up hints in project instruction files.
+
+OPT-IN and default-OFF: 1up writes nothing to your instruction files unless you \
+explicitly run this command. No normal 1up operation (start, indexing, search) \
+ever creates or edits these files.
+
+With --clean-hints, it inspects these files in the project root:
+  - AGENTS.md
+  - CLAUDE.md
+  - .github/copilot-instructions.md
+
+What it detects: legacy stale 1up tool tokens (for example oneup_prepare and \
+oneup_read). The rule is exact: any oneup_* token that is NOT in the current set \
+of real tools (RETAINED_PUBLIC_TOOLS) is treated as stale; real retained tools \
+are never flagged.
+
+Two behaviors:
+  - Fence-only AUTO-REMOVE: removes ONLY a 1up-owned fenced span delimited by \
+<!-- 1up:hint:begin --> and <!-- 1up:hint:end -->. Everything outside that exact \
+pair is preserved byte-for-byte. (In practice 1up has never written such a \
+fence, so this path rarely matches existing files.)
+  - DETECT-AND-ADVISE: for any stale token NOT inside a 1up-owned fence, it \
+reports the finding and recommends manual removal. It never edits unfenced \
+content.
+
+Safety model: the default is a read-only PREVIEW that writes nothing. Mutation \
+requires the explicit --apply flag, and even then only a 1up-owned fenced span \
+is ever removed.")]
     Doctor(doctor::DoctorArgs),
 
     /// Check for updates, view update status, or apply an update
@@ -393,7 +422,7 @@ mod tests {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
         let visible_commands = [
-            "start", "status", "list", "stop", "get", "symbol", "context", "impact",
+            "start", "status", "list", "stop", "get", "symbol", "context", "impact", "doctor",
         ];
 
         for command_name in visible_commands {

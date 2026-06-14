@@ -15,17 +15,26 @@ use crate::shared::types::OutputFormat;
 /// output stays stable across platforms.
 const IN_SCOPE_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"];
 
+/// Arguments for the `doctor` command. The authoritative long-form command help
+/// (opt-in/default-OFF, inspected files, the stale-token detection rule,
+/// fence-only auto-remove vs detect-and-advise, and the preview/`--apply` safety
+/// model) is the `long_about` on the `Doctor` arm in `src/cli/mod.rs`, which
+/// `1up doctor --help` renders. The per-flag help below documents each option.
 #[derive(Args)]
 pub struct DoctorArgs {
     /// Project root directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
 
-    /// Scan project instruction files for legacy 1up code-discovery hints
+    /// Scan project instruction files (AGENTS.md, CLAUDE.md,
+    /// .github/copilot-instructions.md) for legacy stale 1up tool tokens.
+    /// Read-only by default; pair with --apply to remove a 1up-owned fenced span
     #[arg(long)]
     pub clean_hints: bool,
 
-    /// Apply the fence-removal edit (default is a read-only preview)
+    /// Apply the fence-only removal edit. Without this flag the command is a
+    /// read-only preview. Even with --apply, only a 1up-owned fenced span is
+    /// removed; unfenced stale tokens are always advised, never edited
     #[arg(long)]
     pub apply: bool,
 
