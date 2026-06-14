@@ -1,6 +1,7 @@
 pub mod add_mcp;
 pub mod context;
 pub mod discovery_output;
+pub mod doctor;
 pub mod get;
 pub mod hint_cleanup;
 pub mod impact;
@@ -115,6 +116,10 @@ pub enum Command {
     #[command(hide = true)]
     Reindex(reindex::ReindexArgs),
 
+    /// Diagnose and optionally clean legacy 1up hints in project instruction files
+    #[command(hide = true)]
+    Doctor(doctor::DoctorArgs),
+
     /// Check for updates, view update status, or apply an update
     #[command(hide = true)]
     Update(update::UpdateArgs),
@@ -133,7 +138,7 @@ impl Command {
             Command::Start(_) | Command::Status(_) | Command::List(_) | Command::Stop(_) => {
                 Some(OutputFormat::Human)
             }
-            Command::Update(_) => Some(OutputFormat::Human),
+            Command::Update(_) | Command::Doctor(_) => Some(OutputFormat::Human),
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::AddMcp(_)
             | Command::Search(_)
@@ -189,6 +194,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Reindex(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             reindex::exec(args, format).await
+        }
+        Command::Doctor(args) => {
+            let format = resolve_maintenance_format(args.format, maintenance_format);
+            doctor::exec(args, format).await
         }
         Command::Update(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);

@@ -35,6 +35,7 @@ pub trait Formatter {
     fn format_update_result(&self, _result: &UpdateResult) -> String {
         String::new()
     }
+    fn format_doctor_report(&self, report: &DoctorReport) -> String;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +262,54 @@ pub enum UpdateResult {
     },
 }
 
+/// Per-file outcome of `1up doctor --clean-hints`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFileStatus {
+    /// No legacy 1up hints found.
+    Clean,
+    /// A 1up-owned fence was found and would be removed under `--apply`.
+    WouldRemoveFence,
+    /// A 1up-owned fence was removed (`--apply` write succeeded).
+    RemovedFence,
+    /// Stale 1up tokens were found outside any owned fence; advisory only.
+    AdviseUnfenced,
+}
+
+impl DoctorFileStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::WouldRemoveFence => "would_remove_fence",
+            Self::RemovedFence => "removed_fence",
+            Self::AdviseUnfenced => "advise_unfenced",
+        }
+    }
+}
+
+/// A stale `oneup_*` token located outside any 1up-owned fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaleToken {
+    pub token: String,
+    pub line: usize,
+}
+
+/// One inspected instruction file's report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorFileReport {
+    pub file: String,
+    pub status: DoctorFileStatus,
+    pub stale_tokens: Vec<StaleToken>,
+    pub recommended_action: String,
+    pub modified: bool,
+}
+
+/// Aggregated `1up doctor --clean-hints` result across all inspected files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorReport {
+    pub files: Vec<DoctorFileReport>,
+}
+
 impl From<&IndexProgress> for WorkSummary {
     fn from(progress: &IndexProgress) -> Self {
         Self {
@@ -478,6 +527,10 @@ impl Formatter for JsonFormatter {
                 "message": format!("Updated 1up from {old_version} to {new_version}."),
             })),
         }
+    }
+
+    fn format_doctor_report(&self, report: &DoctorReport) -> String {
+        to_json(report)
     }
 }
 
@@ -965,6 +1018,33 @@ impl Formatter for HumanFormatter {
             }
         }
     }
+
+    fn format_doctor_report(&self, report: &DoctorReport) -> String {
+        if report.files.is_empty() {
+            return format!(
+                "No in-scope instruction files found ({}). Nothing to do.",
+                DOCTOR_IN_SCOPE_LABEL
+            );
+        }
+
+        let mut blocks = Vec::with_capacity(report.files.len());
+        for file in &report.files {
+            let mut block = format!(
+                "{}: {}",
+                file.file.bold(),
+                render_doctor_status_human(file.status)
+            );
+            if !file.stale_tokens.is_empty() {
+                block.push_str(&format!(
+                    "\n  Stale tokens: {}",
+                    render_stale_tokens_human(&file.stale_tokens)
+                ));
+            }
+            block.push_str(&format!("\n  Action: {}", file.recommended_action));
+            blocks.push(block);
+        }
+        blocks.join("\n\n")
+    }
 }
 
 impl Formatter for PlainFormatter {
@@ -1328,6 +1408,61 @@ impl Formatter for PlainFormatter {
             }
         }
     }
+
+    fn format_doctor_report(&self, report: &DoctorReport) -> String {
+        if report.files.is_empty() {
+            return "files:0".to_string();
+        }
+
+        report
+            .files
+            .iter()
+            .map(|file| {
+                format!(
+                    "file:{}\tstatus:{}\tmodified:{}\tstale_tokens:{}\taction:{}",
+                    plain_field(&file.file),
+                    file.status.as_str(),
+                    file.modified,
+                    render_stale_tokens_plain(&file.stale_tokens),
+                    plain_field(&file.recommended_action),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Human-readable label of the in-scope instruction file set, for the empty
+/// doctor report.
+const DOCTOR_IN_SCOPE_LABEL: &str = "AGENTS.md, CLAUDE.md, .github/copilot-instructions.md";
+
+fn render_doctor_status_human(status: DoctorFileStatus) -> String {
+    match status {
+        DoctorFileStatus::Clean => "clean — no legacy 1up hints found".green().to_string(),
+        DoctorFileStatus::WouldRemoveFence => "would remove 1up-owned hint fence (preview)"
+            .yellow()
+            .to_string(),
+        DoctorFileStatus::RemovedFence => "removed 1up-owned hint fence".green().to_string(),
+        DoctorFileStatus::AdviseUnfenced => "advise — stale 1up tokens found (not auto-edited)"
+            .yellow()
+            .to_string(),
+    }
+}
+
+fn render_stale_tokens_human(tokens: &[StaleToken]) -> String {
+    tokens
+        .iter()
+        .map(|t| format!("{} (line {})", t.token, t.line))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_stale_tokens_plain(tokens: &[StaleToken]) -> String {
+    tokens
+        .iter()
+        .map(|t| format!("{}@{}", t.token, t.line))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn render_watch_updates(format: OutputFormat, rx: Receiver<IndexProgress>) {

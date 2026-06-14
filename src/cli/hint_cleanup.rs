@@ -15,12 +15,6 @@
 //! can be unit-tested in isolation. The `doctor` command layer is responsible
 //! for reading files, rendering reports, and performing the gated write.
 
-// The `doctor` command (built in a later task) is the only non-test consumer of
-// `classify`. Until that wiring lands, the bin target sees this leaf module as
-// unused; the unit tests below exercise the full surface. Remove once `doctor`
-// calls `classify`.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use crate::mcp::types::RETAINED_PUBLIC_TOOLS;
