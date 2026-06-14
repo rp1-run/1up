@@ -701,7 +701,6 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "## Server Entry",
         "## Host Config Shapes",
         "## After Saving Config",
-        "## Repository Instruction Hint",
         "## Troubleshooting",
         "## Safety",
         "1up mcp",
@@ -720,7 +719,6 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
         "\"args\": [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
         "List MCP tools and call `oneup_status`.",
-        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
         "MCP stdio expects protocol messages on stdout.",
         "It does not edit files",
         "execute arbitrary shell commands",
@@ -797,6 +795,22 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         assert!(
             !readme.contains(unsupported),
             "README should not document unsupported setup/package path {unsupported}"
+        );
+    }
+
+    for paste_recommendation in [
+        "## Repository Instruction Hint",
+        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
+        "Insert this minimal 1up hint",
+        "repo instruction file changed",
+    ] {
+        assert!(
+            !guide.contains(paste_recommendation),
+            "MCP installation guide should no longer recommend pasting a 1up hint into a user instruction file: {paste_recommendation}"
+        );
+        assert!(
+            !readme.contains(paste_recommendation),
+            "README should no longer recommend pasting a 1up hint into a user instruction file: {paste_recommendation}"
         );
     }
 }
