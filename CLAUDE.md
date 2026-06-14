@@ -56,8 +56,9 @@ raw search. This includes questions like "how does X work", "where is Y handled
 or saved", "what calls Z", "where is this pattern implemented", or "what code is
 impacted by this change".
 
-Use `oneup_prepare` when index readiness is unknown, `oneup_search` for ranked
-discovery, `oneup_read` to hydrate returned handles or locations, `oneup_symbol`
-for definition/reference completeness, and `oneup_impact` for likely blast
-radius. Use `rg`, `grep`, `find`, shell `1up`, or broad file reads first only for
-exact literals, regexes, non-code files, or when the MCP server is unavailable.
+Use `oneup_status` when index readiness is unknown, `oneup_search` for ranked
+discovery, `oneup_get` to hydrate returned handles, `oneup_context` for precise
+file-line context, `oneup_symbol` for definition/reference completeness, and
+`oneup_impact` for likely blast radius. Use `rg`, `grep`, `find`, shell `1up`,
+or broad file reads first only for exact literals, regexes, non-code files, or
+when the MCP server is unavailable.

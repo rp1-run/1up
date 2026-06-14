@@ -52,9 +52,9 @@ Agent adoption evals live under `evals/suites/1up-search/` and `evals/suites/1up
 
 The 1up eval variant expects this chain:
 
-1. `oneup_prepare` when readiness is uncertain.
+1. `oneup_status` when readiness is uncertain.
 2. `oneup_search` before any raw discovery tool.
-3. `oneup_read` to hydrate returned handles or precise locations.
+3. `oneup_get` to hydrate returned handles, or `oneup_context` for precise file-line locations.
 4. `oneup_symbol` for completeness-oriented definition/reference checks.
 5. `oneup_impact` for likely-impact tasks, with primary/contextual interpretation.
 
@@ -70,7 +70,7 @@ npx promptfoo validate -c suites/1up-search/evals.yaml
 npx promptfoo validate -c suites/1up-impact/evals.yaml
 ```
 
-These suites are the adoption evidence for MCP installation readiness: agents should call `oneup_prepare`, discover with `oneup_search`, hydrate with `oneup_read`, and use `oneup_symbol` or `oneup_impact` before falling back to raw file search for supported discovery tasks.
+These suites are the adoption evidence for MCP installation readiness: agents should call `oneup_status`, discover with `oneup_search`, hydrate with `oneup_get` (or `oneup_context` for file-line locations), and use `oneup_symbol` or `oneup_impact` before falling back to raw file search for supported discovery tasks.
 
 Release evidence records either the retained adoption summary JSON or an explicit skipped reason; it does not introduce a second eval harness.
 
