@@ -2,6 +2,7 @@ pub mod add_mcp;
 pub mod context;
 pub mod discovery_output;
 pub mod get;
+pub mod hint_cleanup;
 pub mod impact;
 pub mod index;
 pub mod init;
