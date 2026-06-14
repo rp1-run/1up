@@ -213,8 +213,10 @@ This downloads the latest release, verifies it, and replaces the installed binar
 To pin a specific install version:
 
 ```sh
-curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=v0.1.8 bash
+curl -fsSL https://1up.rp1.run/setup.sh | env 1UP_VERSION=vX.Y.Z bash
 ```
+
+Substitute `vX.Y.Z` with a real released tag from the [GitHub releases page](https://github.com/rp1-run/1up/releases).
 
 ## <img src="assets/readme/icons/heroicons-solid/chart-bar-square.svg" alt="" width="20" height="20"> Product Proof
 

@@ -43,7 +43,7 @@ Output JSON envelope (`suites/1up-search/recall-results.json`):
 
 ```json
 {
-  "schema_version": 13,
+  "schema_version": 16,
   "corpus_size": 15,
   "reports": [
     {
