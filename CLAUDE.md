@@ -51,14 +51,4 @@ that an rp1 skill addresses, briefly suggest it.
 <!-- rp1:end:v0.7.1 -->
 ## 1up MCP Code Discovery
 
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad
-raw search. This includes questions like "how does X work", "where is Y handled
-or saved", "what calls Z", "where is this pattern implemented", or "what code is
-impacted by this change".
-
-Use `oneup_status` when index readiness is unknown, `oneup_search` for ranked
-discovery, `oneup_get` to hydrate returned handles, `oneup_context` for precise
-file-line context, `oneup_symbol` for definition/reference completeness, and
-`oneup_impact` for likely blast radius. Use `rg`, `grep`, `find`, shell `1up`,
-or broad file reads first only for exact literals, regexes, non-code files, or
-when the MCP server is unavailable.
+For code-discovery questions in this repo, prefer the `oneup` MCP server's tools over broad raw search; their authoritative usage guidance is delivered in-band through the server instructions and tool descriptions, so it is intentionally not duplicated here.

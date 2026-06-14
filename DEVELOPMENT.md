@@ -70,7 +70,7 @@ npx promptfoo validate -c suites/1up-search/evals.yaml
 npx promptfoo validate -c suites/1up-impact/evals.yaml
 ```
 
-These suites are the adoption evidence for MCP installation readiness: agents should call `oneup_status`, discover with `oneup_search`, hydrate with `oneup_get` (or `oneup_context` for file-line locations), and use `oneup_symbol` or `oneup_impact` before falling back to raw file search for supported discovery tasks.
+These suites are the adoption evidence for MCP installation readiness. The canonical discovery routing they grade is delivered in-band through the `oneup` MCP server instructions and tool descriptions, so it is not restated here.
 
 Release evidence records either the retained adoption summary JSON or an explicit skipped reason; it does not introduce a second eval harness.
 
