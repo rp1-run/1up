@@ -1,79 +1,17 @@
+mod common;
+
 use assert_cmd::Command;
+use common::HideModelGuard;
 use oneup::shared::constants::SCHEMA_VERSION;
 use oneup::storage::{db::Db, queries, schema};
 use predicates::prelude::*;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use tempfile::TempDir;
-
-static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
 fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
-}
-
-struct HideModelGuard {
-    model_path: PathBuf,
-    hidden_path: PathBuf,
-    current_path: PathBuf,
-    hidden_current_path: PathBuf,
-    marker_path: PathBuf,
-    active: bool,
-    current_active: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl HideModelGuard {
-    fn new() -> Self {
-        let lock = MODEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-        let model_dir = dirs::data_dir()
-            .unwrap()
-            .join("1up")
-            .join("models")
-            .join("all-MiniLM-L6-v2");
-        let _ = fs::create_dir_all(&model_dir);
-        let model_path = model_dir.join("model.onnx");
-        let hidden_path = model_dir.join("model.onnx.hidden_by_test");
-        let current_path = model_dir.join("current.json");
-        let hidden_current_path = model_dir.join("current.json.hidden_by_test");
-        let marker_path = model_dir.join(".download_failed");
-
-        let active = model_path.exists();
-        if active {
-            fs::rename(&model_path, &hidden_path).unwrap();
-        }
-        let current_active = current_path.exists();
-        if current_active {
-            fs::rename(&current_path, &hidden_current_path).unwrap();
-        }
-        let _ = fs::write(&marker_path, "hidden_by_test");
-
-        Self {
-            model_path,
-            hidden_path,
-            current_path,
-            hidden_current_path,
-            marker_path,
-            active,
-            current_active,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for HideModelGuard {
-    fn drop(&mut self) {
-        if self.active && self.hidden_path.exists() {
-            let _ = fs::rename(&self.hidden_path, &self.model_path);
-        }
-        if self.current_active && self.hidden_current_path.exists() {
-            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
-        }
-        let _ = fs::remove_file(&self.marker_path);
-    }
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -282,7 +220,12 @@ fn degraded_search_warns_and_returns_results() {
     let (rows, stderr) = search_lean(tmp.path(), "config loading host port");
 
     assert!(!rows.is_empty());
-    assert!(stderr.contains("degraded to FTS-only mode"));
+    // The local CLI gate emits the shared NO_INDEXED_EMBEDDINGS_REASON and the
+    // daemon transport emits its own degraded reason; both carry "FTS-only".
+    assert!(
+        stderr.contains("FTS-only"),
+        "expected a degraded FTS-only warning on stderr, got: {stderr}"
+    );
 }
 
 #[test]

@@ -10,15 +10,51 @@ pub const EMBEDDING_BATCH_SIZE: usize = 32;
 /// Maximum token length for the embedding model.
 pub const EMBEDDING_MAX_TOKENS: usize = 256;
 
+/// Chunk-segment languages excluded from embedding.
+///
+/// Structural segments always embed; text-chunked configuration and data
+/// formats carry little semantic signal per token. This list is shared by the
+/// pipeline's embed decision and the storage coverage counters so reported
+/// vector coverage always matches what the pipeline would embed.
+pub const NON_EMBEDDABLE_CHUNK_LANGUAGES: [&str; 9] = [
+    "json",
+    "yaml",
+    "toml",
+    "protobuf",
+    "terraform",
+    "sql",
+    "config",
+    "makefile",
+    "dockerfile",
+];
+
 /// Default number of vector search prefilter candidates (int8 stage).
 ///
-/// Tuned to 400 for schema v13's FLOAT8 HNSW: quantization makes the top-K
+/// Tuned to 400 for schema v13's FLOAT8 vectors: quantization makes the top-K
 /// ranking slightly noisier, so a wider candidate pool gives the RRF reranker
 /// enough coverage to recover gold segments that drift out of the top 200 but
-/// are still in the right neighbourhood. Doubling K closes the recall gap
+/// are still in the right neighbourhood. Doubling K closed the recall gap
 /// introduced by the FLOAT32 -> FLOAT8 column shift with no measurable search
-/// latency impact at repo scale (~3.3k segments).
+/// latency impact. The constant serves both vector paths: it is the LIMIT of
+/// the exhaustive-scan path (where candidate cost is one sort, so 400 keeps
+/// the reranker pool identical to the index path) and the per-context K for
+/// the approximate index path above
+/// [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`], where it remains the
+/// recall/latency tradeoff originally tuned for quantization noise.
 pub const VECTOR_PREFILTER_K: usize = 400;
+
+/// Maximum context-scoped vector count served by the exhaustive-scan path.
+///
+/// The disk-based approximate vector index answers `vector_top_k` by beam
+/// traversal over a neighbor graph, which is read-heavy and pathologically
+/// slow at small corpus sizes (observed: ~7s single-thread CPU for one query
+/// over ~4.5k vectors). An exhaustive scan is mathematically trivial at this
+/// scale: 16384 x 384 int8 dot products is ~6.3M multiply-accumulates, well
+/// under 10ms, and it is exact rather than approximate. Below this bound
+/// vector candidates come from a full `vector_distance_cos` scan over the
+/// context's vectors; above it the graph traversal amortizes and the
+/// `vector_top_k` index path takes over.
+pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 16384;
 
 /// Maximum number of indexed worktree contexts used to scale vector prefiltering.
 ///
@@ -59,6 +95,13 @@ pub const MAX_DAEMON_IN_FLIGHT_REQUESTS: usize = 8;
 
 /// Maximum results per file in search output.
 pub const MAX_RESULTS_PER_FILE: usize = 3;
+
+/// Degraded-search reason emitted when the local index holds no vector rows
+/// for the active context, so search stays FTS-only without touching the
+/// embedder. Shared by the CLI and MCP vectorless gates so degraded-mode
+/// wording cannot drift between surfaces.
+pub const NO_INDEXED_EMBEDDINGS_REASON: &str =
+    "index contains no embeddings for this context; semantic ranking disabled (FTS-only)";
 
 /// Default context expansion window (lines) when tree-sitter is unavailable.
 pub const CONTEXT_FALLBACK_LINES: usize = 50;
@@ -115,8 +158,19 @@ pub const EMBED_THREADS_ENV_VAR: &str = "ONEUP_EMBED_THREADS";
 /// Environment variable for storage writer batch sizing.
 pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES";
 
+/// Environment variable that disables embedding model auto-download when set
+/// to any non-empty value other than `0`. CI sets this so test suites stay
+/// hermetic: no spawned `1up` process may reach the network for model
+/// artifacts, and model availability cannot flip mid-suite.
+pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS";
+
 /// Schema version for database layout.
-pub const SCHEMA_VERSION: u32 = 13;
+///
+/// v16: markdown heading breadcrumbs store cleaned heading text (inline
+/// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
+/// and the embedding text composed from them change shape, so indexes built
+/// at earlier versions are incompatible and require `1up reindex`.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";

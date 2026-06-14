@@ -3,6 +3,7 @@ pub mod formatter;
 pub mod hybrid;
 pub mod impact;
 pub mod intent;
+pub mod overview;
 pub mod ranking;
 pub mod retrieval;
 pub mod scope;

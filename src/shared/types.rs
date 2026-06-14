@@ -198,6 +198,16 @@ pub enum WorktreeRole {
     Unknown,
 }
 
+impl WorktreeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Linked => "linked",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BranchStatus {
@@ -494,6 +504,12 @@ pub struct IndexProgress {
     pub segments_stored: usize,
     pub embeddings_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddable_segments: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<IndexParallelism>,
@@ -523,6 +539,9 @@ impl IndexProgress {
             files_deleted: 0,
             segments_stored: 0,
             embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
             message: None,
             parallelism: None,
             timings: None,

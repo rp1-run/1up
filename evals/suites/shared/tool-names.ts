@@ -7,6 +7,7 @@ export const ONEUP_MCP_TOOLS = [
   "oneup_context",
   "oneup_impact",
   "oneup_structural",
+  "oneup_overview",
 ] as const;
 
 export type OneupMcpTool = (typeof ONEUP_MCP_TOOLS)[number];

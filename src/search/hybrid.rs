@@ -3,7 +3,7 @@ use libsql::Connection;
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
-use crate::search::ranking::{rank_candidates, RankedCandidate};
+use crate::search::ranking::{rank_candidates, tokenize_text, RankedCandidate};
 use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
@@ -35,18 +35,45 @@ impl<'a> HybridSearchEngine<'a> {
         }
     }
 
+    /// Hybrid search with lazy query embedding: the lexical stages, the
+    /// exact-lexical short-circuit, and the cheap vector-presence probe all
+    /// run before the query is ever embedded, so an index without vector rows
+    /// never exercises the embedder.
     pub async fn search(
         &mut self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        let query_embedding = self.embed_query(query);
-        execute_search(
+        if query.trim().is_empty() {
+            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+        }
+
+        let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
+        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+
+        let should_fetch_vector = self.embedder.is_some()
+            && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
+            && retrieval::has_indexed_embeddings(self.conn, &self.scope).await?;
+        let vector_results = if should_fetch_vector {
+            match self.embed_query(query) {
+                Some(embedding) => {
+                    fetch_vector_candidates_with_degrade(self.conn, &self.scope, &embedding).await
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        rank_and_hydrate(
             self.conn,
-            &self.scope,
+            vector_results,
+            fts_results,
+            symbol_results,
             query,
+            intent,
             limit,
-            query_embedding.as_deref(),
         )
         .await
     }
@@ -56,7 +83,24 @@ impl<'a> HybridSearchEngine<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, OneupError> {
-        execute_search(self.conn, &self.scope, query, limit, None).await
+        if query.trim().is_empty() {
+            return Err(SearchError::InvalidQuery("empty query".to_string()).into());
+        }
+
+        let intent = detect_intent(query);
+        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
+        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+
+        rank_and_hydrate(
+            self.conn,
+            Vec::new(),
+            fts_results,
+            symbol_results,
+            query,
+            intent,
+            limit,
+        )
+        .await
     }
 
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
@@ -74,45 +118,32 @@ impl<'a> HybridSearchEngine<'a> {
     }
 }
 
-async fn execute_search(
+async fn fetch_vector_candidates_with_degrade(
     conn: &Connection,
     scope: &SearchScope,
-    query: &str,
-    limit: usize,
-    query_embedding: Option<&[f32]>,
-) -> Result<Vec<SearchResult>, OneupError> {
-    if query.trim().is_empty() {
-        return Err(SearchError::InvalidQuery("empty query".to_string()).into());
-    }
-
-    let intent = detect_intent(query);
-    let symbol_results = symbol_search(conn, scope, query, intent).await?;
-    let fts_results = retrieval::fetch_fts_candidates(conn, scope, query).await?;
-    let should_fetch_vector = query_embedding.is_some()
-        && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
-        && retrieval::has_indexed_embeddings(conn, scope).await?;
-
-    let vector_results = if should_fetch_vector {
-        match retrieval::fetch_vector_candidates(
-            conn,
-            scope,
-            query_embedding.expect("checked above"),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(err) => {
-                eprintln!(
+    query_embedding: &[f32],
+) -> Vec<CandidateRow> {
+    match retrieval::fetch_vector_candidates(conn, scope, query_embedding).await {
+        Ok(results) => results,
+        Err(err) => {
+            eprintln!(
                 "warning: vector retrieval failed ({err}); search is degraded to FTS-only mode for this query"
             );
-                tracing::debug!("vector retrieval failed: {err}");
-                Vec::new()
-            }
+            tracing::debug!("vector retrieval failed: {err}");
+            Vec::new()
         }
-    } else {
-        Vec::new()
-    };
+    }
+}
 
+async fn rank_and_hydrate(
+    conn: &Connection,
+    vector_results: Vec<CandidateRow>,
+    fts_results: Vec<CandidateRow>,
+    symbol_results: Vec<CandidateRow>,
+    query: &str,
+    intent: QueryIntent,
+    limit: usize,
+) -> Result<Vec<SearchResult>, OneupError> {
     if vector_results.is_empty() && fts_results.is_empty() && symbol_results.is_empty() {
         return Ok(Vec::new());
     }
@@ -186,10 +217,19 @@ async fn symbol_search(
     Ok(deduped)
 }
 
+/// Maximum identifier tokens extracted from a sentence-length query for the
+/// symbol stage. Keeps long queries from fanning out into many symbol
+/// lookups.
+const MAX_LONG_QUERY_SYMBOL_VARIANTS: usize = 3;
+
 fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     let words = query_words(query);
-    if words.is_empty() || words.len() > 4 || words.iter().all(|word| word.len() < 2) {
+    if words.is_empty() || words.iter().all(|word| word.len() < 2) {
         return Vec::new();
+    }
+
+    if words.len() > 4 {
+        return identifier_like_words(&words);
     }
 
     let symbolish = query.contains('_')
@@ -202,6 +242,24 @@ fn build_symbol_variants(query: &str, intent: QueryIntent) -> Vec<String> {
     }
 
     vec![words.join(" ")]
+}
+
+/// Extracts CamelCase/snake_case tokens from a sentence-length query so it
+/// can still engage the symbol stage for identifiers it explicitly mentions.
+/// Pure natural-language queries yield nothing and skip symbol weighting.
+fn identifier_like_words(words: &[String]) -> Vec<String> {
+    let mut variants: Vec<String> = Vec::new();
+
+    for word in words {
+        if variants.len() >= MAX_LONG_QUERY_SYMBOL_VARIANTS {
+            break;
+        }
+        if tokenize_text(word).len() > 1 && !variants.contains(word) {
+            variants.push(word.clone());
+        }
+    }
+
+    variants
 }
 
 fn query_words(query: &str) -> Vec<String> {
@@ -280,6 +338,36 @@ mod tests {
     #[test]
     fn symbol_variants_skip_non_symbolish_long_queries() {
         let variants = build_symbol_variants("how do I load runtime config", QueryIntent::General);
+
+        assert!(variants.is_empty());
+    }
+
+    #[test]
+    fn symbol_variants_extract_camelcase_identifier_from_long_queries() {
+        let variants = build_symbol_variants(
+            "impact horizon expansion with ImpactHorizonEngine corroboration",
+            QueryIntent::General,
+        );
+
+        assert_eq!(variants, vec!["ImpactHorizonEngine".to_string()]);
+    }
+
+    #[test]
+    fn symbol_variants_extract_snake_case_identifier_from_long_queries() {
+        let variants = build_symbol_variants(
+            "benchmark parallel indexing script emitting summary_json output",
+            QueryIntent::General,
+        );
+
+        assert_eq!(variants, vec!["summary_json".to_string()]);
+    }
+
+    #[test]
+    fn symbol_variants_stay_empty_for_long_capitalized_natural_language() {
+        let variants = build_symbol_variants(
+            "Where does the daemon watch project files for changes",
+            QueryIntent::General,
+        );
 
         assert!(variants.is_empty());
     }
@@ -509,6 +597,7 @@ mod tests {
             defined_symbols: None,
             referenced_symbols: None,
             called_symbols: None,
+            content: String::new(),
         }
     }
 }

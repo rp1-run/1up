@@ -1,7 +1,10 @@
 use libsql::{Connection, Row};
 
+use crate::search::ranking::tokenize_text;
 use crate::search::scope::SearchScope;
-use crate::shared::constants::{VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K};
+use crate::shared::constants::{
+    VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS, VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K,
+};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
 use crate::storage::queries;
@@ -20,6 +23,7 @@ pub struct CandidateRow {
     pub defined_symbols: Option<Vec<String>>,
     pub referenced_symbols: Option<Vec<String>>,
     pub called_symbols: Option<Vec<String>>,
+    pub content: String,
 }
 
 impl CandidateRow {
@@ -196,31 +200,130 @@ pub(crate) async fn has_indexed_embeddings(
     }
 }
 
+/// How the vector stage computes nearest-neighbour candidates for a context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorSearchPath {
+    /// Full `vector_distance_cos` scan over the context's vectors: exact and
+    /// fast at small corpus sizes where graph traversal is read-bound.
+    ExhaustiveScan,
+    /// `vector_top_k` traversal of the approximate vector index: amortizes
+    /// above [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`].
+    AnnIndex,
+}
+
+pub(crate) fn vector_search_path_for_corpus(context_vector_count: usize) -> VectorSearchPath {
+    if context_vector_count <= VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS {
+        VectorSearchPath::ExhaustiveScan
+    } else {
+        VectorSearchPath::AnnIndex
+    }
+}
+
 pub(crate) async fn fetch_vector_candidates(
     conn: &Connection,
     scope: &SearchScope,
     query_embedding: &[f32],
 ) -> Result<Vec<CandidateRow>, OneupError> {
+    let started = std::time::Instant::now();
     let query_embedding = serialize_query_embedding(query_embedding)?;
+    let vector_count = count_vector_rows_for_context(conn, scope).await?;
+    let path = vector_search_path_for_corpus(vector_count);
+
+    let results = match path {
+        VectorSearchPath::ExhaustiveScan => {
+            fetch_vector_candidates_exhaustive(conn, scope, &query_embedding).await?
+        }
+        VectorSearchPath::AnnIndex => {
+            fetch_vector_candidates_ann(conn, scope, &query_embedding).await?
+        }
+    };
+
+    tracing::debug!(
+        "vector stage: {path:?} over {vector_count} context vectors returned {} candidates in {:?}",
+        results.len(),
+        started.elapsed()
+    );
+
+    Ok(results)
+}
+
+async fn fetch_vector_candidates_exhaustive(
+    conn: &Connection,
+    scope: &SearchScope,
+    serialized_embedding: &str,
+) -> Result<Vec<CandidateRow>, OneupError> {
+    let mut rows = conn
+        .query(
+            queries::SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT,
+            libsql::params![
+                serialized_embedding,
+                scope.context_id(),
+                VECTOR_PREFILTER_K as i64
+            ],
+        )
+        .await
+        .map_err(|e| SearchError::QueryFailed(format!("vector exhaustive scan: {e}")))?;
+
+    collect_candidate_rows(&mut rows, "vector exhaustive scan row iteration").await
+}
+
+async fn fetch_vector_candidates_ann(
+    conn: &Connection,
+    scope: &SearchScope,
+    serialized_embedding: &str,
+) -> Result<Vec<CandidateRow>, OneupError> {
     let prefilter_k = vector_prefilter_k(conn).await?;
     let mut rows = conn
         .query(
             queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
-            libsql::params![query_embedding, prefilter_k as i64, scope.context_id()],
+            libsql::params![serialized_embedding, prefilter_k as i64, scope.context_id()],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
 
+    collect_candidate_rows(&mut rows, "vector row iteration").await
+}
+
+async fn collect_candidate_rows(
+    rows: &mut libsql::Rows,
+    iteration_context: &str,
+) -> Result<Vec<CandidateRow>, OneupError> {
     let mut results = Vec::new();
     while let Some(row) = rows
         .next()
         .await
-        .map_err(|e| SearchError::QueryFailed(format!("vector row iteration: {e}")))?
+        .map_err(|e| SearchError::QueryFailed(format!("{iteration_context}: {e}")))?
     {
         results.push(row_to_candidate_row(&row)?);
     }
 
     Ok(results)
+}
+
+async fn count_vector_rows_for_context(
+    conn: &Connection,
+    scope: &SearchScope,
+) -> Result<usize, OneupError> {
+    let mut rows = conn
+        .query(queries::COUNT_VECTOR_ROWS_FOR_CONTEXT, [scope.context_id()])
+        .await
+        .map_err(|e| {
+            SearchError::QueryFailed(format!("failed to count context vector rows: {e}"))
+        })?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let count: i64 = row.get(0).map_err(|e| {
+                SearchError::QueryFailed(format!("read context vector count failed: {e}"))
+            })?;
+            Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+        }
+        Ok(None) => Ok(0),
+        Err(e) => Err(SearchError::QueryFailed(format!(
+            "context vector count iteration failed: {e}"
+        ))
+        .into()),
+    }
 }
 
 async fn vector_prefilter_k(conn: &Connection) -> Result<usize, OneupError> {
@@ -272,16 +375,7 @@ pub(crate) async fn fetch_fts_candidates(
         .await
         .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
 
-    let mut results = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("FTS row iteration: {e}")))?
-    {
-        results.push(row_to_candidate_row(&row)?);
-    }
-
-    Ok(results)
+    collect_candidate_rows(&mut rows, "FTS row iteration").await
 }
 
 fn serialize_query_embedding(query_embedding: &[f32]) -> Result<String, OneupError> {
@@ -326,6 +420,9 @@ fn row_to_candidate_row(row: &Row) -> Result<CandidateRow, OneupError> {
     let called_symbols: String = row
         .get(11)
         .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
+    let content: String = row
+        .get(12)
+        .map_err(|e| SearchError::QueryFailed(e.to_string()))?;
 
     let role = parse_role(&role_str);
     let def_syms: Vec<String> = serde_json::from_str(&defined_symbols).unwrap_or_default();
@@ -345,6 +442,7 @@ fn row_to_candidate_row(row: &Row) -> Result<CandidateRow, OneupError> {
         defined_symbols: some_if_not_empty(def_syms),
         referenced_symbols: some_if_not_empty(ref_syms),
         called_symbols: some_if_not_empty(call_syms),
+        content,
     })
 }
 
@@ -367,32 +465,118 @@ fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
+/// Maximum identifier-split and prefix variants appended to the base FTS
+/// terms. Bounds query fan-out so identifier-aware matching cannot regress
+/// FTS latency on long natural-language queries.
+const MAX_FTS_VARIANT_TERMS: usize = 16;
+
+/// Minimum cleaned-term length for emitting a prefix variant. Prefix terms
+/// let a plain query word reach the front of a concatenated identifier token
+/// (`impact` -> `impacthorizonengine`); shorter prefixes pull in too much
+/// noise for the recall they add.
+const MIN_FTS_PREFIX_TERM_CHARS: usize = 4;
+
+/// Minimum plain-word length for emitting a stem-prefix variant. Shorter
+/// words rarely carry the inflectional suffixes this targets, and their
+/// stems are too short to stay selective as prefixes.
+const MIN_FTS_STEM_TERM_CHARS: usize = 5;
+
+/// Common English inflection suffixes stripped to form stem-prefix variants,
+/// checked in order with first match winning when the remaining stem is long
+/// enough.
+const FTS_STEM_SUFFIXES: &[&str] = &["ed", "ing", "es", "s"];
+
+/// Returns the stem-prefix variant for a plain query word: `composed` yields
+/// `compos` (reaching the indexed token `compose`) and `embeddings` yields
+/// `embedding`. Only alphabetic words of at least [`MIN_FTS_STEM_TERM_CHARS`]
+/// stem, and the stem must keep [`MIN_FTS_PREFIX_TERM_CHARS`] so it stays a
+/// selective prefix.
+fn stem_prefix(term: &str) -> Option<String> {
+    if term.chars().count() < MIN_FTS_STEM_TERM_CHARS
+        || !term.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+
+    let lower = term.to_lowercase();
+    FTS_STEM_SUFFIXES.iter().find_map(|suffix| {
+        let stem = lower.strip_suffix(suffix)?;
+        (stem.len() >= MIN_FTS_PREFIX_TERM_CHARS).then(|| stem.to_string())
+    })
+}
+
+/// Builds an FTS5 match expression with identifier-aware variants.
+///
+/// The unicode61 tokenizer indexes `ImpactHorizonEngine` as the single token
+/// `impacthorizonengine`, which plain quoted query terms never match. On top
+/// of the base quoted terms this adds: a split-part phrase variant for
+/// CamelCase/snake_case query terms (matching identifiers mentioned as
+/// prose), bounded prefix variants for plain words so they can match the
+/// head of concatenated identifiers, and stem-prefix variants for inflected
+/// plain words (`composed` -> `compos`*) so natural-language inflections
+/// reach stem-named identifiers. Split parts stay phrase-bound rather than
+/// OR'd individually so exact-identifier queries keep their precision.
 fn build_fts_query(query: &str) -> String {
-    let terms: Vec<&str> = query
+    let cleaned_terms: Vec<String> = query
         .split_whitespace()
         .filter(|term| term.len() >= 2)
+        .map(|term| {
+            term.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|term| !term.is_empty())
         .collect();
 
-    if terms.is_empty() {
+    if cleaned_terms.is_empty() {
         return String::new();
     }
 
-    terms
-        .iter()
-        .map(|term| {
-            let cleaned: String = term
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if cleaned.is_empty() {
-                String::new()
-            } else {
-                format!("\"{cleaned}\"")
+    let mut units: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for term in &cleaned_terms {
+        if seen.insert(term.to_lowercase()) {
+            units.push(format!("\"{term}\""));
+        }
+    }
+
+    let mut variant_count = 0;
+    for term in &cleaned_terms {
+        if variant_count >= MAX_FTS_VARIANT_TERMS {
+            break;
+        }
+
+        let parts = tokenize_text(term);
+        if parts.len() > 1 {
+            let phrase = parts.join(" ");
+            if seen.insert(phrase.clone()) {
+                units.push(format!("\"{phrase}\""));
+                variant_count += 1;
             }
-        })
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>()
-        .join(" OR ")
+            continue;
+        }
+
+        if term.len() >= MIN_FTS_PREFIX_TERM_CHARS
+            && seen.insert(format!("{}*", term.to_lowercase()))
+        {
+            units.push(format!("\"{term}\" *"));
+            variant_count += 1;
+        }
+
+        if variant_count >= MAX_FTS_VARIANT_TERMS {
+            break;
+        }
+
+        if let Some(stem) = stem_prefix(term) {
+            if seen.insert(format!("{stem}*")) {
+                units.push(format!("\"{stem}\" *"));
+                variant_count += 1;
+            }
+        }
+    }
+
+    units.join(" OR ")
 }
 
 #[cfg(test)]
@@ -488,6 +672,125 @@ mod tests {
         assert!(query.contains("\"the\""));
         assert!(query.contains("\"error\""));
         assert!(!query.contains("\"a\""));
+    }
+
+    #[test]
+    fn fts_query_adds_prefix_variants_for_plain_words() {
+        let query = build_fts_query("impact horizon");
+
+        assert!(query.contains("\"impact\""));
+        assert!(query.contains("\"impact\" *"));
+        assert!(query.contains("\"horizon\" *"));
+    }
+
+    #[test]
+    fn fts_query_splits_identifier_terms_into_phrase_variants() {
+        let query = build_fts_query("ImpactHorizonEngine summary_json");
+
+        assert!(query.contains("\"ImpactHorizonEngine\""));
+        assert!(query.contains("\"impact horizon engine\""));
+        assert!(query.contains("\"summary_json\""));
+        assert!(query.contains("\"summary json\""));
+    }
+
+    #[test]
+    fn fts_query_adds_stem_prefix_variants_for_inflected_words() {
+        let query = build_fts_query("embeddings composed indexing");
+
+        assert!(query.contains("\"embedding\" *"), "missing stem in {query}");
+        assert!(query.contains("\"compos\" *"), "missing stem in {query}");
+        assert!(query.contains("\"index\" *"), "missing stem in {query}");
+        assert!(
+            query.contains("\"embeddings\" *"),
+            "base prefix variant should stay alongside the stem: {query}"
+        );
+    }
+
+    #[test]
+    fn fts_query_skips_stems_for_short_or_identifier_words() {
+        let query = build_fts_query("goes summary_json table");
+
+        assert!(
+            !query.contains("\"go\" *"),
+            "short words must not stem: {query}"
+        );
+        assert!(
+            !query.contains("\"goe\" *"),
+            "short words must not stem: {query}"
+        );
+        assert!(query.contains("\"summary json\""));
+        assert!(
+            !query.contains("\"tabl\" *"),
+            "suffix-free words must not stem: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_matches_snake_case_identifier_from_inflected_query() {
+        let conn = setup().await;
+        insert_segment(
+            &conn,
+            "seg-compose-embedding",
+            "src/indexer/pipeline.rs",
+            "fn compose_embedding_text(relative_path: &str) -> String {\n    relative_path.to_string()\n}",
+            None,
+        )
+        .await;
+
+        let candidates = fetch_fts_candidates(
+            &conn,
+            &SearchScope::default_context(),
+            "where are embeddings composed before indexing",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.segment_id == "seg-compose-embedding"),
+            "inflected query words should reach snake_case tokens via stem-prefix variants"
+        );
+    }
+
+    #[test]
+    fn fts_query_caps_added_variants() {
+        let long_query = (0..40)
+            .map(|i| format!("verylongword{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = build_fts_query(&long_query);
+
+        assert_eq!(query.matches('*').count(), MAX_FTS_VARIANT_TERMS);
+    }
+
+    #[tokio::test]
+    async fn fts_matches_camelcase_identifier_from_conceptual_query() {
+        let conn = setup().await;
+        insert_segment(
+            &conn,
+            "seg-impact-engine",
+            "src/search/impact.rs",
+            "pub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}",
+            None,
+        )
+        .await;
+
+        let candidates = fetch_fts_candidates(
+            &conn,
+            &SearchScope::default_context(),
+            "impact horizon expansion with owner aware corroboration",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.segment_id == "seg-impact-engine"),
+            "conceptual terms should reach the CamelCase token via prefix variants"
+        );
     }
 
     #[tokio::test]
@@ -621,8 +924,29 @@ mod tests {
             .any(|result| result.file_path == "config/settings.ini"));
     }
 
+    #[test]
+    fn vector_search_path_pins_threshold_boundaries() {
+        assert_eq!(
+            vector_search_path_for_corpus(0),
+            VectorSearchPath::ExhaustiveScan
+        );
+        assert_eq!(
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1),
+            VectorSearchPath::ExhaustiveScan
+        );
+        assert_eq!(
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS),
+            VectorSearchPath::ExhaustiveScan,
+            "the threshold itself stays on the exact path"
+        );
+        assert_eq!(
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1),
+            VectorSearchPath::AnnIndex
+        );
+    }
+
     #[tokio::test]
-    async fn vector_top_k_roundtrip_at_new_element_type() {
+    async fn exhaustive_scan_ranks_nearest_vector_first() {
         let conn = setup().await;
 
         // Ten one-hot segments in distinct dimensions so cosine similarity can separate them.
@@ -638,15 +962,84 @@ mod tests {
             .await;
         }
 
-        // Query close to seg-3's dimension. seg-3 must rank top-1 through vector_top_k.
+        // Ten vectors sit far below the exhaustive-scan threshold, so this
+        // exercises the full-scan path end to end. seg-3 must rank top-1.
         let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
         let candidates =
             fetch_vector_candidates(&conn, &SearchScope::default_context(), &query_embedding)
                 .await
                 .unwrap();
 
+        assert!(!candidates.is_empty(), "exhaustive scan returned no rows");
+        assert_eq!(candidates[0].segment_id, "seg-3");
+        assert_eq!(candidates.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn ann_index_roundtrip_at_new_element_type() {
+        let conn = setup().await;
+
+        for i in 0..10 {
+            let embedding = embedding_with(&[(i, 1.0)]);
+            insert_segment(
+                &conn,
+                &format!("seg-{i}"),
+                &format!("src/file_{i}.rs"),
+                &format!("fn item_{i}() {{ }}"),
+                Some(&embedding),
+            )
+            .await;
+        }
+
+        // The above-threshold path is exercised directly so the vector_top_k
+        // SQL stays covered without inserting threshold-many vectors.
+        let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
+        let serialized = serialize_query_embedding(&query_embedding).unwrap();
+        let candidates =
+            fetch_vector_candidates_ann(&conn, &SearchScope::default_context(), &serialized)
+                .await
+                .unwrap();
+
         assert!(!candidates.is_empty(), "vector_top_k returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");
+    }
+
+    #[tokio::test]
+    async fn exhaustive_scan_respects_context_scope() {
+        let conn = setup().await;
+        let embedding = embedding_with(&[(0, 1.0)]);
+        let serialized = serialize_query_embedding(&embedding).unwrap();
+
+        insert_segment(
+            &conn,
+            "seg-default",
+            "src/default.rs",
+            "fn default_context_item() {}",
+            Some(&embedding),
+        )
+        .await;
+        conn.execute(
+            "UPDATE segments SET context_id = 'ctx-other' WHERE id = 'seg-default'",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_segment(
+            &conn,
+            "seg-active",
+            "src/active.rs",
+            "fn active_context_item() {}",
+            Some(&embedding),
+        )
+        .await;
+
+        let candidates =
+            fetch_vector_candidates_exhaustive(&conn, &SearchScope::default_context(), &serialized)
+                .await
+                .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].segment_id, "seg-active");
     }
 
     #[test]

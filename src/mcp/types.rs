@@ -13,8 +13,9 @@ pub const TOOL_SYMBOL: &str = "oneup_symbol";
 pub const TOOL_CONTEXT: &str = "oneup_context";
 pub const TOOL_IMPACT: &str = "oneup_impact";
 pub const TOOL_STRUCTURAL: &str = "oneup_structural";
+pub const TOOL_OVERVIEW: &str = "oneup_overview";
 
-pub const RETAINED_PUBLIC_TOOLS: [&str; 8] = [
+pub const RETAINED_PUBLIC_TOOLS: [&str; 9] = [
     TOOL_STATUS,
     TOOL_START,
     TOOL_SEARCH,
@@ -23,6 +24,7 @@ pub const RETAINED_PUBLIC_TOOLS: [&str; 8] = [
     TOOL_CONTEXT,
     TOOL_IMPACT,
     TOOL_STRUCTURAL,
+    TOOL_OVERVIEW,
 ];
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
@@ -38,6 +40,12 @@ pub enum StartMode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatusInput {
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewInput {
     pub path: Option<String>,
 }
 

@@ -9,15 +9,16 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::mcp::ops::{
-    self, McpProjectRoots, OperationStatus, ReadLocation, ReadPayload, ReadinessPayload,
-    ReadinessStatus, SearchPayload, SymbolInclude, SymbolLookupRequest, SymbolPayload,
+    self, McpProjectRoots, OperationStatus, OverviewPayload, ReadLocation, ReadPayload,
+    ReadinessPayload, ReadinessStatus, SearchPayload, SymbolInclude, SymbolLookupRequest,
+    SymbolPayload,
 };
 use crate::mcp::server::OneupMcpServer;
 use crate::mcp::types::{
-    ContextInput, GetInput, ImpactInput, NextAction, ReadinessContextMetadata, SearchInput,
-    StartInput, StatusInput, StructuralInput, SymbolIncludeInput, SymbolInput, ToolEnvelope,
-    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START,
-    TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    ContextInput, GetInput, ImpactInput, NextAction, OverviewInput, ReadinessContextMetadata,
+    SearchInput, StartInput, StatusInput, StructuralInput, SymbolIncludeInput, SymbolInput,
+    ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH,
+    TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::MAX_SEARCH_RESULTS;
@@ -367,6 +368,36 @@ impl OneupMcpServer {
         }
     }
 
+    #[tool(
+        name = "oneup_overview",
+        description = "Retrieve a deterministic orientation digest of the indexed repository: statistics, most-referenced types, module map, cross-module dependencies, and entry points. Call first when starting work on an unfamiliar repository, then follow the returned actions into targeted discovery.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
+        annotations(title = "Repository Overview", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    pub async fn oneup_overview(
+        &self,
+        Parameters(input): Parameters<OverviewInput>,
+    ) -> CallToolResult {
+        let roots = match self.roots(input.path.as_deref()) {
+            Ok(roots) => roots,
+            Err(err) => return error_result("error", err.to_string(), vec![]),
+        };
+
+        match ops::compute_overview(&roots.state_root, &roots.worktree_context).await {
+            Ok(payload) => {
+                let summary = overview_summary(&payload);
+                let next_actions = overview_next_actions(&payload);
+                result(envelope(
+                    status_string(&payload.status),
+                    summary,
+                    payload_value(&payload),
+                    next_actions,
+                ))
+            }
+            Err(err) => indexed_tool_error(err.to_string()),
+        }
+    }
+
     fn roots(&self, path: Option<&str>) -> anyhow::Result<McpProjectRoots> {
         match path.filter(|path| !path.trim().is_empty()) {
             Some(path) => ops::resolve_project(Path::new(path)),
@@ -523,7 +554,7 @@ fn readiness_context_metadata(
 }
 
 fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
-    match payload.status {
+    let mut actions = match payload.status {
         ReadinessStatus::Ready => vec![action(
             TOOL_SEARCH,
             "Start discovery with a task-specific code search.",
@@ -561,7 +592,17 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
             "Retry readiness after correcting the local repository path or project state.",
             json!({}),
         )],
+    };
+
+    if payload.drifted == Some(true) {
+        actions.push(action(
+            TOOL_START,
+            "The repository HEAD moved after the last index; refresh the index to pick up the changes.",
+            json!({ "mode": "index_if_needed" }),
+        ));
     }
+
+    actions
 }
 
 fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
@@ -758,6 +799,38 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
         "Search for a narrower segment or symbol before retrying impact.",
         json!({ "query": "<narrower impact anchor>" }),
     )]
+}
+
+/// Non-empty digests hand the agent its next move (REQ-006): verify the top
+/// most-referenced type, then search the densest module. An empty digest
+/// falls back to a readiness check so the envelope always carries at least
+/// one canonical action.
+fn overview_next_actions(payload: &OverviewPayload) -> Vec<NextAction> {
+    let mut actions = Vec::new();
+
+    if let Some(top) = payload.top_symbols.first() {
+        actions.push(action(
+            TOOL_SYMBOL,
+            "Inspect the definition and references of the most-referenced type.",
+            json!({ "name": top.name }),
+        ));
+    }
+    if let Some(densest) = payload.modules.first() {
+        actions.push(action(
+            TOOL_SEARCH,
+            "Start targeted discovery inside the densest module.",
+            json!({ "query": format!("{} module responsibilities", densest.module) }),
+        ));
+    }
+    if actions.is_empty() {
+        actions.push(action(
+            TOOL_STATUS,
+            "Check readiness and indexing options before retrying the overview.",
+            json!({}),
+        ));
+    }
+
+    actions
 }
 
 fn all_read_records_failed(payload: &ReadPayload) -> bool {
@@ -1004,6 +1077,27 @@ fn impact_summary(payload: &ImpactResultEnvelope) -> String {
     }
 }
 
+fn overview_summary(payload: &OverviewPayload) -> String {
+    if payload.status == OperationStatus::Empty {
+        return "The 1up index is ready but contains no indexed code for this context.".to_string();
+    }
+
+    let mut summary = format!(
+        "Indexed {} file(s) and {} segment(s) across {} language(s)",
+        payload.stats.indexed_files,
+        payload.stats.total_segments,
+        payload.stats.languages.len()
+    );
+    if let Some(module) = payload.modules.first() {
+        summary.push_str(&format!("; densest module is {}", module.module));
+    }
+    if let Some(top) = payload.top_symbols.first() {
+        summary.push_str(&format!("; most-referenced type is {}", top.name));
+    }
+    summary.push('.');
+    summary
+}
+
 fn indexed_tool_error(message: String) -> CallToolResult {
     error_result(
         "error",
@@ -1134,6 +1228,26 @@ mod tests {
     }
 
     #[test]
+    fn readiness_next_actions_append_index_if_needed_start_when_drifted() {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Ready;
+
+        let clean_actions = readiness_next_actions(&payload);
+        assert!(
+            !clean_actions.iter().any(|action| action.tool == TOOL_START),
+            "non-drifted ready payload must not suggest a start action"
+        );
+
+        payload.drifted = Some(true);
+        let drift_actions = readiness_next_actions(&payload);
+        assert_eq!(drift_actions.len(), clean_actions.len() + 1);
+        let appended = drift_actions.last().unwrap();
+        assert_eq!(appended.tool, TOOL_START);
+        assert_eq!(appended.arguments["mode"], "index_if_needed");
+        assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    #[test]
     fn impact_request_accepts_public_handle_anchor() {
         let mut input = impact_input();
         input.handle = Some(":abcdef012345".to_string());
@@ -1198,5 +1312,89 @@ mod tests {
 
         assert_eq!(actions[0].tool, TOOL_IMPACT);
         assert_eq!(actions[0].arguments, json!({ "handle": ":abcdef012345" }));
+    }
+
+    fn overview_payload_fixture(
+        status: OperationStatus,
+        top_symbols: Vec<ops::OverviewTopSymbol>,
+        modules: Vec<ops::OverviewModule>,
+    ) -> OverviewPayload {
+        OverviewPayload {
+            status,
+            stats: ops::OverviewStats {
+                indexed_files: 0,
+                total_segments: 0,
+                languages: Vec::new(),
+            },
+            top_symbols,
+            modules,
+            module_dependencies: Vec::new(),
+            entry_points: Vec::new(),
+        }
+    }
+
+    fn top_symbol(name: &str) -> ops::OverviewTopSymbol {
+        ops::OverviewTopSymbol {
+            name: name.to_string(),
+            handle: "abcdef012345".to_string(),
+            path: "src/storage/db.rs".to_string(),
+            line_start: 10,
+            line_end: 40,
+            referencing_files: 27,
+            definition_count: 1,
+        }
+    }
+
+    fn module(name: &str, segments: u64) -> ops::OverviewModule {
+        ops::OverviewModule {
+            module: name.to_string(),
+            segments,
+        }
+    }
+
+    #[test]
+    fn overview_next_actions_suggest_top_symbol_then_densest_module() {
+        let payload = overview_payload_fixture(
+            OperationStatus::Ok,
+            vec![top_symbol("Db")],
+            vec![module("src/cli", 900), module("src/storage", 700)],
+        );
+
+        let actions = overview_next_actions(&payload);
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].tool, TOOL_SYMBOL);
+        assert_eq!(actions[0].arguments, json!({ "name": "Db" }));
+        assert_eq!(actions[1].tool, TOOL_SEARCH);
+        assert_eq!(
+            actions[1].arguments,
+            json!({ "query": "src/cli module responsibilities" })
+        );
+    }
+
+    #[test]
+    fn overview_next_actions_fall_back_to_status_for_empty_digest() {
+        let payload = overview_payload_fixture(OperationStatus::Empty, Vec::new(), Vec::new());
+
+        let actions = overview_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_STATUS);
+        assert_eq!(actions[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn overview_next_actions_keep_module_search_without_qualifying_types() {
+        let payload =
+            overview_payload_fixture(OperationStatus::Ok, Vec::new(), vec![module("scripts", 12)]);
+
+        let actions = overview_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_SEARCH);
+        assert_eq!(
+            actions[0].arguments,
+            json!({ "query": "scripts module responsibilities" })
+        );
     }
 }

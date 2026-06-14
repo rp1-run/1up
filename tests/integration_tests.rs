@@ -1,11 +1,15 @@
+mod common;
+
 use assert_cmd::Command;
+use common::{HideModelGuard, MODEL_MUTEX};
 use oneup::mcp::types::{
-    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START,
-    TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
+    TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
+use oneup::shared::constants::SCHEMA_VERSION;
 use oneup::storage::{
     db::Db,
-    schema,
+    queries, schema,
     segments::{self, IndexedFileMeta, SegmentInsert},
 };
 use predicates::prelude::*;
@@ -14,15 +18,12 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, net::UnixStream};
-
-static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
 fn cmd() -> Command {
     Command::cargo_bin("1up").unwrap()
@@ -431,77 +432,77 @@ fn seed_current_index_for_context(project: &Path, context_id: &str) {
     });
 }
 
+/// Creates a current-schema index with no rows at all: the ready-but-empty
+/// state REQ-010 distinguishes from a missing/unready index.
+fn seed_ready_empty_index(project: &Path) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("project_id"),
+        "overview-empty-project",
+    )
+    .unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+    });
+}
+
+/// Inserts leak-sensitive rows for a foreign worktree context into an
+/// existing current-schema index: a distinctive language, top-level module,
+/// DEFINITION-role struct segment, and defined symbol that would surface in
+/// digest statistics, modules, entry points, or symbols if context scoping
+/// broke.
+fn seed_foreign_context_overview_rows(project: &Path, context_id: &str) {
+    block_on(async {
+        let db = Db::open_rw(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let segment = SegmentInsert {
+            id: format!("{context_id}-overview-leak"),
+            file_path: "foreignctx/leak.go".to_string(),
+            language: "go".to_string(),
+            block_type: "struct".to_string(),
+            content: "type ForeignLeakWidget struct {\n\tValue int\n}\n".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"ForeignLeakWidget\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "foreign-overview-hash".to_string(),
+        };
+        let meta = IndexedFileMeta {
+            extension: "go".to_string(),
+            file_hash: segment.file_hash.clone(),
+            file_size: segment.content.len() as i64,
+            modified_ns: 1,
+        };
+        segments::replace_file_segments_for_context_tx_with_meta(
+            &conn,
+            context_id,
+            "foreignctx/leak.go",
+            &[segment],
+            Some(&meta),
+        )
+        .await
+        .unwrap();
+    });
+}
+
 impl Drop for McpTestClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-/// RAII guard that temporarily hides the embedding model to force FTS-only mode.
-/// On drop, the model is restored. This works around a pre-existing vector
-/// dimension mismatch bug in the int8 search path. Holds a mutex to prevent
-/// concurrent test interference.
-struct HideModelGuard {
-    model_path: PathBuf,
-    hidden_path: PathBuf,
-    current_path: PathBuf,
-    hidden_current_path: PathBuf,
-    marker_path: PathBuf,
-    active: bool,
-    current_active: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl HideModelGuard {
-    fn new() -> Self {
-        let lock = MODEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-        let model_dir = dirs::data_dir()
-            .unwrap()
-            .join("1up")
-            .join("models")
-            .join("all-MiniLM-L6-v2");
-        let _ = fs::create_dir_all(&model_dir);
-        let model_path = model_dir.join("model.onnx");
-        let hidden_path = model_dir.join("model.onnx.hidden_by_test");
-        let current_path = model_dir.join("current.json");
-        let hidden_current_path = model_dir.join("current.json.hidden_by_test");
-        let marker_path = model_dir.join(".download_failed");
-
-        let active = model_path.exists();
-        if active {
-            fs::rename(&model_path, &hidden_path).unwrap();
-        }
-        let current_active = current_path.exists();
-        if current_active {
-            fs::rename(&current_path, &hidden_current_path).unwrap();
-        }
-        // Create download failure marker to prevent auto-download during tests
-        let _ = fs::write(&marker_path, "hidden_by_test");
-
-        Self {
-            model_path,
-            hidden_path,
-            current_path,
-            hidden_current_path,
-            marker_path,
-            active,
-            current_active,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for HideModelGuard {
-    fn drop(&mut self) {
-        if self.active && self.hidden_path.exists() {
-            let _ = fs::rename(&self.hidden_path, &self.model_path);
-        }
-        if self.current_active && self.hidden_current_path.exists() {
-            let _ = fs::rename(&self.hidden_current_path, &self.current_path);
-        }
-        let _ = fs::remove_file(&self.marker_path);
     }
 }
 
@@ -807,6 +808,24 @@ fn search_rows(dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
     parse_discovery_rows(&stdout)
 }
 
+fn search_rows_with_limit(
+    dir: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Vec<LeanDiscoveryRow> {
+    let limit = limit.to_string();
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "search",
+        query,
+        "-n",
+        &limit,
+        "--path",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(ok, "search failed: {stderr}");
+    parse_discovery_rows(&stdout)
+}
+
 fn search_rows_with_home(home: &Path, dir: &std::path::Path, query: &str) -> Vec<LeanDiscoveryRow> {
     let (stdout, stderr, ok) =
         run_core_cmd_with_home(home, &["search", query, "--path", dir.to_str().unwrap()]);
@@ -814,7 +833,7 @@ fn search_rows_with_home(home: &Path, dir: &std::path::Path, query: &str) -> Vec
     parse_discovery_rows(&stdout)
 }
 
-fn git(repo: &std::path::Path, args: &[&str]) {
+fn git_output(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -825,6 +844,11 @@ fn git(repo: &std::path::Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    git_output(repo, args);
 }
 
 fn create_branch_filtering_fixture() -> (TempDir, PathBuf, PathBuf) {
@@ -949,6 +973,8 @@ fn create_search_acceptance_fixture() -> TempDir {
     fs::create_dir_all(tmp.path().join("docs")).unwrap();
     fs::create_dir_all(tmp.path().join("proto")).unwrap();
     fs::create_dir_all(tmp.path().join("sql")).unwrap();
+    fs::create_dir_all(tmp.path().join("benches")).unwrap();
+    fs::create_dir_all(tmp.path().join("tests")).unwrap();
 
     fs::write(
         tmp.path().join("src").join("policy.rs"),
@@ -1019,6 +1045,247 @@ message PolicyRulePreview {
     id TEXT PRIMARY KEY,
     validator_name TEXT NOT NULL
 );
+"#,
+    )
+    .unwrap();
+
+    // Bench-named file vs real implementation: the descriptive bench name
+    // carries both query terms, the engine carries them only inside one
+    // CamelCase token.
+    fs::write(
+        tmp.path().join("src").join("horizon.rs"),
+        r#"pub struct ImpactHorizonEngine {
+    pub max_depth: usize,
+}
+
+impl ImpactHorizonEngine {
+    pub fn expand_horizon(&self) -> usize {
+        self.max_depth + 1
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("benches").join("horizon_bench.rs"),
+        r#"pub fn bench_impact_horizon() -> usize {
+    let engine_depth = 4;
+    engine_depth + 1
+}
+"#,
+    )
+    .unwrap();
+
+    // Descriptive test name vs implementation: the snake_case test name is a
+    // sentence with near-perfect term coverage for the conceptual query.
+    fs::write(
+        tmp.path().join("src").join("blast_radius.rs"),
+        r#"pub struct BlastRadiusReport {
+    pub expansion_depth: usize,
+}
+
+/// Folds expansion results into trust buckets for the blast radius report.
+pub fn aggregate_bucket(report: &BlastRadiusReport) -> usize {
+    report.expansion_depth + 1
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("tests").join("integration_checks.rs"),
+        r#"pub fn blast_radius_expansion_preserves_trust_buckets_and_followups() {
+    assert!(true);
+}
+"#,
+    )
+    .unwrap();
+
+    // In-file `#[cfg(test)] mod tests` vs implementation: the descriptive
+    // test fn name carries near-perfect term coverage for the conceptual
+    // query, lives in a src path, and is only classifiable through its
+    // `tests` breadcrumb component.
+    fs::write(
+        tmp.path().join("src").join("refinement.rs"),
+        r#"pub struct Margin {
+    pub pool_size: usize,
+}
+
+/// Applies the refinement margin while shrinking the candidate pool.
+pub fn shrink_pool(margin: &Margin) -> usize {
+    margin.pool_size.saturating_sub(1)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("pool_state.rs"),
+        r#"pub fn pool_state_label() -> &'static str {
+    "pool"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn refinement_margin_shrinks_candidate_pool_state() {
+        assert_eq!(super::pool_state_label(), "pool");
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Inflected query vs stem-named symbol: reachable only through
+    // stem-prefix FTS variants (`composed` -> compos*).
+    fs::write(
+        tmp.path().join("src").join("embedding_pipeline.rs"),
+        r#"/// Builds the embedding input for one segment before the indexer stores it.
+pub fn compose_embedding_text(language: &str, crumb: &str) -> String {
+    format!("{language} {crumb}")
+}
+"#,
+    )
+    .unwrap();
+
+    // Heading-matched doc query: the README section competes with a code
+    // file that partially matches, and its H1 carries inline HTML noise.
+    fs::write(
+        tmp.path().join("src").join("daemon_worker.rs"),
+        r#"/// Runs the daemon worker loop with watch support.
+pub fn spawn_daemon_worker() -> bool {
+    true
+}
+"#,
+    )
+    .unwrap();
+
+    // Content-only doc relevance: the "What To Expect" heading shares no
+    // terms with the cadence query, so only its body can prove relevance.
+    // The code competitors below give the query a populated result list
+    // whose middle tier (docs-path text chunks) would bury a doubly
+    // penalized doc section.
+    fs::write(
+        tmp.path().join("src").join("snapshot_refresh.rs"),
+        r#"/// Plans the next snapshot refresh for a capture window.
+pub fn snapshot_refresh_planner(window: usize) -> usize {
+    window + 1
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("cadence.rs"),
+        r#"/// Computes the offline cadence window between captures.
+pub fn offline_cadence_window(base: usize) -> usize {
+    base * 2
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("snapshot_store.rs"),
+        r#"/// Stores one offline snapshot per capture run.
+pub fn offline_snapshot_store(slot: usize) -> usize {
+    slot.max(1)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("runtime_notes.txt"),
+        "runtime notes\nkeep one offline snapshot per machine\nreview the snapshot before rotation\n",
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("startup_notes.txt"),
+        "startup notes\nrefresh happens on a steady cadence\nkeep the cadence aligned with capture\n",
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("README.md"),
+        r#"# <img src="assets/logo.png" alt="logo"> Acceptance Project
+
+Intro paragraph.
+
+## Start Here
+
+Setup notes.
+
+## What To Expect
+
+Each offline snapshot gets a refresh on a fixed cadence.
+
+Background sweeps stay quiet and never require manual
+restarts between sessions.
+
+## Windows daemon support
+
+The daemon runs as a background service on Windows hosts.
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
+/// Markdown structural-indexing fixture: a code definition
+/// (`render_widget_panel` in `src/widget/core.rs`), a real code reference
+/// (`src/widget/dashboard.rs`), and a structured guide
+/// (`docs/widget_guide.md`) whose nested headings produce four doc sections
+/// (`Widget Guide` 1-4, `Rendering` 5-12, `Theming` 13-14, `Accent Colors`
+/// 15-17). Inline and fenced code mentions of `render_widget_panel` attach to
+/// the `Rendering` and `Accent Colors` sections.
+fn create_markdown_docs_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src").join("widget")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("widget").join("core.rs"),
+        r#"pub fn render_widget_panel() -> &'static str {
+    "panel"
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("src").join("widget").join("dashboard.rs"),
+        r#"use crate::widget::core::render_widget_panel;
+
+pub fn draw_dashboard() -> &'static str {
+    render_widget_panel()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("widget_guide.md"),
+        r#"# Widget Guide
+
+Orientation notes for the widget panel stack.
+
+## Rendering
+
+The dashboard surface calls `render_widget_panel` on every refresh tick.
+
+```rust
+let panel = render_widget_panel();
+```
+
+## Theming
+
+### Accent Colors
+
+Accent color guidance: tint palette swatches for the `render_widget_panel` chrome.
 "#,
     )
     .unwrap();
@@ -1324,6 +1591,118 @@ pub fn boot_global_config() -> &'static str {
     tmp
 }
 
+/// Multi-directory overview fixture with fully controlled digest contents:
+/// one qualifying type (`PolicyEngine` in `src`) referenced from two `app`
+/// files plus a second language in `lib`, so statistics, top symbols, the
+/// module map, the `app -> src` dependency edge, and entry points are all
+/// exactly predictable.
+fn create_overview_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    for dir in ["src", "app", "lib"] {
+        fs::create_dir_all(tmp.path().join(dir)).unwrap();
+    }
+
+    fs::write(
+        tmp.path().join("src").join("policy.rs"),
+        r#"pub struct PolicyEngine {
+    pub limit: u32,
+}
+
+impl PolicyEngine {
+    pub fn allows(&self, value: u32) -> bool {
+        value <= self.limit
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("app").join("main.rs"),
+        r#"use crate::policy::PolicyEngine;
+
+fn main() {
+    let engine = PolicyEngine { limit: 8 };
+    println!("{}", engine.allows(3));
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("app").join("wiring.rs"),
+        r#"use crate::policy::PolicyEngine;
+
+pub fn build_engine() -> PolicyEngine {
+    PolicyEngine { limit: 16 }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("lib").join("util.py"),
+        r#"def helper_limit() -> int:
+    return 8
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
+/// Cap-saturating overview fixture: 16 cross-referencing rust modules (every
+/// struct referenced from two other modules' flow files) plus a mixed-language
+/// extras module, so every digest section reaches its documented cap and the
+/// serialized payload approaches its largest realistic size.
+fn create_overview_budget_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+
+    for index in 0..16usize {
+        let module = tmp.path().join(format!("module{index:02}"));
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("types.rs"),
+            format!("pub struct DigestWidget{index:02} {{\n    pub value: u64,\n}}\n"),
+        )
+        .unwrap();
+
+        let first = (index + 1) % 16;
+        let second = (index + 2) % 16;
+        fs::write(
+            module.join("flow.rs"),
+            format!(
+                "use crate::module{first:02}::types::DigestWidget{first:02};\n\
+                 use crate::module{second:02}::types::DigestWidget{second:02};\n\n\
+                 pub fn flow{index:02}(first: &DigestWidget{first:02}, second: &DigestWidget{second:02}) -> u64 {{\n    \
+                 first.value + second.value\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let extras = tmp.path().join("extras");
+    fs::create_dir_all(&extras).unwrap();
+    fs::write(
+        extras.join("util.py"),
+        "def budget_helper():\n    return 1\n",
+    )
+    .unwrap();
+    fs::write(
+        extras.join("notes.md"),
+        "# Budget fixture\n\nOverview payload sizing notes.\n",
+    )
+    .unwrap();
+    fs::write(extras.join("config.yaml"), "budget: true\nlimit: 8192\n").unwrap();
+    fs::write(
+        extras.join("schema.sql"),
+        "CREATE TABLE budget (id TEXT PRIMARY KEY);\n",
+    )
+    .unwrap();
+
+    tmp
+}
+
 // =============================================================================
 // Indexing / storage integration
 // =============================================================================
@@ -1532,6 +1911,27 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
         ("validate incoming request signatures", "src/signatures.rs"),
         ("PolicyRulePreview", "proto/policy_rules.proto"),
         ("policy_rules_preview table", "sql/policy_rules.sql"),
+        // Bench-named file must not outrank the implementation on a
+        // conceptual natural-language query.
+        ("impact horizon", "src/horizon.rs"),
+        // Descriptive snake_case test name must not outrank the
+        // implementation on a conceptual natural-language query.
+        (
+            "blast radius expansion trust buckets",
+            "src/blast_radius.rs",
+        ),
+        // In-file `#[cfg(test)] mod tests` segments live in src paths, so
+        // only their `tests` breadcrumb component can keep the descriptive
+        // test fn from outranking the implementation.
+        (
+            "refinement margin shrinks candidate pool",
+            "src/refinement.rs",
+        ),
+        // Inflected natural-language words must reach stem-named symbols.
+        (
+            "where are embeddings composed before indexing",
+            "src/embedding_pipeline.rs",
+        ),
     ];
 
     for (query, expected_top_path) in cases {
@@ -1554,6 +1954,280 @@ fn search_acceptance_queries_preserve_top_hit_for_priority_classes() {
             "query {query:?} should keep a stable top-3 result set"
         );
     }
+
+    // Heading-matched doc query: the README doc_section must stay in the
+    // top-3 despite the markdown and readme-path penalties, and its
+    // breadcrumb must carry cleaned heading text without the H1's inline
+    // HTML noise.
+    let rows = search_rows(tmp.path(), "windows daemon support");
+    let doc_hit = rows
+        .iter()
+        .take(3)
+        .find(|row| row.kind == "doc_section")
+        .unwrap_or_else(|| {
+            panic!("heading-matched doc query should keep a doc_section in the top-3: {rows:?}")
+        });
+    assert_eq!(doc_hit.file_path, "README.md");
+    assert_eq!(
+        doc_hit.breadcrumb,
+        "README > Acceptance Project > Windows daemon support"
+    );
+
+    // Content-matched doc query: the "What To Expect" heading shares no
+    // query terms, so breadcrumb neutralization cannot fire; strong body
+    // coverage plus non-stacking markdown/docs-path penalties must still
+    // carry the section into the top-5 over the docs-path text chunks.
+    let rows = search_rows_with_limit(tmp.path(), "offline snapshot refresh cadence", 10);
+    let doc_hit = rows
+        .iter()
+        .take(5)
+        .find(|row| row.kind == "doc_section")
+        .unwrap_or_else(|| {
+            panic!("content-matched doc query should put a doc_section in the top-5: {rows:?}")
+        });
+    assert_eq!(doc_hit.file_path, "README.md");
+    assert_eq!(
+        doc_hit.breadcrumb,
+        "README > Acceptance Project > What To Expect"
+    );
+}
+
+// =============================================================================
+// Markdown structural indexing — doc sections, mentions, impact, schema gate
+// =============================================================================
+
+fn count_index_rows(project: &Path, sql: &str) -> i64 {
+    let project = project.canonicalize().unwrap();
+    block_on(async {
+        let db = Db::open_ro(&project.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get::<i64>(0).unwrap()
+    })
+}
+
+#[test]
+fn markdown_doc_topic_search_returns_heading_scoped_section_with_breadcrumb() {
+    // REQ-005: a documentation-topic query returns the heading-scoped doc
+    // section with its document-rooted breadcrumb. Runs FTS-only, which also
+    // pins degraded-path discoverability of markdown doc segments.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "accent color tint guide documentation");
+    assert!(!rows.is_empty(), "doc-topic query should return rows");
+
+    let top = &rows[0];
+    assert_eq!(top.file_path, "docs/widget_guide.md");
+    assert_eq!(top.kind, "doc_section");
+    assert_eq!(
+        (top.line_start, top.line_end),
+        (15, 17),
+        "expected the `Accent Colors` section span: {top:?}"
+    );
+    assert_eq!(
+        top.breadcrumb,
+        "widget_guide > Widget Guide > Theming > Accent Colors"
+    );
+}
+
+#[test]
+fn markdown_symbol_references_include_doc_mentions() {
+    // REQ-003: documentation mentions surface through the existing symbol
+    // reference lookup with doc-section provenance, alongside (not replacing)
+    // code usages.
+    let tmp = create_markdown_docs_fixture();
+    init_and_index(&tmp);
+
+    let rows = symbol_rows(tmp.path(), "render_widget_panel", &["--references"]);
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("def:") && r.file_path == "src/widget/core.rs"),
+        "definition row missing: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind.starts_with("usage:") && r.file_path == "src/widget/dashboard.rs"),
+        "code usage row missing: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.file_path == "docs/widget_guide.md"
+            && r.kind == "usage:doc_section"
+            && r.symbol == "render_widget_panel"
+            && r.breadcrumb == "widget_guide > Widget Guide > Rendering"),
+        "doc mention row with section breadcrumb missing: {rows:?}"
+    );
+}
+
+#[test]
+fn markdown_impact_excludes_doc_mentions_while_code_reference_promotes() {
+    // REQ-004 at the integration level: indexing stores doc_mention relation
+    // rows for the markdown sections, yet anchored impact never surfaces the
+    // doc segments in either trust bucket while the real code reference still
+    // promotes to primary.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let doc_mention_rows = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segment_relations r \
+         JOIN segments s ON s.id = r.source_segment_id \
+         WHERE r.edge_identity_kind = 'doc_mention' \
+         AND s.file_path = 'docs/widget_guide.md'",
+    );
+    assert!(
+        doc_mention_rows >= 2,
+        "both mentioning sections should store doc_mention relation rows, got {doc_mention_rows}"
+    );
+
+    let rows = impact_rows(tmp.path(), &["--from-symbol", "render_widget_panel"]);
+    assert!(
+        rows.iter()
+            .any(|r| r.channel == Some('P') && r.file_path == "src/widget/dashboard.rs"),
+        "code reference should still promote to primary: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.file_path != "docs/widget_guide.md"),
+        "doc-mention edges must not appear in any impact bucket: {rows:?}"
+    );
+}
+
+#[test]
+fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
+    // REQ-005: doc sections participate in the embedding path like any other
+    // structural segment. Vector coverage is asserted only when this run
+    // actually embedded (the local model is a machine-level artifact);
+    // FTS-only discoverability is covered by the doc-topic search test.
+    let _model_guard = RestoreHiddenModelGuard::new();
+    let tmp = create_markdown_docs_fixture();
+    init_project(tmp.path());
+    let payload = run_index_json(tmp.path(), &[]);
+
+    if payload["progress"]["embeddings_enabled"] != true {
+        eprintln!(
+            "skipping vector-row assertions: embedding model unavailable in this environment"
+        );
+        return;
+    }
+
+    let doc_segments = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments WHERE block_type = 'doc_section'",
+    );
+    let doc_vectors = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments s \
+         JOIN segment_vectors v ON v.segment_id = s.id \
+         WHERE s.block_type = 'doc_section'",
+    );
+    assert!(
+        doc_segments > 0,
+        "fixture should produce doc_section segments"
+    );
+    assert_eq!(
+        doc_vectors, doc_segments,
+        "every doc_section segment should carry a vector row"
+    );
+}
+
+#[test]
+fn fresh_index_stores_vector_rows_for_source_segments_when_embeddings_enabled() {
+    // Defect A regression: a fresh index run with a working embedder must
+    // persist vector rows for source-code segments through the real CLI
+    // pipeline path. Counts are read through libsql: stock SQLite tooling
+    // satisfies COUNT(*) from the DiskANN expression-index btree, which
+    // libsql leaves empty, and therefore under-reports stored vectors as 0.
+    let _model_guard = RestoreHiddenModelGuard::new();
+    let tmp = create_multi_lang_fixture();
+    init_project(tmp.path());
+    let payload = run_index_json(tmp.path(), &[]);
+
+    if payload["progress"]["embeddings_enabled"] != true {
+        eprintln!(
+            "skipping vector-row assertions: embedding model unavailable in this environment"
+        );
+        return;
+    }
+
+    let vector_rows = count_index_rows(tmp.path(), "SELECT COUNT(*) FROM segment_vectors");
+    let embeddable_segments = count_index_rows(
+        tmp.path(),
+        "SELECT COUNT(*) FROM segments WHERE NOT (block_type = 'chunk' AND language IN \
+         ('json','yaml','toml','protobuf','terraform','sql','config','makefile','dockerfile'))",
+    );
+
+    assert!(
+        vector_rows > 0,
+        "a fresh index with a working embedder must store vector rows"
+    );
+    assert_eq!(
+        vector_rows, embeddable_segments,
+        "every embeddable segment should carry a vector row"
+    );
+    assert_eq!(
+        payload["progress"]["vector_rows"].as_i64(),
+        Some(vector_rows),
+        "reported vector coverage must match the stored rows"
+    );
+    assert_eq!(
+        payload["progress"]["embeddable_segments"].as_i64(),
+        Some(embeddable_segments),
+        "reported embeddable count must match the stored segments"
+    );
+}
+
+#[test]
+fn prior_schema_version_index_fails_closed_with_reindex_guidance() {
+    // REQ-006: a fresh index at the current schema version serves reads;
+    // downgrading the stored version to the immediate prior value (v15 at the
+    // v16 bump) fails discovery closed with explicit reindex guidance.
+    let tmp = create_markdown_docs_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+
+    let rows = search_rows(tmp.path(), "accent color tint guide documentation");
+    assert!(
+        !rows.is_empty(),
+        "fresh current-version index should serve search"
+    );
+
+    let project_root = tmp.path().canonicalize().unwrap();
+    block_on(async {
+        let db = Db::open_rw(&project_root.join(".1up").join("index.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            ["schema_version", &(SCHEMA_VERSION - 1).to_string()],
+        )
+        .await
+        .unwrap();
+    });
+
+    let (stdout, stderr, ok) = run_core_cmd(&[
+        "search",
+        "accent color tint guide documentation",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert!(
+        !ok,
+        "stale prior-version index must fail closed; stdout={stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "found v{}, expected v{SCHEMA_VERSION}",
+            SCHEMA_VERSION - 1
+        )),
+        "stale-schema error should name found/expected versions: {stderr}"
+    );
+    assert!(
+        stderr.contains("1up reindex"),
+        "stale-schema error should carry reindex guidance: {stderr}"
+    );
 }
 
 // =============================================================================
@@ -1583,6 +2257,10 @@ fn mcp_initialize_advertises_primary_code_search_instructions() {
     assert!(
         instructions.contains("oneup_search before raw grep, rg, find"),
         "instructions should guide agents to use MCP before broad raw search: {instructions}"
+    );
+    assert!(
+        instructions.contains("Call oneup_overview first when starting work on an unfamiliar repository"),
+        "instructions should make orientation-first discovery via oneup_overview discoverable: {instructions}"
     );
     assert!(
         instructions.contains("oneup_get"),
@@ -1649,6 +2327,7 @@ fn mcp_tools_list_default_palette_and_schemas() {
         "oneup_context",
         "oneup_impact",
         "oneup_structural",
+        "oneup_overview",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -1861,6 +2540,11 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
     assert_eq!(degraded_envelope["status"], "degraded");
     assert_eq!(degraded_envelope["data"]["index_readable"], true);
     assert!(
+        degraded_envelope["data"].get("drifted").is_none()
+            && degraded_envelope["data"].get("indexed_at_head").is_none(),
+        "a repository indexed without a known HEAD must not report drift fields: {degraded_envelope:?}"
+    );
+    assert!(
         degraded_envelope["next_actions"]
             .as_array()
             .unwrap()
@@ -1868,6 +2552,95 @@ fn mcp_status_and_start_report_readiness_states_and_next_actions() {
             .any(|action| action["tool"] == "oneup_search"),
         "degraded readiness should still allow search as a next action"
     );
+}
+
+fn git_head_oid(dir: &Path) -> String {
+    let output = git_output(dir, &["rev-parse", "HEAD"]);
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn mcp_status_reports_head_drift_and_start_clears_it() {
+    let repo = create_multi_lang_fixture();
+    git(repo.path(), &["init"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git(repo.path(), &["config", "user.name", "1up Test"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    let indexed_head = git_head_oid(repo.path());
+
+    let _guard = init_and_index_fts_only(&repo);
+
+    // The MCP server is configured for a neutral project and the fixture repo
+    // is addressed per call via `path`, so no daemon ever registers or
+    // reconciles the repo and the drift observations cannot race a refresh.
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let repo_path = repo.path().to_str().unwrap();
+
+    let fresh_result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let fresh = mcp_structured(&fresh_result);
+    assert_mcp_response_is_presentation_free(&fresh_result);
+    assert_eq!(fresh["data"]["index_readable"], true);
+    assert_eq!(fresh["data"]["drifted"], false);
+    assert_eq!(fresh["data"]["indexed_at_head"], indexed_head.as_str());
+    assert_eq!(fresh["data"]["current_head"], indexed_head.as_str());
+    assert!(
+        !fresh["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["arguments"]["mode"] == "index_if_needed"),
+        "non-drifted readiness must not suggest an index_if_needed start: {fresh:?}"
+    );
+    assert_mcp_next_actions_are_canonical(fresh);
+
+    fs::write(
+        repo.path().join("drift.rs"),
+        "pub fn head_drift_marker() {}\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "move head"]);
+    let moved_head = git_head_oid(repo.path());
+    assert_ne!(indexed_head, moved_head);
+
+    let drifted_result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let drifted = mcp_structured(&drifted_result);
+    assert_mcp_response_is_presentation_free(&drifted_result);
+    assert_eq!(drifted["data"]["drifted"], true);
+    assert_eq!(drifted["data"]["indexed_at_head"], indexed_head.as_str());
+    assert_eq!(drifted["data"]["current_head"], moved_head.as_str());
+    let drift_actions = drifted["next_actions"].as_array().unwrap();
+    assert!(
+        drift_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_START
+                && action["arguments"]["mode"] == "index_if_needed"),
+        "drifted readiness must suggest oneup_start with index_if_needed: {drifted:?}"
+    );
+    assert!(
+        drift_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_SEARCH),
+        "the drift advisory must keep the existing readiness actions: {drifted:?}"
+    );
+    assert_mcp_next_actions_are_canonical(drifted);
+
+    let start_result = client.call_tool(
+        TOOL_START,
+        serde_json::json!({ "path": repo_path, "mode": "index_if_needed" }),
+    );
+    let started = mcp_structured(&start_result);
+    assert_mcp_response_is_presentation_free(&start_result);
+    assert_eq!(started["data"]["drifted"], false);
+    assert_eq!(started["data"]["indexed_at_head"], moved_head.as_str());
+    assert_eq!(started["data"]["current_head"], moved_head.as_str());
+    assert_mcp_next_actions_are_canonical(started);
 }
 
 #[test]
@@ -2458,6 +3231,335 @@ fn mcp_structural_returns_matches_and_explicit_diagnostics() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn mcp_overview_returns_orientation_digest_sections() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+
+    let data = &envelope["data"];
+    for section in [
+        "stats",
+        "top_symbols",
+        "modules",
+        "module_dependencies",
+        "entry_points",
+    ] {
+        assert!(
+            data.get(section).is_some(),
+            "one overview call should return the {section} section: {data:?}"
+        );
+    }
+
+    let stats = &data["stats"];
+    assert_eq!(stats["indexed_files"], 4);
+    let total_segments = stats["total_segments"].as_u64().unwrap();
+    assert!(total_segments > 0);
+    let languages = stats["languages"].as_array().unwrap();
+    let language_names = languages
+        .iter()
+        .map(|language| language["language"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(language_names, BTreeSet::from(["python", "rust"]));
+    assert_eq!(
+        languages
+            .iter()
+            .map(|language| language["files"].as_u64().unwrap())
+            .sum::<u64>(),
+        4,
+        "per-language file counts should partition the indexed files: {languages:?}"
+    );
+    assert_eq!(
+        languages
+            .iter()
+            .map(|language| language["segments"].as_u64().unwrap())
+            .sum::<u64>(),
+        total_segments,
+        "per-language segment counts should partition the indexed segments: {languages:?}"
+    );
+
+    let top_symbols = data["top_symbols"].as_array().unwrap();
+    assert_eq!(
+        top_symbols.len(),
+        1,
+        "only PolicyEngine has a qualifying type definition: {top_symbols:?}"
+    );
+    let top = &top_symbols[0];
+    assert_eq!(top["name"], "PolicyEngine");
+    assert_eq!(top["path"], "src/policy.rs");
+    assert!(
+        top["referencing_files"].as_u64().unwrap() >= 2,
+        "both app files reference PolicyEngine: {top:?}"
+    );
+    assert_eq!(top["definition_count"], 1);
+    assert!(top["line_start"].as_u64().unwrap() >= 1);
+    assert!(top["line_end"].as_u64().unwrap() >= top["line_start"].as_u64().unwrap());
+
+    let modules = data["modules"].as_array().unwrap();
+    let module_names = modules
+        .iter()
+        .map(|module| module["module"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(module_names, BTreeSet::from(["app", "lib", "src"]));
+    assert!(
+        modules
+            .iter()
+            .all(|module| module["segments"].as_u64().unwrap() > 0),
+        "every listed module should report its segment count: {modules:?}"
+    );
+
+    let dependencies = data["module_dependencies"].as_array().unwrap();
+    assert_eq!(
+        dependencies
+            .iter()
+            .map(|edge| (
+                edge["source"].as_str().unwrap(),
+                edge["target"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("app", "src")],
+        "the only cross-module reference flow is app -> src: {dependencies:?}"
+    );
+    assert_eq!(
+        dependencies[0]["count"], 2,
+        "both app files form distinct (file, symbol) dependency pairs: {dependencies:?}"
+    );
+
+    let entry_points = data["entry_points"].as_array().unwrap();
+    assert!(
+        !entry_points.is_empty(),
+        "the PolicyEngine definition should surface as an entry point"
+    );
+    for entry in entry_points {
+        assert!(
+            matches!(
+                entry["role"].as_str().unwrap(),
+                "DEFINITION" | "ORCHESTRATION"
+            ),
+            "entry points should come from the existing role classification: {entry:?}"
+        );
+        assert!(!entry["handle"].as_str().unwrap().is_empty());
+        assert!(!entry["path"].as_str().unwrap().is_empty());
+    }
+    assert!(
+        entry_points
+            .iter()
+            .any(|entry| entry["path"] == "src/policy.rs"),
+        "shallow definition segments should be listed: {entry_points:?}"
+    );
+
+    let summary = envelope["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("Indexed 4 file(s)"),
+        "summary should state headline statistics: {summary}"
+    );
+    assert!(
+        summary.contains("PolicyEngine"),
+        "summary should name the most-referenced type: {summary}"
+    );
+
+    let actions = envelope["next_actions"].as_array().unwrap();
+    let symbol_action = actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SYMBOL)
+        .expect("non-empty digest should suggest oneup_symbol on the top type");
+    assert_eq!(symbol_action["arguments"]["name"], "PolicyEngine");
+    let search_action = actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SEARCH)
+        .expect("non-empty digest should suggest oneup_search on the densest module");
+    let densest_module = modules[0]["module"].as_str().unwrap();
+    assert_eq!(
+        search_action["arguments"]["query"],
+        format!("{densest_module} module responsibilities")
+    );
+
+    let handle = top["handle"].as_str().unwrap();
+    let hydrated = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [format!(":{handle}")] }),
+    );
+    assert_ne!(hydrated["isError"], true);
+    let hydrated_envelope = mcp_structured(&hydrated);
+    assert_eq!(hydrated_envelope["data"]["records"][0]["status"], "found");
+    assert_eq!(
+        hydrated_envelope["data"]["records"][0]["segment"]["path"], "src/policy.rs",
+        "top-symbol handles should hydrate through oneup_get: {hydrated_envelope:?}"
+    );
+}
+
+#[test]
+fn mcp_overview_repeated_calls_return_byte_identical_payloads() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let first = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    let second = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(first["isError"], true);
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap(),
+        "repeated overview calls on an unchanged index should be byte-identical"
+    );
+}
+
+#[test]
+fn mcp_overview_data_payload_stays_within_documented_budget() {
+    let tmp = create_overview_budget_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_last_update_complete(&mut client);
+
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+    assert_ne!(result["isError"], true);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+
+    let data = &envelope["data"];
+    assert_eq!(data["top_symbols"].as_array().unwrap().len(), 10);
+    assert_eq!(data["modules"].as_array().unwrap().len(), 12);
+    assert_eq!(data["module_dependencies"].as_array().unwrap().len(), 15);
+    assert_eq!(data["entry_points"].as_array().unwrap().len(), 8);
+    assert!(data["stats"]["languages"].as_array().unwrap().len() <= 10);
+
+    let serialized = serde_json::to_string(data).unwrap();
+    assert!(
+        serialized.len() <= 8192,
+        "digest data should stay within the documented payload budget with every section cap saturated; got {} bytes",
+        serialized.len()
+    );
+}
+
+#[test]
+fn mcp_overview_ignores_rows_from_other_context() {
+    let tmp = create_overview_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let project_root = tmp.path().canonicalize().unwrap();
+    seed_foreign_context_overview_rows(&project_root, "other-context");
+
+    let mut client = McpTestClient::start(&project_root);
+    wait_for_mcp_last_update_complete(&mut client);
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(result["isError"], true);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "ok");
+    let data = &envelope["data"];
+
+    assert_eq!(
+        data["stats"]["indexed_files"], 4,
+        "foreign-context files should not inflate active-context statistics: {data:?}"
+    );
+    assert!(
+        data["stats"]["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|language| language["language"] != "go"),
+        "foreign-context language should not leak into statistics: {data:?}"
+    );
+    assert!(
+        data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|module| module["module"] != "foreignctx"),
+        "foreign-context module should not leak into the module map: {data:?}"
+    );
+    assert!(
+        data["top_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["name"] != "ForeignLeakWidget"),
+        "foreign-context symbols should not leak into the ranking: {data:?}"
+    );
+    assert!(
+        data["entry_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| !entry["path"].as_str().unwrap().starts_with("foreignctx/")),
+        "foreign-context segments should not leak into entry points: {data:?}"
+    );
+}
+
+#[test]
+fn mcp_overview_empty_index_returns_zeroed_digest() {
+    let project = TempDir::new().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    seed_ready_empty_index(&project_root);
+
+    let mut client = McpTestClient::start_with_isolated_state(&project_root);
+    let result = client.call_tool(TOOL_OVERVIEW, serde_json::json!({}));
+
+    assert_ne!(
+        result["isError"], true,
+        "a ready-but-empty index is a valid state, not an error: {result:?}"
+    );
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "empty");
+
+    let data = &envelope["data"];
+    assert_eq!(data["status"], "empty");
+    assert_eq!(data["stats"]["indexed_files"], 0);
+    assert_eq!(data["stats"]["total_segments"], 0);
+    assert!(data["stats"]["languages"].as_array().unwrap().is_empty());
+    for section in [
+        "top_symbols",
+        "modules",
+        "module_dependencies",
+        "entry_points",
+    ] {
+        assert!(
+            data[section].as_array().unwrap().is_empty(),
+            "empty digest should keep the {section} section present but empty: {data:?}"
+        );
+    }
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
+}
+
+#[test]
+fn mcp_overview_unready_index_returns_readiness_error() {
+    let configured = TempDir::new().unwrap();
+    let unready = TempDir::new().unwrap();
+    fs::create_dir_all(unready.path().join(".git")).unwrap();
+    fs::write(unready.path().join("lib.rs"), "pub fn unready_probe() {}\n").unwrap();
+
+    let mut client = McpTestClient::start_with_isolated_state(configured.path());
+    // The MCP daemon auto-start can pre-initialize an empty current-schema
+    // index for the configured repository, so the unready probe must target
+    // a separate repository the daemon has never touched.
+    let result = client.call_tool(
+        TOOL_OVERVIEW,
+        serde_json::json!({ "path": unready.path().to_str().unwrap() }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert_eq!(envelope["status"], "error");
+    assert!(
+        envelope["summary"]
+            .as_str()
+            .unwrap()
+            .contains("no current index"),
+        "unready index should produce the standard readiness-style error: {envelope:?}"
+    );
+    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
 }
 
 #[test]

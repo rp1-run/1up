@@ -17,10 +17,27 @@ jobs:
   security-check:
     name: security-check
     runs-on: ubuntu-24.04
+    env:
+      # The gate runs the full test suite, which spawns real `1up`
+      # processes. Runners have no embedding model, so without this kill
+      # switch those processes attempt live model downloads and global model
+      # state can flip mid-suite — a recurring source of intermittent
+      # failures in this job. Keep the suite deterministic: FTS-only.
+      ONEUP_DISABLE_MODEL_DOWNLOADS: "1"
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-security-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-security-
 
       - name: cache cargo-audit binary
         id: cache-cargo-audit

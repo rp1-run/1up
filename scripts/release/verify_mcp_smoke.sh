@@ -81,6 +81,7 @@ EXPECTED_TOOLS = [
     "oneup_context",
     "oneup_impact",
     "oneup_structural",
+    "oneup_overview",
 ]
 READINESS_STATUSES = {"missing", "indexing", "stale", "ready", "degraded", "blocked"}
 DISCOVERY_READY_STATUSES = {"ready", "degraded"}
@@ -93,6 +94,7 @@ REQUIRED_FLOW_LABELS = [
     "context",
     "impact",
     "structural",
+    "overview",
 ]
 FIXTURE_FILES = {
     "src/policy.rs": """pub struct PolicyRuleValidator;
@@ -500,6 +502,25 @@ def require_fixture_structural_match(envelope):
     raise SmokeFailure("oneup_structural did not return the fixture struct match")
 
 
+def require_fixture_overview(envelope):
+    stats = envelope["data"].get("stats")
+    if not isinstance(stats, dict):
+        raise SmokeFailure("oneup_overview response did not include stats")
+    for field in ("indexed_files", "total_segments"):
+        value = stats.get(field)
+        if not isinstance(value, int) or value <= 0:
+            raise SmokeFailure(f"oneup_overview stats did not report a nonzero {field}")
+    modules = envelope["data"].get("modules")
+    if not isinstance(modules, list) or not modules:
+        raise SmokeFailure("oneup_overview did not return module map entries")
+    if not any(
+        isinstance(module, dict) and module.get("module") == "src" for module in modules
+    ):
+        raise SmokeFailure("oneup_overview modules did not include the fixture src module")
+    if not envelope["next_actions"]:
+        raise SmokeFailure("oneup_overview did not include suggested next actions")
+
+
 try:
     ensure_fixture_repo()
     smoke_env = isolated_child_env()
@@ -717,6 +738,20 @@ try:
         "oneup_structural",
     )
     require_fixture_structural_match(structural_envelope)
+
+    overview_result = call_tool(
+        proc,
+        stdout_queue,
+        11,
+        "oneup_overview",
+        {},
+    )
+    overview_envelope = require_tool_envelope(
+        overview_result,
+        "overview",
+        "oneup_overview",
+    )
+    require_fixture_overview(overview_envelope)
 
     seen_labels = {call["label"] for call in artifact["tool_calls"]}
     missing_labels = [label for label in REQUIRED_FLOW_LABELS if label not in seen_labels]

@@ -157,6 +157,9 @@ pub async fn get_outbound_relations(
     .await
 }
 
+/// Outbound relation lookup for one source segment. Doc-mention rows are
+/// excluded in SQL so documentation evidence never consumes the bounded
+/// fetch window (`LIMIT`) that impact budgets rely on.
 pub async fn get_outbound_relations_for_context(
     conn: &Connection,
     context_id: &str,
@@ -275,6 +278,9 @@ pub async fn get_inbound_relations_by_lookup_symbol(
     .await
 }
 
+/// Inbound relation lookup by canonical symbol tail. Doc-mention rows are
+/// excluded in SQL so a heavily documented symbol cannot evict real code
+/// references from the bounded fetch window (`LIMIT`).
 pub async fn get_inbound_relations_by_lookup_symbol_for_context(
     conn: &Connection,
     context_id: &str,
@@ -317,6 +323,111 @@ pub async fn get_inbound_relations_by_lookup_symbol_for_context(
         StorageError::Query(format!("inbound lookup relation row iteration failed: {e}"))
     })? {
         results.push(row_to_stored_relation(&row)?);
+    }
+
+    Ok(results)
+}
+
+/// One ranked overview symbol key with the breadth of incoming references
+/// (distinct referencing source files) and its qualifying definition count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolReferenceCount {
+    pub symbol_key: String,
+    pub referencing_files: u64,
+    pub definition_count: u64,
+}
+
+/// One directed depth-2 module dependency aggregated from relation rows,
+/// counted as distinct (referencing file, symbol key) pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleDependencyPair {
+    pub source_module: String,
+    pub target_module: String,
+    pub pair_count: u64,
+}
+
+/// Rank overview symbol keys by distinct referencing source files inside one
+/// index context, restricted to identity-bearing relation rows joined to
+/// qualifying type definitions (Branch B kind policy, design D19).
+pub async fn get_top_type_symbol_references_for_context(
+    conn: &Connection,
+    context_id: &str,
+    limit: usize,
+) -> Result<Vec<SymbolReferenceCount>, OneupError> {
+    let Some(limit) = relation_limit(limit)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut rows = conn
+        .query(
+            queries::SELECT_TOP_TYPE_SYMBOL_REFERENCES_FOR_CONTEXT.as_str(),
+            libsql::params![context_id, limit],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("top type symbol ranking failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("top type symbol row iteration failed: {e}")))?
+    {
+        let referencing_files: i64 = row
+            .get(1)
+            .map_err(|e| StorageError::Query(format!("read referencing_files failed: {e}")))?;
+        let definition_count: i64 = row
+            .get(2)
+            .map_err(|e| StorageError::Query(format!("read definition_count failed: {e}")))?;
+        results.push(SymbolReferenceCount {
+            symbol_key: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read symbol_key failed: {e}")))?,
+            referencing_files: referencing_files as u64,
+            definition_count: definition_count as u64,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Aggregate directed depth-2 module dependency pairs inside one index
+/// context, sharing the top-symbol filter stack plus the SQL-side per-key
+/// qualifying-definition-count cap of 1..=3 (design D18).
+pub async fn get_module_dependency_pairs_for_context(
+    conn: &Connection,
+    context_id: &str,
+    limit: usize,
+) -> Result<Vec<ModuleDependencyPair>, OneupError> {
+    let Some(limit) = relation_limit(limit)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut rows = conn
+        .query(
+            queries::SELECT_MODULE_DEPENDENCY_PAIRS_FOR_CONTEXT.as_str(),
+            libsql::params![context_id, limit],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("module dependency aggregate failed: {e}")))?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("module dependency row iteration failed: {e}")))?
+    {
+        let pair_count: i64 = row
+            .get(2)
+            .map_err(|e| StorageError::Query(format!("read pair_count failed: {e}")))?;
+        results.push(ModuleDependencyPair {
+            source_module: row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("read source_module failed: {e}")))?,
+            target_module: row
+                .get(1)
+                .map_err(|e| StorageError::Query(format!("read target_module failed: {e}")))?,
+            pair_count: pair_count as u64,
+        });
     }
 
     Ok(results)
@@ -466,9 +577,12 @@ fn row_to_stored_relation(row: &libsql::Row) -> Result<StoredRelation, OneupErro
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::shared::symbols::{
-        EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
+        EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE,
+        EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
     };
     use crate::storage::{
         db::Db,
@@ -711,5 +825,370 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    fn overview_definition(
+        id: &str,
+        file_path: &str,
+        block_type: &str,
+        symbol: &str,
+    ) -> SegmentInsert {
+        let mut seg = test_segment(id, file_path);
+        seg.block_type = block_type.to_string();
+        seg.role = "DEFINITION".to_string();
+        seg.defined_symbols = serde_json::to_string(&[symbol]).unwrap();
+        seg
+    }
+
+    fn overview_referencing(id: &str, file_path: &str, refs: Vec<ParsedRelation>) -> SegmentInsert {
+        let mut seg = test_segment(id, file_path);
+        seg.defined_symbols = "[]".to_string();
+        seg.referenced_relations = serde_json::to_string(&refs).unwrap();
+        seg
+    }
+
+    #[tokio::test]
+    async fn top_type_symbols_ranked_by_distinct_referencing_files() {
+        let (_db, conn) = setup().await;
+        let ctx = "ctx-a";
+
+        for seg in [
+            overview_definition("def_db", "src/storage/db.rs", "struct", "Db"),
+            overview_definition("def_err", "src/shared/errors.rs", "enum", "OneupError"),
+            overview_definition("def_alpha", "src/cli/alpha.rs", "struct", "Alpha"),
+            overview_definition("def_beta", "src/cli/beta.rs", "struct", "Beta"),
+            overview_definition("def_helper", "src/mcp/tools.rs", "function", "helper"),
+            overview_definition("def_alias", "src/shared/types.rs", "type", "Err"),
+            overview_referencing(
+                "ref_a",
+                "src/cli/a.rs",
+                vec![
+                    relation("Db", EDGE_IDENTITY_QUALIFIED_PATH),
+                    relation("Db", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("OneupError", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("helper", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("Err", EDGE_IDENTITY_BARE_IDENTIFIER),
+                ],
+            ),
+            overview_referencing(
+                "ref_b",
+                "src/cli/b.rs",
+                vec![
+                    relation("Db", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("Alpha", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("Beta", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("OneupError", EDGE_IDENTITY_MACRO_LIKE),
+                    relation("helper", EDGE_IDENTITY_BARE_IDENTIFIER),
+                ],
+            ),
+            overview_referencing(
+                "ref_c",
+                "src/search/c.rs",
+                vec![
+                    relation("Db", EDGE_IDENTITY_CONSTRUCTOR_LIKE),
+                    relation("helper", EDGE_IDENTITY_BARE_IDENTIFIER),
+                ],
+            ),
+            overview_referencing(
+                "ref_d",
+                "src/daemon/d.rs",
+                vec![
+                    relation("Db", EDGE_IDENTITY_METHOD_RECEIVER),
+                    relation("helper", EDGE_IDENTITY_BARE_IDENTIFIER),
+                ],
+            ),
+        ] {
+            segments::upsert_segment_for_context(&conn, ctx, &seg)
+                .await
+                .unwrap();
+        }
+
+        let ranked = get_top_type_symbol_references_for_context(&conn, ctx, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            ranked,
+            vec![
+                SymbolReferenceCount {
+                    symbol_key: "db".to_string(),
+                    referencing_files: 3,
+                    definition_count: 1,
+                },
+                SymbolReferenceCount {
+                    symbol_key: "alpha".to_string(),
+                    referencing_files: 1,
+                    definition_count: 1,
+                },
+                SymbolReferenceCount {
+                    symbol_key: "beta".to_string(),
+                    referencing_files: 1,
+                    definition_count: 1,
+                },
+                SymbolReferenceCount {
+                    symbol_key: "oneuperror".to_string(),
+                    referencing_files: 1,
+                    definition_count: 1,
+                },
+            ]
+        );
+
+        let capped = get_top_type_symbol_references_for_context(&conn, ctx, 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].symbol_key, "db");
+
+        segments::upsert_segment_for_context(
+            &conn,
+            "ctx-b",
+            &overview_definition("b_def_db", "src/storage/db.rs", "struct", "Db"),
+        )
+        .await
+        .unwrap();
+        segments::upsert_segment_for_context(
+            &conn,
+            "ctx-b",
+            &overview_referencing(
+                "b_ref",
+                "src/x.rs",
+                vec![relation("Db", EDGE_IDENTITY_BARE_IDENTIFIER)],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let scoped = get_top_type_symbol_references_for_context(&conn, "ctx-b", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped,
+            vec![SymbolReferenceCount {
+                symbol_key: "db".to_string(),
+                referencing_files: 1,
+                definition_count: 1,
+            }]
+        );
+        assert!(get_top_type_symbol_references_for_context(&conn, ctx, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn module_dependency_pairs_capped_and_filtered() {
+        let (_db, conn) = setup().await;
+        let ctx = "ctx-a";
+
+        for seg in [
+            overview_definition(
+                "def_registry",
+                "src/daemon/registry.rs",
+                "struct",
+                "Registry",
+            ),
+            overview_definition("def_pair_storage", "src/storage/p1.rs", "struct", "Pair"),
+            overview_definition("def_pair_shared", "src/shared/p2.rs", "struct", "Pair"),
+            overview_definition("def_dup_1", "src/a/d1.rs", "struct", "Dup"),
+            overview_definition("def_dup_2", "src/b/d2.rs", "struct", "Dup"),
+            overview_definition("def_dup_3", "src/c/d3.rs", "struct", "Dup"),
+            overview_definition("def_dup_4", "src/d/d4.rs", "struct", "Dup"),
+            overview_referencing(
+                "ref_one_a",
+                "src/cli/one.rs",
+                vec![
+                    relation("Registry", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("Dup", EDGE_IDENTITY_BARE_IDENTIFIER),
+                    relation("Pair", EDGE_IDENTITY_BARE_IDENTIFIER),
+                ],
+            ),
+            overview_referencing(
+                "ref_one_b",
+                "src/cli/one.rs",
+                vec![relation("Registry", EDGE_IDENTITY_QUALIFIED_PATH)],
+            ),
+            overview_referencing(
+                "ref_two",
+                "src/cli/two.rs",
+                vec![relation("Registry", EDGE_IDENTITY_QUALIFIED_PATH)],
+            ),
+            overview_referencing(
+                "ref_tests",
+                "tests/integration.rs",
+                vec![relation("Registry", EDGE_IDENTITY_BARE_IDENTIFIER)],
+            ),
+            overview_referencing(
+                "ref_root",
+                "main.rs",
+                vec![relation("Registry", EDGE_IDENTITY_BARE_IDENTIFIER)],
+            ),
+            overview_referencing(
+                "ref_macro_only",
+                "src/search/s.rs",
+                vec![relation("Registry", EDGE_IDENTITY_MACRO_LIKE)],
+            ),
+            overview_referencing(
+                "ref_worker",
+                "src/daemon/worker.rs",
+                vec![relation("Registry", EDGE_IDENTITY_BARE_IDENTIFIER)],
+            ),
+        ] {
+            segments::upsert_segment_for_context(&conn, ctx, &seg)
+                .await
+                .unwrap();
+        }
+
+        let pairs = get_module_dependency_pairs_for_context(&conn, ctx, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ModuleDependencyPair {
+                    source_module: "src/cli".to_string(),
+                    target_module: "src/daemon".to_string(),
+                    pair_count: 2,
+                },
+                ModuleDependencyPair {
+                    source_module: "(root)".to_string(),
+                    target_module: "src/daemon".to_string(),
+                    pair_count: 1,
+                },
+                ModuleDependencyPair {
+                    source_module: "src/cli".to_string(),
+                    target_module: "src/shared".to_string(),
+                    pair_count: 1,
+                },
+                ModuleDependencyPair {
+                    source_module: "src/cli".to_string(),
+                    target_module: "src/storage".to_string(),
+                    pair_count: 1,
+                },
+                ModuleDependencyPair {
+                    source_module: "src/daemon".to_string(),
+                    target_module: "src/daemon".to_string(),
+                    pair_count: 1,
+                },
+                ModuleDependencyPair {
+                    source_module: "tests".to_string(),
+                    target_module: "src/daemon".to_string(),
+                    pair_count: 1,
+                },
+            ]
+        );
+
+        let capped = get_module_dependency_pairs_for_context(&conn, ctx, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+        assert!(get_module_dependency_pairs_for_context(&conn, ctx, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Latency gate for the overview aggregates (design D16): the symbol and
+    /// module-dependency queries must stay within the ~1s budget on an index
+    /// of representative scale (HYP-001 v3 measured 0.186-0.232s on 81k
+    /// relations; the prohibited correlated form measured 183.8s).
+    #[tokio::test]
+    async fn overview_aggregates_meet_latency_budget_on_representative_index() {
+        let (_db, conn) = setup().await;
+
+        const REFERENCING_SEGMENTS: usize = 400;
+        const TYPE_KEYS: usize = 600;
+        const DEFINED_TARGET_ROWS: usize = 48_000;
+        const RECEIVER_NOISE_ROWS: usize = 16_000;
+        const UNDEFINED_TAIL_ROWS: usize = 16_000;
+
+        for index in 0..REFERENCING_SEGMENTS {
+            let id = format!("latency_ref_{index}");
+            let file_path = format!("app/m{}/file_{index}.rs", index % 8);
+            let mut seg = test_segment(&id, &file_path);
+            seg.defined_symbols = "[]".to_string();
+            segments::upsert_segment(&conn, &seg).await.unwrap();
+        }
+        for key in 0..TYPE_KEYS {
+            let id = format!("latency_def_{key}");
+            let file_path = format!("src/m{}/types_{key}.rs", key % 12);
+            let mut seg = test_segment(&id, &file_path);
+            seg.block_type = "struct".to_string();
+            seg.role = "DEFINITION".to_string();
+            seg.defined_symbols = format!("[\"Type{key}\"]");
+            segments::upsert_segment(&conn, &seg).await.unwrap();
+        }
+
+        let mut rows =
+            Vec::with_capacity(DEFINED_TARGET_ROWS + RECEIVER_NOISE_ROWS + UNDEFINED_TAIL_ROWS);
+        for index in 0..DEFINED_TARGET_ROWS {
+            let key = index % TYPE_KEYS;
+            rows.push(RelationInsert {
+                source_segment_id: format!(
+                    "latency_ref_{}",
+                    (index / TYPE_KEYS) % REFERENCING_SEGMENTS
+                ),
+                relation_kind: RelationKind::Reference,
+                raw_target_symbol: format!("v{index}::Type{key}"),
+                canonical_target_symbol: format!("v{index}type{key}"),
+                lookup_canonical_symbol: format!("type{key}"),
+                qualifier_fingerprint: String::new(),
+                edge_identity_kind: if index % 2 == 0 {
+                    EDGE_IDENTITY_BARE_IDENTIFIER.to_string()
+                } else {
+                    EDGE_IDENTITY_QUALIFIED_PATH.to_string()
+                },
+            });
+        }
+        for index in 0..RECEIVER_NOISE_ROWS {
+            let key = index % TYPE_KEYS;
+            rows.push(RelationInsert {
+                source_segment_id: format!("latency_ref_{}", index % REFERENCING_SEGMENTS),
+                relation_kind: RelationKind::Call,
+                raw_target_symbol: format!("recv{index}.type_{key}"),
+                canonical_target_symbol: format!("recv{index}type{key}"),
+                lookup_canonical_symbol: format!("type{key}"),
+                qualifier_fingerprint: String::new(),
+                edge_identity_kind: EDGE_IDENTITY_METHOD_RECEIVER.to_string(),
+            });
+        }
+        for index in 0..UNDEFINED_TAIL_ROWS {
+            let key = index % 2_000;
+            rows.push(RelationInsert {
+                source_segment_id: format!("latency_ref_{}", index % REFERENCING_SEGMENTS),
+                relation_kind: RelationKind::Reference,
+                raw_target_symbol: format!("u{index}::tail_{key}"),
+                canonical_target_symbol: format!("u{index}tail{key}"),
+                lookup_canonical_symbol: format!("tail{key}"),
+                qualifier_fingerprint: String::new(),
+                edge_identity_kind: EDGE_IDENTITY_BARE_IDENTIFIER.to_string(),
+            });
+        }
+        insert_relations(&conn, &rows).await.unwrap();
+
+        let budget = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let ranked =
+            get_top_type_symbol_references_for_context(&conn, DEFAULT_INDEX_CONTEXT_ID, 120)
+                .await
+                .unwrap();
+        let ranking_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let pairs = get_module_dependency_pairs_for_context(&conn, DEFAULT_INDEX_CONTEXT_ID, 64)
+            .await
+            .unwrap();
+        let pairs_elapsed = started.elapsed();
+
+        assert_eq!(ranked.len(), 120);
+        assert!(ranked.iter().all(|entry| entry.referencing_files > 0));
+        assert!(!pairs.is_empty());
+        assert!(
+            ranking_elapsed < budget,
+            "symbol ranking took {ranking_elapsed:?}, budget {budget:?}"
+        );
+        assert!(
+            pairs_elapsed < budget,
+            "module dependency aggregate took {pairs_elapsed:?}, budget {budget:?}"
+        );
     }
 }

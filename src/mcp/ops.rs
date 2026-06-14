@@ -7,14 +7,20 @@ use libsql::Connection;
 use serde::Serialize;
 
 use crate::daemon::registry::Registry;
-use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
+use crate::indexer::embedder::{
+    self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
+};
 use crate::indexer::pipeline;
 use crate::mcp::types::StartMode;
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
+use crate::search::overview;
+use crate::search::retrieval;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
-use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
+use crate::shared::constants::{
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
+};
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
@@ -25,8 +31,10 @@ use crate::shared::types::{
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
-    count_files_for_context, count_segments_for_context, get_segment_by_id_for_context,
-    get_segment_by_prefix_for_context, SegmentPrefixLookup, StoredSegment,
+    count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
+    count_vector_rows_for_context, get_segment_by_id_for_context,
+    get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
+    StoredSegment,
 };
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
@@ -73,6 +81,16 @@ pub struct ReadinessPayload {
     pub indexed_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_segments: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embeddable_segments: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_at_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drifted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +234,70 @@ pub struct ContextRecord {
     pub line_end: usize,
 }
 
+/// Orientation digest payload for `oneup_overview`. Section sizes are bounded
+/// by the engine caps documented in `crate::search::overview`, which keep the
+/// serialized payload within the documented budget (REQ-008).
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewPayload {
+    pub status: OperationStatus,
+    pub stats: OverviewStats,
+    pub top_symbols: Vec<OverviewTopSymbol>,
+    pub modules: Vec<OverviewModule>,
+    pub module_dependencies: Vec<OverviewModuleDependency>,
+    pub entry_points: Vec<OverviewEntryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewStats {
+    pub indexed_files: u64,
+    pub total_segments: u64,
+    pub languages: Vec<OverviewLanguage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewLanguage {
+    pub language: String,
+    pub files: u64,
+    pub segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewTopSymbol {
+    pub name: String,
+    pub handle: String,
+    pub path: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub referencing_files: u64,
+    pub definition_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewModule {
+    pub module: String,
+    pub segments: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewModuleDependency {
+    pub source: String,
+    pub target: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewEntryPoint {
+    pub handle: String,
+    pub path: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breadcrumb: Option<String>,
+}
+
 struct CurrentIndex {
     conn: Connection,
     _db: Db,
@@ -245,17 +327,22 @@ pub async fn start(roots: &McpProjectRoots, mode: StartMode) -> anyhow::Result<R
         StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
             run_index_then_classify(roots, false).await
         }
-        StartMode::IndexIfNeeded
-            if matches!(
-                readiness.status,
-                ReadinessStatus::Missing | ReadinessStatus::Degraded
-            ) =>
-        {
+        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => {
             run_index_then_classify(roots, false).await
         }
         StartMode::Reindex => run_index_then_classify(roots, true).await,
         _ => Ok(readiness),
     }
+}
+
+/// `index_if_needed` indexes when no usable index exists, when the index is
+/// degraded, or when the recorded indexed-at HEAD drifted from the live
+/// repository HEAD, so the drift advisory in `oneup_status` is self-serve.
+fn index_if_needed_applies(readiness: &ReadinessPayload) -> bool {
+    matches!(
+        readiness.status,
+        ReadinessStatus::Missing | ReadinessStatus::Degraded
+    ) || readiness.drifted == Some(true)
 }
 
 pub async fn classify_readiness(
@@ -297,6 +384,11 @@ pub async fn classify_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: None,
         index_progress,
         daemon_status,
@@ -385,6 +477,23 @@ pub async fn classify_readiness(
     payload.total_segments = count_segments_for_context(&conn, &worktree_context.context_id)
         .await
         .ok();
+    payload.vector_rows = count_vector_rows_for_context(&conn, &worktree_context.context_id)
+        .await
+        .ok();
+    payload.embeddable_segments =
+        count_embeddable_segments_for_context(&conn, &worktree_context.context_id)
+            .await
+            .ok();
+
+    let recorded_head = get_worktree_context_head_oid(&conn, &worktree_context.context_id)
+        .await
+        .ok()
+        .flatten();
+    apply_head_drift(
+        &mut payload,
+        recorded_head,
+        worktree_context.head_oid.clone(),
+    );
 
     if payload.total_segments.unwrap_or(0) == 0 {
         if daemon_refresh_active {
@@ -402,7 +511,12 @@ pub async fn classify_readiness(
         .index_progress
         .as_ref()
         .is_some_and(|progress| !progress.embeddings_enabled);
-    let embedding_reason = embedding_unavailable_reason(&embedding_status_for_search());
+    let progress_reason = payload
+        .index_progress
+        .as_ref()
+        .and_then(|progress| progress.embedding_unavailable_reason.clone());
+    let embedding_reason = embedder::model_unavailable_reason_for_status()
+        .map(|reason| unavailable_reason_text(&reason));
 
     if progress_without_embeddings || embedding_reason.is_some() {
         payload.status = ReadinessStatus::Degraded;
@@ -410,14 +524,50 @@ pub async fn classify_readiness(
             "The index is readable, but semantic embeddings are unavailable.".to_string();
         payload.reason = Some(
             embedding_reason
+                .or(progress_reason)
                 .unwrap_or_else(|| "latest index was built without embeddings".to_string()),
         );
+        return payload;
+    }
+
+    // The model is claimed available, so a context with embeddable segments
+    // but zero stored vector rows means the index and the claim disagree:
+    // report it as degraded instead of ready.
+    let zero_vector_coverage = matches!(
+        (payload.vector_rows, payload.embeddable_segments),
+        (Some(0), Some(embeddable)) if embeddable > 0
+    );
+    if zero_vector_coverage {
+        payload.status = ReadinessStatus::Degraded;
+        payload.summary =
+            "The index is readable, but semantic embeddings are unavailable.".to_string();
+        payload.reason = Some(format!(
+            "embedding model is available but the index stores no vector rows for this context (0 of {} embeddable segments); run oneup_start with mode \"reindex\"",
+            payload.embeddable_segments.unwrap_or(0)
+        ));
         return payload;
     }
 
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
     payload
+}
+
+/// Populate the advisory head-drift fields from the head OID recorded at the
+/// last successful index run and the live repository HEAD. The fields are
+/// emitted only when both sides are known; otherwise all three stay absent.
+/// Drift never changes the readiness status itself.
+fn apply_head_drift(
+    payload: &mut ReadinessPayload,
+    recorded_head: Option<String>,
+    current_head: Option<String>,
+) {
+    let (Some(recorded), Some(current)) = (recorded_head, current_head) else {
+        return;
+    };
+    payload.drifted = Some(recorded != current);
+    payload.indexed_at_head = Some(recorded);
+    payload.current_head = Some(current);
 }
 
 pub fn blocked_readiness(
@@ -444,6 +594,11 @@ pub fn blocked_readiness(
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: Some(reason.into()),
         index_progress,
         daemon_status,
@@ -463,6 +618,11 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         schema_version: None,
         indexed_files: None,
         total_segments: None,
+        vector_rows: None,
+        embeddable_segments: None,
+        indexed_at_head: None,
+        current_head: None,
+        drifted: None,
         reason: Some(reason.into()),
         index_progress: None,
         daemon_status: None,
@@ -486,22 +646,35 @@ async fn run_search_once(
     limit: usize,
 ) -> anyhow::Result<SearchPayload> {
     let current = open_current_index(state_root).await?;
-    let mut runtime = EmbeddingRuntime::default();
-    let embedding_status = runtime.prepare_for_search(1);
     let search_scope = SearchScope::from_worktree_context(worktree_context);
-    let degraded_reason = combine_degraded_reasons(
-        embedding_unavailable_reason(&embedding_status),
-        search_scope.degraded_reason(),
-    );
 
-    let results = if embedding_status.is_available() {
-        let mut engine =
-            HybridSearchEngine::new_scoped(&current.conn, runtime.current_embedder(), search_scope);
-        engine.search(query, limit).await?
+    // Cheap vector-presence gate first: when the index holds no embeddings
+    // for this context, the embedding model must never be initialized.
+    let has_vectors = retrieval::has_indexed_embeddings(&current.conn, &search_scope).await?;
+    let (results, embedding_reason) = if has_vectors {
+        let mut runtime = EmbeddingRuntime::default();
+        let embedding_status = runtime.prepare_for_search(1);
+        let embedding_reason = embedding_unavailable_reason(&embedding_status);
+        let results = if embedding_status.is_available() {
+            let mut engine = HybridSearchEngine::new_scoped(
+                &current.conn,
+                runtime.current_embedder(),
+                search_scope.clone(),
+            );
+            engine.search(query, limit).await?
+        } else {
+            let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
+            engine.fts_only_search(query, limit).await?
+        };
+        (results, embedding_reason)
     } else {
-        let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope);
-        engine.fts_only_search(query, limit).await?
+        let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
+        let results = engine.fts_only_search(query, limit).await?;
+        (results, Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()))
     };
+
+    let degraded_reason =
+        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason());
 
     let status = match degraded_reason {
         Some(_) => OperationStatus::Degraded,
@@ -676,6 +849,23 @@ async fn search_structural_once(
         &worktree_context.context_id,
     );
     Ok(engine.search_report(pattern, language_filter).await?)
+}
+
+pub async fn compute_overview(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+) -> anyhow::Result<OverviewPayload> {
+    retry_on_db_lock(|| async { compute_overview_once(state_root, worktree_context).await }).await
+}
+
+async fn compute_overview_once(
+    state_root: &Path,
+    worktree_context: &WorktreeContext,
+) -> anyhow::Result<OverviewPayload> {
+    let current = open_current_index(state_root).await?;
+    let engine = overview::OverviewEngine::new(&current.conn);
+    let digest = engine.compute(&worktree_context.context_id).await?;
+    Ok(overview_payload(digest))
 }
 
 async fn retry_on_db_lock<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
@@ -1019,6 +1209,93 @@ fn symbol_record(result: SymbolResult) -> SymbolRecord {
     }
 }
 
+fn overview_payload(digest: overview::RepositoryOverview) -> OverviewPayload {
+    // A ready index with zero segments is a valid empty digest, not an
+    // error (REQ-010); missing/unready indexes fail in open_current_index.
+    let status = if digest.stats.total_segments == 0 {
+        OperationStatus::Empty
+    } else {
+        OperationStatus::Ok
+    };
+
+    OverviewPayload {
+        status,
+        stats: OverviewStats {
+            indexed_files: digest.stats.indexed_files,
+            total_segments: digest.stats.total_segments,
+            languages: digest
+                .stats
+                .languages
+                .into_iter()
+                .map(overview_language)
+                .collect(),
+        },
+        top_symbols: digest
+            .top_symbols
+            .into_iter()
+            .map(overview_top_symbol)
+            .collect(),
+        modules: digest.modules.into_iter().map(overview_module).collect(),
+        module_dependencies: digest
+            .module_dependencies
+            .into_iter()
+            .map(overview_module_dependency)
+            .collect(),
+        entry_points: digest
+            .entry_points
+            .into_iter()
+            .map(overview_entry_point)
+            .collect(),
+    }
+}
+
+fn overview_language(stat: overview::LanguageBreakdown) -> OverviewLanguage {
+    OverviewLanguage {
+        language: stat.language,
+        files: stat.files,
+        segments: stat.segments,
+    }
+}
+
+fn overview_top_symbol(entry: overview::TopSymbolEntry) -> OverviewTopSymbol {
+    OverviewTopSymbol {
+        name: entry.name,
+        handle: entry.handle,
+        path: entry.path,
+        line_start: usize_from_i64(entry.line_start),
+        line_end: usize_from_i64(entry.line_end),
+        referencing_files: entry.referencing_files,
+        definition_count: entry.definition_count,
+    }
+}
+
+fn overview_module(entry: overview::ModuleEntry) -> OverviewModule {
+    OverviewModule {
+        module: entry.module,
+        segments: entry.segments,
+    }
+}
+
+fn overview_module_dependency(entry: overview::ModuleDependencyEntry) -> OverviewModuleDependency {
+    OverviewModuleDependency {
+        source: entry.source,
+        target: entry.target,
+        count: entry.count,
+    }
+}
+
+fn overview_entry_point(entry: overview::EntryPointEntry) -> OverviewEntryPoint {
+    OverviewEntryPoint {
+        handle: entry.handle,
+        path: entry.path,
+        line_start: usize_from_i64(entry.line_start),
+        line_end: usize_from_i64(entry.line_end),
+        role: entry.role,
+        symbol: entry.symbol,
+        breadcrumb: entry.breadcrumb,
+    }
+}
+
 fn aggregate_read_status(records: &[ReadRecord]) -> OperationStatus {
     if records.is_empty() {
         return OperationStatus::Empty;
@@ -1071,30 +1348,32 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
     })
 }
 
-fn embedding_status_for_search() -> EmbeddingLoadStatus {
-    let mut runtime = EmbeddingRuntime::default();
-    runtime.prepare_for_search(1)
-}
-
 fn embedding_unavailable_reason(status: &EmbeddingLoadStatus) -> Option<String> {
     match status {
         EmbeddingLoadStatus::Warm
         | EmbeddingLoadStatus::Loaded
         | EmbeddingLoadStatus::Downloaded => None,
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
-            Some("embedding model is missing".to_string())
+        EmbeddingLoadStatus::Unavailable(reason) => Some(unavailable_reason_text(reason)),
+    }
+}
+
+fn unavailable_reason_text(reason: &EmbeddingUnavailableReason) -> String {
+    match reason {
+        EmbeddingUnavailableReason::ModelMissing => "embedding model is missing".to_string(),
+        EmbeddingUnavailableReason::PreviousDownloadFailed => {
+            "embedding model download previously failed".to_string()
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::PreviousDownloadFailed) => {
-            Some("embedding model download previously failed".to_string())
+        EmbeddingUnavailableReason::ModelDirUnavailable(err) => {
+            format!("embedding model directory is unavailable: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err)) => {
-            Some(format!("embedding model directory is unavailable: {err}"))
+        EmbeddingUnavailableReason::LoadFailed(err) => {
+            format!("embedding model failed to load: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err)) => {
-            Some(format!("embedding model failed to load: {err}"))
+        EmbeddingUnavailableReason::DownloadFailed(err) => {
+            format!("embedding model download failed: {err}")
         }
-        EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
-            Some(format!("embedding model download failed: {err}"))
+        EmbeddingUnavailableReason::ArtifactsUnverifiable(err) => {
+            format!("embedding model artifacts failed verification: {err}")
         }
     }
 }
@@ -1139,6 +1418,79 @@ mod tests {
     use crate::shared::types::{BranchStatus, StructuralSearchStatus, WorktreeRole};
     use crate::storage::segments::{self, SegmentInsert};
     use std::fs;
+
+    fn readiness_fixture() -> ReadinessPayload {
+        blocked_readiness_for_path("repo", "fixture")
+    }
+
+    #[test]
+    fn head_drift_is_false_when_recorded_matches_current() {
+        let mut payload = readiness_fixture();
+
+        apply_head_drift(
+            &mut payload,
+            Some("abc123".to_string()),
+            Some("abc123".to_string()),
+        );
+
+        assert_eq!(payload.drifted, Some(false));
+        assert_eq!(payload.indexed_at_head.as_deref(), Some("abc123"));
+        assert_eq!(payload.current_head.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn head_drift_is_true_with_both_heads_when_oids_differ() {
+        let mut payload = readiness_fixture();
+
+        apply_head_drift(
+            &mut payload,
+            Some("abc123".to_string()),
+            Some("def456".to_string()),
+        );
+
+        assert_eq!(payload.drifted, Some(true));
+        assert_eq!(payload.indexed_at_head.as_deref(), Some("abc123"));
+        assert_eq!(payload.current_head.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn head_drift_fields_stay_absent_when_either_head_is_missing() {
+        let mut payload = readiness_fixture();
+        apply_head_drift(&mut payload, None, Some("def456".to_string()));
+        assert_eq!(payload.drifted, None);
+        assert_eq!(payload.indexed_at_head, None);
+        assert_eq!(payload.current_head, None);
+
+        let mut payload = readiness_fixture();
+        apply_head_drift(&mut payload, Some("abc123".to_string()), None);
+        assert_eq!(payload.drifted, None);
+        assert_eq!(payload.indexed_at_head, None);
+        assert_eq!(payload.current_head, None);
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("drifted").is_none());
+        assert!(value.get("indexed_at_head").is_none());
+        assert!(value.get("current_head").is_none());
+    }
+
+    #[test]
+    fn index_if_needed_triggers_on_drift_but_not_on_clean_ready() {
+        let mut readiness = readiness_fixture();
+        readiness.status = ReadinessStatus::Ready;
+        assert!(!index_if_needed_applies(&readiness));
+
+        readiness.drifted = Some(true);
+        assert!(index_if_needed_applies(&readiness));
+
+        readiness.drifted = Some(false);
+        assert!(!index_if_needed_applies(&readiness));
+
+        readiness.status = ReadinessStatus::Missing;
+        assert!(index_if_needed_applies(&readiness));
+
+        readiness.status = ReadinessStatus::Degraded;
+        assert!(index_if_needed_applies(&readiness));
+    }
 
     #[test]
     fn read_context_locations_rejects_parent_escape() {
@@ -1312,6 +1664,61 @@ mod tests {
         assert_eq!(payload.status, StructuralSearchStatus::Ok);
         assert_eq!(payload.results.len(), 1);
         assert_eq!(payload.results[0].content, "active");
+    }
+
+    #[tokio::test]
+    async fn search_without_indexed_vectors_stays_fts_only_with_explicit_reason() {
+        // Defect C query-side regression: when the index holds no vector rows
+        // for the active context, local search must take the FTS-only branch
+        // that never constructs an embedding runtime, and it must report the
+        // explicit degraded reason instead of silently downgrading.
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "src/active.rs",
+            &[test_segment("vectorless_needle", "src/active.rs")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let context = WorktreeContext {
+            context_id: "ctx-active".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        };
+
+        let payload = run_search(&root, &context, "vectorless_needle", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(payload.status, OperationStatus::Degraded);
+        assert_eq!(
+            payload.degraded_reason.as_deref(),
+            Some(NO_INDEXED_EMBEDDINGS_REASON),
+            "the FTS-only path must carry the explicit no-embeddings reason"
+        );
+        assert!(
+            !payload.results.is_empty(),
+            "FTS-only search should still return lexical hits"
+        );
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {

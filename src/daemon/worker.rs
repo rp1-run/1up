@@ -304,7 +304,10 @@ fn log_indexing_embedding_status(
         }
         EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
         | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
-        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ArtifactsUnverifiable(
+            err,
+        )) => {
             warn!(
                 "failed to prepare embedding runtime for {} with embed_threads={embed_threads}: {err}; daemon will index without embeddings",
                 project_root.display()
@@ -345,7 +348,10 @@ fn log_search_embedding_status(
         }
         EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelDirUnavailable(err))
         | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(err))
-        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err))
+        | EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ArtifactsUnverifiable(
+            err,
+        )) => {
             debug!(
                 "failed to prepare daemon search runtime for {} with embed_threads={embed_threads}: {err}; using FTS-only mode",
                 project_root.display()

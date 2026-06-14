@@ -6,7 +6,7 @@ use std::time::Instant;
 use libsql::Connection;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
     config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME)
@@ -127,6 +127,9 @@ fn refresh_progress(
         files_deleted: stats.files_deleted,
         segments_stored: stats.segments_stored,
         embeddings_enabled: stats.embeddings_generated,
+        embedding_unavailable_reason: stats.embedding_unavailable_reason.clone(),
+        vector_rows: stats.vector_rows,
+        embeddable_segments: stats.embeddable_segments,
         message: pipeline_progress_message(stats, update.phase, update.files_total),
         parallelism: update.parallelism,
         timings: update.timings,
@@ -142,10 +145,14 @@ fn refresh_progress(
 
 use crate::indexer::chunker;
 use crate::indexer::embedder::Embedder;
+use crate::indexer::markdown;
 use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
-use crate::shared::constants::{DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, HF_MODEL_REPO};
+use crate::shared::constants::{
+    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
+    NON_EMBEDDABLE_CHUNK_LANGUAGES,
+};
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
@@ -225,23 +232,79 @@ fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
         .map_err(|e| IndexingError::Pipeline(format!("serialize embedding: {e}")).into())
 }
 
+/// Maximum length in characters of the contextual header prepended to
+/// embedding input text.
+///
+/// The embedder truncates input from the right at `EMBEDDING_MAX_TOKENS`, so
+/// an unbounded header could crowd a segment's actual content out of the
+/// model window. 160 characters is roughly 40-80 wordpiece tokens, leaving
+/// the bulk of the 256-token budget for content.
+const EMBEDDING_HEADER_MAX_CHARS: usize = 160;
+
+/// Maximum composed embedding-input length in characters.
+///
+/// The embedder hard-truncates at `EMBEDDING_MAX_TOKENS` (256) tokens, and
+/// wordpiece tokens practically never exceed 16 characters, so clamping here
+/// only bounds tokenizer work on oversized segments without changing what
+/// the model sees.
+const EMBEDDING_INPUT_MAX_CHARS: usize = EMBEDDING_MAX_TOKENS * 16;
+
+/// Builds the text passed to the embedder for one segment.
+///
+/// Prepends a bounded `{language} {path stem} {breadcrumb} {defined symbols}`
+/// header to the segment content so tiny definition segments (3-line structs,
+/// one-line variable assignments) carry topical context into the embedding.
+/// Missing breadcrumbs and empty symbol lists are skipped. Only the embedding
+/// input changes: stored segment content and segment ids are untouched.
+fn compose_embedding_text(relative_path: &str, segment: &ParsedSegment) -> String {
+    let mut header_parts: Vec<&str> = Vec::new();
+
+    if !segment.language.is_empty() {
+        header_parts.push(segment.language.as_str());
+    }
+
+    let path_stem = Path::new(relative_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if !path_stem.is_empty() {
+        header_parts.push(path_stem);
+    }
+
+    if let Some(breadcrumb) = segment.breadcrumb.as_deref() {
+        if !breadcrumb.is_empty() {
+            header_parts.push(breadcrumb);
+        }
+    }
+
+    let symbols = segment.defined_symbols.join(" ");
+    if !symbols.is_empty() {
+        header_parts.push(symbols.as_str());
+    }
+
+    let header = truncate_chars(header_parts.join(" "), EMBEDDING_HEADER_MAX_CHARS);
+    let text = if header.is_empty() {
+        segment.content.clone()
+    } else {
+        format!("{header}\n{}", segment.content)
+    };
+
+    truncate_chars(text, EMBEDDING_INPUT_MAX_CHARS)
+}
+
+fn truncate_chars(mut text: String, max_chars: usize) -> String {
+    if let Some((idx, _)) = text.char_indices().nth(max_chars) {
+        text.truncate(idx);
+    }
+    text
+}
+
 fn should_embed_segment(seg: &ParsedSegment) -> bool {
     if seg.block_type != "chunk" {
         return true;
     }
 
-    !matches!(
-        seg.language.as_str(),
-        "json"
-            | "yaml"
-            | "toml"
-            | "protobuf"
-            | "terraform"
-            | "sql"
-            | "config"
-            | "makefile"
-            | "dockerfile"
-    )
+    !NON_EMBEDDABLE_CHUNK_LANGUAGES.contains(&seg.language.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -572,7 +635,16 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
         return ParseResultKind::Skipped(ParseSkipReason::Unchanged);
     }
 
-    let segments = if parser::use_structural_parser(&scanned_file.extension) {
+    let segments = if matches!(
+        parser::SupportedLanguage::from_extension(&scanned_file.extension),
+        Some(parser::SupportedLanguage::Markdown)
+    ) {
+        let file_stem = Path::new(&scanned_file.relative_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        markdown::parse_markdown_file(&content, file_stem)
+    } else if parser::use_structural_parser(&scanned_file.extension) {
         match parser::parse_file(&content, &scanned_file.extension) {
             Ok(segments) => segments,
             Err(err) => {
@@ -658,17 +730,18 @@ fn build_segment_batches(
     timings: &mut TimingAccumulator,
 ) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
     let mut embeddings = if let Some(embedder) = embedder {
-        let texts: Vec<&str> = parsed_files
+        let texts: Vec<String> = parsed_files
             .iter()
             .flat_map(|file| {
                 file.segments
                     .iter()
                     .filter(|segment| should_embed_segment(segment))
-                    .map(|segment| segment.content.as_str())
+                    .map(|segment| compose_embedding_text(&file.relative_path, segment))
             })
             .collect();
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let embed_started_at = Instant::now();
-        let embeddings = embedder.embed_batch(&texts)?;
+        let embeddings = embedder.embed_batch(&text_refs)?;
         timings.embed_ms += embed_started_at.elapsed().as_millis();
         Some(embeddings.into_iter())
     } else {
@@ -783,6 +856,47 @@ async fn store_ready_files(
     stats.files_indexed += parsed_files.len();
     stats.segments_stored += segment_count;
     Ok(())
+}
+
+/// Reconciles the reported embedding state with what the database actually
+/// holds for this context. A run that had a working embedder but left a
+/// context with embeddable segments and zero stored vector rows must not
+/// report embeddings as enabled; it reports `embeddings_generated: false`
+/// with an explicit reason instead. Count failures are advisory: the indexed
+/// data is already committed, so they log a warning and leave coverage unset.
+async fn verify_stored_embedding_outcome(
+    conn: &Connection,
+    context_id: &str,
+    stats: &mut PipelineStats,
+) {
+    let vector_rows = match segments::count_vector_rows_for_context(conn, context_id).await {
+        Ok(count) => count,
+        Err(err) => {
+            warn!("failed to count stored vector rows for context {context_id}: {err}");
+            return;
+        }
+    };
+    let embeddable_segments =
+        match segments::count_embeddable_segments_for_context(conn, context_id).await {
+            Ok(count) => count,
+            Err(err) => {
+                warn!("failed to count embeddable segments for context {context_id}: {err}");
+                return;
+            }
+        };
+
+    stats.vector_rows = Some(vector_rows);
+    stats.embeddable_segments = Some(embeddable_segments);
+
+    if stats.embeddings_generated && embeddable_segments > 0 && vector_rows == 0 {
+        warn!(
+            "embedder was available but context {context_id} stored 0 vector rows for {embeddable_segments} embeddable segments; reporting embeddings as unavailable"
+        );
+        stats.embeddings_generated = false;
+        stats.embedding_unavailable_reason = Some(format!(
+            "embedder was available but no vector rows were stored ({embeddable_segments} embeddable segments); run `1up reindex` to rebuild"
+        ));
+    }
 }
 
 async fn delete_removed_files(
@@ -949,7 +1063,13 @@ pub struct PipelineStats {
     pub files_skipped: usize,
     pub files_deleted: usize,
     pub segments_stored: usize,
+    /// Reflects the stored outcome, not embedder presence: true only when the
+    /// run had an embedder and the context's stored vector coverage is
+    /// consistent with it (see `verify_stored_embedding_outcome`).
     pub embeddings_generated: bool,
+    pub embedding_unavailable_reason: Option<String>,
+    pub vector_rows: Option<u64>,
+    pub embeddable_segments: Option<u64>,
     pub progress: IndexProgress,
 }
 
@@ -963,6 +1083,9 @@ impl Default for PipelineStats {
             files_deleted: 0,
             segments_stored: 0,
             embeddings_generated: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
             progress: IndexProgress::pending(),
         }
     }
@@ -1164,7 +1287,7 @@ pub async fn run_with_context_scope_setup_and_progress_root(
     daemon_fallback_reason: Option<String>,
     progress_root: Option<&Path>,
 ) -> Result<PipelineStats, OneupError> {
-    run_with_index_context_scope_setup_and_progress_root(
+    let stats = run_with_index_context_scope_setup_and_progress_root(
         conn,
         &context.source_root,
         embedder,
@@ -1177,7 +1300,27 @@ pub async fn run_with_context_scope_setup_and_progress_root(
         progress_root,
         IndexRunContext::from_worktree(context),
     )
-    .await
+    .await?;
+
+    record_indexed_head(conn, context).await;
+
+    Ok(stats)
+}
+
+/// Persist the worktree context row, including the repository head commit OID
+/// this run indexed at, so readiness checks can compare it against the live
+/// repository HEAD. Recording failure is logged instead of failing the run:
+/// the index data is already committed and the recorded head is advisory
+/// freshness metadata.
+async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
+    let project_id =
+        crate::shared::project::read_project_id(&context.state_root).unwrap_or_default();
+    if let Err(err) = segments::upsert_worktree_context(conn, context, &project_id).await {
+        warn!(
+            "failed to record indexed head for context {}: {err}",
+            context.context_id
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1308,6 +1451,8 @@ async fn execute_run_with_inputs(
 
     if !has_embedder {
         info!("embedding model not available: indexing without embeddings (semantic search will be degraded, FTS-only mode active)");
+        stats.embedding_unavailable_reason =
+            Some("embedding model unavailable; indexed without embeddings".to_string());
     } else {
         schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
     }
@@ -1515,6 +1660,8 @@ async fn execute_run_with_inputs(
         content_read_count, timings.parse_ms
     );
 
+    verify_stored_embedding_outcome(conn, &context.context_id, &mut stats).await;
+
     progress_ui.success_with(format!(
         "Processed {} files: {} indexed, {} skipped, {} deleted, {} segments",
         total_files,
@@ -1603,6 +1750,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn successful_context_run_records_indexed_head_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-head", "main");
+
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            segments::get_worktree_context_head_oid(&conn, "ctx-head")
+                .await
+                .unwrap(),
+            context.head_oid,
+            "a successful run must record the head OID it indexed at"
+        );
+
+        let mut moved = context.clone();
+        moved.head_oid = Some("f".repeat(40));
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &moved,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            segments::get_worktree_context_head_oid(&conn, "ctx-head")
+                .await
+                .unwrap(),
+            moved.head_oid,
+            "a later run must replace the recorded head OID"
+        );
+    }
+
     async fn count_context_file_segments(
         conn: &Connection,
         context_id: &str,
@@ -1689,6 +1894,126 @@ mod tests {
 
         let count = segments::count_segments(&conn).await.unwrap();
         assert!(count > 0);
+    }
+
+    #[tokio::test]
+    async fn run_without_embedder_reports_reason_and_stored_vector_coverage() {
+        // Defect C regression: an index run without a usable embedder must
+        // report an explicit unavailable reason and the measured stored
+        // coverage (zero vector rows over a positive embeddable count), both
+        // in stats and in the persisted progress contract.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn coverage_probe() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        let stats = run(&conn, tmp.path(), None).await.unwrap();
+
+        assert!(!stats.embeddings_generated);
+        assert!(
+            stats
+                .embedding_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unavailable")),
+            "missing embedder must carry an explicit reason, got {:?}",
+            stats.embedding_unavailable_reason
+        );
+        assert_eq!(stats.vector_rows, Some(0));
+        assert!(stats.embeddable_segments.is_some_and(|count| count > 0));
+
+        assert!(!stats.progress.embeddings_enabled);
+        assert_eq!(
+            stats.progress.embedding_unavailable_reason,
+            stats.embedding_unavailable_reason
+        );
+        assert_eq!(stats.progress.vector_rows, Some(0));
+        assert_eq!(
+            stats.progress.embeddable_segments,
+            stats.embeddable_segments
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_stored_embedding_outcome_flips_dishonest_embedding_claims() {
+        // Defect C regression: a run claiming embeddings while the context
+        // stores zero vector rows for embeddable segments must be reported as
+        // embeddings unavailable with an explicit reason.
+        let (_db, conn) = setup().await;
+        let context_id = "ctx-honesty";
+        let insert = segments::SegmentInsert {
+            id: segments::generate_segment_id(context_id, "src/a.rs", 1, 3),
+            file_path: "src/a.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn honesty_probe() {}".to_string(),
+            line_start: 1,
+            line_end: 3,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"honesty_probe\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash".to_string(),
+        };
+        segments::replace_file_segments_for_context_tx(&conn, context_id, "src/a.rs", &[insert])
+            .await
+            .unwrap();
+
+        let mut stats = PipelineStats {
+            embeddings_generated: true,
+            ..PipelineStats::default()
+        };
+        verify_stored_embedding_outcome(&conn, context_id, &mut stats).await;
+
+        assert!(
+            !stats.embeddings_generated,
+            "zero stored vectors with embeddable segments must not report embeddings as enabled"
+        );
+        assert!(stats
+            .embedding_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no vector rows")));
+        assert_eq!(stats.vector_rows, Some(0));
+        assert!(stats.embeddable_segments.is_some_and(|count| count > 0));
+    }
+
+    #[test]
+    fn parse_scanned_file_routes_markdown_to_doc_segmenter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("README.md");
+        fs::write(&path, "# Title\n\nintro\n\n## Install\n\nsteps\n").unwrap();
+
+        let outcome = parse_scanned_file(ScannedWorkItem {
+            sequence_id: 0,
+            relative_path: "README.md".to_string(),
+            path,
+            extension: "md".to_string(),
+            stored_hash: None,
+            file_size: 0,
+            modified_ns: 0,
+        });
+
+        let parsed = match outcome {
+            ParseResultKind::Ready(parsed) => parsed,
+            other => panic!("expected ready parse outcome, got {other:?}"),
+        };
+        assert!(!parsed.segments.is_empty());
+        assert!(parsed
+            .segments
+            .iter()
+            .all(|segment| segment.block_type == markdown::DOC_SECTION_BLOCK_TYPE));
+        let breadcrumbs: Vec<_> = parsed
+            .segments
+            .iter()
+            .map(|segment| segment.breadcrumb.as_deref())
+            .collect();
+        assert!(
+            breadcrumbs.contains(&Some("README > Title > Install")),
+            "expected file-stem-rooted heading breadcrumb; found {breadcrumbs:?}"
+        );
     }
 
     #[tokio::test]
@@ -2364,6 +2689,97 @@ mod tests {
             ..code_chunk
         };
         assert!(!should_embed_segment(&yaml_chunk));
+    }
+
+    fn embeddable_segment(content: &str) -> ParsedSegment {
+        ParsedSegment {
+            content: content.into(),
+            block_type: "struct".into(),
+            line_start: 159,
+            line_end: 161,
+            language: "rust".into(),
+            breadcrumb: None,
+            complexity: 0,
+            role: crate::shared::types::SegmentRole::Definition,
+            defined_symbols: Vec::new(),
+            referenced_symbols: Vec::new(),
+            referenced_relations: Vec::new(),
+            called_symbols: Vec::new(),
+            called_relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compose_embedding_text_prepends_language_stem_breadcrumb_and_symbols() {
+        let mut segment = embeddable_segment(
+            "pub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}",
+        );
+        segment.breadcrumb = Some("horizon expansion".into());
+        segment.defined_symbols = vec!["ImpactHorizonEngine".into()];
+
+        let text = compose_embedding_text("src/search/impact.rs", &segment);
+
+        assert_eq!(
+            text,
+            "rust impact horizon expansion ImpactHorizonEngine\npub struct ImpactHorizonEngine<'a> {\n    conn: &'a Connection,\n}"
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_skips_missing_breadcrumb_and_symbols() {
+        let mut segment = embeddable_segment("SUMMARY_JSON=\"$OUT_DIR/summary.json\"");
+        segment.language = "shell".into();
+
+        let text = compose_embedding_text("scripts/benchmark_parallel_indexing.sh", &segment);
+
+        assert_eq!(
+            text,
+            "shell benchmark_parallel_indexing\nSUMMARY_JSON=\"$OUT_DIR/summary.json\""
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_clamps_header_and_total_length() {
+        let mut segment = embeddable_segment(&"x".repeat(EMBEDDING_INPUT_MAX_CHARS * 2));
+        segment.breadcrumb = Some("breadcrumb ".repeat(40));
+        segment.defined_symbols = (0..40).map(|i| format!("Symbol{i}")).collect();
+
+        let text = compose_embedding_text("src/lib.rs", &segment);
+        let header = text.split('\n').next().unwrap();
+
+        assert!(header.chars().count() <= EMBEDDING_HEADER_MAX_CHARS);
+        assert!(text.chars().count() <= EMBEDDING_INPUT_MAX_CHARS);
+        assert!(
+            text.split_once('\n').unwrap().1.starts_with("xxx"),
+            "content must follow the clamped header"
+        );
+    }
+
+    #[test]
+    fn compose_embedding_text_leaves_stored_segment_untouched() {
+        let mut segment = embeddable_segment("pub struct ImpactHorizonEngine;");
+        segment.defined_symbols = vec!["ImpactHorizonEngine".into()];
+
+        let composed = compose_embedding_text("src/search/impact.rs", &segment);
+        let insert = build_segment_insert(
+            DEFAULT_INDEX_CONTEXT_ID,
+            "src/search/impact.rs",
+            "hash",
+            &segment,
+            None,
+        );
+
+        assert_ne!(composed, segment.content);
+        assert_eq!(insert.content, segment.content);
+        assert_eq!(
+            insert.id,
+            segments::generate_segment_id(
+                DEFAULT_INDEX_CONTEXT_ID,
+                "src/search/impact.rs",
+                segment.line_start,
+                segment.line_end
+            )
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@
   Stop asking agents to guess with <code>grep</code>/<code>rg</code>. 1up provides a high-fidelity semantic layer for coding tools, replacing broad searches with focused local intelligence to navigate and trace repositories with surgical precision.
 </p>
 
-`1up` is a local MCP plugin for Codex, Claude Code, Cursor, VS Code, and other MCP-capable agents. Install it once, point it at a repository or linked worktree, and the agent gets eight `oneup_*` tools to check readiness, search by intent, read exact spans, verify symbols, trace impact, and inspect structure.
+`1up` is a local MCP plugin for Codex, Claude Code, Cursor, VS Code, and other MCP-capable agents. Install it once, point it at a repository or linked worktree, and the agent gets nine `oneup_*` tools to check readiness, search by intent, read exact spans, verify symbols, trace impact, and inspect structure.
 
 Under the hood, `1up` builds a local `.1up` index from tree-sitter parsed symbols and spans, local ONNX embeddings for vector search, full-text search, and relation metadata for impact analysis.
 
@@ -62,7 +62,7 @@ This is the fastest path. Paste this into that host or harness, and let it handl
 3. Insert this minimal 1up hint into the repo instruction file only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
 
   ```markdown
-  For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
+  For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_overview` for an orientation digest when starting work on an unfamiliar repository, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
   ```
 
 4. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
@@ -126,12 +126,13 @@ By default, these commands print readable labels and summaries. Add `--plain` wh
 
 ## <img src="assets/readme/icons/heroicons-solid/wrench-screwdriver.svg" alt="" width="20" height="20"> What The Agent Gets
 
-Once connected, your agent gets one canonical MCP server named `oneup` and eight retained tools:
+Once connected, your agent gets one canonical MCP server named `oneup` and nine retained tools:
 
 | Agent need | MCP tool |
 |---|---|
 | Check whether the repository is ready | `oneup_status` |
 | Create, refresh, or rebuild the local index | `oneup_start` |
+| Get oriented in an unfamiliar repository | `oneup_overview` |
 | Search by meaning or intent | `oneup_search` |
 | Read selected result handles | `oneup_get` |
 | Find definitions and references | `oneup_symbol` |
@@ -143,12 +144,13 @@ A good agent flow looks like this:
 
 1. Call `oneup_status`.
 2. Call `oneup_start` only if readiness says indexing or rebuilding is needed.
-3. Use `oneup_search` to find the right area of the codebase.
-4. Use `oneup_get` to inspect selected result handles.
-5. Use `oneup_context` when precise file-line context is needed.
-6. Use `oneup_symbol` when definitions or references must be complete.
-7. Use `oneup_impact` when planning a change and checking likely follow-up files.
-8. Use `oneup_structural` for explicit tree-sitter pattern searches.
+3. Call `oneup_overview` first when starting work on an unfamiliar repository to get an orientation digest of repository statistics, most-referenced types, modules, and entry points.
+4. Use `oneup_search` to find the right area of the codebase.
+5. Use `oneup_get` to inspect selected result handles.
+6. Use `oneup_context` when precise file-line context is needed.
+7. Use `oneup_symbol` when definitions or references must be complete.
+8. Use `oneup_impact` when planning a change and checking likely follow-up files.
+9. Use `oneup_structural` for explicit tree-sitter pattern searches.
 
 `oneup_search` is for discovery, not proof of completeness. Agents should switch to `oneup_symbol` for definition and reference completeness, and they should keep `rg`, `grep`, or `find` for exact literal checks after 1up has narrowed the scope.
 

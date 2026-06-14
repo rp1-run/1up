@@ -189,6 +189,7 @@ impl<'a> SymbolSearchEngine<'a> {
                 defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
                 referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
                 called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
+                content: seg.content.clone(),
             };
             results.push(SymbolMatch {
                 segment_id: seg.id.clone(),

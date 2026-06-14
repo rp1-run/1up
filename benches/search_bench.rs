@@ -1022,12 +1022,110 @@ fn bench_impact_horizon(c: &mut Criterion) {
     });
 }
 
+/// Vector corpus size for the exhaustive-scan guardrail bench. Matches the
+/// repo scale where `vector_top_k` beam traversal was observed taking
+/// multiple seconds per query while an exhaustive scan stays in single-digit
+/// milliseconds.
+const EXHAUSTIVE_SCAN_BENCH_VECTORS: u64 = 4_500;
+
+fn seeded_bench_embedding(seed: u64) -> Vec<f32> {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..384)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        })
+        .collect()
+}
+
+fn setup_exhaustive_scan_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let temp_root = canonical_temp_root(&tmp);
+    std::fs::create_dir_all(temp_root.join(".1up")).unwrap();
+
+    let db_path = temp_root.join(".1up").join("index.db");
+    let query_embedding = seeded_bench_embedding(u64::MAX / 2);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = oneup::storage::db::Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        oneup::storage::schema::initialize(&conn).await.unwrap();
+
+        conn.execute("BEGIN", ()).await.unwrap();
+        for idx in 0..EXHAUSTIVE_SCAN_BENCH_VECTORS {
+            let embedding = serde_json::to_string(&seeded_bench_embedding(idx)).unwrap();
+            conn.execute(
+                "INSERT INTO segments (
+                    id, file_path, language, block_type, content,
+                    line_start, line_end, complexity, role,
+                    defined_symbols, referenced_symbols, called_symbols,
+                    file_hash, created_at, updated_at
+                ) VALUES (?1, ?2, 'rust', 'function', 'fn scan_item() {}',
+                    1, 8, 1, 'DEFINITION', '[]', '[]', '[]',
+                    ?3, datetime('now'), datetime('now'))",
+                libsql::params![
+                    format!("scan-{idx}"),
+                    format!("src/scan_{idx}.rs"),
+                    format!("hash-scan-{idx}")
+                ],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO segment_vectors (segment_id, embedding_vec, created_at, updated_at)
+                 VALUES (?1, vector8(?2), datetime('now'), datetime('now'))",
+                libsql::params![format!("scan-{idx}"), embedding],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("COMMIT", ()).await.unwrap();
+    });
+
+    (tmp, db_path, query_embedding)
+}
+
+/// Guardrail for the small-corpus vector path: at repo scale (~4.5k vectors)
+/// the backend must serve vector candidates through the exhaustive scan in
+/// milliseconds. The query string matches nothing lexically so the vector
+/// stage dominates the measurement.
+fn bench_vector_exhaustive_scan(c: &mut Criterion) {
+    let (_tmp, db_path, query_embedding) = setup_exhaustive_scan_db();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = rt
+        .block_on(async { oneup::storage::db::Db::open_ro(&db_path).await })
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    c.bench_function("search_latency_vector_exhaustive_scan_4k5", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let backend = RetrievalBackend::select(&conn, Some(&query_embedding))
+                    .await
+                    .unwrap();
+                let candidates = backend
+                    .search("zzqxv", Some(&query_embedding))
+                    .await
+                    .unwrap();
+                assert_eq!(backend.mode(), RetrievalMode::SqlVectorV2);
+                assert_eq!(candidates.vector_results.len(), 400);
+            });
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_symbol_lookup,
     bench_fts_search,
     bench_chunked_content_search,
     bench_retrieval_backend,
+    bench_vector_exhaustive_scan,
     bench_impact_horizon
 );
 criterion_main!(benches);
