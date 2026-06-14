@@ -45,7 +45,6 @@ This is the fastest path. Paste this into that host or harness, and let it handl
 - Install or update `1up` globally.
 - Configure the `oneup` MCP server in project/workspace scope.
 - Use explicit `--path` config only when project/workspace config is not available.
-- Add the repository instruction hint only if equivalent guidance does not already exist.
 - Do not try to restart this active host or verify newly added MCP tools from it.
 
 §PROC
@@ -59,18 +58,11 @@ This is the fastest path. Paste this into that host or harness, and let it handl
    - Args: `["mcp"]`
    - JSON shape: `{"mcpServers":{"oneup":{"command":"1up","args":["mcp"]}}}`
    - For TOML hosts, create the equivalent `oneup` server entry.
-3. Insert this minimal 1up hint into the repo instruction file only if equivalent guidance does not already exist (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or host equivalent). Prefer an existing file; create the host's normal repo instruction file only if none exists. Do not duplicate the hint.
-
-  ```markdown
-  For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_overview` for an orientation digest when starting work on an unfamiliar repository, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
-  ```
-
-4. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
+3. If MCP config was added or changed, ask the user to restart/reload this host so it can load `oneup`. The active host cannot restart itself. Ask the user to approve/trust `oneup` if the host prompts after restart.
 
 §OUT
 - `1up --version`
 - MCP config file changed
-- repo instruction file changed
 - restart/approval message given to user, if needed
 ````
 

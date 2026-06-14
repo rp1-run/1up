@@ -93,14 +93,6 @@ Expected tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `one
 
 If `oneup_status` reports `missing` or `stale`, call `oneup_start` with the mode suggested in the response, then check readiness again. Once readiness is `ready`, use `oneup_search`, then hydrate evidence with `oneup_get` or `oneup_context`.
 
-## Repository Instruction Hint
-
-Agents choose better tools when the repository instruction file tells them to use `oneup` before broad raw search. If the repository does not already have equivalent guidance in `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or a host-specific instruction file, add this hint:
-
-```text
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_overview` for an orientation digest when starting work on an unfamiliar repository, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
-```
-
 ## Troubleshooting
 
 ### Host Cannot Start `oneup`
