@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use oneup::mcp::types::RETAINED_PUBLIC_TOOLS;
+
 const TEST_RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn repo_root() -> &'static Path {
@@ -796,6 +798,60 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
             !readme.contains(unsupported),
             "README should not document unsupported setup/package path {unsupported}"
         );
+    }
+}
+
+/// Extract every `oneup_[a-z_]+` token from `content`, mirroring regex
+/// find_iter semantics (a literal `oneup_` prefix followed by a maximal run of
+/// `[a-z_]`, scanning left-to-right with non-overlapping matches). Kept as a
+/// plain byte scan to avoid adding a `regex` dependency just for one guard.
+fn extract_oneup_tokens(content: &str) -> Vec<String> {
+    const PREFIX: &str = "oneup_";
+    let bytes = content.as_bytes();
+    let mut tokens = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = content[search_from..].find(PREFIX) {
+        let start = search_from + rel;
+        let mut end = start + PREFIX.len();
+        while end < bytes.len() && (bytes[end].is_ascii_lowercase() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start + PREFIX.len() {
+            tokens.push(content[start..end].to_string());
+            search_from = end;
+        } else {
+            search_from = start + PREFIX.len();
+        }
+    }
+    tokens
+}
+
+/// Every MCP tool name an agent can read in the repo's own instruction and doc
+/// surfaces must be a currently-retained tool. The authority is the live
+/// `RETAINED_PUBLIC_TOOLS` list, never a hardcoded duplicate, so adding or
+/// removing a real tool keeps this guard correct. Catches the agent-hint drift
+/// class (e.g. `oneup_prepare`/`oneup_read`) returning on any future doc edit.
+#[test]
+fn documentation_tool_names_match_retained_public_tools() {
+    let scanned_docs = [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "DEVELOPMENT.md",
+        "README.md",
+        "docs/mcp-installation.md",
+        "evals/README.md",
+    ];
+
+    for doc in scanned_docs {
+        let content = fs::read_to_string(repo_root().join(doc))
+            .unwrap_or_else(|err| panic!("failed to read scanned doc {doc}: {err}"));
+        for token in extract_oneup_tokens(&content) {
+            assert!(
+                RETAINED_PUBLIC_TOOLS.contains(&token.as_str()),
+                "{doc} references unknown MCP tool `{token}` not in RETAINED_PUBLIC_TOOLS \
+                 (authority: src/mcp/types.rs); correct the doc or update the retained tool set"
+            );
+        }
     }
 }
 
