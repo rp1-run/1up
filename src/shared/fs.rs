@@ -152,6 +152,65 @@ pub fn atomic_replace(
     Ok(validated_path)
 }
 
+/// Atomically replaces the contents of an existing regular file that lives
+/// inside `project_root`, preserving the file's existing permission mode.
+///
+/// Unlike [`atomic_replace`], this clamps to the user's project root rather than
+/// the `.1up` secure state directory and does not impose 1up's restrictive
+/// state-file mode: whatever mode the user's file already has is preserved. The
+/// target's parent must already exist within the project root, a symlink leaf is
+/// rejected, and any target whose parent canonicalizes outside `project_root` is
+/// rejected before any write occurs. The replacement is written to a sibling
+/// temp file, fsync'd, and atomically renamed over the target.
+pub fn atomic_replace_within_project_root(
+    path: &Path,
+    contents: &[u8],
+    project_root: &Path,
+) -> Result<PathBuf, OneupError> {
+    let validated_path = validate_regular_file_path(path, project_root)?;
+    let parent = validated_path.parent().ok_or_else(|| {
+        FilesystemError::InvalidPath(format!(
+            "path must have a parent directory: {}",
+            validated_path.display()
+        ))
+    })?;
+    let existing_mode = existing_file_mode(&validated_path)?;
+    let temp_path = parent.join(format!(".1up-tmp-{}", Uuid::new_v4()));
+
+    let write_result = (|| -> Result<(), OneupError> {
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|source| io_error(&temp_path, source))?;
+        if let Some(mode) = existing_mode {
+            set_path_mode(&temp_path, mode)?;
+        }
+        temp_file
+            .write_all(contents)
+            .map_err(|source| io_error(&temp_path, source))?;
+        temp_file
+            .sync_all()
+            .map_err(|source| io_error(&temp_path, source))?;
+
+        fs::rename(&temp_path, &validated_path)
+            .map_err(|source| io_error(&validated_path, source))?;
+        if let Some(mode) = existing_mode {
+            set_path_mode(&validated_path, mode)?;
+        }
+        sync_directory(parent)?;
+
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    write_result?;
+    Ok(validated_path)
+}
+
 pub fn remove_regular_file(path: &Path, approved_root: &Path) -> Result<bool, OneupError> {
     remove_expected_leaf(path, approved_root, ExpectedLeaf::RegularFile)
 }
@@ -429,6 +488,25 @@ fn sync_directory(path: &Path) -> Result<(), OneupError> {
     }
 }
 
+/// Returns the permission bits (`& 0o7777`) of an existing file so they can be
+/// re-applied after an atomic replace. On non-unix platforms permission modes
+/// are not modeled, so this is a no-op returning `None`.
+fn existing_file_mode(path: &Path) -> Result<Option<u32>, OneupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
+        Ok(Some(metadata.permissions().mode() & 0o7777))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 fn set_path_mode(path: &Path, mode: u32) -> Result<(), OneupError> {
     #[cfg(unix)]
     {
@@ -685,6 +763,73 @@ mod tests {
         assert_eq!(mode_bits(&second), SECURE_STATE_FILE_MODE);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_within_project_root_rejects_symlink_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = canonical_tmp_root(tmp.path()).join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let real_target = project_root.join("real.md");
+        fs::write(&real_target, "original real contents\n").unwrap();
+        symlink(&real_target, project_root.join("CLAUDE.md")).unwrap();
+
+        let err = atomic_replace_within_project_root(
+            &project_root.join("CLAUDE.md"),
+            b"new contents\n",
+            &project_root,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        // The error must be raised without writing anything.
+        assert_eq!(fs::read(&real_target).unwrap(), b"original real contents\n");
+        assert_no_temp_files(&project_root);
+    }
+
+    #[test]
+    fn atomic_replace_within_project_root_rejects_target_outside_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = canonical_tmp_root(tmp.path());
+        let project_root = tmp_root.join("project");
+        let outside_dir = tmp_root.join("outside");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("CLAUDE.md");
+        fs::write(&outside_file, "outside contents\n").unwrap();
+
+        let err =
+            atomic_replace_within_project_root(&outside_file, b"new contents\n", &project_root)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("outside approved root"));
+        assert_eq!(fs::read(&outside_file).unwrap(), b"outside contents\n");
+        assert_no_temp_files(&project_root);
+    }
+
+    #[test]
+    fn atomic_replace_within_project_root_preserves_mode_and_writes_exact_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = canonical_tmp_root(tmp.path()).join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let target = project_root.join("CLAUDE.md");
+        let original =
+            "line A\n<!-- 1up:hint:begin v=1 -->\nstale\n<!-- 1up:hint:end -->\nline B\n";
+        fs::write(&target, original).unwrap();
+        #[cfg(unix)]
+        set_path_mode(&target, 0o640).unwrap();
+
+        let cleaned = "line A\nline B\n";
+        let written =
+            atomic_replace_within_project_root(&target, cleaned.as_bytes(), &project_root).unwrap();
+
+        // Bytes written are exactly what was handed in: surrounding lines are
+        // byte-identical and only the removed span is gone.
+        assert_eq!(fs::read(&written).unwrap(), cleaned.as_bytes());
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&written), 0o640);
+        assert_no_temp_files(&project_root);
+    }
+
     #[test]
     fn remove_helpers_only_remove_regular_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -779,5 +924,16 @@ mod tests {
 
     fn canonical_tmp_root(path: &Path) -> PathBuf {
         path.canonicalize().unwrap()
+    }
+
+    fn assert_no_temp_files(dir: &Path) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".1up-tmp-"),
+                "leftover temp file: {}",
+                name.to_string_lossy()
+            );
+        }
     }
 }
