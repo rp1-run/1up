@@ -54,3 +54,52 @@ pub async fn serve_stdio(state_root: PathBuf, source_root: PathBuf) -> anyhow::R
     let _quit_reason = running.waiting().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude Code truncates the MCP `instructions` field at 2KB.
+    const INSTRUCTIONS_BUDGET_BYTES: usize = 2048;
+
+    /// Stable routing substring that must survive truncation so agents keep
+    /// the "prefer 1up over raw search" rule even under an adverse 2KB cut.
+    const ROUTING_GUIDANCE: &str = "before raw grep";
+
+    /// Realistic long state/source roots so the measurement includes the
+    /// path-dependent suffix `instructions()` appends, not just the static
+    /// `SERVER_GUIDANCE` constant.
+    fn server_with_realistic_long_paths() -> OneupMcpServer {
+        let state_root = PathBuf::from(
+            "/Users/some-developer/Development/workspaces/example-organization/example-monorepo-with-a-long-name",
+        );
+        let source_root = PathBuf::from(
+            "/Users/some-developer/Development/workspaces/example-organization/example-monorepo-with-a-long-name/.worktrees/feature-branch-with-a-descriptive-name",
+        );
+        OneupMcpServer::new(state_root, source_root)
+    }
+
+    #[test]
+    fn rendered_instructions_stay_within_2kb_budget() {
+        let rendered = server_with_realistic_long_paths().instructions();
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BUDGET_BYTES,
+            "rendered MCP instructions are {} bytes, exceeding the {}-byte budget Claude Code truncates at",
+            rendered.len(),
+            INSTRUCTIONS_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn routing_guidance_survives_2kb_truncation() {
+        let rendered = server_with_realistic_long_paths().instructions();
+        let offset = rendered.find(ROUTING_GUIDANCE).unwrap_or_else(|| {
+            panic!("routing guidance {ROUTING_GUIDANCE:?} must be present in rendered instructions")
+        });
+        let end = offset + ROUTING_GUIDANCE.len();
+        assert!(
+            end <= INSTRUCTIONS_BUDGET_BYTES,
+            "routing guidance ends at byte {end} but must fall within the first {INSTRUCTIONS_BUDGET_BYTES} bytes to survive truncation"
+        );
+    }
+}
