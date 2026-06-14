@@ -691,6 +691,41 @@ fn release_manifest_deserializes_as_update_manifest() {
     }
 }
 
+/// Guards that the committed repo-root `update-manifest.json` never drifts away
+/// from the binary version it describes. The manifest is the client's source of
+/// truth for "what version is available"; if its `version` differs from the
+/// shipped binary, clients are told the wrong version and update trust erodes.
+///
+/// The binary version is sourced from `CARGO_PKG_VERSION` (via
+/// `TEST_RELEASE_VERSION`), never a hardcoded literal, so a normal version bump
+/// that updates both `Cargo.toml` and the manifest keeps this green with no test
+/// edit. This complements
+/// `release_manifest_generation_includes_platform_mapping_and_checksums` and
+/// `release_manifest_deserializes_as_update_manifest`, which only validate a
+/// freshly generated fixture manifest, by asserting against the committed
+/// manifest clients actually fetch. A failing `cargo test` fails CI, so this is
+/// hard-fail enforcement with no warn-only path.
+#[test]
+fn committed_update_manifest_version_matches_binary() {
+    let manifest_path = repo_root().join("update-manifest.json");
+    let raw = fs::read(&manifest_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read committed manifest at {}: {err}",
+            manifest_path.display()
+        )
+    });
+    let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
+        .expect("committed update-manifest.json should deserialize as UpdateManifest");
+
+    assert_eq!(
+        manifest.version, TEST_RELEASE_VERSION,
+        "committed update-manifest.json version `{}` does not match the binary version \
+         `{}` (CARGO_PKG_VERSION); bump update-manifest.json `version` and Cargo.toml \
+         together so the published manifest tracks the shipped binary",
+        manifest.version, TEST_RELEASE_VERSION
+    );
+}
+
 #[test]
 fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
