@@ -188,6 +188,8 @@ It does not:
 
 Host configuration remains owned by the host itself or by the user through manual config review.
 
+**All worktrees of a repository must run the same `1up` version.** Linked worktrees share one physical `.1up/index.db`, and the first writer defines its schema for every checkout. If a second worktree opens that shared index with a different-version binary, `1up` fails closed with a precise error that names the offending schema version and the worktree path sharing the index (for example, `index schema is out of date (found v15, expected v16) for worktree '/path/to/worktree' sharing index '/repo/.1up/index.db'`). To fix it, align every worktree on the same `1up` version: upgrade the lagging worktree when its binary is older than the index (`index schema ... is newer than this binary supports`), or run `1up reindex` when its binary is newer than the index (`index schema is out of date`).
+
 ## <img src="assets/readme/icons/heroicons-solid/information-circle.svg" alt="" width="20" height="20"> What To Expect
 
 - The first semantic run may download verified [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) model artifacts from Hugging Face.
