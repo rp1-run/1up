@@ -1,6 +1,6 @@
 # 1up - Knowledge Base Index
 
-**What**: A local-first code discovery substrate that indexes repositories with tree-sitter parsing, ONNX embeddings, libSQL FTS/vector storage, and relation metadata, then exposes search, get, symbol, context, structural, impact, indexing, daemon, and MCP workflows through a single Rust binary.
+**What**: A local-first code discovery substrate that indexes repositories with tree-sitter parsing, ONNX embeddings, libSQL FTS/vector storage, and relation metadata, then exposes search, get, symbol, context, structural, impact, overview, indexing, daemon, and MCP workflows through a single Rust binary.
 
 **Why**: It gives humans and agents a fast, local, evidence-oriented path from ranked code discovery to exact source hydration, symbol verification, and bounded likely-impact exploration without relying on broad raw search as the first step.
 
@@ -10,22 +10,22 @@
 |---|---|
 | Type | Single project |
 | Entry point | `src/main.rs` -> `src/cli/mod.rs` |
-| Primary agent surface | `1up mcp --path <repo>` exposing `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural` |
-| Key patterns | Layered CLI + MCP + daemon, search-before-get/context, candidate-first retrieval, local-only advisory impact, metadata-prefiltered indexing |
+| Primary agent surface | `1up mcp --path <repo>` exposing `oneup_status`, `oneup_start`, `oneup_overview`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural` |
+| Key patterns | Layered CLI + MCP + daemon, orientation-before-discovery, search-before-get/context, candidate-first retrieval, local-only advisory impact, metadata-prefiltered indexing, single-source-of-truth tool guidance |
 | Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, rmcp, clap, TypeScript evals, shell release scripts |
-| Version | 0.1.8 |
-| Schema version | 13 (`FLOAT8(384)`, `vector8(?)`, `compress_neighbors=float8`, `max_neighbors=32`, `VECTOR_PREFILTER_K=400`) |
-| Last generated | 2026-05-01T00:45:02Z |
+| Version | 0.1.11 |
+| Schema version | 16 (`FLOAT8(384)`, `vector8(?)`, `compress_neighbors=float8`, `max_neighbors=32`, `VECTOR_PREFILTER_K=400`; v16 stores cleaned markdown heading breadcrumbs) |
+| Last generated | 2026-06-14T23:12:20Z |
 
 ## KB File Manifest
 
 | File | Lines | Load For |
 |---|---:|---|
-| [concept_map.md](concept_map.md) | 176 | Domain terminology, code-discovery concepts, MCP tool vocabulary, storage/search/impact relationships |
-| [architecture.md](architecture.md) | 183 | System topology, data/state layout, MCP/CLI/daemon flows, release and indexing architecture |
-| [interaction-model.md](interaction-model.md) | 169 | Agent and CLI interaction semantics, readiness states, output contracts, setup/onboarding flows |
-| [modules.md](modules.md) | 158 | Component ownership, module dependencies, public boundaries, tests/evals/scripts organization |
-| [patterns.md](patterns.md) | 92 | Coding conventions, data modeling, errors, validation, output, storage, concurrency, testing idioms |
+| [concept_map.md](concept_map.md) | 165 | Domain terminology, code-discovery concepts, MCP tool vocabulary, storage/search/impact relationships |
+| [architecture.md](architecture.md) | 244 | System topology, data/state layout, MCP/CLI/daemon flows, release and indexing architecture |
+| [interaction-model.md](interaction-model.md) | 115 | Agent and CLI interaction semantics, readiness states, output contracts, setup/onboarding flows |
+| [modules.md](modules.md) | 214 | Component ownership, module dependencies, public boundaries, tests/evals/scripts organization |
+| [patterns.md](patterns.md) | 91 | Coding conventions, data modeling, errors, validation, output, storage, concurrency, testing idioms |
 
 ## Task-Based Loading
 
@@ -43,28 +43,27 @@
 
 ## Recent Learnings
 
-- MCP is now a first-class top-level module and the canonical agent surface, not an incidental CLI/daemon behavior. Agents should use canonical `oneup_*` MCP tools for discovery before broad raw search.
-- The former reminder/skill/`hello-agent` adoption path is historical; current onboarding uses server identity `oneup`, `1up mcp --path <repo>`, repo instruction files, setup docs, host reload/trust prompts, and adoption evals.
-- Search is explicitly search -> get/context -> verify: ranked discovery returns compact segment handles, `oneup_get` hydrates selected evidence, `oneup_context` reads precise file-line context, and `oneup_symbol` is the completeness-oriented path for known symbols.
-- Retained human discovery CLI commands (`get`, `symbol`, `context`, `impact`) default to readable output, use `--plain` for lean output, and reject `--format`; maintenance commands keep human/plain/json formatting.
-- MCP tools return structured `ToolEnvelope` responses with `status`, `summary`, `data`, and `next_actions`, making status/start/search/get/symbol/context/impact/structural a guided loop.
-- Project resolution separates `state_root` from `source_root`, allowing linked worktrees to reuse main-worktree `.1up` state while scanning the active source tree.
-- Schema v13 remains current: `segment_vectors.embedding_vec` is `FLOAT8(384)`, vector writes and reads use `vector8(?)`, and incompatible storage formats fail closed with `1up reindex` guidance.
-- Indexing is metadata-first and transactional: `indexed_files` skips unchanged size/mtime rows before content reads, scoped runs fall back to full when unsafe, and file replacement updates segments, vectors, symbols, relations, and manifest rows together.
-- Impact remains local-only and advisory. Primary likely-impact `results` must stay separate from lower-confidence `contextual_results`, and `refused`/`empty` states carry narrowing guidance.
-- Release architecture now validates MCP as a public contract: archive smoke checks list the retained eight canonical tools, call readiness and discovery tools, verify structured content, and ensure stdout remains JSON-RPC clean.
+- The retained MCP tool set is now **nine** tools: `oneup_overview` was added as a deterministic repository orientation digest (recommended first call on an unfamiliar repo). `RETAINED_PUBLIC_TOOLS` (`src/mcp/types.rs`) is the single source of truth; the legacy `oneup_prepare`/`oneup_read` names do not exist.
+- Agent guidance is now single-sourced in `src/mcp` (server `instructions`, per-tool descriptions, and `next_actions`). README/docs no longer instruct pasting a hint into user instruction files; `AGENTS.md`/`CLAUDE.md`/`DEVELOPMENT.md` discovery blocks are one-line in-band pointers. 1up writes nothing to user instruction files by default.
+- A new opt-in `1up doctor --clean-hints` command (visible top-level) cleans legacy pasted hints: read-only preview by default, mutation gated behind `--apply`, fence-only auto-remove of a 1up-owned `<!-- 1up:hint:begin/end -->` span, and detect-and-advise (never auto-edit) for unfenced stale tokens. Backed by the pure `src/cli/hint_cleanup.rs` classifier and `atomic_replace_within_project_root` (`src/shared/fs.rs`).
+- Schema is now **v16** (was 13): `segment_vectors.embedding_vec` is `FLOAT8(384)`, vector writes/reads use `vector8(?)`, and incompatible formats fail closed with `1up reindex` guidance. v16 stores cleaned markdown heading-breadcrumb text.
+- A documentation tool-name pin test (`tests/release_assets_tests.rs`) asserts every `oneup_*` token in repo docs is a `RETAINED_PUBLIC_TOOLS` member, and a committed-manifest test pins `update-manifest.json` version to `CARGO_PKG_VERSION` (hard-fail on drift). The benchmark schema gate derives its expected version from `constants.rs` rather than a hardcoded literal.
+- MCP `instructions` are engineered to fit a ~2KB host truncation budget with the "use 1up before raw grep" routing rule front-loaded so it survives truncation.
+- Search remains search -> get/context -> verify with candidate-first hybrid retrieval (vector + FTS + symbol via RRF); the vector stage uses an exact exhaustive scan for small corpora and an approximate index above `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`.
+- Project resolution separates `state_root` from `source_root` via a `WorktreeContext` carrying `context_id`, so linked worktrees share one `.1up` index scoped logically per context.
+- Impact remains local-only and advisory: primary likely-impact `results` stay separate from lower-confidence `contextual_results`, and `refused`/`empty` states carry narrowing guidance.
 
 ## Project Structure
 
 ```text
 src/
-  cli/       # Human CLI commands, lean core output, maintenance renderers, MCP launch/setup
-  mcp/       # rmcp stdio server, tool schemas, operation adapters, structured envelopes
-  search/    # Hybrid retrieval, ranking, symbol, context, structural, impact engines
-  indexer/   # Scan, parse/chunk, embed, metadata prefilter, progress, storage pipeline
-  storage/   # libSQL schema v13, SQL, segments, vectors, symbols, relations, manifest
+  cli/       # Human CLI commands, lean core output, maintenance renderers, doctor cleanup, MCP launch/setup
+  mcp/       # rmcp stdio server, 9 tool schemas, operation adapters, structured envelopes, RETAINED_PUBLIC_TOOLS
+  search/    # Hybrid retrieval, ranking, intent, scope, symbol, context, structural, impact, overview engines
+  indexer/   # Scan, parse/chunk, markdown doc-sections, embed, metadata prefilter, progress, storage pipeline
+  storage/   # libSQL schema v16, SQL, segments, vectors, symbols, relations, manifest
   daemon/    # Registry, lifecycle, watcher, worker, secure search IPC, platform stubs
-  shared/    # Types, config, project roots, secure FS, symbols, errors, update helpers
+  shared/    # Types, config, project/worktree roots, secure FS, symbols, errors, update helpers
 tests/       # CLI/MCP/release/setup/security regression suites
 evals/       # Promptfoo/TypeScript search and MCP adoption evals
 scripts/     # Benchmarks, installer, release, security, MCP smoke automation

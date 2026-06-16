@@ -202,7 +202,7 @@ pub struct ResolvedProject {
     /// daemon communication, and registry operations.
     pub state_root: PathBuf,
     /// Root where source files should be read — use for scanning, indexing,
-    /// file resolution, and fence installation.
+    /// and file resolution.
     pub source_root: PathBuf,
     /// Explicit git worktree and branch metadata for the active source root.
     pub worktree_context: WorktreeContext,

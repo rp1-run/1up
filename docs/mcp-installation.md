@@ -93,14 +93,6 @@ Expected tools: `oneup_status`, `oneup_start`, `oneup_search`, `oneup_get`, `one
 
 If `oneup_status` reports `missing` or `stale`, call `oneup_start` with the mode suggested in the response, then check readiness again. Once readiness is `ready`, use `oneup_search`, then hydrate evidence with `oneup_get` or `oneup_context`.
 
-## Repository Instruction Hint
-
-Agents choose better tools when the repository instruction file tells them to use `oneup` before broad raw search. If the repository does not already have equivalent guidance in `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or a host-specific instruction file, add this hint:
-
-```text
-For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search. Use `oneup_status` when readiness is unknown, `oneup_start` only when indexing or rebuilding is needed, `oneup_overview` for an orientation digest when starting work on an unfamiliar repository, `oneup_search` for ranked discovery, `oneup_get` to hydrate result handles, `oneup_context` for precise file-line context, `oneup_symbol` for definitions/references, `oneup_impact` for likely blast radius, and `oneup_structural` for tree-sitter pattern searches. Use `rg`, `grep`, or `find` first only for exact literals, regexes, non-code files, or when the MCP server is unavailable.
-```
-
 ## Troubleshooting
 
 ### Host Cannot Start `oneup`
@@ -141,6 +133,37 @@ MCP stdio expects protocol messages on stdout. If a host reports parse errors:
 - Avoid shell startup files or wrappers that print banners to stdout.
 - Try the absolute binary path from `command -v 1up`.
 - Capture the host log, `1up --version`, OS, host version, and exact MCP config.
+
+## Cleaning Legacy Pasted 1up Hints
+
+Older 1up onboarding once asked users to paste a code-discovery hint block into their own project instruction files. Some of those pasted blocks reference legacy 1up tool names (the `oneup_*` tokens that 1up no longer provides), so an agent reading them is pointed at tools that do not exist. `1up doctor --clean-hints` is an opt-in helper for finding and cleaning that stale guidance.
+
+This command is **opt-in and default-OFF**: 1up writes nothing to your instruction files unless you run it explicitly. Normal 1up operation (`1up start`, indexing, search) never creates or edits these files.
+
+When you run it with `--clean-hints`, it inspects three files in the project root:
+
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.github/copilot-instructions.md`
+
+It detects legacy stale 1up tool tokens, defined precisely as any `oneup_*` token that is not one of 1up's current real tools. Currently retained tools are never flagged.
+
+There are two behaviors, and they are deliberately conservative:
+
+- **Fence-only auto-remove**: the command removes only a span 1up can prove it owns — a fenced block delimited by `<!-- 1up:hint:begin -->` and `<!-- 1up:hint:end -->`. Everything outside that exact pair is preserved byte-for-byte. Because earlier guidance was pasted unfenced and 1up has never written such a fence, this path rarely matches existing files in practice.
+- **Detect-and-advise**: for any stale token that is not inside a 1up-owned fence, the command reports what it found and recommends manual removal. It never edits unfenced content.
+
+The safety model is preview-first:
+
+```sh
+# Read-only preview (writes nothing):
+1up doctor --clean-hints
+
+# Apply the fence-only removal (the only path that edits a file):
+1up doctor --clean-hints --apply
+```
+
+Without `--apply` the command only reports. With `--apply` it removes a 1up-owned fenced span if one is present; unfenced stale tokens are always advised, never edited.
 
 ## Safety
 

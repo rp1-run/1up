@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use oneup::mcp::types::RETAINED_PUBLIC_TOOLS;
+
 const TEST_RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn repo_root() -> &'static Path {
@@ -689,6 +691,72 @@ fn release_manifest_deserializes_as_update_manifest() {
     }
 }
 
+/// Guards that the committed repo-root `update-manifest.json` never advertises a
+/// version *ahead* of the binary it describes. The manifest is the client's
+/// source of truth for "what version is available"; if its `version` ever
+/// exceeds the shipped binary version, clients are told a version exists that the
+/// binary cannot be — an ahead/typo'd version is the real drift bug to catch.
+///
+/// The invariant is `manifest.version <= CARGO_PKG_VERSION` (semver), not strict
+/// equality, because the manifest is allowed to *lag* by a release during a
+/// publish window: release-please bumps `Cargo.toml` in the release PR (so
+/// `push:main` already carries the new `CARGO_PKG_VERSION`), but
+/// `publish-update-manifest.yml` commits `update-manifest.json` separately on
+/// `release:published`. Between those two events there is a guaranteed window
+/// where `manifest.version` is one release behind the binary; a strict `==`
+/// would hard-fail (red-X) CI on every release during that window. The
+/// stuck-behind case (manifest never catching up) is covered at publish time by
+/// the `verify-update-manifest` job, so this test only forbids the
+/// ahead-of-binary direction.
+///
+/// The binary version is sourced from `CARGO_PKG_VERSION` (via
+/// `TEST_RELEASE_VERSION`), never a hardcoded literal, so a normal version bump
+/// that updates both `Cargo.toml` and the manifest keeps this green with no test
+/// edit. This complements
+/// `release_manifest_generation_includes_platform_mapping_and_checksums` and
+/// `release_manifest_deserializes_as_update_manifest`, which only validate a
+/// freshly generated fixture manifest, by asserting against the committed
+/// manifest clients actually fetch. A failing `cargo test` fails CI, so this is
+/// hard-fail enforcement with no warn-only path.
+#[test]
+fn committed_update_manifest_version_not_ahead_of_binary() {
+    use semver::Version;
+
+    let manifest_path = repo_root().join("update-manifest.json");
+    let raw = fs::read(&manifest_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read committed manifest at {}: {err}",
+            manifest_path.display()
+        )
+    });
+    let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
+        .expect("committed update-manifest.json should deserialize as UpdateManifest");
+
+    let manifest_version = Version::parse(&manifest.version).unwrap_or_else(|err| {
+        panic!(
+            "committed update-manifest.json version `{}` is not valid semver: {err}",
+            manifest.version
+        )
+    });
+    let binary_version = Version::parse(TEST_RELEASE_VERSION).unwrap_or_else(|err| {
+        panic!("binary CARGO_PKG_VERSION `{TEST_RELEASE_VERSION}` is not valid semver: {err}")
+    });
+
+    assert!(
+        manifest_version <= binary_version,
+        "committed update-manifest.json version `{}` is AHEAD of the binary version \
+         `{}` (CARGO_PKG_VERSION). The manifest must never advertise a version the \
+         binary cannot be: the invariant is manifest.version <= CARGO_PKG_VERSION. \
+         Lagging by one release during the publish window is allowed (release-please \
+         bumps Cargo.toml on push:main while publish-update-manifest.yml commits the \
+         manifest later on release:published; the publish-time verify-update-manifest \
+         job covers the stuck-behind case), but an ahead/typo'd manifest version is real \
+         drift — fix update-manifest.json `version`",
+        manifest.version,
+        TEST_RELEASE_VERSION
+    );
+}
+
 #[test]
 fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     let guide = fs::read_to_string(repo_root().join("docs/mcp-installation.md")).unwrap();
@@ -699,7 +767,6 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "## Server Entry",
         "## Host Config Shapes",
         "## After Saving Config",
-        "## Repository Instruction Hint",
         "## Troubleshooting",
         "## Safety",
         "1up mcp",
@@ -718,7 +785,6 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
         "args = [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
         "\"args\": [\"mcp\", \"--path\", \"/absolute/path/to/repo\"]",
         "List MCP tools and call `oneup_status`.",
-        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
         "MCP stdio expects protocol messages on stdout.",
         "It does not edit files",
         "execute arbitrary shell commands",
@@ -796,6 +862,76 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
             !readme.contains(unsupported),
             "README should not document unsupported setup/package path {unsupported}"
         );
+    }
+
+    for paste_recommendation in [
+        "## Repository Instruction Hint",
+        "For code-discovery questions in this repo, use the `oneup` MCP tools before broad raw search.",
+        "Insert this minimal 1up hint",
+        "repo instruction file changed",
+    ] {
+        assert!(
+            !guide.contains(paste_recommendation),
+            "MCP installation guide should no longer recommend pasting a 1up hint into a user instruction file: {paste_recommendation}"
+        );
+        assert!(
+            !readme.contains(paste_recommendation),
+            "README should no longer recommend pasting a 1up hint into a user instruction file: {paste_recommendation}"
+        );
+    }
+}
+
+/// Extract every `oneup_[a-z_]+` token from `content`, mirroring regex
+/// find_iter semantics (a literal `oneup_` prefix followed by a maximal run of
+/// `[a-z_]`, scanning left-to-right with non-overlapping matches). Kept as a
+/// plain byte scan to avoid adding a `regex` dependency just for one guard.
+fn extract_oneup_tokens(content: &str) -> Vec<String> {
+    const PREFIX: &str = "oneup_";
+    let bytes = content.as_bytes();
+    let mut tokens = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = content[search_from..].find(PREFIX) {
+        let start = search_from + rel;
+        let mut end = start + PREFIX.len();
+        while end < bytes.len() && (bytes[end].is_ascii_lowercase() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start + PREFIX.len() {
+            tokens.push(content[start..end].to_string());
+            search_from = end;
+        } else {
+            search_from = start + PREFIX.len();
+        }
+    }
+    tokens
+}
+
+/// Every MCP tool name an agent can read in the repo's own instruction and doc
+/// surfaces must be a currently-retained tool. The authority is the live
+/// `RETAINED_PUBLIC_TOOLS` list, never a hardcoded duplicate, so adding or
+/// removing a real tool keeps this guard correct. Catches the agent-hint drift
+/// class (e.g. `oneup_prepare`/`oneup_read`) returning on any future doc edit.
+#[test]
+fn documentation_tool_names_match_retained_public_tools() {
+    let scanned_docs = [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "DEVELOPMENT.md",
+        "README.md",
+        "docs/mcp-installation.md",
+        "evals/README.md",
+    ];
+
+    for doc in scanned_docs {
+        let content = fs::read_to_string(repo_root().join(doc))
+            .unwrap_or_else(|err| panic!("failed to read scanned doc {doc}: {err}"));
+        for token in extract_oneup_tokens(&content) {
+            assert!(
+                RETAINED_PUBLIC_TOOLS.contains(&token.as_str()),
+                "{doc} references unknown MCP tool `{token}` not in RETAINED_PUBLIC_TOOLS \
+                 (authority: src/mcp/types.rs); correct the doc or update the retained tool set"
+            );
+        }
     }
 }
 

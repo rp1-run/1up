@@ -141,7 +141,24 @@ REPO_NAME=$(basename "$REPO")
 # independent of the pinned baseline file.
 readonly SIZE_LIMIT_BYTES=$((80 * 1024 * 1024))
 readonly TIME_LIMIT_MS=90000
-readonly EXPECTED_SCHEMA_VERSION=13
+
+# Source of truth for the expected schema version: src/shared/constants.rs.
+# Derive it at runtime (anchored on `SCHEMA_VERSION: u32 = <N>;`) so this gate
+# can never drift from the binary; a constants.rs bump updates it with no edit.
+CONSTANTS_RS="$ROOT_DIR/src/shared/constants.rs"
+if [[ ! -f "$CONSTANTS_RS" ]]; then
+  log "FATAL: schema source of truth not found: $CONSTANTS_RS"
+  exit 1
+fi
+EXPECTED_SCHEMA_VERSION=$(sed -n \
+  's/^[[:space:]]*pub const SCHEMA_VERSION:[[:space:]]*u32[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*;.*$/\1/p' \
+  "$CONSTANTS_RS" | head -n1)
+if [[ -z "$EXPECTED_SCHEMA_VERSION" || ! "$EXPECTED_SCHEMA_VERSION" =~ ^[0-9]+$ ]]; then
+  log "FATAL: could not parse SCHEMA_VERSION (u32 literal) from $CONSTANTS_RS"
+  log "       got: '${EXPECTED_SCHEMA_VERSION}'"
+  exit 1
+fi
+readonly EXPECTED_SCHEMA_VERSION
 
 mkdir -p "$OUT_DIR" "$FIXTURE_ROOT"
 

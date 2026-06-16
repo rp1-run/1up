@@ -2989,3 +2989,298 @@ fn daemon_restart_reconciles_named_branch_head_changes() {
         false,
     );
 }
+
+/// Build a `1up doctor` invocation isolated from host update state. `doctor`
+/// reads no HOME/XDG paths, but disabling the update manifest guarantees no
+/// passive update notice (or network check) can perturb stdout, keeping the
+/// JSON/text assertions below deterministic regardless of the host environment.
+fn doctor_cmd() -> Command {
+    let mut command = cmd();
+    command.env("ONEUP_UPDATE_MANIFEST_URL", "");
+    command
+}
+
+/// Wrap `body` in the 1up-owned HTML-comment fence pair the cleanup command
+/// recognizes as deterministically owned.
+fn doctor_fence(body: &str) -> String {
+    format!("<!-- 1up:hint:begin v=1 -->\n{body}\n<!-- 1up:hint:end -->\n")
+}
+
+/// Locate one inspected file's report in the JSON `files` array by its relative
+/// path, independent of array ordering.
+fn doctor_file<'a>(report: &'a serde_json::Value, file: &str) -> &'a serde_json::Value {
+    report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["file"].as_str() == Some(file))
+        .unwrap_or_else(|| panic!("no doctor report entry for {file}; got {report}"))
+}
+
+#[test]
+fn doctor_clean_hints_preview_makes_no_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let agents = root.join("AGENTS.md");
+    let original = format!(
+        "# My Project\n\nSome user notes.\n{}",
+        doctor_fence("Use oneup_prepare and oneup_read.")
+    );
+    fs::write(&agents, &original).unwrap();
+
+    let output = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Preview (no --apply) must never mutate the file.
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        original,
+        "preview run must leave the file byte-identical"
+    );
+
+    let report = json_stdout(&output);
+    let entry = doctor_file(&report, "AGENTS.md");
+    assert_eq!(entry["status"].as_str(), Some("would_remove_fence"));
+    assert_eq!(entry["modified"].as_bool(), Some(false));
+}
+
+#[test]
+fn doctor_clean_hints_apply_removes_fence_and_preserves_surrounding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let agents = root.join("AGENTS.md");
+    let before = "# My Project\n\nSome user notes.\n";
+    let after = "\nMore user notes after.\n";
+    let original = format!(
+        "{before}{}{after}",
+        doctor_fence("Use oneup_prepare and oneup_read.")
+    );
+    fs::write(&agents, &original).unwrap();
+
+    let output = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // The fence (and its single trailing blank line) is gone; every other byte
+    // of the user's content is preserved exactly.
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        "# My Project\n\nSome user notes.\nMore user notes after.\n",
+        "fence removal must preserve all surrounding content byte-for-byte"
+    );
+
+    let report = json_stdout(&output);
+    let entry = doctor_file(&report, "AGENTS.md");
+    assert_eq!(entry["status"].as_str(), Some("removed_fence"));
+    assert_eq!(entry["modified"].as_bool(), Some(true));
+    // Stale tokens lived inside the removed fence, so none are advised.
+    assert!(entry["stale_tokens"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn doctor_clean_hints_second_apply_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let agents = root.join("AGENTS.md");
+    let original = format!(
+        "# Title\n\n{}\nTrailing note.\n",
+        doctor_fence("oneup_prepare hint")
+    );
+    fs::write(&agents, &original).unwrap();
+
+    let first = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let after_first = fs::read_to_string(&agents).unwrap();
+    assert_ne!(
+        after_first, original,
+        "first --apply should remove the fence"
+    );
+
+    let second = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+
+    // A second --apply against the cleaned file is a no-op.
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        after_first,
+        "second --apply must leave the file byte-identical"
+    );
+    let report = json_stdout(&second);
+    let entry = doctor_file(&report, "AGENTS.md");
+    assert_eq!(entry["status"].as_str(), Some("clean"));
+    assert_eq!(entry["modified"].as_bool(), Some(false));
+}
+
+#[test]
+fn doctor_clean_hints_unfenced_is_advised_and_not_modified_with_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let claude = root.join("CLAUDE.md");
+    let original = "# Notes\n\nRun oneup_prepare then oneup_read to begin.\n";
+    fs::write(&claude, original).unwrap();
+
+    // --apply is set, but unfenced content must still never be auto-edited.
+    let output = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    assert_eq!(
+        fs::read_to_string(&claude).unwrap(),
+        original,
+        "unfenced content must be byte-identical even with --apply"
+    );
+
+    let report = json_stdout(&output);
+    let entry = doctor_file(&report, "CLAUDE.md");
+    assert_eq!(entry["status"].as_str(), Some("advise_unfenced"));
+    assert_eq!(entry["modified"].as_bool(), Some(false));
+    let tokens = entry["stale_tokens"].as_array().unwrap();
+    let names: Vec<&str> = tokens
+        .iter()
+        .map(|t| t["token"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["oneup_prepare", "oneup_read"]);
+    assert_eq!(tokens[0]["line"].as_u64(), Some(3));
+    assert_eq!(tokens[1]["line"].as_u64(), Some(3));
+}
+
+#[test]
+fn doctor_clean_hints_missing_files_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    // No in-scope instruction files exist in the project.
+    let json = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let report = json_stdout(&json);
+    assert!(
+        report["files"].as_array().unwrap().is_empty(),
+        "missing files must be skipped, leaving an empty report"
+    );
+
+    // The default human report says there is nothing to do.
+    doctor_cmd()
+        .args(["doctor", root.to_str().unwrap(), "--clean-hints"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to do"));
+}
+
+#[test]
+fn doctor_clean_hints_json_report_shape_covers_all_statuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".github")).unwrap();
+
+    // One fenced (auto-removable), one unfenced (advise-only), one clean file.
+    fs::write(
+        root.join("AGENTS.md"),
+        format!(
+            "# Agents\n\n{}\nKeep me.\n",
+            doctor_fence("Use oneup_prepare and oneup_read.")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("CLAUDE.md"),
+        "# Claude\n\nCall oneup_read to load context.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".github").join("copilot-instructions.md"),
+        "# Copilot\n\nUse oneup_search for discovery.\n",
+    )
+    .unwrap();
+
+    let output = doctor_cmd()
+        .args([
+            "doctor",
+            root.to_str().unwrap(),
+            "--clean-hints",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report = json_stdout(&output);
+
+    let fenced = doctor_file(&report, "AGENTS.md");
+    assert_eq!(fenced["status"].as_str(), Some("removed_fence"));
+    assert_eq!(fenced["modified"].as_bool(), Some(true));
+    assert!(fenced["stale_tokens"].as_array().unwrap().is_empty());
+    assert!(!fenced["recommended_action"].as_str().unwrap().is_empty());
+
+    let advised = doctor_file(&report, "CLAUDE.md");
+    assert_eq!(advised["status"].as_str(), Some("advise_unfenced"));
+    assert_eq!(advised["modified"].as_bool(), Some(false));
+    let advised_tokens = advised["stale_tokens"].as_array().unwrap();
+    assert_eq!(advised_tokens.len(), 1);
+    assert_eq!(advised_tokens[0]["token"].as_str(), Some("oneup_read"));
+    assert_eq!(advised_tokens[0]["line"].as_u64(), Some(3));
+    assert!(!advised["recommended_action"].as_str().unwrap().is_empty());
+
+    // A retained tool (oneup_search) must never be flagged: this file is clean.
+    let clean = doctor_file(&report, ".github/copilot-instructions.md");
+    assert_eq!(clean["status"].as_str(), Some("clean"));
+    assert_eq!(clean["modified"].as_bool(), Some(false));
+    assert!(clean["stale_tokens"].as_array().unwrap().is_empty());
+    assert!(!clean["recommended_action"].as_str().unwrap().is_empty());
+}

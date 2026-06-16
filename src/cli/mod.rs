@@ -1,7 +1,9 @@
 pub mod add_mcp;
 pub mod context;
 pub mod discovery_output;
+pub mod doctor;
 pub mod get;
+pub mod hint_cleanup;
 pub mod impact;
 pub mod index;
 pub mod init;
@@ -41,6 +43,7 @@ Commands:
   symbol  Look up symbol definitions and references
   context Read source context around a file location
   impact  Explore advisory likely impact from a known anchor
+  doctor  Diagnose and optionally clean legacy 1up hints in instruction files
 
 Options:
 {options}",
@@ -114,6 +117,38 @@ pub enum Command {
     #[command(hide = true)]
     Reindex(reindex::ReindexArgs),
 
+    /// Diagnose and optionally clean legacy 1up hints in project instruction files
+    #[command(long_about = "\
+Diagnose and optionally clean legacy 1up hints in project instruction files.
+
+OPT-IN and default-OFF: 1up writes nothing to your instruction files unless you \
+explicitly run this command. No normal 1up operation (start, indexing, search) \
+ever creates or edits these files.
+
+With --clean-hints, it inspects these files in the project root:
+  - AGENTS.md
+  - CLAUDE.md
+  - .github/copilot-instructions.md
+
+What it detects: legacy stale 1up tool tokens (for example oneup_prepare and \
+oneup_read). The rule is exact: any oneup_* token that is NOT in the current set \
+of real tools (RETAINED_PUBLIC_TOOLS) is treated as stale; real retained tools \
+are never flagged.
+
+Two behaviors:
+  - Fence-only AUTO-REMOVE: removes ONLY a 1up-owned fenced span delimited by \
+<!-- 1up:hint:begin --> and <!-- 1up:hint:end -->. Everything outside that exact \
+pair is preserved byte-for-byte. (In practice 1up has never written such a \
+fence, so this path rarely matches existing files.)
+  - DETECT-AND-ADVISE: for any stale token NOT inside a 1up-owned fence, it \
+reports the finding and recommends manual removal. It never edits unfenced \
+content.
+
+Safety model: the default is a read-only PREVIEW that writes nothing. Mutation \
+requires the explicit --apply flag, and even then only a 1up-owned fenced span \
+is ever removed.")]
+    Doctor(doctor::DoctorArgs),
+
     /// Check for updates, view update status, or apply an update
     #[command(hide = true)]
     Update(update::UpdateArgs),
@@ -132,7 +167,7 @@ impl Command {
             Command::Start(_) | Command::Status(_) | Command::List(_) | Command::Stop(_) => {
                 Some(OutputFormat::Human)
             }
-            Command::Update(_) => Some(OutputFormat::Human),
+            Command::Update(_) | Command::Doctor(_) => Some(OutputFormat::Human),
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::AddMcp(_)
             | Command::Search(_)
@@ -188,6 +223,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Reindex(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             reindex::exec(args, format).await
+        }
+        Command::Doctor(args) => {
+            let format = resolve_maintenance_format(args.format, maintenance_format);
+            doctor::exec(args, format).await
         }
         Command::Update(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
@@ -383,7 +422,7 @@ mod tests {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
         let visible_commands = [
-            "start", "status", "list", "stop", "get", "symbol", "context", "impact",
+            "start", "status", "list", "stop", "get", "symbol", "context", "impact", "doctor",
         ];
 
         for command_name in visible_commands {
@@ -475,5 +514,29 @@ mod tests {
             resolve_lifecycle_format(false, Some(OutputFormat::Json)),
             OutputFormat::Json
         );
+    }
+
+    /// Drift guard for the Doctor `long_about` prose. clap derive requires a
+    /// string literal for `long_about`, so the in-scope file list there cannot be
+    /// interpolated from [`doctor::IN_SCOPE_FILES`] (the single source of truth).
+    /// This asserts the rendered Doctor help still lists every canonical in-scope
+    /// file, so the help text can never silently diverge from the const that
+    /// actually drives the scan.
+    #[test]
+    fn doctor_long_about_lists_all_in_scope_files() {
+        let mut command = Cli::command();
+        let doctor = command
+            .find_subcommand_mut("doctor")
+            .expect("doctor subcommand should exist");
+        let help = doctor.render_long_help().to_string();
+
+        for in_scope_file in doctor::IN_SCOPE_FILES {
+            assert!(
+                help.contains(in_scope_file),
+                "Doctor long_about help must list the in-scope file {in_scope_file:?} \
+                 (canonical source: doctor::IN_SCOPE_FILES); update the long_about prose \
+                 in src/cli/mod.rs to match the const. Help was:\n{help}",
+            );
+        }
     }
 }

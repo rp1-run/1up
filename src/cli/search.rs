@@ -70,7 +70,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
 
     if !db_path.exists() {
         anyhow::bail!(
-            "no current index found at {}. Run `1up reindex` to create a fresh schema-v5 index.",
+            "no current index found at {}. Run `1up reindex` to create a fresh index.",
             db_path.display()
         );
     }
