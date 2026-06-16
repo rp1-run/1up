@@ -131,6 +131,26 @@ pub const DAEMON_DRAIN_TIMEOUT_MS: u64 = 3_000;
 /// Poll interval while waiting for a drained daemon to exit after SIGTERM.
 pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
 
+/// Whether the post-upgrade daemon auto-restart is gated on an idle/size
+/// threshold before draining and restarting on a detected version mismatch.
+///
+/// Decision (REQ-004, OQ-003): `false` — there is **no** idle/size gating by
+/// default. On a detected `daemon_version` mismatch the search path always
+/// drains the stale daemon and restarts under the current binary (trigger
+/// point: `src/cli/search.rs`). Serving silently wrong-version results is the
+/// headline hazard this phase retires, so correctness is preferred over the
+/// small risk of interrupting active work; the drain is bounded
+/// ([`DAEMON_DRAIN_TIMEOUT_MS`]) and falls back to local in-process search, so
+/// an unconditional restart can never strand the user.
+///
+/// The specific idle/size thresholds are an open owner decision (OQ-003): a
+/// future owner can flip this to `true` and add the gating check at the
+/// trigger point without re-deriving the rationale recorded here. Provisioned
+/// (unused until that owner decision) per the codebase's pre-provisioned-API
+/// convention.
+#[allow(dead_code)]
+pub const DAEMON_AUTO_RESTART_GATING_ENABLED: bool = false;
+
 /// Bounded wait for the single-writer rebuild lock before a synchronous
 /// one-shot rebuild (CLI `index`/`reindex`, MCP indexing) fails closed rather
 /// than racing a competing rebuild of the shared `.1up/index.db`. The daemon

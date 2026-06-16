@@ -67,7 +67,11 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
 
         // REQ-002: refuse the stale result, then drain the old daemon and restart
         // a fresh one under the current binary. On a detected mismatch this
-        // always drains and restarts (no idle/size gating).
+        // always drains and restarts: per the recorded gating decision
+        // (`DAEMON_AUTO_RESTART_GATING_ENABLED = false`, REQ-004/OQ-003) there is
+        // no idle/size gating. The specific idle/size thresholds are an open
+        // owner decision (OQ-003); a future owner introduces the gate here
+        // without re-deriving the rationale.
         let stale_version = daemon_version.as_deref().unwrap_or("unknown");
         eprintln!(
             "warning: daemon is running a stale binary version ({stale_version}); CLI is ({VERSION}). Draining the stale daemon and restarting under the current binary."
