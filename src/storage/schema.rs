@@ -241,20 +241,49 @@ async fn table_has_column(
     table_name: &str,
     column_name: &str,
 ) -> Result<bool, OneupError> {
+    // Retry on transient `database is locked` exactly like `schema_object_exists`:
+    // this PRAGMA-backed inspection runs on the MCP status / readiness path while
+    // an auto-started daemon may hold a write lock, and a single-shot failure
+    // would surface as a misleading `stale` schema state instead of retrying.
+    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    let mut last_error = None;
+
+    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
+        match table_has_column_once(conn, table_name, column_name).await {
+            Ok(exists) => return Ok(exists),
+            Err(e) => {
+                let err_text = e.to_string();
+                if !is_lock_error(&err_text) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
+                    return Err(StorageError::Query(format!(
+                        "table column inspection failed for {table_name}.{column_name}: {err_text}"
+                    ))
+                    .into());
+                }
+                last_error = Some(err_text);
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+
+    Err(StorageError::Query(format!(
+        "table column inspection failed for {table_name}.{column_name}: {}",
+        last_error.unwrap_or_else(|| "database inspection failed".to_string())
+    ))
+    .into())
+}
+
+async fn table_has_column_once(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, libsql::Error> {
     let query = format!("SELECT 1 FROM pragma_table_info('{table_name}') WHERE name = ?1 LIMIT 1");
-    let mut rows = conn.query(&query, [column_name]).await.map_err(|e| {
-        StorageError::Query(format!(
-            "failed to inspect table column {table_name}.{column_name}: {e}"
-        ))
-    })?;
+    let mut rows = conn.query(&query, [column_name]).await?;
 
     match rows.next().await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(e) => Err(StorageError::Query(format!(
-            "table column inspection failed for {table_name}.{column_name}: {e}"
-        ))
-        .into()),
+        Err(e) => Err(e),
     }
 }
 
