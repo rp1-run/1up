@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Args;
 use std::io::{self, Write};
 use std::path::Path;
@@ -54,18 +55,53 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     )
     .await
     {
-        write_results(&results)?;
-        if let Some(reason) = degraded_reason {
-            eprintln!("warning: {reason}");
+        // REQ-001: classify by version BEFORE writing. A daemon still running the
+        // previous binary stamps a mismatched `daemon_version`; its results must
+        // never be served as authoritative, so the version check now gates the
+        // write instead of trailing a soft warning after results were already
+        // emitted (the headline write-then-warn bug).
+        if daemon_response_is_authoritative(daemon_version.as_deref()) {
+            serve_daemon_results(&results, degraded_reason)?;
+            return Ok(());
         }
-        if let Some(ref dv) = daemon_version {
-            if dv != VERSION {
-                eprintln!(
-                    "warning: CLI version ({VERSION}) differs from daemon version ({dv}). Run `1up stop` and re-run your command to restart the daemon under the current binary."
-                );
+
+        // REQ-002: refuse the stale result, then drain the old daemon and restart
+        // a fresh one under the current binary. On a detected mismatch this
+        // always drains and restarts (no idle/size gating).
+        let stale_version = daemon_version.as_deref().unwrap_or("unknown");
+        eprintln!(
+            "warning: daemon is running a stale binary version ({stale_version}); CLI is ({VERSION}). Draining the stale daemon and restarting under the current binary."
+        );
+
+        match drain_and_restart_stale_daemon(&project_root, &source_root) {
+            Ok(()) => {
+                // Re-attempt against the fresh daemon and serve only if it now
+                // reports a matching version. If it is not yet ready (or somehow
+                // still mismatched), fall through to the local search below.
+                if let Some((results, daemon_version, degraded_reason)) = try_daemon_search(
+                    &project_root,
+                    &source_root,
+                    search_scope.context_id(),
+                    &args.query,
+                    args.limit,
+                )
+                .await
+                {
+                    if daemon_response_is_authoritative(daemon_version.as_deref()) {
+                        serve_daemon_results(&results, degraded_reason)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(err) => {
+                // Drain exceeded its bound or the restart failed: surface the
+                // actionable guidance (the drain-timeout error already says to
+                // run `1up stop` then retry) and fall back to local search.
+                eprintln!("warning: {err}");
             }
         }
-        return Ok(());
+        // Fall through to the local in-process search below: a version mismatch
+        // is served from the current binary locally, never from the stale daemon.
     }
 
     if !db_path.exists() {
@@ -143,6 +179,50 @@ fn write_results(results: &[SearchResult]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes authoritative daemon results to stdout and emits any degraded-search
+/// notice to stderr, keeping the machine-readable result stream on stdout clean.
+fn serve_daemon_results(
+    results: &[SearchResult],
+    degraded_reason: Option<String>,
+) -> anyhow::Result<()> {
+    write_results(results)?;
+    if let Some(reason) = degraded_reason {
+        eprintln!("warning: {reason}");
+    }
+    Ok(())
+}
+
+/// Whether a daemon search response may be served as authoritative.
+///
+/// A response whose `daemon_version` matches the running binary is authoritative.
+/// A *known* mismatch is refused (REQ-001) so results produced by a daemon still
+/// running the previous binary are never served; an absent version is treated as
+/// authoritative to preserve the established no-version-info behavior.
+fn daemon_response_is_authoritative(daemon_version: Option<&str>) -> bool {
+    daemon_version.is_none_or(|dv| dv == VERSION)
+}
+
+/// Refuses a stale-binary daemon (REQ-002): drains the running daemon then
+/// restarts a fresh one under the current binary so the retried search is served
+/// by a matching-version daemon. Returns the actionable error on a drain timeout
+/// or a restart failure so the caller surfaces it and falls back to local search
+/// rather than serving stale results.
+fn drain_and_restart_stale_daemon(project_root: &Path, source_root: &Path) -> anyhow::Result<()> {
+    let project_id = project::read_project_id(project_root)
+        .context("read project id while restarting the stale daemon")?;
+    match lifecycle::is_daemon_running()? {
+        Some(pid) => {
+            lifecycle::drain_and_restart_daemon(pid, &project_id, project_root, source_root)?;
+        }
+        None => {
+            // The stale daemon exited between the search and now; spawn a fresh
+            // one under the current binary instead of draining a dead pid.
+            lifecycle::ensure_daemon(&project_id, project_root, source_root)?;
+        }
+    }
+    Ok(())
+}
+
 async fn try_daemon_search(
     project_root: &Path,
     source_root: &Path,
@@ -181,7 +261,8 @@ fn warn_if_degraded_branch_context(scope: &SearchScope) {
 
 #[cfg(test)]
 mod tests {
-    use super::SearchArgs;
+    use super::{daemon_response_is_authoritative, SearchArgs};
+    use crate::shared::constants::VERSION;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -200,5 +281,24 @@ mod tests {
     fn search_limit_override_is_respected() {
         let cli = TestCli::parse_from(["test", "needle", "-n", "7"]);
         assert_eq!(cli.args.limit, 7);
+    }
+
+    /// REQ-001: a daemon response whose `daemon_version` differs from the running
+    /// binary must be refused (non-authoritative) so the caller takes the
+    /// drain/restart path instead of writing stale-binary results. A matching or
+    /// absent version stays authoritative. This is the inverted-ordering guard;
+    /// before the fix there was no version gate and stale results were written.
+    #[test]
+    fn daemon_response_authority_is_gated_by_version() {
+        // Known mismatch -> refused, so the write is skipped and the mismatch
+        // (drain+restart) path is taken.
+        assert!(!daemon_response_is_authoritative(Some(
+            "0.0.0-stale-binary"
+        )));
+        // Same binary -> authoritative, results may be served.
+        assert!(daemon_response_is_authoritative(Some(VERSION)));
+        // No version reported -> authoritative (preserves prior behavior; we
+        // only refuse on a *known* mismatch).
+        assert!(daemon_response_is_authoritative(None));
     }
 }
