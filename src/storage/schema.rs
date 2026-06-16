@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -133,10 +134,61 @@ async fn set_schema_version(conn: &Connection, version: u32) -> Result<(), Oneup
     Ok(())
 }
 
+/// Caller-supplied location for a schema-gate failure.
+///
+/// Threaded into [`ensure_current`] so a version mismatch can name the worktree
+/// the caller resolved and the shared `.1up/index.db` it opened. Because every
+/// git worktree of a repository shares one physical index (scoped only logically
+/// by `context_id`), naming both turns the otherwise-generic cross-worktree drift
+/// into an actionable error. Both paths are optional so internal write-path callers
+/// (`prepare_for_write`) that hold no resolved paths can still gate without
+/// fabricating one — the message then names the offending version and remediation
+/// without a location clause.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchemaContext<'a> {
+    pub db_path: Option<&'a Path>,
+    pub worktree_path: Option<&'a Path>,
+}
+
+impl<'a> SchemaContext<'a> {
+    /// Context naming the shared index and the worktree that opened it.
+    pub fn new(db_path: &'a Path, worktree_path: &'a Path) -> Self {
+        Self {
+            db_path: Some(db_path),
+            worktree_path: Some(worktree_path),
+        }
+    }
+
+    /// Context for internal callers that hold no resolved paths; the error still
+    /// names the offending version and remediation, just not a location.
+    pub fn unspecified() -> Self {
+        Self::default()
+    }
+}
+
+/// Render the caller-supplied location as a trailing clause for a version-mismatch
+/// message (e.g. ` for worktree '/a/wt' sharing index '/repo/.1up/index.db'`).
+/// Returns an empty string when no paths were supplied so the mandated substring
+/// contract that `src/cli/start.rs` parses is never perturbed. The clause is always
+/// appended *after* the `(found v.., expected v..)` / `index schema v..` tokens, so
+/// the first-match version parsers in `start.rs` keep reading the real versions.
+fn schema_location_clause(ctx: &SchemaContext) -> String {
+    match (ctx.worktree_path, ctx.db_path) {
+        (Some(worktree), Some(db)) => format!(
+            " for worktree '{}' sharing index '{}'",
+            worktree.display(),
+            db.display()
+        ),
+        (Some(worktree), None) => format!(" for worktree '{}'", worktree.display()),
+        (None, Some(db)) => format!(" for index '{}'", db.display()),
+        (None, None) => String::new(),
+    }
+}
+
 /// Create the current schema for an empty database or require explicit rebuild guidance.
 pub async fn prepare_for_write(conn: &Connection) -> Result<(), OneupError> {
     if database_has_user_tables(conn).await? {
-        ensure_current(conn).await
+        ensure_current(conn, &SchemaContext::unspecified()).await
     } else {
         initialize(conn).await
     }
@@ -151,16 +203,25 @@ pub async fn rebuild(conn: &Connection) -> Result<(), OneupError> {
 }
 
 /// Verify that an existing database matches the current schema without mutating it.
-pub async fn ensure_current(conn: &Connection) -> Result<(), OneupError> {
+///
+/// On a version mismatch the error names the offending version, the caller-supplied
+/// worktree/index location (via `ctx`), and the exact remediation. The mandated
+/// substrings (`out of date`, `found v{N}`, `expected v{M}`, `newer than this binary
+/// supports`, and the `; run `1up reindex`` remediation) are preserved verbatim so the
+/// `src/cli/start.rs` parser (`classify_schema_error`/`parse_schema_versions`) keeps
+/// classifying the enriched message.
+pub async fn ensure_current(conn: &Connection, ctx: &SchemaContext<'_>) -> Result<(), OneupError> {
     let current = get_schema_version(conn).await?;
 
     match current {
         Some(v) if v == SCHEMA_VERSION => validate_required_objects(conn).await,
         Some(v) if v < SCHEMA_VERSION => Err(reindex_required(format!(
-            "index schema is out of date (found v{v}, expected v{SCHEMA_VERSION})"
+            "index schema is out of date (found v{v}, expected v{SCHEMA_VERSION}){location}",
+            location = schema_location_clause(ctx)
         ))),
         Some(v) => Err(StorageError::Migration(format!(
-            "index schema v{v} is newer than this binary supports (expected v{SCHEMA_VERSION}); rebuild with a compatible binary or upgrade `1up`"
+            "index schema v{v} is newer than this binary supports (expected v{SCHEMA_VERSION}){location}; rebuild with a compatible binary or upgrade `1up`",
+            location = schema_location_clause(ctx)
         ))
         .into()),
         None => {
@@ -707,7 +768,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        ensure_current(&conn).await.unwrap();
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -775,7 +838,9 @@ mod tests {
         .await
         .unwrap();
 
-        let err = ensure_current(&conn).await.unwrap_err();
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("incomplete"));
         assert!(msg.contains("run `1up reindex`"));
@@ -840,7 +905,9 @@ mod tests {
         .await
         .unwrap();
 
-        let err = ensure_current(&conn).await.unwrap_err();
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("segment_relations.edge_identity_kind"));
         assert!(msg.contains("run `1up reindex`"));
@@ -861,6 +928,117 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        ensure_current(&conn).await.unwrap();
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap();
+    }
+
+    /// Seed a meta-only DB at an arbitrary schema version so the version-mismatch
+    /// branches of `ensure_current` can be exercised in isolation.
+    async fn seed_schema_version(conn: &Connection, version: u32) {
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            [META_KEY_SCHEMA_VERSION, &version.to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_current_names_version_worktree_and_remediation_for_older_db() {
+        let (_db, conn) = setup().await;
+        seed_schema_version(&conn, SCHEMA_VERSION - 1).await;
+
+        let db_path = Path::new("/repo/.1up/index.db");
+        let worktree_path = Path::new("/repo/worktrees/feature-x");
+        let err = ensure_current(&conn, &SchemaContext::new(db_path, worktree_path))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        // Mandated substring contract (consumed by start.rs::parse_schema_versions).
+        assert!(
+            msg.contains("out of date"),
+            "older-DB error must say `out of date`; got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("found v{}", SCHEMA_VERSION - 1)),
+            "older-DB error must name the found version; got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("expected v{SCHEMA_VERSION}")),
+            "older-DB error must name the expected version; got: {msg}"
+        );
+        assert!(
+            msg.contains("run `1up reindex`"),
+            "older-DB error must state the reindex remediation; got: {msg}"
+        );
+        // Enrichment: names the worktree and the shared index path.
+        assert!(
+            msg.contains("/repo/worktrees/feature-x"),
+            "older-DB error must name the worktree path; got: {msg}"
+        );
+        assert!(
+            msg.contains("/repo/.1up/index.db"),
+            "older-DB error must name the shared index path; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_current_names_version_worktree_and_remediation_for_newer_db() {
+        let (_db, conn) = setup().await;
+        seed_schema_version(&conn, SCHEMA_VERSION + 1).await;
+
+        let db_path = Path::new("/repo/.1up/index.db");
+        let worktree_path = Path::new("/repo/worktrees/feature-y");
+        let err = ensure_current(&conn, &SchemaContext::new(db_path, worktree_path))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        // Mandated substring contract (consumed by start.rs::classify_schema_error
+        // + parse_single_version, which reads the integer after "index schema v").
+        assert!(
+            msg.contains("newer than this binary supports"),
+            "newer-DB error must say `newer than this binary supports`; got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("index schema v{}", SCHEMA_VERSION + 1)),
+            "newer-DB error must name the found version after `index schema v`; got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("expected v{SCHEMA_VERSION}")),
+            "newer-DB error must name the expected version; got: {msg}"
+        );
+        // Enrichment: names the worktree and the shared index path.
+        assert!(
+            msg.contains("/repo/worktrees/feature-y"),
+            "newer-DB error must name the worktree path; got: {msg}"
+        );
+        assert!(
+            msg.contains("/repo/.1up/index.db"),
+            "newer-DB error must name the shared index path; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_current_omits_location_clause_when_context_unspecified() {
+        let (_db, conn) = setup().await;
+        seed_schema_version(&conn, SCHEMA_VERSION - 1).await;
+
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        // Substring contract still holds with no location supplied.
+        assert!(msg.contains(&format!("found v{}", SCHEMA_VERSION - 1)));
+        assert!(msg.contains(&format!("expected v{SCHEMA_VERSION}")));
+        assert!(msg.contains("run `1up reindex`"));
+        assert!(
+            !msg.contains("for worktree"),
+            "unspecified context must not render a location clause; got: {msg}"
+        );
     }
 }

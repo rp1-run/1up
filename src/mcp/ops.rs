@@ -459,7 +459,9 @@ pub async fn classify_readiness(
 
     payload.schema_version = schema::get_schema_version(&conn).await.ok().flatten();
 
-    if let Err(err) = schema::ensure_current(&conn).await {
+    if let Err(err) =
+        schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, source_root)).await
+    {
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
@@ -982,7 +984,7 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::ensure_current(&conn).await?;
+    schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, state_root)).await?;
 
     Ok(CurrentIndex { conn, _db: db })
 }

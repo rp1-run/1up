@@ -77,7 +77,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::ensure_current(&conn).await?;
+    schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, &source_root)).await?;
 
     let results = if retrieval::has_indexed_embeddings(&conn, &search_scope).await? {
         let mut runtime = EmbeddingRuntime::default();

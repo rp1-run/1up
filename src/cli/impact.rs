@@ -123,7 +123,11 @@ pub async fn exec(args: ImpactArgs) -> anyhow::Result<()> {
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::ensure_current(&conn).await?;
+    schema::ensure_current(
+        &conn,
+        &schema::SchemaContext::new(&db_path, &resolved.source_root),
+    )
+    .await?;
 
     let engine = ImpactHorizonEngine::new_scoped(&conn, search_scope);
     let result = engine.explore(args.to_request()?).await?;

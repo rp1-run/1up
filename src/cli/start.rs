@@ -549,7 +549,7 @@ async fn classify_project_index(project_root: &Path) -> anyhow::Result<ProjectIn
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
 
-    match schema::ensure_current(&conn).await {
+    match schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, project_root)).await {
         Ok(()) => Ok(ProjectIndexState::Current),
         Err(err) => Ok(classify_schema_error(&err.to_string())),
     }

@@ -1174,7 +1174,13 @@ async fn handle_search_request(
         }
     };
 
-    if let Err(err) = schema::ensure_current(&conn).await {
+    let schema_db_path = config::project_db_path(&state.project_root);
+    if let Err(err) = schema::ensure_current(
+        &conn,
+        &schema::SchemaContext::new(&schema_db_path, &state.source_root),
+    )
+    .await
+    {
         warn!(
             "daemon search index is unavailable for {}: {err}",
             state.project_root.display()
