@@ -55,7 +55,7 @@ Evidence: `src/cli/mod.rs:55`, `src/mcp/server.rs:82`, `src/mcp/ops.rs:40`
 
 **Organization**: Unit tests in module `#[cfg(test)]` blocks; integration/CLI tests under `tests/`. Release/script behavior is black-box: tests spawn release shell scripts and a stdio MCP fixture binary via `std::process::Command`, asserting on emitted JSON evidence.
 **Fixtures**: Storage tests use a real libSQL DB in a tempdir + explicit `schema::initialize`; in-memory `Db::open_memory` available. Drift/version guards source the expected value from `CARGO_PKG_VERSION`, never a literal, so a normal bump stays green.
-**Levels**: Behavioral guards over snapshots: `documentation_tool_names_match_retained_public_tools` scans docs for `oneup_*` tokens and asserts each is in `RETAINED_PUBLIC_TOOLS`; `committed_update_manifest_version_matches_binary` pins manifest version to the binary.
+**Levels**: Behavioral guards over snapshots: `documentation_tool_names_match_retained_public_tools` scans docs for `oneup_*` tokens and asserts each is in `RETAINED_PUBLIC_TOOLS`; `committed_update_manifest_version_not_ahead_of_binary` asserts the manifest version is never ahead of the binary (semver `<=`, tolerating the release-window lag).
 
 Evidence: `tests/release_assets_tests.rs:884`, `tests/release_assets_tests.rs:709`, `src/cli/mod.rs:281`
 

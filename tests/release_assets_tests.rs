@@ -719,7 +719,7 @@ fn release_manifest_deserializes_as_update_manifest() {
 /// manifest clients actually fetch. A failing `cargo test` fails CI, so this is
 /// hard-fail enforcement with no warn-only path.
 #[test]
-fn committed_update_manifest_version_matches_binary() {
+fn committed_update_manifest_version_not_ahead_of_binary() {
     use semver::Version;
 
     let manifest_path = repo_root().join("update-manifest.json");
