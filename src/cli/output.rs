@@ -1023,7 +1023,7 @@ impl Formatter for HumanFormatter {
         if report.files.is_empty() {
             return format!(
                 "No in-scope instruction files found ({}). Nothing to do.",
-                DOCTOR_IN_SCOPE_LABEL
+                doctor_in_scope_label()
             );
         }
 
@@ -1432,9 +1432,12 @@ impl Formatter for PlainFormatter {
     }
 }
 
-/// Human-readable label of the in-scope instruction file set, for the empty
-/// doctor report.
-const DOCTOR_IN_SCOPE_LABEL: &str = "AGENTS.md, CLAUDE.md, .github/copilot-instructions.md";
+/// Human-readable, comma-separated label of the in-scope instruction file set,
+/// for the empty doctor report. Derived from the single source of truth
+/// [`crate::cli::doctor::IN_SCOPE_FILES`] so the two can never drift.
+fn doctor_in_scope_label() -> String {
+    crate::cli::doctor::IN_SCOPE_FILES.join(", ")
+}
 
 fn render_doctor_status_human(status: DoctorFileStatus) -> String {
     match status {

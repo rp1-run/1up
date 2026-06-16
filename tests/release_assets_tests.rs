@@ -691,10 +691,23 @@ fn release_manifest_deserializes_as_update_manifest() {
     }
 }
 
-/// Guards that the committed repo-root `update-manifest.json` never drifts away
-/// from the binary version it describes. The manifest is the client's source of
-/// truth for "what version is available"; if its `version` differs from the
-/// shipped binary, clients are told the wrong version and update trust erodes.
+/// Guards that the committed repo-root `update-manifest.json` never advertises a
+/// version *ahead* of the binary it describes. The manifest is the client's
+/// source of truth for "what version is available"; if its `version` ever
+/// exceeds the shipped binary version, clients are told a version exists that the
+/// binary cannot be — an ahead/typo'd version is the real drift bug to catch.
+///
+/// The invariant is `manifest.version <= CARGO_PKG_VERSION` (semver), not strict
+/// equality, because the manifest is allowed to *lag* by a release during a
+/// publish window: release-please bumps `Cargo.toml` in the release PR (so
+/// `push:main` already carries the new `CARGO_PKG_VERSION`), but
+/// `publish-update-manifest.yml` commits `update-manifest.json` separately on
+/// `release:published`. Between those two events there is a guaranteed window
+/// where `manifest.version` is one release behind the binary; a strict `==`
+/// would hard-fail (red-X) CI on every release during that window. The
+/// stuck-behind case (manifest never catching up) is covered at publish time by
+/// the `verify-update-manifest` job, so this test only forbids the
+/// ahead-of-binary direction.
 ///
 /// The binary version is sourced from `CARGO_PKG_VERSION` (via
 /// `TEST_RELEASE_VERSION`), never a hardcoded literal, so a normal version bump
@@ -707,6 +720,8 @@ fn release_manifest_deserializes_as_update_manifest() {
 /// hard-fail enforcement with no warn-only path.
 #[test]
 fn committed_update_manifest_version_matches_binary() {
+    use semver::Version;
+
     let manifest_path = repo_root().join("update-manifest.json");
     let raw = fs::read(&manifest_path).unwrap_or_else(|err| {
         panic!(
@@ -717,12 +732,28 @@ fn committed_update_manifest_version_matches_binary() {
     let manifest: oneup::shared::update::UpdateManifest = serde_json::from_slice(&raw)
         .expect("committed update-manifest.json should deserialize as UpdateManifest");
 
-    assert_eq!(
-        manifest.version, TEST_RELEASE_VERSION,
-        "committed update-manifest.json version `{}` does not match the binary version \
-         `{}` (CARGO_PKG_VERSION); bump update-manifest.json `version` and Cargo.toml \
-         together so the published manifest tracks the shipped binary",
-        manifest.version, TEST_RELEASE_VERSION
+    let manifest_version = Version::parse(&manifest.version).unwrap_or_else(|err| {
+        panic!(
+            "committed update-manifest.json version `{}` is not valid semver: {err}",
+            manifest.version
+        )
+    });
+    let binary_version = Version::parse(TEST_RELEASE_VERSION).unwrap_or_else(|err| {
+        panic!("binary CARGO_PKG_VERSION `{TEST_RELEASE_VERSION}` is not valid semver: {err}")
+    });
+
+    assert!(
+        manifest_version <= binary_version,
+        "committed update-manifest.json version `{}` is AHEAD of the binary version \
+         `{}` (CARGO_PKG_VERSION). The manifest must never advertise a version the \
+         binary cannot be: the invariant is manifest.version <= CARGO_PKG_VERSION. \
+         Lagging by one release during the publish window is allowed (release-please \
+         bumps Cargo.toml on push:main while publish-update-manifest.yml commits the \
+         manifest later on release:published; the publish-time verify-update-manifest \
+         job covers the stuck-behind case), but an ahead/typo'd manifest version is real \
+         drift — fix update-manifest.json `version`",
+        manifest.version,
+        TEST_RELEASE_VERSION
     );
 }
 

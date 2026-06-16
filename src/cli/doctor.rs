@@ -12,8 +12,12 @@ use crate::shared::types::OutputFormat;
 
 /// User project instruction files, relative to the project root, that legacy 1up
 /// hints may have been pasted into. Stored as forward-slash literals so report
-/// output stays stable across platforms.
-const IN_SCOPE_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"];
+/// output stays stable across platforms. Single source of truth for the doctor
+/// in-scope file set: the empty-report label in `output.rs` derives from this,
+/// and a drift guard in `mod.rs` asserts the Doctor `long_about` help lists each
+/// entry.
+pub(crate) const IN_SCOPE_FILES: [&str; 3] =
+    ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"];
 
 /// Arguments for the `doctor` command. The authoritative long-form command help
 /// (opt-in/default-OFF, inspected files, the stale-token detection rule,

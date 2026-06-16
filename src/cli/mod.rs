@@ -515,4 +515,28 @@ mod tests {
             OutputFormat::Json
         );
     }
+
+    /// Drift guard for the Doctor `long_about` prose. clap derive requires a
+    /// string literal for `long_about`, so the in-scope file list there cannot be
+    /// interpolated from [`doctor::IN_SCOPE_FILES`] (the single source of truth).
+    /// This asserts the rendered Doctor help still lists every canonical in-scope
+    /// file, so the help text can never silently diverge from the const that
+    /// actually drives the scan.
+    #[test]
+    fn doctor_long_about_lists_all_in_scope_files() {
+        let mut command = Cli::command();
+        let doctor = command
+            .find_subcommand_mut("doctor")
+            .expect("doctor subcommand should exist");
+        let help = doctor.render_long_help().to_string();
+
+        for in_scope_file in doctor::IN_SCOPE_FILES {
+            assert!(
+                help.contains(in_scope_file),
+                "Doctor long_about help must list the in-scope file {in_scope_file:?} \
+                 (canonical source: doctor::IN_SCOPE_FILES); update the long_about prose \
+                 in src/cli/mod.rs to match the const. Help was:\n{help}",
+            );
+        }
+    }
 }
