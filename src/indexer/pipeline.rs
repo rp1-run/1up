@@ -6,6 +6,7 @@ use std::time::Instant;
 use libsql::Connection;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
@@ -1258,6 +1259,10 @@ pub async fn run_with_scope_setup_and_progress_root(
     progress_root: Option<&Path>,
 ) -> Result<PipelineStats, OneupError> {
     let context = IndexRunContext::legacy(project_root);
+    // Synchronous one-shot callers (CLI/MCP rebuilds, tests) are not subject to
+    // the daemon's SIGTERM drain, so they run under a fresh token that is never
+    // cancelled. Only the daemon threads a live token (see `worker.rs`).
+    let cancel_token = CancellationToken::new();
     run_with_index_context_scope_setup_and_progress_root(
         conn,
         project_root,
@@ -1270,6 +1275,7 @@ pub async fn run_with_scope_setup_and_progress_root(
         daemon_fallback_reason,
         progress_root,
         context,
+        &cancel_token,
     )
     .await
 }
@@ -1286,6 +1292,7 @@ pub async fn run_with_context_scope_setup_and_progress_root(
     setup_timings: Option<SetupTimings>,
     daemon_fallback_reason: Option<String>,
     progress_root: Option<&Path>,
+    cancel_token: &CancellationToken,
 ) -> Result<PipelineStats, OneupError> {
     let stats = run_with_index_context_scope_setup_and_progress_root(
         conn,
@@ -1299,6 +1306,7 @@ pub async fn run_with_context_scope_setup_and_progress_root(
         daemon_fallback_reason,
         progress_root,
         IndexRunContext::from_worktree(context),
+        cancel_token,
     )
     .await?;
 
@@ -1336,6 +1344,7 @@ async fn run_with_index_context_scope_setup_and_progress_root(
     daemon_fallback_reason: Option<String>,
     progress_root: Option<&Path>,
     context: IndexRunContext,
+    cancel_token: &CancellationToken,
 ) -> Result<PipelineStats, OneupError> {
     let progress_root = progress_root.unwrap_or(project_root);
     let input_prep_start = Instant::now();
@@ -1400,6 +1409,7 @@ async fn run_with_index_context_scope_setup_and_progress_root(
         progress_tx,
         show_progress_ui,
         setup_timings,
+        cancel_token,
     )
     .await
 }
@@ -1416,6 +1426,7 @@ async fn execute_run_with_inputs(
     progress_tx: Option<ProgressSender>,
     show_progress_ui: bool,
     setup_timings: Option<SetupTimings>,
+    cancel_token: &CancellationToken,
 ) -> Result<PipelineStats, OneupError> {
     let run_started_at = setup_timings
         .as_ref()
@@ -1591,6 +1602,15 @@ async fn execute_run_with_inputs(
         };
 
         while next_to_dispatch < content_read_count || !parse_workers.is_empty() {
+            // Safe yield point: stop dispatching new files once cancelled. The
+            // already-spawned parse workers are pure CPU and write nothing, so
+            // abandoning their pending results leaves the index at the last
+            // committed batch boundary (incomplete, never corrupt).
+            if cancel_token.is_cancelled() {
+                debug!("indexing cancelled at dispatch boundary; stopping at last committed batch");
+                return Err(IndexingError::Cancelled.into());
+            }
+
             while next_to_dispatch < content_read_count && parse_workers.len() < config.jobs {
                 let scanned_file = scanned_files[next_to_dispatch].clone();
                 let sequence_id = scanned_file.sequence_id;
@@ -1620,6 +1640,15 @@ async fn execute_run_with_inputs(
                 parse_result.sequence_id
             );
 
+            // Safe yield point: never enter a flush once cancelled.
+            // `flush_reorder_buffer` is the only writer (embed-then-commit per
+            // batch), so checking immediately before it — never inside it —
+            // guarantees an aborted pass stops at a committed boundary.
+            if cancel_token.is_cancelled() {
+                debug!("indexing cancelled before flush; stopping at last committed batch");
+                return Err(IndexingError::Cancelled.into());
+            }
+
             flush_reorder_buffer(
                 conn,
                 &mut reorder_buffer,
@@ -1636,6 +1665,13 @@ async fn execute_run_with_inputs(
                 current_progress_phase(flush_state.stats),
                 content_read_count,
             ));
+        }
+
+        // Safe yield point before the tail flush, for the same reason as the
+        // in-loop check above.
+        if cancel_token.is_cancelled() {
+            debug!("indexing cancelled before tail flush; stopping at last committed batch");
+            return Err(IndexingError::Cancelled.into());
         }
 
         flush_reorder_buffer(
@@ -1770,6 +1806,7 @@ mod tests {
             None,
             None,
             None,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -1795,6 +1832,7 @@ mod tests {
             None,
             None,
             None,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -1805,6 +1843,127 @@ mod tests {
                 .unwrap(),
             moved.head_oid,
             "a later run must replace the recorded head OID"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_pass_returns_cancelled_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(
+                tmp.path().join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-cancel", "main");
+
+        // A token cancelled before the pass starts must short-circuit at the very
+        // first dispatch-boundary check and surface the distinct Cancelled
+        // outcome — not a success and not a hard error.
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &token,
+        )
+        .await
+        .expect_err("a pre-cancelled pass must not report success");
+
+        assert!(
+            matches!(err, OneupError::Indexing(IndexingError::Cancelled)),
+            "cancellation must surface the distinct Cancelled variant, got: {err:?}"
+        );
+
+        // The pass stopped before any flush, so the index is consistent and
+        // simply empty (incomplete, not corrupt): the DB still validates and a
+        // read returns zero rows for this context.
+        schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
+            .await
+            .expect("a cancelled pass must leave the schema valid");
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-cancel")
+                .await
+                .unwrap(),
+            0,
+            "a pass cancelled at the first boundary must not commit any files"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_after_cancellation_completes_the_remaining_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(
+                tmp.path().join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let (_db, conn) = setup().await;
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-resume", "main");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let _ = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &cancelled,
+        )
+        .await;
+
+        // A subsequent pass under a live (never-cancelled) token re-indexes the
+        // remainder against the consistent-but-incomplete index and succeeds.
+        let live = CancellationToken::new();
+        let stats = run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &live,
+        )
+        .await
+        .expect("a normal pass after cancellation must complete");
+
+        assert_eq!(
+            stats.files_indexed, 8,
+            "the resumed pass must index every source file"
+        );
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-resume")
+                .await
+                .unwrap(),
+            8,
+            "every file must be committed after the resumed pass"
         );
     }
 
@@ -2180,6 +2339,7 @@ mod tests {
             None,
             None,
             Some(&main_root),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -2194,6 +2354,7 @@ mod tests {
             None,
             None,
             Some(&main_root),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -2231,6 +2392,7 @@ mod tests {
             None,
             None,
             Some(&main_root),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -2251,6 +2413,7 @@ mod tests {
             None,
             None,
             Some(&main_root),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();

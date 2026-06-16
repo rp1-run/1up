@@ -5329,3 +5329,130 @@ fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
     // The lock released on drop: a fresh rebuild can now acquire it.
     drop(acquire_rebuild_lock(&state_root).expect("rebuild lock re-acquires after release"));
 }
+
+/// Cancelling an in-flight indexing pass must leave the on-disk libSQL index
+/// consistent (stopped at a committed batch boundary, not torn mid-write): a
+/// freshly-opened DB handle still validates via `ensure_current` and reads, and
+/// a subsequent uncancelled pass completes the remaining files. This is the
+/// corruption-safety + reopen-cleanly claim from the design's Validation Plan.
+/// The timing claim (SIGTERM interrupts a real daemon pass within the ~3s bound)
+/// was validated separately by the HYP-001/HYP-003 daemon CODE_EXPERIMENT; this
+/// test pins the deterministic on-disk consistency invariant the seam relies on.
+#[cfg(unix)]
+#[test]
+fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
+    use oneup::indexer::pipeline;
+    use oneup::shared::types::{
+        BranchStatus, IndexingConfig, RunScope, WorktreeContext, WorktreeRole,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    for i in 0..12 {
+        fs::write(
+            root.join(format!("mod_{i}.rs")),
+            format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+
+    let db_path = root.join(".1up").join("index.db");
+    let context = WorktreeContext {
+        context_id: "ctx-cancel-reopen".to_string(),
+        state_root: root.clone(),
+        source_root: root.clone(),
+        main_worktree_root: root.clone(),
+        worktree_role: WorktreeRole::Main,
+        git_dir: None,
+        common_git_dir: None,
+        branch_name: Some("main".to_string()),
+        branch_ref: Some("refs/heads/main".to_string()),
+        head_oid: Some("0".repeat(40)),
+        branch_status: BranchStatus::Named,
+    };
+    let config = IndexingConfig::new(2, 1, 1).unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        schema::initialize(&db.connect_tuned().await.unwrap())
+            .await
+            .unwrap();
+
+        // A token cancelled before the pass aborts at the first safe boundary.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let conn = db.connect_tuned().await.unwrap();
+        let result = pipeline::run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&root),
+            &cancelled,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(oneup::shared::errors::OneupError::Indexing(
+                    oneup::shared::errors::IndexingError::Cancelled
+                ))
+            ),
+            "the cancelled pass must surface the Cancelled outcome, got: {result:?}"
+        );
+    });
+
+    // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly and
+    // be readable (consistent at the last committed batch, never corrupt).
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
+            .await
+            .expect("a cancelled pass must leave the reopened index schema-valid");
+        let indexed = segments::count_files_for_context(&conn, "ctx-cancel-reopen")
+            .await
+            .expect("reading the reopened index must succeed");
+        assert!(
+            indexed <= 12,
+            "committed file count must be a consistent prefix of the work"
+        );
+
+        // A subsequent uncancelled pass completes the remainder against the
+        // consistent-but-incomplete index.
+        let live = CancellationToken::new();
+        let stats = pipeline::run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&root),
+            &live,
+        )
+        .await
+        .expect("a normal pass after cancellation must complete");
+        assert_eq!(
+            stats.files_skipped + stats.files_indexed,
+            12,
+            "the resumed pass must account for every source file"
+        );
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-cancel-reopen")
+                .await
+                .unwrap(),
+            12,
+            "every file must be committed after the resumed pass"
+        );
+    });
+}

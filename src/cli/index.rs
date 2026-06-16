@@ -269,6 +269,8 @@ async fn run_index_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
+    // One-shot CLI index: not subject to the daemon's SIGTERM drain, so it runs
+    // under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         context,
@@ -280,6 +282,7 @@ async fn run_index_once(
         Some(setup),
         None,
         state_root,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .map_err(Into::into)

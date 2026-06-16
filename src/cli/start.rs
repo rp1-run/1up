@@ -739,6 +739,8 @@ async fn run_initial_index(
         EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message),
     }
 
+    // One-shot CLI start indexing: not subject to the daemon's SIGTERM drain, so
+    // it runs under a fresh token that is never cancelled.
     let stats = pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         context,
@@ -750,6 +752,7 @@ async fn run_initial_index(
         Some(setup),
         None,
         Some(project_root),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
 

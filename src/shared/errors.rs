@@ -68,6 +68,15 @@ pub enum IndexingError {
     #[error("pipeline failed: {0}")]
     #[allow(dead_code)]
     Pipeline(String),
+
+    /// A cooperatively-cancelled indexing pass. Distinct from success and from a
+    /// hard failure: the pass stopped at a committed batch boundary (incomplete
+    /// but consistent), so the daemon leaves the context dirty and re-indexes the
+    /// remainder on the next pass rather than recording a completed or failed run.
+    #[error(
+        "indexing cancelled at a unit boundary; remaining files will re-index on the next pass"
+    )]
+    Cancelled,
 }
 
 #[derive(Error, Debug)]

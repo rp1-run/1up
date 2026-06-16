@@ -957,6 +957,8 @@ async fn run_index(
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
+    // One-shot MCP rebuild: not subject to the daemon's SIGTERM drain, so it
+    // runs under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         &roots.worktree_context,
@@ -968,6 +970,7 @@ async fn run_index(
         Some(setup),
         None,
         Some(&roots.state_root),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .map_err(Into::into)
