@@ -118,6 +118,19 @@ pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 /// Maximum interval between persisted daemon file-check heartbeats.
 pub const DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS: u64 = 30_000;
 
+/// Bounded timeout for a graceful daemon drain (SIGTERM + poll).
+///
+/// Reused by `1up update`'s pre-update stop and by the post-upgrade
+/// version-handshake drain/restart on the search path. ~3s (30 x 100ms order
+/// of magnitude) is the conservative bound inherited from the original update
+/// stop primitive; it now wraps a genuinely-cancellable indexing pass (the
+/// daemon cancels in-flight work on SIGTERM), with the local in-process search
+/// as the safety net if a drain still exceeds it.
+pub const DAEMON_DRAIN_TIMEOUT_MS: u64 = 3_000;
+
+/// Poll interval while waiting for a drained daemon to exit after SIGTERM.
+pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 

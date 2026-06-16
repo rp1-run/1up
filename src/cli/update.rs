@@ -4,7 +4,7 @@ use clap::Args;
 
 use crate::cli::output::{formatter_for, UpdateResult, UpdateStatusInfo};
 use crate::daemon::lifecycle;
-use crate::shared::constants::{UPDATE_DISABLED_MESSAGE, VERSION};
+use crate::shared::constants::{DAEMON_DRAIN_TIMEOUT_MS, UPDATE_DISABLED_MESSAGE, VERSION};
 use crate::shared::types::OutputFormat;
 use crate::shared::update::{
     build_cache_from_manifest, build_update_check_client, build_update_status, clear_update_cache,
@@ -164,8 +164,9 @@ async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
 
 /// Stops the daemon before an update action, verifying it has exited.
 ///
-/// Polls `is_process_alive()` with bounded retries after sending SIGTERM.
-/// Returns an error if the daemon cannot be stopped.
+/// Delegates to the shared `lifecycle::drain_daemon` SIGTERM+poll primitive
+/// (same ~3s bound), returning its actionable error if the daemon cannot be
+/// stopped within the bound.
 fn stop_daemon_for_update() -> anyhow::Result<()> {
     if !lifecycle::supports_daemon() {
         return Ok(());
@@ -177,24 +178,12 @@ fn stop_daemon_for_update() -> anyhow::Result<()> {
     };
 
     eprintln!("Stopping daemon (pid={pid}) before update...");
-    lifecycle::send_sigterm(pid)?;
-
-    let max_attempts = 30;
-    let poll_interval = std::time::Duration::from_millis(100);
-
-    for _ in 0..max_attempts {
-        if !lifecycle::is_process_alive(pid) {
-            eprintln!("Daemon stopped.");
-            return Ok(());
-        }
-        std::thread::sleep(poll_interval);
-    }
-
-    bail!(
-        "Daemon (pid={pid}) did not exit after {}ms. Update aborted. \
-         Try `1up stop` manually, then retry `1up update`.",
-        max_attempts * 100
-    );
+    lifecycle::drain_daemon(
+        pid,
+        std::time::Duration::from_millis(DAEMON_DRAIN_TIMEOUT_MS),
+    )?;
+    eprintln!("Daemon stopped.");
+    Ok(())
 }
 
 // --- Helpers ---

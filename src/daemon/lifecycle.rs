@@ -11,7 +11,10 @@ use nix::unistd::Pid;
 use tracing::{debug, info, warn};
 
 use crate::shared::config;
-use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
+use crate::shared::constants::{
+    DAEMON_DRAIN_POLL_INTERVAL_MS, DAEMON_DRAIN_TIMEOUT_MS, SECURE_STATE_FILE_MODE,
+    XDG_STATE_DIR_MODE,
+};
 use crate::shared::errors::{DaemonError, OneupError};
 use crate::shared::fs::{
     atomic_replace, ensure_secure_xdg_root, remove_regular_file, validate_regular_file_path,
@@ -371,6 +374,64 @@ pub fn ensure_daemon(
     Ok(pid)
 }
 
+/// Gracefully drains a running daemon: sends SIGTERM, then polls
+/// [`is_process_alive`] at [`DAEMON_DRAIN_POLL_INTERVAL_MS`] until the process
+/// exits or `timeout` elapses.
+///
+/// Returns `Ok(())` once the daemon has exited (releasing its DB write lock and
+/// any held rebuild lock as their guards drop). On timeout it returns an
+/// actionable error instructing the user to run `1up stop` then retry, rather
+/// than forcing a kill or proceeding against a still-live daemon.
+///
+/// This is the shared SIGTERM+poll primitive reused by `1up update`'s
+/// pre-update stop and by the post-upgrade version-handshake drain/restart.
+pub fn drain_daemon(pid: u32, timeout: Duration) -> Result<(), OneupError> {
+    debug!("draining daemon (pid={pid}) with SIGTERM; bound={timeout:?}");
+    send_sigterm(pid)?;
+
+    let poll_interval = Duration::from_millis(DAEMON_DRAIN_POLL_INTERVAL_MS);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if !is_process_alive(pid) {
+            debug!("daemon (pid={pid}) exited within drain bound");
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+
+    warn!("daemon (pid={pid}) did not exit within {timeout:?} drain bound");
+    Err(DaemonError::DrainTimeout {
+        pid,
+        timeout_ms: timeout.as_millis(),
+    }
+    .into())
+}
+
+/// Drains a stale daemon and restarts a fresh one under the current binary.
+///
+/// Drains via [`drain_daemon`] using the standard [`DAEMON_DRAIN_TIMEOUT_MS`]
+/// bound; if the drain exceeds the bound the actionable error is returned and
+/// no restart is attempted (the caller falls back rather than proceeding). On a
+/// clean drain the stale daemon has released its locks, so [`ensure_daemon`]
+/// spawns a fresh daemon under the current executable and returns its pid.
+#[allow(dead_code)]
+pub fn drain_and_restart_daemon(
+    pid: u32,
+    project_id: &str,
+    project_root: &Path,
+    source_root: &Path,
+) -> Result<u32, OneupError> {
+    drain_daemon(pid, Duration::from_millis(DAEMON_DRAIN_TIMEOUT_MS))?;
+    info!("stale daemon (pid={pid}) drained; restarting under current binary");
+    ensure_daemon(project_id, project_root, source_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +587,51 @@ mod tests {
             err,
             OneupError::Daemon(DaemonError::StartupInProgress)
         ));
+    }
+
+    #[test]
+    fn drain_daemon_times_out_with_actionable_error_when_pid_ignores_sigterm() {
+        struct ChildGuard {
+            child: std::process::Child,
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        // A process that ignores SIGTERM, so the bounded drain must give up
+        // rather than observe an exit. `kill()` (SIGKILL) cleans it up.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap "" TERM; while true; do sleep 1; done"#)
+            .spawn()
+            .expect("spawn sigterm-ignoring child");
+        let pid = child.id();
+        let _guard = ChildGuard { child };
+
+        assert!(
+            is_process_alive(pid),
+            "child should be running before drain"
+        );
+
+        let err = drain_daemon(pid, std::time::Duration::from_millis(50))
+            .expect_err("drain must time out when the pid ignores SIGTERM");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1up stop"),
+            "timeout error must instruct `1up stop`: {msg}"
+        );
+        assert!(
+            msg.contains("retry"),
+            "timeout error must instruct a retry: {msg}"
+        );
+        assert!(
+            is_process_alive(pid),
+            "drain must not force-kill the daemon on timeout"
+        );
     }
 }

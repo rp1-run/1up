@@ -122,6 +122,9 @@ pub enum DaemonError {
     #[error("signal error: {0}")]
     SignalError(String),
 
+    #[error("daemon (pid: {pid}) did not exit within {timeout_ms}ms; run `1up stop` then retry")]
+    DrainTimeout { pid: u32, timeout_ms: u128 },
+
     #[error("request error: {0}")]
     RequestError(String),
 

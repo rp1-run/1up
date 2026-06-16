@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::shared::errors::{DaemonError, OneupError};
 
@@ -60,6 +61,20 @@ pub fn current_binary_path() -> Result<PathBuf, OneupError> {
 }
 
 pub fn ensure_daemon(
+    _project_id: &str,
+    _project_root: &Path,
+    _source_root: &Path,
+) -> Result<u32, OneupError> {
+    Err(unsupported_daemon_error())
+}
+
+pub fn drain_daemon(_pid: u32, _timeout: Duration) -> Result<(), OneupError> {
+    Err(unsupported_daemon_error())
+}
+
+#[allow(dead_code)]
+pub fn drain_and_restart_daemon(
+    _pid: u32,
     _project_id: &str,
     _project_root: &Path,
     _source_root: &Path,
