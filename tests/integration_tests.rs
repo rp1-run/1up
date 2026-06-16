@@ -5269,3 +5269,63 @@ fn branch_context_search_excludes_other_worktree_only_content() {
         "feature branch should keep shared content discoverable"
     );
 }
+
+/// REQ-003: the `state_root`-keyed single-writer rebuild lock must serialize
+/// concurrent rebuilds — exactly one process performs the rebuild while a second
+/// concurrent attempt defers (never starting a competing destructive rebuild) —
+/// and must release on drop so a later rebuild can proceed.
+#[cfg(unix)]
+#[test]
+fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
+    use oneup::daemon::lifecycle::{acquire_rebuild_lock, try_acquire_rebuild_lock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let state_root = tmp.path().canonicalize().unwrap();
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+
+    let (winner_holds_lock_tx, winner_holds_lock_rx) = mpsc::channel::<()>();
+    let (loser_done_tx, loser_done_rx) = mpsc::channel::<()>();
+
+    let winner = {
+        let state_root = state_root.clone();
+        let rebuilds = Arc::clone(&rebuilds);
+        thread::spawn(move || {
+            let _lock =
+                acquire_rebuild_lock(&state_root).expect("winner acquires the rebuild lock");
+            // Model "this process performs the rebuild" while holding the lock.
+            rebuilds.fetch_add(1, Ordering::SeqCst);
+            winner_holds_lock_tx.send(()).unwrap();
+            // Hold the lock until the loser has attempted its concurrent rebuild.
+            loser_done_rx.recv().unwrap();
+            // `_lock` drops here, releasing the flock for any later acquirer.
+        })
+    };
+
+    // The loser attempts a concurrent rebuild only once the winner provably
+    // holds the lock, so the contention window is deterministic.
+    winner_holds_lock_rx.recv().unwrap();
+    let loser_guard =
+        try_acquire_rebuild_lock(&state_root).expect("loser's lock attempt must not error");
+    if loser_guard.is_some() {
+        // A competing rebuild would have started here — it must not.
+        rebuilds.fetch_add(1, Ordering::SeqCst);
+    }
+    assert!(
+        loser_guard.is_none(),
+        "a second concurrent rebuild must defer while the single-writer lock is held"
+    );
+    loser_done_tx.send(()).unwrap();
+    winner.join().unwrap();
+
+    assert_eq!(
+        rebuilds.load(Ordering::SeqCst),
+        1,
+        "exactly one process performs the rebuild under contention"
+    );
+
+    // The lock released on drop: a fresh rebuild can now acquire it.
+    drop(acquire_rebuild_lock(&state_root).expect("rebuild lock re-acquires after release"));
+}

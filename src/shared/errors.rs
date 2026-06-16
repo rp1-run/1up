@@ -125,6 +125,14 @@ pub enum DaemonError {
     #[error("daemon (pid: {pid}) did not exit within {timeout_ms}ms; run `1up stop` then retry")]
     DrainTimeout { pid: u32, timeout_ms: u128 },
 
+    #[error("rebuild lock error: {0}")]
+    RebuildLockError(String),
+
+    #[error(
+        "another 1up process is rebuilding the index at {state_root}; retry once it completes"
+    )]
+    RebuildLockContended { state_root: String },
+
     #[error("request error: {0}")]
     RequestError(String),
 

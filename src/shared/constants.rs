@@ -131,6 +131,16 @@ pub const DAEMON_DRAIN_TIMEOUT_MS: u64 = 3_000;
 /// Poll interval while waiting for a drained daemon to exit after SIGTERM.
 pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
 
+/// Bounded wait for the single-writer rebuild lock before a synchronous
+/// one-shot rebuild (CLI `index`/`reindex`, MCP indexing) fails closed rather
+/// than racing a competing rebuild of the shared `.1up/index.db`. The daemon
+/// instead acquires the lock non-blockingly and defers the pass, so this bound
+/// governs only the user-driven one-shot commands.
+pub const REBUILD_LOCK_CONTENTION_TIMEOUT_MS: u64 = 5_000;
+
+/// Poll interval while waiting for a contended rebuild lock to be released.
+pub const REBUILD_LOCK_RETRY_INTERVAL_MS: u64 = 200;
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 

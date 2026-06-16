@@ -6,6 +6,7 @@ use anyhow::{bail, Context};
 use libsql::Connection;
 use serde::Serialize;
 
+use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{
     self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
@@ -931,6 +932,11 @@ async fn run_index(
         registry.indexing_config_for_context(&roots.worktree_context),
     )?;
     let mut setup = SetupTimings::new(Instant::now());
+
+    // Single-writer rebuild lock: hold it across schema rebuild/prepare + the
+    // pipeline write so a concurrent daemon/CLI rebuild of the shared index
+    // cannot race this one. Released when this function returns (RAII).
+    let _rebuild_lock = lifecycle::acquire_rebuild_lock(&roots.state_root)?;
 
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;

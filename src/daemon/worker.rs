@@ -906,6 +906,20 @@ async fn run_dirty_projects_until_clean(watcher: &FileWatcher, projects: &mut Pr
                 }
             }
             Err(e) => {
+                if matches!(
+                    &e,
+                    OneupError::Daemon(
+                        crate::shared::errors::DaemonError::RebuildLockContended { .. }
+                    )
+                ) {
+                    // The pass deferred to a competing one-shot rebuild and left
+                    // the project dirty. Return to the select loop instead of
+                    // immediately re-selecting the same key (which would
+                    // busy-spin on the held lock); the next debounce tick or
+                    // file event retries once the other writer releases it.
+                    debug!("deferring re-index sweep for context {key}: {e}");
+                    break;
+                }
                 error!("re-index failed for context {key}: {e}");
             }
         }
@@ -980,6 +994,33 @@ async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
 ) -> Result<pipeline::PipelineStats, OneupError> {
+    // Acquire the single-writer rebuild lock BEFORE `start_run` consumes the
+    // pending scope, so a contended pass leaves the project dirty (its queued
+    // paths intact) for a later retry instead of racing a competing rebuild and
+    // dropping the changes. Non-blocking: the daemon defers rather than stalling
+    // its event loop while a one-shot rebuild holds the lock. The guard releases
+    // on drop — including when an in-flight pass is cancelled and this frame
+    // unwinds — freeing the lock for the restarted binary.
+    let lock_root = projects
+        .get(context_id)
+        .expect("dirty project must exist while running")
+        .project_root
+        .clone();
+    let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            debug!(
+                "deferring re-index for {}: rebuild lock held by another process",
+                lock_root.display()
+            );
+            return Err(crate::shared::errors::DaemonError::RebuildLockContended {
+                state_root: lock_root.display().to_string(),
+            }
+            .into());
+        }
+        Err(e) => return Err(e),
+    };
+
     let mut setup = SetupTimings::new(std::time::Instant::now());
     let (project_root, source_root, context, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects

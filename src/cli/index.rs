@@ -226,6 +226,14 @@ async fn run_index_once(
     let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
+    // Single-writer rebuild lock: hold it across schema prepare + the pipeline
+    // write so a concurrent daemon/CLI/MCP rebuild of the shared index cannot
+    // race this one. Released when this function returns (RAII).
+    let _rebuild_lock = match state_root {
+        Some(root) => Some(crate::daemon::lifecycle::acquire_rebuild_lock(root)?),
+        None => None,
+    };
+
     let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
     let conn = db.connect_tuned().await?;

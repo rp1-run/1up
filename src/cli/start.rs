@@ -712,6 +712,11 @@ async fn run_initial_index(
     let db_path = config::project_db_path(project_root);
     let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
+    // Single-writer rebuild lock: hold it across schema prepare + the pipeline
+    // write so a concurrent rebuild of the shared index cannot race the initial
+    // index. Released when this function returns (RAII).
+    let _rebuild_lock = lifecycle::acquire_rebuild_lock(project_root)?;
+
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect_tuned().await?;

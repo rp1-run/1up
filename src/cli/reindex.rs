@@ -215,6 +215,14 @@ async fn run_reindex_once(
     let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
 
+    // Single-writer rebuild lock: hold it across the destructive schema rebuild
+    // + pipeline write so exactly one process owns the format change. Released
+    // when this function returns (RAII).
+    let _rebuild_lock = match state_root {
+        Some(root) => Some(crate::daemon::lifecycle::acquire_rebuild_lock(root)?),
+        None => None,
+    };
+
     let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
     let conn = db.connect_tuned().await?;
