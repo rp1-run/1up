@@ -128,6 +128,10 @@ serde_json = "1"
 dirs = "6"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", default-features = false }
+# Integration tests register a libSQL update hook to deterministically
+# cancel an in-flight indexing pass at a committed-batch boundary (mirrors
+# the main-crate pin; reuses the same Cargo.lock version, no new tree).
+libsql = { version = "0.9", default-features = false, features = ["core"] }
 
 [[bench]]
 name = "search_bench"

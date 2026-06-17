@@ -5330,26 +5330,40 @@ fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
     drop(acquire_rebuild_lock(&state_root).expect("rebuild lock re-acquires after release"));
 }
 
-/// Cancelling an in-flight indexing pass must leave the on-disk libSQL index
-/// consistent (stopped at a committed batch boundary, not torn mid-write): a
-/// freshly-opened DB handle still validates via `ensure_current` and reads, and
-/// a subsequent uncancelled pass completes the remaining files. This is the
-/// corruption-safety + reopen-cleanly claim from the design's Validation Plan.
+/// Cancelling an in-flight indexing pass *after a non-zero prefix has already
+/// committed* must leave the on-disk libSQL index consistent (stopped at a
+/// committed batch boundary, not torn mid-write) AND resumable: the committed
+/// prefix survives, a freshly-opened DB handle still validates via
+/// `ensure_current` and reads, and a subsequent uncancelled pass completes the
+/// remainder to the full file count.
+///
+/// This is the design's headline T7 "resume-don't-drop" guarantee (REQ-002):
+/// the prior cancellation tests all cancel *before* the pass (a 0->N from-scratch
+/// resume), so the resume-from-a-committed-prefix path was unguarded. The
+/// mid-pass cancellation here is DETERMINISTIC, not timing-based: a libSQL
+/// update hook on the pipeline's own connection fires on the first committed
+/// row write and cancels the token, so the very next safe-point check (loop top
+/// / pre-flush — never mid-flush) surfaces `Cancelled` with at least one batch
+/// already durably committed. No wall-clock sleep or race is involved.
+///
 /// The timing claim (SIGTERM interrupts a real daemon pass within the ~3s bound)
-/// was validated separately by the HYP-001/HYP-003 daemon CODE_EXPERIMENT; this
-/// test pins the deterministic on-disk consistency invariant the seam relies on.
+/// was validated separately by the HYP-001/HYP-003 daemon CODE_EXPERIMENT.
 #[cfg(unix)]
 #[test]
-fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
+fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
+    use libsql::Op;
     use oneup::indexer::pipeline;
     use oneup::shared::types::{
         BranchStatus, IndexingConfig, RunScope, WorktreeContext, WorktreeRole,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
+    const FILES: usize = 12;
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    for i in 0..12 {
+    for i in 0..FILES {
         fs::write(
             root.join(format!("mod_{i}.rs")),
             format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
@@ -5359,7 +5373,7 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
 
     let db_path = root.join(".1up").join("index.db");
     let context = WorktreeContext {
-        context_id: "ctx-cancel-reopen".to_string(),
+        context_id: "ctx-cancel-midpass".to_string(),
         state_root: root.clone(),
         source_root: root.clone(),
         main_worktree_root: root.clone(),
@@ -5371,6 +5385,9 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
         head_oid: Some("0".repeat(40)),
         branch_status: BranchStatus::Named,
     };
+    // write_batch_files = 1 so each file commits as its own batch: the first
+    // committed row fires the update hook, guaranteeing a non-zero prefix is
+    // durable before the next safe-point check observes the cancellation.
     let config = IndexingConfig::new(2, 1, 1).unwrap();
 
     block_on(async {
@@ -5379,10 +5396,26 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
             .await
             .unwrap();
 
-        // A token cancelled before the pass aborts at the first safe boundary.
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
+        // The token starts LIVE. An update hook on the pipeline's own connection
+        // cancels it on the first committed row insert — deterministically
+        // landing the cancellation *after* at least one batch has committed.
+        let token = CancellationToken::new();
         let conn = db.connect_tuned().await.unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let token = token.clone();
+            let fired = Arc::clone(&fired);
+            conn.add_update_hook(Box::new(move |op, _db, _table, _rowid| {
+                if op == Op::Insert && !fired.swap(true, Ordering::SeqCst) {
+                    // First committed write: request cancellation. The in-flight
+                    // batch still commits; the next loop-top / pre-flush check
+                    // (never mid-flush) returns Cancelled.
+                    token.cancel();
+                }
+            }))
+            .expect("registering the update hook must succeed");
+        }
+
         let result = pipeline::run_with_context_scope_setup_and_progress_root(
             &conn,
             &context,
@@ -5394,7 +5427,7 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
             None,
             None,
             Some(&root),
-            &cancelled,
+            &token,
         )
         .await;
         assert!(
@@ -5404,28 +5437,35 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
                     oneup::shared::errors::IndexingError::Cancelled
                 ))
             ),
-            "the cancelled pass must surface the Cancelled outcome, got: {result:?}"
+            "the mid-pass cancelled pass must surface the Cancelled outcome, got: {result:?}"
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the update hook must have fired (a write must have been committed before cancellation)"
         );
     });
 
-    // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly and
-    // be readable (consistent at the last committed batch, never corrupt).
+    // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly,
+    // be readable, and expose a STRICTLY-PARTIAL committed prefix (0 < n < FILES)
+    // — proof the pass stopped at a committed batch boundary mid-way, not at 0
+    // (pre-cancel) and not at FILES (no cancellation).
     block_on(async {
         let db = Db::open_rw(&db_path).await.unwrap();
         let conn = db.connect_tuned().await.unwrap();
         schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
             .await
             .expect("a cancelled pass must leave the reopened index schema-valid");
-        let indexed = segments::count_files_for_context(&conn, "ctx-cancel-reopen")
+        let prefix = segments::count_files_for_context(&conn, "ctx-cancel-midpass")
             .await
-            .expect("reading the reopened index must succeed");
+            .expect("reading the reopened index must succeed") as usize;
         assert!(
-            indexed <= 12,
-            "committed file count must be a consistent prefix of the work"
+            prefix > 0 && prefix < FILES,
+            "a mid-pass cancellation must leave a non-zero, incomplete committed prefix; \
+             got {prefix} of {FILES}"
         );
 
-        // A subsequent uncancelled pass completes the remainder against the
-        // consistent-but-incomplete index.
+        // A subsequent uncancelled pass resumes the remainder against the
+        // consistent-but-incomplete index and completes to the full count.
         let live = CancellationToken::new();
         let stats = pipeline::run_with_context_scope_setup_and_progress_root(
             &conn,
@@ -5444,14 +5484,14 @@ fn cancelled_index_pass_leaves_reopenable_db_and_resumes() {
         .expect("a normal pass after cancellation must complete");
         assert_eq!(
             stats.files_skipped + stats.files_indexed,
-            12,
+            FILES,
             "the resumed pass must account for every source file"
         );
         assert_eq!(
-            segments::count_files_for_context(&conn, "ctx-cancel-reopen")
+            segments::count_files_for_context(&conn, "ctx-cancel-midpass")
                 .await
-                .unwrap(),
-            12,
+                .unwrap() as usize,
+            FILES,
             "every file must be committed after the resumed pass"
         );
     });
