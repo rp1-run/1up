@@ -2652,11 +2652,16 @@ mod tests {
     #[tokio::test]
     async fn persisted_progress_snapshot_includes_parallelism_and_timings() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        // persist_progress writes via the secure-fs helper, which rejects
+        // symlinked path components (macOS tmp dirs resolve through
+        // /var -> /private/var); canonicalize so the progress file is written
+        // and read back from the same real path.
+        let project_root = tmp.path().canonicalize().unwrap();
+        fs::write(project_root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
 
         let (_db, conn) = setup().await;
         let config = IndexingConfig::new(3, 2, 1).unwrap();
-        let stats = run_with_config(&conn, tmp.path(), None, &config)
+        let stats = run_with_config(&conn, &project_root, None, &config)
             .await
             .unwrap();
         let timings = stats.progress.timings.as_ref().unwrap();
@@ -2675,7 +2680,7 @@ mod tests {
         );
         assert!(timings.total_ms >= timings.scan_ms);
 
-        let progress_path = index_progress_path(tmp.path());
+        let progress_path = index_progress_path(&project_root);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
 
@@ -2724,7 +2729,8 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let project_root = tmp.path().canonicalize().unwrap();
+        fs::write(project_root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
 
         let (_db, conn) = setup().await;
         let config = IndexingConfig::new(2, 2, 1).unwrap();
@@ -2732,7 +2738,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = run_with_config(&conn, tmp.path(), Some(&mut embedder), &config)
+        let stats = run_with_config(&conn, &project_root, Some(&mut embedder), &config)
             .await
             .unwrap();
 
@@ -2750,7 +2756,7 @@ mod tests {
             config.embed_threads
         );
 
-        let progress_path = index_progress_path(tmp.path());
+        let progress_path = index_progress_path(&project_root);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
         assert_eq!(persisted["parallelism"]["embed_threads"], 2);
