@@ -5385,10 +5385,19 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
         head_oid: Some("0".repeat(40)),
         branch_status: BranchStatus::Named,
     };
-    // write_batch_files = 1 so each file commits as its own batch: the first
-    // committed row fires the update hook, guaranteeing a non-zero prefix is
-    // durable before the next safe-point check observes the cancellation.
-    let config = IndexingConfig::new(2, 1, 1).unwrap();
+    // Determinism: jobs = 1 + write_batch_files = 1. With a single parse worker,
+    // exactly one file is ever in flight, so the dispatch loop processes files in
+    // submission order and each `flush_reorder_buffer` call can only ever drain
+    // ONE buffered file (one committed batch). The update hook below cancels the
+    // token on that first committed insert, so the very next safe-point check
+    // (loop top, before dispatching file 1 — never mid-flush) observes the cancel
+    // and returns, leaving a committed prefix of exactly 1. This removes the
+    // scheduling race that a multi-worker config has, where all files can land in
+    // the reorder buffer and a single flush commits them all before the next
+    // safe-point is reached. (Real-world cancel granularity is fine regardless —
+    // validated separately by HYP-003: files parse over time and flush
+    // incrementally, giving 17-53ms interruption. This knob is test-only.)
+    let config = IndexingConfig::new(1, 1, 1).unwrap();
 
     block_on(async {
         let db = Db::open_rw(&db_path).await.unwrap();
@@ -5448,7 +5457,11 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
     // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly,
     // be readable, and expose a STRICTLY-PARTIAL committed prefix (0 < n < FILES)
     // — proof the pass stopped at a committed batch boundary mid-way, not at 0
-    // (pre-cancel) and not at FILES (no cancellation).
+    // (pre-cancel) and not at FILES (no cancellation). With the jobs=1 +
+    // write_batch=1 config the prefix is deterministically exactly 1, so we
+    // assert that precise value (a stronger guard than the bare 0 < n < FILES
+    // invariant: it also catches any future regression that lets a single flush
+    // drain more than one batch before a cancel safe-point).
     block_on(async {
         let db = Db::open_rw(&db_path).await.unwrap();
         let conn = db.connect_tuned().await.unwrap();
@@ -5462,6 +5475,11 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
             prefix > 0 && prefix < FILES,
             "a mid-pass cancellation must leave a non-zero, incomplete committed prefix; \
              got {prefix} of {FILES}"
+        );
+        assert_eq!(
+            prefix, 1,
+            "with jobs=1 + write_batch=1 the cancel must land deterministically after \
+             exactly one committed batch; got {prefix} of {FILES}"
         );
 
         // A subsequent uncancelled pass resumes the remainder against the
