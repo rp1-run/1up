@@ -938,7 +938,15 @@ async fn run_index(
     // Single-writer rebuild lock: hold it across schema rebuild/prepare + the
     // pipeline write so a concurrent daemon/CLI rebuild of the shared index
     // cannot race this one. Released when this function returns (RAII).
-    let _rebuild_lock = lifecycle::acquire_rebuild_lock(&roots.state_root)?;
+    //
+    // `acquire_rebuild_lock` is a blocking, bounded-wait retry (std::thread::sleep
+    // on contention). On this async MCP path it would block a tokio worker for up
+    // to REBUILD_LOCK_CONTENTION_TIMEOUT_MS on the rare cross-process rebuild race,
+    // so the blocking acquire is moved to spawn_blocking. The guard
+    // (Flock<File>) is Send and is held in this task across the pipeline write.
+    let lock_root = roots.state_root.clone();
+    let _rebuild_lock =
+        tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
