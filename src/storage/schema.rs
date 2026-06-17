@@ -12,6 +12,18 @@ use crate::storage::queries;
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
 const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
+
+/// Stable message fragment emitted by [`ensure_current`] when the database has
+/// user tables but no readable `schema_version` row.
+///
+/// This is the exact shape produced while a fresh index is mid-initialization:
+/// [`initialize`] creates every table first and writes the version row last (it
+/// is not one atomic transaction), so a concurrent reader on a separate
+/// connection can momentarily observe "tables exist, version absent". Callers
+/// that can tolerate a transient state (e.g. the MCP readiness path during
+/// daemon auto-start) match this fragment via [`is_initializing_schema_error`]
+/// to avoid misreporting a freshly-initializing index as permanently stale.
+pub const SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT: &str = "index schema is missing or unreadable";
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "worktree_contexts"),
     ("table", "segments"),
@@ -227,13 +239,27 @@ pub async fn ensure_current(conn: &Connection, ctx: &SchemaContext<'_>) -> Resul
         None => {
             if database_has_user_tables(conn).await? {
                 Err(reindex_required(
-                    "index schema is missing or unreadable".to_string(),
+                    SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT.to_string(),
                 ))
             } else {
                 Err(reindex_required("index is missing".to_string()))
             }
         }
     }
+}
+
+/// Whether an [`ensure_current`] error is the transient "tables present but no
+/// readable schema version" shape (see [`SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT`]).
+///
+/// This shape — and *only* this shape — can be produced by a fresh index that is
+/// still mid-initialization (the daemon's [`initialize`] writes the version row
+/// last). A genuine version mismatch reports the distinct `out of date (found
+/// v{N}...)` / `newer than this binary supports` shapes instead, so matching this
+/// fragment never masks a real incompatible-schema condition. Callers can use this
+/// to ride out the initialization window before deciding an index is stale.
+pub fn is_initializing_schema_error(err: &OneupError) -> bool {
+    err.to_string()
+        .contains(SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT)
 }
 
 async fn database_has_user_tables(conn: &Connection) -> Result<bool, OneupError> {
@@ -844,6 +870,53 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("incomplete"));
         assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_reports_initializing_when_tables_present_but_version_absent() {
+        // Reproduces the daemon-auto-start window: `initialize` creates the user
+        // tables first and writes the `schema_version` row last (not one
+        // transaction), so a concurrent reader can observe "tables exist, no
+        // version". This must surface the transient initializing shape — *not* a
+        // version-mismatch shape — so the MCP readiness path can ride it out /
+        // degrade to `missing` instead of misreporting `stale`.
+        let (_db, conn) = setup().await;
+        conn.execute("CREATE TABLE segments (id TEXT PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        assert!(database_has_user_tables(&conn).await.unwrap());
+        assert!(get_schema_version(&conn).await.unwrap().is_none());
+
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
+        assert!(
+            is_initializing_schema_error(&err),
+            "tables-without-version must be classified as initializing, got: {err}"
+        );
+        assert!(err
+            .to_string()
+            .contains(SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT));
+    }
+
+    #[tokio::test]
+    async fn is_initializing_schema_error_ignores_genuine_version_mismatches() {
+        // A real incompatible schema (out of date / newer than supported) must
+        // never be mistaken for the transient initializing window, so the
+        // readiness path keeps reporting those as `stale`.
+        let (_db, older) = setup().await;
+        seed_schema_version(&older, SCHEMA_VERSION - 1).await;
+        let older_err = ensure_current(&older, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
+        assert!(!is_initializing_schema_error(&older_err));
+
+        let (_db2, newer) = setup().await;
+        seed_schema_version(&newer, SCHEMA_VERSION + 1).await;
+        let newer_err = ensure_current(&newer, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
+        assert!(!is_initializing_schema_error(&newer_err));
     }
 
     #[tokio::test]
