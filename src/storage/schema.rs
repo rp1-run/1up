@@ -974,14 +974,15 @@ mod tests {
             msg.contains("run `1up reindex`"),
             "older-DB error must state the reindex remediation; got: {msg}"
         );
-        // Enrichment: names the worktree and the shared index path.
+        // Enrichment: the precise location-clause framing the cross-worktree
+        // contract mandates — `for worktree '<wt>' sharing index '<db>'` — not
+        // merely that the paths appear somewhere. A refactor that reworded the
+        // clause (e.g. dropped `sharing index`) must fail here.
         assert!(
-            msg.contains("/repo/worktrees/feature-x"),
-            "older-DB error must name the worktree path; got: {msg}"
-        );
-        assert!(
-            msg.contains("/repo/.1up/index.db"),
-            "older-DB error must name the shared index path; got: {msg}"
+            msg.contains(
+                "for worktree '/repo/worktrees/feature-x' sharing index '/repo/.1up/index.db'"
+            ),
+            "older-DB error must carry the exact worktree+shared-index location clause; got: {msg}"
         );
     }
 
@@ -1011,14 +1012,24 @@ mod tests {
             msg.contains(&format!("expected v{SCHEMA_VERSION}")),
             "newer-DB error must name the expected version; got: {msg}"
         );
-        // Enrichment: names the worktree and the shared index path.
+        // Newer-than-supported direction: the remediation must direct the user
+        // to upgrade the binary (NOT to reindex). This guards the second
+        // recovery direction of the cross-worktree error contract.
         assert!(
-            msg.contains("/repo/worktrees/feature-y"),
-            "newer-DB error must name the worktree path; got: {msg}"
+            msg.contains("upgrade `1up`"),
+            "newer-DB error must state the upgrade-`1up` remediation; got: {msg}"
         );
         assert!(
-            msg.contains("/repo/.1up/index.db"),
-            "newer-DB error must name the shared index path; got: {msg}"
+            !msg.contains("run `1up reindex`"),
+            "newer-DB error must NOT offer the reindex remediation (wrong direction); got: {msg}"
+        );
+        // Enrichment: the precise location-clause framing the cross-worktree
+        // contract mandates — `for worktree '<wt>' sharing index '<db>'`.
+        assert!(
+            msg.contains(
+                "for worktree '/repo/worktrees/feature-y' sharing index '/repo/.1up/index.db'"
+            ),
+            "newer-DB error must carry the exact worktree+shared-index location clause; got: {msg}"
         );
     }
 
