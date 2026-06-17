@@ -108,7 +108,7 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
         let stats = run_index_once(
             &db_path,
             &worktree_context,
-            Some(&project_root),
+            &project_root,
             &indexing_config,
             true,
             None,
@@ -137,7 +137,7 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
     let result = run_index_once(
         &db_path,
         &worktree_context,
-        Some(&project_root),
+        &project_root,
         &indexing_config,
         false,
         Some(&progress_tx),
@@ -192,7 +192,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
     let stats = run_index_once(
         &db_path,
         &worktree_context,
-        Some(&project_root),
+        &project_root,
         &indexing_config,
         show_progress_ui,
         None,
@@ -218,7 +218,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 async fn run_index_once(
     db_path: &std::path::Path,
     context: &WorktreeContext,
-    state_root: Option<&std::path::Path>,
+    state_root: &std::path::Path,
     indexing_config: &crate::shared::types::IndexingConfig,
     show_progress_ui: bool,
     progress_tx: Option<&pipeline::ProgressSender>,
@@ -226,13 +226,12 @@ async fn run_index_once(
     let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
-    // Single-writer rebuild lock: hold it across schema prepare + the pipeline
-    // write so a concurrent daemon/CLI/MCP rebuild of the shared index cannot
-    // race this one. Released when this function returns (RAII).
-    let _rebuild_lock = match state_root {
-        Some(root) => Some(crate::daemon::lifecycle::acquire_rebuild_lock(root)?),
-        None => None,
-    };
+    // Single-writer rebuild lock: ALWAYS held across schema prepare + the
+    // pipeline write so a concurrent daemon/CLI/MCP rebuild of the shared index
+    // cannot race this one (REQ-003 single-writer guarantee). `state_root` is
+    // non-optional precisely so this lock can never be silently bypassed.
+    // Released when this function returns (RAII).
+    let _rebuild_lock = crate::daemon::lifecycle::acquire_rebuild_lock(state_root)?;
 
     let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
@@ -281,7 +280,7 @@ async fn run_index_once(
         show_progress_ui,
         Some(setup),
         None,
-        state_root,
+        Some(state_root),
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
