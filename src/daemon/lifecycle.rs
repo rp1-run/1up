@@ -421,7 +421,6 @@ pub fn drain_daemon(pid: u32, timeout: Duration) -> Result<(), OneupError> {
 /// no restart is attempted (the caller falls back rather than proceeding). On a
 /// clean drain the stale daemon has released its locks, so [`ensure_daemon`]
 /// spawns a fresh daemon under the current executable and returns its pid.
-#[allow(dead_code)]
 pub fn drain_and_restart_daemon(
     pid: u32,
     project_id: &str,
