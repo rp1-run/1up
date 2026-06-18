@@ -13,7 +13,6 @@ fn index_progress_path(project_root: &Path) -> std::path::PathBuf {
 }
 
 fn persist_progress(project_root: &Path, progress: &IndexProgress) {
-    let dot_dir = config::project_dot_dir(project_root);
     let payload = match serde_json::to_vec_pretty(progress) {
         Ok(payload) => payload,
         Err(err) => {
@@ -22,16 +21,32 @@ fn persist_progress(project_root: &Path, progress: &IndexProgress) {
         }
     };
 
-    if let Err(err) = std::fs::create_dir_all(&dot_dir) {
-        debug!(
-            "failed to create progress directory {}: {err}",
-            dot_dir.display()
-        );
-        return;
-    }
+    // Write the progress file atomically (temp + fsync + rename) rather than
+    // truncate-then-write. A plain `std::fs::write` opens the target with
+    // `O_TRUNC`, so a concurrent reader (`1up status`/`list`/MCP, which parse
+    // this file and silently drop a parse error to `None`) can observe a
+    // zero-length or partial document and report `index_progress: null` for a
+    // fully-ready index. The atomic rename guarantees every reader sees either
+    // the previous complete document or the new one, never a torn one.
+    let secure_root = match ensure_secure_project_root(project_root) {
+        Ok(root) => root,
+        Err(err) => {
+            debug!(
+                "failed to prepare secure project root for index progress {}: {err}",
+                project_root.display()
+            );
+            return;
+        }
+    };
 
     let progress_path = index_progress_path(project_root);
-    if let Err(err) = std::fs::write(&progress_path, payload) {
+    if let Err(err) = atomic_replace(
+        &progress_path,
+        &payload,
+        &secure_root,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    ) {
         debug!(
             "failed to persist index progress to {}: {err}",
             progress_path.display()
@@ -151,9 +166,10 @@ use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{
     DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
-    NON_EMBEDDABLE_CHUNK_LANGUAGES,
+    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{IndexingError, OneupError};
+use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
     BranchStatus, IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexScopeInfo,
@@ -2473,11 +2489,16 @@ mod tests {
     #[tokio::test]
     async fn persisted_progress_snapshot_includes_parallelism_and_timings() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        // persist_progress writes via the secure-fs helper, which rejects
+        // symlinked path components (macOS tmp dirs resolve through
+        // /var -> /private/var); canonicalize so the progress file is written
+        // and read back from the same real path.
+        let project_root = tmp.path().canonicalize().unwrap();
+        fs::write(project_root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
 
         let (_db, conn) = setup().await;
         let config = IndexingConfig::new(3, 2, 1).unwrap();
-        let stats = run_with_config(&conn, tmp.path(), None, &config)
+        let stats = run_with_config(&conn, &project_root, None, &config)
             .await
             .unwrap();
         let timings = stats.progress.timings.as_ref().unwrap();
@@ -2496,7 +2517,7 @@ mod tests {
         );
         assert!(timings.total_ms >= timings.scan_ms);
 
-        let progress_path = index_progress_path(tmp.path());
+        let progress_path = index_progress_path(&project_root);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
 
@@ -2545,7 +2566,8 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let project_root = tmp.path().canonicalize().unwrap();
+        fs::write(project_root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
 
         let (_db, conn) = setup().await;
         let config = IndexingConfig::new(2, 2, 1).unwrap();
@@ -2553,7 +2575,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = run_with_config(&conn, tmp.path(), Some(&mut embedder), &config)
+        let stats = run_with_config(&conn, &project_root, Some(&mut embedder), &config)
             .await
             .unwrap();
 
@@ -2571,7 +2593,7 @@ mod tests {
             config.embed_threads
         );
 
-        let progress_path = index_progress_path(tmp.path());
+        let progress_path = index_progress_path(&project_root);
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(progress_path).unwrap()).unwrap();
         assert_eq!(persisted["parallelism"]["embed_threads"], 2);

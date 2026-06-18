@@ -458,10 +458,24 @@ pub async fn classify_readiness(
 
     payload.schema_version = schema::get_schema_version(&conn).await.ok().flatten();
 
-    if let Err(err) = schema::ensure_current(&conn).await {
+    if let Err(err) = ensure_schema_current_tolerating_init(&conn).await {
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
+            return payload;
+        }
+        // A freshly-initializing index (DB file and tables present, but the
+        // version row not yet written) survives `is_initializing_schema_error`
+        // even after the bounded ride-out above when the writer is slower than
+        // our budget. Report it as `missing` rather than `stale`: the same
+        // `oneup_start` remediation applies, it self-corrects on the next poll
+        // once initialization commits, and we never mislabel a genuinely
+        // initializing index as a permanent version mismatch. Real
+        // out-of-date / newer-than-supported schemas keep reporting `stale`.
+        if schema::is_initializing_schema_error(&err) {
+            payload.status = ReadinessStatus::Missing;
+            payload.summary = "No usable 1up index is available for this repository.".to_string();
+            payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
             return payload;
         }
         payload.status = ReadinessStatus::Stale;
@@ -551,6 +565,37 @@ pub async fn classify_readiness(
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
     payload
+}
+
+/// Run [`schema::ensure_current`], riding out a freshly-initializing index.
+///
+/// `schema::initialize` (invoked by the auto-started daemon when it first opens a
+/// brand-new project DB) creates every table first and writes the `schema_version`
+/// row last, and is not a single transaction. A readiness check that lands inside
+/// that window on a separate read-only connection sees "tables exist, version
+/// absent" and `ensure_current` returns the transient
+/// [`schema::is_initializing_schema_error`] shape. The daemon commits the version
+/// row microseconds later, so we retry on exactly that shape (reusing the shared
+/// DB-lock retry budget) to let initialization settle before classifying. This
+/// mirrors the lock-retry hardening of `schema::table_has_column` and never retries
+/// a genuine version mismatch (`out of date` / `newer than this binary supports`),
+/// which fails fast on the first attempt.
+async fn ensure_schema_current_tolerating_init(conn: &Connection) -> Result<(), OneupError> {
+    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    let mut attempt = 0;
+    loop {
+        match schema::ensure_current(conn).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= DB_LOCK_RETRY_ATTEMPTS || !schema::is_initializing_schema_error(&err)
+                {
+                    return Err(err);
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
 }
 
 /// Populate the advisory head-drift fields from the head OID recorded at the
