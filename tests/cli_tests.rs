@@ -1202,6 +1202,69 @@ fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
     );
 }
 
+/// REQ-001/002: a daemon-backed search keeps the machine-readable result stream
+/// on stdout clean — result rows go to stdout while any notice (degraded-search
+/// or drain/restart) is confined to stderr. This guards the stdout/stderr
+/// discipline that the refuse-before-write reordering touches; the genuine
+/// cross-version drain/restart path itself is covered by the worker
+/// CODE_EXPERIMENT (a real version mismatch cannot be induced from a single
+/// compiled binary whose `VERSION` is a compile-time constant).
+#[cfg(unix)]
+#[test]
+fn search_keeps_stdout_clean_and_notices_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
+    // Force FTS-only so the run is deterministic and never blocks on a download.
+    seed_model_download_failure(&canonical_home);
+
+    // A distinctive token that does not contain the substring "warning" so the
+    // result row can never be mistaken for a leaked notice.
+    let query = "discipline_probe_token";
+    fs::write(
+        canonical_dir.join("probe.rs"),
+        format!("pub fn {query}() -> u32 {{\n    42\n}}\n"),
+    )
+    .unwrap();
+
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    let start = cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "start should succeed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // Poll until the index can serve the token, then capture one clean run.
+    wait_for_search(&canonical_home, &canonical_dir, query, true);
+
+    let search = cmd_with_home(&canonical_home)
+        .args(["search", query, "--path", canonical_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search should succeed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let stdout = String::from_utf8(search.stdout).unwrap();
+    assert!(
+        stdout.contains(query),
+        "search result row must be served on stdout; stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("warning:"),
+        "notices must never leak into the machine-readable stdout stream; stdout={stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn start_from_worktree_uses_main_state_and_indexes_worktree_source() {

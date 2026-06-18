@@ -6,6 +6,7 @@ use anyhow::{bail, Context};
 use libsql::Connection;
 use serde::Serialize;
 
+use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{
     self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
@@ -458,7 +459,12 @@ pub async fn classify_readiness(
 
     payload.schema_version = schema::get_schema_version(&conn).await.ok().flatten();
 
-    if let Err(err) = ensure_schema_current_tolerating_init(&conn).await {
+    if let Err(err) = ensure_schema_current_tolerating_init(
+        &conn,
+        &schema::SchemaContext::new(&db_path, source_root),
+    )
+    .await
+    {
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
@@ -580,11 +586,14 @@ pub async fn classify_readiness(
 /// mirrors the lock-retry hardening of `schema::table_has_column` and never retries
 /// a genuine version mismatch (`out of date` / `newer than this binary supports`),
 /// which fails fast on the first attempt.
-async fn ensure_schema_current_tolerating_init(conn: &Connection) -> Result<(), OneupError> {
+async fn ensure_schema_current_tolerating_init(
+    conn: &Connection,
+    ctx: &schema::SchemaContext<'_>,
+) -> Result<(), OneupError> {
     let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
     let mut attempt = 0;
     loop {
-        match schema::ensure_current(conn).await {
+        match schema::ensure_current(conn, ctx).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 attempt += 1;
@@ -977,6 +986,19 @@ async fn run_index(
     )?;
     let mut setup = SetupTimings::new(Instant::now());
 
+    // Single-writer rebuild lock: hold it across schema rebuild/prepare + the
+    // pipeline write so a concurrent daemon/CLI rebuild of the shared index
+    // cannot race this one. Released when this function returns (RAII).
+    //
+    // `acquire_rebuild_lock` is a blocking, bounded-wait retry (std::thread::sleep
+    // on contention). On this async MCP path it would block a tokio worker for up
+    // to REBUILD_LOCK_CONTENTION_TIMEOUT_MS on the rare cross-process rebuild race,
+    // so the blocking acquire is moved to spawn_blocking. The guard
+    // (Flock<File>) is Send and is held in this task across the pipeline write.
+    let lock_root = roots.state_root.clone();
+    let _rebuild_lock =
+        tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
+
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect_tuned().await?;
@@ -994,6 +1016,8 @@ async fn run_index(
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
+    // One-shot MCP rebuild: not subject to the daemon's SIGTERM drain, so it
+    // runs under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         &roots.worktree_context,
@@ -1005,6 +1029,7 @@ async fn run_index(
         Some(setup),
         None,
         Some(&roots.state_root),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .map_err(Into::into)
@@ -1021,7 +1046,7 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
 
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
-    schema::ensure_current(&conn).await?;
+    schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, state_root)).await?;
 
     Ok(CurrentIndex { conn, _db: db })
 }

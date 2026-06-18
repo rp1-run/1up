@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::shared::errors::{DaemonError, OneupError};
 
@@ -65,6 +66,34 @@ pub fn ensure_daemon(
     _source_root: &Path,
 ) -> Result<u32, OneupError> {
     Err(unsupported_daemon_error())
+}
+
+pub fn drain_daemon(_pid: u32, _timeout: Duration) -> Result<(), OneupError> {
+    Err(unsupported_daemon_error())
+}
+
+#[allow(dead_code)]
+pub fn drain_and_restart_daemon(
+    _pid: u32,
+    _project_id: &str,
+    _project_root: &Path,
+    _source_root: &Path,
+) -> Result<u32, OneupError> {
+    Err(unsupported_daemon_error())
+}
+
+/// No-op rebuild-lock guard for platforms without `flock`. The daemon does not
+/// run here, so indexing continues without the cross-process single-writer
+/// lock — matching how the secure-fs layer degrades Unix-only primitives to
+/// no-ops on non-Unix targets rather than failing a working CLI feature.
+pub struct RebuildLock;
+
+pub fn acquire_rebuild_lock(_state_root: &Path) -> Result<RebuildLock, OneupError> {
+    Ok(RebuildLock)
+}
+
+pub fn try_acquire_rebuild_lock(_state_root: &Path) -> Result<Option<RebuildLock>, OneupError> {
+    Ok(Some(RebuildLock))
 }
 
 fn unsupported_daemon_error() -> OneupError {

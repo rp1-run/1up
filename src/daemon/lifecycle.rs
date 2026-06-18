@@ -11,10 +11,14 @@ use nix::unistd::Pid;
 use tracing::{debug, info, warn};
 
 use crate::shared::config;
-use crate::shared::constants::{SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE};
+use crate::shared::constants::{
+    DAEMON_DRAIN_POLL_INTERVAL_MS, DAEMON_DRAIN_TIMEOUT_MS, REBUILD_LOCK_CONTENTION_TIMEOUT_MS,
+    REBUILD_LOCK_RETRY_INTERVAL_MS, SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE,
+};
 use crate::shared::errors::{DaemonError, OneupError};
 use crate::shared::fs::{
-    atomic_replace, ensure_secure_xdg_root, remove_regular_file, validate_regular_file_path,
+    atomic_replace, ensure_secure_project_root, ensure_secure_xdg_root, remove_regular_file,
+    validate_regular_file_path,
 };
 
 const CONTENTION_RETRY_INTERVAL_MS: u64 = 200;
@@ -371,6 +375,177 @@ pub fn ensure_daemon(
     Ok(pid)
 }
 
+/// Gracefully drains a running daemon: sends SIGTERM, then polls
+/// [`is_process_alive`] at [`DAEMON_DRAIN_POLL_INTERVAL_MS`] until the process
+/// exits or `timeout` elapses.
+///
+/// Returns `Ok(())` once the daemon has exited (releasing its DB write lock and
+/// any held rebuild lock as their guards drop). On timeout it returns an
+/// actionable error instructing the user to run `1up stop` then retry, rather
+/// than forcing a kill or proceeding against a still-live daemon.
+///
+/// This is the shared SIGTERM+poll primitive reused by `1up update`'s
+/// pre-update stop and by the post-upgrade version-handshake drain/restart.
+pub fn drain_daemon(pid: u32, timeout: Duration) -> Result<(), OneupError> {
+    debug!("draining daemon (pid={pid}) with SIGTERM; bound={timeout:?}");
+    send_sigterm(pid)?;
+
+    let poll_interval = Duration::from_millis(DAEMON_DRAIN_POLL_INTERVAL_MS);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if !is_process_alive(pid) {
+            debug!("daemon (pid={pid}) exited within drain bound");
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+
+    warn!("daemon (pid={pid}) did not exit within {timeout:?} drain bound");
+    Err(DaemonError::DrainTimeout {
+        pid,
+        timeout_ms: timeout.as_millis(),
+    }
+    .into())
+}
+
+/// Drains a stale daemon and restarts a fresh one under the current binary.
+///
+/// Drains via [`drain_daemon`] using the standard [`DAEMON_DRAIN_TIMEOUT_MS`]
+/// bound; if the drain exceeds the bound the actionable error is returned and
+/// no restart is attempted (the caller falls back rather than proceeding). On a
+/// clean drain the stale daemon has released its locks, so [`ensure_daemon`]
+/// spawns a fresh daemon under the current executable and returns its pid.
+pub fn drain_and_restart_daemon(
+    pid: u32,
+    project_id: &str,
+    project_root: &Path,
+    source_root: &Path,
+) -> Result<u32, OneupError> {
+    drain_daemon(pid, Duration::from_millis(DAEMON_DRAIN_TIMEOUT_MS))?;
+    info!("stale daemon (pid={pid}) drained; restarting under current binary");
+    ensure_daemon(project_id, project_root, source_root)
+}
+
+/// RAII guard for the single-writer rebuild lock.
+///
+/// Holds an exclusive `flock` on `<state_root>/.1up/rebuild.lock` for as long as
+/// the guard is alive, so exactly one process owns a destructive rebuild /
+/// format change of the shared index. The lock auto-releases when the guard
+/// drops — on normal scope exit, on a `?` early return, or when an in-flight
+/// indexing pass is cancelled and the holding frame unwinds — so a daemon
+/// drained mid-rebuild frees the lock for the restarted binary with no
+/// stale-lock reconciliation (HYP-002).
+///
+/// Unlike [`DaemonLock`], the lockfile is intentionally NOT removed on drop:
+/// unlinking a held `flock` target races a concurrent waiter onto a different
+/// inode, so the file is left in place and only the advisory lock is released.
+#[must_use = "the rebuild lock releases as soon as the guard is dropped"]
+pub struct RebuildLock {
+    _lock: Flock<File>,
+}
+
+impl std::fmt::Debug for RebuildLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebuildLock").finish_non_exhaustive()
+    }
+}
+
+/// Opens (creating if absent) the `state_root`-keyed rebuild lockfile under
+/// `.1up/` with owner-only permissions, rejecting symlinked components.
+fn open_rebuild_lock_file(state_root: &Path) -> Result<(File, PathBuf), OneupError> {
+    let dot_dir = ensure_secure_project_root(state_root).map_err(|err| {
+        DaemonError::RebuildLockError(format!("failed to prepare rebuild lock root: {err}"))
+    })?;
+    let lock_path = config::project_rebuild_lock_path(state_root);
+    let validated_path = validate_regular_file_path(&lock_path, &dot_dir).map_err(|err| {
+        DaemonError::RebuildLockError(format!("failed to validate rebuild lock file: {err}"))
+    })?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(SECURE_STATE_FILE_MODE)
+        .open(&validated_path)
+        .map_err(|e| {
+            DaemonError::RebuildLockError(format!("failed to open rebuild lock file: {e}"))
+        })?;
+    Ok((file, validated_path))
+}
+
+/// Attempts to acquire the rebuild lock without blocking.
+///
+/// Returns `Ok(Some(guard))` when the lock is acquired, `Ok(None)` when another
+/// process currently holds it, or an error if the lockfile cannot be opened.
+/// The daemon uses this to defer an indexing pass (leaving the project dirty for
+/// a later retry) instead of blocking its event loop while a competing one-shot
+/// rebuild runs.
+pub fn try_acquire_rebuild_lock(state_root: &Path) -> Result<Option<RebuildLock>, OneupError> {
+    let (file, lock_path) = open_rebuild_lock_file(state_root)?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            debug!("acquired rebuild lock: {}", lock_path.display());
+            Ok(Some(RebuildLock { _lock: lock }))
+        }
+        Err((_, Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, errno)) => Err(DaemonError::RebuildLockError(format!(
+            "failed to lock rebuild file: {errno}"
+        ))
+        .into()),
+    }
+}
+
+/// Acquires the single-writer rebuild lock, waiting up to
+/// [`REBUILD_LOCK_CONTENTION_TIMEOUT_MS`] for a competing holder to release it
+/// before failing closed with an actionable, named reason.
+///
+/// Used by the synchronous one-shot rebuild paths (CLI `index`/`reindex`, MCP)
+/// so two processes never race a destructive rebuild of the shared
+/// `.1up/index.db`. The returned guard releases on drop.
+pub fn acquire_rebuild_lock(state_root: &Path) -> Result<RebuildLock, OneupError> {
+    acquire_rebuild_lock_with_bound(
+        state_root,
+        Duration::from_millis(REBUILD_LOCK_CONTENTION_TIMEOUT_MS),
+        Duration::from_millis(REBUILD_LOCK_RETRY_INTERVAL_MS),
+    )
+}
+
+fn acquire_rebuild_lock_with_bound(
+    state_root: &Path,
+    timeout: Duration,
+    retry_interval: Duration,
+) -> Result<RebuildLock, OneupError> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(lock) = try_acquire_rebuild_lock(state_root)? {
+            return Ok(lock);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(retry_interval.min(deadline.saturating_duration_since(now)));
+    }
+
+    warn!(
+        "rebuild lock for {} held by another process within {timeout:?}; failing closed",
+        state_root.display()
+    );
+    Err(DaemonError::RebuildLockContended {
+        state_root: state_root.display().to_string(),
+    }
+    .into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +701,142 @@ mod tests {
             err,
             OneupError::Daemon(DaemonError::StartupInProgress)
         ));
+    }
+
+    #[test]
+    fn drain_daemon_times_out_with_actionable_error_when_pid_ignores_sigterm() {
+        struct ChildGuard {
+            child: std::process::Child,
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        // A process that ignores SIGTERM, so the bounded drain must give up
+        // rather than observe an exit. `kill()` (SIGKILL) cleans it up.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap "" TERM; while true; do sleep 1; done"#)
+            .spawn()
+            .expect("spawn sigterm-ignoring child");
+        let pid = child.id();
+        let _guard = ChildGuard { child };
+
+        assert!(
+            is_process_alive(pid),
+            "child should be running before drain"
+        );
+
+        let err = drain_daemon(pid, std::time::Duration::from_millis(50))
+            .expect_err("drain must time out when the pid ignores SIGTERM");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1up stop"),
+            "timeout error must instruct `1up stop`: {msg}"
+        );
+        assert!(
+            msg.contains("retry"),
+            "timeout error must instruct a retry: {msg}"
+        );
+        assert!(
+            is_process_alive(pid),
+            "drain must not force-kill the daemon on timeout"
+        );
+    }
+
+    fn state_root_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&state_root).unwrap();
+        (tmp, state_root)
+    }
+
+    #[test]
+    fn rebuild_lock_creates_secure_lockfile_under_dot_1up() {
+        let (_tmp, state_root) = state_root_dir();
+
+        let _lock = acquire_rebuild_lock(&state_root).unwrap();
+
+        let lock_path = crate::shared::config::project_rebuild_lock_path(&state_root);
+        assert_eq!(lock_path, state_root.join(".1up").join("rebuild.lock"));
+        assert!(lock_path.exists(), "lockfile must be created on acquire");
+
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, SECURE_STATE_FILE_MODE);
+    }
+
+    #[test]
+    fn rebuild_lock_contention_fails_closed_with_named_reason() {
+        let (_tmp, state_root) = state_root_dir();
+
+        let _held = acquire_rebuild_lock(&state_root).unwrap();
+
+        // A second acquirer must give up within the bound rather than start a
+        // competing rebuild, and the reason must name the contended index.
+        let err = acquire_rebuild_lock_with_bound(
+            &state_root,
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+        )
+        .expect_err("second acquisition must fail closed while the lock is held");
+
+        assert!(matches!(
+            err,
+            OneupError::Daemon(DaemonError::RebuildLockContended { .. })
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&state_root.display().to_string()),
+            "contention error must name the index path: {msg}"
+        );
+        assert!(
+            msg.contains("rebuilding the index"),
+            "contention error must explain the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn rebuild_lock_releases_on_drop_so_a_later_acquire_succeeds() {
+        let (_tmp, state_root) = state_root_dir();
+
+        {
+            let _held = acquire_rebuild_lock(&state_root).unwrap();
+            assert!(
+                try_acquire_rebuild_lock(&state_root).unwrap().is_none(),
+                "lock must be exclusive while held"
+            );
+        }
+
+        // The flock auto-released when the guard dropped: a fresh acquire wins.
+        let reacquired = try_acquire_rebuild_lock(&state_root).unwrap();
+        assert!(
+            reacquired.is_some(),
+            "lock must be re-acquirable after the holder is dropped"
+        );
+    }
+
+    #[test]
+    fn rebuild_lock_is_keyed_per_state_root() {
+        let (_tmp_a, state_root_a) = state_root_dir();
+        let (_tmp_b, state_root_b) = state_root_dir();
+
+        // Holding the lock for one state root blocks a second acquire for the
+        // SAME state root (linked worktrees share `.1up/` so resolve here),...
+        let _held = acquire_rebuild_lock(&state_root_a).unwrap();
+        assert!(
+            try_acquire_rebuild_lock(&state_root_a).unwrap().is_none(),
+            "same state root must contend on the same lock"
+        );
+
+        // ...but leaves an independent state root free to acquire its own lock.
+        assert!(
+            try_acquire_rebuild_lock(&state_root_b).unwrap().is_some(),
+            "a different state root must use an independent lock"
+        );
     }
 }

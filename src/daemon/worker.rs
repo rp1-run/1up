@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::net::UnixStream;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::lifecycle;
@@ -110,6 +111,12 @@ async fn run_inner() -> Result<(), OneupError> {
         crate::shared::errors::DaemonError::SignalError(format!("SIGTERM handler: {e}"))
     })?;
 
+    // A single cooperative-cancellation token shared by every dirty-run pass.
+    // SIGTERM cancels it so an in-flight indexing pass stops at its next safe
+    // unit boundary (see `pipeline`), making the bounded SIGTERM drain genuinely
+    // interrupt indexing instead of waiting for the whole pass to finish.
+    let cancel_token = CancellationToken::new();
+
     let mut file_watcher = FileWatcher::new()?;
     let mut projects: ProjectStates = HashMap::new();
     let request_limit = Arc::new(Semaphore::new(MAX_DAEMON_IN_FLIGHT_REQUESTS));
@@ -125,11 +132,17 @@ async fn run_inner() -> Result<(), OneupError> {
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
-    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
+    run_dirty_projects_until_clean_or_cancelled(
+        &file_watcher,
+        &mut projects,
+        &cancel_token,
+        &mut sigterm,
+    )
+    .await;
 
     let debounce = std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS);
 
-    loop {
+    while !cancel_token.is_cancelled() {
         tokio::select! {
             request = async {
                 match search_listener.as_ref() {
@@ -176,11 +189,20 @@ async fn run_inner() -> Result<(), OneupError> {
                     error!("failed to reload projects: {e}");
                 } else {
                     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
-                    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
+                    run_dirty_projects_until_clean_or_cancelled(
+                        &file_watcher,
+                        &mut projects,
+                        &cancel_token,
+                        &mut sigterm,
+                    )
+                    .await;
                 }
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
+                // No pass is in flight on this arm; cancel so the loop guard and
+                // any future pass observe the shutdown, then break.
+                cancel_token.cancel();
                 break;
             }
             _ = tokio::time::sleep(debounce) => {
@@ -188,7 +210,13 @@ async fn run_inner() -> Result<(), OneupError> {
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
                 mark_branch_context_changes(&mut file_watcher, &mut projects);
                 if filtered.is_empty() {
-                    run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
+                    run_dirty_projects_until_clean_or_cancelled(
+                        &file_watcher,
+                        &mut projects,
+                        &cancel_token,
+                        &mut sigterm,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -198,7 +226,13 @@ async fn run_inner() -> Result<(), OneupError> {
                     filtered.ambiguous_paths.len()
                 );
                 mark_changed_projects(&mut projects, &filtered);
-                run_dirty_projects_until_clean(&file_watcher, &mut projects).await;
+                run_dirty_projects_until_clean_or_cancelled(
+                    &file_watcher,
+                    &mut projects,
+                    &cancel_token,
+                    &mut sigterm,
+                )
+                .await;
             }
         }
     }
@@ -862,13 +896,54 @@ fn next_dirty_project_key(projects: &ProjectStates, preferred_key: Option<&str>)
     dirty_keys.into_iter().next()
 }
 
-async fn run_dirty_projects_until_clean(watcher: &FileWatcher, projects: &mut ProjectStates) {
+/// Run dirty projects to completion, but race the whole sweep against SIGTERM so
+/// the daemon can honour its bounded drain mid-pass.
+///
+/// On SIGTERM the token is cancelled and the in-flight sweep is **resumed**
+/// (never dropped) until it reaches its next safe unit boundary and returns. The
+/// pinned future is awaited to completion rather than dropped at an arbitrary
+/// `.await`, which is what keeps an interrupted flush from being torn mid-write.
+/// SIGTERM is consumed here, so callers detect shutdown via
+/// `cancel_token.is_cancelled()` (the main loop guard) rather than a second
+/// `sigterm.recv()`.
+async fn run_dirty_projects_until_clean_or_cancelled(
+    watcher: &FileWatcher,
+    projects: &mut ProjectStates,
+    cancel_token: &CancellationToken,
+    sigterm: &mut Signal,
+) {
+    let sweep = run_dirty_projects_until_clean(watcher, projects, cancel_token);
+    tokio::pin!(sweep);
+
+    tokio::select! {
+        _ = &mut sweep => {}
+        _ = sigterm.recv() => {
+            info!("received SIGTERM during indexing; cancelling in-flight pass at next safe point");
+            cancel_token.cancel();
+            // Resume the same pinned future so it unwinds cooperatively at a
+            // committed boundary instead of being dropped mid-flush.
+            sweep.await;
+        }
+    }
+}
+
+async fn run_dirty_projects_until_clean(
+    watcher: &FileWatcher,
+    projects: &mut ProjectStates,
+    cancel_token: &CancellationToken,
+) {
     let mut preferred_key: Option<String> = None;
 
     while let Some(key) = next_dirty_project_key(projects, preferred_key.as_deref()) {
+        // Stop starting new project passes once cancelled; the current process is
+        // draining for shutdown and any started pass would immediately re-cancel.
+        if cancel_token.is_cancelled() {
+            debug!("skipping further re-index sweeps: shutdown cancellation requested");
+            break;
+        }
         preferred_key = None;
 
-        let result = run_project(&key, projects).await;
+        let result = run_project(&key, projects, cancel_token).await;
 
         let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
@@ -906,6 +981,31 @@ async fn run_dirty_projects_until_clean(watcher: &FileWatcher, projects: &mut Pr
                 }
             }
             Err(e) => {
+                if matches!(
+                    &e,
+                    OneupError::Indexing(crate::shared::errors::IndexingError::Cancelled)
+                ) {
+                    // SIGTERM cancelled the pass at a unit boundary. `run_project`
+                    // already re-queued the scope (the context stays dirty so the
+                    // restarted binary re-indexes the remainder). Stop the sweep;
+                    // the main loop guard will break for shutdown.
+                    debug!("re-index sweep for context {key} cancelled for shutdown");
+                    break;
+                }
+                if matches!(
+                    &e,
+                    OneupError::Daemon(
+                        crate::shared::errors::DaemonError::RebuildLockContended { .. }
+                    )
+                ) {
+                    // The pass deferred to a competing one-shot rebuild and left
+                    // the project dirty. Return to the select loop instead of
+                    // immediately re-selecting the same key (which would
+                    // busy-spin on the held lock); the next debounce tick or
+                    // file event retries once the other writer releases it.
+                    debug!("deferring re-index sweep for context {key}: {e}");
+                    break;
+                }
                 error!("re-index failed for context {key}: {e}");
             }
         }
@@ -979,7 +1079,35 @@ fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
 async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
+    cancel_token: &CancellationToken,
 ) -> Result<pipeline::PipelineStats, OneupError> {
+    // Acquire the single-writer rebuild lock BEFORE `start_run` consumes the
+    // pending scope, so a contended pass leaves the project dirty (its queued
+    // paths intact) for a later retry instead of racing a competing rebuild and
+    // dropping the changes. Non-blocking: the daemon defers rather than stalling
+    // its event loop while a one-shot rebuild holds the lock. The guard releases
+    // on drop — including when an in-flight pass is cancelled and this frame
+    // unwinds — freeing the lock for the restarted binary.
+    let lock_root = projects
+        .get(context_id)
+        .expect("dirty project must exist while running")
+        .project_root
+        .clone();
+    let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            debug!(
+                "deferring re-index for {}: rebuild lock held by another process",
+                lock_root.display()
+            );
+            return Err(crate::shared::errors::DaemonError::RebuildLockContended {
+                state_root: lock_root.display().to_string(),
+            }
+            .into());
+        }
+        Err(e) => return Err(e),
+    };
+
     let mut setup = SetupTimings::new(std::time::Instant::now());
     let (project_root, source_root, context, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects
@@ -1071,6 +1199,7 @@ async fn run_project(
             Some(setup),
             daemon_fallback_reason,
             Some(&project_root),
+            cancel_token,
         )
         .await
     };
@@ -1079,6 +1208,22 @@ async fn run_project(
         .get_mut(context_id)
         .expect("dirty project must exist while finishing a run");
     state.run_state.finish_run();
+
+    if matches!(
+        &result,
+        Err(OneupError::Indexing(
+            crate::shared::errors::IndexingError::Cancelled
+        ))
+    ) {
+        // A cancelled pass is neither complete nor failed: it stopped at a
+        // committed boundary with the remainder unindexed. Re-queue the scope so
+        // the context stays dirty (refresh state -> Pending) and the remaining
+        // files re-index on the next pass — here if the daemon survives, or on
+        // the restarted binary's startup reconciliation after a SIGTERM drain.
+        mark_refresh_pending(state, scope, Some("cancelled".to_string()));
+        return result;
+    }
+
     mark_refresh_finished(state, Utc::now(), result.as_ref().map(|_| ()));
 
     result
@@ -1133,7 +1278,13 @@ async fn handle_search_request(
         }
     };
 
-    if let Err(err) = schema::ensure_current(&conn).await {
+    let schema_db_path = config::project_db_path(&state.project_root);
+    if let Err(err) = schema::ensure_current(
+        &conn,
+        &schema::SchemaContext::new(&schema_db_path, &state.source_root),
+    )
+    .await
+    {
         warn!(
             "daemon search index is unavailable for {}: {err}",
             state.project_root.display()
@@ -1616,6 +1767,78 @@ mod tests {
         projects.get_mut(&beta_key).unwrap().run_state.dirty = false;
         let fallback = next_dirty_project_key(&projects, Some(&beta_key));
         assert_eq!(fallback, Some(alpha_key));
+    }
+
+    #[tokio::test]
+    async fn run_project_leaves_context_dirty_when_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        // A file-backed DB so the connection `run_project` opens shares the
+        // initialized schema (separate `:memory:` connections would not), letting
+        // the pass reach the hot-loop cancel check.
+        let db_path = config::project_db_path(&root);
+        ensure_secure_project_root(&root).unwrap();
+        let db = Db::open_rw(&db_path).await.unwrap();
+        schema::initialize(&db.connect_tuned().await.unwrap())
+            .await
+            .unwrap();
+
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(
+                &root,
+                &root,
+                db,
+                ProjectRunState {
+                    running: false,
+                    dirty: true,
+                    pending_scope: Some(RunScope::Full),
+                    pending_fallback_reason: None,
+                },
+            ),
+        );
+
+        // A token cancelled before the pass means run_project must not record a
+        // completed (or failed) run; the context stays dirty for re-indexing.
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let result = run_project(&key, &mut projects, &cancel_token).await;
+        assert!(
+            matches!(
+                result,
+                Err(OneupError::Indexing(
+                    crate::shared::errors::IndexingError::Cancelled
+                ))
+            ),
+            "a cancelled pass must surface the Cancelled outcome, got: {result:?}"
+        );
+
+        let run_state = &projects.get(&key).unwrap().run_state;
+        assert!(!run_state.running, "the cancelled run must be finished");
+        assert!(
+            run_state.dirty,
+            "a cancelled context must stay dirty so the remainder re-indexes"
+        );
+        assert_eq!(
+            run_state.pending_scope,
+            Some(RunScope::Full),
+            "the un-indexed scope must be re-queued for the next pass"
+        );
+        assert_eq!(
+            projects.get(&key).unwrap().last_refresh_state,
+            DaemonRefreshState::Pending,
+            "a cancelled pass is pending re-index, neither complete nor failed"
+        );
     }
 
     #[tokio::test]

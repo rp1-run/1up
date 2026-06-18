@@ -106,7 +106,7 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
         let stats = run_reindex_once(
             &db_path,
             &worktree_context,
-            Some(&project_root),
+            &project_root,
             &indexing_config,
             true,
             None,
@@ -133,7 +133,7 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
     let result = run_reindex_once(
         &db_path,
         &worktree_context,
-        Some(&project_root),
+        &project_root,
         &indexing_config,
         false,
         Some(&progress_tx),
@@ -183,7 +183,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     let stats = run_reindex_once(
         &db_path,
         &worktree_context,
-        Some(&project_root),
+        &project_root,
         &indexing_config,
         show_progress_ui,
         None,
@@ -207,13 +207,20 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
 async fn run_reindex_once(
     db_path: &std::path::Path,
     context: &WorktreeContext,
-    state_root: Option<&std::path::Path>,
+    state_root: &std::path::Path,
     indexing_config: &crate::shared::types::IndexingConfig,
     show_progress_ui: bool,
     progress_tx: Option<&pipeline::ProgressSender>,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
+
+    // Single-writer rebuild lock: ALWAYS held across the destructive schema
+    // rebuild + pipeline write so exactly one process owns the format change
+    // (REQ-003 single-writer guarantee). `state_root` is non-optional precisely
+    // so this lock can never be silently bypassed. Released when this function
+    // returns (RAII).
+    let _rebuild_lock = crate::daemon::lifecycle::acquire_rebuild_lock(state_root)?;
 
     let db_start = Instant::now();
     let db = Db::open_rw(db_path).await?;
@@ -254,6 +261,8 @@ async fn run_reindex_once(
         send_watch_progress(progress_tx, IndexPhase::LoadingModel, status_message);
     }
 
+    // One-shot CLI reindex: not subject to the daemon's SIGTERM drain, so it
+    // runs under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         context,
@@ -264,7 +273,8 @@ async fn run_reindex_once(
         show_progress_ui,
         Some(setup),
         None,
-        state_root,
+        Some(state_root),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .map_err(Into::into)

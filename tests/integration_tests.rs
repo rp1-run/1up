@@ -5303,3 +5303,248 @@ fn branch_context_search_excludes_other_worktree_only_content() {
         "feature branch should keep shared content discoverable"
     );
 }
+
+/// REQ-003: the `state_root`-keyed single-writer rebuild lock must serialize
+/// concurrent rebuilds — exactly one process performs the rebuild while a second
+/// concurrent attempt defers (never starting a competing destructive rebuild) —
+/// and must release on drop so a later rebuild can proceed.
+#[cfg(unix)]
+#[test]
+fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
+    use oneup::daemon::lifecycle::{acquire_rebuild_lock, try_acquire_rebuild_lock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let state_root = tmp.path().canonicalize().unwrap();
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+
+    let (winner_holds_lock_tx, winner_holds_lock_rx) = mpsc::channel::<()>();
+    let (loser_done_tx, loser_done_rx) = mpsc::channel::<()>();
+
+    let winner = {
+        let state_root = state_root.clone();
+        let rebuilds = Arc::clone(&rebuilds);
+        thread::spawn(move || {
+            let _lock =
+                acquire_rebuild_lock(&state_root).expect("winner acquires the rebuild lock");
+            // Model "this process performs the rebuild" while holding the lock.
+            rebuilds.fetch_add(1, Ordering::SeqCst);
+            winner_holds_lock_tx.send(()).unwrap();
+            // Hold the lock until the loser has attempted its concurrent rebuild.
+            loser_done_rx.recv().unwrap();
+            // `_lock` drops here, releasing the flock for any later acquirer.
+        })
+    };
+
+    // The loser attempts a concurrent rebuild only once the winner provably
+    // holds the lock, so the contention window is deterministic.
+    winner_holds_lock_rx.recv().unwrap();
+    let loser_guard =
+        try_acquire_rebuild_lock(&state_root).expect("loser's lock attempt must not error");
+    if loser_guard.is_some() {
+        // A competing rebuild would have started here — it must not.
+        rebuilds.fetch_add(1, Ordering::SeqCst);
+    }
+    assert!(
+        loser_guard.is_none(),
+        "a second concurrent rebuild must defer while the single-writer lock is held"
+    );
+    loser_done_tx.send(()).unwrap();
+    winner.join().unwrap();
+
+    assert_eq!(
+        rebuilds.load(Ordering::SeqCst),
+        1,
+        "exactly one process performs the rebuild under contention"
+    );
+
+    // The lock released on drop: a fresh rebuild can now acquire it.
+    drop(acquire_rebuild_lock(&state_root).expect("rebuild lock re-acquires after release"));
+}
+
+/// Cancelling an in-flight indexing pass *after a non-zero prefix has already
+/// committed* must leave the on-disk libSQL index consistent (stopped at a
+/// committed batch boundary, not torn mid-write) AND resumable: the committed
+/// prefix survives, a freshly-opened DB handle still validates via
+/// `ensure_current` and reads, and a subsequent uncancelled pass completes the
+/// remainder to the full file count.
+///
+/// This is the design's headline T7 "resume-don't-drop" guarantee (REQ-002):
+/// the prior cancellation tests all cancel *before* the pass (a 0->N from-scratch
+/// resume), so the resume-from-a-committed-prefix path was unguarded. The
+/// mid-pass cancellation here is DETERMINISTIC, not timing-based: a libSQL
+/// update hook on the pipeline's own connection fires on the first committed
+/// row write and cancels the token, so the very next safe-point check (loop top
+/// / pre-flush — never mid-flush) surfaces `Cancelled` with at least one batch
+/// already durably committed. No wall-clock sleep or race is involved.
+///
+/// The timing claim (SIGTERM interrupts a real daemon pass within the ~3s bound)
+/// was validated separately by the HYP-001/HYP-003 daemon CODE_EXPERIMENT.
+#[cfg(unix)]
+#[test]
+fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
+    use libsql::Op;
+    use oneup::indexer::pipeline;
+    use oneup::shared::types::{
+        BranchStatus, IndexingConfig, RunScope, WorktreeContext, WorktreeRole,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    const FILES: usize = 12;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    for i in 0..FILES {
+        fs::write(
+            root.join(format!("mod_{i}.rs")),
+            format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+
+    let db_path = root.join(".1up").join("index.db");
+    let context = WorktreeContext {
+        context_id: "ctx-cancel-midpass".to_string(),
+        state_root: root.clone(),
+        source_root: root.clone(),
+        main_worktree_root: root.clone(),
+        worktree_role: WorktreeRole::Main,
+        git_dir: None,
+        common_git_dir: None,
+        branch_name: Some("main".to_string()),
+        branch_ref: Some("refs/heads/main".to_string()),
+        head_oid: Some("0".repeat(40)),
+        branch_status: BranchStatus::Named,
+    };
+    // Determinism: jobs = 1 + write_batch_files = 1. With a single parse worker,
+    // exactly one file is ever in flight, so the dispatch loop processes files in
+    // submission order and each `flush_reorder_buffer` call can only ever drain
+    // ONE buffered file (one committed batch). The update hook below cancels the
+    // token on that first committed insert, so the very next safe-point check
+    // (loop top, before dispatching file 1 — never mid-flush) observes the cancel
+    // and returns, leaving a committed prefix of exactly 1. This removes the
+    // scheduling race that a multi-worker config has, where all files can land in
+    // the reorder buffer and a single flush commits them all before the next
+    // safe-point is reached. (Real-world cancel granularity is fine regardless —
+    // validated separately by HYP-003: files parse over time and flush
+    // incrementally, giving 17-53ms interruption. This knob is test-only.)
+    let config = IndexingConfig::new(1, 1, 1).unwrap();
+
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        schema::initialize(&db.connect_tuned().await.unwrap())
+            .await
+            .unwrap();
+
+        // The token starts LIVE. An update hook on the pipeline's own connection
+        // cancels it on the first committed row insert — deterministically
+        // landing the cancellation *after* at least one batch has committed.
+        let token = CancellationToken::new();
+        let conn = db.connect_tuned().await.unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let token = token.clone();
+            let fired = Arc::clone(&fired);
+            conn.add_update_hook(Box::new(move |op, _db, _table, _rowid| {
+                if op == Op::Insert && !fired.swap(true, Ordering::SeqCst) {
+                    // First committed write: request cancellation. The in-flight
+                    // batch still commits; the next loop-top / pre-flush check
+                    // (never mid-flush) returns Cancelled.
+                    token.cancel();
+                }
+            }))
+            .expect("registering the update hook must succeed");
+        }
+
+        let result = pipeline::run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&root),
+            &token,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(oneup::shared::errors::OneupError::Indexing(
+                    oneup::shared::errors::IndexingError::Cancelled
+                ))
+            ),
+            "the mid-pass cancelled pass must surface the Cancelled outcome, got: {result:?}"
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the update hook must have fired (a write must have been committed before cancellation)"
+        );
+    });
+
+    // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly,
+    // be readable, and expose a STRICTLY-PARTIAL committed prefix (0 < n < FILES)
+    // — proof the pass stopped at a committed batch boundary mid-way, not at 0
+    // (pre-cancel) and not at FILES (no cancellation). With the jobs=1 +
+    // write_batch=1 config the prefix is deterministically exactly 1, so we
+    // assert that precise value (a stronger guard than the bare 0 < n < FILES
+    // invariant: it also catches any future regression that lets a single flush
+    // drain more than one batch before a cancel safe-point).
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
+            .await
+            .expect("a cancelled pass must leave the reopened index schema-valid");
+        let prefix = segments::count_files_for_context(&conn, "ctx-cancel-midpass")
+            .await
+            .expect("reading the reopened index must succeed") as usize;
+        assert!(
+            prefix > 0 && prefix < FILES,
+            "a mid-pass cancellation must leave a non-zero, incomplete committed prefix; \
+             got {prefix} of {FILES}"
+        );
+        assert_eq!(
+            prefix, 1,
+            "with jobs=1 + write_batch=1 the cancel must land deterministically after \
+             exactly one committed batch; got {prefix} of {FILES}"
+        );
+
+        // A subsequent uncancelled pass resumes the remainder against the
+        // consistent-but-incomplete index and completes to the full count.
+        let live = CancellationToken::new();
+        let stats = pipeline::run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            Some(&root),
+            &live,
+        )
+        .await
+        .expect("a normal pass after cancellation must complete");
+        assert_eq!(
+            stats.files_skipped + stats.files_indexed,
+            FILES,
+            "the resumed pass must account for every source file"
+        );
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-cancel-midpass")
+                .await
+                .unwrap() as usize,
+            FILES,
+            "every file must be committed after the resumed pass"
+        );
+    });
+}

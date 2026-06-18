@@ -41,7 +41,7 @@ pub async fn exec(args: StructuralArgs) -> anyhow::Result<()> {
     let results = if db_path.exists() {
         let db = Db::open_ro(&db_path).await?;
         let conn = db.connect()?;
-        schema::ensure_current(&conn).await?;
+        schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, source_root)).await?;
 
         let engine = StructuralSearchEngine::new_scoped(
             source_root,

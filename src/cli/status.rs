@@ -65,7 +65,13 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
-                        if schema::ensure_current(&conn).await.is_ok() {
+                        if schema::ensure_current(
+                            &conn,
+                            &schema::SchemaContext::new(&db_path, &source_root),
+                        )
+                        .await
+                        .is_ok()
+                        {
                             index_readable = true;
                             let context_id = &worktree_context.context_id;
                             let files = segments::count_files_for_context(&conn, context_id)

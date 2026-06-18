@@ -68,6 +68,15 @@ pub enum IndexingError {
     #[error("pipeline failed: {0}")]
     #[allow(dead_code)]
     Pipeline(String),
+
+    /// A cooperatively-cancelled indexing pass. Distinct from success and from a
+    /// hard failure: the pass stopped at a committed batch boundary (incomplete
+    /// but consistent), so the daemon leaves the context dirty and re-indexes the
+    /// remainder on the next pass rather than recording a completed or failed run.
+    #[error(
+        "indexing cancelled at a unit boundary; remaining files will re-index on the next pass"
+    )]
+    Cancelled,
 }
 
 #[derive(Error, Debug)]
@@ -121,6 +130,17 @@ pub enum DaemonError {
 
     #[error("signal error: {0}")]
     SignalError(String),
+
+    #[error("daemon (pid: {pid}) did not exit within {timeout_ms}ms; run `1up stop` then retry")]
+    DrainTimeout { pid: u32, timeout_ms: u128 },
+
+    #[error("rebuild lock error: {0}")]
+    RebuildLockError(String),
+
+    #[error(
+        "another 1up process is rebuilding the index at {state_root}; retry once it completes"
+    )]
+    RebuildLockContended { state_root: String },
 
     #[error("request error: {0}")]
     RequestError(String),

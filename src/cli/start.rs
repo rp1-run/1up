@@ -549,7 +549,7 @@ async fn classify_project_index(project_root: &Path) -> anyhow::Result<ProjectIn
     let db = Db::open_ro(&db_path).await?;
     let conn = db.connect()?;
 
-    match schema::ensure_current(&conn).await {
+    match schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, project_root)).await {
         Ok(()) => Ok(ProjectIndexState::Current),
         Err(err) => Ok(classify_schema_error(&err.to_string())),
     }
@@ -712,6 +712,11 @@ async fn run_initial_index(
     let db_path = config::project_db_path(project_root);
     let mut setup_spinner = spin("Preparing database", show_progress_ui);
 
+    // Single-writer rebuild lock: hold it across schema prepare + the pipeline
+    // write so a concurrent rebuild of the shared index cannot race the initial
+    // index. Released when this function returns (RAII).
+    let _rebuild_lock = lifecycle::acquire_rebuild_lock(project_root)?;
+
     let db_start = Instant::now();
     let db = Db::open_rw(&db_path).await?;
     let conn = db.connect_tuned().await?;
@@ -734,6 +739,8 @@ async fn run_initial_index(
         EmbeddingLoadStatus::Unavailable(_) => model_spinner.warn_with(status_message),
     }
 
+    // One-shot CLI start indexing: not subject to the daemon's SIGTERM drain, so
+    // it runs under a fresh token that is never cancelled.
     let stats = pipeline::run_with_context_scope_setup_and_progress_root(
         &conn,
         context,
@@ -745,6 +752,7 @@ async fn run_initial_index(
         Some(setup),
         None,
         Some(project_root),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
 
