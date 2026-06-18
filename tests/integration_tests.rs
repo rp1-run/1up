@@ -243,6 +243,36 @@ fn wait_for_mcp_last_update_complete(client: &mut McpTestClient) -> serde_json::
     }
 }
 
+/// Waits until the MCP index reaches searchable readiness (`ready`/`degraded`
+/// with stored segments) — the correct synchronization point for tests that
+/// assert the index was *built and is searchable*.
+///
+/// Unlike [`wait_for_mcp_last_update_complete`], this does not wait on the
+/// daemon's refresh bookkeeping (`last_update_state`). After a one-shot
+/// `index_if_missing`, the daemon's own refresh can legitimately stay `pending`
+/// (it defers to the competing one-shot rebuild and only resumes on the next
+/// file event), so waiting on `last_update_state` there is a load-sensitive
+/// flake even though the index is already complete and searchable.
+fn wait_for_mcp_searchable_readiness(client: &mut McpTestClient) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+        let envelope = mcp_structured(&result);
+        let status = envelope["status"].as_str();
+        let segments = envelope["data"]["total_segments"].as_u64().unwrap_or(0);
+        if matches!(status, Some("ready" | "degraded")) && segments > 0 {
+            return result;
+        }
+        if status == Some("blocked") {
+            panic!("indexing reported blocked; last status={result}");
+        }
+        if Instant::now() >= deadline {
+            panic!("index did not reach searchable readiness; last status={result}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn assert_mcp_text_matches_summary(result: &serde_json::Value) {
     assert_eq!(
         result["content"][0]["text"],
@@ -2759,7 +2789,11 @@ fn mcp_start_index_if_missing_builds_index_state_only() {
         TOOL_START,
         serde_json::json!({ "mode": "index_if_missing" }),
     );
-    let result = wait_for_mcp_last_update_complete(&mut client);
+    // This test asserts the index is built and searchable, not the daemon's
+    // refresh bookkeeping — wait on searchable readiness so a legitimately
+    // deferred (`pending`) daemon refresh after the one-shot index can't flake
+    // it under CI load.
+    let result = wait_for_mcp_searchable_readiness(&mut client);
     let envelope = mcp_structured(&result);
 
     assert_ne!(result["isError"], true);
