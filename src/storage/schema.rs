@@ -937,22 +937,22 @@ mod tests {
                 queries::CREATE_SEGMENT_VECTORS_TABLE,
                 queries::CREATE_SEGMENT_SYMBOLS_TABLE,
                 "CREATE TABLE segment_relations (
-                context_id TEXT NOT NULL DEFAULT 'default',
-                source_segment_id TEXT NOT NULL,
-                relation_kind TEXT NOT NULL,
-                raw_target_symbol TEXT NOT NULL,
-                canonical_target_symbol TEXT NOT NULL,
-                lookup_canonical_symbol TEXT NOT NULL,
-                qualifier_fingerprint TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (
-                    context_id,
-                    source_segment_id,
-                    relation_kind,
-                    canonical_target_symbol,
-                    raw_target_symbol
-                )
-            )",
+            context_id TEXT NOT NULL DEFAULT 'default',
+            source_segment_id TEXT NOT NULL,
+            relation_kind TEXT NOT NULL,
+            raw_target_symbol TEXT NOT NULL,
+            canonical_target_symbol TEXT NOT NULL,
+            lookup_canonical_symbol TEXT NOT NULL,
+            qualifier_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (
+                context_id,
+                source_segment_id,
+                relation_kind,
+                canonical_target_symbol,
+                raw_target_symbol
+            )
+        )",
                 queries::CREATE_INDEXED_FILES_TABLE,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
