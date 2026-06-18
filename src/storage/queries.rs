@@ -181,6 +181,16 @@ DROP TABLE IF EXISTS indexed_files;
 DROP TABLE IF EXISTS worktree_contexts;
 DROP TABLE IF EXISTS meta";
 
+/// Fold every write-ahead-log frame into the main database file and truncate the
+/// WAL to zero bytes. Returns one row `(busy, log, checkpointed)`: a non-zero
+/// `busy` means a concurrent reader/writer blocked the checkpoint and the WAL was
+/// *not* truncated, so the database is not yet self-contained. Used by
+/// [`crate::storage::swap::finalize_staged_db`] to turn a freshly-built staging
+/// database into a single self-contained file before it is renamed over the
+/// served index.
+#[allow(dead_code)]
+pub const WAL_CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+
 pub const SELECT_SCHEMA_OBJECT: &str =
     "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1";
 
