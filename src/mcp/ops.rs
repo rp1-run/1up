@@ -346,6 +346,53 @@ fn index_if_needed_applies(readiness: &ReadinessPayload) -> bool {
     ) || readiness.drifted == Some(true)
 }
 
+/// Whether a daemon refresh state means the index is actively being (re)built
+/// for a context. Single source of truth for the "Pending/Running ==
+/// in-flight" mapping, shared by the readiness classifier and the
+/// rebuild-in-progress detector so the two cannot drift.
+fn daemon_refresh_state_active(state: DaemonRefreshState) -> bool {
+    matches!(
+        state,
+        DaemonRefreshState::Pending | DaemonRefreshState::Running
+    )
+}
+
+/// Reports whether an index rebuild/refresh is in progress for `context_id`,
+/// so a served search can be flagged stale-but-available
+/// ([`STALE_REBUILD_REASON`]).
+///
+/// Derived only from signals that already exist (no new status file or field):
+/// - the daemon's `daemon_context_status.json` `last_refresh_state` is
+///   `Pending`/`Running` (reusing the same reader and predicate as
+///   [`classify_readiness`]), and/or
+/// - the single-writer rebuild lock is currently held by another process — a
+///   one-shot `1up index`/`reindex` or MCP rebuild — detected by a
+///   non-blocking probe of [`lifecycle::try_acquire_rebuild_lock`].
+///
+/// The lock probe never retains the lock: any guard it acquires is dropped
+/// immediately, so it only observes whether some *other* holder exists. A
+/// probe error degrades to the refresh-state signal alone rather than failing
+/// the read path. This is the MCP/CLI (out-of-process) detector; the daemon's
+/// own search path detects from its in-memory refresh state instead, so the
+/// daemon does not depend on the MCP layer.
+#[allow(dead_code)] // consumed by T6 (inject staleness reason into served searches)
+pub(crate) fn rebuild_in_progress(state_root: &Path, context_id: &str) -> bool {
+    let refresh_active =
+        crate::cli::project_status_files::read_daemon_context_status(state_root, context_id)
+            .is_some_and(|status| daemon_refresh_state_active(status.last_refresh_state));
+
+    refresh_active || rebuild_lock_held(state_root)
+}
+
+/// Non-blocking probe of the single-writer rebuild lock: `true` when another
+/// process currently holds it. Any guard acquired here is dropped immediately,
+/// so the probe never blocks a rebuild owner; a probe error reads as "not
+/// held" so a transient lock-file error cannot mask served results.
+#[allow(dead_code)] // reached only via rebuild_in_progress (T6 consumer)
+fn rebuild_lock_held(state_root: &Path) -> bool {
+    matches!(lifecycle::try_acquire_rebuild_lock(state_root), Ok(None))
+}
+
 pub async fn classify_readiness(
     state_root: &Path,
     source_root: &Path,
@@ -360,12 +407,9 @@ pub async fn classify_readiness(
         state_root,
         &worktree_context.context_id,
     );
-    let daemon_refresh_active = daemon_context_status.as_ref().is_some_and(|status| {
-        matches!(
-            status.last_refresh_state,
-            DaemonRefreshState::Pending | DaemonRefreshState::Running
-        )
-    });
+    let daemon_refresh_active = daemon_context_status
+        .as_ref()
+        .is_some_and(|status| daemon_refresh_state_active(status.last_refresh_state));
     let daemon_status = daemon_context_status
         .as_ref()
         .and_then(|status| {
@@ -1560,6 +1604,98 @@ mod tests {
 
         readiness.status = ReadinessStatus::Degraded;
         assert!(index_if_needed_applies(&readiness));
+    }
+
+    fn write_refresh_state(state_root: &Path, context_id: &str, state: DaemonRefreshState) {
+        use crate::shared::types::{
+            DaemonContextStatus, DaemonContextStatusFile, DaemonWatchStatus,
+        };
+        use std::collections::BTreeMap;
+
+        fs::create_dir_all(project_dot_dir(state_root)).unwrap();
+        let file = DaemonContextStatusFile {
+            contexts: BTreeMap::from([(
+                context_id.to_string(),
+                DaemonContextStatus {
+                    context_id: context_id.to_string(),
+                    source_root: Some(state_root.to_path_buf()),
+                    watch_status: DaemonWatchStatus::Watching,
+                    last_file_check_at: None,
+                    last_refresh_state: state,
+                    last_refresh_started_at: None,
+                    last_refresh_completed_at: None,
+                    last_refresh_error: None,
+                    branch_name: Some("main".to_string()),
+                    branch_status: BranchStatus::Named,
+                },
+            )]),
+        };
+        fs::write(
+            project_dot_dir(state_root).join("daemon_context_status.json"),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_rebuild_reason_states_rebuilding_and_stale() {
+        // The wording is the single source of truth folded into degraded_reason
+        // by T6; pin its substance so the user-facing notice cannot silently drift.
+        assert_eq!(
+            crate::shared::constants::STALE_REBUILD_REASON,
+            "index is rebuilding; results may be stale"
+        );
+    }
+
+    // Canonicalize: the secure-fs rebuild-lock root rejects symlinked path
+    // components (macOS `tempdir()` lives under the `/var -> /private/var`
+    // symlink), so the lock probe runs its genuine no-holder path on all
+    // platforms instead of error-degrading to "not held".
+    fn canonical_state_root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn rebuild_in_progress_false_when_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // No daemon status file and no rebuild lock held: not rebuilding.
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+
+        // A completed refresh is not in progress either.
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Complete);
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[test]
+    fn rebuild_in_progress_true_when_refresh_running_or_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Running);
+        assert!(rebuild_in_progress(&state_root, "ctx"));
+
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Pending);
+        assert!(rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[test]
+    fn rebuild_in_progress_scoped_to_requested_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // A running refresh on a different context must not flag this one.
+        write_refresh_state(&state_root, "other", DaemonRefreshState::Running);
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_in_progress_true_when_rebuild_lock_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // No refresh state recorded: the only signal is the held lock.
+        let _held = lifecycle::acquire_rebuild_lock(&state_root).unwrap();
+        assert!(rebuild_in_progress(&state_root, "ctx"));
     }
 
     #[test]

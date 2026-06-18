@@ -103,6 +103,18 @@ pub const MAX_RESULTS_PER_FILE: usize = 3;
 pub const NO_INDEXED_EMBEDDINGS_REASON: &str =
     "index contains no embeddings for this context; semantic ranking disabled (FTS-only)";
 
+/// Degraded-search reason emitted when a non-destructive index rebuild is in
+/// progress and the prior index is still being served (stale-but-available).
+/// Carried on the existing `degraded_reason` channel — never on the
+/// machine-readable result stream — and combined with any other degraded
+/// reason (e.g. [`NO_INDEXED_EMBEDDINGS_REASON`]) rather than replacing it.
+/// Single source of truth for this wording so the rebuild/stale notice cannot
+/// drift between the CLI and MCP surfaces.
+// Define-ahead-of-use: folded into `degraded_reason` by T6; the `#[allow]`
+// drops once that producer lands.
+#[allow(dead_code)]
+pub const STALE_REBUILD_REASON: &str = "index is rebuilding; results may be stale";
+
 /// Default context expansion window (lines) when tree-sitter is unavailable.
 pub const CONTEXT_FALLBACK_LINES: usize = 50;
 
