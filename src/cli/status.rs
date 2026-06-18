@@ -214,7 +214,15 @@ fn derive_lifecycle_state(
     index_readable: bool,
     index_progress: Option<&IndexProgress>,
 ) -> LifecycleState {
-    if index_progress.is_some_and(|progress| progress.state == IndexState::Running) {
+    // Indexing belongs to a *registered* project. `1up stop` unregisters the
+    // project but can leave a stale `Running` marker in `index_status.json`
+    // (the daemon was SIGTERM'd mid-pass); without the `registered` guard that
+    // stale marker would mislabel a stopped/unregistered project as `Indexing`
+    // instead of `Stopped` — a post-stop status race seen under load. A
+    // registered project with a `Running` marker is still genuinely indexing
+    // (the daemon refresh, or the synchronous `1up start` initial index, which
+    // runs while the daemon process is not yet observable as running).
+    if registered && index_progress.is_some_and(|progress| progress.state == IndexState::Running) {
         return LifecycleState::Indexing;
     }
 
@@ -267,5 +275,30 @@ mod tests {
         let state = derive_lifecycle_state(false, false, false, false, false, None);
 
         assert_eq!(state, LifecycleState::NotStarted);
+    }
+
+    #[test]
+    fn lifecycle_is_stopped_not_indexing_when_unregistered_with_stale_running_progress() {
+        // `1up stop` unregisters the project but a daemon SIGTERM'd mid-pass can
+        // leave a `Running` marker in index_status.json. An unregistered project
+        // must report `Stopped`, never `Indexing`. Regression for the post-stop
+        // status race that flaked
+        // `lifecycle_plain_flow_covers_start_status_list_and_stop` under load.
+        let progress = IndexProgress::watch(IndexState::Running, IndexPhase::Storing, "indexing");
+        let state = derive_lifecycle_state(false, false, true, true, true, Some(&progress));
+
+        assert_eq!(state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn lifecycle_is_indexing_for_registered_project_even_without_running_daemon() {
+        // The guard keys on `registered`, not `daemon_running`: a registered
+        // project with a `Running` marker is genuinely indexing even when the
+        // daemon process is not yet observable as running (the synchronous
+        // `1up start` initial index). Guards against over-gating on daemon state.
+        let progress = IndexProgress::watch(IndexState::Running, IndexPhase::Storing, "indexing");
+        let state = derive_lifecycle_state(true, false, true, true, true, Some(&progress));
+
+        assert_eq!(state, LifecycleState::Indexing);
     }
 }
