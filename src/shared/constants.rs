@@ -110,9 +110,6 @@ pub const NO_INDEXED_EMBEDDINGS_REASON: &str =
 /// reason (e.g. [`NO_INDEXED_EMBEDDINGS_REASON`]) rather than replacing it.
 /// Single source of truth for this wording so the rebuild/stale notice cannot
 /// drift between the CLI and MCP surfaces.
-// Define-ahead-of-use: folded into `degraded_reason` by T6; the `#[allow]`
-// drops once that producer lands.
-#[allow(dead_code)]
 pub const STALE_REBUILD_REASON: &str = "index is rebuilding; results may be stale";
 
 /// Default context expansion window (lines) when tree-sitter is unavailable.

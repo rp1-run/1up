@@ -151,7 +151,9 @@ pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> 
 /// The fixed served-index filename within a project's `.1up` directory.
 const SERVED_INDEX_FILENAME: &str = "index.db";
 /// Prefix shared by build-aside staging filenames (`index.db.rebuild-<uuid>`).
-const STAGING_INDEX_PREFIX: &str = "index.db.rebuild-";
+/// Sourced from [`crate::shared::config::STAGING_INDEX_DB_PREFIX`] so the
+/// path-building and validation sides cannot drift.
+const STAGING_INDEX_PREFIX: &str = crate::shared::config::STAGING_INDEX_DB_PREFIX;
 
 fn validate_project_db_path_for_write(path: &Path) -> Result<PathBuf, OneupError> {
     validate_db_path_for_write(path, project_root_from_db_path(path)?)

@@ -93,6 +93,12 @@ pub fn project_db_path(project_root: &std::path::Path) -> PathBuf {
     project_dot_dir(project_root).join("index.db")
 }
 
+/// Filename prefix for build-aside staging index files (`index.db.rebuild-<uuid>`).
+/// Single source of truth shared by [`project_staging_db_path`] (which builds the
+/// path) and the storage-layer staging-leaf validation (which clamps it), so the
+/// two cannot drift.
+pub const STAGING_INDEX_DB_PREFIX: &str = "index.db.rebuild-";
+
 /// Returns a fresh uuid-suffixed staging path for a non-destructive index
 /// rebuild, e.g. `<project>/.1up/index.db.rebuild-<uuid>`.
 ///
@@ -101,7 +107,7 @@ pub fn project_db_path(project_root: &std::path::Path) -> PathBuf {
 /// index is never torn down in place. A fresh uuid per call keeps a staging file
 /// left behind by a previously-aborted rebuild from colliding with a new one.
 pub fn project_staging_db_path(state_root: &std::path::Path) -> PathBuf {
-    project_dot_dir(state_root).join(format!("index.db.rebuild-{}", uuid::Uuid::new_v4()))
+    project_dot_dir(state_root).join(format!("{STAGING_INDEX_DB_PREFIX}{}", uuid::Uuid::new_v4()))
 }
 
 /// Returns the path to the project-local daemon status file.
