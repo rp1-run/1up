@@ -10,7 +10,8 @@ use crate::shared::config;
 use crate::shared::constants::{
     SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS,
     UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
-    UPDATE_MANIFEST_URL_ENV_VAR, VERSION, XDG_STATE_DIR_MODE,
+    UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS, UPDATE_MANIFEST_URL_ENV_VAR, VERSION,
+    XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
 
@@ -725,6 +726,57 @@ fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Hard gate that refuses an unsafe manifest *before* any download or binary
+/// activation: a version older than the installed binary (anti-rollback) or one
+/// whose publication `expiry` has passed (anti-freeze/staleness).
+///
+/// This is distinct from the advisory [`build_update_status`] notification path:
+/// `build_update_status` only decides what to *show*, while a refusal here aborts
+/// the self-update so the running binary is never replaced. The normal
+/// up-to-date and publish-window-lag cases (`manifest.version <= installed`)
+/// never reach this gate because the CLI update flow resolves them to a no-op via
+/// `build_update_status` before calling [`self_update`]; if the gate is reached
+/// with an equal version it still passes (equal is not a rollback).
+///
+/// `installed_version` and `now` are parameters rather than read internally so
+/// the gate is deterministic and unit-testable. A manifest without an `expiry`
+/// is accepted: the field is additive, so manifests published before it existed
+/// (including the current committed manifest) carry none.
+fn ensure_manifest_acceptable(
+    manifest: &UpdateManifest,
+    installed_version: &str,
+    now: DateTime<Utc>,
+) -> Result<(), UpdateError> {
+    let installed = semver::Version::parse(installed_version).map_err(|e| {
+        UpdateError::ParseFailed(format!("installed version {installed_version:?}: {e}"))
+    })?;
+    let candidate = semver::Version::parse(&manifest.version).map_err(|e| {
+        UpdateError::ParseFailed(format!("manifest version {:?}: {e}", manifest.version))
+    })?;
+    if candidate < installed {
+        return Err(UpdateError::ManifestRollback {
+            manifest: manifest.version.clone(),
+            installed: installed_version.to_string(),
+        });
+    }
+
+    if let Some(expiry_raw) = manifest.expiry.as_deref() {
+        let expiry = DateTime::parse_from_rfc3339(expiry_raw)
+            .map_err(|e| UpdateError::ParseFailed(format!("manifest expiry {expiry_raw:?}: {e}")))?
+            .with_timezone(&Utc);
+        let deadline =
+            expiry + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64);
+        if now > deadline {
+            return Err(UpdateError::ManifestExpired {
+                expiry: expiry_raw.to_string(),
+                now: now.to_rfc3339(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Performs a self-update: downloads, verifies, and atomically replaces the
 /// running binary.
 ///
@@ -733,6 +785,8 @@ fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
 ///
 /// Returns the old and new versions on success.
 pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, UpdateError> {
+    ensure_manifest_acceptable(manifest, VERSION, Utc::now())?;
+
     let artifact = find_artifact_for_platform(manifest)?;
 
     let current_exe = std::env::current_exe()
@@ -1140,6 +1194,18 @@ mod tests {
         assert!(!UpdateError::FetchFailed {
             detail: "manifest fetch: timeout".to_string(),
             permanent: false,
+        }
+        .should_invalidate_cache());
+        // Gate refusals reject a specific bad manifest; they must not wipe the
+        // advisory update-check cache built from the last successful check.
+        assert!(!UpdateError::ManifestRollback {
+            manifest: "0.1.0".to_string(),
+            installed: "0.2.0".to_string(),
+        }
+        .should_invalidate_cache());
+        assert!(!UpdateError::ManifestExpired {
+            expiry: "2026-01-01T00:00:00Z".to_string(),
+            now: "2026-06-19T00:00:00Z".to_string(),
         }
         .should_invalidate_cache());
     }
@@ -1646,5 +1712,132 @@ mod tests {
 
         assert_eq!(format_update_notification(), None);
         assert!(read_update_cache().is_none());
+    }
+
+    // --- Anti-rollback + expiry gate (`ensure_manifest_acceptable`) ---
+
+    fn rfc3339(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Builds a manifest with an explicit version and optional expiry for gate
+    /// tests. Other fields are irrelevant to the gate.
+    fn make_gate_manifest(version: &str, expiry: Option<&str>) -> UpdateManifest {
+        let mut manifest = make_manifest_with_artifact("aarch64-apple-darwin", "abc123");
+        manifest.version = version.to_string();
+        manifest.expiry = expiry.map(|s| s.to_string());
+        manifest
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_newer_version_without_expiry() {
+        let manifest = make_gate_manifest("0.2.0", None);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_equal_version() {
+        // Equal is not a rollback; the gate passes it (the up-to-date no-op is
+        // owned upstream by `build_update_status`, see
+        // `build_update_status_returns_up_to_date_when_versions_match`).
+        let manifest = make_gate_manifest("0.1.0", None);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_older_version() {
+        let manifest = make_gate_manifest("0.1.0", None);
+        let err = ensure_manifest_acceptable(&manifest, "0.2.0", Utc::now()).unwrap_err();
+        match err {
+            UpdateError::ManifestRollback {
+                manifest: m,
+                installed,
+            } => {
+                assert_eq!(m, "0.1.0");
+                assert_eq!(installed, "0.2.0");
+            }
+            other => panic!("expected ManifestRollback, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_future_expiry() {
+        let manifest = make_gate_manifest("0.2.0", Some("2099-01-01T00:00:00Z"));
+        let now = rfc3339("2026-06-19T00:00:00Z");
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", now).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_expiry_past_skew() {
+        let manifest = make_gate_manifest("0.2.0", Some("2026-01-01T00:00:00Z"));
+        // Well beyond expiry + the clock-skew tolerance.
+        let now = rfc3339("2026-01-01T00:00:00Z")
+            + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64)
+            + chrono::Duration::seconds(1);
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", now).unwrap_err();
+        match err {
+            UpdateError::ManifestExpired { expiry, .. } => {
+                assert_eq!(expiry, "2026-01-01T00:00:00Z");
+            }
+            other => panic!("expected ManifestExpired, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_expiry_within_skew() {
+        // Past the literal expiry but inside the clock-skew tolerance window:
+        // a moderately wrong clock must not falsely refuse a current feed.
+        let manifest = make_gate_manifest("0.2.0", Some("2026-01-01T00:00:00Z"));
+        let now = rfc3339("2026-01-01T00:00:00Z")
+            + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64)
+            - chrono::Duration::seconds(60);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", now).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_malformed_expiry() {
+        let manifest = make_gate_manifest("0.2.0", Some("not-a-timestamp"));
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ParseFailed(_)),
+            "expected ParseFailed for malformed expiry, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_malformed_manifest_version() {
+        let manifest = make_gate_manifest("not-semver", None);
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ParseFailed(_)),
+            "expected ParseFailed for malformed manifest version, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_rollback_manifest_before_touching_the_binary() {
+        // version "0.0.1" is below any real CARGO_PKG_VERSION, so the gate (the
+        // first statement in `self_update`) short-circuits before any download
+        // or `replace_binary`; the running binary is never touched.
+        let manifest = make_gate_manifest("0.0.1", None);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime.block_on(self_update(&manifest)).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ManifestRollback { .. }),
+            "expected ManifestRollback, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_expired_manifest_before_touching_the_binary() {
+        // version "999.0.0" clears anti-rollback so the expiry gate is what
+        // fires; the far-past expiry refuses before any download or replacement.
+        let manifest = make_gate_manifest("999.0.0", Some("2000-01-01T00:00:00Z"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime.block_on(self_update(&manifest)).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ManifestExpired { .. }),
+            "expected ManifestExpired, got: {err:?}"
+        );
     }
 }

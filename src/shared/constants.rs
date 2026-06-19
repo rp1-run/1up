@@ -295,3 +295,13 @@ pub const UPDATE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// TCP connect timeout for update binary downloads in seconds.
 pub const UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Clock-skew tolerance applied to the update-manifest `expiry` gate.
+///
+/// The self-update path refuses a manifest only once `now > expiry + this
+/// skew`, so a machine with a moderately wrong clock is not falsely refused a
+/// still-current feed. Deliberately generous (1 day) yet small relative to the
+/// release-side expiry TTL (90 days, set in `generate_release_manifest.sh`): it
+/// barely weakens freeze/staleness protection while absorbing realistic clock
+/// drift, and is paired with an actionable refusal message.
+pub const UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS: u64 = 24 * 60 * 60;

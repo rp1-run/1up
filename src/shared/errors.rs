@@ -229,6 +229,16 @@ pub enum UpdateError {
 
     #[error("checksum verification failed")]
     ChecksumMismatch,
+
+    #[error(
+        "refusing update: manifest version {manifest} is older than the installed version {installed}; the update feed may have been rolled back"
+    )]
+    ManifestRollback { manifest: String, installed: String },
+
+    #[error(
+        "refusing update: update manifest expired at {expiry} (now {now}); the update feed may be stale or frozen — retry once a current manifest is published"
+    )]
+    ManifestExpired { expiry: String, now: String },
 }
 
 impl UpdateError {
