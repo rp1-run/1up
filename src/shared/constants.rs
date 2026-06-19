@@ -295,3 +295,48 @@ pub const UPDATE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// TCP connect timeout for update binary downloads in seconds.
 pub const UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Clock-skew tolerance applied to the update-manifest `expiry` gate.
+///
+/// The self-update path refuses a manifest only once `now > expiry + this
+/// skew`, so a machine with a moderately wrong clock is not falsely refused a
+/// still-current feed. Deliberately generous (1 day) yet small relative to the
+/// release-side expiry TTL (90 days, set in `generate_release_manifest.sh`): it
+/// barely weakens freeze/staleness protection while absorbing realistic clock
+/// drift, and is paired with an actionable refusal message.
+pub const UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS: u64 = 24 * 60 * 60;
+
+/// GitHub `owner/repo` slug whose release attestations the self-update path
+/// trusts. Used to build the attestations-API request path and (via
+/// [`ATTESTATION_WORKFLOW_IDENTITY_PREFIX`]) to pin the signing identity.
+pub const ATTESTATION_REPO_SLUG: &str = "rp1-run/1up";
+
+/// OIDC issuer the release attestation's signing certificate must carry.
+///
+/// Keyless-OIDC GitHub Actions provenance is always issued by this token
+/// service; pinning it rejects any attestation minted through a different
+/// identity provider even if it otherwise chains to the Sigstore root.
+pub const ATTESTATION_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Required prefix of the attestation certificate's SAN (the signing workflow
+/// identity), matching repo + workflow file but deliberately NOT the trailing
+/// `@<ref>`.
+///
+/// GitHub encodes the signer as
+/// `https://github.com/<owner>/<repo>/.github/workflows/<wf>.yml@<ref>`, where
+/// `<ref>` varies per release (`refs/tags/v0.1.12`, a branch, etc.). Pinning the
+/// repo + workflow path while allowing any ref is the granularity
+/// `gh attestation verify --repo <owner>/<repo>` enforces: it binds the artifact
+/// to *this project's own release workflow* (an attacker cannot mint a cert for
+/// it without compromising GitHub's OIDC) without coupling the client to a tag
+/// string that legitimately changes every release.
+pub const ATTESTATION_WORKFLOW_IDENTITY_PREFIX: &str =
+    "https://github.com/rp1-run/1up/.github/workflows/release-assets.yml@";
+
+/// Base URL of the GitHub REST API used to fetch release attestations by digest.
+///
+/// The self-update path requests
+/// `{base}/repos/{slug}/attestations/sha256:{hex}`; the response carries the
+/// keyless-OIDC Sigstore bundle(s) GitHub stored for that archive's digest (the
+/// attestation is keyed by digest, not uploaded as a release asset).
+pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";

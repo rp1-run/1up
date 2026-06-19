@@ -132,6 +132,13 @@ jobs:
     needs:
       - validate
       - build
+    # Scope id-token/attestations to the only job that mints them. Job-level
+    # permissions replace the top-level grant, so contents:write is re-declared
+    # here for the gh release create/upload below.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,6 +175,19 @@ jobs:
             --output "${RUNNER_TEMP}/dist/release-manifest.json" \
             --commit-sha "${commit_sha}"
           bash scripts/release/extract_release_notes.sh "${RELEASE_TAG}" > "${RUNNER_TEMP}/dist/release-notes.md"
+
+      # Independent-channel trust: keyless-OIDC build provenance over the exact
+      # archives clients download (not the SHA256SUMS/manifest/setup.sh). The
+      # attestation is stored in the GitHub attestations API keyed by each
+      # archive's digest, so install/self-update can verify by digest later.
+      # Runs before the release is created so a release never publishes without
+      # its provenance recorded.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/dist/*.tar.gz
+            ${{ runner.temp }}/dist/*.zip
 
       - name: create or update release
         shell: bash

@@ -4,12 +4,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::shared::config;
 use crate::shared::constants::{
-    SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS,
-    UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
+    ATTESTATION_OIDC_ISSUER, ATTESTATION_REPO_SLUG, ATTESTATION_WORKFLOW_IDENTITY_PREFIX,
+    GITHUB_API_BASE_URL, SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS,
+    UPDATE_CHECK_TIMEOUT_SECS, UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS,
+    UPDATE_DOWNLOAD_TIMEOUT_SECS, UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS,
     UPDATE_MANIFEST_URL_ENV_VAR, VERSION, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
@@ -20,6 +22,11 @@ pub struct UpdateManifest {
     pub version: String,
     pub git_tag: String,
     pub published_at: String,
+    /// RFC3339 timestamp after which the client refuses to apply this manifest
+    /// (anti-freeze gate). Additive and optional so manifests published before
+    /// the field existed continue to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<String>,
     pub notes_url: String,
     pub artifacts: Vec<UpdateArtifact>,
     pub channels: UpdateChannels,
@@ -592,6 +599,219 @@ fn verify_archive_checksum(path: &Path, expected_sha256: &str) -> Result<(), Upd
     Ok(())
 }
 
+/// Whether a certificate SAN (the signing workflow identity) is the project's
+/// own release workflow.
+///
+/// Pins the repo + workflow path via [`ATTESTATION_WORKFLOW_IDENTITY_PREFIX`]
+/// while allowing any trailing `@<ref>` — see that constant for why the ref is
+/// intentionally not pinned. A missing SAN is never trusted.
+fn attestation_identity_is_trusted(san: Option<&str>) -> bool {
+    san.is_some_and(|identity| identity.starts_with(ATTESTATION_WORKFLOW_IDENTITY_PREFIX))
+}
+
+/// Verification policy for GitHub keyless-OIDC release attestations.
+///
+/// Pins the OIDC issuer and keeps transparency-log (Rekor inclusion-proof)
+/// verification on — the proof ships inside the bundle and is checked against
+/// the embedded trusted root's Rekor keys, so this stays a local cryptographic
+/// check, not a network call. SCT verification is disabled because GitHub's
+/// artifact-attestation certificates do not carry public Sigstore CT SCTs (the
+/// certificate chain itself is still verified); this mirrors the upstream
+/// crate's documented guidance for the GitHub trust domain. Identity is checked
+/// after verification via [`attestation_identity_is_trusted`] rather than
+/// `require_identity`, which only does exact matching and cannot express the
+/// any-ref pin.
+fn attestation_verification_policy() -> sigstore_verify::VerificationPolicy {
+    sigstore_verify::VerificationPolicy::default()
+        .require_issuer(ATTESTATION_OIDC_ISSUER)
+        .skip_sct()
+}
+
+/// Verifies a downloaded archive against one or more candidate attestation
+/// bundles fetched from the GitHub attestations API.
+///
+/// `Ok(())` means at least one bundle cryptographically verified against the
+/// embedded Sigstore production trusted root AND named the project's own release
+/// workflow as the signer — the *verified* state. `Err(AttestationFailed)` means
+/// material was present but none of it verified (bad signature, wrong issuer,
+/// untrusted/missing signing identity, or an artifact-digest mismatch) — the
+/// *disproved* state, which must fail closed. A caller that cannot even obtain
+/// bundles (offline / 404 / rate-limited) handles the distinct *cannot-run*
+/// degrade before calling this; this function is only reached with material in
+/// hand.
+///
+/// Pure and offline (no network): given the bundle JSON and the artifact (raw
+/// bytes or a pre-computed SHA-256 digest), all verification is local against
+/// the embedded trusted root, which makes it unit testable with a fixture
+/// bundle. Taking `Artifact` lets production pass the downloaded bytes while a
+/// test can verify by digest without vendoring the binary artifact.
+fn verify_attestation_bundles(
+    bundle_jsons: &[String],
+    artifact: sigstore_verify::types::Artifact<'_>,
+) -> Result<(), UpdateError> {
+    let trusted_root = sigstore_trust_root::TrustedRoot::from_json(
+        sigstore_trust_root::SIGSTORE_PRODUCTION_TRUSTED_ROOT,
+    )
+    .map_err(|e| UpdateError::AttestationFailed {
+        detail: format!("could not load embedded trusted root: {e}"),
+    })?;
+    let policy = attestation_verification_policy();
+
+    let mut last_failure: Option<String> = None;
+    for bundle_json in bundle_jsons {
+        let bundle = match sigstore_verify::types::Bundle::from_json(bundle_json) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                last_failure = Some(format!("malformed attestation bundle: {e}"));
+                continue;
+            }
+        };
+
+        match sigstore_verify::verify(artifact.clone(), &bundle, &policy, &trusted_root) {
+            Ok(result) if result.success => {
+                if attestation_identity_is_trusted(result.identity.as_deref()) {
+                    return Ok(());
+                }
+                last_failure = Some(format!(
+                    "attestation signer {:?} is not the project's release workflow",
+                    result.identity.as_deref().unwrap_or("<none>")
+                ));
+            }
+            Ok(_) => {
+                last_failure = Some("attestation verification did not succeed".to_string());
+            }
+            Err(e) => {
+                last_failure = Some(format!("attestation verification error: {e}"));
+            }
+        }
+    }
+
+    Err(UpdateError::AttestationFailed {
+        detail: last_failure
+            .unwrap_or_else(|| "no attestation bundle could be verified".to_string()),
+    })
+}
+
+/// Fetches release attestation bundles for an archive digest from the GitHub
+/// attestations API.
+///
+/// Returns `Ok(Some(bundles))` when the API returns attestation material (one
+/// JSON-encoded Sigstore bundle per attestation), and `Ok(None)` for every
+/// *cannot-run* outcome — transport failure, a 404 (no attestation published
+/// for this digest), a rate-limit/5xx, or a malformed/empty response. The
+/// caller degrades to the checksum floor on `None`; a `None` is never a tamper
+/// signal, so this function deliberately collapses all non-success outcomes
+/// rather than surfacing an error that could be mistaken for a disproof.
+async fn fetch_attestation_bundles(sha256_hex: &str) -> Result<Option<Vec<String>>, UpdateError> {
+    let client = match build_attestation_client() {
+        Ok(client) => client,
+        Err(e) => {
+            debug!("attestation client unavailable: {e}");
+            return Ok(None);
+        }
+    };
+
+    let url = format!(
+        "{GITHUB_API_BASE_URL}/repos/{ATTESTATION_REPO_SLUG}/attestations/sha256:{sha256_hex}"
+    );
+    let response = match client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            debug!("attestation fetch failed (cannot-run): {e}");
+            return Ok(None);
+        }
+    };
+
+    if !response.status().is_success() {
+        debug!(
+            "attestation fetch returned HTTP {} (cannot-run)",
+            response.status()
+        );
+        return Ok(None);
+    }
+
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            debug!("attestation response read failed (cannot-run): {e}");
+            return Ok(None);
+        }
+    };
+
+    Ok(parse_attestation_bundles(&body))
+}
+
+/// Extracts the per-attestation Sigstore bundles from a GitHub attestations-API
+/// response body, returning each bundle re-serialized as a JSON string.
+///
+/// Returns `None` (cannot-run) when the body does not parse or carries no
+/// bundles, so a shape change or empty list degrades to the checksum floor
+/// rather than being treated as a disproof. Pure (no IO) for unit testing.
+fn parse_attestation_bundles(body: &str) -> Option<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let attestations = parsed.get("attestations")?.as_array()?;
+    let bundles: Vec<String> = attestations
+        .iter()
+        .filter_map(|attestation| attestation.get("bundle"))
+        .filter_map(|bundle| serde_json::to_string(bundle).ok())
+        .collect();
+    if bundles.is_empty() {
+        return None;
+    }
+    Some(bundles)
+}
+
+/// Builds the HTTP client used to fetch attestation bundles. GitHub's API
+/// rejects requests without a User-Agent, so one is always set; timeouts reuse
+/// the small-JSON update-check budget.
+fn build_attestation_client() -> Result<reqwest::Client, UpdateError> {
+    reqwest::Client::builder()
+        .user_agent(format!("1up/{VERSION}"))
+        .connect_timeout(Duration::from_secs(UPDATE_CHECK_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("attestation http client: {e}")))
+}
+
+/// Verifies the downloaded archive's release attestation, returning a three-state
+/// outcome collapsed onto `Result`:
+///
+/// - verified: at least one fetched bundle verified and named the project's
+///   release workflow -> `Ok(())`, proceed to activation.
+/// - cannot-run: no attestation material could be obtained (offline / 404 /
+///   rate-limited) -> `Ok(())` with a stderr degrade notice, proceeding on the
+///   already-passed SHA-256 checksum floor. This is deliberately distinct from a
+///   disproof so an offline or rate-limited machine is not falsely blocked.
+/// - disproved: material was present but none verified (bad signature, wrong
+///   issuer, untrusted signer, or digest mismatch) -> `Err(AttestationFailed)`,
+///   a hard fail that leaves the running binary untouched.
+async fn verify_artifact_attestation(
+    archive_path: &Path,
+    archive_sha256_hex: &str,
+) -> Result<(), UpdateError> {
+    let bundles = match fetch_attestation_bundles(archive_sha256_hex).await? {
+        Some(bundles) => bundles,
+        None => {
+            warn!(
+                "release attestation could not be verified (no attestation material reachable); \
+                 proceeding on the verified SHA-256 checksum"
+            );
+            return Ok(());
+        }
+    };
+
+    let artifact = std::fs::read(archive_path)
+        .map_err(|e| UpdateError::SelfUpdateFailed(format!("read archive for attestation: {e}")))?;
+
+    verify_attestation_bundles(&bundles, sigstore_verify::types::Artifact::from(&artifact))
+}
+
 /// Extracts the 1up binary from a tar.gz archive into the staging directory.
 ///
 /// The archive structure is `1up-v{version}-{target}/{binary_name}` where
@@ -720,6 +940,57 @@ fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Hard gate that refuses an unsafe manifest *before* any download or binary
+/// activation: a version older than the installed binary (anti-rollback) or one
+/// whose publication `expiry` has passed (anti-freeze/staleness).
+///
+/// This is distinct from the advisory [`build_update_status`] notification path:
+/// `build_update_status` only decides what to *show*, while a refusal here aborts
+/// the self-update so the running binary is never replaced. The normal
+/// up-to-date and publish-window-lag cases (`manifest.version <= installed`)
+/// never reach this gate because the CLI update flow resolves them to a no-op via
+/// `build_update_status` before calling [`self_update`]; if the gate is reached
+/// with an equal version it still passes (equal is not a rollback).
+///
+/// `installed_version` and `now` are parameters rather than read internally so
+/// the gate is deterministic and unit-testable. A manifest without an `expiry`
+/// is accepted: the field is additive, so manifests published before it existed
+/// (including the current committed manifest) carry none.
+fn ensure_manifest_acceptable(
+    manifest: &UpdateManifest,
+    installed_version: &str,
+    now: DateTime<Utc>,
+) -> Result<(), UpdateError> {
+    let installed = semver::Version::parse(installed_version).map_err(|e| {
+        UpdateError::ParseFailed(format!("installed version {installed_version:?}: {e}"))
+    })?;
+    let candidate = semver::Version::parse(&manifest.version).map_err(|e| {
+        UpdateError::ParseFailed(format!("manifest version {:?}: {e}", manifest.version))
+    })?;
+    if candidate < installed {
+        return Err(UpdateError::ManifestRollback {
+            manifest: manifest.version.clone(),
+            installed: installed_version.to_string(),
+        });
+    }
+
+    if let Some(expiry_raw) = manifest.expiry.as_deref() {
+        let expiry = DateTime::parse_from_rfc3339(expiry_raw)
+            .map_err(|e| UpdateError::ParseFailed(format!("manifest expiry {expiry_raw:?}: {e}")))?
+            .with_timezone(&Utc);
+        let deadline =
+            expiry + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64);
+        if now > deadline {
+            return Err(UpdateError::ManifestExpired {
+                expiry: expiry_raw.to_string(),
+                now: now.to_rfc3339(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Performs a self-update: downloads, verifies, and atomically replaces the
 /// running binary.
 ///
@@ -728,6 +999,8 @@ fn replace_binary(new_binary: &Path, target: &Path) -> Result<(), UpdateError> {
 ///
 /// Returns the old and new versions on success.
 pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, UpdateError> {
+    ensure_manifest_acceptable(manifest, VERSION, Utc::now())?;
+
     let artifact = find_artifact_for_platform(manifest)?;
 
     let current_exe = std::env::current_exe()
@@ -742,6 +1015,13 @@ pub async fn self_update(manifest: &UpdateManifest) -> Result<SelfUpdateResult, 
     let archive_path = download_archive(&client, artifact, staging_dir.path()).await?;
 
     verify_archive_checksum(&archive_path, &artifact.sha256)?;
+
+    // Independent-channel trust gate: verify the archive's keyless-OIDC release
+    // attestation after the checksum floor and before activation. Disproved
+    // attestation fails closed; a cannot-run (offline/unreachable) outcome
+    // degrades to the checksum floor inside this call. Never alters the atomic
+    // temp-then-rename activation below.
+    verify_artifact_attestation(&archive_path, &artifact.sha256).await?;
 
     let new_binary = extract_binary_from_archive(&archive_path, staging_dir.path())?;
 
@@ -895,6 +1175,7 @@ mod tests {
             version: "0.1.1".to_string(),
             git_tag: "v0.1.1".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: Some("2026-07-10T12:00:00Z".to_string()),
             notes_url: "https://github.com/rp1-run/1up/releases/tag/v0.1.1".to_string(),
             artifacts: vec![UpdateArtifact {
                 target: "aarch64-apple-darwin".to_string(),
@@ -924,6 +1205,7 @@ mod tests {
         assert!(!parsed.yanked);
         assert!(parsed.minimum_safe_version.is_none());
         assert!(parsed.message.is_none());
+        assert_eq!(parsed.expiry.as_deref(), Some("2026-07-10T12:00:00Z"));
     }
 
     #[test]
@@ -943,6 +1225,7 @@ mod tests {
         assert!(!manifest.yanked);
         assert!(manifest.minimum_safe_version.is_none());
         assert!(manifest.message.is_none());
+        assert!(manifest.expiry.is_none());
     }
 
     #[test]
@@ -1134,6 +1417,18 @@ mod tests {
             permanent: false,
         }
         .should_invalidate_cache());
+        // Gate refusals reject a specific bad manifest; they must not wipe the
+        // advisory update-check cache built from the last successful check.
+        assert!(!UpdateError::ManifestRollback {
+            manifest: "0.1.0".to_string(),
+            installed: "0.2.0".to_string(),
+        }
+        .should_invalidate_cache());
+        assert!(!UpdateError::ManifestExpired {
+            expiry: "2026-01-01T00:00:00Z".to_string(),
+            now: "2026-06-19T00:00:00Z".to_string(),
+        }
+        .should_invalidate_cache());
     }
 
     #[test]
@@ -1150,6 +1445,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![],
             channels: UpdateChannels {
@@ -1184,6 +1480,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![],
             channels: UpdateChannels {
@@ -1372,6 +1669,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![UpdateArtifact {
                 target: target.to_string(),
@@ -1635,5 +1933,278 @@ mod tests {
 
         assert_eq!(format_update_notification(), None);
         assert!(read_update_cache().is_none());
+    }
+
+    // --- Anti-rollback + expiry gate (`ensure_manifest_acceptable`) ---
+
+    fn rfc3339(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Builds a manifest with an explicit version and optional expiry for gate
+    /// tests. Other fields are irrelevant to the gate.
+    fn make_gate_manifest(version: &str, expiry: Option<&str>) -> UpdateManifest {
+        let mut manifest = make_manifest_with_artifact("aarch64-apple-darwin", "abc123");
+        manifest.version = version.to_string();
+        manifest.expiry = expiry.map(|s| s.to_string());
+        manifest
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_newer_version_without_expiry() {
+        let manifest = make_gate_manifest("0.2.0", None);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_equal_version() {
+        // Equal is not a rollback; the gate passes it (the up-to-date no-op is
+        // owned upstream by `build_update_status`, see
+        // `build_update_status_returns_up_to_date_when_versions_match`).
+        let manifest = make_gate_manifest("0.1.0", None);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_older_version() {
+        let manifest = make_gate_manifest("0.1.0", None);
+        let err = ensure_manifest_acceptable(&manifest, "0.2.0", Utc::now()).unwrap_err();
+        match err {
+            UpdateError::ManifestRollback {
+                manifest: m,
+                installed,
+            } => {
+                assert_eq!(m, "0.1.0");
+                assert_eq!(installed, "0.2.0");
+            }
+            other => panic!("expected ManifestRollback, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_future_expiry() {
+        let manifest = make_gate_manifest("0.2.0", Some("2099-01-01T00:00:00Z"));
+        let now = rfc3339("2026-06-19T00:00:00Z");
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", now).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_expiry_past_skew() {
+        let manifest = make_gate_manifest("0.2.0", Some("2026-01-01T00:00:00Z"));
+        // Well beyond expiry + the clock-skew tolerance.
+        let now = rfc3339("2026-01-01T00:00:00Z")
+            + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64)
+            + chrono::Duration::seconds(1);
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", now).unwrap_err();
+        match err {
+            UpdateError::ManifestExpired { expiry, .. } => {
+                assert_eq!(expiry, "2026-01-01T00:00:00Z");
+            }
+            other => panic!("expected ManifestExpired, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_allows_expiry_within_skew() {
+        // Past the literal expiry but inside the clock-skew tolerance window:
+        // a moderately wrong clock must not falsely refuse a current feed.
+        let manifest = make_gate_manifest("0.2.0", Some("2026-01-01T00:00:00Z"));
+        let now = rfc3339("2026-01-01T00:00:00Z")
+            + chrono::Duration::seconds(UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS as i64)
+            - chrono::Duration::seconds(60);
+        assert!(ensure_manifest_acceptable(&manifest, "0.1.0", now).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_malformed_expiry() {
+        let manifest = make_gate_manifest("0.2.0", Some("not-a-timestamp"));
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ParseFailed(_)),
+            "expected ParseFailed for malformed expiry, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_manifest_acceptable_refuses_malformed_manifest_version() {
+        let manifest = make_gate_manifest("not-semver", None);
+        let err = ensure_manifest_acceptable(&manifest, "0.1.0", Utc::now()).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ParseFailed(_)),
+            "expected ParseFailed for malformed manifest version, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_rollback_manifest_before_touching_the_binary() {
+        // version "0.0.1" is below any real CARGO_PKG_VERSION, so the gate (the
+        // first statement in `self_update`) short-circuits before any download
+        // or `replace_binary`; the running binary is never touched.
+        let manifest = make_gate_manifest("0.0.1", None);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime.block_on(self_update(&manifest)).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ManifestRollback { .. }),
+            "expected ManifestRollback, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn self_update_refuses_expired_manifest_before_touching_the_binary() {
+        // version "999.0.0" clears anti-rollback so the expiry gate is what
+        // fires; the far-past expiry refuses before any download or replacement.
+        let manifest = make_gate_manifest("999.0.0", Some("2000-01-01T00:00:00Z"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime.block_on(self_update(&manifest)).unwrap_err();
+        assert!(
+            matches!(err, UpdateError::ManifestExpired { .. }),
+            "expected ManifestExpired, got: {err:?}"
+        );
+    }
+
+    // --- Attestation verification (`verify_attestation_bundles`, identity pin) ---
+
+    /// Real GitHub Actions keyless-OIDC attestation bundle whose signer is
+    /// `prefix-dev/sigstore-example` (issuer `token.actions.githubusercontent.com`)
+    /// — genuinely foreign to `rp1-run/1up`. Vendored from sigstore-rust's test
+    /// data so the cryptographic material (cert chain, Rekor inclusion proof) is
+    /// real and chains to the embedded production trusted root.
+    const FOREIGN_GITHUB_ATTESTATION: &str =
+        include_str!("testdata/github-attestation-foreign-identity.sigstore.json");
+
+    /// SHA-256 of the artifact the foreign bundle attests (the in-toto subject
+    /// digest), used to verify by digest without vendoring the binary artifact.
+    const FOREIGN_ATTESTATION_SUBJECT_SHA256: &str =
+        "54303491a8418fbed24344b513546182c29b43bf282ceb433af65e2299f9271f";
+
+    #[test]
+    fn attestation_identity_is_trusted_accepts_project_workflow_any_ref() {
+        assert!(attestation_identity_is_trusted(Some(
+            "https://github.com/rp1-run/1up/.github/workflows/release-assets.yml@refs/tags/v0.1.12"
+        )));
+        assert!(attestation_identity_is_trusted(Some(
+            "https://github.com/rp1-run/1up/.github/workflows/release-assets.yml@refs/heads/main"
+        )));
+    }
+
+    #[test]
+    fn attestation_identity_is_trusted_rejects_foreign_and_missing() {
+        // Foreign repo.
+        assert!(!attestation_identity_is_trusted(Some(
+            "https://github.com/evil/1up/.github/workflows/release-assets.yml@refs/tags/v1"
+        )));
+        // Right repo, wrong workflow file.
+        assert!(!attestation_identity_is_trusted(Some(
+            "https://github.com/rp1-run/1up/.github/workflows/evil.yml@refs/tags/v1"
+        )));
+        // Look-alike repo prefix must not satisfy the pin.
+        assert!(!attestation_identity_is_trusted(Some(
+            "https://github.com/rp1-run/1up-evil/.github/workflows/release-assets.yml@refs/tags/v1"
+        )));
+        // Missing SAN is never trusted.
+        assert!(!attestation_identity_is_trusted(None));
+    }
+
+    #[test]
+    fn verify_attestation_bundles_rejects_foreign_workflow_identity() {
+        // AC#1: a real attestation bundle whose signing workflow identity is
+        // foreign to `rp1-run/1up` is disproved -> AttestationFailed. The bundle
+        // is cryptographically valid against the embedded production trusted root
+        // (issuer pin passes), so it is the *identity* pin that fails closed.
+        let digest =
+            sigstore_verify::types::Sha256Hash::from_hex(FOREIGN_ATTESTATION_SUBJECT_SHA256)
+                .expect("subject digest parses");
+        let bundle: sigstore_verify::types::Bundle =
+            sigstore_verify::types::Bundle::from_json(FOREIGN_GITHUB_ATTESTATION)
+                .expect("fixture bundle parses");
+        let policy = attestation_verification_policy();
+        let trusted_root = sigstore_trust_root::TrustedRoot::from_json(
+            sigstore_trust_root::SIGSTORE_PRODUCTION_TRUSTED_ROOT,
+        )
+        .expect("embedded trusted root loads");
+
+        // Sanity: the bundle's cryptography is genuinely valid against the pinned
+        // issuer + embedded root (so the test below isolates the identity pin,
+        // not a crypto failure).
+        let crypto = sigstore_verify::verify(
+            sigstore_verify::types::Artifact::from(&digest),
+            &bundle,
+            &policy,
+            &trusted_root,
+        )
+        .expect("foreign bundle is cryptographically valid");
+        assert!(crypto.success);
+        assert_eq!(crypto.issuer.as_deref(), Some(ATTESTATION_OIDC_ISSUER));
+        assert!(
+            !attestation_identity_is_trusted(crypto.identity.as_deref()),
+            "fixture identity must be foreign to rp1-run/1up"
+        );
+
+        // The behavior under test: our wrapper fails closed on the foreign signer.
+        // Verify by digest (equivalent to the production by-bytes path) so the
+        // binary artifact need not be vendored.
+        let bundle_jsons = vec![FOREIGN_GITHUB_ATTESTATION.to_string()];
+        let err = verify_attestation_bundles(
+            &bundle_jsons,
+            sigstore_verify::types::Artifact::from(&digest),
+        )
+        .unwrap_err();
+        match err {
+            UpdateError::AttestationFailed { detail } => {
+                assert!(
+                    detail.contains("not the project's release workflow"),
+                    "expected an identity-pin failure, got: {detail}"
+                );
+            }
+            other => panic!("expected AttestationFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_attestation_bundles_fails_closed_on_malformed_material() {
+        // Material present but unparseable -> disproved (fail closed), never a
+        // silent pass.
+        let bundles = vec!["{ not a bundle }".to_string()];
+        let err = verify_attestation_bundles(
+            &bundles,
+            sigstore_verify::types::Artifact::from(b"artifact-bytes".as_slice()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpdateError::AttestationFailed { .. }),
+            "expected AttestationFailed for malformed bundle, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_attestation_bundles_fails_closed_on_empty_material() {
+        let err = verify_attestation_bundles(
+            &[],
+            sigstore_verify::types::Artifact::from(b"artifact-bytes".as_slice()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpdateError::AttestationFailed { .. }),
+            "expected AttestationFailed for empty material, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_attestation_bundles_extracts_each_bundle() {
+        let body =
+            r#"{"attestations":[{"bundle":{"mediaType":"a"}},{"bundle":{"mediaType":"b"}}]}"#;
+        let bundles = parse_attestation_bundles(body).expect("two bundles");
+        assert_eq!(bundles.len(), 2);
+        assert!(bundles[0].contains("\"mediaType\":\"a\""));
+        assert!(bundles[1].contains("\"mediaType\":\"b\""));
+    }
+
+    #[test]
+    fn parse_attestation_bundles_returns_none_for_cannot_run_shapes() {
+        // 404-style "no attestations" and shape drift both degrade (None), never
+        // a disproof.
+        assert!(parse_attestation_bundles(r#"{"attestations":[]}"#).is_none());
+        assert!(parse_attestation_bundles(r#"{"message":"Not Found"}"#).is_none());
+        assert!(parse_attestation_bundles("not json").is_none());
     }
 }

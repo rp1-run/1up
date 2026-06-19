@@ -632,6 +632,17 @@ fn release_manifest_generation_includes_platform_mapping_and_checksums() {
         published_at.ends_with('Z') && published_at.contains('T'),
         "published_at should be ISO 8601 UTC: {published_at}"
     );
+    let expiry = manifest["expiry"]
+        .as_str()
+        .expect("manifest should include a non-null expiry string");
+    assert!(
+        expiry.ends_with('Z') && expiry.contains('T'),
+        "expiry should be ISO 8601 UTC: {expiry}"
+    );
+    assert!(
+        expiry > published_at,
+        "expiry ({expiry}) should be after published_at ({published_at})"
+    );
     assert_eq!(
         manifest["notes_url"],
         format!("https://github.com/rp1-run/1up/releases/tag/{release_tag}")
@@ -664,6 +675,21 @@ fn release_manifest_deserializes_as_update_manifest() {
     assert_eq!(manifest.version, TEST_RELEASE_VERSION);
     assert_eq!(manifest.git_tag, test_release_tag());
     assert!(!manifest.published_at.is_empty());
+    let expiry = manifest
+        .expiry
+        .as_deref()
+        .expect("generated manifest should carry a non-null expiry");
+    assert!(
+        expiry.ends_with('Z') && expiry.contains('T'),
+        "expiry should be RFC3339 UTC: {expiry}"
+    );
+    // RFC3339 UTC `Z` timestamps sort lexicographically in chronological order,
+    // so a string comparison is a valid "expiry is after published_at" check.
+    assert!(
+        expiry > manifest.published_at.as_str(),
+        "expiry ({expiry}) should be after published_at ({})",
+        manifest.published_at
+    );
     assert!(manifest
         .notes_url
         .contains(&format!("/releases/tag/{}", test_release_tag())));
@@ -2126,6 +2152,40 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
     assert!(workflow.contains("Get-FileHash"));
     assert!(workflow.contains("onnxruntime-win-x64-1.24.2.zip"));
     assert!(workflow.contains("Expand-Archive -LiteralPath $archivePath"));
+}
+
+#[test]
+fn release_assets_workflow_emits_build_provenance_attestation() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
+
+    // The publish job that mints the OIDC token must hold both elevated grants.
+    assert!(
+        workflow.contains("id-token: write"),
+        "release-assets must grant id-token:write for keyless-OIDC attestation"
+    );
+    assert!(
+        workflow.contains("attestations: write"),
+        "release-assets must grant attestations:write to record provenance"
+    );
+    // contents:write is still required for the gh release create/upload.
+    assert!(workflow.contains("contents: write"));
+
+    // The provenance step must run and cover the exact archives clients verify.
+    assert!(
+        workflow.contains("actions/attest-build-provenance@v2"),
+        "release-assets must run actions/attest-build-provenance for build provenance"
+    );
+    assert!(workflow.contains("subject-path:"));
+    assert!(
+        workflow.contains("/dist/*.tar.gz") && workflow.contains("/dist/*.zip"),
+        "attestation subject must cover the published .tar.gz and .zip archives"
+    );
+
+    // No regression: existing artifact/checksum/manifest emission still present.
+    assert!(workflow.contains("write_sha256sums.sh"));
+    assert!(workflow.contains("generate_release_manifest.sh"));
+    assert!(workflow.contains("gh release upload \"$tag\""));
 }
 
 #[test]

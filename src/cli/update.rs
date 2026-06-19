@@ -150,9 +150,7 @@ async fn exec_update(format: OutputFormat) -> anyhow::Result<()> {
         .await
         .map_err(map_update_error)?;
 
-    let self_update_result = self_update(&manifest)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let self_update_result = self_update(&manifest).await.map_err(map_update_error)?;
 
     let result = UpdateResult::Updated {
         old_version: self_update_result.old_version,
