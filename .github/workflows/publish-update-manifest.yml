@@ -66,6 +66,7 @@ jobs:
             version,
             git_tag,
             published_at,
+            expiry,
             notes_url,
             artifacts: [.artifacts[] | {target, archive, sha256, url}],
             channels: {
@@ -129,6 +130,7 @@ jobs:
             version,
             git_tag,
             published_at,
+            expiry,
             notes_url,
             artifacts: [.artifacts[] | {target, archive, sha256, url}],
             channels: {

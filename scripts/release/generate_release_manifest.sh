@@ -112,11 +112,18 @@ mkdir -p "$(dirname "$OUTPUT_PATH")"
 PUBLISHED_AT=$(utc_timestamp)
 NOTES_URL="$(release_repo_url)/releases/tag/${TAG}"
 
+# Time-bound the manifest so clients refuse a stale/frozen feed (anti-freeze).
+# Generous TTL: the manifest is re-published on every release, so this only has
+# to outlast the gap between releases to avoid false refusals on valid feeds,
+# while still bounding how long a frozen feed can be replayed.
+EXPIRY_TTL_SECONDS=$((90 * 24 * 60 * 60))
+
 jq -n \
   --arg version "$VERSION" \
   --arg git_tag "$TAG" \
   --arg commit_sha "$COMMIT_SHA" \
   --arg published_at "$PUBLISHED_AT" \
+  --argjson expiry_ttl_seconds "$EXPIRY_TTL_SECONDS" \
   --arg binary_name "1up" \
   --arg license "$LICENSE" \
   --arg checksums_file "$(basename "$CHECKSUMS_PATH")" \
@@ -131,6 +138,7 @@ jq -n \
     git_tag: $git_tag,
     commit_sha: $commit_sha,
     published_at: $published_at,
+    expiry: ($published_at | fromdateiso8601 + $expiry_ttl_seconds | todateiso8601),
     binary_name: $binary_name,
     license: $license,
     artifacts: $artifacts[0],

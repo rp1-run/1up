@@ -20,6 +20,11 @@ pub struct UpdateManifest {
     pub version: String,
     pub git_tag: String,
     pub published_at: String,
+    /// RFC3339 timestamp after which the client refuses to apply this manifest
+    /// (anti-freeze gate). Additive and optional so manifests published before
+    /// the field existed continue to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<String>,
     pub notes_url: String,
     pub artifacts: Vec<UpdateArtifact>,
     pub channels: UpdateChannels,
@@ -895,6 +900,7 @@ mod tests {
             version: "0.1.1".to_string(),
             git_tag: "v0.1.1".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: Some("2026-07-10T12:00:00Z".to_string()),
             notes_url: "https://github.com/rp1-run/1up/releases/tag/v0.1.1".to_string(),
             artifacts: vec![UpdateArtifact {
                 target: "aarch64-apple-darwin".to_string(),
@@ -924,6 +930,7 @@ mod tests {
         assert!(!parsed.yanked);
         assert!(parsed.minimum_safe_version.is_none());
         assert!(parsed.message.is_none());
+        assert_eq!(parsed.expiry.as_deref(), Some("2026-07-10T12:00:00Z"));
     }
 
     #[test]
@@ -943,6 +950,7 @@ mod tests {
         assert!(!manifest.yanked);
         assert!(manifest.minimum_safe_version.is_none());
         assert!(manifest.message.is_none());
+        assert!(manifest.expiry.is_none());
     }
 
     #[test]
@@ -1150,6 +1158,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![],
             channels: UpdateChannels {
@@ -1184,6 +1193,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![],
             channels: UpdateChannels {
@@ -1372,6 +1382,7 @@ mod tests {
             version: "0.2.0".to_string(),
             git_tag: "v0.2.0".to_string(),
             published_at: "2026-04-10T12:00:00Z".to_string(),
+            expiry: None,
             notes_url: "https://example.com/notes".to_string(),
             artifacts: vec![UpdateArtifact {
                 target: target.to_string(),
