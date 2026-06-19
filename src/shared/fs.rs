@@ -914,7 +914,13 @@ mod tests {
         let err =
             atomic_rename_file_within_root(&root.join("absent.rebuild"), &dest, &root).unwrap_err();
 
-        assert!(err.to_string().to_lowercase().contains("no such file"));
+        // Platform-agnostic "not found": Unix reports "No such file or directory";
+        // Windows reports "The system cannot find the file specified".
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("no such file") || msg.contains("cannot find"),
+            "expected a not-found error, got: {err}"
+        );
         // A missing source leaves the destination byte-for-byte intact.
         assert_eq!(fs::read(&dest).unwrap(), b"old");
     }

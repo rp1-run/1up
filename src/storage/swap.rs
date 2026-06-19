@@ -632,7 +632,13 @@ mod tests {
         let missing = config::project_staging_db_path(&root);
         let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
         let err = swap_index_into_place(&root, &missing).await.unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("no such file"));
+        // Platform-agnostic "not found": Unix reports "No such file or directory";
+        // Windows reports "The system cannot find the file specified".
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("no such file") || msg.contains("cannot find"),
+            "expected a not-found error, got: {err}"
+        );
 
         assert_eq!(
             fs::read(&index_path).unwrap(),
