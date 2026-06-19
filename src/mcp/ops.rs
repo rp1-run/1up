@@ -21,12 +21,13 @@ use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, Sym
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
+    STALE_REBUILD_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
-    ContextAccessScope, ContextResult, DaemonProjectStatus, DaemonRefreshState, IndexProgress,
-    IndexState, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
+    combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
+    IndexProgress, IndexState, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
     StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
@@ -346,17 +347,6 @@ fn index_if_needed_applies(readiness: &ReadinessPayload) -> bool {
     ) || readiness.drifted == Some(true)
 }
 
-/// Whether a daemon refresh state means the index is actively being (re)built
-/// for a context. Single source of truth for the "Pending/Running ==
-/// in-flight" mapping, shared by the readiness classifier and the
-/// rebuild-in-progress detector so the two cannot drift.
-fn daemon_refresh_state_active(state: DaemonRefreshState) -> bool {
-    matches!(
-        state,
-        DaemonRefreshState::Pending | DaemonRefreshState::Running
-    )
-}
-
 /// Reports whether an index rebuild/refresh is in progress for `context_id`,
 /// so a served search can be flagged stale-but-available
 /// ([`STALE_REBUILD_REASON`]).
@@ -375,11 +365,10 @@ fn daemon_refresh_state_active(state: DaemonRefreshState) -> bool {
 /// the read path. This is the MCP/CLI (out-of-process) detector; the daemon's
 /// own search path detects from its in-memory refresh state instead, so the
 /// daemon does not depend on the MCP layer.
-#[allow(dead_code)] // consumed by T6 (inject staleness reason into served searches)
 pub(crate) fn rebuild_in_progress(state_root: &Path, context_id: &str) -> bool {
     let refresh_active =
         crate::cli::project_status_files::read_daemon_context_status(state_root, context_id)
-            .is_some_and(|status| daemon_refresh_state_active(status.last_refresh_state));
+            .is_some_and(|status| status.last_refresh_state.is_in_flight());
 
     refresh_active || rebuild_lock_held(state_root)
 }
@@ -388,7 +377,6 @@ pub(crate) fn rebuild_in_progress(state_root: &Path, context_id: &str) -> bool {
 /// process currently holds it. Any guard acquired here is dropped immediately,
 /// so the probe never blocks a rebuild owner; a probe error reads as "not
 /// held" so a transient lock-file error cannot mask served results.
-#[allow(dead_code)] // reached only via rebuild_in_progress (T6 consumer)
 fn rebuild_lock_held(state_root: &Path) -> bool {
     matches!(lifecycle::try_acquire_rebuild_lock(state_root), Ok(None))
 }
@@ -409,7 +397,7 @@ pub async fn classify_readiness(
     );
     let daemon_refresh_active = daemon_context_status
         .as_ref()
-        .is_some_and(|status| daemon_refresh_state_active(status.last_refresh_state));
+        .is_some_and(|status| status.last_refresh_state.is_in_flight());
     let daemon_status = daemon_context_status
         .as_ref()
         .and_then(|status| {
@@ -771,8 +759,17 @@ async fn run_search_once(
         (results, Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()))
     };
 
-    let degraded_reason =
-        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason());
+    // Stale-but-available: when a rebuild/refresh is in progress for this
+    // context, readers keep serving the prior index (build-aside, REQ-002), so
+    // flag the served results as possibly stale. The notice rides only in
+    // `degraded_reason` (no parallel field) and the render path keeps it off
+    // stdout (REQ-003).
+    let stale_reason = rebuild_in_progress(state_root, &worktree_context.context_id)
+        .then(|| STALE_REBUILD_REASON.to_string());
+    let degraded_reason = combine_degraded_reasons(
+        stale_reason,
+        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason()),
+    );
 
     let status = match degraded_reason {
         Some(_) => OperationStatus::Degraded,
@@ -1492,14 +1489,6 @@ fn unavailable_reason_text(reason: &EmbeddingUnavailableReason) -> String {
     }
 }
 
-fn combine_degraded_reasons(left: Option<String>, right: Option<String>) -> Option<String> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
-        (Some(reason), None) | (None, Some(reason)) => Some(reason),
-        (None, None) => None,
-    }
-}
-
 fn usize_from_i64(value: i64) -> usize {
     usize::try_from(value).unwrap_or_default()
 }
@@ -1529,7 +1518,9 @@ enum LocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::types::{BranchStatus, StructuralSearchStatus, WorktreeRole};
+    use crate::shared::types::{
+        BranchStatus, DaemonRefreshState, StructuralSearchStatus, WorktreeRole,
+    };
     use crate::storage::segments::{self, SegmentInsert};
     use std::fs;
 

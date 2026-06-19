@@ -589,6 +589,23 @@ pub enum DaemonRefreshState {
     Unknown,
 }
 
+impl DaemonRefreshState {
+    /// Whether this state means an index refresh/rebuild is currently in
+    /// flight, so a served search should be flagged stale-but-available.
+    ///
+    /// Single source of truth for the `Pending`/`Running` == in-flight mapping.
+    /// Lives on the type (in `shared`) rather than in any one consumer so the
+    /// readiness classifier and the MCP detector (`src/mcp/ops.rs`) and the
+    /// daemon's own search path (`src/daemon/worker.rs`, which cannot depend on
+    /// the MCP layer) all share one predicate and cannot drift.
+    pub fn is_in_flight(self) -> bool {
+        matches!(
+            self,
+            DaemonRefreshState::Pending | DaemonRefreshState::Running
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonContextStatus {
     pub context_id: String,
@@ -647,6 +664,20 @@ impl std::str::FromStr for OutputFormat {
             "plain" => Ok(OutputFormat::Plain),
             other => Err(format!("unknown output format: {other}")),
         }
+    }
+}
+
+/// Merges two optional `degraded_reason` fragments into one, joining both with
+/// `"; "` when present so neither is silently dropped. Lives in `shared` so
+/// both served-search surfaces — MCP (`src/mcp/ops.rs`) and the daemon
+/// (`src/daemon/worker.rs`, which cannot depend on the MCP layer) — fold the
+/// stale-rebuild reason in through one combiner rather than duplicating the
+/// join.
+pub fn combine_degraded_reasons(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
+        (Some(reason), None) | (None, Some(reason)) => Some(reason),
+        (None, None) => None,
     }
 }
 
@@ -723,5 +754,34 @@ mod tests {
         let with_embeddings = config.reporting_parallelism(2, true);
         assert_eq!(with_embeddings.jobs_effective, 2);
         assert_eq!(with_embeddings.embed_threads, 4);
+    }
+
+    #[test]
+    fn refresh_state_in_flight_only_for_pending_or_running() {
+        assert!(DaemonRefreshState::Pending.is_in_flight());
+        assert!(DaemonRefreshState::Running.is_in_flight());
+        assert!(!DaemonRefreshState::Complete.is_in_flight());
+        assert!(!DaemonRefreshState::Failed.is_in_flight());
+        assert!(!DaemonRefreshState::Unknown.is_in_flight());
+    }
+
+    #[test]
+    fn combine_degraded_reasons_joins_both_without_dropping_either() {
+        // Both present: joined by "; ", neither silently dropped (REQ-003 AC4).
+        assert_eq!(
+            combine_degraded_reasons(Some("stale".to_string()), Some("no embeddings".to_string())),
+            Some("stale; no embeddings".to_string())
+        );
+        // Exactly one present passes through unchanged.
+        assert_eq!(
+            combine_degraded_reasons(Some("stale".to_string()), None),
+            Some("stale".to_string())
+        );
+        assert_eq!(
+            combine_degraded_reasons(None, Some("no embeddings".to_string())),
+            Some("no embeddings".to_string())
+        );
+        // No stale reason (rebuild idle) leaves no stale fragment (REQ-003 AC3).
+        assert_eq!(combine_degraded_reasons(None, None), None);
     }
 }

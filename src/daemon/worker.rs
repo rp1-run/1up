@@ -20,15 +20,15 @@ use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE, VERSION, WATCHER_DEBOUNCE_MS,
+    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
 use crate::shared::project::canonical_project_root;
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
-    DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus, DaemonRefreshState,
-    DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
+    combine_degraded_reasons, DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus,
+    DaemonRefreshState, DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
 };
 use crate::storage::{db::Db, schema};
 
@@ -1254,6 +1254,11 @@ async fn handle_search_request(
         return search_service::unavailable_response();
     }
     let search_scope = SearchScope::from_worktree_context(&state.context);
+    // Stale-but-available: the daemon detects a rebuild/refresh from its own
+    // in-memory refresh state (not the MCP out-of-process detector, so the
+    // daemon keeps no dependency on the MCP layer). When a pass is in flight
+    // the served results are flagged possibly-stale via `degraded_reason`.
+    let rebuild_in_progress = state.last_refresh_state.is_in_flight();
 
     let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
     {
@@ -1327,6 +1332,14 @@ async fn handle_search_request(
         let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
         engine.fts_only_search(&request.query, request.limit).await
     };
+
+    // Fold the stale-rebuild notice in through the shared combiner so it
+    // coexists with any embeddings-degraded reason (joined by "; ", neither
+    // dropped) and rides only in `degraded_reason`.
+    let degraded_reason = combine_degraded_reasons(
+        rebuild_in_progress.then(|| STALE_REBUILD_REASON.to_string()),
+        degraded_reason,
+    );
 
     match results {
         Ok(results) => SearchResponse::Results {
