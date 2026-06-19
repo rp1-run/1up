@@ -64,6 +64,14 @@ INSTALL_DIR_OVERRIDE=$(read_env 1UP_INSTALL_DIR)
 SUMS_FETCH_ATTEMPTS=3
 SUMS_FETCH_RETRY_DELAY=1
 
+# OIDC issuer pinned for release attestation verification. Every legitimate
+# 1up release attestation is a keyless GitHub Actions OIDC provenance, so the
+# verifier requires the signer certificate to carry this issuer. Paired with a
+# per-repo workflow-identity regexp (see attestation_identity_regexp), it is
+# what makes a substituted artifact's attestation non-attributable and thus
+# rejected.
+ATTESTATION_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
 # Populated by stages below.
 HASH_CMD=""
 TARGET=""
@@ -309,6 +317,198 @@ verify_checksum() {
 }
 
 # ---------------------------------------------------------------------------
+# Stage 5b: verify attestation (opt-in, independent trust channel)
+# ---------------------------------------------------------------------------
+#
+# An independent-channel check layered on top of (never replacing) the SHA256
+# checksum floor. The checksum only proves the archive matches a value served
+# from the same host; a keyless-OIDC GitHub artifact attestation proves the
+# archive was built by this repo's own release workflow, defeating the
+# substituted-artifact / compromised-host threat.
+#
+# This is deliberately OPT-IN and best-effort so `curl | bash` keeps working on
+# a bare machine: it runs only when a verifier (gh or cosign) is available and
+# never hard-fails for a missing or unable verifier. Three outcomes:
+#   verified   -> proceed silently
+#   cannot-run -> degrade to the checksum floor with a notice (verifier absent,
+#                 offline, rate-limited, no attestation found, or the gh
+#                 multi-entry/offline bug cli/cli#10059)
+#   disproved  -> fail(): an attestation was retrieved but rejected by policy
+#                 (foreign identity / bad signature) -- a real tamper.
+# Only a positive disproof is fatal; everything else degrades, because breaking
+# a legitimate install on a verifier quirk is worse than relying on the
+# checksum floor (the in-binary self-update enforces attestation more strictly).
+
+# Build the certificate-identity regexp that pins the signer to this repo's
+# release workflow for ANY git ref. The attested SAN is
+#   https://github.com/<REPO>/.github/workflows/release-assets.yml@<ref>
+# and <ref> is a per-release tag, so we anchor a prefix rather than an exact
+# identity. Only '.' is a realistic regexp metacharacter in a GitHub owner/repo
+# slug (alnum, '-', '_', '.'), so escaping dots is sufficient.
+attestation_identity_regexp() {
+    local repo_escaped
+    repo_escaped=$(printf '%s' "$REPO" | sed 's/\./\\./g')
+    printf '^https://github\.com/%s/\.github/workflows/release-assets\.yml@' "$repo_escaped"
+}
+
+# Echo the preferred available+usable verifier ("cosign" or "gh"), or empty if
+# none. Each probe runs the tool locally (no network) so a too-old or stubbed
+# tool is correctly seen as unusable. cosign is preferred for its unambiguous
+# per-artifact verify (sidesteps cli/cli#10059), but this repo publishes no
+# sidecar bundle -- the attestation lives in the GitHub API keyed by digest --
+# so cosign needs gh to fetch the bundle. cosign is therefore only selectable
+# when gh is also usable; gh alone can verify directly by digest.
+detect_attestation_verifier() {
+    local have_gh have_cosign
+    have_gh=no
+    have_cosign=no
+
+    if command -v gh >/dev/null 2>&1 && gh attestation --help >/dev/null 2>&1; then
+        have_gh=yes
+    fi
+    if command -v cosign >/dev/null 2>&1 && cosign version >/dev/null 2>&1; then
+        have_cosign=yes
+    fi
+
+    if [ "$have_cosign" = yes ] && [ "$have_gh" = yes ]; then
+        printf '%s\n' "cosign"
+    elif [ "$have_gh" = yes ]; then
+        printf '%s\n' "gh"
+    else
+        printf '%s\n' ""
+    fi
+}
+
+# Run the selected verifier over the downloaded archive, capturing its combined
+# output to $TMP/attest.log. Echoes nothing; returns the verifier's exit code
+# (which classify_attestation_result interprets alongside the log). Never aborts
+# under `set -e`: the verifier's non-zero exit is captured, not propagated.
+run_attestation_verifier() {
+    local verifier archive identity_re rc bundle
+    verifier="$1"
+    archive="$TMP/$ARCHIVE"
+    identity_re=$(attestation_identity_regexp)
+
+    if [ "$verifier" = "gh" ]; then
+        rc=0
+        gh attestation verify "$archive" \
+            --repo "$REPO" \
+            --cert-identity-regexp "$identity_re" \
+            --cert-oidc-issuer "$ATTESTATION_OIDC_ISSUER" \
+            >"$TMP/attest.log" 2>&1 || rc=$?
+        return "$rc"
+    fi
+
+    # cosign path: no sidecar bundle is published, so fetch the by-digest
+    # bundle via gh, then verify exactly this one artifact with cosign. Any
+    # fetch/locate problem leaves a marker in the log and returns non-zero;
+    # the caller classifies that as cannot-run (and falls back to gh verify).
+    rc=0
+    ( cd "$TMP" && gh attestation download "$archive" --repo "$REPO" ) >"$TMP/attest.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        return "$rc"
+    fi
+    # First downloaded bundle. A literal glob (no `ls`) handles the digest
+    # filename's ':' and the no-match case (the pattern stays literal and the
+    # -f test fails, leaving bundle empty).
+    bundle=""
+    local candidate
+    for candidate in "$TMP"/*.jsonl; do
+        if [ -f "$candidate" ]; then
+            bundle="$candidate"
+            break
+        fi
+    done
+    if [ -z "$bundle" ]; then
+        printf '%s\n' "could not locate downloaded attestation bundle" >>"$TMP/attest.log"
+        return 1
+    fi
+    rc=0
+    cosign verify-blob "$archive" \
+        --new-bundle-format \
+        --bundle "$bundle" \
+        --certificate-identity-regexp "$identity_re" \
+        --certificate-oidc-issuer "$ATTESTATION_OIDC_ISSUER" \
+        >"$TMP/attest.log" 2>&1 || rc=$?
+    return "$rc"
+}
+
+# Map a verifier exit code + its $TMP/attest.log output to one of:
+#   verified | disproved | cannot_run
+# Cannot-run signals (checked first) are "could not reach a verdict" cases that
+# must degrade. A disproof requires a positive rejection signal. Anything
+# unrecognized defaults to cannot_run: a verifier quirk or output-wording change
+# must never break a legitimate `curl | bash` install -- the checksum floor
+# still applies and the self-update path enforces attestation more strictly.
+classify_attestation_result() {
+    local rc log
+    rc="$1"
+    log="$TMP/attest.log"
+
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "verified"
+        return
+    fi
+
+    if [ -f "$log" ] && grep -qiE \
+        'no attestations? (found|present)|found no attestation|could not (find|fetch|load|locate)|failed to fetch|loading attestation|rate.?limit|\b429\b|could not resolve host|no such host|connection (refused|reset)|could(n.?t| not) connect|network is unreachable|i/o timeout|deadline exceeded|temporary failure|tls handshake|x509|multiple attestation|more than one' \
+        "$log"; then
+        printf '%s\n' "cannot_run"
+        return
+    fi
+
+    if [ -f "$log" ] && grep -qiE \
+        'verification failed|failed to verify|none of the|do(es)? not match|no matching|bad signature|invalid signature|expected identity|certificate identity|untrusted|rejected by policy' \
+        "$log"; then
+        printf '%s\n' "disproved"
+        return
+    fi
+
+    printf '%s\n' "cannot_run"
+}
+
+verify_attestation() {
+    local verifier rc result
+    verifier=$(detect_attestation_verifier)
+
+    if [ -z "$verifier" ]; then
+        warn "note: no attestation verifier (gh or cosign) available; skipping provenance check and relying on the SHA256 checksum. Install GitHub CLI (gh) to enable attestation verification."
+        return
+    fi
+
+    rc=0
+    run_attestation_verifier "$verifier" || rc=$?
+    result=$(classify_attestation_result "$rc")
+
+    # Prefer cosign, but never lose verification to a flaky cosign/bundle-fetch:
+    # if the cosign path could not reach a verdict, fall back to gh's direct
+    # by-digest verify (gh is always present when cosign was selected).
+    if [ "$verifier" = "cosign" ] && [ "$result" = "cannot_run" ]; then
+        rc=0
+        run_attestation_verifier "gh" || rc=$?
+        result=$(classify_attestation_result "$rc")
+    fi
+
+    case "$result" in
+        verified)
+            # Silent on success to keep stdout clean; diagnostics only on
+            # degrade/fail (both to stderr).
+            return
+            ;;
+        cannot_run)
+            warn "note: could not verify release attestation for $ARCHIVE (verifier unavailable, offline, or no attestation found); relying on the SHA256 checksum."
+            return
+            ;;
+        disproved)
+            fail "attestation verification failed for $ARCHIVE: the release artifact is not attributable to $REPO's release workflow. Refusing to install."
+            ;;
+        *)
+            fail "internal error: unclassified attestation result '$result'."
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Stage 6: install binary
 # ---------------------------------------------------------------------------
 
@@ -470,6 +670,7 @@ detect_target
 resolve_tag
 download_artifacts
 verify_checksum
+verify_attestation
 install_binary
 configure_path
 print_next_steps
