@@ -2155,6 +2155,40 @@ fn release_assets_workflow_stages_windows_onnx_runtime_dll() {
 }
 
 #[test]
+fn release_assets_workflow_emits_build_provenance_attestation() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
+
+    // The publish job that mints the OIDC token must hold both elevated grants.
+    assert!(
+        workflow.contains("id-token: write"),
+        "release-assets must grant id-token:write for keyless-OIDC attestation"
+    );
+    assert!(
+        workflow.contains("attestations: write"),
+        "release-assets must grant attestations:write to record provenance"
+    );
+    // contents:write is still required for the gh release create/upload.
+    assert!(workflow.contains("contents: write"));
+
+    // The provenance step must run and cover the exact archives clients verify.
+    assert!(
+        workflow.contains("actions/attest-build-provenance@v2"),
+        "release-assets must run actions/attest-build-provenance for build provenance"
+    );
+    assert!(workflow.contains("subject-path:"));
+    assert!(
+        workflow.contains("/dist/*.tar.gz") && workflow.contains("/dist/*.zip"),
+        "attestation subject must cover the published .tar.gz and .zip archives"
+    );
+
+    // No regression: existing artifact/checksum/manifest emission still present.
+    assert!(workflow.contains("write_sha256sums.sh"));
+    assert!(workflow.contains("generate_release_manifest.sh"));
+    assert!(workflow.contains("gh release upload \"$tag\""));
+}
+
+#[test]
 fn release_please_config_disables_component_prefixed_tags() {
     let config = fs::read_to_string(repo_root().join("release-please-config.json")).unwrap();
 
