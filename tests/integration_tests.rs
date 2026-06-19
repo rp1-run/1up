@@ -533,6 +533,21 @@ impl Drop for McpTestClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Killing the `mcp` child does not stop the separate daemon worker the
+        // server may have spawned under this client's isolated HOME, which would
+        // then be orphaned when the temp HOME is removed. Best-effort reap by
+        // pid (panic-safe: runs during unwind and ignores every failure).
+        #[cfg(unix)]
+        if let Some(home) = &self._state_home {
+            let pid_path = test_data_dir(home.path()).join("daemon.pid");
+            if let Ok(raw) = fs::read_to_string(&pid_path) {
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
     }
 }
 

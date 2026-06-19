@@ -1573,6 +1573,12 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
         .assert()
         .success();
 
+    // Tear down deterministically, including on an assertion panic below: both
+    // projects share the daemon started here, and it only stops once its LAST
+    // project is deregistered, so guard both or it is orphaned when HOME is
+    // removed. (RAII Drop runs on unwind; the previous trailing `stop` did not.)
+    let _cleanup_a = DaemonCleanupGuard::new(&canonical_home, &canonical_project_a);
+
     let pid_file = data_dir.join("daemon.pid");
     let deadline = Instant::now() + Duration::from_secs(2);
     while !pid_file.exists() && Instant::now() < deadline {
@@ -1596,6 +1602,7 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
         .output()
         .unwrap();
     assert!(output.status.success());
+    let _cleanup_b = DaemonCleanupGuard::new(&canonical_home, &canonical_project_b);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -1606,18 +1613,8 @@ fn start_indexes_project_when_daemon_is_already_running_and_index_is_missing() {
     assert!(payload["progress"]["segments_stored"].as_u64().unwrap() > 0);
     assert!(canonical_project_b.join(".1up").join("index.db").exists());
 
-    cmd()
-        .env("HOME", &canonical_home)
-        .env("XDG_DATA_HOME", canonical_home.join(".local").join("share"))
-        .env("XDG_CONFIG_HOME", canonical_home.join(".config"))
-        .args([
-            "stop",
-            canonical_project_a.to_str().unwrap(),
-            "--format",
-            "json",
-        ])
-        .assert()
-        .success();
+    // Daemon teardown is handled by `_cleanup_a` / `_cleanup_b` above so it
+    // also runs if any assertion in this test panics.
 }
 
 #[test]
