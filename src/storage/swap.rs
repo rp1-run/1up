@@ -13,15 +13,109 @@
 //! index, leave an orphan WAL that SQLite replays silently and that even
 //! `PRAGMA integrity_check` reports as "ok" (HYP-001).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+
+use libsql::Connection;
 
 use crate::shared::config;
 use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
 use crate::shared::errors::{OneupError, StorageError};
 use crate::storage::db::{is_lock_error, Db};
-use crate::storage::queries;
+use crate::storage::{queries, schema};
+
+/// RAII guard owning a build-aside staging database for a non-destructive rebuild.
+///
+/// The refreshed index is built through [`Self::connection`] into a uuid-suffixed
+/// staging file under `.1up/`, then [`Self::finalize_and_swap`] folds it into a
+/// single self-contained file and atomically switches it over the served
+/// `index.db`. The served index is never torn down before that switch, so a reader
+/// keeps seeing the full prior index throughout the rebuild and a single rename
+/// flips it to the full new index — and a rebuild that fails, is cancelled, or
+/// panics before the switch leaves the prior `index.db` intact and served
+/// (REQ-001 AC3).
+///
+/// On drop the staging file is best-effort removed so an aborted rebuild leaves no
+/// orphan behind; after a successful switch the file was already renamed away, so
+/// the removal is a harmless no-op. [`Self::finalize_and_swap`] must run while the
+/// single-writer `RebuildLock` is held.
+pub struct StagingRebuild {
+    state_root: PathBuf,
+    staging_path: PathBuf,
+    // Held in `Option`s so `finalize_and_swap` can release the build connection
+    // and move the `Db` into the finalize step (which consumes it) while `Drop`
+    // still runs the staging-file cleanup on every exit path.
+    db: Option<Db>,
+    conn: Option<Connection>,
+}
+
+impl StagingRebuild {
+    /// Open and initialize a fresh staging database for `state_root`.
+    ///
+    /// Sites the staging file at a uuid-suffixed path under `.1up/` and creates the
+    /// current schema in it. The file is brand-new, so this uses
+    /// [`schema::initialize`] rather than a destructive in-place drop-and-recreate
+    /// — nothing is ever dropped from the served index.
+    pub async fn open(state_root: &Path) -> Result<Self, OneupError> {
+        let staging_path = config::project_staging_db_path(state_root);
+        let db = Db::open_staging_rw(&staging_path).await?;
+        let conn = db.connect_tuned().await?;
+        schema::initialize(&conn).await?;
+        Ok(Self {
+            state_root: state_root.to_path_buf(),
+            staging_path,
+            db: Some(db),
+            conn: Some(conn),
+        })
+    }
+
+    /// The tuned connection to the staging database; the rebuild pipeline writes
+    /// the refreshed index through this.
+    pub fn connection(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("staging connection is live until finalize_and_swap consumes the guard")
+    }
+
+    /// Finalize the staged build and atomically switch it over the served
+    /// `index.db`.
+    ///
+    /// Releases the build connection first — a `wal_checkpoint(TRUNCATE)` cannot
+    /// truncate the WAL while another connection is open (see
+    /// [`finalize_staged_db`]) — then folds the staging WAL into a single file and
+    /// performs the atomic switch-over ([`swap_index_into_place`]). MUST run while
+    /// the single-writer `RebuildLock` is held. On a finalize or swap failure the
+    /// prior `index.db` is left intact and the staging file is cleaned up (by the
+    /// swap on a swap failure, otherwise by this guard's `Drop`).
+    pub async fn finalize_and_swap(mut self) -> Result<(), OneupError> {
+        // Release the build connection so the finalize checkpoint can truncate the
+        // staging WAL into a single self-contained file.
+        self.conn = None;
+        let db = self
+            .db
+            .take()
+            .expect("staging db is live until finalize_and_swap consumes the guard");
+        finalize_staged_db(db, &self.staging_path).await?;
+        swap_index_into_place(&self.state_root, &self.staging_path).await
+    }
+}
+
+impl Drop for StagingRebuild {
+    fn drop(&mut self) {
+        // Release any live handles, then best-effort remove the staging file so an
+        // aborted rebuild (build error, cancellation, or panic before the switch)
+        // leaves no orphan. After a successful switch the file was renamed away, so
+        // this is a no-op. The staging path is never the served `index.db`, so this
+        // can never disturb the prior served index.
+        self.conn = None;
+        self.db = None;
+        let _ = crate::shared::fs::remove_regular_file(
+            &self.staging_path,
+            &config::project_dot_dir(&self.state_root),
+        );
+    }
+}
 
 /// Fold a freshly-built staging database into a single self-contained file.
 ///
@@ -40,9 +134,6 @@ use crate::storage::queries;
 ///
 /// `staging_path` is used only to frame error messages and to verify the
 /// post-checkpoint on-disk state; the database is operated through `db`.
-// Consumed by the atomic switch-over primitive (T2) and the rebuild owners
-// (T4/T5); reserved ahead of those callers per the build-aside DAG.
-#[allow(dead_code)]
 pub async fn finalize_staged_db(db: Db, staging_path: &Path) -> Result<(), OneupError> {
     let conn = db.connect()?;
     checkpoint_truncate(&conn, staging_path).await?;
@@ -92,9 +183,6 @@ pub async fn finalize_staged_db(db: Db, staging_path: &Path) -> Result<(), Oneup
 /// queryable and the staging file is best-effort removed (mirroring
 /// `atomic_replace`'s temp-file cleanup). On a cold start (no prior `index.db`)
 /// the rename simply creates it.
-// Consumed by the one-shot rebuild owners (T4) and the daemon-coordinated swap
-// (T5); reserved ahead of those callers per the build-aside DAG.
-#[allow(dead_code)]
 pub async fn swap_index_into_place(
     state_root: &Path,
     staging_path: &Path,
@@ -161,9 +249,6 @@ pub async fn swap_index_into_place(
 /// (HYP-001), so leaving a reader's transient sidecar behind is harmless; what
 /// matters is that no writer-produced WAL survives, which holds because none can be
 /// produced during the swap.
-// Reachable only from `swap_index_into_place`; reserved ahead of its T4/T5 callers
-// per the build-aside DAG.
-#[allow(dead_code)]
 async fn retire_prior_index_sidecars(index_path: &Path) -> Result<(), OneupError> {
     if !index_path.exists() || !index_has_sidecars(index_path) {
         return Ok(());
@@ -198,11 +283,7 @@ fn index_has_sidecars(index_path: &Path) -> bool {
 /// shared DB-lock retry budget. A non-zero `busy` means the WAL could not be
 /// truncated because another connection held a lock; that is treated the same as
 /// a transient `database is locked` and retried, then failed loud if it persists.
-#[allow(dead_code)]
-async fn checkpoint_truncate(
-    conn: &libsql::Connection,
-    staging_path: &Path,
-) -> Result<(), OneupError> {
+async fn checkpoint_truncate(conn: &Connection, staging_path: &Path) -> Result<(), OneupError> {
     let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
     let mut last_blocker: Option<String> = None;
 
@@ -245,8 +326,7 @@ async fn checkpoint_truncate(
 /// completed. Returns `Ok(true)` when the checkpoint truncated the WAL
 /// (`busy == 0`), `Ok(false)` when it was blocked (`busy != 0`), and `Err` for a
 /// query failure (e.g. a transient `database is locked`).
-#[allow(dead_code)]
-async fn checkpoint_truncate_once(conn: &libsql::Connection) -> Result<bool, libsql::Error> {
+async fn checkpoint_truncate_once(conn: &Connection) -> Result<bool, libsql::Error> {
     let mut rows = conn.query(queries::WAL_CHECKPOINT_TRUNCATE, ()).await?;
     match rows.next().await? {
         // Column 0 is `busy`: 0 means the WAL was checkpointed and truncated.
@@ -265,7 +345,6 @@ async fn checkpoint_truncate_once(conn: &libsql::Connection) -> Result<bool, lib
 /// `-wal` sidecar either absent or zero-length. A non-empty `-wal` is the exact
 /// HYP-001 hazard (a header-compatible orphan WAL the rename would carry over and
 /// SQLite would silently replay), so it is rejected here rather than swapped.
-#[allow(dead_code)]
 fn ensure_no_live_wal(staging_path: &Path) -> Result<(), OneupError> {
     let wal_path = wal_sidecar_path(staging_path);
     match std::fs::metadata(&wal_path) {
@@ -287,21 +366,20 @@ fn ensure_no_live_wal(staging_path: &Path) -> Result<(), OneupError> {
 }
 
 /// Sidecar `-wal` path for a database file (`<name>` -> `<name>-wal`).
-#[allow(dead_code)]
-fn wal_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+fn wal_sidecar_path(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, "-wal")
 }
 
 /// Sidecar `-shm` path for a database file (`<name>` -> `<name>-shm`).
-fn shm_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+fn shm_sidecar_path(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, "-shm")
 }
 
 /// Append a sidecar suffix to a database path (`<name>` -> `<name><suffix>`).
-fn sidecar_path(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut name = db_path.as_os_str().to_os_string();
     name.push(suffix);
-    std::path::PathBuf::from(name)
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -612,5 +690,66 @@ mod tests {
         assert_no_sidecars(&index_path);
         assert_eq!(read_segment_count(&index_path).await.unwrap(), 2);
         assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn staging_rebuild_switches_in_the_new_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_root(&tmp, "project");
+        let index_path = config::project_db_path(&root);
+
+        // A prior served index of 2 rows.
+        build_index(&index_path, &["old1", "old2"]).await;
+
+        // Build the refreshed index (3 rows) into the staging file through the
+        // guard, then finalize + switch it over the served index under the lock.
+        let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+        let staged = StagingRebuild::open(&root).await.unwrap();
+        for id in ["new1", "new2", "new3"] {
+            insert_segment(staged.connection(), id).await;
+        }
+        staged.finalize_and_swap().await.unwrap();
+
+        // The served index is the full new generation, with no orphan sidecars.
+        assert_no_sidecars(&index_path);
+        assert_eq!(read_segment_count(&index_path).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn aborted_staging_rebuild_leaves_prior_index_intact_and_no_orphan() {
+        // REQ-001 AC3: a rebuild interrupted/cancelled before the switch-over must
+        // leave the prior `index.db` intact and served, and leave no orphan staging
+        // file. Dropping the guard without `finalize_and_swap` is the build-aside
+        // equivalent of a failed/cancelled rebuild before the switch.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = project_root(&tmp, "project");
+        let index_path = config::project_db_path(&root);
+
+        build_index(&index_path, &["old1", "old2"]).await;
+        let before = fs::read(&index_path).unwrap();
+
+        let staging_path = {
+            let staged = StagingRebuild::open(&root).await.unwrap();
+            let staging_path = staged.staging_path.clone();
+            // Partially build the staged index, then drop the guard below without
+            // ever finalizing or switching it over.
+            insert_segment(staged.connection(), "partial").await;
+            assert!(staging_path.exists(), "staging file exists mid-build");
+            staging_path
+        };
+
+        // The prior served index is byte-for-byte intact and still queryable: the
+        // build-aside rebuild never touched it before the (skipped) switch.
+        assert_eq!(
+            fs::read(&index_path).unwrap(),
+            before,
+            "an aborted rebuild must not touch the served index"
+        );
+        assert_eq!(read_segment_count(&index_path).await.unwrap(), 2);
+        // The aborted build left no orphan staging file behind.
+        assert!(
+            !staging_path.exists(),
+            "dropping the guard before the switch must remove the staging file"
+        );
     }
 }

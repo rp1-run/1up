@@ -100,9 +100,6 @@ pub fn project_db_path(project_root: &std::path::Path) -> PathBuf {
 /// directory and atomically renamed over `index.db` once finalized, so the live
 /// index is never torn down in place. A fresh uuid per call keeps a staging file
 /// left behind by a previously-aborted rebuild from colliding with a new one.
-// Consumed by the rebuild owners (T4/T5) to site the staged build, and by the
-// swap primitive's tests; reserved ahead of those callers per the build-aside DAG.
-#[allow(dead_code)]
 pub fn project_staging_db_path(state_root: &std::path::Path) -> PathBuf {
     project_dot_dir(state_root).join(format!("index.db.rebuild-{}", uuid::Uuid::new_v4()))
 }

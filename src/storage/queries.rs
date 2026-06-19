@@ -155,6 +155,11 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
+// Retained as a test-only schema-reset utility (e.g. exercising
+// `ensure_current`'s rejection of a deliberately broken schema). The
+// non-destructive rebuild builds a fresh staging index and atomically switches it
+// over the served index, so production code never drops the live search schema.
+#[cfg(test)]
 pub const DROP_SEARCH_SCHEMA: &str = "
 DROP TRIGGER IF EXISTS segments_ai;
 DROP TRIGGER IF EXISTS segments_ad;

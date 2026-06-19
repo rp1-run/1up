@@ -27,8 +27,8 @@ use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
-    IndexProgress, IndexState, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
-    StructuralSearchReport, SymbolResult, WorktreeContext,
+    IndexProgress, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult, SegmentRole,
+    SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
@@ -38,6 +38,7 @@ use crate::storage::segments::{
     get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
     StoredSegment,
 };
+use crate::storage::swap;
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
@@ -1018,7 +1019,6 @@ async fn run_index(
         project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
-    let db_path = config::project_db_path(&roots.state_root);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         None,
@@ -1027,9 +1027,11 @@ async fn run_index(
     )?;
     let mut setup = SetupTimings::new(Instant::now());
 
-    // Single-writer rebuild lock: hold it across schema rebuild/prepare + the
-    // pipeline write so a concurrent daemon/CLI rebuild of the shared index
-    // cannot race this one. Released when this function returns (RAII).
+    // Single-writer rebuild lock: hold it across the staged build + atomic
+    // switch-over (rebuild) or the prepare + pipeline write (incremental) so a
+    // concurrent daemon/CLI rebuild of the shared index cannot race this one, and
+    // so the switch-over runs under the lock. Released when this function returns
+    // (RAII).
     //
     // `acquire_rebuild_lock` is a blocking, bounded-wait retry (std::thread::sleep
     // on contention). On this async MCP path it would block a tokio worker for up
@@ -1041,15 +1043,40 @@ async fn run_index(
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
     let db_start = Instant::now();
-    let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect_tuned().await?;
     if rebuild {
-        schema::rebuild(&conn).await?;
+        // Build the refreshed index aside into a staging file and atomically switch
+        // it over the served `index.db`, so search keeps serving the prior index
+        // (stale-but-available) throughout and is never torn down in place. A
+        // failure before the switch drops the guard, leaving the prior index intact.
+        let staged = swap::StagingRebuild::open(&roots.state_root).await?;
+        setup.db_prepare_ms = db_start.elapsed().as_millis();
+        let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
+        staged.finalize_and_swap().await?;
+        Ok(stats)
     } else {
+        // Incremental write against the live index — unchanged: no rebuild, so no
+        // build-aside switch-over is involved.
+        let db = Db::open_rw(&config::project_db_path(&roots.state_root)).await?;
+        let conn = db.connect_tuned().await?;
         schema::prepare_for_write(&conn).await?;
+        setup.db_prepare_ms = db_start.elapsed().as_millis();
+        run_index_pipeline(&conn, roots, &indexing_config, setup).await
     }
-    setup.db_prepare_ms = db_start.elapsed().as_millis();
+}
 
+/// Load the embedding model and run the indexing pipeline against `conn`.
+///
+/// Shared by the build-aside rebuild branch (writing into a staging connection)
+/// and the incremental branch (writing into the live index): both load the model,
+/// stamp the model-prepare timing onto `setup`, and run a one-shot full pass under
+/// a fresh, never-cancelled token (this MCP path is not subject to the daemon's
+/// SIGTERM drain).
+async fn run_index_pipeline(
+    conn: &Connection,
+    roots: &McpProjectRoots,
+    indexing_config: &IndexingConfig,
+    mut setup: SetupTimings,
+) -> anyhow::Result<pipeline::PipelineStats> {
     let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     runtime
@@ -1057,14 +1084,12 @@ async fn run_index(
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
-    // One-shot MCP rebuild: not subject to the daemon's SIGTERM drain, so it
-    // runs under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
-        &conn,
+        conn,
         &roots.worktree_context,
         runtime.current_embedder(),
         &RunScope::Full,
-        &indexing_config,
+        indexing_config,
         None,
         false,
         Some(setup),
