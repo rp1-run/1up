@@ -56,6 +56,14 @@ fi
 VERSION_PIN=$(read_env 1UP_VERSION)
 INSTALL_DIR_OVERRIDE=$(read_env 1UP_INSTALL_DIR)
 
+# The SHA256SUMS fetch is classified into published / unpublished / transient.
+# A transient transport failure (connect/timeout/DNS/TLS) or a 5xx is retried
+# up to this many times before the install fails closed. This is what keeps a
+# network blip from being misread as "checksum genuinely unpublished" and
+# silently skipping the mandatory integrity check.
+SUMS_FETCH_ATTEMPTS=3
+SUMS_FETCH_RETRY_DELAY=1
+
 # Populated by stages below.
 HASH_CMD=""
 TARGET=""
@@ -63,7 +71,9 @@ TAG=""
 TMP=""
 ARCHIVE=""
 PACKAGE_DIR_NAME=""
-HAVE_SUMS=0
+# Tri-state checksum signal: "published" (must verify), "unpublished" (warn and
+# continue), or "transient" (retry, then fail). Empty until classified.
+SUMS_STATE=""
 INSTALL_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -195,10 +205,54 @@ download_artifacts() {
         fail "release asset not found: $ARCHIVE for tag $TAG (from $archive_url)."
     fi
 
-    HAVE_SUMS=0
-    if curl -fsSL "$sums_url" -o "$TMP/SHA256SUMS" 2>/dev/null; then
-        HAVE_SUMS=1
+    # Classify the SHA256SUMS fetch into published / unpublished / transient,
+    # retrying only while the result is transient. A transient transport failure
+    # or 5xx must never be mistaken for "genuinely unpublished" -- that would
+    # silently skip the now-mandatory checksum. verify_checksum enforces the
+    # policy; this loop only resolves the signal.
+    local attempt
+    attempt=1
+    while :; do
+        SUMS_STATE=$(classify_sums_fetch "$sums_url")
+        if [ "$SUMS_STATE" != "transient" ]; then
+            break
+        fi
+        if [ "$attempt" -ge "$SUMS_FETCH_ATTEMPTS" ]; then
+            break
+        fi
+        warn "warning: could not fetch SHA256SUMS for $TAG (attempt $attempt/$SUMS_FETCH_ATTEMPTS); retrying in ${SUMS_FETCH_RETRY_DELAY}s..."
+        attempt=$((attempt + 1))
+        sleep "$SUMS_FETCH_RETRY_DELAY"
+    done
+}
+
+# Fetch SHA256SUMS once and classify the outcome. Writes the sums body to
+# $TMP/SHA256SUMS on HTTP 200, and echoes exactly one of:
+#   published   -- HTTP 200; the checksum exists and verification is mandatory
+#   unpublished -- HTTP 404; the project ships no checksum for this tag
+#   transient   -- connect/timeout/DNS/TLS failure or a non-200/404 status
+#                  (e.g. 5xx, 403); the signal is unreliable, do not downgrade
+#
+# Deliberately omits curl's -f: with -f every HTTP >= 400 collapses to exit 22,
+# which cannot tell a definitive 404 from a flaky 5xx. Reading %{http_code}
+# instead lets a real 404 mean "unpublished" while a 5xx stays "transient".
+classify_sums_fetch() {
+    local url http_code curl_exit
+    url="$1"
+    curl_exit=0
+    http_code=$(curl -sSL -o "$TMP/SHA256SUMS" -w '%{http_code}' "$url" 2>/dev/null) || curl_exit=$?
+
+    if [ "$curl_exit" -ne 0 ]; then
+        # No usable HTTP response (curl prints 000 for %{http_code} here).
+        printf '%s\n' "transient"
+        return
     fi
+
+    case "$http_code" in
+        200) printf '%s\n' "published" ;;
+        404) printf '%s\n' "unpublished" ;;
+        *)   printf '%s\n' "transient" ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -206,10 +260,26 @@ download_artifacts() {
 # ---------------------------------------------------------------------------
 
 verify_checksum() {
-    if [ "$HAVE_SUMS" -eq 0 ]; then
-        warn "warning: SHA256SUMS not published for $TAG; integrity not verified."
-        return
-    fi
+    case "$SUMS_STATE" in
+        unpublished)
+            # Genuinely no checksum for this tag: preserve warn-and-continue so
+            # releases that legitimately ship without SHA256SUMS still install.
+            warn "warning: SHA256SUMS not published for $TAG; integrity not verified."
+            return
+            ;;
+        transient)
+            # The checksum may exist but we could not obtain it. Fail closed
+            # rather than installing unverified bytes; do NOT downgrade to the
+            # unpublished warn-and-continue path.
+            fail "could not obtain SHA256SUMS for $TAG after $SUMS_FETCH_ATTEMPTS attempts; refusing to install without integrity verification. Check connectivity and retry, or pin a known-good release with 1UP_VERSION."
+            ;;
+        published)
+            : # checksum is published; verification below is mandatory.
+            ;;
+        *)
+            fail "internal error: unclassified checksum state '$SUMS_STATE'."
+            ;;
+    esac
 
     local expected actual sums_line
     expected=""

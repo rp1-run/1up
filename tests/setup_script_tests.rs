@@ -349,6 +349,57 @@ exec "$REAL_CURL" "${{args[@]}}"
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Like `install_curl_wrapper`, but any request for the `SHA256SUMS` asset
+/// simulates a transport failure (curl exit 7, "couldn't connect"), mirroring
+/// a network blip on the checksum fetch while the archive and API requests
+/// still succeed against the fixture. Lets a test assert the installer treats
+/// a transient sums-fetch failure as fatal (retry-then-fail) instead of
+/// silently downgrading to the warn-and-continue "unpublished" path.
+fn install_curl_wrapper_transient_sums(dir: &Path, base: &str) {
+    let wrapper_path = dir.join("curl");
+    let real_curl = which("curl");
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -eu
+REAL_CURL='{real_curl}'
+BASE='{base}'
+# Fail only the checksum fetch; let the archive and API requests through so the
+# script reaches the checksum stage with a real archive already downloaded.
+for a in "$@"; do
+    case "$a" in
+        *SHA256SUMS)
+            # Mirror real curl: %{{http_code}} prints 000 on a connect failure,
+            # and curl exits non-zero (7 == couldn't connect).
+            echo 000
+            exit 7
+            ;;
+    esac
+done
+args=()
+for a in "$@"; do
+    case "$a" in
+        https://github.com/*/releases/download/*)
+            tail=${{a#https://github.com/}}
+            args+=("$BASE/repos/$tail")
+            ;;
+        https://api.github.com/*)
+            tail=${{a#https://api.github.com/}}
+            args+=("$BASE/api/$tail")
+            ;;
+        *)
+            args+=("$a")
+            ;;
+    esac
+done
+exec "$REAL_CURL" "${{args[@]}}"
+"#,
+        real_curl = real_curl.display(),
+        base = base,
+    );
+    fs::write(&wrapper_path, body).unwrap();
+    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Write a uname wrapper that impersonates a requested platform so we can
 /// exercise the unsupported-platform exit code without spoofing the host.
 fn install_uname_wrapper(dir: &Path, s_value: &str, m_value: &str) {
@@ -682,6 +733,99 @@ fn setup_warns_and_installs_without_sha256sums() {
     assert!(
         host_home.path().join(".1up/bin/1up").is_file(),
         "binary must still be installed"
+    );
+}
+
+#[test]
+fn setup_treats_transient_sums_fetch_as_fatal() {
+    // A published-checksum release must not be silently downgraded by a network
+    // blip on the SHA256SUMS fetch. When the checksum fetch fails transiently
+    // (connect error, not a definitive 404), the installer must retry and then
+    // FAIL closed -- it must NOT enter the warn-and-continue "unpublished" path,
+    // and the binary must not be installed.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    // The archive IS published; only the SHA256SUMS fetch is forced to fail at
+    // the transport layer by the wrapper.
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper_transient_sums(wrapper_dir.path(), &server.url());
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        !output.status.success(),
+        "setup.sh must fail when the checksum fetch is transiently unreachable: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not obtain SHA256SUMS"),
+        "stderr should name the transient checksum-fetch failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not published"),
+        "a transient failure must NOT be reported as genuinely unpublished: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".1up/bin/1up").exists(),
+        "binary must not be installed when the checksum cannot be obtained"
+    );
+}
+
+#[test]
+fn setup_fails_when_sums_published_but_entry_missing() {
+    // A SHA256SUMS that is published (HTTP 200) but carries no entry for the
+    // requested archive must be fatal -- the published checksum is mandatory, so
+    // a missing entry cannot fall through to warn-and-continue. Guards the
+    // published-path policy across the tri-state refactor.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    // Build a fixture WITHOUT an auto-generated SHA256SUMS, then publish one
+    // that only lists an unrelated archive so our archive's entry is absent.
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), false);
+    let releases_dir = fixture
+        .serve_root
+        .join("repos")
+        .join(FIXTURE_REPO)
+        .join("releases")
+        .join("download")
+        .join(FIXTURE_TAG);
+    fs::write(
+        releases_dir.join("SHA256SUMS"),
+        "0000000000000000000000000000000000000000000000000000000000000000  some-other-archive.tar.gz\n",
+    )
+    .unwrap();
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/bash",
+    });
+    assert!(
+        !output.status.success(),
+        "setup.sh must fail when SHA256SUMS is published but lacks our archive entry: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("entry missing"),
+        "stderr should name the missing checksum entry: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".1up/bin/1up").exists(),
+        "binary must not be installed when the published checksum has no matching entry"
     );
 }
 
