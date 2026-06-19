@@ -191,6 +191,17 @@ DROP TABLE IF EXISTS meta";
 #[allow(dead_code)]
 pub const WAL_CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
+/// Fold as many write-ahead-log frames as possible into the main database file
+/// *without waiting on concurrent readers* (unlike `TRUNCATE`, which blocks until
+/// every reader releases the WAL). Returns one row `(busy, log, checkpointed)`; a
+/// non-zero `busy` simply means a reader held part of the WAL and is not an error.
+/// Used by [`crate::storage::swap`] to retire the prior index's WAL via the
+/// open-then-immediately-close idiom before the atomic switch-over, where a live
+/// CLI/MCP reader may hold the index and a blocking checkpoint would stall or fail
+/// the swap.
+#[allow(dead_code)]
+pub const WAL_CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE)";
+
 pub const SELECT_SCHEMA_OBJECT: &str =
     "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1";
 

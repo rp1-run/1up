@@ -211,6 +211,50 @@ pub fn atomic_replace_within_project_root(
     Ok(validated_path)
 }
 
+/// Atomically renames an existing finalized file `source` over `dest`, where both
+/// paths resolve inside `approved_root`.
+///
+/// The index swap uses this to switch a finalized staging database over the
+/// served `index.db` in a single `rename(2)` so any reader observes either the
+/// full prior file or the full new file, never a partial or absent one. Both
+/// paths are clamped to `approved_root` and a symlink leaf at either end is
+/// rejected before the rename (mirroring [`atomic_replace`]'s validation); the
+/// `source` must be an existing regular file. After the rename the destination's
+/// parent directory is fsync'd so the switched directory entry is durable.
+///
+/// Unlike [`atomic_replace`], the source is an already-built file rather than
+/// in-memory bytes, and the existing file mode is preserved (the rename carries
+/// the source's mode), so this imposes no state-file mode of its own.
+pub fn atomic_rename_file_within_root(
+    source: &Path,
+    dest: &Path,
+    approved_root: &Path,
+) -> Result<PathBuf, OneupError> {
+    let validated_source = validate_regular_file_path(source, approved_root)?;
+    let source_metadata =
+        fs::symlink_metadata(&validated_source).map_err(|err| io_error(&validated_source, err))?;
+    if !source_metadata.file_type().is_file() {
+        return Err(unexpected_type(
+            &validated_source,
+            "regular file",
+            &source_metadata.file_type(),
+        ));
+    }
+
+    let validated_dest = validate_regular_file_path(dest, approved_root)?;
+    let parent = validated_dest.parent().ok_or_else(|| {
+        FilesystemError::InvalidPath(format!(
+            "path must have a parent directory: {}",
+            validated_dest.display()
+        ))
+    })?;
+
+    fs::rename(&validated_source, &validated_dest).map_err(|err| io_error(&validated_dest, err))?;
+    sync_directory(parent)?;
+
+    Ok(validated_dest)
+}
+
 pub fn remove_regular_file(path: &Path, approved_root: &Path) -> Result<bool, OneupError> {
     remove_expected_leaf(path, approved_root, ExpectedLeaf::RegularFile)
 }
@@ -828,6 +872,72 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode_bits(&written), 0o640);
         assert_no_temp_files(&project_root);
+    }
+
+    #[test]
+    fn atomic_rename_file_within_root_replaces_dest_and_preserves_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ensure_secure_dir(
+            &canonical_tmp_root(tmp.path()).join("secure"),
+            PROJECT_STATE_DIR_MODE,
+        )
+        .unwrap();
+        let source = root.join("index.db.rebuild-1234");
+        let dest = root.join("index.db");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&dest, b"old").unwrap();
+        #[cfg(unix)]
+        set_path_mode(&source, 0o640).unwrap();
+
+        let renamed = atomic_rename_file_within_root(&source, &dest, &root).unwrap();
+
+        assert_eq!(renamed, dest);
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        // The source name is consumed by the rename.
+        assert!(!source.exists());
+        // The destination carries the source's mode (no state-file mode imposed).
+        #[cfg(unix)]
+        assert_eq!(mode_bits(&dest), 0o640);
+    }
+
+    #[test]
+    fn atomic_rename_file_within_root_rejects_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ensure_secure_dir(
+            &canonical_tmp_root(tmp.path()).join("secure"),
+            PROJECT_STATE_DIR_MODE,
+        )
+        .unwrap();
+        let dest = root.join("index.db");
+        fs::write(&dest, b"old").unwrap();
+
+        let err =
+            atomic_rename_file_within_root(&root.join("absent.rebuild"), &dest, &root).unwrap_err();
+
+        assert!(err.to_string().to_lowercase().contains("no such file"));
+        // A missing source leaves the destination byte-for-byte intact.
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_rename_file_within_root_rejects_symlink_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = canonical_tmp_root(tmp.path());
+        let root = ensure_secure_dir(&tmp_root.join("secure"), PROJECT_STATE_DIR_MODE).unwrap();
+        let source = root.join("index.db.rebuild-9999");
+        fs::write(&source, b"new").unwrap();
+        let real_target = tmp_root.join("outside.db");
+        fs::write(&real_target, b"outside").unwrap();
+        symlink(&real_target, root.join("index.db")).unwrap();
+
+        let err =
+            atomic_rename_file_within_root(&source, &root.join("index.db"), &root).unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        // The symlink target outside the root is never written through.
+        assert_eq!(fs::read(&real_target).unwrap(), b"outside");
+        assert!(source.exists());
     }
 
     #[test]

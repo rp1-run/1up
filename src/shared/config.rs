@@ -93,6 +93,20 @@ pub fn project_db_path(project_root: &std::path::Path) -> PathBuf {
     project_dot_dir(project_root).join("index.db")
 }
 
+/// Returns a fresh uuid-suffixed staging path for a non-destructive index
+/// rebuild, e.g. `<project>/.1up/index.db.rebuild-<uuid>`.
+///
+/// The refreshed index is built into this sibling file under the same `.1up/`
+/// directory and atomically renamed over `index.db` once finalized, so the live
+/// index is never torn down in place. A fresh uuid per call keeps a staging file
+/// left behind by a previously-aborted rebuild from colliding with a new one.
+// Consumed by the rebuild owners (T4/T5) to site the staged build, and by the
+// swap primitive's tests; reserved ahead of those callers per the build-aside DAG.
+#[allow(dead_code)]
+pub fn project_staging_db_path(state_root: &std::path::Path) -> PathBuf {
+    project_dot_dir(state_root).join(format!("index.db.rebuild-{}", uuid::Uuid::new_v4()))
+}
+
 /// Returns the path to the project-local daemon status file.
 pub fn project_daemon_status_path(project_root: &std::path::Path) -> PathBuf {
     project_dot_dir(project_root).join("daemon_status.json")
