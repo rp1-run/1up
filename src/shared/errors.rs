@@ -239,6 +239,11 @@ pub enum UpdateError {
         "refusing update: update manifest expired at {expiry} (now {now}); the update feed may be stale or frozen — retry once a current manifest is published"
     )]
     ManifestExpired { expiry: String, now: String },
+
+    #[error(
+        "refusing update: release attestation verification failed ({detail}); the downloaded artifact is not attributable to the project's release workflow and was not installed"
+    )]
+    AttestationFailed { detail: String },
 }
 
 impl UpdateError {
