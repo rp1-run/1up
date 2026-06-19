@@ -155,6 +155,11 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 )";
 
+// Retained as a test-only schema-reset utility (e.g. exercising
+// `ensure_current`'s rejection of a deliberately broken schema). The
+// non-destructive rebuild builds a fresh staging index and atomically switches it
+// over the served index, so production code never drops the live search schema.
+#[cfg(test)]
 pub const DROP_SEARCH_SCHEMA: &str = "
 DROP TRIGGER IF EXISTS segments_ai;
 DROP TRIGGER IF EXISTS segments_ad;
@@ -180,6 +185,27 @@ DROP TABLE IF EXISTS segments;
 DROP TABLE IF EXISTS indexed_files;
 DROP TABLE IF EXISTS worktree_contexts;
 DROP TABLE IF EXISTS meta";
+
+/// Fold every write-ahead-log frame into the main database file and truncate the
+/// WAL to zero bytes. Returns one row `(busy, log, checkpointed)`: a non-zero
+/// `busy` means a concurrent reader/writer blocked the checkpoint and the WAL was
+/// *not* truncated, so the database is not yet self-contained. Used by
+/// [`crate::storage::swap::finalize_staged_db`] to turn a freshly-built staging
+/// database into a single self-contained file before it is renamed over the
+/// served index.
+#[allow(dead_code)]
+pub const WAL_CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+
+/// Fold as many write-ahead-log frames as possible into the main database file
+/// *without waiting on concurrent readers* (unlike `TRUNCATE`, which blocks until
+/// every reader releases the WAL). Returns one row `(busy, log, checkpointed)`; a
+/// non-zero `busy` simply means a reader held part of the WAL and is not an error.
+/// Used by [`crate::storage::swap`] to retire the prior index's WAL via the
+/// open-then-immediately-close idiom before the atomic switch-over, where a live
+/// CLI/MCP reader may hold the index and a blocking checkpoint would stall or fail
+/// the swap.
+#[allow(dead_code)]
+pub const WAL_CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE)";
 
 pub const SELECT_SCHEMA_OBJECT: &str =
     "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1";

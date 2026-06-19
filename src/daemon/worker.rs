@@ -20,15 +20,15 @@ use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE, VERSION, WATCHER_DEBOUNCE_MS,
+    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
 use crate::shared::project::canonical_project_root;
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
-    DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus, DaemonRefreshState,
-    DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
+    combine_degraded_reasons, DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus,
+    DaemonRefreshState, DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
 };
 use crate::storage::{db::Db, schema};
 
@@ -77,6 +77,13 @@ struct ProjectState {
     source_root: PathBuf,
     context: WorktreeContext,
     db: Db,
+    /// Identity (device, inode) of the `index.db` file backing `db` at the time
+    /// `db` was opened. A one-shot rebuild swaps the index via an atomic rename
+    /// onto a fresh inode (T2), so a mismatch between this and the current
+    /// on-disk identity means the daemon's long-lived handle now points at the
+    /// orphaned pre-swap inode and must be reopened before any pass touches it
+    /// (HYP-002). `None` when the index was absent when `db` was opened.
+    index_identity: Option<IndexFileIdentity>,
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
@@ -87,6 +94,15 @@ struct ProjectState {
     last_refresh_error: Option<String>,
     last_file_check_persisted_at: Option<DateTime<Utc>>,
 }
+
+/// On-disk identity of an `index.db` file, used to detect a build-aside swap
+/// performed by another process (the one-shot rebuild owners — T4). On Unix the
+/// atomic rename that switches the index over (T2) replaces the directory entry
+/// with a different inode, so `(device, inode)` changes exactly when the file the
+/// daemon's open handle refers to has been orphaned. `worker.rs` is compiled only
+/// on Unix (`mod.rs` routes non-Unix to `worker_stub.rs`), so the Unix-specific
+/// `MetadataExt` is always available here.
+type IndexFileIdentity = (u64, u64);
 
 struct QueuedSearchRequest {
     request: SearchRequest,
@@ -550,12 +566,17 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         );
         return Ok(None);
     }
+    // Record the inode the handle now refers to so a later build-aside swap (a
+    // one-shot rebuild atomically renaming a fresh index over `index.db`) is
+    // detectable and the handle gets reopened before it writes (HYP-002).
+    let index_identity = index_file_identity(&db_path);
 
     Ok(Some(ProjectState {
         project_root: entry.project_root.clone(),
         source_root,
         context: context_from_entry(entry),
         db,
+        index_identity,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
@@ -566,6 +587,68 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         last_refresh_error: None,
         last_file_check_persisted_at: None,
     }))
+}
+
+/// On-disk `(device, inode)` identity of an `index.db` file, or `None` when the
+/// file is absent or cannot be stat'd. Two opens of the same path yield the same
+/// identity until an atomic rename swaps a different file over it, which is
+/// exactly how the build-aside switch-over (T2) installs a refreshed index.
+fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(index_path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Reopen the daemon's long-lived `ProjectState.db` if a build-aside rebuild has
+/// swapped `index.db` onto a fresh inode since the handle was opened.
+///
+/// The daemon is the sole cross-process holder of a long-lived RW handle to
+/// `index.db`. A one-shot rebuild (CLI `reindex` / MCP `run_index` — T4) builds a
+/// refreshed index aside and atomically renames it over `index.db` (T2), which
+/// orphans the inode the daemon's handle still refers to. Continuing to use that
+/// stale handle is a data-divergence hazard, not merely a stale read: a write
+/// through it lands in the now-unlinked old inode and is silently lost (HYP-002).
+///
+/// This compares the recorded open-time identity against the current on-disk
+/// identity. On a match (the common case — no swap) it is a cheap no-op that
+/// keeps the warm handle. On a mismatch it closes the stale handle, reopens
+/// `index.db` (picking up the new inode), and re-validates the schema via
+/// `prepare_for_write` before the caller proceeds — so no refresh pass or search
+/// ever runs against a pre-swap handle. Because the switch-over is a single
+/// atomic rename, the file is always a complete index; reopening therefore lands
+/// on a fully-built, finalized generation, never a partial one.
+///
+/// Closing and reopening rather than holding the handle open across the rename is
+/// also what keeps the swap unblocked on Windows, where a rename cannot replace a
+/// file that another handle holds open (`ERROR_SHARING_VIOLATION`): the daemon
+/// never keeps the orphaned handle once it observes the swap.
+async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupError> {
+    let db_path = config::project_db_path(&state.project_root);
+    let current_identity = index_file_identity(&db_path);
+
+    // No swap: identities match (or the index is still absent on both sides).
+    // Keep the warm handle untouched so steady-state passes never thrash it.
+    if current_identity == state.index_identity {
+        return Ok(());
+    }
+
+    info!(
+        "index for {} was swapped underneath the daemon; reopening handle to adopt the refreshed index",
+        state.project_root.display()
+    );
+
+    let db = Db::open_rw(&db_path).await?;
+    let conn = db.connect_tuned().await?;
+    // Re-validate the freshly-renamed index before adopting it, so a swap that
+    // produced an unreadable/incompatible index fails loud here instead of
+    // surfacing later as a confusing write/search failure.
+    schema::prepare_for_write(&conn).await?;
+    drop(conn);
+
+    state.db = db;
+    state.index_identity = current_identity;
+    Ok(())
 }
 
 fn context_from_entry(entry: &ProjectEntry) -> WorktreeContext {
@@ -1108,6 +1191,27 @@ async fn run_project(
         Err(e) => return Err(e),
     };
 
+    // Holding the rebuild lock means any one-shot rebuild has finished and
+    // released it, so its atomic switch-over is complete. If that rebuild swapped
+    // the index onto a fresh inode, the daemon's long-lived handle now points at
+    // the orphaned pre-swap inode; reopen it here — before `start_run` consumes
+    // the pending scope and before any write — so this pass writes into the
+    // refreshed index, never the lost old one (HYP-002). Doing this before
+    // `start_run` keeps the project dirty for a clean retry if the reopen fails.
+    {
+        let state = projects
+            .get_mut(context_id)
+            .expect("dirty project must exist while running");
+        if let Err(e) = reopen_if_index_swapped(state).await {
+            warn!(
+                "failed to reopen swapped index for {} before re-index: {e}",
+                state.project_root.display()
+            );
+            mark_refresh_finished(state, Utc::now(), Err(&e));
+            return Err(e);
+        }
+    }
+
     let mut setup = SetupTimings::new(std::time::Instant::now());
     let (project_root, source_root, context, scope, daemon_fallback_reason, conn_setup) = {
         let state = projects
@@ -1253,7 +1357,28 @@ async fn handle_search_request(
         );
         return search_service::unavailable_response();
     }
+
+    // Adopt a freshly-swapped index before serving: if a one-shot rebuild
+    // atomically switched `index.db` onto a new inode (T2), reopen the handle so
+    // this search is served by the refreshed index automatically, with no manual
+    // step (REQ-002 AC3). The switch-over is atomic, so the handle always lands
+    // on a complete index — never a partial one. A reopen failure falls back to
+    // the standard unavailable response (the CLI then searches locally) rather
+    // than serving through the orphaned pre-swap handle.
+    if let Err(err) = reopen_if_index_swapped(state).await {
+        warn!(
+            "failed to reopen swapped index for {} before daemon search: {err}",
+            state.project_root.display()
+        );
+        return search_service::unavailable_response();
+    }
+
     let search_scope = SearchScope::from_worktree_context(&state.context);
+    // Stale-but-available: the daemon detects a rebuild/refresh from its own
+    // in-memory refresh state (not the MCP out-of-process detector, so the
+    // daemon keeps no dependency on the MCP layer). When a pass is in flight
+    // the served results are flagged possibly-stale via `degraded_reason`.
+    let rebuild_in_progress = state.last_refresh_state.is_in_flight();
 
     let indexing_config = match config::resolve_indexing_config(None, None, state.indexing.as_ref())
     {
@@ -1328,6 +1453,14 @@ async fn handle_search_request(
         engine.fts_only_search(&request.query, request.limit).await
     };
 
+    // Fold the stale-rebuild notice in through the shared combiner so it
+    // coexists with any embeddings-degraded reason (joined by "; ", neither
+    // dropped) and rides only in `degraded_reason`.
+    let degraded_reason = combine_degraded_reasons(
+        rebuild_in_progress.then(|| STALE_REBUILD_REASON.to_string()),
+        degraded_reason,
+    );
+
     match results {
         Ok(results) => SearchResponse::Results {
             results,
@@ -1391,6 +1524,7 @@ mod tests {
             source_root: source_root.to_path_buf(),
             context: test_context(project_root, source_root),
             db,
+            index_identity: index_file_identity(&config::project_db_path(project_root)),
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),
             run_state,
@@ -1990,6 +2124,162 @@ mod tests {
         assert_eq!(
             entry.last_refresh_error.as_deref(),
             Some("daemon error: watcher error: boom")
+        );
+    }
+
+    use crate::storage::{queries, swap};
+
+    /// Open a file-backed `ProjectState` whose `index.db` holds `segment_ids`,
+    /// recording the inode identity exactly as the daemon does on startup. The
+    /// project root is canonicalized so the secure-fs path checks and the `flock`
+    /// probe in the swap primitive take their real paths on macOS (`/var` ->
+    /// `/private/var`).
+    async fn file_backed_state(tmp: &tempfile::TempDir, segment_ids: &[&str]) -> ProjectState {
+        let root = tmp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = config::project_db_path(&root);
+        ensure_secure_project_root(&root).unwrap();
+
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+        for id in segment_ids {
+            insert_test_segment(&conn, id).await;
+        }
+        drop(conn);
+
+        project_state(&root, &root, db, ProjectRunState::default())
+    }
+
+    /// Insert a minimal segment row (mirrors the storage/swap test fixture's
+    /// NOT-NULL columns) so a generation can be distinguished by its row set.
+    async fn insert_test_segment(conn: &libsql::Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO segments (id, file_path, language, block_type, content, line_start, line_end, complexity, file_hash) \
+             VALUES (?1, 'f.rs', 'rust', 'function', 'fn f(){}', 1, 1, 0, 'abc')",
+            [id],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Count segments through a connection from `db` (what a daemon pass/search
+    /// would observe through its long-lived handle).
+    async fn segment_count_via(db: &Db) -> i64 {
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query(queries::COUNT_SEGMENTS, ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    /// Count segments via an independent fresh read-only open of `index.db` —
+    /// i.e. what survives on the *current* inode, independent of any stale handle.
+    async fn segment_count_on_disk(index_path: &Path) -> i64 {
+        let ro = Db::open_ro(index_path).await.unwrap();
+        let conn = ro.connect().unwrap();
+        let mut rows = conn.query(queries::COUNT_SEGMENTS, ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    /// Build a finalized, self-contained staged index holding `segment_ids` at
+    /// `state_root`'s uuid staging path, ready for `swap::swap_index_into_place`.
+    /// The staged file is built in a scratch project (its name is not `index.db`,
+    /// which `Db::open_rw` requires) and its single self-contained file is moved
+    /// into the staging slot — the same approach the storage/swap tests use.
+    async fn staged_index(state_root: &Path, segment_ids: &[&str]) -> PathBuf {
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_root = scratch.path().canonicalize().unwrap().join("scratch");
+        std::fs::create_dir_all(&scratch_root).unwrap();
+        let scratch_index = config::project_db_path(&scratch_root);
+        ensure_secure_project_root(&scratch_root).unwrap();
+
+        let db = Db::open_rw(&scratch_index).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+        for id in segment_ids {
+            insert_test_segment(&conn, id).await;
+        }
+        drop(conn);
+        swap::finalize_staged_db(db, &scratch_index).await.unwrap();
+
+        let staging = config::project_staging_db_path(state_root);
+        std::fs::rename(&scratch_index, &staging).unwrap();
+        staging
+    }
+
+    /// HYP-002 regression: after a one-shot rebuild swaps the index onto a fresh
+    /// inode, the daemon's reopen gate must adopt the new inode so a subsequent
+    /// write lands in the refreshed index and is durable — never silently lost
+    /// into the orphaned pre-swap inode.
+    ///
+    /// The decisive assertion is the post-reopen WRITE: with a stale handle the
+    /// insert would land in the unlinked old inode and an independent open of
+    /// `index.db` would not see it. Through the reopened handle the row is visible
+    /// on disk, proving the daemon writes the live index after a swap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_adopts_swapped_index_so_writes_land_in_the_new_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Prior generation = 2 rows; the daemon holds an open handle to it.
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+        let root = state.project_root.clone();
+        let index_path = config::project_db_path(&root);
+        let pre_swap_identity = state.index_identity;
+        assert_eq!(segment_count_via(&state.db).await, 2);
+
+        // Simulate the one-shot rebuild: a new generation (3 rows) built aside and
+        // atomically switched over while holding the single-writer rebuild lock.
+        let staging = staged_index(&root, &["new1", "new2", "new3"]).await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        // The daemon adopts the swap: the recorded identity changes to the new
+        // inode and the handle now reads the new generation.
+        reopen_if_index_swapped(&mut state).await.unwrap();
+        assert_ne!(
+            state.index_identity, pre_swap_identity,
+            "reopen must record the new inode identity after a swap"
+        );
+        assert_eq!(
+            segment_count_via(&state.db).await,
+            3,
+            "the reopened handle must read the swapped-in (new) generation"
+        );
+
+        // Decisive HYP-002 guard: a write through the reopened handle is durable
+        // on the live inode. A stale handle would write into the orphaned old
+        // inode and this independent on-disk read would still see only 3 rows.
+        let conn = state.db.connect_tuned().await.unwrap();
+        insert_test_segment(&conn, "daemon_write").await;
+        drop(conn);
+        assert_eq!(
+            segment_count_on_disk(&index_path).await,
+            4,
+            "a post-reopen daemon write must land in the live index, not the orphaned inode"
+        );
+    }
+
+    /// Without a swap the reopen gate is a cheap no-op that keeps the warm handle:
+    /// the recorded identity is unchanged and the handle is not reopened (a needless
+    /// reopen every pass would thrash the connection and drop the warm cache).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_is_a_noop_when_the_index_was_not_swapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["only1"]).await;
+        let identity_before = state.index_identity;
+
+        reopen_if_index_swapped(&mut state).await.unwrap();
+
+        assert_eq!(
+            state.index_identity, identity_before,
+            "an unswapped index must leave the recorded identity untouched"
+        );
+        assert_eq!(
+            segment_count_via(&state.db).await,
+            1,
+            "the warm handle must keep serving the unchanged index"
         );
     }
 }

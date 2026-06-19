@@ -21,13 +21,14 @@ use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, Sym
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
+    STALE_REBUILD_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
-    ContextAccessScope, ContextResult, DaemonProjectStatus, DaemonRefreshState, IndexProgress,
-    IndexState, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
-    StructuralSearchReport, SymbolResult, WorktreeContext,
+    combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
+    IndexProgress, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult, SegmentRole,
+    SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
@@ -37,6 +38,7 @@ use crate::storage::segments::{
     get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
     StoredSegment,
 };
+use crate::storage::swap;
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
@@ -346,6 +348,40 @@ fn index_if_needed_applies(readiness: &ReadinessPayload) -> bool {
     ) || readiness.drifted == Some(true)
 }
 
+/// Reports whether an index rebuild/refresh is in progress for `context_id`,
+/// so a served search can be flagged stale-but-available
+/// ([`STALE_REBUILD_REASON`]).
+///
+/// Derived only from signals that already exist (no new status file or field):
+/// - the daemon's `daemon_context_status.json` `last_refresh_state` is
+///   `Pending`/`Running` (reusing the same reader and predicate as
+///   [`classify_readiness`]), and/or
+/// - the single-writer rebuild lock is currently held by another process — a
+///   one-shot `1up index`/`reindex` or MCP rebuild — detected by a
+///   non-blocking probe of [`lifecycle::try_acquire_rebuild_lock`].
+///
+/// The lock probe never retains the lock: any guard it acquires is dropped
+/// immediately, so it only observes whether some *other* holder exists. A
+/// probe error degrades to the refresh-state signal alone rather than failing
+/// the read path. This is the MCP/CLI (out-of-process) detector; the daemon's
+/// own search path detects from its in-memory refresh state instead, so the
+/// daemon does not depend on the MCP layer.
+pub(crate) fn rebuild_in_progress(state_root: &Path, context_id: &str) -> bool {
+    let refresh_active =
+        crate::cli::project_status_files::read_daemon_context_status(state_root, context_id)
+            .is_some_and(|status| status.last_refresh_state.is_in_flight());
+
+    refresh_active || rebuild_lock_held(state_root)
+}
+
+/// Non-blocking probe of the single-writer rebuild lock: `true` when another
+/// process currently holds it. Any guard acquired here is dropped immediately,
+/// so the probe never blocks a rebuild owner; a probe error reads as "not
+/// held" so a transient lock-file error cannot mask served results.
+fn rebuild_lock_held(state_root: &Path) -> bool {
+    matches!(lifecycle::try_acquire_rebuild_lock(state_root), Ok(None))
+}
+
 pub async fn classify_readiness(
     state_root: &Path,
     source_root: &Path,
@@ -360,12 +396,9 @@ pub async fn classify_readiness(
         state_root,
         &worktree_context.context_id,
     );
-    let daemon_refresh_active = daemon_context_status.as_ref().is_some_and(|status| {
-        matches!(
-            status.last_refresh_state,
-            DaemonRefreshState::Pending | DaemonRefreshState::Running
-        )
-    });
+    let daemon_refresh_active = daemon_context_status
+        .as_ref()
+        .is_some_and(|status| status.last_refresh_state.is_in_flight());
     let daemon_status = daemon_context_status
         .as_ref()
         .and_then(|status| {
@@ -727,8 +760,17 @@ async fn run_search_once(
         (results, Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()))
     };
 
-    let degraded_reason =
-        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason());
+    // Stale-but-available: when a rebuild/refresh is in progress for this
+    // context, readers keep serving the prior index (build-aside, REQ-002), so
+    // flag the served results as possibly stale. The notice rides only in
+    // `degraded_reason` (no parallel field) and the render path keeps it off
+    // stdout (REQ-003).
+    let stale_reason = rebuild_in_progress(state_root, &worktree_context.context_id)
+        .then(|| STALE_REBUILD_REASON.to_string());
+    let degraded_reason = combine_degraded_reasons(
+        stale_reason,
+        combine_degraded_reasons(embedding_reason, search_scope.degraded_reason()),
+    );
 
     let status = match degraded_reason {
         Some(_) => OperationStatus::Degraded,
@@ -977,7 +1019,6 @@ async fn run_index(
         project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
-    let db_path = config::project_db_path(&roots.state_root);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
         None,
@@ -986,9 +1027,11 @@ async fn run_index(
     )?;
     let mut setup = SetupTimings::new(Instant::now());
 
-    // Single-writer rebuild lock: hold it across schema rebuild/prepare + the
-    // pipeline write so a concurrent daemon/CLI rebuild of the shared index
-    // cannot race this one. Released when this function returns (RAII).
+    // Single-writer rebuild lock: hold it across the staged build + atomic
+    // switch-over (rebuild) or the prepare + pipeline write (incremental) so a
+    // concurrent daemon/CLI rebuild of the shared index cannot race this one, and
+    // so the switch-over runs under the lock. Released when this function returns
+    // (RAII).
     //
     // `acquire_rebuild_lock` is a blocking, bounded-wait retry (std::thread::sleep
     // on contention). On this async MCP path it would block a tokio worker for up
@@ -1000,15 +1043,40 @@ async fn run_index(
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
     let db_start = Instant::now();
-    let db = Db::open_rw(&db_path).await?;
-    let conn = db.connect_tuned().await?;
     if rebuild {
-        schema::rebuild(&conn).await?;
+        // Build the refreshed index aside into a staging file and atomically switch
+        // it over the served `index.db`, so search keeps serving the prior index
+        // (stale-but-available) throughout and is never torn down in place. A
+        // failure before the switch drops the guard, leaving the prior index intact.
+        let staged = swap::StagingRebuild::open(&roots.state_root).await?;
+        setup.db_prepare_ms = db_start.elapsed().as_millis();
+        let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
+        staged.finalize_and_swap().await?;
+        Ok(stats)
     } else {
+        // Incremental write against the live index — unchanged: no rebuild, so no
+        // build-aside switch-over is involved.
+        let db = Db::open_rw(&config::project_db_path(&roots.state_root)).await?;
+        let conn = db.connect_tuned().await?;
         schema::prepare_for_write(&conn).await?;
+        setup.db_prepare_ms = db_start.elapsed().as_millis();
+        run_index_pipeline(&conn, roots, &indexing_config, setup).await
     }
-    setup.db_prepare_ms = db_start.elapsed().as_millis();
+}
 
+/// Load the embedding model and run the indexing pipeline against `conn`.
+///
+/// Shared by the build-aside rebuild branch (writing into a staging connection)
+/// and the incremental branch (writing into the live index): both load the model,
+/// stamp the model-prepare timing onto `setup`, and run a one-shot full pass under
+/// a fresh, never-cancelled token (this MCP path is not subject to the daemon's
+/// SIGTERM drain).
+async fn run_index_pipeline(
+    conn: &Connection,
+    roots: &McpProjectRoots,
+    indexing_config: &IndexingConfig,
+    mut setup: SetupTimings,
+) -> anyhow::Result<pipeline::PipelineStats> {
     let model_start = Instant::now();
     let mut runtime = EmbeddingRuntime::default();
     runtime
@@ -1016,14 +1084,12 @@ async fn run_index(
         .await;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
-    // One-shot MCP rebuild: not subject to the daemon's SIGTERM drain, so it
-    // runs under a fresh token that is never cancelled.
     pipeline::run_with_context_scope_setup_and_progress_root(
-        &conn,
+        conn,
         &roots.worktree_context,
         runtime.current_embedder(),
         &RunScope::Full,
-        &indexing_config,
+        indexing_config,
         None,
         false,
         Some(setup),
@@ -1448,14 +1514,6 @@ fn unavailable_reason_text(reason: &EmbeddingUnavailableReason) -> String {
     }
 }
 
-fn combine_degraded_reasons(left: Option<String>, right: Option<String>) -> Option<String> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(format!("{left}; {right}")),
-        (Some(reason), None) | (None, Some(reason)) => Some(reason),
-        (None, None) => None,
-    }
-}
-
 fn usize_from_i64(value: i64) -> usize {
     usize::try_from(value).unwrap_or_default()
 }
@@ -1485,7 +1543,9 @@ enum LocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::types::{BranchStatus, StructuralSearchStatus, WorktreeRole};
+    use crate::shared::types::{
+        BranchStatus, DaemonRefreshState, StructuralSearchStatus, WorktreeRole,
+    };
     use crate::storage::segments::{self, SegmentInsert};
     use std::fs;
 
@@ -1560,6 +1620,98 @@ mod tests {
 
         readiness.status = ReadinessStatus::Degraded;
         assert!(index_if_needed_applies(&readiness));
+    }
+
+    fn write_refresh_state(state_root: &Path, context_id: &str, state: DaemonRefreshState) {
+        use crate::shared::types::{
+            DaemonContextStatus, DaemonContextStatusFile, DaemonWatchStatus,
+        };
+        use std::collections::BTreeMap;
+
+        fs::create_dir_all(project_dot_dir(state_root)).unwrap();
+        let file = DaemonContextStatusFile {
+            contexts: BTreeMap::from([(
+                context_id.to_string(),
+                DaemonContextStatus {
+                    context_id: context_id.to_string(),
+                    source_root: Some(state_root.to_path_buf()),
+                    watch_status: DaemonWatchStatus::Watching,
+                    last_file_check_at: None,
+                    last_refresh_state: state,
+                    last_refresh_started_at: None,
+                    last_refresh_completed_at: None,
+                    last_refresh_error: None,
+                    branch_name: Some("main".to_string()),
+                    branch_status: BranchStatus::Named,
+                },
+            )]),
+        };
+        fs::write(
+            project_dot_dir(state_root).join("daemon_context_status.json"),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_rebuild_reason_states_rebuilding_and_stale() {
+        // The wording is the single source of truth folded into degraded_reason
+        // by T6; pin its substance so the user-facing notice cannot silently drift.
+        assert_eq!(
+            crate::shared::constants::STALE_REBUILD_REASON,
+            "index is rebuilding; results may be stale"
+        );
+    }
+
+    // Canonicalize: the secure-fs rebuild-lock root rejects symlinked path
+    // components (macOS `tempdir()` lives under the `/var -> /private/var`
+    // symlink), so the lock probe runs its genuine no-holder path on all
+    // platforms instead of error-degrading to "not held".
+    fn canonical_state_root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn rebuild_in_progress_false_when_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // No daemon status file and no rebuild lock held: not rebuilding.
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+
+        // A completed refresh is not in progress either.
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Complete);
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[test]
+    fn rebuild_in_progress_true_when_refresh_running_or_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Running);
+        assert!(rebuild_in_progress(&state_root, "ctx"));
+
+        write_refresh_state(&state_root, "ctx", DaemonRefreshState::Pending);
+        assert!(rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[test]
+    fn rebuild_in_progress_scoped_to_requested_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // A running refresh on a different context must not flag this one.
+        write_refresh_state(&state_root, "other", DaemonRefreshState::Running);
+        assert!(!rebuild_in_progress(&state_root, "ctx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_in_progress_true_when_rebuild_lock_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        // No refresh state recorded: the only signal is the held lock.
+        let _held = lifecycle::acquire_rebuild_lock(&state_root).unwrap();
+        assert!(rebuild_in_progress(&state_root, "ctx"));
     }
 
     #[test]

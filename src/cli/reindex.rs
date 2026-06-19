@@ -12,8 +12,7 @@ use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
     IndexPhase, IndexProgress, IndexState, OutputFormat, SetupTimings, WorktreeContext,
 };
-use crate::storage::db::Db;
-use crate::storage::schema;
+use crate::storage::swap::StagingRebuild;
 
 #[derive(Args)]
 pub struct ReindexArgs {
@@ -93,7 +92,6 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
     )?;
     let project_root = resolved.state_root;
     let worktree_context = resolved.worktree_context;
-    let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
@@ -104,7 +102,6 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
 
     if should_use_direct_watch_progress_ui(format) {
         let stats = run_reindex_once(
-            &db_path,
             &worktree_context,
             &project_root,
             &indexing_config,
@@ -131,7 +128,6 @@ async fn exec_watch(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<(
     send_watch_progress(&progress_tx, IndexPhase::Rebuilding, "Rebuilding database");
 
     let result = run_reindex_once(
-        &db_path,
         &worktree_context,
         &project_root,
         &indexing_config,
@@ -171,7 +167,6 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     )?;
     let project_root = resolved.state_root;
     let worktree_context = resolved.worktree_context;
-    let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
     let indexing_config = config::resolve_indexing_config(
@@ -181,7 +176,6 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     )?;
     let show_progress_ui = format == OutputFormat::Human;
     let stats = run_reindex_once(
-        &db_path,
         &worktree_context,
         &project_root,
         &indexing_config,
@@ -205,7 +199,6 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
 }
 
 async fn run_reindex_once(
-    db_path: &std::path::Path,
     context: &WorktreeContext,
     state_root: &std::path::Path,
     indexing_config: &crate::shared::types::IndexingConfig,
@@ -215,17 +208,21 @@ async fn run_reindex_once(
     let mut setup = SetupTimings::new(Instant::now());
     let mut setup_spinner = spin("Rebuilding database", show_progress_ui);
 
-    // Single-writer rebuild lock: ALWAYS held across the destructive schema
-    // rebuild + pipeline write so exactly one process owns the format change
-    // (REQ-003 single-writer guarantee). `state_root` is non-optional precisely
-    // so this lock can never be silently bypassed. Released when this function
-    // returns (RAII).
+    // Single-writer rebuild lock: ALWAYS held across the staged build + the atomic
+    // switch-over so exactly one process owns the rebuild (single-writer
+    // guarantee) and the switch runs under the lock (HYP-001/HYP-002). `state_root`
+    // is non-optional precisely so this lock can never be silently bypassed.
+    // Released when this function returns (RAII).
     let _rebuild_lock = crate::daemon::lifecycle::acquire_rebuild_lock(state_root)?;
 
+    // Build the refreshed index aside into a staging file rather than dropping the
+    // live index in place: the served `index.db` keeps answering (stale-but-
+    // available) throughout the rebuild and is replaced by a single atomic switch
+    // only once the refreshed index is complete and valid. If this function returns
+    // early (error/cancellation) before the switch, the guard drops and the prior
+    // index is left intact and served.
     let db_start = Instant::now();
-    let db = Db::open_rw(db_path).await?;
-    let conn = db.connect_tuned().await?;
-    schema::rebuild(&conn).await?;
+    let staged = StagingRebuild::open(state_root).await?;
     setup.db_prepare_ms = db_start.elapsed().as_millis();
     setup_spinner.success_with(format!("Rebuilt schema v{SCHEMA_VERSION}"));
 
@@ -263,8 +260,8 @@ async fn run_reindex_once(
 
     // One-shot CLI reindex: not subject to the daemon's SIGTERM drain, so it
     // runs under a fresh token that is never cancelled.
-    pipeline::run_with_context_scope_setup_and_progress_root(
-        &conn,
+    let stats = pipeline::run_with_context_scope_setup_and_progress_root(
+        staged.connection(),
         context,
         runtime.current_embedder(),
         &crate::shared::types::RunScope::Full,
@@ -276,6 +273,11 @@ async fn run_reindex_once(
         Some(state_root),
         &tokio_util::sync::CancellationToken::new(),
     )
-    .await
-    .map_err(Into::into)
+    .await?;
+
+    // Switch the freshly-built staging index over the served `index.db` in a single
+    // atomic rename, still under the held rebuild lock.
+    staged.finalize_and_swap().await?;
+
+    Ok(stats)
 }

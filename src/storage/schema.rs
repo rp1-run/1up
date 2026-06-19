@@ -206,14 +206,6 @@ pub async fn prepare_for_write(conn: &Connection) -> Result<(), OneupError> {
     }
 }
 
-/// Drop all search objects and recreate the current schema from scratch.
-pub async fn rebuild(conn: &Connection) -> Result<(), OneupError> {
-    conn.execute_batch(queries::DROP_SEARCH_SCHEMA)
-        .await
-        .map_err(|e| StorageError::Migration(format!("failed to reset search schema: {e}")))?;
-    initialize(conn).await
-}
-
 /// Verify that an existing database matches the current schema without mutating it.
 ///
 /// On a version mismatch the error names the offending version, the caller-supplied
@@ -984,26 +976,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("segment_relations.edge_identity_kind"));
         assert!(msg.contains("run `1up reindex`"));
-    }
-
-    #[tokio::test]
-    async fn rebuild_recreates_current_schema_from_stale_database() {
-        let (_db, conn) = setup().await;
-
-        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "4"])
-            .await
-            .unwrap();
-
-        rebuild(&conn).await.unwrap();
-
-        assert_eq!(
-            get_schema_version(&conn).await.unwrap(),
-            Some(SCHEMA_VERSION)
-        );
-        ensure_current(&conn, &SchemaContext::unspecified())
-            .await
-            .unwrap();
     }
 
     /// Seed a meta-only DB at an arbitrary schema version so the version-mismatch

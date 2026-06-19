@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +19,28 @@ impl Db {
     /// creating the file and parent directories if they do not exist.
     pub async fn open_rw(path: &Path) -> Result<Self, OneupError> {
         let path = validate_project_db_path_for_write(path)?;
+        Self::open_local_rw(&path).await
+    }
+
+    /// Open a build-aside staging database in read-write mode, creating the file
+    /// and the secure `.1up` directory if they do not exist.
+    ///
+    /// `path` MUST be a `<project>/.1up/index.db.rebuild-<uuid>` staging sibling
+    /// (see [`config::project_staging_db_path`]). A non-destructive rebuild builds
+    /// the refreshed index into this staging file and atomically switches it over
+    /// the served `index.db` once finalized. [`Db::open_rw`] deliberately accepts
+    /// only the served `index.db`, so the rebuild owner opens the staging file
+    /// through this dedicated constructor; the staging leaf is clamped to the
+    /// `.1up` state root and a symlink leaf is rejected, mirroring `open_rw`'s gate.
+    pub async fn open_staging_rw(path: &Path) -> Result<Self, OneupError> {
+        let path = validate_staging_db_path_for_write(path)?;
+        Self::open_local_rw(&path).await
+    }
+
+    /// Open a validated local database path in read-write mode. Shared by
+    /// [`Db::open_rw`] and [`Db::open_staging_rw`]; the caller has already clamped
+    /// `path` to its project's `.1up` state root.
+    async fn open_local_rw(path: &Path) -> Result<Self, OneupError> {
         let path_str = path.to_str().ok_or_else(|| {
             StorageError::Connection(format!(
                 "database path is not valid UTF-8: {}",
@@ -126,8 +148,25 @@ pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> 
     .into())
 }
 
-fn validate_project_db_path_for_write(path: &Path) -> Result<std::path::PathBuf, OneupError> {
-    let project_root = project_root_from_db_path(path)?;
+/// The fixed served-index filename within a project's `.1up` directory.
+const SERVED_INDEX_FILENAME: &str = "index.db";
+/// Prefix shared by build-aside staging filenames (`index.db.rebuild-<uuid>`).
+/// Sourced from [`crate::shared::config::STAGING_INDEX_DB_PREFIX`] so the
+/// path-building and validation sides cannot drift.
+const STAGING_INDEX_PREFIX: &str = crate::shared::config::STAGING_INDEX_DB_PREFIX;
+
+fn validate_project_db_path_for_write(path: &Path) -> Result<PathBuf, OneupError> {
+    validate_db_path_for_write(path, project_root_from_db_path(path)?)
+}
+
+fn validate_staging_db_path_for_write(path: &Path) -> Result<PathBuf, OneupError> {
+    validate_db_path_for_write(path, project_root_from_staging_path(path)?)
+}
+
+/// Prepare the secure `.1up` state directory and clamp a writable database leaf
+/// to it. Shared by the served-index and staging-file write gates; the leaf-name
+/// validation that produced `project_root` already distinguishes the two.
+fn validate_db_path_for_write(path: &Path, project_root: &Path) -> Result<PathBuf, OneupError> {
     let secure_root = ensure_secure_project_root(project_root).map_err(|err| {
         StorageError::Connection(format!(
             "failed to prepare project state directory for {}: {err}",
@@ -143,7 +182,7 @@ fn validate_project_db_path_for_write(path: &Path) -> Result<std::path::PathBuf,
     })
 }
 
-fn validate_existing_project_db_path(path: &Path) -> Result<std::path::PathBuf, OneupError> {
+fn validate_existing_project_db_path(path: &Path) -> Result<PathBuf, OneupError> {
     let project_root = project_root_from_db_path(path)?;
     validate_regular_file_path(path, project_root).map_err(|err| {
         StorageError::Connection(format!(
@@ -155,9 +194,36 @@ fn validate_existing_project_db_path(path: &Path) -> Result<std::path::PathBuf, 
 }
 
 fn project_root_from_db_path(path: &Path) -> Result<&Path, OneupError> {
-    if path.file_name() != Some(OsStr::new("index.db")) {
+    project_root_for_dot_dir_child(
+        path,
+        |leaf| leaf == SERVED_INDEX_FILENAME,
+        "<project>/.1up/index.db",
+    )
+}
+
+fn project_root_from_staging_path(path: &Path) -> Result<&Path, OneupError> {
+    project_root_for_dot_dir_child(
+        path,
+        |leaf| leaf.starts_with(STAGING_INDEX_PREFIX),
+        "<project>/.1up/index.db.rebuild-<uuid>",
+    )
+}
+
+/// Derive the project root from a `<project>/.1up/<leaf>` database path, requiring
+/// the leaf filename to satisfy `leaf_ok`. `target_desc` names the accepted layout
+/// in the rejection error so a misrouted path reports what it should have been.
+fn project_root_for_dot_dir_child<'a>(
+    path: &'a Path,
+    leaf_ok: impl Fn(&str) -> bool,
+    target_desc: &str,
+) -> Result<&'a Path, OneupError> {
+    let leaf_valid = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(leaf_ok);
+    if !leaf_valid {
         return Err(StorageError::Connection(format!(
-            "database path must target <project>/.1up/index.db: {}",
+            "database path must target {target_desc}: {}",
             path.display()
         ))
         .into());
@@ -171,7 +237,7 @@ fn project_root_from_db_path(path: &Path) -> Result<&Path, OneupError> {
     })?;
     if dot_dir.file_name() != Some(OsStr::new(".1up")) {
         return Err(StorageError::Connection(format!(
-            "database path must target <project>/.1up/index.db: {}",
+            "database path must target {target_desc}: {}",
             path.display()
         ))
         .into());
@@ -264,6 +330,46 @@ mod tests {
 
         let err = Db::open_rw(&invalid_path).await.err().unwrap();
         assert!(err.to_string().contains("<project>/.1up/index.db"));
+    }
+
+    #[tokio::test]
+    async fn open_staging_rw_creates_uuid_suffixed_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let staging_path = config::project_staging_db_path(&project_root);
+
+        let db = Db::open_staging_rw(&staging_path).await.unwrap();
+        db.connect().unwrap();
+
+        assert!(staging_path.exists());
+        assert!(staging_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("index.db.rebuild-"));
+        #[cfg(unix)]
+        {
+            let dot_dir = config::project_dot_dir(&project_root);
+            assert_eq!(mode_bits(&dot_dir), PROJECT_STATE_DIR_MODE);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_staging_rw_rejects_non_staging_leaf() {
+        // The staging gate must not become a back door for opening the served
+        // index (or any other file) read-write: only `index.db.rebuild-*` siblings
+        // inside `.1up` are accepted.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(config::project_dot_dir(&project_root)).unwrap();
+
+        let served = config::project_db_path(&project_root);
+        let err = Db::open_staging_rw(&served).await.err().unwrap();
+        assert!(err
+            .to_string()
+            .contains("<project>/.1up/index.db.rebuild-<uuid>"));
     }
 
     #[cfg(unix)]

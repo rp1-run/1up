@@ -5548,3 +5548,426 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
         );
     });
 }
+
+// =============================================================================
+// Non-destructive background index rebuild (build-aside + atomic switch-over)
+//
+// These are the end-to-end guards the design's Validation Plan defers to T7. The
+// decisive in-process primitive guards already live inline:
+//   - all-or-nothing swap / new-generation / sidecar retirement (HYP-001):
+//     `src/storage/swap.rs` (`swap_is_all_or_nothing_under_concurrent_readers`,
+//     `swap_replaces_index_with_new_generation_and_leaves_no_sidecars`),
+//   - aborted-rebuild-leaves-prior-index-intact: `src/storage/swap.rs`
+//     (`aborted_staging_rebuild_leaves_prior_index_intact_and_no_orphan`,
+//     `swap_leaves_prior_index_unchanged_when_staging_missing`),
+//   - daemon stale-handle reopen after a swap (HYP-002): `src/daemon/worker.rs`
+//     (`reopen_adopts_swapped_index_so_writes_land_in_the_new_inode`),
+//   - stale/embeddings reason combination + scoping: `src/shared/types.rs` and
+//     `src/mcp/ops.rs` detector tests.
+// The tests below exercise the assembled behavior through the real CLI reindex,
+// the real MCP search path, and the CLI render seam.
+// =============================================================================
+
+/// Open `index.db` read-only, gate it through `ensure_current`, and return the
+/// segment count — the "is this a complete, valid index?" probe a real reader
+/// runs. Retries on a transient lock the same way the production read paths do
+/// (`retry_on_db_lock`), so a momentary checkpoint/rename lock is absorbed rather
+/// than misread as a torn index; a genuinely absent/partial index can never occur
+/// because the switch-over is a single atomic rename.
+async fn count_segments_ro(db_path: &Path) -> Result<i64, String> {
+    let mut last = String::new();
+    for _ in 0..50 {
+        match count_segments_ro_once(db_path).await {
+            Ok(count) => return Ok(count),
+            Err(err) => {
+                last = err;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
+async fn count_segments_ro_once(db_path: &Path) -> Result<i64, String> {
+    let ro = Db::open_ro(db_path).await.map_err(|e| e.to_string())?;
+    let conn = ro.connect().map_err(|e| e.to_string())?;
+    schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut rows = conn
+        .query(queries::COUNT_SEGMENTS, ())
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "count query returned no row".to_string())?;
+    row.get::<i64>(0).map_err(|e| e.to_string())
+}
+
+/// Whether the served index holds a segment for `repo_relative_path` (the new
+/// generation's distinguishing content). The path is a test-controlled literal.
+async fn served_index_has_file(db_path: &Path, repo_relative_path: &str) -> bool {
+    let ro = Db::open_ro(db_path).await.unwrap();
+    let conn = ro.connect().unwrap();
+    schema::ensure_current(&conn, &schema::SchemaContext::unspecified())
+        .await
+        .unwrap();
+    let sql = format!("SELECT COUNT(*) FROM segments WHERE file_path = '{repo_relative_path}'");
+    let mut rows = conn.query(sql.as_str(), ()).await.unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    count > 0
+}
+
+/// REQ-001 AC4 + AC2 (integration): a *real* `1up reindex` builds the refreshed
+/// index aside and switches it over in a single atomic rename. A reader
+/// repeatedly inspecting the served index throughout the reindex only ever
+/// observes a full valid index (never absent/empty/partial); the switch installs
+/// a *new inode* (build-aside-then-rename, not edit-in-place, mirroring the binary
+/// replacement discipline); and a fresh read afterwards is the new generation.
+///
+/// The new inode is also the HYP-002 substrate: any handle opened before the swap
+/// is left on the orphaned old inode — the exact reason the daemon must reopen
+/// after a swap. The daemon's reopen response is unit-covered in
+/// `src/daemon/worker.rs`; here we prove the cross-process switch installs the new
+/// inode under a live concurrent reader.
+#[cfg(unix)]
+#[test]
+fn reindex_switch_over_is_all_or_nothing_with_atomic_inode_replacement() {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let _guard = HideModelGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let db_path = root.join(".1up").join("index.db");
+
+    // Seed a prior served index (FTS-only) holding only the "alpha" generation.
+    fs::write(
+        root.join("alpha.rs"),
+        "pub fn alpha_generation_marker() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    cmd()
+        .args(["init", root.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+    cmd()
+        .args(["index", root.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    let prior_inode = fs::metadata(&db_path).unwrap().ino();
+    let prior_count = block_on(count_segments_ro(&db_path)).expect("prior index is a full index");
+    assert!(
+        prior_count > 0,
+        "the prior index must hold the alpha generation"
+    );
+    assert!(
+        !block_on(served_index_has_file(&db_path, "beta.rs")),
+        "the prior generation must not yet contain beta.rs"
+    );
+
+    // Introduce the new "beta" generation, then sample the served index from a
+    // background reader straddling the real reindex.
+    fs::write(
+        root.join("beta.rs"),
+        "pub fn beta_generation_marker() -> u32 { 2 }\n",
+    )
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let db_path = db_path.clone();
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut samples = Vec::new();
+            while !stop.load(Ordering::Acquire) {
+                samples.push(rt.block_on(count_segments_ro(&db_path)));
+                thread::sleep(Duration::from_millis(1));
+            }
+            // A few more samples after the reindex returns so some land on the
+            // settled new inode.
+            for _ in 0..5 {
+                samples.push(rt.block_on(count_segments_ro(&db_path)));
+            }
+            samples
+        })
+    };
+
+    cmd()
+        .args(["reindex", root.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+    stop.store(true, Ordering::Release);
+    let samples = sampler.join().unwrap();
+
+    // REQ-001 AC4: every inspection during the reindex saw a complete, valid index
+    // — never absent, empty, or partial.
+    assert!(!samples.is_empty(), "the sampler must observe the index");
+    for sample in &samples {
+        let count = sample
+            .as_ref()
+            .unwrap_or_else(|err| panic!("every sample must be a full valid index: {err}"));
+        assert!(
+            *count > 0,
+            "a sample observed an empty index ({count} rows) mid-reindex"
+        );
+    }
+
+    // REQ-001 AC2: the switch-over is a build-aside atomic rename, so the served
+    // file is a *new inode* (an in-place rebuild would keep the same inode).
+    let new_inode = fs::metadata(&db_path).unwrap().ino();
+    assert_ne!(
+        prior_inode, new_inode,
+        "the atomic switch-over must replace index.db with a freshly-built inode"
+    );
+
+    // The fresh read is unambiguously the new generation (REQ-001 AC4 / HYP-001
+    // post-swap-is-new-generation), proving the rename flipped readers over.
+    assert!(
+        block_on(served_index_has_file(&db_path, "beta.rs")),
+        "the served index after reindex must be the new generation (beta.rs present)"
+    );
+}
+
+/// REQ-002 AC1 + REQ-003 AC2/AC4 (integration, MCP surface): while a rebuild is in
+/// progress and a usable prior index exists, MCP `oneup_search` keeps returning the
+/// prior index's results (stale-but-available) and folds the stale notice into
+/// `degraded_reason` — combined with the pre-existing embeddings-unavailable reason,
+/// neither dropping the other. Rebuild-in-progress is modelled by holding the
+/// single-writer rebuild lock from the test process; the MCP server (a separate
+/// process) detects it via the out-of-process `try_acquire_rebuild_lock` probe, so
+/// the signal is deterministic and independent of daemon refresh-state timing.
+#[cfg(unix)]
+#[test]
+fn mcp_search_during_rebuild_serves_prior_results_with_stale_degraded_reason() {
+    use oneup::daemon::lifecycle::acquire_rebuild_lock;
+    use oneup::shared::constants::{NO_INDEXED_EMBEDDINGS_REASON, STALE_REBUILD_REASON};
+
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    // A git repo structure so `index_if_missing` can auto-initialize and index
+    // (loose files without a repo are blocked — see
+    // `mcp_start_reports_blocked_when_indexing_cannot_auto_initialize`).
+    fs::create_dir_all(root.join(".git").join("refs").join("heads")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "pub fn rebuild_stale_marker_fn() -> &'static str {\n    \"ready\"\n}\n",
+    )
+    .unwrap();
+
+    // Build a real FTS-only index through the MCP start flow (isolated state seeds
+    // a model-download failure, so the index carries no embeddings).
+    let mut client = McpTestClient::start_with_isolated_state(&root);
+    client.call_tool(
+        TOOL_START,
+        serde_json::json!({ "mode": "index_if_missing" }),
+    );
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    // Model "a rebuild is in progress": hold the single-writer rebuild lock.
+    let lock = acquire_rebuild_lock(&root).expect("test holds the rebuild lock");
+
+    let result = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "rebuild_stale_marker_fn" }),
+    );
+    let envelope = mcp_structured(&result);
+
+    // Stale-but-available: the prior index is still served (REQ-002 AC1).
+    let hits = envelope["data"]["results"]
+        .as_array()
+        .expect("search payload carries a results array");
+    assert!(
+        !hits.is_empty(),
+        "a rebuild-in-progress search must still serve prior results: {result}"
+    );
+
+    // The notice rides only in `degraded_reason` and flips status to degraded
+    // (REQ-003 AC2 — reuse the existing reason channel, no parallel field).
+    assert_eq!(
+        envelope["status"].as_str(),
+        Some("degraded"),
+        "a stale-but-available search reports degraded status: {result}"
+    );
+    let reason = envelope["data"]["degraded_reason"]
+        .as_str()
+        .expect("degraded_reason is set while a rebuild is in progress");
+    assert!(
+        reason.contains(STALE_REBUILD_REASON),
+        "degraded_reason must carry the stale fragment: {reason}"
+    );
+    // REQ-003 AC4: the pre-existing embeddings-unavailable reason coexists with the
+    // stale fragment (combined via `combine_degraded_reasons`), neither dropped.
+    assert!(
+        reason.contains(NO_INDEXED_EMBEDDINGS_REASON),
+        "stale and embeddings reasons must coexist in degraded_reason: {reason}"
+    );
+
+    // The result rows themselves are clean lean data — the notice never pollutes
+    // them (it lives only in the dedicated `degraded_reason` field, asserted above).
+    for hit in hits {
+        assert!(
+            !serde_json::to_string(hit).unwrap().contains("rebuilding"),
+            "the stale notice must not leak into a result row: {hit}"
+        );
+    }
+
+    drop(lock);
+}
+
+/// REQ-002 AC2 (integration, MCP surface): the stale-but-available plumbing must
+/// not fabricate results on the cold-start path. With a rebuild in progress
+/// (rebuild lock held) and *no* prior index, MCP `oneup_search` surfaces a
+/// not-ready state with no result rows, never a synthesized hit. The lock is held
+/// before the server starts so the auto-started daemon also defers indexing,
+/// keeping the cold-start state deterministic.
+#[cfg(unix)]
+#[test]
+fn mcp_search_cold_start_during_rebuild_does_not_fabricate_results() {
+    use oneup::daemon::lifecycle::acquire_rebuild_lock;
+
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+
+    // Hold the rebuild lock first: the daemon the MCP server best-effort starts
+    // then defers its own indexing, so no index is ever built (true cold start).
+    let _lock = acquire_rebuild_lock(&root).expect("test holds the rebuild lock");
+
+    let mut client = McpTestClient::start_with_isolated_state(&root);
+    let result = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "cold_start_marker_fn" }),
+    );
+    let envelope = mcp_structured(&result);
+
+    let result_rows = envelope["data"]["results"]
+        .as_array()
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    assert_eq!(
+        result_rows, 0,
+        "cold-start search during a rebuild must not fabricate results: {result}"
+    );
+    assert_ne!(
+        envelope["status"].as_str(),
+        Some("ok"),
+        "cold-start search during a rebuild must not report a successful result set: {result}"
+    );
+}
+
+/// REQ-003 AC1 + AC3 (integration, CLI render seam): `1up search` keeps the
+/// machine-readable result stream (stdout) byte-for-byte identical whether or not
+/// a stale-rebuild notice is present, and emits the notice only on the warning
+/// channel (stderr) and only while a rebuild is in progress. A one-shot fake daemon
+/// supplies the framed `SearchResponse` (mirroring the daemon's IPC contract) so the
+/// production CLI render path (`serve_daemon_results`) is exercised deterministically.
+#[cfg(unix)]
+#[test]
+fn cli_search_keeps_stale_rebuild_notice_off_stdout() {
+    use oneup::shared::constants::STALE_REBUILD_REASON;
+    use std::os::unix::net::UnixListener;
+
+    // Run `1up search` against a fake daemon that replies once with a fixed lean
+    // result set and an optional `degraded_reason`. Returns (stdout, stderr).
+    fn search_against_fake_daemon(degraded_reason: Option<&str>) -> (Vec<u8>, String) {
+        let home = tempfile::Builder::new()
+            .prefix("1up-home-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        // No project_id, so the CLI does not auto-start a real daemon and only the
+        // fake socket answers the search.
+        let project = TempDir::new().unwrap();
+        let socket_path = test_data_dir(home.path()).join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server_socket_path = socket_path.clone();
+        let reason = degraded_reason.map(str::to_string);
+        let server = thread::spawn(move || {
+            if let Some(parent) = server_socket_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let _ = fs::remove_file(&server_socket_path);
+            let listener = UnixListener::bind(&server_socket_path).unwrap();
+            ready_tx.send(()).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_framed_json(&mut stream);
+
+            let mut response = serde_json::json!({
+                "status": "results",
+                "results": [{
+                    "segment_id": "servedseg000",
+                    "file_path": "src/lib.rs",
+                    "language": "rust",
+                    "block_type": "function",
+                    "content": "fn served() {}",
+                    "score": 42,
+                    "line_number": 1,
+                    "line_end": 2
+                }]
+            });
+            if let Some(reason) = reason {
+                response["degraded_reason"] = serde_json::Value::String(reason);
+            }
+            write_framed_json(&mut stream, &response);
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let output = cmd()
+            .env("HOME", home.path())
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .args([
+                "search",
+                "served",
+                "--path",
+                project.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "search against the fake daemon failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.stdout, String::from_utf8(output.stderr).unwrap())
+    }
+
+    let (stdout_stale, stderr_stale) = search_against_fake_daemon(Some(STALE_REBUILD_REASON));
+    let (stdout_fresh, stderr_fresh) = search_against_fake_daemon(None);
+
+    // REQ-003 AC1: the stale notice never alters the machine-readable result
+    // stream — stdout is byte-identical with and without it.
+    assert_eq!(
+        stdout_stale, stdout_fresh,
+        "the stale notice must not change stdout"
+    );
+    assert!(
+        !stdout_stale.is_empty(),
+        "the served result row must be written to stdout"
+    );
+    let stdout_text = String::from_utf8(stdout_stale).unwrap();
+    assert!(
+        !stdout_text.contains("rebuilding") && !stdout_text.contains(STALE_REBUILD_REASON),
+        "the stale notice must not appear on stdout: {stdout_text}"
+    );
+
+    // The notice appears on stderr only, and only when a rebuild is in progress
+    // (REQ-003 AC1 warning-channel + AC3 scoping).
+    assert!(
+        stderr_stale.contains(STALE_REBUILD_REASON),
+        "the stale notice must appear on stderr during a rebuild: {stderr_stale}"
+    );
+    assert!(
+        !stderr_fresh.contains("rebuilding") && !stderr_fresh.contains("stale"),
+        "no stale notice may appear on stderr when no rebuild is in progress: {stderr_fresh}"
+    );
+}
