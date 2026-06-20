@@ -8,84 +8,68 @@ strictness: strict
 ---
 # Implementation Patterns
 
-**Project**: 1up
-**Last Updated**: 2026-06-15
+Conventions and idioms for 1up (`oneup`). New patterns from the supply-chain, daemon-handshake, and non-destructive-rebuild work are folded in.
 
 ## Naming & Organization
 
-**Files**: `snake_case` modules inside layer dirs (`src/cli`, `src/daemon`, `src/indexer`, `src/mcp`, `src/search`, `src/shared`, `src/storage`). New CLI commands are wired via `mod.rs` exports plus a clap `Command` enum arm, never a runtime registry. MCP splits by file role: schema inputs in `types.rs`, operation adapters in `ops.rs`, rmcp `#[tool]` wrappers in `tools.rs`, stdio server in `server.rs`.
-**Functions**: CLI command modules use `<Name>Args` + `pub async fn exec(...)`; maintenance commands take `OutputFormat`, core/discovery commands own fixed output and reject `--format`. Verb-prefixed helpers: `resolve_`, `classify_`, `ensure_`, `read_`, `format_`, `apply_`.
-**Imports**: explicit `crate::...` paths grouped after std/external blocks. Shared literals/tunables live in `src/shared/constants.rs` and are imported, never re-hardcoded per call site.
+- `snake_case` modules inside layer dirs (`src/{cli,daemon,indexer,mcp,search,shared,storage}`). New CLI commands wire through `cli/mod.rs` + a clap `Command` enum arm — never a runtime registry.
+- CLI command modules use `<Name>Args` + `pub async fn exec(...)`. Maintenance commands accept `OutputFormat`; core/discovery commands own fixed output and reject `--format`.
+- Verb-prefixed helpers (`resolve_`/`classify_`/`ensure_`/`build_`) and RAII openers (`acquire_`/`try_acquire_`/`open_`).
+- Shared literals live in `src/shared/constants.rs` and are imported, never re-hardcoded — even env-var *names* are constants (`ONEUP_*`).
 
-Evidence: `src/cli/mod.rs:62`, `src/mcp/tools.rs:35`, `src/shared/constants.rs`
+## Type Modeling
 
-## Type & Data Modeling
-
-**Data Representation**: Owned structs/enums with serde derives. MCP inputs derive `Deserialize + JsonSchema`; payloads derive `Serialize`. `Value` fields that must stay host-compatible get explicit object schemas via `schema_with = json_object_schema`. Single source of truth via const arrays, e.g. `RETAINED_PUBLIC_TOOLS: [&str; 9]`.
-**Type Strictness**: Strict typed enums for status/role/state with explicit serde `rename_all = "snake_case"` wire names (`OperationStatus`, `ReadinessStatus`, `ReadStatus`). `usize`<->`i64` conversions go through saturating helpers (`usize_from_i64`).
-**Immutability**: Defaults via `#[derive(Default)]` + `#[serde(default)]`; compatibility aliases via `#[serde(alias)]` (`StartMode` auto->index_if_needed, `ImpactInput` segment_id->handle).
-
-Evidence: `src/mcp/types.rs:18`, `src/mcp/ops.rs:49`, `src/shared/update.rs:18`
+- Owned structs/enums with serde derives; MCP inputs derive `Deserialize + JsonSchema` (`deny_unknown_fields`), `rename_all="snake_case"` wire names.
+- Single source of truth via const arrays (`RETAINED_PUBLIC_TOOLS: [&str; 9]`, `NON_EMBEDDABLE_CHUNK_LANGUAGES`).
+- Domain outcomes are dedicated enums (`UpdateStatus`, `ReadinessStatus`), often a three-state collapsed onto `Result`.
+- Additive fields stay back-compatible: `#[serde(default, skip_serializing_if = "Option::is_none")]` (e.g. manifest `expiry`). RAII guards consumed by value (`finalize_and_swap(self)`); `RebuildLock` is `#[must_use]`.
 
 ## Error Handling
 
-**Strategy**: Two-layer split. CLI/MCP boundaries use `anyhow::Result` + `bail!`/`Context`; library layers (storage/search/indexer/daemon/update) use `OneupError` with per-domain `thiserror` enums. Advisory failures are typed envelope statuses (refused/empty/degraded/blocked), not process errors.
-**Propagation**: Stale/incompatible indexes fail closed: `schema::ensure_current` returns a reindex-required error with version detail (v{found} vs v{expected}). Transient DB locks retried via generic `retry_on_db_lock` bounded by `DB_LOCK_RETRY_ATTEMPTS`.
-**Common Types**: `OneupError`, `StorageError`, `anyhow::Error`
+- **Two layers:** CLI/MCP boundaries use `anyhow` + `bail!`/`Context`; libraries use `OneupError` with per-domain `thiserror` enums (`UpdateError`, `DaemonError`, `StorageError`).
+- **Actionable wording:** `DrainTimeout` → "run `1up stop` then retry"; schema errors name found-vs-expected versions + the worktree path.
+- **Three outcome shapes:** verified → `Ok`; disproved → hard fail leaving state untouched (`ensure_manifest_acceptable`, `AttestationFailed`); cannot-run → degrade to a safe floor.
+- **Cooperative cancellation** is its own typed outcome (`IndexingError::Cancelled`), leaving the context dirty for a later pass.
 
-Evidence: `src/shared/errors.rs`, `src/storage/schema.rs:154`, `src/mcp/ops.rs:871`
+## Validation
 
-## Validation & Boundaries
+- Concentrated at clap parsing, MCP input schemas, filesystem gates, and schema-readiness seams.
+- **Decision gates are pure**, taking inputs as parameters (`ensure_manifest_acceptable(manifest, installed, now)`, `should_idle_shutdown(is_empty, empty_for, timeout)`) — deterministic + unit-testable.
+- Repo paths canonicalized + clamped to `source_root`; out-of-root/parent-escape → `Rejected`; 1-based lines enforced.
 
-**Location**: Concentrated at clap parsing, MCP input schemas, filesystem gates, and schema-readiness seams. MCP input structs use `#[serde(deny_unknown_fields)]`. Empty-string/empty-collection args rejected early with a structured error + canonical `next_action`.
-**Method**: Impact requires exactly one anchor and limits `line` to file anchors in both CLI and MCP. Repo paths are canonicalized and clamped to `source_root`; absolute and parent-escape paths outside the repo become `Rejected` records; 1-based lines enforced.
-**Normalization**: Secure dir/file creation rejects symlink components and unexpected leaf types; repo-relative paths normalized to forward slashes to match indexed paths.
+## Output Contracts
 
-Evidence: `src/mcp/types.rs:41`, `src/mcp/ops.rs:1060`, `src/shared/fs.rs:62`
+- `tracing` to stderr; **stdout reserved for protocol/data** so MCP stdio + machine output stay clean — notices/banners go to stderr.
+- Degraded/stale wording is centralized in single-source `*_REASON` constants (`STALE_REBUILD_REASON`, `NO_INDEXED_EMBEDDINGS_REASON`) and merged via `combine_degraded_reasons` (never overwritten).
+- MCP `instructions` fit a ~2KB host-truncation budget with the routing rule front-loaded.
 
-## Observability
+## Storage / I-O
 
-**Logging**: `tracing` to stderr, verbosity from global `-v` count; stdout reserved for protocol/data so MCP stdio stays clean. MCP instructions kept under a 2KB budget with a routing substring guaranteed to survive truncation.
-**Metrics**: None detected — no metrics backend.
-**Tracing**: None detected. Observability is logs, stderr notices, per-context progress JSON (`.1up/index_status.json`), and release/security JSON evidence artifacts.
+- libSQL via a `Db` wrapper; tuned PRAGMAs applied with lock-retry; reads context-scoped (`*_for_context`).
+- **Atomic temp-then-rename** for state files (`atomic_replace`) and the index: a rebuild is **build-aside** (uuid-suffixed staging DB), finalized to one self-contained file (`wal_checkpoint(TRUNCATE)`), then atomically renamed over `index.db`; prior sidecars retired first.
+- Downloaded artifacts verified against a pinned SHA-256 floor, then keyless-OIDC attestation. Secure-fs enforces canonical paths, clamps writes to an approved root, rejects symlink components.
 
-Evidence: `src/cli/mod.rs:55`, `src/mcp/server.rs:82`, `src/mcp/ops.rs:40`
+## Concurrency
 
-## Testing Idioms
+- Async over Tokio/libSQL everywhere; MCP via rmcp `serve(stdio())`.
+- Indexing parses in parallel (`JoinSet::spawn_blocking`) then reorders deterministically. The daemon worker multiplexes signals/requests/reload/debounce with `tokio::select!` + a `Semaphore` cap.
+- **One shared `CancellationToken`** threads every pass; SIGTERM cancels it and indexing stops at the next safe yield point, resumed not restarted.
+- **RAII `flock` guards** (`DaemonLock`, single-writer `RebuildLock`) enforce single-owner rebuilds, auto-released on drop/`?` unwind.
 
-**Organization**: Unit tests in module `#[cfg(test)]` blocks; integration/CLI tests under `tests/`. Release/script behavior is black-box: tests spawn release shell scripts and a stdio MCP fixture binary via `std::process::Command`, asserting on emitted JSON evidence.
-**Fixtures**: Storage tests use a real libSQL DB in a tempdir + explicit `schema::initialize`; in-memory `Db::open_memory` available. Drift/version guards source the expected value from `CARGO_PKG_VERSION`, never a literal, so a normal bump stays green.
-**Levels**: Behavioral guards over snapshots: `documentation_tool_names_match_retained_public_tools` scans docs for `oneup_*` tokens and asserts each is in `RETAINED_PUBLIC_TOOLS`; `committed_update_manifest_version_not_ahead_of_binary` asserts the manifest version is never ahead of the binary (semver `<=`, tolerating the release-window lag).
+## Dependency Injection / Config
 
-Evidence: `tests/release_assets_tests.rs:884`, `tests/release_assets_tests.rs:709`, `src/cli/mod.rs:281`
+- No DI container; deps passed explicitly (`HybridSearchEngine::new_scoped`). Engines built per-request from a connection + a `SearchScope` from the `WorktreeContext`.
+- `shared::config` centralizes paths; `state_root` vs `source_root` separated for worktrees. Indexing config resolves CLI → env → registry → defaults. `option_env!` defaults overridable by a same-named runtime env var.
 
-## I/O & Integration
+## Extension
 
-**Database**: libSQL via a `Db` wrapper; write/index connections get tuned PRAGMAs (WAL, `synchronous=NORMAL`, `cache_size`, `mmap_size`, `temp_store=MEMORY`) applied with lock-retry. All counts/reads are context-scoped (`count_files_for_context`, `*_for_context`). Embeddings stored as `FLOAT8(384)` matching `EMBEDDING_DIM=384`; vector writes/reads use `vector8(?)` and `vector_distance_cos`, not generic `vector(?)`.
-**HTTP Clients**: External HTTP confined to model-download and update adapters with explicit connect/total timeouts.
-**Resilience**: Downloaded artifacts verified against pinned SHA-256 digests and recorded in a verified-artifact manifest before use.
+- Static extension surfaces, not plugin loaders: clap enum variants + rmcp `#[tool_router]` methods.
+- `RETAINED_PUBLIC_TOOLS` is the single authority: next-actions `debug_assert!` membership; the doctor classifier treats any `oneup_*` token absent from it as stale; doc/test guards pin to it.
+- The only opt-in user-file mutation (`doctor --clean-hints --apply`) is default-OFF, preview-by-default, and removes only a byte-exact 1up-owned fence via `atomic_replace_within_project_root`.
 
-Evidence: `src/storage/db.rs:91`, `src/storage/queries.rs:57`, `src/indexer/embedder.rs:50`
+## Testing
 
-## Concurrency & Async
-
-**Async Usage**: Async over Tokio/libSQL at every entry point (main, CLI, daemon, MCP, search, storage); MCP stdio server runs via rmcp `serve(stdio())`.
-**Parallelism**: Indexing parses in parallel with `JoinSet::spawn_blocking` then reorders deterministically. Daemon worker multiplexes signals/requests/reload/debounce with `tokio::select!` and caps in-flight work with a `Semaphore`.
-**Safety**: DB lock contention handled by bounded retry + sleep, never busy-spin; per-request engines hold no shared mutable state.
-
-Evidence: `src/indexer/pipeline.rs:1573`, `src/daemon/worker.rs:115`, `src/mcp/ops.rs:871`
-
-## Dependency & Configuration
-
-**DI Pattern**: No DI container; dependencies passed explicitly via constructors/args (`HybridSearchEngine::new_scoped`, `SymbolSearchEngine::new_scoped`, `OneupMcpServer::new`). Engines are constructed per-request from an opened connection + a `SearchScope` derived from the `WorktreeContext`.
-**Config Loading**: Path helpers centralized in `shared::config`; `state_root` vs `source_root` separated for worktree support. Indexing config resolved at call time from CLI -> env -> persisted registry -> defaults; non-positive numeric values rejected.
-**Initialization**: Embedding runtime is lazily prepared and gated on a cheap vector-presence check, so the model is never loaded when a context holds no embeddings.
-
-Evidence: `src/mcp/ops.rs:642`, `src/mcp/ops.rs:928`, `src/cli/mod.rs:261`
-
-## Extension Mechanisms
-
-**Plugin Pattern**: Extension surfaces are static, not plugin loaders: clap subcommands are enum variants and MCP tools are rmcp `#[tool_router]` macro methods. A named authority list (`RETAINED_PUBLIC_TOOLS`) is the single source of truth referenced everywhere — next-action construction `debug_assert!`s every emitted tool is in it, the doctor hint classifier treats any `oneup_*` token absent from it as stale, and doc/test guards pin to it.
-**Hook System**: Agent guidance lives only in MCP (server instructions + tool descriptions + `next_actions`); 1up never writes to user instruction files. The sole opt-in mutation (`doctor --clean-hints --apply`) is default-OFF, preview-by-default, and removes only a byte-exact 1up-owned `<!-- 1up:hint:begin --> / <!-- 1up:hint:end -->` HTML-comment fence via `atomic_replace_within_project_root`.
-
-Evidence: `src/mcp/tools.rs:1171`, `src/cli/hint_cleanup.rs:216`, `src/cli/doctor.rs:76`
+- Unit tests in `#[cfg(test)]`; integration/CLI tests under `tests/`. Release/script behavior is black-box (spawn scripts + a stdio MCP fixture, assert on emitted JSON).
+- **TDD red-first**; behavioral guards over snapshots. Pure injected gates tested with crafted `now`/version/empty-state values.
+- **RAII test guards** isolate/clean up: `EnvGuard` (under a static `Mutex`), `ChildGuard`/`DaemonCleanupGuard` reap spawned daemons, real `flock` guards prove exclusion.
+- Drift guards source expected values from `CARGO_PKG_VERSION` (`documentation_tool_names_match_retained_public_tools`, `committed_update_manifest_version_not_ahead_of_binary`); swap tests assert all-or-nothing reads under concurrent readers.
