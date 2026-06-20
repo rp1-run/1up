@@ -2,9 +2,9 @@
   "strategy": "parallel-map-reduce",
   "repo_type": "single-project",
   "monorepo_projects": [],
-  "generated_at": "2026-06-14T23:12:20Z",
-  "git_commit": "fa549d5bca05b1ebba8a21b05d5f8e7eaf0f86a8",
-  "files_analyzed": 188,
+  "generated_at": "2026-06-20T09:44:31Z",
+  "git_commit": "d7ac940dada21d21db4b6586cbbb6a744d393726",
+  "files_analyzed": 44,
   "languages": [
     "Rust",
     "TypeScript",
@@ -15,20 +15,20 @@
     "TOML"
   ],
   "metrics": {
-    "mode": "FULL",
-    "previous_git_commit": "cb841a0cbccaaba559a00c0e23d1b76a2b894e08",
-    "changed_files": 143,
-    "total_files_scanned": 188,
+    "mode": "INCREMENTAL",
+    "previous_git_commit": "fa549d5bca05b1ebba8a21b05d5f8e7eaf0f86a8",
+    "changed_files": 44,
+    "total_files_scanned": 42,
     "section_lines": {
-      "concept_map": 165,
-      "architecture": 244,
-      "interaction_model": 115,
-      "modules": 214,
-      "patterns": 91,
-      "index": 86
+      "concept_map": 73,
+      "architecture": 101,
+      "interaction_model": 70,
+      "modules": 80,
+      "patterns": 75,
+      "index": 90
     },
     "schema_version": 16,
     "mcp_surface": true,
-    "strategy_detail": "large-change wide reconcile against prior KB with novelty scan"
+    "strategy_detail": "incremental reconcile of the 44-file changed frontier (PRs #61-#68) against the prior KB with novelty scan; corrected the vector exhaustive-scan threshold (16384 -> 262144) and added supply-chain trust, daemon version-handshake, non-destructive rebuild, and idle self-exit"
   }
 }
