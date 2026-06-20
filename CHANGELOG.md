@@ -15,6 +15,26 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.12](https://github.com/rp1-run/1up/compare/v0.1.11...v0.1.12) (2026-06-20)
+
+
+### Features
+
+* agent discovery — conceptual recall, oneup_overview, markdown indexing, freshness loop ([#60](https://github.com/rp1-run/1up/issues/60)) ([0aebaaa](https://github.com/rp1-run/1up/commit/0aebaaab4315f15948b1edaeb5a99ab74db3e5b8))
+* daemon version-handshake — drain/restart, single-writer rebuild lock, precise cross-worktree error (P1) ([#62](https://github.com/rp1-run/1up/issues/62)) ([01f5065](https://github.com/rp1-run/1up/commit/01f50659ae5b0943e32a39160d53cc2df8aa353f))
+* harden agent-hint delivery — drift fix, single-source guidance, doctor --clean-hints, version guards ([#61](https://github.com/rp1-run/1up/issues/61)) ([95ba105](https://github.com/rp1-run/1up/commit/95ba105e965aa1c14eb65f016913dddd10b23d37))
+* non-destructive background index rebuild — build-aside + atomic swap, serve-stale (P2) ([#65](https://github.com/rp1-run/1up/issues/65)) ([92437b1](https://github.com/rp1-run/1up/commit/92437b1005aad5c761f7d1eee295f3c3ffa2b9ae))
+* supply-chain trust — GitHub attestation verify, mandatory-when-published checksum, anti-rollback/expiring manifest (P3) ([#66](https://github.com/rp1-run/1up/issues/66)) ([0f55173](https://github.com/rp1-run/1up/commit/0f55173207bcdcc477ea9b1c134775fe4027fc2a))
+
+
+### Bug Fixes
+
+* harden status/progress file reads against pre-existing torn-read CI flakes ([#63](https://github.com/rp1-run/1up/issues/63)) ([f37a2b8](https://github.com/rp1-run/1up/commit/f37a2b8647c71a1ab7f125673449679bfa50e794))
+* retry schema column-inspection on transient DB lock ([dd071b2](https://github.com/rp1-run/1up/commit/dd071b2d5af5ca3f509e058aea435c59501fd56b))
+* search latency on larger repos, daemon idle-exit, and test daemon teardown ([#68](https://github.com/rp1-run/1up/issues/68)) ([e6ba852](https://github.com/rp1-run/1up/commit/e6ba8520c1c816f8749af1235ba6168b21c2bc9b))
+* **tests:** de-flake daemon status-timing tests under CI load ([#64](https://github.com/rp1-run/1up/issues/64)) ([10ff1d8](https://github.com/rp1-run/1up/commit/10ff1d8d0218528cadaa6e67c0cbd70e14ac7b51))
+* Windows extended-length paths + release pipeline hardening ([#57](https://github.com/rp1-run/1up/issues/57)) ([6815afa](https://github.com/rp1-run/1up/commit/6815afa1768c5cbb0fa6aa751455f725633a5d7e))
+
 ## [0.1.11](https://github.com/rp1-run/1up/compare/v0.1.10...v0.1.11) (2026-06-10)
 
 
