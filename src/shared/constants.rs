@@ -47,14 +47,16 @@ pub const VECTOR_PREFILTER_K: usize = 400;
 ///
 /// The disk-based approximate vector index answers `vector_top_k` by beam
 /// traversal over a neighbor graph, which is read-heavy and pathologically
-/// slow at small corpus sizes (observed: ~7s single-thread CPU for one query
-/// over ~4.5k vectors). An exhaustive scan is mathematically trivial at this
-/// scale: 16384 x 384 int8 dot products is ~6.3M multiply-accumulates, well
-/// under 10ms, and it is exact rather than approximate. Below this bound
-/// vector candidates come from a full `vector_distance_cos` scan over the
-/// context's vectors; above it the graph traversal amortizes and the
-/// `vector_top_k` index path takes over.
-pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 16384;
+/// slow — and, contrary to the original "amortizes at scale" assumption, it
+/// gets WORSE as the corpus grows, not better: ~7s single-thread CPU over
+/// ~4.5k vectors, and ~45s over ~27k vectors (measured on the emdash corpus).
+/// The exhaustive path is the inverse: an exact `vector_distance_cos` scan is
+/// a single linear pass of ~N x 384 dot products (~6.3M MACs at 16384, well
+/// under 10ms) and stays sub-second well past 256k vectors. So the exact scan
+/// is preferred for all realistic single-repo corpus sizes; the `vector_top_k`
+/// graph path only takes over above this (deliberately high) bound, where the
+/// memory-resident linear pass would finally lose to the disk-based index.
+pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 262_144;
 
 /// Maximum number of indexed worktree contexts used to scale vector prefiltering.
 ///
@@ -123,6 +125,18 @@ pub const CHUNK_OVERLAP: usize = 10;
 
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
+
+/// How long the daemon may run with zero registered projects before it
+/// self-exits. The daemon otherwise only exits on SIGTERM, so a daemon left
+/// behind once its last project is deregistered (`1up stop`), or one orphaned
+/// by a crashed/ended parent (e.g. a test run in a throwaway HOME), would
+/// linger forever and accumulate. A daemon with any registered project never
+/// idles out. Overridable via [`DAEMON_IDLE_SHUTDOWN_ENV_VAR`] for tests and
+/// operators; `0` exits as soon as the daemon observes itself empty.
+pub const DAEMON_IDLE_SHUTDOWN_SECS: u64 = 60;
+
+/// Runtime override for [`DAEMON_IDLE_SHUTDOWN_SECS`] (seconds).
+pub const DAEMON_IDLE_SHUTDOWN_ENV_VAR: &str = "ONEUP_DAEMON_IDLE_SHUTDOWN_SECS";
 
 /// Maximum interval between persisted daemon file-check heartbeats.
 pub const DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS: u64 = 30_000;

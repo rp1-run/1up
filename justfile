@@ -76,3 +76,20 @@ update-test url="":
     ONEUP_UPDATE_MANIFEST_URL="{{url}}" ./target/debug/1up update --check -f human
     echo
     ONEUP_UPDATE_MANIFEST_URL="{{url}}" ./target/debug/1up update --status -f human
+
+# Reap orphaned build/test 1up daemons (keeps the installed ~/.local/bin daemon).
+reap-daemons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pids="$(pgrep -fl '1up __worker' 2>/dev/null | grep -v '/.local/bin/1up' | awk '{print $1}' || true)"
+    if [ -z "$pids" ]; then echo "no orphaned 1up daemons"; exit 0; fi
+    echo "reaping orphaned 1up daemon(s): $(echo "$pids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    sleep 1
+    left="$(pgrep -fl '1up __worker' 2>/dev/null | grep -v '/.local/bin/1up' | awk '{print $1}' || true)"
+    if [ -n "$left" ]; then
+        # shellcheck disable=SC2086
+        kill -KILL $left 2>/dev/null || true
+    fi
+    echo "done"

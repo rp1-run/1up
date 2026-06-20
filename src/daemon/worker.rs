@@ -19,8 +19,9 @@ use crate::indexer::pipeline;
 use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
-    DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
+    DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, DAEMON_IDLE_SHUTDOWN_ENV_VAR, DAEMON_IDLE_SHUTDOWN_SECS,
+    MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
+    STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -111,6 +112,31 @@ struct QueuedSearchRequest {
 
 type ProjectStates = HashMap<String, ProjectState>;
 
+/// Idle-shutdown grace as a `Duration`, honouring the runtime override
+/// [`DAEMON_IDLE_SHUTDOWN_ENV_VAR`] and otherwise [`DAEMON_IDLE_SHUTDOWN_SECS`].
+fn daemon_idle_shutdown_timeout() -> std::time::Duration {
+    let secs = std::env::var(DAEMON_IDLE_SHUTDOWN_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DAEMON_IDLE_SHUTDOWN_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Whether an empty daemon has been idle long enough to self-exit.
+///
+/// A daemon that still has a registered project (`is_empty == false`) never
+/// idles out. An empty one exits once it has been continuously empty for at
+/// least `idle_timeout`, so a daemon left behind by `1up stop` (last project
+/// deregistered) or orphaned by a crashed/ended parent reaps itself instead of
+/// lingering until SIGTERM.
+fn should_idle_shutdown(
+    is_empty: bool,
+    empty_for: Option<std::time::Duration>,
+    idle_timeout: std::time::Duration,
+) -> bool {
+    is_empty && empty_for.is_some_and(|elapsed| elapsed >= idle_timeout)
+}
+
 pub async fn run() -> Result<(), OneupError> {
     let _daemon_lock = lifecycle::acquire_daemon_lock()?;
 
@@ -157,6 +183,15 @@ async fn run_inner() -> Result<(), OneupError> {
     .await;
 
     let debounce = std::time::Duration::from_millis(WATCHER_DEBOUNCE_MS);
+    let idle_timeout = daemon_idle_shutdown_timeout();
+    // Reap an empty daemon: one with zero registered projects self-exits past
+    // `idle_timeout` instead of lingering until SIGTERM, so a daemon left
+    // behind by `1up stop` (last project deregistered) or orphaned by a
+    // crashed/ended parent does not accumulate. Registration precedes daemon
+    // spawn, so a fresh daemon loads a non-empty registry and never idles out
+    // at startup.
+    let mut empty_since: Option<std::time::Instant> =
+        projects.is_empty().then(std::time::Instant::now);
 
     while !cancel_token.is_cancelled() {
         tokio::select! {
@@ -222,6 +257,21 @@ async fn run_inner() -> Result<(), OneupError> {
                 break;
             }
             _ = tokio::time::sleep(debounce) => {
+                let is_empty = projects.is_empty();
+                let empty_for = if is_empty {
+                    Some(empty_since.get_or_insert_with(std::time::Instant::now).elapsed())
+                } else {
+                    empty_since = None;
+                    None
+                };
+                if should_idle_shutdown(is_empty, empty_for, idle_timeout) {
+                    info!(
+                        "daemon has had no registered projects for >= {}s; self-exiting",
+                        idle_timeout.as_secs()
+                    );
+                    cancel_token.cancel();
+                    break;
+                }
                 let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
                 mark_branch_context_changes(&mut file_watcher, &mut projects);
@@ -1486,6 +1536,42 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    #[test]
+    fn should_idle_shutdown_only_when_empty_past_timeout() {
+        let timeout = Duration::from_secs(60);
+        // A daemon that still owns a project never idles out.
+        assert!(!should_idle_shutdown(false, None, timeout));
+        assert!(!should_idle_shutdown(
+            false,
+            Some(Duration::from_secs(10_000)),
+            timeout
+        ));
+        // Empty but inside the grace window: keep running.
+        assert!(!should_idle_shutdown(true, None, timeout));
+        assert!(!should_idle_shutdown(
+            true,
+            Some(Duration::from_secs(59)),
+            timeout
+        ));
+        // Empty at/past the grace window: self-exit.
+        assert!(should_idle_shutdown(
+            true,
+            Some(Duration::from_secs(60)),
+            timeout
+        ));
+        assert!(should_idle_shutdown(
+            true,
+            Some(Duration::from_secs(61)),
+            timeout
+        ));
+        // A zero timeout exits as soon as the daemon first observes itself empty.
+        assert!(should_idle_shutdown(
+            true,
+            Some(Duration::ZERO),
+            Duration::ZERO
+        ));
+    }
 
     fn test_context(project_root: &Path, source_root: &Path) -> WorktreeContext {
         WorktreeContext {
