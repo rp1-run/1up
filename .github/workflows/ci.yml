@@ -5,6 +5,14 @@ on:
   push:
     branches:
       - main
+    # A release pushes a manifest-only "chore: publish update manifest" commit
+    # immediately after the release commit. Without this ignore it triggers ci
+    # and, via the cancel-in-progress concurrency below, cancels the release
+    # commit's still-running ci run (observed on v0.1.12). The published manifest
+    # is validated by publish-update-manifest.yml's own verify job, so a
+    # manifest-only push to main does not need its own ci run.
+    paths-ignore:
+      - update-manifest.json
 
 permissions:
   contents: read
