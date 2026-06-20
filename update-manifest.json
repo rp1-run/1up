@@ -1,36 +1,37 @@
 {
-  "version": "0.1.11",
-  "git_tag": "v0.1.11",
-  "published_at": "2026-06-10T04:20:04Z",
-  "notes_url": "https://github.com/rp1-run/1up/releases/tag/v0.1.11",
+  "version": "0.1.12",
+  "git_tag": "v0.1.12",
+  "published_at": "2026-06-20T08:48:06Z",
+  "expiry": "2026-09-18T08:48:06Z",
+  "notes_url": "https://github.com/rp1-run/1up/releases/tag/v0.1.12",
   "artifacts": [
     {
       "target": "aarch64-apple-darwin",
-      "archive": "1up-v0.1.11-aarch64-apple-darwin.tar.gz",
-      "sha256": "17cf9562436f467947d56025d6d7ffac97acf8f7a3cf35c70b52848e3d693068",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.11/1up-v0.1.11-aarch64-apple-darwin.tar.gz"
+      "archive": "1up-v0.1.12-aarch64-apple-darwin.tar.gz",
+      "sha256": "3067ecbe443022a819e6d0532987612f48989dc75211588de5b3d8f43e0fdc51",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.12/1up-v0.1.12-aarch64-apple-darwin.tar.gz"
     },
     {
       "target": "aarch64-unknown-linux-gnu",
-      "archive": "1up-v0.1.11-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "f964e026618eb4b818edd04c768512d3042b28ef51f8d5551f9a356b3ab8ca5d",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.11/1up-v0.1.11-aarch64-unknown-linux-gnu.tar.gz"
+      "archive": "1up-v0.1.12-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "9fc378f522a32580d6ae8a5350fd624cf70614e20ee92ff1d3ca33bb98af6500",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.12/1up-v0.1.12-aarch64-unknown-linux-gnu.tar.gz"
     },
     {
       "target": "x86_64-pc-windows-msvc",
-      "archive": "1up-v0.1.11-x86_64-pc-windows-msvc.zip",
-      "sha256": "017552ea545729db7199267f1bfe5f80eeb60a9b9facb6b184de44feba0e3897",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.11/1up-v0.1.11-x86_64-pc-windows-msvc.zip"
+      "archive": "1up-v0.1.12-x86_64-pc-windows-msvc.zip",
+      "sha256": "bdbf6607f666f4ea1a1c2822d5090c3a02d7416d4c113119b9ca28bda603c97b",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.12/1up-v0.1.12-x86_64-pc-windows-msvc.zip"
     },
     {
       "target": "x86_64-unknown-linux-gnu",
-      "archive": "1up-v0.1.11-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "f70a01ed57abd05928f10c2acb9fd4ccaad3753d4398a7e6c8485ccefb4207e3",
-      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.11/1up-v0.1.11-x86_64-unknown-linux-gnu.tar.gz"
+      "archive": "1up-v0.1.12-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "b053189071ffe33e3a85c7f91f5063214a88128bd6e56b2be7ab01e2f6ef1c27",
+      "url": "https://github.com/rp1-run/1up/releases/download/v0.1.12/1up-v0.1.12-x86_64-unknown-linux-gnu.tar.gz"
     }
   ],
   "channels": {
-    "github_release": "https://github.com/rp1-run/1up/releases/tag/v0.1.11",
+    "github_release": "https://github.com/rp1-run/1up/releases/tag/v0.1.12",
     "script_install": "https://1up.rp1.run/setup.sh",
     "update_manifest": "https://raw.githubusercontent.com/rp1-run/1up/main/update-manifest.json"
   },
