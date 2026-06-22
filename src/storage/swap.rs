@@ -258,15 +258,27 @@ async fn retire_prior_index_sidecars(index_path: &Path) -> Result<(), OneupError
     let conn = db.connect()?;
     // Force the file open + WAL recovery and best-effort fold; a non-zero `busy`
     // (a reader held part of the WAL) is expected and fine, only a hard query
-    // failure is surfaced.
-    conn.query(queries::WAL_CHECKPOINT_PASSIVE, ())
-        .await
-        .map_err(|err| {
-            StorageError::Query(format!(
-                "failed to retire prior index WAL for {}: {err}",
-                index_path.display()
-            ))
-        })?;
+    // failure is surfaced. A transient `database is locked` — a sibling handle
+    // mid-close briefly holding the lock, made likelier now that the index carries
+    // the `embedding_pool` DiskANN sidecar tables — is retried within the shared
+    // lock budget rather than failing the swap, mirroring `checkpoint_truncate`.
+    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
+        match conn.query(queries::WAL_CHECKPOINT_PASSIVE, ()).await {
+            Ok(_) => break,
+            Err(err) => {
+                let err_text = err.to_string();
+                if !is_lock_error(&err_text) || attempt + 1 == DB_LOCK_RETRY_ATTEMPTS {
+                    return Err(StorageError::Query(format!(
+                        "failed to retire prior index WAL for {}: {err_text}",
+                        index_path.display()
+                    ))
+                    .into());
+                }
+                thread::sleep(retry_delay);
+            }
+        }
+    }
     drop(conn);
     drop(db);
 
