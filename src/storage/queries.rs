@@ -51,12 +51,26 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
 
+/// Content-addressed embedding store. One row per distinct `(model_id,
+/// embedding_dim, embed_input)` content key, holding the shared vector bytes and
+/// the DiskANN index. `ref_count` tracks how many `segment_vectors` rows
+/// reference the row across every context; a row is physically deleted only when
+/// its last referencing segment is gone (centralized in `delete_context`).
+pub const CREATE_EMBEDDING_POOL_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS embedding_pool (
+    content_key TEXT PRIMARY KEY,
+    embedding_vec FLOAT8(384) NOT NULL,
+    ref_count INTEGER NOT NULL DEFAULT 0
+)";
+
+/// Per-segment reference into [`CREATE_EMBEDDING_POOL_TABLE`]. The vector bytes
+/// no longer live inline here; `content_key` points at the shared
+/// `embedding_pool` row so byte-identical content across contexts shares a
+/// single stored embedding.
 pub const CREATE_SEGMENT_VECTORS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_vectors (
     segment_id TEXT PRIMARY KEY,
-    embedding_vec FLOAT8(384) NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    content_key TEXT NOT NULL
 )";
 
 pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
@@ -91,8 +105,8 @@ CREATE TABLE IF NOT EXISTS segment_relations (
     )
 )";
 
-pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
-    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
+pub const CREATE_INDEX_EMBEDDING_POOL_EMBEDDING: &str =
+    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_embedding_pool_embedding ON embedding_pool (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(context_id, canonical_symbol, reference_kind)";
@@ -167,7 +181,7 @@ DROP TRIGGER IF EXISTS segments_au;
 DROP TRIGGER IF EXISTS segments_vector_ad;
 DROP TRIGGER IF EXISTS segments_symbol_ad;
 DROP TABLE IF EXISTS segments_fts;
-DROP INDEX IF EXISTS idx_segment_vectors_embedding;
+DROP INDEX IF EXISTS idx_embedding_pool_embedding;
 DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP INDEX IF EXISTS idx_segment_relations_source;
@@ -175,6 +189,7 @@ DROP INDEX IF EXISTS idx_segment_relations_target;
 DROP INDEX IF EXISTS idx_segment_relations_lookup_target;
 DROP INDEX IF EXISTS idx_indexed_files_context_path;
 DROP TABLE IF EXISTS segment_vectors;
+DROP TABLE IF EXISTS embedding_pool;
 DROP TABLE IF EXISTS segment_symbols;
 DROP TABLE IF EXISTS segment_relations;
 DROP INDEX IF EXISTS idx_segments_context_file_path;
