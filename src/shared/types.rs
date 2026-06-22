@@ -227,6 +227,21 @@ impl BranchStatus {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Single-source wording for the "results are not branch-filtered" caveat.
+    ///
+    /// Emitted whenever the active branch cannot be pinned (`Unknown`/`Unreadable`
+    /// on the search path; any non-`Named` status on the readiness path). Lives on
+    /// the type so the search scope (`src/search/scope.rs`) and the readiness
+    /// payload (`src/mcp/tools.rs`) share one phrasing and cannot drift, and is kept
+    /// short so it reads cleanly when `combine_degraded_reasons` stacks it after
+    /// another reason such as `STALE_REBUILD_REASON`.
+    pub fn branch_scope_caveat(self) -> String {
+        format!(
+            "branch context is {}; results are worktree-scoped, not branch-filtered",
+            self.as_str()
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

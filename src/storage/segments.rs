@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::path::PathBuf;
 
 use libsql::Connection;
 use sha2::{Digest, Sha256};
@@ -887,6 +888,109 @@ pub async fn get_worktree_context_head_oid(
         }
         None => Ok(None),
     }
+}
+
+/// One row from `worktree_contexts`: a context recorded in the shared index, with
+/// the worktree paths and branch that minted its `context_id`. Consumed by `1up gc`
+/// to classify stale branch snapshots and dead worktrees.
+#[derive(Debug, Clone)]
+pub struct IndexedContextRow {
+    pub context_id: String,
+    pub state_root: PathBuf,
+    pub source_root: PathBuf,
+    pub branch_name: Option<String>,
+}
+
+/// List every worktree context recorded in the shared index.
+pub async fn list_worktree_contexts(
+    conn: &Connection,
+) -> Result<Vec<IndexedContextRow>, OneupError> {
+    let mut rows = conn
+        .query(queries::SELECT_ALL_WORKTREE_CONTEXTS, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("list worktree contexts failed: {e}")))?;
+
+    let mut contexts = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let context_id: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("read context_id failed: {e}")))?;
+        let state_root: String = row
+            .get(1)
+            .map_err(|e| StorageError::Query(format!("read state_root failed: {e}")))?;
+        let source_root: String = row
+            .get(2)
+            .map_err(|e| StorageError::Query(format!("read source_root failed: {e}")))?;
+        let branch_name: Option<String> = row
+            .get(3)
+            .map_err(|e| StorageError::Query(format!("read branch_name failed: {e}")))?;
+        contexts.push(IndexedContextRow {
+            context_id,
+            state_root: PathBuf::from(state_root),
+            source_root: PathBuf::from(source_root),
+            branch_name,
+        });
+    }
+    Ok(contexts)
+}
+
+/// Row counts removed from the shared index when a context is pruned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextDeletionCounts {
+    pub segments: u64,
+    pub relations: u64,
+    pub indexed_files: u64,
+}
+
+/// Evict one worktree context from the shared index, removing its rows from every
+/// context-scoped table. Deleting `segments` cascades to `segment_vectors`,
+/// `segment_symbols`, and the FTS index via the schema's AFTER DELETE triggers, so
+/// only `segment_relations`, `indexed_files`, `segments`, and the `worktree_contexts`
+/// registry row are deleted explicitly. Idempotent: re-running on an already-pruned
+/// context deletes nothing and still succeeds, so a partial failure is safe to retry.
+pub async fn delete_context(
+    conn: &Connection,
+    context_id: &str,
+) -> Result<ContextDeletionCounts, OneupError> {
+    validate_context_id(context_id)?;
+
+    let relations = conn
+        .execute(queries::DELETE_SEGMENT_RELATIONS_BY_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("delete context relations failed: {e}")))?;
+    let indexed_files = conn
+        .execute(queries::DELETE_INDEXED_FILES_BY_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("delete context indexed files failed: {e}")))?;
+    let segments = conn
+        .execute(queries::DELETE_SEGMENTS_BY_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("delete context segments failed: {e}")))?;
+    conn.execute(queries::DELETE_WORKTREE_CONTEXT, [context_id])
+        .await
+        .map_err(|e| StorageError::Query(format!("delete worktree context row failed: {e}")))?;
+
+    Ok(ContextDeletionCounts {
+        segments,
+        relations,
+        indexed_files,
+    })
+}
+
+/// Reclaim disk space freed by deleted rows. SQLite/libSQL keep emptied pages
+/// allocated after a `DELETE`, so `VACUUM` is required to actually shrink the
+/// `index.db` file. Runs outside any transaction and needs exclusive database
+/// access, so callers should hold the rebuild lock and surface lock contention
+/// (a live daemon) as an actionable "stop the daemon and retry" error.
+pub async fn vacuum_database(conn: &Connection) -> Result<(), OneupError> {
+    conn.execute(queries::VACUUM_DATABASE, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("vacuum failed: {e}")))?;
+    Ok(())
 }
 
 /// Count total number of segments in the database.

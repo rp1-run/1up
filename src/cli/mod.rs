@@ -2,6 +2,7 @@ pub mod add_mcp;
 pub mod context;
 pub mod discovery_output;
 pub mod doctor;
+pub mod gc;
 pub mod get;
 pub mod hint_cleanup;
 pub mod impact;
@@ -44,6 +45,7 @@ Commands:
   context Read source context around a file location
   impact  Explore advisory likely impact from a known anchor
   doctor  Diagnose and optionally clean legacy 1up hints in instruction files
+  gc      Prune stale worktree contexts and reclaim index disk
 
 Options:
 {options}",
@@ -117,6 +119,33 @@ pub enum Command {
     #[command(hide = true)]
     Reindex(reindex::ReindexArgs),
 
+    /// Prune stale worktree contexts from the shared index and reclaim disk
+    #[command(long_about = "\
+Prune stale worktree contexts from the shared index and reclaim disk space.
+
+1up keeps one index context per (worktree, branch). Switching branches or removing \
+linked worktrees leaves behind per-branch index snapshots that accumulate in the \
+shared index.db and are never reclaimed automatically. `gc` removes the ones that \
+are safe to drop and compacts the database.
+
+What is pruned, relative to the worktree you run it in:
+  - stale-branch-snapshot: a context for THIS worktree under a different (older) \
+branch. That branch's index rebuilds on demand the next time you search it.
+  - source-missing: a context whose source directory no longer exists on disk \
+(for example a deleted linked worktree).
+
+The active context (the branch currently checked out where you run gc) is ALWAYS \
+kept, and contexts belonging to other still-present worktrees are left untouched \
+(run gc inside those worktrees to prune them).
+
+Safety model: the default is a read-only PREVIEW that writes nothing. Pruning \
+requires the explicit --apply flag, which deletes the rows and then VACUUMs to \
+shrink index.db. Pass --no-vacuum to skip compaction (for example when a running \
+daemon holds the exclusive lock); the rows are still pruned and the freed space is \
+reused by future indexing. Pruning is reversible: any dropped context is rebuilt \
+the next time it is searched.")]
+    Gc(gc::GcArgs),
+
     /// Diagnose and optionally clean legacy 1up hints in project instruction files
     #[command(long_about = "\
 Diagnose and optionally clean legacy 1up hints in project instruction files.
@@ -167,7 +196,7 @@ impl Command {
             Command::Start(_) | Command::Status(_) | Command::List(_) | Command::Stop(_) => {
                 Some(OutputFormat::Human)
             }
-            Command::Update(_) | Command::Doctor(_) => Some(OutputFormat::Human),
+            Command::Update(_) | Command::Doctor(_) | Command::Gc(_) => Some(OutputFormat::Human),
             Command::Init(_) | Command::Index(_) | Command::Reindex(_) => Some(OutputFormat::Plain),
             Command::AddMcp(_)
             | Command::Search(_)
@@ -227,6 +256,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Doctor(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             doctor::exec(args, format).await
+        }
+        Command::Gc(args) => {
+            let format = resolve_maintenance_format(args.format, maintenance_format);
+            gc::exec(args, format).await
         }
         Command::Update(args) => {
             let format = resolve_maintenance_format(args.format, maintenance_format);
@@ -422,7 +455,7 @@ mod tests {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
         let visible_commands = [
-            "start", "status", "list", "stop", "get", "symbol", "context", "impact", "doctor",
+            "start", "status", "list", "stop", "get", "symbol", "context", "impact", "doctor", "gc",
         ];
 
         for command_name in visible_commands {
