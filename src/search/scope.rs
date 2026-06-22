@@ -32,10 +32,9 @@ impl SearchScope {
 
     pub fn degraded_reason(&self) -> Option<String> {
         match self.branch_status {
-            BranchStatus::Unreadable | BranchStatus::Unknown => Some(format!(
-                "branch context is {}; results are scoped to the active worktree context but cannot be presented as definitively branch-filtered",
-                self.branch_status.as_str()
-            )),
+            BranchStatus::Unreadable | BranchStatus::Unknown => {
+                Some(self.branch_status.branch_scope_caveat())
+            }
             BranchStatus::Named | BranchStatus::Detached => None,
         }
     }

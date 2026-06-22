@@ -481,10 +481,7 @@ fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeCont
         return;
     }
 
-    let branch_reason = format!(
-        "branch_status is {}; search results may not be definitively branch-filtered",
-        context.branch_status.as_str()
-    );
+    let branch_reason = context.branch_status.branch_scope_caveat();
 
     if payload.status == ReadinessStatus::Ready {
         payload.status = ReadinessStatus::Degraded;
