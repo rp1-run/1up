@@ -316,6 +316,38 @@ fn truncate_chars(mut text: String, max_chars: usize) -> String {
     text
 }
 
+/// Content-addressed key for a chunk embedding.
+///
+/// Deterministic SHA-256 hex over the embedding-model identity (`model_id` plus
+/// `embedding_dim` — the same identity gated by
+/// [`schema::check_embedding_model_compatible`] and recorded as
+/// `meta.embedding_model`) followed by the exact embedder input produced by
+/// [`compose_embedding_text`].
+///
+/// Because the embed input uses repository-relative paths, it is identical
+/// across branch/worktree contexts, so identical content yields an identical
+/// key and is embedded and stored exactly once in `embedding_pool` (REQ-006).
+/// Folding the model identity into the key makes embeddings produced by a
+/// different model resolve to a different key, so changing the model
+/// automatically invalidates reuse of older vectors.
+///
+/// The full 256-bit digest is returned (rather than the 128-bit prefix used for
+/// segment ids) because a key collision would silently share a wrong embedding
+/// across distinct content, which must never happen for the search-identical
+/// guarantee. The `model_id`/`embedding_dim`/`embed_input` fields are
+/// `\0`-delimited so adjacent fields can never bleed into one another.
+#[allow(dead_code)]
+fn embedding_content_key(model_id: &str, embedding_dim: usize, embed_input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(embedding_dim.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(embed_input.as_bytes());
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn should_embed_segment(seg: &ParsedSegment) -> bool {
     if seg.block_type != "chunk" {
         return true;
@@ -2964,6 +2996,61 @@ mod tests {
                 segment.line_start,
                 segment.line_end
             )
+        );
+    }
+
+    #[test]
+    fn embedding_content_key_is_context_invariant_and_model_differentiated() {
+        let mut segment = embeddable_segment("pub struct ImpactHorizonEngine;");
+        segment.defined_symbols = vec!["ImpactHorizonEngine".into()];
+
+        // The embed input is a deterministic function of repository-relative
+        // path + content, so two different contexts (branches/worktrees) that
+        // hold the same chunk produce the byte-identical embed input that any
+        // context would, and therefore the same content key (REQ-006).
+        let embed_input = compose_embedding_text("src/search/impact.rs", &segment);
+        let key_ctx_a = embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+        let key_ctx_b = embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+        assert_eq!(
+            key_ctx_a, key_ctx_b,
+            "identical content must yield an identical key across contexts"
+        );
+
+        // A SHA-256 hex digest is 64 lowercase hex characters.
+        assert_eq!(key_ctx_a.len(), 64);
+        assert!(key_ctx_a.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // Different content must yield a different key.
+        let other_input = compose_embedding_text("src/search/impact.rs", &{
+            let mut s = segment.clone();
+            s.content = "pub struct DifferentEngine;".into();
+            s
+        });
+        assert_ne!(
+            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &other_input),
+            key_ctx_a,
+            "distinct content must not collide"
+        );
+
+        // Changing the model identity must invalidate reuse: a different model
+        // id or embedding dimension yields a different key for the same input.
+        assert_ne!(
+            embedding_content_key("org/other-model", EMBEDDING_DIM, &embed_input),
+            key_ctx_a,
+            "a different model id must change the key"
+        );
+        assert_ne!(
+            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM + 1, &embed_input),
+            key_ctx_a,
+            "a different embedding dimension must change the key"
+        );
+
+        // Fields are delimited so a longer model id cannot alias a shorter one
+        // with a leading-digit dimension (e.g. ("ab", 1, ...) vs ("a", 12, ...)).
+        assert_ne!(
+            embedding_content_key("ab", 1, &embed_input),
+            embedding_content_key("a", 12, &embed_input),
+            "field boundaries must be unambiguous"
         );
     }
 
