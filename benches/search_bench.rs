@@ -1092,10 +1092,21 @@ fn setup_exhaustive_scan_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32
             )
             .await
             .unwrap();
+            // Pool-backed seed under the content-addressed schema: each scan
+            // vector is distinct, so the bytes live once in `embedding_pool`
+            // (one row per segment, a single reference) and `segment_vectors`
+            // carries only the thin `content_key` reference into it.
+            let content_key = format!("scan-key-{idx}");
             conn.execute(
-                "INSERT INTO segment_vectors (segment_id, embedding_vec, created_at, updated_at)
-                 VALUES (?1, vector8(?2), datetime('now'), datetime('now'))",
-                libsql::params![format!("scan-{idx}"), embedding],
+                "INSERT INTO embedding_pool (content_key, embedding_vec, ref_count)
+                 VALUES (?1, vector8(?2), 1)",
+                libsql::params![content_key.clone(), embedding],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO segment_vectors (segment_id, content_key) VALUES (?1, ?2)",
+                libsql::params![format!("scan-{idx}"), content_key],
             )
             .await
             .unwrap();
