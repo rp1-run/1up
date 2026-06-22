@@ -257,47 +257,69 @@ SELECT COUNT(DISTINCT s.context_id)
 FROM segment_vectors AS sv
 JOIN segments AS s ON s.id = sv.segment_id";
 
+/// Context-agnostic sibling of [`SELECT_VECTOR_CANDIDATES_FOR_CONTEXT`] (no
+/// `context_id` filter). Kept in lockstep with the pooled schema so it joins the
+/// relocated pool index and fans out through `content_key`; the `s.id` secondary
+/// sort keeps fan-out ties deterministic.
 #[allow(dead_code)]
 pub const SELECT_VECTOR_CANDIDATES: &str = "
 WITH vector_matches AS (
     SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
-JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN embedding_pool AS p ON p.rowid = v.id
+JOIN segment_vectors AS sv ON sv.content_key = p.content_key
 JOIN segments AS s ON s.id = sv.segment_id
-ORDER BY v.rank";
+ORDER BY v.rank, s.id";
 
+/// Approximate (ANN) vector candidates for a context, used only above
+/// `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`. `vector_top_k` runs over the relocated
+/// pool index and returns one rowid per distinct pool vector (`?2` = over-fetch
+/// budget, scaled by indexed-context count at the call site so enough top
+/// vectors survive the per-context filter). Each pool row then fans out across
+/// every `segment_vectors` reference sharing its `content_key`; the result is
+/// filtered to the context and truncated to `?4` (the base candidate budget K).
+/// The secondary sort `s.id` is load-bearing: one pool row now maps to multiple
+/// segments, so `v.rank` alone leaves ties unordered — `ORDER BY v.rank, s.id`
+/// makes the truncation deterministic.
 pub const SELECT_VECTOR_CANDIDATES_FOR_CONTEXT: &str = "
 WITH vector_matches AS (
     SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
-JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN embedding_pool AS p ON p.rowid = v.id
+JOIN segment_vectors AS sv ON sv.content_key = p.content_key
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?3
-ORDER BY v.rank";
+ORDER BY v.rank, s.id
+LIMIT ?4";
 
-/* KEEP: the exhaustive path must not touch idx_segment_vectors_embedding.
+/* KEEP: the exhaustive path must not touch idx_embedding_pool_embedding.
 Below VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS a full ordered scan over the
 context's vectors is both exact and orders of magnitude faster than beam
 traversal over the disk-based approximate index, which the profiling for the
-small-corpus latency fix showed spending seconds in read-heavy graph walks. */
+small-corpus latency fix showed spending seconds in read-heavy graph walks.
+The `segment_vectors -> embedding_pool` join is 1:1 (each reference names exactly
+one pool row), so the candidate row set, the `vector_distance_cos` values, and the
+`ORDER BY ..., s.id` ordering are byte-for-byte identical to the pre-pooling inline
+column (HYP-001 CONFIRMED) — the vector bytes simply moved into the shared pool. */
 pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM segment_vectors AS sv
+JOIN embedding_pool AS p ON p.content_key = sv.content_key
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?2
-ORDER BY vector_distance_cos(sv.embedding_vec, vector8(?1)), s.id
+ORDER BY vector_distance_cos(p.embedding_vec, vector8(?1)), s.id
 LIMIT ?3";
 
 #[allow(dead_code)]
