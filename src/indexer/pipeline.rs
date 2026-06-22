@@ -336,7 +336,6 @@ fn truncate_chars(mut text: String, max_chars: usize) -> String {
 /// across distinct content, which must never happen for the search-identical
 /// guarantee. The `model_id`/`embedding_dim`/`embed_input` fields are
 /// `\0`-delimited so adjacent fields can never bleed into one another.
-#[allow(dead_code)]
 fn embedding_content_key(model_id: &str, embedding_dim: usize, embed_input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(model_id.as_bytes());
@@ -739,6 +738,7 @@ fn build_segment_insert(
     relative_path: &str,
     file_hash: &str,
     segment: &ParsedSegment,
+    content_key: Option<String>,
     embedding_vec: Option<String>,
 ) -> SegmentInsert {
     SegmentInsert {
@@ -754,6 +754,7 @@ fn build_segment_insert(
         content: segment.content.clone(),
         line_start: segment.line_start as i64,
         line_end: segment.line_end as i64,
+        content_key,
         embedding_vec,
         breadcrumb: segment.breadcrumb.clone(),
         complexity: segment.complexity as i64,
@@ -772,50 +773,145 @@ fn build_segment_insert(
     }
 }
 
-fn build_segment_batches(
+/// An embeddable segment paired with the content key that addresses its shared
+/// embedding. Collected in deterministic file/segment order so embedder outputs
+/// can be mapped back to the exact segments that produced them.
+struct EmbeddableSegment {
+    content_key: String,
+    embed_input: String,
+}
+
+/// Selects the embed inputs that genuinely need embedding.
+///
+/// `embeddable` lists every embeddable segment's content key plus embed input in
+/// deterministic order; `present` holds the content keys already stored in
+/// `embedding_pool` under the current model. The returned `(content_key,
+/// embed_input)` pairs are exactly the misses: pool hits are dropped (their
+/// shared vector is reused) and within-batch duplicates are collapsed, so each
+/// distinct new `(content, model)` pair is embedded at most once (REQ-002).
+/// Input order is preserved so embedding stays deterministic.
+fn plan_embedding_work<'a>(
+    embeddable: &'a [EmbeddableSegment],
+    present: &HashSet<String>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut planned: HashSet<&str> = HashSet::new();
+    let mut misses = Vec::new();
+    for segment in embeddable {
+        let key = segment.content_key.as_str();
+        if present.contains(key) {
+            continue;
+        }
+        if !planned.insert(key) {
+            continue;
+        }
+        misses.push((key, segment.embed_input.as_str()));
+    }
+    misses
+}
+
+async fn build_segment_batches(
+    conn: &Connection,
     context_id: &str,
     parsed_files: &[ParsedWorkItem],
     embedder: Option<&mut Embedder>,
     timings: &mut TimingAccumulator,
 ) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
-    let mut embeddings = if let Some(embedder) = embedder {
-        let texts: Vec<String> = parsed_files
+    let Some(embedder) = embedder else {
+        // No active embedder: segments are stored without content keys or
+        // vectors, exactly as before content-addressed pooling.
+        return Ok(parsed_files
             .iter()
-            .flat_map(|file| {
+            .map(|file| {
                 file.segments
                     .iter()
-                    .filter(|segment| should_embed_segment(segment))
-                    .map(|segment| compose_embedding_text(&file.relative_path, segment))
+                    .map(|segment| {
+                        build_segment_insert(
+                            context_id,
+                            &file.relative_path,
+                            &file.file_hash,
+                            segment,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect()
             })
-            .collect();
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let embed_started_at = Instant::now();
-        let embeddings = embedder.embed_batch(&text_refs)?;
-        timings.embed_ms += embed_started_at.elapsed().as_millis();
-        Some(embeddings.into_iter())
-    } else {
-        None
+            .collect());
     };
 
+    // Pass 1: derive the content key + embed input for every embeddable segment,
+    // in deterministic file/segment order.
+    let embeddable: Vec<EmbeddableSegment> = parsed_files
+        .iter()
+        .flat_map(|file| {
+            file.segments
+                .iter()
+                .filter(|segment| should_embed_segment(segment))
+                .map(|segment| {
+                    let embed_input = compose_embedding_text(&file.relative_path, segment);
+                    let content_key =
+                        embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+                    EmbeddableSegment {
+                        content_key,
+                        embed_input,
+                    }
+                })
+        })
+        .collect();
+
+    // Look up which keys already live in the pool, then embed only the misses so
+    // content already embedded under this model is never re-embedded (REQ-002).
+    let distinct_keys: Vec<&str> = {
+        let mut seen = HashSet::new();
+        embeddable
+            .iter()
+            .map(|segment| segment.content_key.as_str())
+            .filter(|key| seen.insert(*key))
+            .collect()
+    };
+    let present = segments::existing_embedding_pool_keys(conn, &distinct_keys).await?;
+    let misses = plan_embedding_work(&embeddable, &present);
+
+    let miss_inputs: Vec<&str> = misses.iter().map(|(_, input)| *input).collect();
+    let embed_started_at = Instant::now();
+    let vectors = embedder.embed_batch(&miss_inputs)?;
+    timings.embed_ms += embed_started_at.elapsed().as_millis();
+
+    if vectors.len() != misses.len() {
+        return Err(IndexingError::Pipeline(format!(
+            "embedder returned {} vectors for {} miss-set inputs",
+            vectors.len(),
+            misses.len()
+        ))
+        .into());
+    }
+
+    // Map each freshly embedded key to its serialized vector. An embeddable
+    // segment whose key is absent here is a pool hit: the shared vector already
+    // exists, so the segment carries only its `content_key` reference.
+    let mut key_to_vec: HashMap<&str, String> = HashMap::with_capacity(misses.len());
+    for ((key, _input), vector) in misses.iter().zip(vectors) {
+        key_to_vec.insert(*key, serialize_embedding(&vector)?);
+    }
+
+    // Pass 2: assemble inserts, every embeddable segment carrying its resolved
+    // content key (and, for misses, the new vector to be pooled).
+    let mut resolved_keys = embeddable.iter();
     let mut batches = Vec::with_capacity(parsed_files.len());
     for file in parsed_files {
         let mut inserts = Vec::with_capacity(file.segments.len());
         for segment in &file.segments {
-            let embedding_vec = if should_embed_segment(segment) {
-                match embeddings.as_mut() {
-                    Some(embeddings) => {
-                        let embedding = embeddings.next().ok_or_else(|| {
-                            IndexingError::Pipeline(format!(
-                                "missing embedding for {}:{}-{}",
-                                file.relative_path, segment.line_start, segment.line_end
-                            ))
-                        })?;
-                        Some(serialize_embedding(&embedding)?)
-                    }
-                    None => None,
-                }
+            let (content_key, embedding_vec) = if should_embed_segment(segment) {
+                let resolved = resolved_keys.next().ok_or_else(|| {
+                    IndexingError::Pipeline(format!(
+                        "missing content key for {}:{}-{}",
+                        file.relative_path, segment.line_start, segment.line_end
+                    ))
+                })?;
+                let embedding_vec = key_to_vec.get(resolved.content_key.as_str()).cloned();
+                (Some(resolved.content_key.clone()), embedding_vec)
             } else {
-                None
+                (None, None)
             };
 
             inserts.push(build_segment_insert(
@@ -823,18 +919,17 @@ fn build_segment_batches(
                 &file.relative_path,
                 &file.file_hash,
                 segment,
+                content_key,
                 embedding_vec,
             ));
         }
         batches.push(inserts);
     }
 
-    if let Some(embeddings) = embeddings.as_mut() {
-        debug_assert!(
-            embeddings.next().is_none(),
-            "unexpected trailing embeddings after pipeline run"
-        );
-    }
+    debug_assert!(
+        resolved_keys.next().is_none(),
+        "unexpected trailing embeddable segments after pipeline run"
+    );
 
     Ok(batches)
 }
@@ -895,7 +990,8 @@ async fn store_ready_files(
     }
 
     let parsed_files = std::mem::take(ready_files);
-    let segment_batches = build_segment_batches(context_id, &parsed_files, embedder, timings)?;
+    let segment_batches =
+        build_segment_batches(conn, context_id, &parsed_files, embedder, timings).await?;
     let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
 
     let store_started_at = Instant::now();
@@ -2154,6 +2250,7 @@ mod tests {
             content: "fn honesty_probe() {}".to_string(),
             line_start: 1,
             line_end: 3,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,
@@ -2984,6 +3081,7 @@ mod tests {
             "hash",
             &segment,
             None,
+            None,
         );
 
         assert_ne!(composed, segment.content);
@@ -3052,6 +3150,43 @@ mod tests {
             embedding_content_key("a", 12, &embed_input),
             "field boundaries must be unambiguous"
         );
+    }
+
+    #[test]
+    fn plan_embedding_work_returns_only_deduped_in_order_misses() {
+        fn seg(key: &str, input: &str) -> EmbeddableSegment {
+            EmbeddableSegment {
+                content_key: key.into(),
+                embed_input: input.into(),
+            }
+        }
+
+        let embeddable = vec![
+            seg("k1", "input-1"),
+            seg("k2", "input-2"),
+            seg("k1", "input-1"), // same content as the first entry (within-batch dup)
+            seg("k3", "input-3"),
+        ];
+
+        // k2 already lives in the pool, so it is reused rather than re-embedded;
+        // the duplicate k1 is collapsed so identical content is embedded once;
+        // ordering is preserved for deterministic embedding (REQ-002).
+        let present: HashSet<String> = ["k2".to_string()].into_iter().collect();
+        assert_eq!(
+            plan_embedding_work(&embeddable, &present),
+            vec![("k1", "input-1"), ("k3", "input-3")]
+        );
+
+        // Cold start (nothing pooled): every distinct chunk is embedded once, in
+        // order — no regression for the no-overlap case.
+        let cold = HashSet::new();
+        assert_eq!(
+            plan_embedding_work(&embeddable, &cold),
+            vec![("k1", "input-1"), ("k2", "input-2"), ("k3", "input-3")]
+        );
+
+        // Nothing embeddable means nothing to embed.
+        assert!(plan_embedding_work(&[], &cold).is_empty());
     }
 
     #[tokio::test]

@@ -73,6 +73,21 @@ pub struct SegmentInsert {
     pub content: String,
     pub line_start: i64,
     pub line_end: i64,
+    /// Content-addressed key into `embedding_pool` for an embeddable segment,
+    /// resolved by the lookup-before-embed pipeline. `None` for non-embeddable
+    /// segments and for runs with no active embedder. When `Some`, the pool-aware
+    /// write path writes a `segment_vectors(segment_id, content_key)` reference
+    /// and reconciles the pool `ref_count`.
+    // Transient: produced by the lookup-before-embed pipeline (T3) but not read
+    // until the pool-aware write path (T4) consumes it. Remove this attribute
+    // when T4 wires `content_key` into the `segment_vectors` write.
+    #[allow(dead_code)]
+    pub content_key: Option<String>,
+    /// Serialized embedding vector for this segment, present only when the
+    /// content is *new* under the current model (a pool miss this run) and must
+    /// be inserted into `embedding_pool`. `None` for a pool hit (the shared
+    /// vector already exists) or a non-embeddable segment. Pairs with
+    /// `content_key`: a hit is `content_key: Some, embedding_vec: None`.
     pub embedding_vec: Option<String>,
     pub breadcrumb: Option<String>,
     pub complexity: i64,
@@ -200,6 +215,54 @@ async fn upsert_segment_record_for_context(
     replace_segment_symbols_for_context(conn, context_id, seg).await?;
 
     Ok(())
+}
+
+/// Returns the subset of `content_keys` that already exist in `embedding_pool`.
+///
+/// The lookup-before-embed pipeline uses this to embed only genuinely new
+/// content: any key already present resolves to its shared vector instead of
+/// being re-embedded (REQ-002). The check is batched in `SQLITE_MAX_PARAMS`-sized
+/// chunks so an arbitrarily large key set stays within the bound-parameter
+/// limit. Read-only: it never mutates the pool or `ref_count`.
+pub async fn existing_embedding_pool_keys(
+    conn: &Connection,
+    content_keys: &[&str],
+) -> Result<HashSet<String>, OneupError> {
+    let mut present = HashSet::new();
+    if content_keys.is_empty() {
+        return Ok(present);
+    }
+
+    for chunk in content_keys.chunks(queries::SQLITE_MAX_PARAMS) {
+        let mut sql = String::from(queries::SELECT_EMBEDDING_POOL_KEYS_PREFIX);
+        for i in 0..chunk.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            write!(sql, "?{}", i + 1).expect("write to String cannot fail");
+        }
+        sql.push(')');
+
+        let params: Vec<libsql::Value> =
+            chunk.iter().map(|key| (*key).to_string().into()).collect();
+
+        let mut rows = conn
+            .query(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("query embedding pool keys failed: {e}")))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Query(format!("embedding pool key iteration failed: {e}")))?
+        {
+            let key: String = row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("decode content_key failed: {e}")))?;
+            present.insert(key);
+        }
+    }
+
+    Ok(present)
 }
 
 /// Query all segments for a given file path, ordered by line_start.
@@ -2197,6 +2260,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_embedding_pool_keys_returns_only_present_keys() {
+        let (_db, conn) = setup().await;
+
+        let vector = serde_json::to_string(&vec![0.1f32; 384]).unwrap();
+        for key in ["key-present-a", "key-present-b"] {
+            conn.execute(
+                "INSERT INTO embedding_pool (content_key, embedding_vec, ref_count) \
+                 VALUES (?1, vector8(?2), 0)",
+                libsql::params![key, vector.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        // The lookup reports exactly the keys already stored, filtering out
+        // absent ones, so the pipeline embeds only genuinely new content.
+        let present =
+            existing_embedding_pool_keys(&conn, &["key-present-a", "key-absent", "key-present-b"])
+                .await
+                .unwrap();
+        assert_eq!(
+            present,
+            ["key-present-a".to_string(), "key-present-b".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+
+        // An empty query set short-circuits without touching the database.
+        assert!(existing_embedding_pool_keys(&conn, &[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn worktree_context_head_oid_write_read_roundtrip() {
         let (_db, conn) = setup().await;
 
@@ -2255,6 +2353,7 @@ mod tests {
             content: format!("fn {id}() {{ }}"),
             line_start: 1,
             line_end: 3,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,
@@ -3479,6 +3578,7 @@ mod tests {
             content: format!("segment {id}"),
             line_start,
             line_end: line_start + 2,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,

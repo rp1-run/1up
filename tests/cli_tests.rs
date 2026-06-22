@@ -1961,6 +1961,7 @@ fn seed_current_index_for_context(dir: &Path, context_id: &str) {
             content: "pub fn other_context_only() {}\n".to_string(),
             line_start: 1,
             line_end: 1,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,

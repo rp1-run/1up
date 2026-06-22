@@ -340,6 +340,13 @@ ON CONFLICT(id) DO UPDATE SET
     file_hash = excluded.file_hash,
     updated_at = datetime('now')";
 
+/// Prefix for a batched existence check against `embedding_pool`. The caller
+/// appends a comma-separated `?n` placeholder list (one per content key) and a
+/// closing `)`. The lookup-before-embed pipeline uses this to find which keys
+/// are already stored so it can embed only the misses (REQ-002).
+pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
+    "SELECT content_key FROM embedding_pool WHERE content_key IN (";
+
 pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT INTO segment_vectors (
     segment_id, embedding_vec, created_at, updated_at
