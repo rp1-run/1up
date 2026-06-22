@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::shared::config;
+use crate::shared::fs::atomic_replace_within_project_root;
 use crate::shared::types::{
     DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus, IndexProgress,
 };
@@ -43,6 +45,31 @@ fn read_daemon_context_status_file(project_root: &Path) -> Option<DaemonContextS
     let path = config::project_dot_dir(project_root).join(DAEMON_CONTEXT_STATUS_FILE_NAME);
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Remove the given context ids from `daemon_context_status.json` so pruned contexts
+/// stop appearing in status snapshots. Used by `1up gc --apply`. Returns how many
+/// entries were removed; a missing or unreadable file is treated as empty (no-op).
+/// The write is clamped to the project root, matching the daemon's own secure write.
+pub(crate) fn prune_daemon_context_status(
+    project_root: &Path,
+    context_ids: &HashSet<String>,
+) -> anyhow::Result<usize> {
+    let Some(mut file) = read_daemon_context_status_file(project_root) else {
+        return Ok(0);
+    };
+    let before = file.contexts.len();
+    file.contexts
+        .retain(|context_id, _| !context_ids.contains(context_id));
+    let removed = before - file.contexts.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let path = config::project_dot_dir(project_root).join(DAEMON_CONTEXT_STATUS_FILE_NAME);
+    let payload = serde_json::to_vec_pretty(&file)?;
+    atomic_replace_within_project_root(&path, &payload, project_root)?;
+    Ok(removed)
 }
 
 fn read_legacy_daemon_status(project_root: &Path) -> Option<DaemonProjectStatus> {

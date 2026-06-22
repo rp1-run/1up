@@ -529,6 +529,126 @@ fn seed_foreign_context_overview_rows(project: &Path, context_id: &str) {
     });
 }
 
+/// `delete_context` must remove every row for the target context — and only that
+/// context. Guards the `1up gc --apply` deletion path: context scoping has to isolate
+/// the prune so a live context is never collateral-damaged, and the pruned context
+/// must also disappear from `list_worktree_contexts` (its `worktree_contexts` row).
+#[test]
+fn delete_context_removes_only_the_target_context() {
+    use oneup::shared::types::{BranchStatus, WorktreeContext, WorktreeRole};
+
+    fn context(root: &Path, id: &str) -> WorktreeContext {
+        WorktreeContext {
+            context_id: id.to_string(),
+            state_root: root.to_path_buf(),
+            source_root: root.to_path_buf(),
+            main_worktree_root: root.to_path_buf(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some(id.to_string()),
+            branch_ref: Some(format!("refs/heads/{id}")),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".1up")).unwrap();
+    let db_path = root.join(".1up").join("index.db");
+
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        for id in ["ctx-keep", "ctx-prune"] {
+            let file = format!("{id}/a.rs");
+            let segment = SegmentInsert {
+                id: format!("{id}-seg"),
+                file_path: file.clone(),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!("pub fn {id}() {{}}\n"),
+                line_start: 1,
+                line_end: 1,
+                embedding_vec: None,
+                breadcrumb: None,
+                complexity: 1,
+                role: "DEFINITION".to_string(),
+                defined_symbols: format!("[\"{id}\"]"),
+                referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
+                file_hash: format!("{id}-hash"),
+            };
+            let meta = IndexedFileMeta {
+                extension: "rs".to_string(),
+                file_hash: segment.file_hash.clone(),
+                file_size: segment.content.len() as i64,
+                modified_ns: 1,
+            };
+            segments::replace_file_segments_for_context_tx_with_meta(
+                &conn,
+                id,
+                &file,
+                &[segment],
+                Some(&meta),
+            )
+            .await
+            .unwrap();
+            segments::upsert_worktree_context(&conn, &context(&root, id), "proj")
+                .await
+                .unwrap();
+        }
+
+        // Both contexts are present before the prune.
+        let listed = segments::list_worktree_contexts(&conn).await.unwrap();
+        assert_eq!(listed.len(), 2, "both contexts recorded before prune");
+
+        let counts = segments::delete_context(&conn, "ctx-prune").await.unwrap();
+        assert_eq!(
+            counts.segments, 1,
+            "one segment removed for the pruned context"
+        );
+        assert_eq!(counts.indexed_files, 1, "one indexed file removed");
+
+        // The pruned context is gone from every context-scoped surface...
+        assert_eq!(
+            segments::count_segments_for_context(&conn, "ctx-prune")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-prune")
+                .await
+                .unwrap(),
+            0
+        );
+        // ...including its worktree_contexts registry row.
+        let remaining = segments::list_worktree_contexts(&conn).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].context_id, "ctx-keep");
+
+        // The untouched context keeps all of its rows.
+        assert_eq!(
+            segments::count_segments_for_context(&conn, "ctx-keep")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            segments::count_files_for_context(&conn, "ctx-keep")
+                .await
+                .unwrap(),
+            1
+        );
+    });
+}
+
 impl Drop for McpTestClient {
     fn drop(&mut self) {
         let _ = self.child.kill();

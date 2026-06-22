@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
@@ -170,6 +171,22 @@ impl Registry {
         self.deregister_context_at_path(context, &config::projects_registry_path()?, &xdg_root)
     }
 
+    /// Remove every registry entry whose context id is in `context_ids`. Used by
+    /// `1up gc` to stop the daemon from re-watching (and so re-indexing) contexts
+    /// whose rows were just pruned from the shared index. Returns how many entries
+    /// were removed.
+    pub fn deregister_context_ids(
+        &mut self,
+        context_ids: &HashSet<String>,
+    ) -> Result<usize, OneupError> {
+        let xdg_root = ensure_secure_xdg_root()?;
+        self.deregister_context_ids_at_path(
+            context_ids,
+            &config::projects_registry_path()?,
+            &xdg_root,
+        )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.projects.is_empty()
     }
@@ -271,6 +288,26 @@ impl Registry {
         let mut latest = Self::load_from_path(path, approved_root)?;
         let removed = latest.remove_context(context);
         if removed {
+            latest.save_to_path(path, approved_root)?;
+        }
+        *self = latest;
+        Ok(removed)
+    }
+
+    fn deregister_context_ids_at_path(
+        &mut self,
+        context_ids: &HashSet<String>,
+        path: &Path,
+        approved_root: &Path,
+    ) -> Result<usize, OneupError> {
+        let _lock = acquire_registry_lock(approved_root)?;
+        let mut latest = Self::load_from_path(path, approved_root)?;
+        let before = latest.projects.len();
+        latest
+            .projects
+            .retain(|entry| !context_ids.contains(&entry.context_id()));
+        let removed = before - latest.projects.len();
+        if removed > 0 {
             latest.save_to_path(path, approved_root)?;
         }
         *self = latest;
