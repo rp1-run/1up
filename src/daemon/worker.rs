@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::cli::project_status_files::prune_daemon_context_status;
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
@@ -31,6 +32,7 @@ use crate::shared::types::{
     combine_degraded_reasons, DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus,
     DaemonRefreshState, DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
 };
+use crate::storage::segments::{self, IndexedContextRow};
 use crate::storage::{db::Db, schema};
 
 const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
@@ -466,6 +468,18 @@ async fn load_and_watch_projects(
 ) -> Result<(), OneupError> {
     let registry = Registry::load()?;
 
+    // Prune dead-worktree contexts (source directory gone) before building per-
+    // context state and watching, so they are neither re-indexed nor re-watched.
+    // Best-effort and non-blocking — it can never fail or block startup (see the
+    // routine). It deregisters every context it prunes, so reload the registry
+    // afterwards and watch only the survivors; contexts it did *not* prune (lock
+    // contended, no index DB, or a deregister hiccup) remain and still flow through
+    // `build_project_state`'s existing `SourceMissing` handling. Fall back to the
+    // pre-prune snapshot if the reload itself hiccups so this introduces no new
+    // startup failure.
+    prune_source_missing_contexts_on_startup(&registry).await;
+    let registry = Registry::load().unwrap_or(registry);
+
     for entry in &registry.projects {
         let Some(mut state) = build_project_state(entry).await? else {
             continue;
@@ -486,6 +500,150 @@ async fn load_and_watch_projects(
     }
 
     Ok(())
+}
+
+/// Select the recorded contexts whose source worktree directory no longer exists.
+///
+/// Pure and injected with `source_exists` so it is deterministic and
+/// unit-testable (the daemon passes `|p| p.exists()`). This mirrors the
+/// source-missing arm of `cli::gc::prune_reason`, but deliberately selects on
+/// *source-root absence alone*: unlike `1up gc`, the daemon's startup prune never
+/// touches stale-branch snapshots of a still-present worktree — those rebuild on
+/// demand and stay a manual decision. A context whose `source_root` still exists
+/// is therefore always retained, including a same-`state_root`, other-branch
+/// snapshot that shares a live worktree.
+pub fn source_missing_context_ids(
+    contexts: &[IndexedContextRow],
+    source_exists: &dyn Fn(&Path) -> bool,
+) -> Vec<String> {
+    contexts
+        .iter()
+        .filter(|ctx| !source_exists(&ctx.source_root))
+        .map(|ctx| ctx.context_id.clone())
+        .collect()
+}
+
+/// Best-effort startup prune of contexts whose source worktree directory has been
+/// removed (e.g. a deleted git worktree), so a dead context's rows do not linger
+/// in the shared index until a manual `1up gc`.
+///
+/// Scope is deliberately the *source-missing* subset only (via
+/// [`source_missing_context_ids`]) — never stale-branch snapshots of a live
+/// worktree, which stay a manual decision. The safety boundaries are all enforced
+/// here: the single-writer rebuild lock is taken **non-blocking** per index DB (a
+/// contended or un-openable DB is skipped this cycle, never waited on), **no
+/// `VACUUM`** runs on startup (deletes free pages for reuse without the exclusive
+/// compaction), and every step is best-effort so any error is logged and swallowed
+/// — a prune failure can never block or fail daemon startup. Registered entries
+/// are grouped by their shared `index.db` path, since linked worktrees share one
+/// index keyed by the main worktree's state root.
+async fn prune_source_missing_contexts_on_startup(registry: &Registry) {
+    // Linked worktrees share one `.1up/index.db` (keyed by the main worktree's
+    // state root), so visit each distinct index DB once. The first entry seen for
+    // a given DB path carries the state root used for its lock and bookkeeping.
+    let mut seen_dbs: HashSet<PathBuf> = HashSet::new();
+    let mut state_roots: Vec<PathBuf> = Vec::new();
+    for entry in &registry.projects {
+        if seen_dbs.insert(config::project_db_path(&entry.project_root)) {
+            state_roots.push(entry.project_root.clone());
+        }
+    }
+
+    for state_root in state_roots {
+        let pruned = prune_source_missing_contexts_for_state_root(&state_root).await;
+        if pruned.is_empty() {
+            continue;
+        }
+
+        // Best-effort bookkeeping so pruned contexts neither linger in the daemon
+        // status snapshot nor get re-watched. The index rows are already gone; a
+        // hiccup here is a warning, never a startup failure (mirrors `1up gc`).
+        // `deregister_context_ids` reloads the registry fresh so it does not clobber
+        // a concurrent registration.
+        let pruned_ids: HashSet<String> = pruned.iter().cloned().collect();
+        if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
+            warn!(
+                "failed to prune daemon status for source-missing contexts at {}: {err}",
+                state_root.display()
+            );
+        }
+        if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
+            warn!(
+                "failed to deregister source-missing contexts at {}: {err}",
+                state_root.display()
+            );
+        }
+        info!(
+            "pruned {} source-missing context(s) from {} on startup: {}",
+            pruned.len(),
+            state_root.display(),
+            pruned.join(", ")
+        );
+    }
+}
+
+/// Prune source-missing contexts from a single shared index DB, returning the ids
+/// that were deleted.
+///
+/// The non-blocking rebuild lock is held only across the read + delete and dropped
+/// when this function returns — before the caller does its registry/status
+/// bookkeeping — so the exclusive hold is bounded to the mutation. Returns an empty
+/// vec (never an error) when the DB is absent, the lock is contended, nothing is
+/// source-missing, or any step fails: every failure is logged and swallowed so the
+/// caller's startup path is never broken.
+async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<String> {
+    let db_path = config::project_db_path(state_root);
+    // A registered entry without an on-disk index yet has nothing to prune.
+    if !db_path.exists() {
+        return Vec::new();
+    }
+
+    // Non-blocking: a contended lock means a one-shot rebuild or another writer is
+    // active, so skip this DB this cycle rather than stalling startup. The guard
+    // releases on drop / `?` unwind, bounding the hold to this scope.
+    let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(state_root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            debug!(
+                "skipping source-missing prune for {}: rebuild lock held by another process",
+                state_root.display()
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            warn!(
+                "skipping source-missing prune for {}: {err}",
+                state_root.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    // Open RW, list contexts, and delete only the source-missing subset. NO
+    // `vacuum_database` here: startup never runs the exclusive compaction, so the
+    // deletes free pages for reuse without competing with the live index.
+    let pruned = async {
+        let db = Db::open_rw(&db_path).await?;
+        let conn = db.connect_tuned().await?;
+        let contexts = segments::list_worktree_contexts(&conn).await?;
+        let pruned = source_missing_context_ids(&contexts, &|p: &Path| p.exists());
+        for context_id in &pruned {
+            segments::delete_context(&conn, context_id).await?;
+        }
+        Ok::<_, OneupError>(pruned)
+    }
+    .await;
+
+    match pruned {
+        Ok(pruned) => pruned,
+        Err(err) => {
+            warn!(
+                "failed to prune source-missing contexts from {}: {err}",
+                db_path.display()
+            );
+            Vec::new()
+        }
+    }
 }
 
 async fn reload_projects(
@@ -2366,6 +2524,60 @@ mod tests {
             segment_count_via(&state.db).await,
             1,
             "the warm handle must keep serving the unchanged index"
+        );
+    }
+
+    fn context_row(context_id: &str, state_root: &str, source_root: &str) -> IndexedContextRow {
+        IndexedContextRow {
+            context_id: context_id.to_string(),
+            state_root: PathBuf::from(state_root),
+            source_root: PathBuf::from(source_root),
+            branch_name: None,
+        }
+    }
+
+    #[test]
+    fn source_missing_selects_only_contexts_whose_source_is_gone() {
+        let contexts = [
+            context_row("live00000001", "/repo", "/repo"),
+            context_row("gone00000001", "/repo", "/repo-feature"),
+        ];
+        // Only `/repo-feature` is gone; the live `/repo` context is retained.
+        let pruned = source_missing_context_ids(&contexts, &|p| p != Path::new("/repo-feature"));
+        assert_eq!(pruned, vec!["gone00000001".to_string()]);
+    }
+
+    #[test]
+    fn source_present_contexts_are_never_selected() {
+        // A live worktree plus a same-state_root, other-branch snapshot of it: both
+        // have a present source, so the startup prune leaves both alone (unlike
+        // `1up gc`, which would treat the snapshot as stale).
+        let contexts = [
+            context_row("active000001", "/repo", "/repo"),
+            context_row("oldbranch001", "/repo", "/repo"),
+        ];
+        assert!(source_missing_context_ids(&contexts, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn source_missing_on_empty_input_is_empty() {
+        assert!(source_missing_context_ids(&[], &|_| true).is_empty());
+        assert!(source_missing_context_ids(&[], &|_| false).is_empty());
+    }
+
+    #[test]
+    fn source_missing_selects_every_gone_context_and_keeps_the_live_one() {
+        let contexts = [
+            context_row("gone00000001", "/repo", "/wt-a"),
+            context_row("live00000001", "/repo", "/repo"),
+            context_row("gone00000002", "/repo", "/wt-b"),
+        ];
+        // Every context whose source is absent is selected, order-preserved; the
+        // single live context is the only one retained.
+        let pruned = source_missing_context_ids(&contexts, &|p| p == Path::new("/repo"));
+        assert_eq!(
+            pruned,
+            vec!["gone00000001".to_string(), "gone00000002".to_string()]
         );
     }
 }
