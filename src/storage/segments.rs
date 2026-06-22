@@ -199,20 +199,68 @@ async fn upsert_segment_record_for_context(
     .await
     .map_err(|e| StorageError::Query(format!("upsert segment failed: {e}")))?;
 
-    if let Some(embedding_vec) = &seg.embedding_vec {
+    write_segment_vector_reference(conn, seg).await?;
+
+    replace_segment_symbols_for_context(conn, context_id, seg).await?;
+
+    Ok(())
+}
+
+/// Reconcile one segment's `segment_vectors` reference and the pool `ref_count`
+/// it holds. The single-segment counterpart to [`batch_upsert_vectors`]:
+///
+/// - An embeddable segment (`content_key` set) points at its pooled vector. A
+///   pool miss (`embedding_vec` set) inserts the shared row idempotently first;
+///   a hit reuses the existing row. The reference is then incremented.
+/// - A non-embeddable segment (`content_key` `None`) drops any prior reference
+///   and decrements the pool row it used to hold.
+///
+/// The increment/decrement here are explicit because this path performs no
+/// preceding segment delete (unlike the replace path, where the
+/// `segments_vector_ad` trigger does the decrement). It is idempotent for the
+/// no-op case and safe to re-run.
+async fn write_segment_vector_reference(
+    conn: &Connection,
+    seg: &SegmentInsert,
+) -> Result<(), OneupError> {
+    let Some(content_key) = &seg.content_key else {
+        // Non-embeddable (or embedder-absent): give up any prior pool reference,
+        // then remove the now-orphaned segment_vectors row. The decrement must
+        // run first, while the row still names its content_key.
         conn.execute(
-            queries::UPSERT_SEGMENT_VECTOR,
-            libsql::params![seg.id.clone(), embedding_vec.clone()],
+            queries::DECREMENT_EMBEDDING_POOL_REF_COUNT_FOR_SEGMENT,
+            [seg.id.clone()],
         )
         .await
-        .map_err(|e| StorageError::Query(format!("upsert segment vector failed: {e}")))?;
-    } else {
+        .map_err(|e| StorageError::Query(format!("decrement pool ref_count failed: {e}")))?;
         conn.execute(queries::DELETE_SEGMENT_VECTOR, [seg.id.clone()])
             .await
             .map_err(|e| StorageError::Query(format!("delete segment vector failed: {e}")))?;
+        return Ok(());
+    };
+
+    if let Some(embedding_vec) = &seg.embedding_vec {
+        conn.execute(
+            queries::UPSERT_EMBEDDING_POOL,
+            libsql::params![content_key.clone(), embedding_vec.clone()],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("upsert embedding pool failed: {e}")))?;
     }
 
-    replace_segment_symbols_for_context(conn, context_id, seg).await?;
+    conn.execute(
+        queries::UPSERT_SEGMENT_VECTOR,
+        libsql::params![seg.id.clone(), content_key.clone()],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("upsert segment vector failed: {e}")))?;
+
+    conn.execute(
+        queries::INCREMENT_EMBEDDING_POOL_REF_COUNT,
+        libsql::params![content_key.clone(), 1_i64],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("increment pool ref_count failed: {e}")))?;
 
     Ok(())
 }
@@ -1826,23 +1874,101 @@ async fn batch_upsert_segments_for_context(
     Ok(())
 }
 
+/// Persist the pooled embedding references for one file's segments (REQ-001).
+///
+/// Each embeddable segment carries a `content_key`; a pool *miss* additionally
+/// carries the freshly embedded `embedding_vec` to be shared. The write proceeds
+/// in three ordered phases so the pool row always exists before anything counts
+/// against it:
+///
+/// 1. Insert pool rows for misses (`INSERT ... ON CONFLICT(content_key) DO
+///    NOTHING`) — idempotent across contexts and concurrent writers, storing
+///    each distinct `(model, content)` vector exactly once.
+/// 2. Insert the thin `segment_vectors(segment_id, content_key)` references.
+/// 3. Increment each pool row's `ref_count` by the number of references just
+///    written for its key, keeping `ref_count` equal to the referencing-row
+///    count.
+///
+/// Callers invoke this inside the per-file replace transaction *after*
+/// `delete_segments_by_file_only_for_context`, whose `segments_vector_ad` trigger
+/// has already decremented and removed the prior references, so the inserts here
+/// are fresh and the `+1`-per-row increment is exact.
 async fn batch_upsert_vectors(
     conn: &Connection,
     segments: &[SegmentInsert],
 ) -> Result<(), OneupError> {
-    let vec_segments: Vec<&SegmentInsert> = segments
+    let ref_segments: Vec<&SegmentInsert> = segments
+        .iter()
+        .filter(|seg| seg.content_key.is_some())
+        .collect();
+
+    if ref_segments.is_empty() {
+        return Ok(());
+    }
+
+    batch_upsert_embedding_pool(conn, &ref_segments).await?;
+    batch_insert_segment_vector_refs(conn, &ref_segments).await?;
+    batch_increment_pool_ref_counts(conn, &ref_segments).await?;
+
+    Ok(())
+}
+
+/// Phase 1: idempotently insert pool rows for the pool *misses* (segments
+/// carrying a freshly embedded vector). Hits already have a pool row and are
+/// skipped here.
+async fn batch_upsert_embedding_pool(
+    conn: &Connection,
+    ref_segments: &[&SegmentInsert],
+) -> Result<(), OneupError> {
+    let miss_segments: Vec<&&SegmentInsert> = ref_segments
         .iter()
         .filter(|seg| seg.embedding_vec.is_some())
         .collect();
 
-    if vec_segments.is_empty() {
+    if miss_segments.is_empty() {
         return Ok(());
     }
 
-    for chunk in vec_segments.chunks(queries::VECTOR_CHUNK_SIZE) {
+    for chunk in miss_segments.chunks(queries::POOL_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "INSERT INTO embedding_pool (\
+             content_key, embedding_vec, ref_count\
+             ) VALUES ",
+        );
+        let mut params: Vec<libsql::Value> =
+            Vec::with_capacity(chunk.len() * queries::POOL_INSERT_COLS);
+
+        for (i, seg) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let b = i * queries::POOL_INSERT_COLS;
+            write!(sql, "(?{}, vector8(?{}), 0)", b + 1, b + 2)
+                .expect("write to String cannot fail");
+
+            params.push(seg.content_key.clone().unwrap().into());
+            params.push(seg.embedding_vec.clone().unwrap().into());
+        }
+
+        sql.push_str(queries::EMBEDDING_POOL_UPSERT_CONFLICT_CLAUSE);
+
+        conn.execute(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("batch upsert embedding pool failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Phase 2: insert the per-segment `segment_vectors` references into the pool.
+async fn batch_insert_segment_vector_refs(
+    conn: &Connection,
+    ref_segments: &[&SegmentInsert],
+) -> Result<(), OneupError> {
+    for chunk in ref_segments.chunks(queries::VECTOR_CHUNK_SIZE) {
         let mut sql = String::from(
             "INSERT INTO segment_vectors (\
-             segment_id, embedding_vec, created_at, updated_at\
+             segment_id, content_key\
              ) VALUES ",
         );
         let mut params: Vec<libsql::Value> =
@@ -1853,16 +1979,10 @@ async fn batch_upsert_vectors(
                 sql.push_str(", ");
             }
             let b = i * queries::VECTOR_INSERT_COLS;
-            write!(
-                sql,
-                "(?{}, vector8(?{}), datetime('now'), datetime('now'))",
-                b + 1,
-                b + 2
-            )
-            .expect("write to String cannot fail");
+            write!(sql, "(?{}, ?{})", b + 1, b + 2).expect("write to String cannot fail");
 
             params.push(seg.id.clone().into());
-            params.push(seg.embedding_vec.clone().unwrap().into());
+            params.push(seg.content_key.clone().unwrap().into());
         }
 
         sql.push_str(queries::VECTOR_UPSERT_CONFLICT_CLAUSE);
@@ -1870,6 +1990,33 @@ async fn batch_upsert_vectors(
         conn.execute(&sql, params)
             .await
             .map_err(|e| StorageError::Query(format!("batch upsert vectors failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Phase 3: bump `ref_count` by the number of references written per distinct
+/// content key, so it equals the live referencing-row count.
+async fn batch_increment_pool_ref_counts(
+    conn: &Connection,
+    ref_segments: &[&SegmentInsert],
+) -> Result<(), OneupError> {
+    let mut counts: HashMap<&str, i64> = HashMap::new();
+    for seg in ref_segments {
+        let key = seg
+            .content_key
+            .as_deref()
+            .expect("ref_segments are filtered to content_key-bearing segments");
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    for (content_key, delta) in counts {
+        conn.execute(
+            queries::INCREMENT_EMBEDDING_POOL_REF_COUNT,
+            libsql::params![content_key.to_string(), delta],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("increment pool ref_count failed: {e}")))?;
     }
 
     Ok(())
@@ -2817,8 +2964,7 @@ mod tests {
     async fn upsert_stores_native_vector_embeddings() {
         let (_db, conn) = setup().await;
 
-        let mut seg = test_segment("seg1", "src/main.rs", "abc123");
-        seg.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        let seg = embedded_segment("seg1", "src/main.rs", "abc123", 0.5);
         upsert_segment(&conn, &seg).await.unwrap();
 
         let mut rows = conn
@@ -2880,10 +3026,10 @@ mod tests {
     async fn upsert_without_embedding_removes_existing_vector() {
         let (_db, conn) = setup().await;
 
-        let mut seg = test_segment("seg1", "src/main.rs", "abc123");
-        seg.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        let mut seg = embedded_segment("seg1", "src/main.rs", "abc123", 0.5);
         upsert_segment(&conn, &seg).await.unwrap();
 
+        seg.content_key = None;
         seg.embedding_vec = None;
         upsert_segment(&conn, &seg).await.unwrap();
 
@@ -2909,20 +3055,31 @@ mod tests {
             let mut seg = test_segment(&id, &format!("src/file_{i:03}.rs"), &format!("hash-{i}"));
             let mut embedding = vec![0.0f32; 384];
             embedding[i % 384] = 1.0;
-            seg.embedding_vec = Some(serde_json::to_string(&embedding).unwrap());
+            let vector_json = serde_json::to_string(&embedding).unwrap();
+            seg.content_key = Some(test_content_key(&vector_json));
+            seg.embedding_vec = Some(vector_json);
             segments.push(seg);
         }
 
         batch_upsert_segments(&conn, &segments).await.unwrap();
         batch_upsert_vectors(&conn, &segments).await.unwrap();
 
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM segment_vectors", ())
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let stored: i64 = row.get(0).unwrap();
-        assert_eq!(stored, 100);
+        let stored = count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await;
+        assert_eq!(stored, 100, "one reference row per embedded segment");
+
+        // The 100 orthogonal one-hot vectors are all distinct, so each maps to
+        // its own pool row referenced exactly once.
+        let pool_rows = count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await;
+        assert_eq!(pool_rows, 100, "distinct vectors store one pool row each");
+        let total_refs = count_rows(
+            &conn,
+            "SELECT COALESCE(SUM(ref_count), 0) FROM embedding_pool",
+        )
+        .await;
+        assert_eq!(
+            total_refs, 100,
+            "ref_count must equal the referencing-row count"
+        );
     }
 
     async fn count_rows(conn: &Connection, sql: &str) -> i64 {
@@ -2933,8 +3090,123 @@ mod tests {
 
     fn embedded_segment(id: &str, file_path: &str, file_hash: &str, fill: f32) -> SegmentInsert {
         let mut seg = test_segment(id, file_path, file_hash);
-        seg.embedding_vec = Some(serde_json::to_string(&vec![fill; 384]).unwrap());
+        let vector_json = serde_json::to_string(&vec![fill; 384]).unwrap();
+        // Mirror the pipeline contract: an embeddable segment carries both a
+        // content key and (for a pool miss) the vector. Keying on the vector
+        // bytes means identical embeddings share a pool row, distinct ones do
+        // not — the same dedup the production content key produces.
+        seg.content_key = Some(test_content_key(&vector_json));
+        seg.embedding_vec = Some(vector_json);
         seg
+    }
+
+    /// Deterministic stand-in for the pipeline's `embedding_content_key` in
+    /// storage-layer tests: a short hash of the embedding bytes, so equal
+    /// vectors collapse to one pool row and unequal vectors stay separate.
+    fn test_content_key(vector_json: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(vector_json.as_bytes());
+        let hash = hasher.finalize();
+        hash.iter().map(|b| format!("{b:02x}")).collect::<String>()[..32].to_string()
+    }
+
+    async fn pool_ref_count(conn: &Connection, content_key: &str) -> Option<i64> {
+        let mut rows = conn
+            .query(
+                "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+                [content_key],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().map(|row| row.get(0).unwrap())
+    }
+
+    #[tokio::test]
+    async fn pooled_write_shares_one_vector_across_contexts_with_matched_ref_count() {
+        // REQ-001 / T4 AC4: byte-identical content indexed in two contexts must
+        // store its embedding exactly once and count both references. Identical
+        // content => identical content_key, so the pool holds one row; the two
+        // distinct segment_vectors rows (one per context) both reference it.
+        let (_db, conn) = setup().await;
+        let file_path = "src/shared.rs";
+        let vector_json = serde_json::to_string(&vec![0.42f32; 384]).unwrap();
+        let shared_key = test_content_key(&vector_json);
+
+        let into_context = |context: &str| -> SegmentInsert {
+            let id = generate_segment_id(context, file_path, 1, 3);
+            let mut seg = test_segment(&id, file_path, "shared-hash");
+            seg.content_key = Some(shared_key.clone());
+            // Both contexts present the vector as a "miss" payload; the second
+            // pool insert is a no-op (ON CONFLICT DO NOTHING), proving the bytes
+            // are stored once regardless of how many contexts supply them.
+            seg.embedding_vec = Some(vector_json.clone());
+            seg
+        };
+
+        let ctx_a = into_context("ctx-a");
+        let ctx_b = into_context("ctx-b");
+        let a_segment_id = ctx_a.id.clone();
+        let b_segment_id = ctx_b.id.clone();
+        assert_ne!(a_segment_id, b_segment_id, "segment ids fold in context_id");
+
+        replace_file_segments_for_context_tx(&conn, "ctx-a", file_path, &[ctx_a])
+            .await
+            .unwrap();
+        replace_file_segments_for_context_tx(&conn, "ctx-b", file_path, &[ctx_b])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await,
+            1,
+            "shared content must store exactly one pooled embedding"
+        );
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await,
+            2,
+            "each context keeps its own reference into the shared pool row"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(2),
+            "ref_count equals the number of referencing segment_vectors rows"
+        );
+
+        // Re-indexing one context (delete-then-insert) must leave ref_count
+        // unchanged: the trigger decrements on the segment delete, the write
+        // re-increments. The invariant ref_count == referencing-row count holds.
+        let mut ctx_a_again = test_segment(&a_segment_id, file_path, "shared-hash");
+        ctx_a_again.content_key = Some(shared_key.clone());
+        ctx_a_again.embedding_vec = Some(vector_json.clone());
+        replace_file_segments_for_context_tx(&conn, "ctx-a", file_path, &[ctx_a_again])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(2),
+            "re-indexing a context must not drift ref_count"
+        );
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await,
+            1,
+            "re-indexing must not duplicate the shared pool row"
+        );
+
+        // Post-write invariant (mirrors the build-aside rebuild assertion): every
+        // pool row's ref_count equals its live referencing-row count.
+        let drifted = count_rows(
+            &conn,
+            "SELECT COUNT(*) FROM embedding_pool AS p \
+             WHERE p.ref_count != (\
+                SELECT COUNT(*) FROM segment_vectors AS sv WHERE sv.content_key = p.content_key\
+             )",
+        )
+        .await;
+        assert_eq!(
+            drifted, 0,
+            "no pool row's ref_count may drift from its references"
+        );
     }
 
     #[tokio::test]
@@ -3198,10 +3470,14 @@ mod tests {
 
         let mut main_old = generated_test_segment(main_context, file_path, "main-old");
         main_old.called_symbols = r#"["delete_main_relation"]"#.to_string();
-        main_old.embedding_vec = Some(serde_json::to_string(&vec![0.5f32; 384]).unwrap());
+        let main_old_vec = serde_json::to_string(&vec![0.5f32; 384]).unwrap();
+        main_old.content_key = Some(test_content_key(&main_old_vec));
+        main_old.embedding_vec = Some(main_old_vec);
         let mut linked_old = generated_test_segment(linked_context, file_path, "linked-old");
         linked_old.called_symbols = r#"["keep_linked_relation"]"#.to_string();
-        linked_old.embedding_vec = Some(serde_json::to_string(&vec![0.25f32; 384]).unwrap());
+        let linked_old_vec = serde_json::to_string(&vec![0.25f32; 384]).unwrap();
+        linked_old.content_key = Some(test_content_key(&linked_old_vec));
+        linked_old.embedding_vec = Some(linked_old_vec);
 
         let main_meta = IndexedFileMeta {
             extension: "rs".to_string(),
@@ -3236,7 +3512,9 @@ mod tests {
         .unwrap();
 
         let mut main_new = generated_test_segment(main_context, file_path, "main-new");
-        main_new.embedding_vec = Some(serde_json::to_string(&vec![0.75f32; 384]).unwrap());
+        let main_new_vec = serde_json::to_string(&vec![0.75f32; 384]).unwrap();
+        main_new.content_key = Some(test_content_key(&main_new_vec));
+        main_new.embedding_vec = Some(main_new_vec);
         let main_new_meta = IndexedFileMeta {
             extension: "rs".to_string(),
             file_hash: "main-new".to_string(),
@@ -3313,6 +3591,7 @@ mod tests {
         replacement_a_segment.called_symbols = r#"["replacement_a"]"#.to_string();
         let replacement_a = [replacement_a_segment];
         let mut replacement_b = test_segment("new_b_1", "src/b.rs", "new-b");
+        replacement_b.content_key = Some(test_content_key("not-a-vector"));
         replacement_b.embedding_vec = Some("not-a-vector".to_string());
         replacement_b.called_symbols = r#"["replacement_b"]"#.to_string();
         let replacement_b = [replacement_b];
@@ -3520,6 +3799,7 @@ mod tests {
 
         let new_a = test_segment("new_a", "src/a.rs", "new-hash");
         let mut bad_b = test_segment("bad_b", "src/b.rs", "b-hash");
+        bad_b.content_key = Some(test_content_key("not-a-vector"));
         bad_b.embedding_vec = Some("not-a-vector".to_string());
 
         let result = replace_file_batch_tx(

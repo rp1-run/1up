@@ -143,6 +143,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
     content_rowid='rowid'
 )";
 
+/// FTS sync triggers plus `segments_vector_ad`, the single decrement point for
+/// `embedding_pool.ref_count`. Because `recursive_triggers` defaults OFF, this
+/// trigger's own `DELETE FROM segment_vectors` fires no further trigger, so the
+/// decrement is done here (before the row is deleted, while its `content_key` is
+/// still readable) rather than via a `segment_vectors` AFTER DELETE trigger.
+/// Every segment removal — file re-index replace and whole-context delete alike
+/// — flows through here, keeping `ref_count` equal to the live referencing-row
+/// count without any application bookkeeping. The trigger only decrements; it
+/// never deletes a pool row, so a key dropping to zero references survives as a
+/// harmless orphan until the reference-aware `delete_context` sweep removes it.
 pub const CREATE_FTS_TRIGGERS: &str = "
 CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN
     INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -155,6 +165,11 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 CREATE TRIGGER IF NOT EXISTS segments_vector_ad AFTER DELETE ON segments BEGIN
+    UPDATE embedding_pool
+       SET ref_count = ref_count - 1
+     WHERE content_key IN (
+        SELECT content_key FROM segment_vectors WHERE segment_id = old.id
+     );
     DELETE FROM segment_vectors WHERE segment_id = old.id;
 END";
 
@@ -347,15 +362,41 @@ ON CONFLICT(id) DO UPDATE SET
 pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
     "SELECT content_key FROM embedding_pool WHERE content_key IN (";
 
+/// Idempotent insert of a shared pool vector. The vector bytes for a given
+/// `content_key` are a deterministic function of (model, content), so a key
+/// already present is left untouched (`DO NOTHING`) rather than rewritten —
+/// avoiding needless churn in the DiskANN index shadow tables. Concurrency-safe
+/// (REQ-001): two writers inserting the same new content collapse to one row.
+/// `ref_count` is reconciled separately (incremented on the `segment_vectors`
+/// write, decremented by the `segments_vector_ad` AFTER DELETE trigger).
+pub const UPSERT_EMBEDDING_POOL: &str = "
+INSERT INTO embedding_pool (content_key, embedding_vec, ref_count)
+VALUES (?1, vector8(?2), 0)
+ON CONFLICT(content_key) DO NOTHING";
+
+/// Add `?2` references to a pool row. Called once per distinct `content_key`
+/// written into `segment_vectors`, with `?2` set to the number of new
+/// referencing rows so `ref_count` stays equal to the referencing-row count.
+pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
+    "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
+
+/// Decrement one reference from the pool row a single segment referenced. Used
+/// by the test-only single-segment write path when it removes a segment's
+/// vector directly (the batch/replace path decrements via the
+/// `segments_vector_ad` AFTER DELETE trigger instead).
+pub const DECREMENT_EMBEDDING_POOL_REF_COUNT_FOR_SEGMENT: &str = "
+UPDATE embedding_pool
+   SET ref_count = ref_count - 1
+ WHERE content_key = (SELECT content_key FROM segment_vectors WHERE segment_id = ?1)";
+
 pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT INTO segment_vectors (
-    segment_id, embedding_vec, created_at, updated_at
+    segment_id, content_key
 ) VALUES (
-    ?1, vector8(?2), datetime('now'), datetime('now')
+    ?1, ?2
 )
 ON CONFLICT(segment_id) DO UPDATE SET
-    embedding_vec = excluded.embedding_vec,
-    updated_at = datetime('now')";
+    content_key = excluded.content_key";
 
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
 
@@ -1025,12 +1066,19 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = datetime('now')";
 
 /// Conflict clause appended to chunked multi-row vector inserts. Mirrors
-/// `UPSERT_SEGMENT_VECTOR`: updating in place avoids delete/reinsert churn in
-/// the DiskANN vector index shadow tables.
+/// `UPSERT_SEGMENT_VECTOR`: a `segment_vectors` row now carries only the
+/// `content_key` reference into `embedding_pool`, so a conflicting re-write of
+/// the same `segment_id` repoints it at its (re-derived) content key.
 pub const VECTOR_UPSERT_CONFLICT_CLAUSE: &str = "
 ON CONFLICT(segment_id) DO UPDATE SET
-    embedding_vec = excluded.embedding_vec,
-    updated_at = datetime('now')";
+    content_key = excluded.content_key";
+
+/// Conflict clause appended to chunked multi-row `embedding_pool` inserts.
+/// Mirrors [`UPSERT_EMBEDDING_POOL`]: a key already present keeps its existing
+/// (deterministic) vector and `ref_count`, so re-seeing shared content across
+/// contexts never rewrites the pooled vector.
+pub const EMBEDDING_POOL_UPSERT_CONFLICT_CLAUSE: &str = "
+ON CONFLICT(content_key) DO NOTHING";
 
 /// Maximum number of SQL parameters per statement to stay below SQLite limits.
 pub const SQLITE_MAX_PARAMS: usize = 999;
@@ -1047,8 +1095,13 @@ pub const RELATION_INSERT_COLS: usize = 7;
 /// Number of columns in a context-scoped segment_relations INSERT (positional params only).
 pub const CONTEXT_RELATION_INSERT_COLS: usize = 8;
 
-/// Number of columns in a segment_vectors INSERT (positional params only).
+/// Number of columns in a segment_vectors INSERT (positional params only):
+/// `(segment_id, content_key)`.
 pub const VECTOR_INSERT_COLS: usize = 2;
+
+/// Number of columns in an embedding_pool INSERT (positional params only):
+/// `(content_key, embedding_vec)`; `ref_count` is seeded by the literal `0`.
+pub const POOL_INSERT_COLS: usize = 2;
 
 /// Maximum rows per chunk for each table, derived from `SQLITE_MAX_PARAMS`.
 pub const SEGMENT_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SEGMENT_INSERT_COLS;
@@ -1056,6 +1109,7 @@ pub const SYMBOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SYMBOL_INSERT_COLS;
 pub const RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / RELATION_INSERT_COLS;
 pub const CONTEXT_RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / CONTEXT_RELATION_INSERT_COLS;
 pub const VECTOR_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / VECTOR_INSERT_COLS;
+pub const POOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / POOL_INSERT_COLS;
 
 // --- Overview digest aggregates ---------------------------------------------
 //
