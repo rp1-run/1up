@@ -411,6 +411,19 @@ UPDATE embedding_pool
    SET ref_count = ref_count - 1
  WHERE content_key = (SELECT content_key FROM segment_vectors WHERE segment_id = ?1)";
 
+/// Reference-aware garbage collection of the shared pool (REQ-004). The
+/// `segments_vector_ad` trigger decrements `ref_count` as segments are deleted
+/// but never removes a pool row, so a vector whose last referencer is gone
+/// lingers as a zero-ref orphan. `delete_context` runs this sweep after its
+/// context-scoped segment deletes to drop exactly those orphans, freeing the
+/// shared bytes and the DiskANN index entry. The `<= 0` floor is defensive: a
+/// correctly maintained count never goes negative, but any row at or below zero
+/// is unreferenced and safe to delete. Pool rows still referenced by another
+/// context keep `ref_count >= 1`, so this never touches a live vector — the
+/// per-context isolation guarantee (REQ-005).
+pub const DELETE_ORPHANED_EMBEDDING_POOL_ROWS: &str =
+    "DELETE FROM embedding_pool WHERE ref_count <= 0";
+
 pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT INTO segment_vectors (
     segment_id, content_key

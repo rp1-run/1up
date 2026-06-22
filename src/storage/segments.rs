@@ -1061,8 +1061,21 @@ pub struct ContextDeletionCounts {
 /// context-scoped table. Deleting `segments` cascades to `segment_vectors`,
 /// `segment_symbols`, and the FTS index via the schema's AFTER DELETE triggers, so
 /// only `segment_relations`, `indexed_files`, `segments`, and the `worktree_contexts`
-/// registry row are deleted explicitly. Idempotent: re-running on an already-pruned
-/// context deletes nothing and still succeeds, so a partial failure is safe to retry.
+/// registry row are deleted explicitly.
+///
+/// Reference-aware (REQ-004/005): embeddings are content-addressed and shared
+/// across contexts via `embedding_pool`. The `segments_vector_ad` trigger
+/// decrements `ref_count` as this context's segments are deleted, then the
+/// delete-at-zero sweep removes only the pool rows whose last referencer is now
+/// gone. A vector still referenced by another context keeps `ref_count >= 1` and
+/// survives, so deleting one context never disturbs another's embeddings.
+///
+/// This is the single convergence point for both removal paths — explicit
+/// `cli::gc` removal and the daemon startup source-missing prune — so both are
+/// reference-aware by construction.
+///
+/// Idempotent: re-running on an already-pruned context deletes nothing, sweeps
+/// no orphans, and still succeeds, so a partial failure is safe to retry.
 pub async fn delete_context(
     conn: &Connection,
     context_id: &str,
@@ -1081,6 +1094,12 @@ pub async fn delete_context(
         .execute(queries::DELETE_SEGMENTS_BY_CONTEXT, [context_id])
         .await
         .map_err(|e| StorageError::Query(format!("delete context segments failed: {e}")))?;
+    // The segment deletes above fired `segments_vector_ad`, decrementing the pool
+    // ref_count for each removed reference; now reclaim the rows that dropped to
+    // zero references. Runs after the deletes so the counts are settled.
+    conn.execute(queries::DELETE_ORPHANED_EMBEDDING_POOL_ROWS, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("prune orphaned pool vectors failed: {e}")))?;
     conn.execute(queries::DELETE_WORKTREE_CONTEXT, [context_id])
         .await
         .map_err(|e| StorageError::Query(format!("delete worktree context row failed: {e}")))?;
@@ -3206,6 +3225,93 @@ mod tests {
         assert_eq!(
             drifted, 0,
             "no pool row's ref_count may drift from its references"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_context_refcounts_shared_pool_row_and_frees_last_referencer() {
+        // REQ-004 / T6 AC4: a vector shared by two contexts is reference-counted
+        // on deletion. Removing one context must leave the shared pool row with
+        // ref_count == 1 (still resolvable by the survivor); removing the last
+        // referencer must drop it to zero and physically delete the pool row.
+        let (_db, conn) = setup().await;
+        let file_path = "src/shared.rs";
+        let vector_json = serde_json::to_string(&vec![0.17f32; 384]).unwrap();
+        let shared_key = test_content_key(&vector_json);
+
+        let into_context = |context: &str| -> SegmentInsert {
+            let id = generate_segment_id(context, file_path, 1, 3);
+            let mut seg = test_segment(&id, file_path, "shared-hash");
+            seg.content_key = Some(shared_key.clone());
+            seg.embedding_vec = Some(vector_json.clone());
+            seg
+        };
+
+        let ctx_a = into_context("ctx-a");
+        let ctx_b = into_context("ctx-b");
+        let b_segment_id = ctx_b.id.clone();
+
+        replace_file_segments_for_context_tx(&conn, "ctx-a", file_path, &[ctx_a])
+            .await
+            .unwrap();
+        replace_file_segments_for_context_tx(&conn, "ctx-b", file_path, &[ctx_b])
+            .await
+            .unwrap();
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(2),
+            "both contexts reference the one shared pool row"
+        );
+
+        // Delete the first context: the shared vector must survive because the
+        // second context still references it, with ref_count decremented to 1.
+        delete_context(&conn, "ctx-a").await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await,
+            1,
+            "a still-referenced shared vector must survive a context delete"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(1),
+            "the surviving context leaves ref_count == 1"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM segment_vectors AS sv \
+                 JOIN embedding_pool AS p ON p.content_key = sv.content_key \
+                 WHERE sv.segment_id = ?1",
+                [b_segment_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let b_resolves: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            b_resolves, 1,
+            "the surviving context still resolves the shared embedding through the pool"
+        );
+
+        // Delete the last referencer: ref_count reaches zero, so the pool row is
+        // physically removed by the delete-at-zero sweep this task adds.
+        delete_context(&conn, "ctx-b").await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await,
+            0,
+            "removing the last referencer frees the shared pool row"
+        );
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM segment_vectors").await,
+            0,
+            "no dangling references remain once the last context is gone"
+        );
+
+        // Idempotency (AC3): re-deleting an already-pruned context is a safe no-op
+        // and the sweep finds nothing left to remove.
+        delete_context(&conn, "ctx-b").await.unwrap();
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM embedding_pool").await,
+            0,
+            "re-deleting a pruned context must remain a safe no-op"
         );
     }
 
