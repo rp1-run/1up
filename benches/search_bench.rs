@@ -215,7 +215,7 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 ),
                 line_start: 1,
                 line_end: 5,
-                content_key: None,
+                content_key: Some(format!("auth-key-{idx}")),
                 embedding_vec: Some(
                     serde_json::to_string(&embedding_with(&[
                         (0, 0.95),
@@ -248,7 +248,7 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 ),
                 line_start: 1,
                 line_end: 8,
-                content_key: None,
+                content_key: Some(format!("config-key-{idx}")),
                 embedding_vec: Some(
                     serde_json::to_string(&embedding_with(&[
                         (2, 0.92),
@@ -281,7 +281,7 @@ fn setup_retrieval_db() -> (tempfile::TempDir, std::path::PathBuf, Vec<f32>, Str
                 ),
                 line_start: 1,
                 line_end: 7,
-                content_key: None,
+                content_key: Some(format!("billing-key-{idx}")),
                 embedding_vec: Some(
                     serde_json::to_string(&embedding_with(&[
                         (4, 0.93),
