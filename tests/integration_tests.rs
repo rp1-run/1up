@@ -590,6 +590,106 @@ async fn write_pooled_segment(
     .unwrap();
 }
 
+/// Re-index / replace-in-place refcount reconciliation (REQ-002 delta-on-re-embed).
+/// Re-writing a file whose content_key is UNCHANGED nets zero (the replace path
+/// decrements via the `segments_vector_ad` trigger, then re-increments). Re-writing
+/// with a CHANGED content_key seeds the new key at 1 and decrements the superseded
+/// key to 0 — that orphan is reclaimed later by `delete_context`'s sweep, not by the
+/// per-file replace path (orphan reclamation is centralized in `delete_context`).
+#[test]
+fn pooled_reindex_reconciles_ref_counts() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".1up")).unwrap();
+    let db_path = root.join(".1up").join("index.db");
+
+    let seg = |file: &str, key: &str, vector: &str, line: i64| -> SegmentInsert {
+        SegmentInsert {
+            id: format!("rx-{file}-seg"),
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: format!("pub fn item_{line}() {{}}\n"),
+            line_start: line,
+            line_end: line,
+            content_key: Some(key.to_string()),
+            embedding_vec: Some(vector.to_string()),
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"item\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("rx-{file}-hash"),
+        }
+    };
+
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        // Initial index: stable.rs (k-stable) + churn.rs (k-v1).
+        write_pooled_segment(
+            &conn,
+            "rx",
+            "stable.rs",
+            seg("stable.rs", "k-stable", &pool_vector_json(0.30), 1),
+        )
+        .await;
+        write_pooled_segment(
+            &conn,
+            "rx",
+            "churn.rs",
+            seg("churn.rs", "k-v1", &pool_vector_json(0.40), 2),
+        )
+        .await;
+        assert_eq!(pool_ref_count(&conn, "k-stable").await, Some(1));
+        assert_eq!(pool_ref_count(&conn, "k-v1").await, Some(1));
+        assert_eq!(pool_row_count(&conn).await, 2);
+
+        // Re-index stable.rs with the SAME content_key (unchanged content): net-zero.
+        write_pooled_segment(
+            &conn,
+            "rx",
+            "stable.rs",
+            seg("stable.rs", "k-stable", &pool_vector_json(0.30), 1),
+        )
+        .await;
+        assert_eq!(
+            pool_ref_count(&conn, "k-stable").await,
+            Some(1),
+            "re-indexing unchanged content nets zero (decrement-then-reinsert keeps ref_count at 1)"
+        );
+
+        // Re-index churn.rs with a CHANGED content_key: new key seeded, old key decremented.
+        write_pooled_segment(
+            &conn,
+            "rx",
+            "churn.rs",
+            seg("churn.rs", "k-v2", &pool_vector_json(0.50), 2),
+        )
+        .await;
+        assert_eq!(
+            pool_ref_count(&conn, "k-v2").await,
+            Some(1),
+            "changed content seeds the new content_key at ref_count 1"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, "k-v1").await,
+            Some(0),
+            "the superseded content_key is decremented to 0 (orphan reclaimed later by delete_context, not the replace path)"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, "k-stable").await,
+            Some(1),
+            "the unrelated file's content_key is untouched by churn.rs re-index"
+        );
+    });
+}
+
 /// Cross-context dedup (REQ-001) and delta-only embedding (REQ-002) through the
 /// production per-file write path (`replace_file_segments_for_context_tx_with_meta`).
 ///
