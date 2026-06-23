@@ -272,11 +272,20 @@ async fn fetch_vector_candidates_ann(
     scope: &SearchScope,
     serialized_embedding: &str,
 ) -> Result<Vec<CandidateRow>, OneupError> {
-    let prefilter_k = vector_prefilter_k(conn).await?;
+    // `vector_top_k` over the pool index returns distinct pool vectors; the
+    // context-scaled over-fetch ensures enough survive the per-context fan-out
+    // filter, after which we truncate back to the base budget K so the ANN path
+    // yields the same candidate count as the exhaustive path.
+    let over_fetch = vector_prefilter_k(conn).await?;
     let mut rows = conn
         .query(
             queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
-            libsql::params![serialized_embedding, prefilter_k as i64, scope.context_id()],
+            libsql::params![
+                serialized_embedding,
+                over_fetch as i64,
+                scope.context_id(),
+                VECTOR_PREFILTER_K as i64
+            ],
         )
         .await
         .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
@@ -585,6 +594,7 @@ mod tests {
 
     use crate::storage::db::Db;
     use crate::storage::schema;
+    use sha2::{Digest, Sha256};
 
     fn embedding_with(values: &[(usize, f32)]) -> Vec<f32> {
         let mut embedding = vec![0.0; 384];
@@ -592,6 +602,17 @@ mod tests {
             embedding[*idx] = *value;
         }
         embedding
+    }
+
+    /// Content-addressed key for a serialized embedding, mirroring the production
+    /// pool write: identical vectors hash to one key and therefore collapse to a
+    /// single `embedding_pool` row, so seeding the same embedding for two segments
+    /// faithfully reproduces cross-segment sharing.
+    fn test_content_key(serialized_embedding: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serialized_embedding.as_bytes());
+        let hash = hasher.finalize();
+        hash.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     async fn insert_segment(
@@ -620,10 +641,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                let content_key = test_content_key(&embedding);
                 conn.execute(
-                    "INSERT INTO segment_vectors (segment_id, embedding_vec, created_at, updated_at)
-                     VALUES (?1, vector8(?2), datetime('now'), datetime('now'))",
-                    libsql::params![id, embedding],
+                    "INSERT INTO embedding_pool (content_key, embedding_vec, ref_count)
+                     VALUES (?1, vector8(?2), 1)
+                     ON CONFLICT(content_key) DO UPDATE SET ref_count = ref_count + 1",
+                    libsql::params![content_key.clone(), embedding],
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO segment_vectors (segment_id, content_key) VALUES (?1, ?2)",
+                    libsql::params![id, content_key],
                 )
                 .await
                 .unwrap();
@@ -1002,6 +1031,68 @@ mod tests {
 
         assert!(!candidates.is_empty(), "vector_top_k returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");
+    }
+
+    // TDD (REQ-003 / T5 AC2+AC3): under pooling, the ANN `vector_top_k` returns
+    // one row per distinct pool vector, so the query must fan out to every
+    // `segment_vectors` reference sharing that `content_key` (AC2). This is the
+    // discriminating assertion — a missing/wrong fan-out join yields the wrong
+    // rows (verified: it returns 2 unrelated rows instead of all 5). The expected
+    // ascending-id ordering documents the `ORDER BY v.rank, s.id` tiebreak
+    // contract (AC3); it guarantees determinism independent of query plan even
+    // though the current libSQL plan already scans `segment_vectors` by its
+    // segment-id PK. The full pre/post search-identical guard runs in T7.
+    #[tokio::test]
+    async fn ann_path_fans_out_shared_pool_row_with_deterministic_tiebreak() {
+        let conn = setup().await;
+
+        // Five segments share one embedding -> a single pool row with five
+        // references. Insert in descending id order to defeat any natural
+        // insertion-order ranking.
+        let shared = embedding_with(&[(0, 1.0)]);
+        for id in ["seg-e", "seg-d", "seg-c", "seg-b", "seg-a"] {
+            insert_segment(
+                &conn,
+                id,
+                &format!("src/{id}.rs"),
+                "fn shared() {}",
+                Some(&shared),
+            )
+            .await;
+        }
+        // A distinct, far vector that must not interleave with the shared set.
+        let far = embedding_with(&[(7, 1.0)]);
+        insert_segment(&conn, "seg-z", "src/z.rs", "fn z() {}", Some(&far)).await;
+
+        // The shared content collapses to exactly one pool row (the fan-out
+        // source); the far vector adds the second.
+        let pool_rows: i64 = {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM embedding_pool", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        assert_eq!(pool_rows, 2, "identical content must share one pool row");
+
+        let query = serialize_query_embedding(&shared).unwrap();
+        let candidates =
+            fetch_vector_candidates_ann(&conn, &SearchScope::default_context(), &query)
+                .await
+                .unwrap();
+
+        // One pool row fanned out to all five referencing segments, ordered by
+        // ascending segment id (not the descending insertion order).
+        let shared_ids: Vec<&str> = candidates
+            .iter()
+            .map(|c| c.segment_id.as_str())
+            .filter(|id| id.starts_with("seg-") && *id != "seg-z")
+            .collect();
+        assert_eq!(
+            shared_ids,
+            vec!["seg-a", "seg-b", "seg-c", "seg-d", "seg-e"],
+            "the shared pool vector must fan out to every reference, tie-broken by ascending segment id"
+        );
     }
 
     #[tokio::test]

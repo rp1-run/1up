@@ -433,6 +433,7 @@ fn seed_current_index_for_context(project: &Path, context_id: &str) {
             content: "pub fn other_context_only() {}\n".to_string(),
             line_start: 1,
             line_end: 1,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,
@@ -500,6 +501,7 @@ fn seed_foreign_context_overview_rows(project: &Path, context_id: &str) {
             content: "type ForeignLeakWidget struct {\n\tValue int\n}\n".to_string(),
             line_start: 1,
             line_end: 3,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,
@@ -529,10 +531,202 @@ fn seed_foreign_context_overview_rows(project: &Path, context_id: &str) {
     });
 }
 
+/// The 384-dim vector JSON that a `SegmentInsert` carries as its pool "miss"
+/// payload (`embedding_vec`), mirroring the indexer write contract. The fill
+/// value only has to be deterministic; pooling here is driven by the explicit
+/// `content_key`, the dedup primitive the production `embedding_content_key`
+/// produces.
+fn pool_vector_json(fill: f32) -> String {
+    serde_json::to_string(&vec![fill; 384]).unwrap()
+}
+
+/// Total rows in the content-addressed `embedding_pool` — the count of distinct
+/// stored embeddings across every context.
+async fn pool_row_count(conn: &libsql::Connection) -> i64 {
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM embedding_pool", ())
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+/// The reference count recorded for a pooled embedding, or `None` if no pool row
+/// exists for `content_key` (i.e. it was reclaimed by the delete-at-zero sweep).
+async fn pool_ref_count(conn: &libsql::Connection, content_key: &str) -> Option<i64> {
+    let mut rows = conn
+        .query(
+            "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+            [content_key],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().map(|row| row.get(0).unwrap())
+}
+
+/// Write a single pooled segment through the production per-file transaction
+/// (`replace_file_segments_for_context_tx_with_meta`) — the path the indexer
+/// uses — so the pool upsert, the `segment_vectors` reference, and `ref_count`
+/// seeding all run exactly as in production.
+async fn write_pooled_segment(
+    conn: &libsql::Connection,
+    context: &str,
+    file: &str,
+    seg: SegmentInsert,
+) {
+    let meta = IndexedFileMeta {
+        extension: "rs".to_string(),
+        file_hash: seg.file_hash.clone(),
+        file_size: seg.content.len() as i64,
+        modified_ns: 1,
+    };
+    segments::replace_file_segments_for_context_tx_with_meta(
+        conn,
+        context,
+        file,
+        &[seg],
+        Some(&meta),
+    )
+    .await
+    .unwrap();
+}
+
+/// Cross-context dedup (REQ-001) and delta-only embedding (REQ-002) through the
+/// production per-file write path (`replace_file_segments_for_context_tx_with_meta`).
+///
+/// Cold-start: a fresh context with all-distinct content stores one pool row per
+/// segment (REQ-002 no-regression — everything is embedded). A second context that
+/// reuses one content's `content_key` and adds one new content grows the pool by
+/// exactly one row — the shared content is reused, not re-stored, so only the delta
+/// would reach the embedder (REQ-002). The shared embedding ends with `ref_count == 2`
+/// (REQ-001: stored once, referenced by both contexts); each unique content keeps
+/// `ref_count == 1`.
+#[test]
+fn pooled_index_dedups_shared_content_and_embeds_only_deltas() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".1up")).unwrap();
+    let db_path = root.join(".1up").join("index.db");
+
+    // Identical content across contexts => identical content_key + identical
+    // bytes => one shared pool row. Distinct contents get distinct keys/bytes.
+    let shared_key = "key-shared".to_string();
+    let shared_vec = pool_vector_json(0.10);
+
+    let pooled_segment =
+        |context: &str, file: &str, key: &str, vector: &str, line: i64| -> SegmentInsert {
+            SegmentInsert {
+                id: format!("{context}-{file}-seg"),
+                file_path: file.to_string(),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: format!("pub fn item_{line}() {{}}\n"),
+                line_start: line,
+                line_end: line,
+                content_key: Some(key.to_string()),
+                embedding_vec: Some(vector.to_string()),
+                breadcrumb: None,
+                complexity: 1,
+                role: "DEFINITION".to_string(),
+                defined_symbols: "[\"item\"]".to_string(),
+                referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
+                file_hash: format!("{context}-{file}-hash"),
+            }
+        };
+
+    block_on(async {
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        // Cold start (ctx-a): two files with distinct content -> two pool rows,
+        // each referenced once. No prior overlap, so everything is "embedded".
+        let unique_a = pool_vector_json(0.20);
+        write_pooled_segment(
+            &conn,
+            "ctx-a",
+            "shared.rs",
+            pooled_segment("ctx-a", "shared.rs", &shared_key, &shared_vec, 1),
+        )
+        .await;
+        write_pooled_segment(
+            &conn,
+            "ctx-a",
+            "only_a.rs",
+            pooled_segment("ctx-a", "only_a.rs", "key-only-a", &unique_a, 2),
+        )
+        .await;
+
+        assert_eq!(
+            pool_row_count(&conn).await,
+            2,
+            "cold-start context embeds every distinct content (one pool row each)"
+        );
+        assert_eq!(pool_ref_count(&conn, &shared_key).await, Some(1));
+        assert_eq!(pool_ref_count(&conn, "key-only-a").await, Some(1));
+
+        // Second context (ctx-b): reuses the shared content_key and adds one new
+        // content. The pool grows by exactly one row -> the shared content was
+        // reused (only the delta would be embedded), not re-stored.
+        let unique_b = pool_vector_json(0.30);
+        write_pooled_segment(
+            &conn,
+            "ctx-b",
+            "shared.rs",
+            pooled_segment("ctx-b", "shared.rs", &shared_key, &shared_vec, 1),
+        )
+        .await;
+        write_pooled_segment(
+            &conn,
+            "ctx-b",
+            "only_b.rs",
+            pooled_segment("ctx-b", "only_b.rs", "key-only-b", &unique_b, 3),
+        )
+        .await;
+
+        assert_eq!(
+            pool_row_count(&conn).await,
+            3,
+            "overlapping context stores only its new content (shared content reused, not re-embedded)"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(2),
+            "the shared embedding is stored once and referenced by both contexts (REQ-001)"
+        );
+        assert_eq!(pool_ref_count(&conn, "key-only-a").await, Some(1));
+        assert_eq!(pool_ref_count(&conn, "key-only-b").await, Some(1));
+
+        // Every pool row's ref_count equals its live referencing-row count.
+        let mut drift = conn
+            .query(
+                "SELECT COUNT(*) FROM embedding_pool AS p \
+                 WHERE p.ref_count != (\
+                    SELECT COUNT(*) FROM segment_vectors AS sv \
+                    WHERE sv.content_key = p.content_key\
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+        let drifted: i64 = drift.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            drifted, 0,
+            "no pool row's ref_count may drift from its references"
+        );
+    });
+}
+
 /// `delete_context` must remove every row for the target context — and only that
 /// context. Guards the `1up gc --apply` deletion path: context scoping has to isolate
 /// the prune so a live context is never collateral-damaged, and the pruned context
 /// must also disappear from `list_worktree_contexts` (its `worktree_contexts` row).
+///
+/// Adapted to the shared-store model (REQ-004/005): both contexts share one pooled
+/// embedding, so pruning one must leave the shared vector intact for the survivor
+/// (reference-counted, not unconditional, deletion) rather than orphaning it.
 #[test]
 fn delete_context_removes_only_the_target_context() {
     use oneup::shared::types::{BranchStatus, WorktreeContext, WorktreeRole};
@@ -563,6 +757,12 @@ fn delete_context_removes_only_the_target_context() {
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
 
+        // Both contexts reference one shared pooled embedding (same content_key +
+        // bytes), so deleting one must reference-count it down rather than orphan
+        // the survivor's vector.
+        let shared_key = "key-shared-del".to_string();
+        let shared_vec = pool_vector_json(0.40);
+
         for id in ["ctx-keep", "ctx-prune"] {
             let file = format!("{id}/a.rs");
             let segment = SegmentInsert {
@@ -573,7 +773,8 @@ fn delete_context_removes_only_the_target_context() {
                 content: format!("pub fn {id}() {{}}\n"),
                 line_start: 1,
                 line_end: 1,
-                embedding_vec: None,
+                content_key: Some(shared_key.clone()),
+                embedding_vec: Some(shared_vec.clone()),
                 breadcrumb: None,
                 complexity: 1,
                 role: "DEFINITION".to_string(),
@@ -607,6 +808,14 @@ fn delete_context_removes_only_the_target_context() {
         // Both contexts are present before the prune.
         let listed = segments::list_worktree_contexts(&conn).await.unwrap();
         assert_eq!(listed.len(), 2, "both contexts recorded before prune");
+
+        // The shared embedding is stored once and referenced by both contexts.
+        assert_eq!(
+            pool_row_count(&conn).await,
+            1,
+            "the shared content is pooled exactly once"
+        );
+        assert_eq!(pool_ref_count(&conn, &shared_key).await, Some(2));
 
         let counts = segments::delete_context(&conn, "ctx-prune").await.unwrap();
         assert_eq!(
@@ -646,6 +855,43 @@ fn delete_context_removes_only_the_target_context() {
                 .unwrap(),
             1
         );
+
+        // Reference-counted deletion (REQ-004/005): pruning ctx-prune decremented
+        // the shared embedding to a single reference rather than deleting it, so
+        // the survivor's vector is intact and still resolves through the pool.
+        assert_eq!(
+            pool_row_count(&conn).await,
+            1,
+            "a still-referenced shared embedding survives a context delete"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(1),
+            "the surviving context leaves ref_count == 1"
+        );
+        let mut resolves = conn
+            .query(
+                "SELECT COUNT(*) FROM segment_vectors AS sv \
+                 JOIN embedding_pool AS p ON p.content_key = sv.content_key \
+                 WHERE sv.segment_id = ?1",
+                ["ctx-keep-seg"],
+            )
+            .await
+            .unwrap();
+        let keep_resolves: i64 = resolves.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            keep_resolves, 1,
+            "the surviving context still resolves the shared embedding through the pool"
+        );
+
+        // Removing the last referencer (ctx-keep) drops ref_count to zero, so the
+        // delete-at-zero sweep reclaims the now-orphaned pooled embedding (REQ-004).
+        segments::delete_context(&conn, "ctx-keep").await.unwrap();
+        assert_eq!(
+            pool_row_count(&conn).await,
+            0,
+            "removing the last referencer frees the shared pooled embedding"
+        );
     });
 }
 
@@ -656,6 +902,10 @@ fn delete_context_removes_only_the_target_context() {
 /// a hardcoded id) drives which context's rows are removed, the live one's rows and
 /// its `worktree_contexts` row survive, and no stale-branch snapshot of the live
 /// worktree is ever in scope.
+///
+/// Adapted to the shared-store model (REQ-005): both contexts share one pooled
+/// embedding, so the prune must reference-count it down and leave the live
+/// context's vector intact rather than deleting it.
 #[cfg(unix)]
 #[test]
 fn startup_prune_removes_only_source_missing_contexts() {
@@ -699,6 +949,12 @@ fn startup_prune_removes_only_source_missing_contexts() {
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
 
+        // Both linked-worktree contexts reference one shared pooled embedding, so
+        // the startup prune of the source-missing context must reference-count it
+        // down rather than delete a vector the live context still uses.
+        let shared_key = "key-shared-prune".to_string();
+        let shared_vec = pool_vector_json(0.50);
+
         for (id, source_root) in [("ctx-live", &live_source), ("ctx-gone", &gone_source)] {
             let file = format!("{id}/a.rs");
             let segment = SegmentInsert {
@@ -709,7 +965,8 @@ fn startup_prune_removes_only_source_missing_contexts() {
                 content: format!("pub fn {id}() {{}}\n"),
                 line_start: 1,
                 line_end: 1,
-                embedding_vec: None,
+                content_key: Some(shared_key.clone()),
+                embedding_vec: Some(shared_vec.clone()),
                 breadcrumb: None,
                 complexity: 1,
                 role: "DEFINITION".to_string(),
@@ -749,6 +1006,14 @@ fn startup_prune_removes_only_source_missing_contexts() {
             "only the source-missing context is selected; the live one is retained"
         );
 
+        // The shared embedding is stored once and referenced by both contexts.
+        assert_eq!(
+            pool_row_count(&conn).await,
+            1,
+            "the shared content is pooled exactly once"
+        );
+        assert_eq!(pool_ref_count(&conn, &shared_key).await, Some(2));
+
         // Apply the prune exactly as the startup routine does.
         for context_id in &pruned {
             segments::delete_context(&conn, context_id).await.unwrap();
@@ -784,6 +1049,20 @@ fn startup_prune_removes_only_source_missing_contexts() {
                 .await
                 .unwrap(),
             1
+        );
+
+        // The startup prune is reference-aware (REQ-005): removing the
+        // source-missing context decremented the shared embedding to one
+        // reference instead of deleting a vector the live context still uses.
+        assert_eq!(
+            pool_row_count(&conn).await,
+            1,
+            "the live context's shared embedding survives the startup prune"
+        );
+        assert_eq!(
+            pool_ref_count(&conn, &shared_key).await,
+            Some(1),
+            "the surviving live context leaves ref_count == 1"
         );
     });
 }

@@ -1952,6 +1952,7 @@ mod tests {
             content: format!("fn {id}() {{}}"),
             line_start: 1,
             line_end: 1,
+            content_key: None,
             embedding_vec: None,
             breadcrumb: None,
             complexity: 1,

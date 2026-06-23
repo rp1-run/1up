@@ -51,12 +51,26 @@ pub const CREATE_INDEX_LANGUAGE: &str =
 pub const CREATE_INDEX_FILE_HASH: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
 
+/// Content-addressed embedding store. One row per distinct `(model_id,
+/// embedding_dim, embed_input)` content key, holding the shared vector bytes and
+/// the DiskANN index. `ref_count` tracks how many `segment_vectors` rows
+/// reference the row across every context; a row is physically deleted only when
+/// its last referencing segment is gone (centralized in `delete_context`).
+pub const CREATE_EMBEDDING_POOL_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS embedding_pool (
+    content_key TEXT PRIMARY KEY,
+    embedding_vec FLOAT8(384) NOT NULL,
+    ref_count INTEGER NOT NULL DEFAULT 0
+)";
+
+/// Per-segment reference into [`CREATE_EMBEDDING_POOL_TABLE`]. The vector bytes
+/// no longer live inline here; `content_key` points at the shared
+/// `embedding_pool` row so byte-identical content across contexts shares a
+/// single stored embedding.
 pub const CREATE_SEGMENT_VECTORS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_vectors (
     segment_id TEXT PRIMARY KEY,
-    embedding_vec FLOAT8(384) NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    content_key TEXT NOT NULL
 )";
 
 pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
@@ -91,8 +105,8 @@ CREATE TABLE IF NOT EXISTS segment_relations (
     )
 )";
 
-pub const CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING: &str =
-    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_segment_vectors_embedding ON segment_vectors (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
+pub const CREATE_INDEX_EMBEDDING_POOL_EMBEDDING: &str =
+    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_embedding_pool_embedding ON embedding_pool (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(context_id, canonical_symbol, reference_kind)";
@@ -129,6 +143,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
     content_rowid='rowid'
 )";
 
+/// FTS sync triggers plus `segments_vector_ad`, the single decrement point for
+/// `embedding_pool.ref_count`. Because `recursive_triggers` defaults OFF, this
+/// trigger's own `DELETE FROM segment_vectors` fires no further trigger, so the
+/// decrement is done here (before the row is deleted, while its `content_key` is
+/// still readable) rather than via a `segment_vectors` AFTER DELETE trigger.
+/// Every segment removal — file re-index replace and whole-context delete alike
+/// — flows through here, keeping `ref_count` equal to the live referencing-row
+/// count without any application bookkeeping. The trigger only decrements; it
+/// never deletes a pool row, so a key dropping to zero references survives as a
+/// harmless orphan until the reference-aware `delete_context` sweep removes it.
 pub const CREATE_FTS_TRIGGERS: &str = "
 CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN
     INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -141,6 +165,11 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 CREATE TRIGGER IF NOT EXISTS segments_vector_ad AFTER DELETE ON segments BEGIN
+    UPDATE embedding_pool
+       SET ref_count = ref_count - 1
+     WHERE content_key IN (
+        SELECT content_key FROM segment_vectors WHERE segment_id = old.id
+     );
     DELETE FROM segment_vectors WHERE segment_id = old.id;
 END";
 
@@ -167,7 +196,7 @@ DROP TRIGGER IF EXISTS segments_au;
 DROP TRIGGER IF EXISTS segments_vector_ad;
 DROP TRIGGER IF EXISTS segments_symbol_ad;
 DROP TABLE IF EXISTS segments_fts;
-DROP INDEX IF EXISTS idx_segment_vectors_embedding;
+DROP INDEX IF EXISTS idx_embedding_pool_embedding;
 DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP INDEX IF EXISTS idx_segment_relations_source;
@@ -175,6 +204,7 @@ DROP INDEX IF EXISTS idx_segment_relations_target;
 DROP INDEX IF EXISTS idx_segment_relations_lookup_target;
 DROP INDEX IF EXISTS idx_indexed_files_context_path;
 DROP TABLE IF EXISTS segment_vectors;
+DROP TABLE IF EXISTS embedding_pool;
 DROP TABLE IF EXISTS segment_symbols;
 DROP TABLE IF EXISTS segment_relations;
 DROP INDEX IF EXISTS idx_segments_context_file_path;
@@ -227,47 +257,69 @@ SELECT COUNT(DISTINCT s.context_id)
 FROM segment_vectors AS sv
 JOIN segments AS s ON s.id = sv.segment_id";
 
+/// Context-agnostic sibling of [`SELECT_VECTOR_CANDIDATES_FOR_CONTEXT`] (no
+/// `context_id` filter). Kept in lockstep with the pooled schema so it joins the
+/// relocated pool index and fans out through `content_key`; the `s.id` secondary
+/// sort keeps fan-out ties deterministic.
 #[allow(dead_code)]
 pub const SELECT_VECTOR_CANDIDATES: &str = "
 WITH vector_matches AS (
     SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
-JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN embedding_pool AS p ON p.rowid = v.id
+JOIN segment_vectors AS sv ON sv.content_key = p.content_key
 JOIN segments AS s ON s.id = sv.segment_id
-ORDER BY v.rank";
+ORDER BY v.rank, s.id";
 
+/// Approximate (ANN) vector candidates for a context, used only above
+/// `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`. `vector_top_k` runs over the relocated
+/// pool index and returns one rowid per distinct pool vector (`?2` = over-fetch
+/// budget, scaled by indexed-context count at the call site so enough top
+/// vectors survive the per-context filter). Each pool row then fans out across
+/// every `segment_vectors` reference sharing its `content_key`; the result is
+/// filtered to the context and truncated to `?4` (the base candidate budget K).
+/// The secondary sort `s.id` is load-bearing: one pool row now maps to multiple
+/// segments, so `v.rank` alone leaves ties unordered — `ORDER BY v.rank, s.id`
+/// makes the truncation deterministic.
 pub const SELECT_VECTOR_CANDIDATES_FOR_CONTEXT: &str = "
 WITH vector_matches AS (
     SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_segment_vectors_embedding', vector8(?1), ?2)
+    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
 )
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM vector_matches AS v
-JOIN segment_vectors AS sv ON sv.rowid = v.id
+JOIN embedding_pool AS p ON p.rowid = v.id
+JOIN segment_vectors AS sv ON sv.content_key = p.content_key
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?3
-ORDER BY v.rank";
+ORDER BY v.rank, s.id
+LIMIT ?4";
 
-/* KEEP: the exhaustive path must not touch idx_segment_vectors_embedding.
+/* KEEP: the exhaustive path must not touch idx_embedding_pool_embedding.
 Below VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS a full ordered scan over the
 context's vectors is both exact and orders of magnitude faster than beam
 traversal over the disk-based approximate index, which the profiling for the
-small-corpus latency fix showed spending seconds in read-heavy graph walks. */
+small-corpus latency fix showed spending seconds in read-heavy graph walks.
+The `segment_vectors -> embedding_pool` join is 1:1 (each reference names exactly
+one pool row), so the candidate row set, the `vector_distance_cos` values, and the
+`ORDER BY ..., s.id` ordering are byte-for-byte identical to the pre-pooling inline
+column (HYP-001 CONFIRMED) — the vector bytes simply moved into the shared pool. */
 pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
        s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
 FROM segment_vectors AS sv
+JOIN embedding_pool AS p ON p.content_key = sv.content_key
 JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?2
-ORDER BY vector_distance_cos(sv.embedding_vec, vector8(?1)), s.id
+ORDER BY vector_distance_cos(p.embedding_vec, vector8(?1)), s.id
 LIMIT ?3";
 
 #[allow(dead_code)]
@@ -325,15 +377,61 @@ ON CONFLICT(id) DO UPDATE SET
     file_hash = excluded.file_hash,
     updated_at = datetime('now')";
 
+/// Prefix for a batched existence check against `embedding_pool`. The caller
+/// appends a comma-separated `?n` placeholder list (one per content key) and a
+/// closing `)`. The lookup-before-embed pipeline uses this to find which keys
+/// are already stored so it can embed only the misses (REQ-002).
+pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
+    "SELECT content_key FROM embedding_pool WHERE content_key IN (";
+
+/// Idempotent insert of a shared pool vector. The vector bytes for a given
+/// `content_key` are a deterministic function of (model, content), so a key
+/// already present is left untouched (`DO NOTHING`) rather than rewritten —
+/// avoiding needless churn in the DiskANN index shadow tables. Concurrency-safe
+/// (REQ-001): two writers inserting the same new content collapse to one row.
+/// `ref_count` is reconciled separately (incremented on the `segment_vectors`
+/// write, decremented by the `segments_vector_ad` AFTER DELETE trigger).
+pub const UPSERT_EMBEDDING_POOL: &str = "
+INSERT INTO embedding_pool (content_key, embedding_vec, ref_count)
+VALUES (?1, vector8(?2), 0)
+ON CONFLICT(content_key) DO NOTHING";
+
+/// Add `?2` references to a pool row. Called once per distinct `content_key`
+/// written into `segment_vectors`, with `?2` set to the number of new
+/// referencing rows so `ref_count` stays equal to the referencing-row count.
+pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
+    "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
+
+/// Decrement one reference from the pool row a single segment referenced. Used
+/// by the test-only single-segment write path when it removes a segment's
+/// vector directly (the batch/replace path decrements via the
+/// `segments_vector_ad` AFTER DELETE trigger instead).
+pub const DECREMENT_EMBEDDING_POOL_REF_COUNT_FOR_SEGMENT: &str = "
+UPDATE embedding_pool
+   SET ref_count = ref_count - 1
+ WHERE content_key = (SELECT content_key FROM segment_vectors WHERE segment_id = ?1)";
+
+/// Reference-aware garbage collection of the shared pool (REQ-004). The
+/// `segments_vector_ad` trigger decrements `ref_count` as segments are deleted
+/// but never removes a pool row, so a vector whose last referencer is gone
+/// lingers as a zero-ref orphan. `delete_context` runs this sweep after its
+/// context-scoped segment deletes to drop exactly those orphans, freeing the
+/// shared bytes and the DiskANN index entry. The `<= 0` floor is defensive: a
+/// correctly maintained count never goes negative, but any row at or below zero
+/// is unreferenced and safe to delete. Pool rows still referenced by another
+/// context keep `ref_count >= 1`, so this never touches a live vector — the
+/// per-context isolation guarantee (REQ-005).
+pub const DELETE_ORPHANED_EMBEDDING_POOL_ROWS: &str =
+    "DELETE FROM embedding_pool WHERE ref_count <= 0";
+
 pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT INTO segment_vectors (
-    segment_id, embedding_vec, created_at, updated_at
+    segment_id, content_key
 ) VALUES (
-    ?1, vector8(?2), datetime('now'), datetime('now')
+    ?1, ?2
 )
 ON CONFLICT(segment_id) DO UPDATE SET
-    embedding_vec = excluded.embedding_vec,
-    updated_at = datetime('now')";
+    content_key = excluded.content_key";
 
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
 
@@ -1003,12 +1101,19 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = datetime('now')";
 
 /// Conflict clause appended to chunked multi-row vector inserts. Mirrors
-/// `UPSERT_SEGMENT_VECTOR`: updating in place avoids delete/reinsert churn in
-/// the DiskANN vector index shadow tables.
+/// `UPSERT_SEGMENT_VECTOR`: a `segment_vectors` row now carries only the
+/// `content_key` reference into `embedding_pool`, so a conflicting re-write of
+/// the same `segment_id` repoints it at its (re-derived) content key.
 pub const VECTOR_UPSERT_CONFLICT_CLAUSE: &str = "
 ON CONFLICT(segment_id) DO UPDATE SET
-    embedding_vec = excluded.embedding_vec,
-    updated_at = datetime('now')";
+    content_key = excluded.content_key";
+
+/// Conflict clause appended to chunked multi-row `embedding_pool` inserts.
+/// Mirrors [`UPSERT_EMBEDDING_POOL`]: a key already present keeps its existing
+/// (deterministic) vector and `ref_count`, so re-seeing shared content across
+/// contexts never rewrites the pooled vector.
+pub const EMBEDDING_POOL_UPSERT_CONFLICT_CLAUSE: &str = "
+ON CONFLICT(content_key) DO NOTHING";
 
 /// Maximum number of SQL parameters per statement to stay below SQLite limits.
 pub const SQLITE_MAX_PARAMS: usize = 999;
@@ -1025,8 +1130,13 @@ pub const RELATION_INSERT_COLS: usize = 7;
 /// Number of columns in a context-scoped segment_relations INSERT (positional params only).
 pub const CONTEXT_RELATION_INSERT_COLS: usize = 8;
 
-/// Number of columns in a segment_vectors INSERT (positional params only).
+/// Number of columns in a segment_vectors INSERT (positional params only):
+/// `(segment_id, content_key)`.
 pub const VECTOR_INSERT_COLS: usize = 2;
+
+/// Number of columns in an embedding_pool INSERT (positional params only):
+/// `(content_key, embedding_vec)`; `ref_count` is seeded by the literal `0`.
+pub const POOL_INSERT_COLS: usize = 2;
 
 /// Maximum rows per chunk for each table, derived from `SQLITE_MAX_PARAMS`.
 pub const SEGMENT_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SEGMENT_INSERT_COLS;
@@ -1034,6 +1144,7 @@ pub const SYMBOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / SYMBOL_INSERT_COLS;
 pub const RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / RELATION_INSERT_COLS;
 pub const CONTEXT_RELATION_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / CONTEXT_RELATION_INSERT_COLS;
 pub const VECTOR_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / VECTOR_INSERT_COLS;
+pub const POOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / POOL_INSERT_COLS;
 
 // --- Overview digest aggregates ---------------------------------------------
 //

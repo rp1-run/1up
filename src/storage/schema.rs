@@ -27,6 +27,7 @@ pub const SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT: &str = "index schema is missing
 const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("table", "worktree_contexts"),
     ("table", "segments"),
+    ("table", "embedding_pool"),
     ("table", "segment_vectors"),
     ("table", "segment_symbols"),
     ("table", "segment_relations"),
@@ -37,7 +38,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segments_context_file_path"),
     ("index", "idx_segments_language"),
     ("index", "idx_segments_file_hash"),
-    ("index", "idx_segment_vectors_embedding"),
+    ("index", "idx_embedding_pool_embedding"),
     ("index", "idx_segment_symbols_exact"),
     ("index", "idx_segment_symbols_prefix"),
     ("index", "idx_segment_relations_source"),
@@ -54,13 +55,14 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{};{}",
         queries::CREATE_WORKTREE_CONTEXTS_TABLE,
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
         queries::CREATE_INDEX_FILE_HASH,
+        queries::CREATE_EMBEDDING_POOL_TABLE,
         queries::CREATE_SEGMENT_VECTORS_TABLE,
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
         queries::CREATE_SEGMENT_RELATIONS_TABLE,
@@ -69,7 +71,7 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
 
-    conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
+    conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
 
@@ -366,23 +368,23 @@ async fn table_has_column_once(
     }
 }
 
-async fn segment_vectors_has_embedding_vec(conn: &Connection) -> Result<bool, OneupError> {
-    table_has_column(conn, "segment_vectors", "embedding_vec").await
+async fn segment_vectors_has_content_key(conn: &Connection) -> Result<bool, OneupError> {
+    table_has_column(conn, "segment_vectors", "content_key").await
 }
 
 #[cfg(test)]
-async fn segment_vectors_embedding_vec_type(
+async fn embedding_pool_embedding_vec_type(
     conn: &Connection,
 ) -> Result<Option<String>, OneupError> {
     let mut rows = conn
         .query(
-            "SELECT type FROM pragma_table_info('segment_vectors') WHERE name = ?1 LIMIT 1",
+            "SELECT type FROM pragma_table_info('embedding_pool') WHERE name = ?1 LIMIT 1",
             ["embedding_vec"],
         )
         .await
         .map_err(|e| {
             StorageError::Query(format!(
-                "failed to read segment_vectors.embedding_vec type: {e}"
+                "failed to read embedding_pool.embedding_vec type: {e}"
             ))
         })?;
 
@@ -390,14 +392,14 @@ async fn segment_vectors_embedding_vec_type(
         Ok(Some(row)) => {
             let ty: String = row.get(0).map_err(|e| {
                 StorageError::Query(format!(
-                    "failed to read segment_vectors.embedding_vec type value: {e}"
+                    "failed to read embedding_pool.embedding_vec type value: {e}"
                 ))
             })?;
             Ok(Some(ty))
         }
         Ok(None) => Ok(None),
         Err(e) => Err(StorageError::Query(format!(
-            "segment_vectors.embedding_vec type inspection failed: {e}"
+            "embedding_pool.embedding_vec type inspection failed: {e}"
         ))
         .into()),
     }
@@ -412,9 +414,9 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
         }
     }
 
-    if !segment_vectors_has_embedding_vec(conn).await? {
+    if !segment_vectors_has_content_key(conn).await? {
         return Err(reindex_required(format!(
-            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.embedding_vec`)"
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required column `segment_vectors.content_key`)"
         )));
     }
 
@@ -577,6 +579,30 @@ mod tests {
         s
     }
 
+    /// Seed one pooled embedding plus a `segment_vectors` reference to it,
+    /// mirroring the content-addressed write path: the vector bytes live once in
+    /// `embedding_pool` and `segment_vectors` carries only the `content_key`.
+    /// Used to put the index into a "has embeddings" state for model-compat tests.
+    async fn seed_pooled_vector(
+        conn: &Connection,
+        content_key: &str,
+        segment_id: &str,
+        vector_json: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO embedding_pool (content_key, embedding_vec, ref_count) VALUES (?1, vector8(?2), 1)",
+            libsql::params![content_key, vector_json],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_vectors (segment_id, content_key) VALUES (?1, ?2)",
+            libsql::params![segment_id, content_key],
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn check_embedding_model_compatible_records_on_first_run() {
         let (_db, conn) = setup().await;
@@ -639,12 +665,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector8(?1))",
-            [zero_vector_json(384)],
-        )
-        .await
-        .unwrap();
+        seed_pooled_vector(&conn, "k1", "s1", &zero_vector_json(384)).await;
 
         let err = check_embedding_model_compatible(&conn, "org/model-v2", 768)
             .await
@@ -666,12 +687,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO segment_vectors (segment_id, embedding_vec) VALUES ('s1', vector8(?1))",
-            [zero_vector_json(384)],
-        )
-        .await
-        .unwrap();
+        seed_pooled_vector(&conn, "k1", "s1", &zero_vector_json(384)).await;
 
         let err = check_embedding_model_compatible(&conn, "org/model-v1", 384)
             .await
@@ -693,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_v16() {
+    async fn prepare_for_write_initializes_v17() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -702,12 +718,15 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
         assert!(schema_object_exists(&conn, "table", "worktree_contexts")
             .await
             .unwrap());
+        assert!(schema_object_exists(&conn, "table", "embedding_pool")
+            .await
+            .unwrap());
         assert!(
-            schema_object_exists(&conn, "index", "idx_segment_vectors_embedding")
+            schema_object_exists(&conn, "index", "idx_embedding_pool_embedding")
                 .await
                 .unwrap()
         );
@@ -716,10 +735,11 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let declared_type = segment_vectors_embedding_vec_type(&conn)
+        // The shared vector bytes (and the DiskANN index) live on the pool now.
+        let declared_type = embedding_pool_embedding_vec_type(&conn)
             .await
             .unwrap()
-            .expect("embedding_vec column should be present");
+            .expect("embedding_pool.embedding_vec column should be present");
         assert!(
             declared_type.contains("FLOAT8") || declared_type.contains("F1BIT"),
             "expected embedding_vec declared type to contain FLOAT8 or F1BIT, got `{declared_type}`"
@@ -758,7 +778,10 @@ mod tests {
         assert!(schema_object_exists(&conn, "trigger", "segments_symbol_ad")
             .await
             .unwrap());
-        assert!(segment_vectors_has_embedding_vec(&conn).await.unwrap());
+        assert!(segment_vectors_has_content_key(&conn).await.unwrap());
+        assert!(table_has_column(&conn, "embedding_pool", "ref_count")
+            .await
+            .unwrap());
         assert!(table_has_column(&conn, "segments", "context_id")
             .await
             .unwrap());
@@ -807,17 +830,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_pre_v16_schema() {
+    async fn prepare_for_write_rejects_v16_schema() {
+        // Fail-closed at the v16 -> v17 boundary: an index built under the prior
+        // schema is refused with reindex guidance naming found (16) vs expected
+        // (17), with no in-place migration attempted.
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "15"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "16"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v15, expected v16"));
+        assert!(msg.contains("found v16, expected v17"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
@@ -926,6 +952,7 @@ mod tests {
                 queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
                 queries::CREATE_INDEX_LANGUAGE,
                 queries::CREATE_INDEX_FILE_HASH,
+                queries::CREATE_EMBEDDING_POOL_TABLE,
                 queries::CREATE_SEGMENT_VECTORS_TABLE,
                 queries::CREATE_SEGMENT_SYMBOLS_TABLE,
                 "CREATE TABLE segment_relations (
@@ -960,7 +987,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(queries::CREATE_INDEX_SEGMENT_VECTORS_EMBEDDING, ())
+        conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
             .await
             .unwrap();
         conn.execute(

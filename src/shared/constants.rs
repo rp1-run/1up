@@ -232,11 +232,19 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 
 /// Schema version for database layout.
 ///
+/// v17: embeddings are content-addressed. Vector bytes move out of
+/// `segment_vectors` into a shared `embedding_pool` keyed by
+/// `hash(model_id, embedding_dim, embed_input)` with a reference count;
+/// `segment_vectors` becomes a thin `(segment_id, content_key)` reference and
+/// the DiskANN index lives on `embedding_pool.embedding_vec`. The physical
+/// layout differs from v16, so older indexes are incompatible and require
+/// `1up reindex`.
+///
 /// v16: markdown heading breadcrumbs store cleaned heading text (inline
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
