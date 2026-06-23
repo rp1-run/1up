@@ -1489,9 +1489,54 @@ mod tests {
         assert!(model_downloads_disabled_value(Some(OsString::from("true"))));
     }
 
+    /// Restores `HOME`/`XDG_DATA_HOME` on drop — even if an assertion panics — so a
+    /// redirected data root never leaks to other tests in this binary.
+    struct DataRootGuard {
+        home: Option<std::ffi::OsString>,
+        xdg_data: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            fn restore(key: &str, value: Option<std::ffi::OsString>) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            restore("HOME", self.home.take());
+            restore("XDG_DATA_HOME", self.xdg_data.take());
+        }
+    }
+
     #[test]
     fn mark_and_clear_download_failure() {
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        // Serialize against every other env-mutating test in this process (e.g. the fs.rs
+        // XDG_DATA_HOME tests). dirs::data_dir() honors XDG_DATA_HOME on Linux, so a
+        // concurrent env mutation in another module would flip our resolved root between
+        // mark/clear/is and break the assertions (the failure this PR's first attempt hit).
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        // mark/clear/is_download_failed operate on the GLOBAL data root
+        // (config::data_dir() = dirs::data_dir()/1up). `cargo test` also runs test binaries
+        // in parallel and the in-process mutexes above cannot reach a sibling BINARY, so
+        // redirect the data root to a process-private temp dir for this test too. The path
+        // MUST be canonicalized: secure-fs rejects symlink path components and macOS
+        // tempdirs live under /var -> /private/var. The guard restores the environment
+        // before the mutexes are released (drop runs in reverse declaration order), so the
+        // next serialized embedder test sees the real data root.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let _data_root = DataRootGuard {
+            home: std::env::var_os("HOME"),
+            xdg_data: std::env::var_os("XDG_DATA_HOME"),
+        };
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", home.join("share"));
+
         mark_download_failed();
         assert!(is_download_failed());
 
