@@ -12,6 +12,13 @@ use crate::shared::config;
 use crate::shared::constants::{PROJECT_STATE_DIR_MODE, XDG_STATE_DIR_MODE};
 use crate::shared::errors::{FilesystemError, OneupError};
 
+/// Test-only: serializes process-wide environment mutation (HOME/XDG_*) across every
+/// module's tests. `dirs::*` reads these env vars at call time, so two tests mutating
+/// them concurrently — even in different modules — corrupt each other's resolved paths.
+/// Every test that mutates the process environment must hold this single lock.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn ensure_secure_xdg_root() -> Result<PathBuf, OneupError> {
     ensure_secure_dir(&config::data_dir()?, XDG_STATE_DIR_MODE)
 }
@@ -635,7 +642,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io::Read;
     use std::path::PathBuf;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use crate::shared::constants::SECURE_STATE_FILE_MODE;
@@ -644,8 +651,6 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<OsString>)>,

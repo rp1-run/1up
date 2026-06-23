@@ -1512,15 +1512,21 @@ mod tests {
     #[test]
     fn mark_and_clear_download_failure() {
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        // Serialize against every other env-mutating test in this process (e.g. the fs.rs
+        // XDG_DATA_HOME tests). dirs::data_dir() honors XDG_DATA_HOME on Linux, so a
+        // concurrent env mutation in another module would flip our resolved root between
+        // mark/clear/is and break the assertions (the failure this PR's first attempt hit).
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         // mark/clear/is_download_failed operate on the GLOBAL data root
-        // (config::data_dir() = dirs::data_dir()/1up). `cargo test` runs test binaries
-        // in parallel and MODEL_MUTEX only serializes within this process, so a sibling
-        // binary could race the shared `.download_failed` marker (observed CI flake).
-        // Redirect the data root to a process-private temp dir for this test. The path
+        // (config::data_dir() = dirs::data_dir()/1up). `cargo test` also runs test binaries
+        // in parallel and the in-process mutexes above cannot reach a sibling BINARY, so
+        // redirect the data root to a process-private temp dir for this test too. The path
         // MUST be canonicalized: secure-fs rejects symlink path components and macOS
         // tempdirs live under /var -> /private/var. The guard restores the environment
-        // before MODEL_MUTEX is released (drop runs in reverse declaration order), so the
+        // before the mutexes are released (drop runs in reverse declaration order), so the
         // next serialized embedder test sees the real data root.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().canonicalize().unwrap();
