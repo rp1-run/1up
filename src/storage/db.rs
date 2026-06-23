@@ -321,6 +321,37 @@ mod tests {
         }
     }
 
+    /// Pins the load-bearing invariant that `recursive_triggers` stays OFF on
+    /// project connections. The content-addressed `segments_vector_ad` trigger's
+    /// inner `DELETE FROM segment_vectors` must NOT recursively re-fire, or it
+    /// would double-decrement `embedding_pool.ref_count`. `apply_project_pragmas`
+    /// must never enable it, and SQLite's default is OFF.
+    #[tokio::test]
+    async fn project_connections_keep_recursive_triggers_off() {
+        async fn recursive_triggers(conn: &Connection) -> i64 {
+            let mut rows = conn.query("PRAGMA recursive_triggers", ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let db = Db::open_rw(&config::project_db_path(&project_root))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recursive_triggers(&db.connect().unwrap()).await,
+            0,
+            "plain project connection must keep recursive_triggers OFF (segments_vector_ad must not re-fire)"
+        );
+        assert_eq!(
+            recursive_triggers(&db.connect_tuned().await.unwrap()).await,
+            0,
+            "tuned project connection must keep recursive_triggers OFF"
+        );
+    }
+
     #[tokio::test]
     async fn open_rw_rejects_non_project_db_layouts() {
         let tmp = tempfile::tempdir().unwrap();
