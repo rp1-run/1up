@@ -4,7 +4,15 @@ pub const EMBEDDING_DIM: usize = 384;
 /// 1up version from Cargo.toml, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default batch size for embedding inference.
+/// Default batch size for embedding inference (R-005).
+///
+/// Held at 32: a partial best-of-3 reindex benchmark over this repo's own ~1.5k
+/// chunk corpus showed 32 (~47.7s) slightly ahead of 64 (~49.6s), i.e. larger
+/// batches did not amortize per-call overhead enough to win once each sub-batch's
+/// tensor is already trimmed to its real token length (see `Embedder::embed_batch`
+/// length-bucketing). The exhaustive {32,64,128} release-LTO sweep is deferred to
+/// the feature-level benchmark manual item; 32 is the conservative, measured-best
+/// default among the sizes that completed.
 pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// Effective maximum token length for the embedding model.

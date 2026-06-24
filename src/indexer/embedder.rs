@@ -7,7 +7,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 use tokio::io::AsyncWriteExt;
 
 use crate::shared::config::{
@@ -635,26 +635,25 @@ impl Embedder {
 
     /// Embeds a batch of texts, returning one 384-dimensional unit vector per input.
     ///
-    /// Inputs are processed in sub-batches of the configured batch size.
+    /// Inputs are length-bucketed before inference (R-005): every input is
+    /// tokenized once, the set is sorted by real (un-padded) token length, and
+    /// equal-length-ish inputs are grouped into the configured-size sub-batches.
+    /// Because the shipped tokenizer pads to a fixed 128 tokens but `run_inference`
+    /// trims each sub-batch's tensor to its own longest *real* sequence, grouping
+    /// short inputs together shrinks that per-sub-batch width and cuts the padding
+    /// FLOPs a mixed-length batch would otherwise waste on a 128-wide tensor.
+    /// Results are scattered back to the caller's original input order via the
+    /// sort permutation, so the key->vector contract (`miss_inputs[i]` ->
+    /// `vectors[i]`) is preserved. Per-input vectors are byte-identical to the
+    /// unbucketed path: mean-pooling masks out pad positions, so the pooled vector
+    /// is independent of how many trailing pad tokens (i.e. of the tensor width) a
+    /// given input is batched with.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, OneupError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for chunk in texts.chunks(self.batch_size) {
-            let batch_embeddings = self.run_inference(chunk)?;
-            all_embeddings.extend(batch_embeddings);
-        }
-
-        Ok(all_embeddings)
-    }
-
-    fn run_inference(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, OneupError> {
-        let batch_size = texts.len();
-
-        let encodings = texts
+        let mut encodings = texts
             .iter()
             .map(|t| {
                 let mut enc = self
@@ -670,29 +669,57 @@ impl Embedder {
             })
             .collect::<Result<Vec<_>, OneupError>>()?;
 
-        let max_len = encodings
+        // Sort input indices by real token length (ascending). A stable sort keeps
+        // equal-length inputs in original order; the permutation is inverted below
+        // to restore the caller's order, so bucketing never reorders outputs.
+        let mut order: Vec<usize> = (0..encodings.len()).collect();
+        order.sort_by_key(|&i| real_token_len(&encodings[i]));
+
+        let bucketed: Vec<Encoding> = order
             .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
+            .map(|&i| std::mem::take(&mut encodings[i]))
+            .collect();
+
+        let mut bucketed_embeddings = Vec::with_capacity(bucketed.len());
+        for chunk in bucketed.chunks(self.batch_size) {
+            bucketed_embeddings.extend(self.run_inference(chunk)?);
+        }
+
+        // Scatter each bucketed result back to its original input position.
+        let mut all_embeddings: Vec<Vec<f32>> = vec![Vec::new(); bucketed_embeddings.len()];
+        for (bucket_pos, &original_pos) in order.iter().enumerate() {
+            all_embeddings[original_pos] = std::mem::take(&mut bucketed_embeddings[bucket_pos]);
+        }
+
+        Ok(all_embeddings)
+    }
+
+    fn run_inference(&mut self, encodings: &[Encoding]) -> Result<Vec<Vec<f32>>, OneupError> {
+        let batch_size = encodings.len();
+
+        // Trim the tensor to this sub-batch's longest *real* sequence rather than
+        // the tokenizer's fixed 128-token padding. Mean-pooling masks pad
+        // positions, so a narrower tensor yields byte-identical vectors while
+        // skipping the wasted compute on trailing pads (R-005).
+        let max_len = encodings.iter().map(real_token_len).max().unwrap_or(0);
 
         let mut input_ids = vec![0i64; batch_size * max_len];
         let mut attention_mask = vec![0i64; batch_size * max_len];
         let mut token_type_ids = vec![0i64; batch_size * max_len];
 
         for (i, enc) in encodings.iter().enumerate() {
+            // Copy only the first `max_len` positions: padding is Right, so these
+            // are the real tokens for this row and any tokens beyond `max_len`
+            // (always pads, since `max_len` is the sub-batch's longest real
+            // sequence) are dropped without affecting the masked mean-pool.
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
             let type_ids = enc.get_type_ids();
             let offset = i * max_len;
-            for (j, &id) in ids.iter().enumerate() {
-                input_ids[offset + j] = id as i64;
-            }
-            for (j, &m) in mask.iter().enumerate() {
-                attention_mask[offset + j] = m as i64;
-            }
-            for (j, &t) in type_ids.iter().enumerate() {
-                token_type_ids[offset + j] = t as i64;
+            for j in 0..max_len {
+                input_ids[offset + j] = ids[j] as i64;
+                attention_mask[offset + j] = mask[j] as i64;
+                token_type_ids[offset + j] = type_ids[j] as i64;
             }
         }
 
@@ -775,6 +802,15 @@ impl Embedder {
 
         Ok(embeddings)
     }
+}
+
+/// Real (un-padded) token count of an encoding: the number of attention-mask
+/// positions set to 1. The shipped tokenizer pads to a fixed 128 tokens, so
+/// `get_ids().len()` is always 128; the attention mask is the only signal of how
+/// many tokens are real. Used for both length-bucketing and per-sub-batch tensor
+/// trimming.
+fn real_token_len(enc: &Encoding) -> usize {
+    enc.get_attention_mask().iter().filter(|&&m| m == 1).count()
 }
 
 fn ensure_secure_model_root() -> Result<PathBuf, OneupError> {
@@ -2173,6 +2209,55 @@ mod tests {
         assert_eq!(results.len(), 5);
         for vec in &results {
             assert_eq!(vec.len(), EMBEDDING_DIM);
+        }
+    }
+
+    #[test]
+    fn length_bucketed_batch_preserves_per_input_vectors_and_order() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+        let dir = runtime_model_dir();
+        // batch_size 2 forces multiple sub-batches, so length-bucketing must
+        // group across the original order and then restore it.
+        let mut embedder = Embedder {
+            session: Session::builder()
+                .unwrap()
+                .with_intra_threads(1)
+                .unwrap()
+                .commit_from_file(dir.join(MODEL_FILENAME))
+                .unwrap(),
+            tokenizer: Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).unwrap(),
+            batch_size: 2,
+        };
+
+        // Deliberately interleaved short/long inputs: a stable sort by token
+        // length reorders these into a different bucket order than the input
+        // order, so a missing or wrong inverse permutation flips the mapping.
+        let long = "error handling and propagation across asynchronous tokio tasks \
+            with cancellation tokens and structured concurrency in a long rust function body"
+            .to_string();
+        let texts: Vec<&str> = vec![
+            "a",
+            long.as_str(),
+            "bb",
+            "concurrent vector search over an embedding index",
+            "c",
+        ];
+
+        let bucketed = embedder.embed_batch(&texts).unwrap();
+        assert_eq!(bucketed.len(), texts.len());
+
+        // Ground truth: each input embedded on its own (order-independent). The
+        // bucketed result must equal it position-for-position and bit-for-bit.
+        for (i, &text) in texts.iter().enumerate() {
+            let standalone = embedder.embed_one(text).unwrap();
+            assert_eq!(
+                bucketed[i], standalone,
+                "bucketed vector for input {i} ({text:?}) must be byte-identical to the standalone embedding"
+            );
         }
     }
 }
