@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_v17() {
+    async fn prepare_for_write_initializes_v18() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -928,7 +928,7 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
         assert!(schema_object_exists(&conn, "table", "worktree_contexts")
             .await
             .unwrap());
@@ -1040,20 +1040,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_v16_schema() {
-        // Fail-closed at the v16 -> v17 boundary: an index built under the prior
-        // schema is refused with reindex guidance naming found (16) vs expected
-        // (17), with no in-place migration attempted.
+    async fn prepare_for_write_rejects_v17_schema() {
+        // Fail-closed at the v17 -> v18 boundary: a content-addressed v17 index
+        // (FP32-keyed embeddings, pre-INT8 default) is refused with reindex
+        // guidance naming found (17) vs expected (18), forcing the re-embed
+        // migration with no in-place migration attempted.
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "16"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "17"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v16, expected v17"));
+        assert!(msg.contains("found v17, expected v18"));
         assert!(msg.contains("run `1up reindex`"));
     }
 

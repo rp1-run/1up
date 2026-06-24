@@ -281,6 +281,17 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 
 /// Schema version for database layout.
 ///
+/// v18: bundles the Phase-2 re-embed migration. The default embedding path is
+/// now the dynamic-INT8 model variant ([`MODEL_ONNX_INT8_FILENAME`]), whose
+/// identity is folded into the content-addressed embedding `content_key` via
+/// [`MODEL_VARIANT_INT8_SUFFIX`]; INT8 and FP32 produce numerically different
+/// vectors, so cached embeddings from a v17 (FP32-keyed) index are invalid and
+/// must be re-embedded. The required-objects set also shifts: the dead
+/// `idx_segments_file_hash` index is dropped and `idx_segment_vectors_content_key`
+/// is added for the ANN fan-out join. The physical/numeric layout therefore
+/// differs from v17, so older indexes are incompatible and fail closed with
+/// `1up reindex` (no in-place migration).
+///
 /// v17: embeddings are content-addressed. Vector bytes move out of
 /// `segment_vectors` into a shared `embedding_pool` keyed by
 /// `hash(model_id, embedding_dim, embed_input)` with a reference count;
@@ -293,7 +304,7 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
