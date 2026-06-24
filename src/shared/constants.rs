@@ -190,6 +190,26 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 
+/// Write-ahead-log autocheckpoint threshold, in WAL pages, for the write/staging
+/// connection profile only.
+///
+/// SQLite's default `wal_autocheckpoint` (1000 pages) forces frequent
+/// mid-rebuild checkpoints during a large cold rebuild, each competing with the
+/// embed/write flush. Raising it to 10000 on the staging connection lets the WAL
+/// grow further between checkpoints so a full rebuild pays far fewer checkpoint
+/// stalls; the staging file is finalized with an explicit `wal_checkpoint(TRUNCATE)`
+/// at swap time, so the larger interim WAL is bounded by the rebuild's lifetime.
+/// The read/base profile keeps SQLite's default.
+pub const STAGING_WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
+
+/// Page-cache size for the write/staging connection profile only, in SQLite's
+/// negative-KiB form (`-131072` KiB = 128 MiB).
+///
+/// 128 MiB keeps more index pages hot during a large cold rebuild than the
+/// read/base profile's 32 MiB (`-32768`), cutting page churn on the write path.
+/// The read/base profile is left unchanged.
+pub const STAGING_DB_CACHE_SIZE_KIB: i32 = -131_072;
+
 /// Owner-only permissions for the XDG-managed state directory.
 #[allow(dead_code)]
 pub const XDG_STATE_DIR_MODE: u32 = 0o700;

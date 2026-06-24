@@ -60,7 +60,10 @@ impl StagingRebuild {
     pub async fn open(state_root: &Path) -> Result<Self, OneupError> {
         let staging_path = config::project_staging_db_path(state_root);
         let db = Db::open_staging_rw(&staging_path).await?;
-        let conn = db.connect_tuned().await?;
+        // Cold full rebuilds write the entire refreshed index through this one
+        // connection, so it takes the write/staging PRAGMA profile (raised
+        // cache_size + wal_autocheckpoint) to cut mid-rebuild checkpoint churn.
+        let conn = db.connect_tuned_staging().await?;
         schema::initialize(&conn).await?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
