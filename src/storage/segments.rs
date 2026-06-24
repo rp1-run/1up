@@ -384,6 +384,7 @@ pub async fn get_segment_by_id(
 }
 
 /// Get a single segment by its ID inside one index context.
+#[allow(dead_code)]
 pub async fn get_segment_by_id_for_context(
     conn: &Connection,
     context_id: &str,
@@ -406,6 +407,49 @@ pub async fn get_segment_by_id_for_context(
         Some(row) => Ok(Some(row_to_stored_segment(&row)?)),
         None => Ok(None),
     }
+}
+
+/// Batch-fetch segments by exact id within one context, returning a map from
+/// `id -> StoredSegment` for the ids that matched a row. An id with no matching
+/// row is simply absent from the map — the same outcome as an individual
+/// [`get_segment_by_id_for_context`] returning `None` — and duplicate ids are
+/// harmless (each row keys on its own id). Batched in `SQLITE_MAX_PARAMS`-sized
+/// chunks (reserving one bound slot for the leading context id) so an
+/// arbitrarily large handle set stays within the bound-parameter limit (R-013).
+pub async fn get_segments_by_ids_for_context(
+    conn: &Connection,
+    context_id: &str,
+    ids: &[String],
+) -> Result<HashMap<String, StoredSegment>, OneupError> {
+    let mut found = HashMap::new();
+    if ids.is_empty() {
+        return Ok(found);
+    }
+    validate_context_id(context_id)?;
+
+    // Reserve one bound-parameter slot for the leading context id (?1); the id
+    // list occupies the remaining ?2.. placeholders of each chunk.
+    for chunk in ids.chunks(queries::SQLITE_MAX_PARAMS - 1) {
+        let sql = queries::select_segments_by_ids_for_context_sql(chunk.len());
+        let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() + 1);
+        params.push(context_id.to_string().into());
+        params.extend(chunk.iter().map(|id| id.clone().into()));
+
+        let mut rows = conn
+            .query(&sql, params)
+            .await
+            .map_err(|e| StorageError::Query(format!("batch query segments by id failed: {e}")))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+        {
+            let segment = row_to_stored_segment(&row)?;
+            found.insert(segment.id.clone(), segment);
+        }
+    }
+
+    Ok(found)
 }
 
 /// Outcome of a prefix-based segment lookup.
