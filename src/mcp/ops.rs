@@ -726,6 +726,23 @@ pub async fn run_search(
         .await
 }
 
+/// Process-global warm embedding runtime for the in-process MCP fallback search
+/// path (R-008).
+///
+/// The MCP server process serves many tool calls over its lifetime. When the
+/// daemon is unavailable, `run_search_once` embeds the query in-process; keeping a
+/// single warmed [`EmbeddingRuntime`] here lets the second and later searches
+/// reuse the already-loaded ONNX session instead of cold-loading a fresh
+/// `EmbeddingRuntime::default()` per call. A `tokio::sync::Mutex` serializes
+/// access because the cached `Embedder` is borrowed `&mut` during a search; MCP
+/// queries are served one at a time on this path, so the lock is effectively
+/// uncontended.
+fn fallback_embedding_runtime() -> &'static tokio::sync::Mutex<EmbeddingRuntime> {
+    static RUNTIME: std::sync::OnceLock<tokio::sync::Mutex<EmbeddingRuntime>> =
+        std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::sync::Mutex::new(EmbeddingRuntime::default()))
+}
+
 async fn run_search_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
@@ -739,7 +756,14 @@ async fn run_search_once(
     // for this context, the embedding model must never be initialized.
     let has_vectors = retrieval::has_indexed_embeddings(&current.conn, &search_scope).await?;
     let (results, embedding_reason) = if has_vectors {
-        let mut runtime = EmbeddingRuntime::default();
+        // Warm the in-process fallback embedding runtime instead of cold-loading
+        // `EmbeddingRuntime::default()` on every call (R-008). The MCP server is a
+        // long-lived process serving many tool calls; this in-process search path
+        // runs when the daemon is unavailable, so a per-call cold load would
+        // re-read and re-initialize the ONNX session for each query. The runtime
+        // is held in a process-global cache and `prepare_for_search` returns
+        // `Warm` (a no-op) after the first successful load.
+        let mut runtime = fallback_embedding_runtime().lock().await;
         let embedding_status = runtime.prepare_for_search(1);
         let embedding_reason = embedding_unavailable_reason(&embedding_status);
         let results = if embedding_status.is_available() {
