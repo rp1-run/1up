@@ -402,6 +402,22 @@ ON CONFLICT(content_key) DO NOTHING";
 pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
     "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
 
+/// Bulk form of [`INCREMENT_EMBEDDING_POOL_REF_COUNT`] (R-011): apply every
+/// distinct key's increment from one write batch in a single statement instead
+/// of one `UPDATE` per key. `?1` is a JSON object mapping each `content_key` to
+/// the number of new referencing rows (e.g. `{"<key>": 2}`); `json_each` expands
+/// it to `(key, value)` rows and the `UPDATE ... FROM` join adds each delta to
+/// the matching pool row. Counts are identical to the per-key loop: the keys are
+/// distinct so each matches exactly one (primary-key) pool row, keys absent from
+/// `embedding_pool` match nothing and are silently skipped (as the per-key
+/// `WHERE content_key = ?1` did), and `embedding_pool` carries no UPDATE trigger
+/// so the bulk write fires nothing the loop did not.
+pub const BATCH_INCREMENT_EMBEDDING_POOL_REF_COUNTS: &str = "
+UPDATE embedding_pool
+   SET ref_count = ref_count + CAST(j.value AS INTEGER)
+  FROM json_each(?1) AS j
+ WHERE embedding_pool.content_key = j.key";
+
 /// Decrement one reference from the pool row a single segment referenced. Used
 /// by the test-only single-segment write path when it removes a segment's
 /// vector directly (the batch/replace path decrements via the

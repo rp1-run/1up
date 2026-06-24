@@ -2016,6 +2016,13 @@ async fn batch_insert_segment_vector_refs(
 
 /// Phase 3: bump `ref_count` by the number of references written per distinct
 /// content key, so it equals the live referencing-row count.
+///
+/// Dedup-heavy write batches reference many keys, so a single bulk `UPDATE`
+/// (R-011) replaces the prior per-key `UPDATE` loop: the per-distinct-key deltas
+/// are serialized to a JSON `content_key -> delta` object and applied in one
+/// statement via [`queries::BATCH_INCREMENT_EMBEDDING_POOL_REF_COUNTS`]. Counts
+/// are identical to the loop because the keys are distinct (one pool row each)
+/// and `embedding_pool` has no UPDATE trigger.
 async fn batch_increment_pool_ref_counts(
     conn: &Connection,
     ref_segments: &[&SegmentInsert],
@@ -2029,14 +2036,19 @@ async fn batch_increment_pool_ref_counts(
         *counts.entry(key).or_insert(0) += 1;
     }
 
-    for (content_key, delta) in counts {
-        conn.execute(
-            queries::INCREMENT_EMBEDDING_POOL_REF_COUNT,
-            libsql::params![content_key.to_string(), delta],
-        )
-        .await
-        .map_err(|e| StorageError::Query(format!("increment pool ref_count failed: {e}")))?;
+    if counts.is_empty() {
+        return Ok(());
     }
+
+    let deltas = serde_json::to_string(&counts)
+        .map_err(|e| StorageError::Query(format!("serialize ref_count deltas failed: {e}")))?;
+
+    conn.execute(
+        queries::BATCH_INCREMENT_EMBEDDING_POOL_REF_COUNTS,
+        libsql::params![deltas],
+    )
+    .await
+    .map_err(|e| StorageError::Query(format!("increment pool ref_count failed: {e}")))?;
 
     Ok(())
 }
@@ -3105,6 +3117,120 @@ mod tests {
         let mut rows = conn.query(sql, ()).await.unwrap();
         let row = rows.next().await.unwrap().unwrap();
         row.get(0).unwrap()
+    }
+
+    /// Seed one `embedding_pool` row at a given starting `ref_count`.
+    async fn seed_pool_row(conn: &Connection, content_key: &str, ref_count: i64) {
+        let vector = serde_json::to_string(&vec![0.1f32; 384]).unwrap();
+        conn.execute(
+            "INSERT INTO embedding_pool (content_key, embedding_vec, ref_count) \
+             VALUES (?1, vector8(?2), ?3)",
+            libsql::params![content_key, vector, ref_count],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Read every `(content_key, ref_count)` row, ordered for stable comparison.
+    async fn all_pool_ref_counts(conn: &Connection) -> Vec<(String, i64)> {
+        let mut rows = conn
+            .query(
+                "SELECT content_key, ref_count FROM embedding_pool ORDER BY content_key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        out
+    }
+
+    /// Byte-for-byte replica of the pre-R-011 per-key `UPDATE` loop, retained as
+    /// the equivalence baseline the bulk statement must match (mirrors the T1
+    /// pattern of keeping the prior implementation in the test module).
+    async fn loop_increment_pool_ref_counts_baseline(
+        conn: &Connection,
+        ref_segments: &[&SegmentInsert],
+    ) {
+        let mut counts: HashMap<&str, i64> = HashMap::new();
+        for seg in ref_segments {
+            let key = seg.content_key.as_deref().unwrap();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        for (content_key, delta) in counts {
+            conn.execute(
+                queries::INCREMENT_EMBEDDING_POOL_REF_COUNT,
+                libsql::params![content_key.to_string(), delta],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_ref_count_bulk_statement_matches_per_key_loop() {
+        // R-011 / REQ-008: the single bulk `UPDATE` must leave `ref_count` rows
+        // identical to the prior per-key loop for a multi-key batch with varied
+        // per-key reference counts. Run both paths against separately-seeded
+        // in-memory pools and assert the full row set matches.
+        let mk = |id: &str, key: &str| -> SegmentInsert {
+            let mut seg = test_segment(id, "src/x.rs", "h");
+            seg.content_key = Some(key.to_string());
+            seg
+        };
+        // keyA x3, keyB x1, keyC x2; keyE x2 is absent from the pool (exercises
+        // the no-match path); keyD is seeded but never incremented.
+        let owned = [
+            mk("s1", "keyA"),
+            mk("s2", "keyA"),
+            mk("s3", "keyA"),
+            mk("s4", "keyB"),
+            mk("s5", "keyC"),
+            mk("s6", "keyC"),
+            mk("s7", "keyE"),
+            mk("s8", "keyE"),
+        ];
+        let ref_segments: Vec<&SegmentInsert> = owned.iter().collect();
+
+        // Non-zero starting counts prove this increments rather than sets.
+        async fn seed(conn: &Connection) {
+            seed_pool_row(conn, "keyA", 5).await;
+            seed_pool_row(conn, "keyB", 0).await;
+            seed_pool_row(conn, "keyC", 2).await;
+            seed_pool_row(conn, "keyD", 10).await;
+        }
+
+        let (_db_bulk, conn_bulk) = setup().await;
+        seed(&conn_bulk).await;
+        batch_increment_pool_ref_counts(&conn_bulk, &ref_segments)
+            .await
+            .unwrap();
+
+        let (_db_loop, conn_loop) = setup().await;
+        seed(&conn_loop).await;
+        loop_increment_pool_ref_counts_baseline(&conn_loop, &ref_segments).await;
+
+        let bulk_rows = all_pool_ref_counts(&conn_bulk).await;
+        let loop_rows = all_pool_ref_counts(&conn_loop).await;
+        assert_eq!(
+            bulk_rows, loop_rows,
+            "bulk ref_count statement must yield identical rows to the per-key loop"
+        );
+
+        // Correctness guard so the test catches a wrong-delta or set-instead-of-add
+        // regression, not merely two equal implementations of the same bug.
+        assert_eq!(
+            bulk_rows,
+            vec![
+                ("keyA".to_string(), 8),
+                ("keyB".to_string(), 1),
+                ("keyC".to_string(), 4),
+                ("keyD".to_string(), 10),
+            ],
+            "each key gains exactly its reference count; an absent key inserts nothing"
+        );
     }
 
     fn embedded_segment(id: &str, file_path: &str, file_hash: &str, fill: f32) -> SegmentInsert {
