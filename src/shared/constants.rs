@@ -206,8 +206,19 @@ pub const SECURE_STATE_FILE_MODE: u32 = 0o600;
 #[allow(dead_code)]
 pub const SECURE_SOCKET_MODE: u32 = 0o600;
 
-/// Conservative upper bound for auto-selected embedding threads.
-pub const MAX_AUTO_EMBED_THREADS: usize = 4;
+/// Upper bound for auto-selected embedding (ONNX intra-op) threads.
+///
+/// Embedding is the dominant indexing cost and the only sustained CPU work
+/// during the serial flush, so the embed phase scales toward physical cores
+/// rather than the legacy fixed cap of 4 (R-004). The bound stays coordinated
+/// with parse parallelism by
+/// [`crate::shared::types::IndexingConfig::default_jobs`], which reserves cores
+/// for embedding so `embed_threads + jobs` never exceeds physical cores — ONNX
+/// intra-op throughput regresses ~3.5x once the overlapping parse and embed
+/// pools over-subscribe. 8 is a benchmark-informed ceiling for the common
+/// single-repo host; the effective per-host value is further bounded by the
+/// cores left after the parse pool.
+pub const MAX_AUTO_EMBED_THREADS: usize = 8;
 
 /// Minimum number of files written per auto-selected storage transaction.
 pub const DEFAULT_INDEX_WRITE_BATCH_FILES: usize = 4;

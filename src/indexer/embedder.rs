@@ -3,6 +3,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -596,10 +597,22 @@ impl Embedder {
             .into());
         }
 
+        // Pin GraphOptimizationLevel::Level3 explicitly (R-004). It is ort's
+        // default today, so this guards against a future or host default that
+        // silently lowers graph optimization rather than enabling anything new.
+        // Each batch is one serial inference call, so parallelism comes from
+        // intra-op threads (`intra_threads`); inter-op is pinned to 1 so
+        // node-level parallelism cannot add threads beyond the coordinated
+        // intra-op budget (embed_threads + parse jobs <= physical cores).
+        // Neither setting changes the produced vectors.
         let session = Session::builder()
             .map_err(|e| EmbeddingError::InferenceFailed(format!("session builder: {e}")))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set optimization level: {e}")))?
             .with_intra_threads(intra_threads)
-            .map_err(|e| EmbeddingError::InferenceFailed(format!("set threads: {e}")))?
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set intra threads: {e}")))?
+            .with_inter_threads(1)
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set inter threads: {e}")))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
 
