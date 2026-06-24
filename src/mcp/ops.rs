@@ -747,7 +747,8 @@ async fn run_search_once(
                 &current.conn,
                 runtime.current_embedder(),
                 search_scope.clone(),
-            );
+            )
+            .with_has_vectors(has_vectors);
             engine.search(query, limit).await?
         } else {
             let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());

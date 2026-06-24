@@ -224,9 +224,27 @@ pub(crate) async fn fetch_vector_candidates(
     scope: &SearchScope,
     query_embedding: &[f32],
 ) -> Result<Vec<CandidateRow>, OneupError> {
+    fetch_vector_candidates_with_count(conn, scope, query_embedding, None).await
+}
+
+/// Like [`fetch_vector_candidates`], but accepts a pre-computed per-context
+/// vector count so a caller that already knows it (the daemon caches it on
+/// `ProjectState`, invalidated on index swap — R-007) can skip the per-query
+/// `COUNT(*)`. The cached count MUST equal the live `COUNT(*)` for the open
+/// index, so path selection (`vector_search_path_for_corpus`) is identical to
+/// the live-count path; passing `None` falls back to the live count.
+pub(crate) async fn fetch_vector_candidates_with_count(
+    conn: &Connection,
+    scope: &SearchScope,
+    query_embedding: &[f32],
+    cached_count: Option<usize>,
+) -> Result<Vec<CandidateRow>, OneupError> {
     let started = std::time::Instant::now();
     let query_embedding = serialize_query_embedding(query_embedding)?;
-    let vector_count = count_vector_rows_for_context(conn, scope).await?;
+    let vector_count = match cached_count {
+        Some(count) => count,
+        None => count_vector_rows_for_context(conn, scope).await?,
+    };
     let path = vector_search_path_for_corpus(vector_count);
 
     let results = match path {
@@ -309,7 +327,7 @@ async fn collect_candidate_rows(
     Ok(results)
 }
 
-async fn count_vector_rows_for_context(
+pub(crate) async fn count_vector_rows_for_context(
     conn: &Connection,
     scope: &SearchScope,
 ) -> Result<usize, OneupError> {
@@ -1002,6 +1020,54 @@ mod tests {
         assert!(!candidates.is_empty(), "exhaustive scan returned no rows");
         assert_eq!(candidates[0].segment_id, "seg-3");
         assert_eq!(candidates.len(), 10);
+    }
+
+    // TDD (REQ-006 / T6 AC2): a cached per-context vector count threaded into
+    // the vector stage MUST select the same path and return byte-identical
+    // candidates as the live `COUNT(*)`. This pins R-007's "cached count is a
+    // pure optimization, never a behavior change" contract: the daemon caches
+    // the count on `ProjectState` and the served results must not depend on
+    // whether the count came from the cache or a live query.
+    #[tokio::test]
+    async fn cached_count_yields_identical_candidates_to_live_count() {
+        let conn = setup().await;
+
+        for i in 0..10 {
+            let embedding = embedding_with(&[(i, 1.0)]);
+            insert_segment(
+                &conn,
+                &format!("seg-{i}"),
+                &format!("src/file_{i}.rs"),
+                &format!("fn item_{i}() {{ }}"),
+                Some(&embedding),
+            )
+            .await;
+        }
+
+        let scope = SearchScope::default_context();
+        let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
+
+        let live = count_vector_rows_for_context(&conn, &scope).await.unwrap();
+        assert_eq!(live, 10, "fixture seeds ten context vectors");
+        assert_eq!(
+            vector_search_path_for_corpus(live),
+            VectorSearchPath::ExhaustiveScan,
+            "ten vectors stay on the exact path"
+        );
+
+        let with_live = fetch_vector_candidates_with_count(&conn, &scope, &query_embedding, None)
+            .await
+            .unwrap();
+        let with_cached =
+            fetch_vector_candidates_with_count(&conn, &scope, &query_embedding, Some(live))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            with_cached, with_live,
+            "cached count must produce byte-identical candidates to the live count"
+        );
+        assert_eq!(with_cached[0].segment_id, "seg-3");
     }
 
     #[tokio::test]

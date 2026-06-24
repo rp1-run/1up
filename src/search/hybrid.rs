@@ -14,6 +14,18 @@ pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
     embedder: Option<&'a mut Embedder>,
     scope: SearchScope,
+    /// Pre-probed vector-presence flag (R-007). Every live caller already runs
+    /// the cheap `has_indexed_embeddings` probe before deciding whether to warm
+    /// the embedder, so threading the result in here removes the engine's
+    /// duplicate probe. `None` means "not supplied" and the engine falls back to
+    /// probing live, preserving the prior behaviour for callers that do not set
+    /// it (e.g. unit tests).
+    has_vectors: Option<bool>,
+    /// Pre-computed per-context vector `COUNT(*)` (R-007), cached by the daemon
+    /// on `ProjectState` and invalidated on index swap. When `Some`, the vector
+    /// stage skips its per-query `COUNT(*)` for path selection; it MUST equal the
+    /// live count so selection is identical. `None` falls back to the live count.
+    vector_count: Option<usize>,
 }
 
 impl<'a> HybridSearchEngine<'a> {
@@ -31,7 +43,25 @@ impl<'a> HybridSearchEngine<'a> {
             conn,
             embedder,
             scope,
+            has_vectors: None,
+            vector_count: None,
         }
+    }
+
+    /// Supply the already-probed vector-presence flag so the vector stage skips
+    /// its duplicate `has_indexed_embeddings` probe (R-007). The supplied value
+    /// MUST match the live probe for the open index.
+    pub fn with_has_vectors(mut self, has_vectors: bool) -> Self {
+        self.has_vectors = Some(has_vectors);
+        self
+    }
+
+    /// Supply a cached per-context vector count so the vector stage skips its
+    /// per-query `COUNT(*)` for path selection (R-007). The supplied value MUST
+    /// equal the live `COUNT(*)` for the open index.
+    pub fn with_vector_count(mut self, vector_count: usize) -> Self {
+        self.vector_count = Some(vector_count);
+        self
     }
 
     /// Hybrid search with lazy query embedding: the lexical stages, the
@@ -64,13 +94,25 @@ impl<'a> HybridSearchEngine<'a> {
             retrieval::fetch_fts_candidates(self.conn, &self.scope, query),
         )?;
 
+        // Use the caller-supplied vector-presence flag when present, falling back
+        // to the live probe otherwise (R-007: removes the engine's duplicate
+        // `has_indexed_embeddings` probe on the live daemon/MCP/CLI paths, which
+        // already ran it before warming the embedder). The exact-lexical-hit
+        // short-circuit and `&mut embedder` discipline are unchanged.
         let should_fetch_vector = self.embedder.is_some()
             && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
-            && retrieval::has_indexed_embeddings(self.conn, &self.scope).await?;
+            && self.has_indexed_embeddings().await?;
+        let cached_vector_count = self.vector_count;
         let vector_results = if should_fetch_vector {
             match self.embed_query(query) {
                 Some(embedding) => {
-                    fetch_vector_candidates_with_degrade(self.conn, &self.scope, &embedding).await
+                    fetch_vector_candidates_with_degrade(
+                        self.conn,
+                        &self.scope,
+                        &embedding,
+                        cached_vector_count,
+                    )
+                    .await
                 }
                 None => Vec::new(),
             }
@@ -125,6 +167,16 @@ impl<'a> HybridSearchEngine<'a> {
     /// unchanged), and tells the runtime to relocate this worker's other tasks
     /// while the inference runs. Every live caller runs on the multi-thread
     /// `#[tokio::main]` runtime, which `block_in_place` requires.
+    /// Vector-presence gate: the caller-supplied flag when set (R-007), else a
+    /// live probe. Identical to the live probe by contract — `with_has_vectors`
+    /// callers pass the live result they already computed.
+    async fn has_indexed_embeddings(&self) -> Result<bool, OneupError> {
+        match self.has_vectors {
+            Some(has_vectors) => Ok(has_vectors),
+            None => retrieval::has_indexed_embeddings(self.conn, &self.scope).await,
+        }
+    }
+
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_deref_mut()?;
         match tokio::task::block_in_place(|| embedder.embed_one(query)) {
@@ -144,8 +196,11 @@ async fn fetch_vector_candidates_with_degrade(
     conn: &Connection,
     scope: &SearchScope,
     query_embedding: &[f32],
+    cached_count: Option<usize>,
 ) -> Vec<CandidateRow> {
-    match retrieval::fetch_vector_candidates(conn, scope, query_embedding).await {
+    match retrieval::fetch_vector_candidates_with_count(conn, scope, query_embedding, cached_count)
+        .await
+    {
         Ok(results) => results,
         Err(err) => {
             eprintln!(
@@ -779,6 +834,81 @@ mod tests {
             !results.is_empty(),
             "search with None embedder should fall back to FTS"
         );
+    }
+
+    // TDD (REQ-006 / T6 AC2): the threaded `has_vectors` flag must be the
+    // authoritative vector-presence signal — identical to the live
+    // `has_indexed_embeddings` probe the caller already ran — and replace the
+    // engine's duplicate probe. This pins both halves: `with_has_vectors(true)`
+    // matches the live probe on an index that has vectors, and the value
+    // supplied is what the gate uses (a `false` flag forces FTS-only even when
+    // the index physically holds vectors, proving the live re-probe is gone).
+    #[tokio::test]
+    async fn threaded_has_vectors_flag_drives_vector_gate_and_matches_live_probe() {
+        use crate::storage::segments::{upsert_segment, SegmentInsert};
+
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let embedding = vec![1.0_f32; 384];
+        let serialized = serde_json::to_string(&embedding).unwrap();
+        let content_key = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(serialized.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let insert = SegmentInsert {
+            id: "seg-vec".to_string(),
+            file_path: "src/vec.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn vector_target() { run(); }".to_string(),
+            line_start: 1,
+            line_end: 3,
+            content_key: Some(content_key),
+            embedding_vec: Some(serialized),
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"vector_target\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-vec".to_string(),
+        };
+        upsert_segment(&conn, &insert).await.unwrap();
+
+        let scope = SearchScope::default_context();
+
+        // The index physically holds vectors, so the live probe is true.
+        let live = retrieval::has_indexed_embeddings(&conn, &scope)
+            .await
+            .unwrap();
+        assert!(live, "fixture seeds an indexed embedding");
+
+        // `with_has_vectors(true)` matches the live probe.
+        let engine_true =
+            HybridSearchEngine::new_scoped(&conn, None, scope.clone()).with_has_vectors(true);
+        assert_eq!(engine_true.has_indexed_embeddings().await.unwrap(), live);
+
+        // A `false` flag is authoritative — the gate uses it, not a live re-probe.
+        let engine_false =
+            HybridSearchEngine::new_scoped(&conn, None, scope.clone()).with_has_vectors(false);
+        assert!(
+            !engine_false.has_indexed_embeddings().await.unwrap(),
+            "the supplied flag must drive the gate, proving the duplicate live probe is gone"
+        );
+
+        // Unset falls back to the live probe (default behaviour preserved).
+        let engine_unset = HybridSearchEngine::new_scoped(&conn, None, scope);
+        assert_eq!(engine_unset.has_indexed_embeddings().await.unwrap(), live);
     }
 
     #[tokio::test]

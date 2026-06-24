@@ -87,6 +87,12 @@ struct ProjectState {
     /// orphaned pre-swap inode and must be reopened before any pass touches it
     /// (HYP-002). `None` when the index was absent when `db` was opened.
     index_identity: Option<IndexFileIdentity>,
+    /// Cached per-context vector `COUNT(*)` for the open index (R-007), populated
+    /// lazily on the first search that needs it and reused across requests so the
+    /// hot path skips a per-query `COUNT(*)`. MUST be invalidated (`None`) on
+    /// `reopen_if_index_swapped` so a build-aside swap never serves a stale count
+    /// into `vector_search_path_for_corpus` (exhaustive-vs-ANN) path selection.
+    cached_vector_count: Option<usize>,
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
@@ -785,6 +791,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         context: context_from_entry(entry),
         db,
         index_identity,
+        cached_vector_count: None,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
@@ -856,6 +863,11 @@ async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupEr
 
     state.db = db;
     state.index_identity = current_identity;
+    // The swapped-in index has its own vector population; drop the cached count
+    // so the next search recomputes it against the refreshed index (R-007). A
+    // stale count here could flip `vector_search_path_for_corpus` between the
+    // exhaustive scan and the ANN path and silently change served candidates.
+    state.cached_vector_count = None;
     Ok(())
 }
 
@@ -1636,6 +1648,31 @@ async fn handle_search_request(
         }
     };
 
+    // Populate (once) and reuse the per-context vector count so the hot path
+    // skips a per-query `COUNT(*)` (R-007). The cache is invalidated on index
+    // swap by `reopen_if_index_swapped`, so a populated value always reflects the
+    // currently-open index. Only meaningful when embeddings exist.
+    let cached_vector_count = if has_embeddings {
+        match state.cached_vector_count {
+            Some(count) => Some(count),
+            None => match retrieval::count_vector_rows_for_context(&conn, &search_scope).await {
+                Ok(count) => {
+                    state.cached_vector_count = Some(count);
+                    Some(count)
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to count daemon search vectors for {}: {err}",
+                        state.project_root.display()
+                    );
+                    return search_service::unavailable_response();
+                }
+            },
+        }
+    } else {
+        None
+    };
+
     let mut degraded_reason = None;
     let results = if has_embeddings {
         let status = state
@@ -1648,7 +1685,11 @@ async fn handle_search_request(
                 &conn,
                 state.embedding_runtime.current_embedder(),
                 search_scope.clone(),
-            );
+            )
+            .with_has_vectors(has_embeddings);
+            if let Some(count) = cached_vector_count {
+                engine = engine.with_vector_count(count);
+            }
             engine.search(&request.query, request.limit).await
         } else {
             degraded_reason = Some(daemon_search_degraded_reason());
@@ -1769,6 +1810,7 @@ mod tests {
             context: test_context(project_root, source_root),
             db,
             index_identity: index_file_identity(&config::project_db_path(project_root)),
+            cached_vector_count: None,
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),
             run_state,
@@ -2501,6 +2543,54 @@ mod tests {
             segment_count_on_disk(&index_path).await,
             4,
             "a post-reopen daemon write must land in the live index, not the orphaned inode"
+        );
+    }
+
+    /// REQ-006 / T6 AC3: the per-context vector-count cache on `ProjectState`
+    /// MUST be invalidated when a build-aside rebuild swaps the index. A stale
+    /// count surviving the swap could flip `vector_search_path_for_corpus`
+    /// between the exhaustive scan and the ANN path and silently change served
+    /// candidates, so `reopen_if_index_swapped` clears it; the next search then
+    /// recomputes against the refreshed index.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_invalidates_cached_vector_count_after_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+        let root = state.project_root.clone();
+
+        // Prime the cache with a stale count from the pre-swap generation.
+        state.cached_vector_count = Some(2);
+
+        let staging = staged_index(&root, &["new1", "new2", "new3"]).await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        reopen_if_index_swapped(&mut state).await.unwrap();
+
+        assert_eq!(
+            state.cached_vector_count, None,
+            "a build-aside swap must invalidate the cached vector count"
+        );
+    }
+
+    /// REQ-006 / T6 AC3 (no-swap arm): a no-op reopen (no swap) keeps the cached
+    /// count untouched so steady-state searches reuse it and never re-`COUNT(*)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_no_swap_keeps_cached_vector_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+
+        state.cached_vector_count = Some(7);
+        reopen_if_index_swapped(&mut state).await.unwrap();
+
+        assert_eq!(
+            state.cached_vector_count,
+            Some(7),
+            "without a swap the cached count must survive a reopen no-op"
         );
     }
 
