@@ -51,9 +51,45 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "segments_symbol_ad"),
 ];
 
+/// When to create the `idx_embedding_pool_embedding` DiskANN vector index during
+/// [`initialize`].
+///
+/// On a cold full rebuild every `embedding_pool` row is known up front, so building
+/// the DiskANN graph once after all rows are inserted is far cheaper than the
+/// incremental per-insert maintenance the index does when it already exists (R-006).
+/// [`VectorIndexBuild::Deferred`] therefore skips index creation (and its
+/// completeness check) here; the staging rebuild builds it once via
+/// [`build_embedding_pool_vector_index`] after the pool is fully loaded and before
+/// the atomic swap. The daemon's incremental maintenance path never uses `Deferred`
+/// — it goes through `prepare_for_write`/`ensure_current` on an already-complete
+/// index, so per-insert maintenance is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VectorIndexBuild {
+    /// Create the DiskANN vector index inline (the default for any fresh or
+    /// in-place initialization).
+    Immediate,
+    /// Skip the DiskANN vector index here; it is built later via
+    /// [`build_embedding_pool_vector_index`] once the pool is fully loaded.
+    Deferred,
+}
+
 /// Run all DDL statements to initialize the database schema.
 /// This only creates the current schema version for fresh or explicitly rebuilt indexes.
 pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
+    initialize_with_vector_index(conn, VectorIndexBuild::Immediate).await
+}
+
+/// [`initialize`] with explicit control over when the DiskANN vector index is built.
+///
+/// See [`VectorIndexBuild`]. With [`VectorIndexBuild::Deferred`] the resulting schema
+/// is intentionally *incomplete* — `idx_embedding_pool_embedding` is absent — so a
+/// reader gating it through [`ensure_current`] fails closed until
+/// [`build_embedding_pool_vector_index`] runs. The staging rebuild only exposes the
+/// finished index through the atomic swap, so a served `index.db` always carries it.
+pub async fn initialize_with_vector_index(
+    conn: &Connection,
+    vector_index: VectorIndexBuild,
+) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
         "{};{};{};{};{};{};{};{};{};{};{}",
         queries::CREATE_WORKTREE_CONTEXTS_TABLE,
@@ -71,9 +107,11 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
     .await
     .map_err(|e| StorageError::Migration(format!("failed to create segments schema: {e}")))?;
 
-    conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
-        .await
-        .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
+    if vector_index == VectorIndexBuild::Immediate {
+        conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
+            .await
+            .map_err(|e| StorageError::Migration(format!("failed to create vector index: {e}")))?;
+    }
 
     conn.execute_batch(&format!(
         "{};{};{};{};{}",
@@ -104,8 +142,39 @@ pub async fn initialize(conn: &Connection) -> Result<(), OneupError> {
         .await
         .map_err(|e| StorageError::Migration(format!("failed to create meta table: {e}")))?;
 
-    validate_required_objects(conn).await?;
+    // In deferred mode the DiskANN vector index is not built yet, so validate every
+    // required object *except* it; the staging rebuild builds and validates that one
+    // index in `build_embedding_pool_vector_index` before the swap.
+    match vector_index {
+        VectorIndexBuild::Immediate => validate_required_objects(conn).await?,
+        VectorIndexBuild::Deferred => validate_required_objects_except_vector_index(conn).await?,
+    }
     set_schema_version(conn, SCHEMA_VERSION).await?;
+
+    Ok(())
+}
+
+/// Build the deferred `idx_embedding_pool_embedding` DiskANN index, then confirm it
+/// exists.
+///
+/// Called by the staging rebuild after the `embedding_pool` is fully loaded and
+/// before the atomic swap, completing a schema initialized with
+/// [`VectorIndexBuild::Deferred`]. Building the DiskANN graph once over the full pool
+/// avoids the incremental per-insert maintenance the index performs when it already
+/// exists (R-006). After this returns the staging schema is complete and passes
+/// [`ensure_current`].
+pub async fn build_embedding_pool_vector_index(conn: &Connection) -> Result<(), OneupError> {
+    conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
+        .await
+        .map_err(|e| {
+            StorageError::Migration(format!("failed to build deferred vector index: {e}"))
+        })?;
+
+    if !schema_object_exists(conn, "index", "idx_embedding_pool_embedding").await? {
+        return Err(reindex_required(format!(
+            "index schema v{SCHEMA_VERSION} is incomplete (missing required index `idx_embedding_pool_embedding`)"
+        )));
+    }
 
     Ok(())
 }
@@ -406,7 +475,29 @@ async fn embedding_pool_embedding_vec_type(
 }
 
 async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> {
+    validate_required_objects_inner(conn, true).await
+}
+
+/// Like [`validate_required_objects`] but tolerates the DiskANN vector index being
+/// absent — used after a [`VectorIndexBuild::Deferred`] initialize, where that index
+/// is intentionally built later (R-006).
+async fn validate_required_objects_except_vector_index(
+    conn: &Connection,
+) -> Result<(), OneupError> {
+    validate_required_objects_inner(conn, false).await
+}
+
+async fn validate_required_objects_inner(
+    conn: &Connection,
+    require_vector_index: bool,
+) -> Result<(), OneupError> {
     for (object_type, name) in REQUIRED_SCHEMA_OBJECTS {
+        if !require_vector_index
+            && *object_type == "index"
+            && *name == "idx_embedding_pool_embedding"
+        {
+            continue;
+        }
         if !schema_object_exists(conn, object_type, name).await? {
             return Err(reindex_required(format!(
                 "index schema v{SCHEMA_VERSION} is incomplete (missing required {object_type} `{name}`)"
@@ -562,6 +653,63 @@ mod tests {
         let db = Db::open_memory().await.unwrap();
         let conn = db.connect().unwrap();
         (db, conn)
+    }
+
+    #[tokio::test]
+    async fn immediate_initialize_builds_the_vector_index_inline() {
+        // The default (incremental/daemon) path keeps building the DiskANN index
+        // during `initialize`, so the schema is complete and `ensure_current` passes.
+        let (_db, conn) = setup().await;
+        initialize(&conn).await.unwrap();
+
+        assert!(
+            schema_object_exists(&conn, "index", "idx_embedding_pool_embedding")
+                .await
+                .unwrap(),
+            "immediate initialize must build the DiskANN index inline"
+        );
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect("an immediately-initialized schema must be complete");
+    }
+
+    #[tokio::test]
+    async fn deferred_initialize_omits_index_until_built_then_completes() {
+        // R-006: the deferred path leaves the schema intentionally incomplete (the
+        // DiskANN index is absent) so a reader fails closed, then
+        // `build_embedding_pool_vector_index` completes it.
+        let (_db, conn) = setup().await;
+        initialize_with_vector_index(&conn, VectorIndexBuild::Deferred)
+            .await
+            .unwrap();
+
+        assert!(
+            !schema_object_exists(&conn, "index", "idx_embedding_pool_embedding")
+                .await
+                .unwrap(),
+            "deferred initialize must NOT build the DiskANN index yet"
+        );
+        // Every other required object is present already — the version is set, so a
+        // reader gating this incomplete schema fails closed only on the missing index.
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect_err("an incomplete (index-less) schema must fail closed");
+        assert!(
+            err.to_string().contains("idx_embedding_pool_embedding"),
+            "fail-closed error must name the missing vector index, got: {err}"
+        );
+
+        build_embedding_pool_vector_index(&conn).await.unwrap();
+
+        assert!(
+            schema_object_exists(&conn, "index", "idx_embedding_pool_embedding")
+                .await
+                .unwrap(),
+            "the deferred build must create the DiskANN index"
+        );
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect("after the deferred build the schema must be complete");
     }
 
     /// Build a 384-dimension zero-valued JSON vector literal for test fixtures.
