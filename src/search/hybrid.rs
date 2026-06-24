@@ -38,6 +38,17 @@ impl<'a> HybridSearchEngine<'a> {
     /// exact-lexical short-circuit, and the cheap vector-presence probe all
     /// run before the query is ever embedded, so an index without vector rows
     /// never exercises the embedder.
+    ///
+    /// The symbol and FTS stages are independent read-only queries over the
+    /// same connection, so they run concurrently via `tokio::try_join!`
+    /// (R-002, reviving the dead `SqlVectorV2` concurrency pattern on the live
+    /// path). The vector stage stays sequenced after them because its
+    /// `is_exact_lexical_hit` / `has_indexed_embeddings` gate depends on the
+    /// lexical results — embedding it concurrently would break the
+    /// short-circuit's "an index without vector rows never exercises the
+    /// embedder" guarantee. Fusion stays timing-independent: each stage's rank
+    /// comes from its own SQL `ORDER BY`, and RRF is keyed by `segment_id`, so
+    /// overlapping the lexical reads cannot change the ranked output.
     pub async fn search(
         &mut self,
         query: &str,
@@ -48,8 +59,10 @@ impl<'a> HybridSearchEngine<'a> {
         }
 
         let intent = detect_intent(query);
-        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
-        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+        let (symbol_results, fts_results) = tokio::try_join!(
+            symbol_search(self.conn, &self.scope, query, intent),
+            retrieval::fetch_fts_candidates(self.conn, &self.scope, query),
+        )?;
 
         let should_fetch_vector = self.embedder.is_some()
             && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
@@ -98,9 +111,23 @@ impl<'a> HybridSearchEngine<'a> {
         )
     }
 
+    /// Embeds the query for the vector stage, running the CPU-bound ONNX
+    /// inference off the cooperative scheduler so it does not stall other
+    /// async work on the multi-thread runtime (R-002).
+    ///
+    /// Uses `block_in_place` rather than `spawn_blocking`: the embedder is a
+    /// borrowed `&mut Embedder` lent by the caller's (warm) runtime, and
+    /// `spawn_blocking` requires a `'static + Send` closure, which would force
+    /// either an `Arc<Mutex<Embedder>>` or moving ownership through the engine
+    /// — both of which would break the `&mut embedder` borrow discipline the
+    /// three live callers rely on. `block_in_place` keeps that exact borrow,
+    /// runs the identical `embed_one` call (so the vector is bit-for-bit
+    /// unchanged), and tells the runtime to relocate this worker's other tasks
+    /// while the inference runs. Every live caller runs on the multi-thread
+    /// `#[tokio::main]` runtime, which `block_in_place` requires.
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_deref_mut()?;
-        match embedder.embed_one(query) {
+        match tokio::task::block_in_place(|| embedder.embed_one(query)) {
             Ok(embedding) => Some(embedding),
             Err(err) => {
                 eprintln!(
@@ -775,6 +802,137 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].segment_id, "seg-main");
+    }
+
+    fn symbol_fts_insert(
+        id: &str,
+        file_path: &str,
+        content: &str,
+        defined_symbols: &str,
+    ) -> crate::storage::segments::SegmentInsert {
+        crate::storage::segments::SegmentInsert {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: content.to_string(),
+            line_start: 1,
+            line_end: 3,
+            content_key: None,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: defined_symbols.to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("hash-{id}"),
+        }
+    }
+
+    /// REQ-002 (T2): `search` fuses the concurrently-run (`try_join!`) symbol
+    /// and FTS stages identically to the prior sequential awaits. The corpus
+    /// is split so one segment matches *only* the symbol stage and the other
+    /// *only* FTS, and the per-stage RRF weights differ (`SYMBOL_WEIGHT=4.0`
+    /// vs FTS `1.0`), so the symbol-only hit must rank first. This is the
+    /// discriminating assertion: swapping the two `try_join!` outputs (mis-
+    /// attributing symbol rows as FTS and vice versa) flips the order, so the
+    /// test fails — verified by construction. The `None` embedder keeps the
+    /// vector stage out, isolating the lexical-fusion path that changed and
+    /// keeping the test hermetic (no model required).
+    #[tokio::test]
+    async fn search_fuses_concurrent_symbol_and_fts_stages_in_weighted_order() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        // Symbol-only hit: its canonical symbol matches "render widget"; its
+        // content carries none of the query tokens or their prefixes, so the
+        // FTS stage cannot reach it.
+        let symbol_only = symbol_fts_insert(
+            "seg-symbol-only",
+            "src/symbol.rs",
+            "fn zzz_handler() { qqq_helper(); }",
+            "[\"render_widget\"]",
+        );
+        // FTS-only hit: its content matches "render"/"widget", but its symbol
+        // does not canonicalize to the query, so the symbol stage skips it.
+        let fts_only = symbol_fts_insert(
+            "seg-fts-only",
+            "src/text.rs",
+            "// render the widget in this routine",
+            "[\"unrelated_symbol\"]",
+        );
+        crate::storage::segments::upsert_segment(&conn, &symbol_only)
+            .await
+            .unwrap();
+        crate::storage::segments::upsert_segment(&conn, &fts_only)
+            .await
+            .unwrap();
+
+        let mut engine = HybridSearchEngine::new(&conn, None);
+        let results = engine.search("render widget", 10).await.unwrap();
+
+        let ids: Vec<&str> = results.iter().map(|r| r.segment_id.as_str()).collect();
+        assert!(
+            ids.contains(&"seg-symbol-only"),
+            "symbol-only hit must surface: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"seg-fts-only"),
+            "fts-only hit must surface: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], "seg-symbol-only",
+            "symbol-stage weight ({}) must outrank the fts-stage hit ({}); a swap of the try_join! outputs would flip this: {ids:?}",
+            crate::shared::constants::SYMBOL_WEIGHT,
+            1.0
+        );
+        // The symbol-only hit carries strictly more fused weight than the
+        // fts-only hit, so its normalized score is the larger of the two.
+        let score_of = |id: &str| results.iter().find(|r| r.segment_id == id).unwrap().score;
+        assert!(
+            score_of("seg-symbol-only") > score_of("seg-fts-only"),
+            "symbol-only score must exceed fts-only score: {ids:?}"
+        );
+    }
+
+    /// REQ-002 (T2): the query embedding now runs through `block_in_place`
+    /// (off the cooperative scheduler) rather than inline. The produced vector
+    /// must be bit-for-bit identical to the direct synchronous call — the
+    /// numerics acceptance gate. Runs on a multi-thread runtime because
+    /// `block_in_place` panics on a current-thread runtime, and is gated on
+    /// model availability like the other real-inference tests (hermetic CI
+    /// disables model downloads).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_embedding_is_bit_stable_through_block_in_place() {
+        use crate::indexer::embedder::{is_model_available, EmbeddingRuntime};
+
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let mut runtime = EmbeddingRuntime::default();
+        let status = runtime.prepare_for_search(1);
+        assert!(
+            status.is_available(),
+            "expected an available embedder, got {status:?}"
+        );
+        let embedder = runtime
+            .current_embedder()
+            .expect("available runtime must expose an embedder");
+
+        let query = "where is the query embedding computed";
+        let synchronous = embedder.embed_one(query).unwrap();
+        let off_runtime = tokio::task::block_in_place(|| embedder.embed_one(query)).unwrap();
+
+        assert_eq!(
+            synchronous, off_runtime,
+            "block_in_place must run the identical inference and not perturb the vector"
+        );
     }
 
     fn scoped_insert(
