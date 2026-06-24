@@ -48,9 +48,6 @@ pub const CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH: &str =
 pub const CREATE_INDEX_LANGUAGE: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_language ON segments(language)";
 
-pub const CREATE_INDEX_FILE_HASH: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
-
 /// Content-addressed embedding store. One row per distinct `(model_id,
 /// embedding_dim, embed_input)` content key, holding the shared vector bytes and
 /// the DiskANN index. `ref_count` tracks how many `segment_vectors` rows

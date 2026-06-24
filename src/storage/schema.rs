@@ -37,7 +37,6 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segments_file_path"),
     ("index", "idx_segments_context_file_path"),
     ("index", "idx_segments_language"),
-    ("index", "idx_segments_file_hash"),
     ("index", "idx_embedding_pool_embedding"),
     ("index", "idx_segment_symbols_exact"),
     ("index", "idx_segment_symbols_prefix"),
@@ -91,13 +90,12 @@ pub async fn initialize_with_vector_index(
     vector_index: VectorIndexBuild,
 ) -> Result<(), OneupError> {
     conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{};{};{};{}",
+        "{};{};{};{};{};{};{};{};{};{}",
         queries::CREATE_WORKTREE_CONTEXTS_TABLE,
         queries::CREATE_SEGMENTS_TABLE,
         queries::CREATE_INDEX_FILE_PATH,
         queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
         queries::CREATE_INDEX_LANGUAGE,
-        queries::CREATE_INDEX_FILE_HASH,
         queries::CREATE_EMBEDDING_POOL_TABLE,
         queries::CREATE_SEGMENT_VECTORS_TABLE,
         queries::CREATE_SEGMENT_SYMBOLS_TABLE,
@@ -656,6 +654,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_does_not_create_the_dead_file_hash_index() {
+        // R-009 (T11): `idx_segments_file_hash` had no reader and was dropped. A fresh
+        // index build must no longer create it, and it must not be a required object.
+        let (_db, conn) = setup().await;
+        initialize(&conn).await.unwrap();
+
+        assert!(
+            !schema_object_exists(&conn, "index", "idx_segments_file_hash")
+                .await
+                .unwrap(),
+            "a fresh build must not create the dead idx_segments_file_hash index"
+        );
+        assert!(
+            !REQUIRED_SCHEMA_OBJECTS
+                .iter()
+                .any(|(_, name)| *name == "idx_segments_file_hash"),
+            "idx_segments_file_hash must not be a required schema object"
+        );
+        // The schema is still complete without it.
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect("schema must be complete after dropping the dead index");
+    }
+
+    #[tokio::test]
     async fn immediate_initialize_builds_the_vector_index_inline() {
         // The default (incremental/daemon) path keeps building the DiskANN index
         // during `initialize`, so the schema is complete and `ensure_current` passes.
@@ -1099,7 +1122,6 @@ mod tests {
                 queries::CREATE_INDEX_FILE_PATH,
                 queries::CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH,
                 queries::CREATE_INDEX_LANGUAGE,
-                queries::CREATE_INDEX_FILE_HASH,
                 queries::CREATE_EMBEDDING_POOL_TABLE,
                 queries::CREATE_SEGMENT_VECTORS_TABLE,
                 queries::CREATE_SEGMENT_SYMBOLS_TABLE,
