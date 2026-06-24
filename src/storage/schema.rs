@@ -37,6 +37,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_segments_file_path"),
     ("index", "idx_segments_context_file_path"),
     ("index", "idx_segments_language"),
+    ("index", "idx_segment_vectors_content_key"),
     ("index", "idx_embedding_pool_embedding"),
     ("index", "idx_segment_symbols_exact"),
     ("index", "idx_segment_symbols_prefix"),
@@ -112,7 +113,8 @@ pub async fn initialize_with_vector_index(
     }
 
     conn.execute_batch(&format!(
-        "{};{};{};{};{}",
+        "{};{};{};{};{};{}",
+        queries::CREATE_INDEX_SEGMENT_VECTORS_CONTENT_KEY,
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
         queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
         queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
@@ -679,6 +681,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_creates_the_segment_vectors_content_key_index() {
+        // R-010 (T12): `idx_segment_vectors_content_key` backs the ANN fan-out join
+        // `sv.content_key = p.content_key`. A fresh build must create it, it must be a
+        // required object, and an otherwise-complete schema missing only this index
+        // must fail closed (so it is genuinely maintained, not best-effort).
+        let (_db, conn) = setup().await;
+        initialize(&conn).await.unwrap();
+
+        assert!(
+            schema_object_exists(&conn, "index", "idx_segment_vectors_content_key")
+                .await
+                .unwrap(),
+            "a fresh build must create idx_segment_vectors_content_key"
+        );
+        assert!(
+            REQUIRED_SCHEMA_OBJECTS
+                .iter()
+                .any(|(ty, name)| *ty == "index" && *name == "idx_segment_vectors_content_key"),
+            "idx_segment_vectors_content_key must be a required schema object"
+        );
+        ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect("schema with the content_key index must be complete");
+
+        conn.execute("DROP INDEX idx_segment_vectors_content_key", ())
+            .await
+            .unwrap();
+        let err = ensure_current(&conn, &SchemaContext::unspecified())
+            .await
+            .expect_err("dropping the required content_key index must fail closed");
+        assert!(
+            err.to_string().contains("idx_segment_vectors_content_key"),
+            "fail-closed error must name the missing index, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn immediate_initialize_builds_the_vector_index_inline() {
         // The default (incremental/daemon) path keeps building the DiskANN index
         // during `initialize`, so the schema is complete and `ensure_current` passes.
@@ -1143,6 +1182,7 @@ mod tests {
             )
         )",
                 queries::CREATE_INDEXED_FILES_TABLE,
+                queries::CREATE_INDEX_SEGMENT_VECTORS_CONTENT_KEY,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_EXACT,
                 queries::CREATE_INDEX_SEGMENT_SYMBOLS_PREFIX,
                 queries::CREATE_INDEX_SEGMENT_RELATIONS_SOURCE,
