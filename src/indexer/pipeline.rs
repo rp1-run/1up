@@ -854,6 +854,11 @@ async fn build_segment_batches(
             .collect());
     };
 
+    // Fold the loaded model variant (INT8 default vs FP32 fallback, R-003/T10)
+    // into the content key so swapping the variant resolves to distinct keys and
+    // forces a clean re-embed instead of reusing numerically-different vectors.
+    let model_id = embedder.model_id();
+
     // Pass 1: derive the content key + embed input for every embeddable segment,
     // in deterministic file/segment order.
     let embeddable: Vec<EmbeddableSegment> = parsed_files
@@ -864,8 +869,7 @@ async fn build_segment_batches(
                 .filter(|segment| should_embed_segment(segment))
                 .map(|segment| {
                     let embed_input = compose_embedding_text(&file.relative_path, segment);
-                    let content_key =
-                        embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+                    let content_key = embedding_content_key(&model_id, EMBEDDING_DIM, &embed_input);
                     EmbeddableSegment {
                         content_key,
                         embed_input,
@@ -1624,7 +1628,14 @@ async fn execute_run_with_inputs(
         stats.embedding_unavailable_reason =
             Some("embedding model unavailable; indexed without embeddings".to_string());
     } else {
-        schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
+        // Use the loaded variant's identity (INT8 vs FP32, R-003/T10) so an index
+        // built under one variant fails closed with reindex guidance when reopened
+        // under the other while vectors exist — the FP32->INT8 re-embed gate.
+        let model_id = embedder
+            .as_ref()
+            .map(|embedder| embedder.model_id())
+            .unwrap_or_else(|| HF_MODEL_REPO.to_string());
+        schema::check_embedding_model_compatible(conn, &model_id, EMBEDDING_DIM).await?;
     }
 
     let scope_info = Some(IndexScopeInfo {

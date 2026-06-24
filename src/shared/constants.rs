@@ -298,8 +298,31 @@ pub const SCHEMA_VERSION: u32 = 17;
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 
-/// ONNX model filename.
+/// FP32 ONNX model filename (the always-present baseline / fallback artifact).
 pub const MODEL_FILENAME: &str = "model.onnx";
+
+/// INT8-quantized ONNX model filename (R-003, T10).
+///
+/// When present alongside [`MODEL_FILENAME`] in the active model directory, this
+/// dynamic-INT8 build of all-MiniLM-L6-v2 is loaded as the default CPU embedding
+/// path; when absent (or it fails to load) the embedder falls back to the FP32
+/// [`MODEL_FILENAME`] with byte-identical numerics. The file lives next to the
+/// FP32 model in the verified artifact directory; provisioning the actual
+/// quantized artifact (download + pinned-SHA verification) is the manual gate —
+/// this constant is the load-time contract the loader keys off.
+pub const MODEL_ONNX_INT8_FILENAME: &str = "model.int8.onnx";
+
+/// Model-identity suffix that distinguishes the INT8 variant from the FP32
+/// baseline inside the content-addressed embedding key (R-003, T10).
+///
+/// The embedding `content_key` and the stored `meta.embedding_model` fold the
+/// model identity (`HF_MODEL_REPO`). The INT8 and FP32 builds of the same repo
+/// produce numerically different vectors, so they MUST resolve to distinct keys:
+/// the active variant's identity is `HF_MODEL_REPO` for FP32 and
+/// `format!("{HF_MODEL_REPO}{MODEL_VARIANT_INT8_SUFFIX}")` for INT8. Swapping the
+/// variant therefore changes every key, invalidating cached vectors and forcing
+/// a clean re-embed (the load-bearing correctness point for the v18 re-embed).
+pub const MODEL_VARIANT_INT8_SUFFIX: &str = "@int8";
 
 /// Tokenizer filename.
 pub const TOKENIZER_FILENAME: &str = "tokenizer.json";

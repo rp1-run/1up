@@ -18,9 +18,9 @@ use crate::shared::constants::{
     DISABLE_MODEL_DOWNLOADS_ENV_VAR, EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     HF_BASE_URL, HF_MODEL_REPO, MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
-    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME,
-    MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
-    XDG_STATE_DIR_MODE,
+    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_SHA256,
+    MODEL_STAGING_DIRNAME, MODEL_VARIANT_INT8_SUFFIX, MODEL_VERIFIED_DIRNAME,
+    SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::{EmbeddingError, OneupError};
 use crate::shared::fs::{
@@ -174,6 +174,41 @@ impl EmbeddingCompatibilityKey {
             tokenizer: FileFingerprint::from_path(&tokenizer_path)?,
             embed_threads,
         })
+    }
+}
+
+/// Which ONNX model variant an [`Embedder`] loaded (R-003, T10).
+///
+/// INT8 is the default CPU path when the quantized artifact is present and
+/// loads; FP32 is the always-available fallback with byte-identical numerics to
+/// the historical path. The variant feeds [`Embedder::model_id`], which is
+/// folded into the embedding `content_key` and `meta.embedding_model` so a
+/// variant swap invalidates cached vectors and forces a clean re-embed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVariant {
+    Int8,
+    Fp32,
+}
+
+impl ModelVariant {
+    /// Model-identity string folded into the content-addressed embedding key.
+    ///
+    /// FP32 keeps the bare [`HF_MODEL_REPO`] identity (so existing FP32 indexes
+    /// stay valid); INT8 appends [`MODEL_VARIANT_INT8_SUFFIX`] so its vectors
+    /// resolve to distinct keys and never collide with FP32 vectors.
+    pub fn model_id(self) -> String {
+        match self {
+            ModelVariant::Int8 => format!("{HF_MODEL_REPO}{MODEL_VARIANT_INT8_SUFFIX}"),
+            ModelVariant::Fp32 => HF_MODEL_REPO.to_string(),
+        }
+    }
+
+    /// Filename of the ONNX artifact backing this variant.
+    fn model_filename(self) -> &'static str {
+        match self {
+            ModelVariant::Int8 => MODEL_ONNX_INT8_FILENAME,
+            ModelVariant::Fp32 => MODEL_FILENAME,
+        }
     }
 }
 
@@ -410,6 +445,7 @@ pub struct Embedder {
     session: Session,
     tokenizer: Tokenizer,
     batch_size: usize,
+    variant: ModelVariant,
 }
 
 /// Reports whether the embedding model files are present on disk.
@@ -579,20 +615,47 @@ impl Embedder {
         intra_threads: usize,
         batch_size: usize,
     ) -> Result<Self, OneupError> {
-        let model_path = dir.join(MODEL_FILENAME);
         let tokenizer_path = dir.join(TOKENIZER_FILENAME);
+        if !tokenizer_path.exists() {
+            return Err(EmbeddingError::ModelNotAvailable(format!(
+                "tokenizer not found at {}",
+                tokenizer_path.display()
+            ))
+            .into());
+        }
+
+        // INT8 is the default CPU path when present (R-003, T10); FP32 is the
+        // always-present fallback. Loading the INT8 artifact can fail
+        // independently of the FP32 baseline (corrupt/incompatible quantized
+        // graph), so a failed INT8 load degrades to FP32 rather than failing the
+        // whole embedder — the FP32 numerics are byte-identical to the historical
+        // path. Only an absent *and* unloadable FP32 baseline is fatal.
+        let int8_path = dir.join(MODEL_ONNX_INT8_FILENAME);
+        if int8_path.exists() {
+            match Self::load_variant(dir, ModelVariant::Int8, intra_threads, batch_size) {
+                Ok(embedder) => return Ok(embedder),
+                Err(err) => tracing::warn!(
+                    "INT8 model present at {} but failed to load ({err}); falling back to FP32",
+                    int8_path.display()
+                ),
+            }
+        }
+
+        Self::load_variant(dir, ModelVariant::Fp32, intra_threads, batch_size)
+    }
+
+    fn load_variant(
+        dir: &Path,
+        variant: ModelVariant,
+        intra_threads: usize,
+        batch_size: usize,
+    ) -> Result<Self, OneupError> {
+        let model_path = dir.join(variant.model_filename());
 
         if !model_path.exists() {
             return Err(EmbeddingError::ModelNotAvailable(format!(
                 "model not found at {}",
                 model_path.display()
-            ))
-            .into());
-        }
-        if !tokenizer_path.exists() {
-            return Err(EmbeddingError::ModelNotAvailable(format!(
-                "tokenizer not found at {}",
-                tokenizer_path.display()
             ))
             .into());
         }
@@ -616,7 +679,7 @@ impl Embedder {
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
             EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
         })?;
 
@@ -624,7 +687,20 @@ impl Embedder {
             session,
             tokenizer,
             batch_size,
+            variant,
         })
+    }
+
+    /// Model-identity string of the loaded variant, folded into the
+    /// content-addressed embedding key and `meta.embedding_model` (R-003, T10).
+    pub fn model_id(&self) -> String {
+        self.variant.model_id()
+    }
+
+    /// Which ONNX variant this embedder loaded (INT8 default vs FP32 fallback).
+    #[allow(dead_code)]
+    pub fn variant(&self) -> ModelVariant {
+        self.variant
     }
 
     /// Embeds a single text, returning a 384-dimensional unit vector.
@@ -1538,6 +1614,31 @@ mod tests {
         assert!(model_downloads_disabled_value(Some(OsString::from("true"))));
     }
 
+    #[test]
+    fn model_variant_identity_distinguishes_int8_from_fp32() {
+        // R-003 (T10): FP32 keeps the bare repo identity so existing FP32 indexes
+        // stay valid; INT8 appends the suffix so its content keys never collide
+        // with FP32 vectors. This is the load-bearing correctness point: a variant
+        // swap must change the model identity (and therefore every content key),
+        // forcing a clean re-embed rather than reusing numerically-different
+        // vectors.
+        assert_eq!(ModelVariant::Fp32.model_id(), HF_MODEL_REPO);
+        assert_ne!(
+            ModelVariant::Int8.model_id(),
+            ModelVariant::Fp32.model_id(),
+            "INT8 and FP32 must resolve to distinct model identities"
+        );
+        assert!(
+            ModelVariant::Int8.model_id().starts_with(HF_MODEL_REPO),
+            "INT8 identity is the FP32 repo plus the variant suffix"
+        );
+        assert_ne!(
+            ModelVariant::Int8.model_filename(),
+            ModelVariant::Fp32.model_filename(),
+            "each variant loads a distinct ONNX artifact"
+        );
+    }
+
     /// Restores `HOME`/`XDG_DATA_HOME` on drop — even if an assertion panics — so a
     /// redirected data root never leaks to other tests in this binary.
     struct DataRootGuard {
@@ -2196,6 +2297,7 @@ mod tests {
                 .unwrap(),
             tokenizer: Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).unwrap(),
             batch_size: 2,
+            variant: ModelVariant::Fp32,
         };
 
         let texts: Vec<&str> = vec![
@@ -2231,6 +2333,7 @@ mod tests {
                 .unwrap(),
             tokenizer: Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).unwrap(),
             batch_size: 2,
+            variant: ModelVariant::Fp32,
         };
 
         // Deliberately interleaved short/long inputs: a stable sort by token
