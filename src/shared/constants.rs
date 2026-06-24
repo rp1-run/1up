@@ -7,8 +7,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default batch size for embedding inference.
 pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
-/// Maximum token length for the embedding model.
-pub const EMBEDDING_MAX_TOKENS: usize = 256;
+/// Effective maximum token length for the embedding model.
+///
+/// This is the shipped tokenizer's real cap: `tokenizer.json` sets
+/// `truncation.max_length = 128` and `padding = {Fixed: 128}`, so every
+/// encoding is already truncated and padded to 128 tokens before inference. The
+/// embedder's explicit `enc.truncate(EMBEDDING_MAX_TOKENS)` is therefore a
+/// belt-and-suspenders no-op the tokenizer has already applied. This was
+/// historically 256, a value that never took effect (256 > 128) yet
+/// misrepresented the model window; correcting it to the real 128-token cap
+/// changes no produced vector (the truncate stays a no-op) and lets
+/// length-aware callers reason against the true window.
+pub const EMBEDDING_MAX_TOKENS: usize = 128;
 
 /// Chunk-segment languages excluded from embedding.
 ///
