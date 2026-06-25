@@ -475,7 +475,7 @@ pub async fn classify_readiness(
         }
     };
 
-    let conn = match db.connect() {
+    let conn = match db.connect_tuned().await {
         Ok(conn) => conn,
         Err(err) => {
             if daemon_refresh_active {
@@ -523,13 +523,31 @@ pub async fn classify_readiness(
         return payload;
     }
 
+    // index_readable must imply the own-context counts were actually read. If the
+    // counts cannot be read right now (e.g. the auto-started daemon holds the write
+    // lock during a concurrent refresh), report indexing/stale rather than claiming
+    // index_readable with silently-omitted counts — that mismatch (index_readable
+    // true alongside a null count) is what made the status-count assertions flaky
+    // under parallel CI load.
+    let (indexed_files, total_segments) = match (
+        count_files_for_context(&conn, &worktree_context.context_id).await,
+        count_segments_for_context(&conn, &worktree_context.context_id).await,
+    ) {
+        (Ok(files), Ok(segments)) => (files, segments),
+        _ => {
+            if daemon_refresh_active {
+                payload.status = ReadinessStatus::Indexing;
+                payload.summary = "Indexing is currently running.".to_string();
+            } else {
+                payload.status = ReadinessStatus::Stale;
+                payload.summary = "The index exists but its contents cannot be read.".to_string();
+            }
+            return payload;
+        }
+    };
     payload.index_readable = true;
-    payload.indexed_files = count_files_for_context(&conn, &worktree_context.context_id)
-        .await
-        .ok();
-    payload.total_segments = count_segments_for_context(&conn, &worktree_context.context_id)
-        .await
-        .ok();
+    payload.indexed_files = Some(indexed_files);
+    payload.total_segments = Some(total_segments);
     payload.vector_rows = count_vector_rows_for_context(&conn, &worktree_context.context_id)
         .await
         .ok();
@@ -1131,7 +1149,7 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     }
 
     let db = Db::open_ro(&db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, state_root)).await?;
 
     Ok(CurrentIndex { conn, _db: db })
