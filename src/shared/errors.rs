@@ -252,6 +252,11 @@ pub enum UpdateError {
         "refusing update: no attestation exists for {subject}; the attestation service definitively confirmed none, so it was not installed"
     )]
     AttestationMissing { subject: String },
+
+    #[error(
+        "refusing download: host {host} is not on the artifact download allowlist; the update manifest or a redirect target may have been tampered with"
+    )]
+    DownloadHostNotAllowed { host: String },
 }
 
 impl UpdateError {

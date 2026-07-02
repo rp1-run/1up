@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,10 +10,11 @@ use tracing::{debug, warn};
 use crate::shared::config;
 use crate::shared::constants::{
     ATTESTATION_OIDC_ISSUER, ATTESTATION_REPO_SLUG, ATTESTATION_WORKFLOW_IDENTITY_PREFIX,
-    GITHUB_API_BASE_URL, SECURE_STATE_FILE_MODE, UPDATE_CHECK_CONNECT_TIMEOUT_SECS,
-    UPDATE_CHECK_TIMEOUT_SECS, UPDATE_CHECK_TTL_SECS, UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS,
-    UPDATE_DOWNLOAD_TIMEOUT_SECS, UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS,
-    UPDATE_MANIFEST_URL_ENV_VAR, VERSION, XDG_STATE_DIR_MODE,
+    GITHUB_API_BASE_URL, SECURE_STATE_FILE_MODE, UPDATE_ARTIFACT_HOST_ALLOWLIST,
+    UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS, UPDATE_CHECK_TTL_SECS,
+    UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS, UPDATE_DOWNLOAD_TIMEOUT_SECS,
+    UPDATE_MANIFEST_EXPIRY_CLOCK_SKEW_SECS, UPDATE_MANIFEST_URL_ENV_VAR, VERSION,
+    XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::UpdateError;
 
@@ -495,13 +497,58 @@ pub struct SelfUpdateResult {
     pub new_version: String,
 }
 
+/// Ensures an artifact download URL uses `https` and resolves to a host on
+/// the frozen [`UPDATE_ARTIFACT_HOST_ALLOWLIST`].
+///
+/// Applied both to the initial artifact URL (in [`download_archive`]) and to
+/// every redirect hop (via the custom policy in [`build_download_client`]),
+/// so neither a tampered manifest URL nor a malicious redirect can steer the
+/// download to an attacker-controlled host.
+fn ensure_artifact_url_allowlisted(url: &str) -> Result<(), UpdateError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| UpdateError::DownloadHostNotAllowed {
+        host: format!("<unparseable URL: {e}>"),
+    })?;
+    let host = parsed.host_str().unwrap_or("<no host>");
+    if parsed.scheme() == "https" && UPDATE_ARTIFACT_HOST_ALLOWLIST.contains(&host) {
+        Ok(())
+    } else {
+        Err(UpdateError::DownloadHostNotAllowed {
+            host: host.to_string(),
+        })
+    }
+}
+
 /// Builds a pre-configured HTTP client for downloading update artifacts.
+///
+/// The redirect policy re-applies [`ensure_artifact_url_allowlisted`] to
+/// every hop: reqwest only invokes a custom policy for redirect targets, not
+/// the initial request URL, so the initial URL is still gated separately in
+/// [`download_archive`].
 pub fn build_download_client() -> Result<reqwest::Client, UpdateError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(UPDATE_DOWNLOAD_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(UPDATE_DOWNLOAD_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match ensure_artifact_url_allowlisted(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(e) => attempt.error(e),
+            },
+        ))
         .build()
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("http client: {e}")))
+}
+
+/// Recovers a [`UpdateError::DownloadHostNotAllowed`] refused by the redirect
+/// policy from a `reqwest::Error`'s source chain, so a redirect-hop refusal
+/// names the refused host the same way an initial-URL refusal does; any other
+/// transport failure falls back to the generic download-failure wording.
+fn download_request_error(err: reqwest::Error) -> UpdateError {
+    match err.source().and_then(|s| s.downcast_ref::<UpdateError>()) {
+        Some(UpdateError::DownloadHostNotAllowed { host }) => {
+            UpdateError::DownloadHostNotAllowed { host: host.clone() }
+        }
+        _ => UpdateError::SelfUpdateFailed(format!("download request: {err}")),
+    }
 }
 
 /// Finds the artifact matching the current platform in the manifest.
@@ -534,11 +581,13 @@ async fn download_archive(
 ) -> Result<PathBuf, UpdateError> {
     use futures_util::StreamExt;
 
+    ensure_artifact_url_allowlisted(&artifact.url)?;
+
     let response = client
         .get(&artifact.url)
         .send()
         .await
-        .map_err(|e| UpdateError::SelfUpdateFailed(format!("download request: {e}")))?;
+        .map_err(download_request_error)?;
 
     if !response.status().is_success() {
         return Err(UpdateError::SelfUpdateFailed(format!(
@@ -1840,6 +1889,88 @@ mod tests {
     fn build_download_client_succeeds() {
         let client = build_download_client();
         assert!(client.is_ok(), "expected download client to build");
+    }
+
+    #[test]
+    fn ensure_artifact_url_allowlisted_allows_allowlisted_host() {
+        let result = ensure_artifact_url_allowlisted(
+            "https://github.com/rp1-run/1up/releases/download/v1/1up.tar.gz",
+        );
+        assert!(
+            result.is_ok(),
+            "expected allowlisted host to proceed: {result:?}"
+        );
+
+        let result = ensure_artifact_url_allowlisted(
+            "https://release-assets.githubusercontent.com/1up.tar.gz",
+        );
+        assert!(
+            result.is_ok(),
+            "expected allowlisted CDN host to proceed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_artifact_url_allowlisted_refuses_off_allowlist_initial_url() {
+        let result = ensure_artifact_url_allowlisted("https://evil.example.com/1up.tar.gz");
+        match result {
+            Err(UpdateError::DownloadHostNotAllowed { host }) => {
+                assert_eq!(host, "evil.example.com");
+            }
+            other => panic!("expected DownloadHostNotAllowed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_artifact_url_allowlisted_refuses_non_https_scheme() {
+        let result = ensure_artifact_url_allowlisted("http://github.com/rp1-run/1up/1up.tar.gz");
+        match result {
+            Err(UpdateError::DownloadHostNotAllowed { host }) => {
+                assert_eq!(host, "github.com");
+            }
+            other => panic!("expected DownloadHostNotAllowed for non-https scheme, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_download_client_redirect_policy_refuses_off_allowlist_hop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/unreachable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = build_download_client().unwrap();
+        let result = client
+            .get(format!("http://{address}/download"))
+            .send()
+            .await;
+
+        server.join().unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.is_redirect(),
+            "expected the custom redirect policy to refuse the hop, got: {err}"
+        );
+        match err.source().and_then(|s| s.downcast_ref::<UpdateError>()) {
+            Some(UpdateError::DownloadHostNotAllowed { host }) => {
+                assert_eq!(host, "127.0.0.1");
+            }
+            other => panic!("expected DownloadHostNotAllowed source, got: {other:?}"),
+        }
     }
 
     fn make_manifest_with_artifact(target: &str, sha256: &str) -> UpdateManifest {

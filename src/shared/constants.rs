@@ -475,3 +475,22 @@ pub const ATTESTATION_WORKFLOW_IDENTITY_PREFIX: &str =
 /// keyless-OIDC Sigstore bundle(s) GitHub stored for that archive's digest (the
 /// attestation is keyed by digest, not uploaded as a release asset).
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
+/// Frozen set of hosts an artifact download URL (initial request or any
+/// redirect hop) is allowed to reach.
+///
+/// A manifest is TLS-trusted but not yet attestation-verified at the moment
+/// its artifact URL is dereferenced (the archive's own attestation gate runs
+/// only after download), so a tampered manifest — or a malicious redirect —
+/// must not be able to steer the download to an attacker-controlled host.
+/// Membership is frozen post-HYP-002 validation, which confirmed the live
+/// redirect chain for a release asset is exactly `github.com` ->
+/// `release-assets.githubusercontent.com`; `objects.githubusercontent.com` is
+/// kept as a historical GitHub release-asset CDN hedge. Deliberately a
+/// compile-time constant, not runtime-configurable: an update feed that could
+/// redefine its own trust boundary would defeat the allowlist's purpose.
+pub const UPDATE_ARTIFACT_HOST_ALLOWLIST: [&str; 3] = [
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
