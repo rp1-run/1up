@@ -692,22 +692,160 @@ fn verify_attestation_bundles(
     })
 }
 
-/// Fetches release attestation bundles for an archive digest from the GitHub
-/// attestations API.
+/// Fully-resolved outcome of fetching attestation bundles for a digest from
+/// the GitHub attestations API, replacing the previous `Option<Vec<String>>`
+/// collapse so a definitive-empty result is distinguishable from cannot-run
+/// (REQ-003, recalibrated by ADD-001 in `hypotheses.md`).
 ///
-/// Returns `Ok(Some(bundles))` when the API returns attestation material (one
-/// JSON-encoded Sigstore bundle per attestation), and `Ok(None)` for every
-/// *cannot-run* outcome — transport failure, a 404 (no attestation published
-/// for this digest), a rate-limit/5xx, or a malformed/empty response. The
-/// caller degrades to the checksum floor on `None`; a `None` is never a tamper
-/// signal, so this function deliberately collapses all non-success outcomes
-/// rather than surfacing an error that could be mistaken for a disproof.
-async fn fetch_attestation_bundles(sha256_hex: &str) -> Result<Option<Vec<String>>, UpdateError> {
+/// - `Bundles`: attestation material was returned; verify it normally.
+/// - `DefinitiveEmpty`: the API confirmed no attestation exists for this
+///   digest — HTTP 200 with a parseable empty list (defense-in-depth), or an
+///   HTTP 404 whose repo-existence probe confirmed the repository is
+///   reachable. This is a disproof and must fail closed.
+/// - `CannotRun`: the outcome could not be determined (offline, rate-limited,
+///   5xx, transport failure, a malformed body, an unconfirmed 404, or a
+///   response whose `Sunset` date has passed). Callers degrade to the
+///   checksum floor, unchanged from the prior posture.
+#[derive(Debug)]
+enum AttestationFetchOutcome {
+    Bundles(Vec<String>),
+    DefinitiveEmpty,
+    CannotRun { reason: String },
+}
+
+/// Provisional classification of a GitHub attestations-API response, before an
+/// ambiguous not-found is resolved by the repo-existence probe. See
+/// [`classify_attestation_response`].
+#[derive(Debug, PartialEq, Eq)]
+enum ProvisionalAttestationOutcome {
+    Bundles(Vec<String>),
+    DefinitiveEmpty,
+    AmbiguousNotFound,
+    CannotRun { reason: String },
+}
+
+/// Classifies a GitHub attestations-API response into a provisional outcome.
+///
+/// Pure and IO-free — `status`, `sunset_expired`, and `body` are already
+/// extracted from the HTTP response — so this is exhaustively unit-testable
+/// without a network call. HTTP 200 with at least one bundle is `Bundles`;
+/// HTTP 200 with a parseable empty list is `DefinitiveEmpty` (kept as
+/// defense-in-depth even though the live API signals absence via 404 per
+/// HYP-001); HTTP 404 is left `AmbiguousNotFound` rather than resolved here,
+/// since disambiguating it requires the repo-existence probe (an IO call) in
+/// [`fetch_attestation_bundles`]; 403/429/5xx/malformed-200 are `CannotRun`;
+/// and any response whose `Sunset` header date has passed is `CannotRun`
+/// regardless of status, guarding against the endpoint's scheduled retirement
+/// (`Sunset: 2028-03-10`) making blanket 404s look like definitive-empty.
+fn classify_attestation_response(
+    status: u16,
+    sunset_expired: bool,
+    body: &str,
+) -> ProvisionalAttestationOutcome {
+    if sunset_expired {
+        return ProvisionalAttestationOutcome::CannotRun {
+            reason: "attestations endpoint Sunset date has passed".to_string(),
+        };
+    }
+    match status {
+        200 => match parse_attestation_body(body) {
+            Ok(bundles) if !bundles.is_empty() => ProvisionalAttestationOutcome::Bundles(bundles),
+            Ok(_) => ProvisionalAttestationOutcome::DefinitiveEmpty,
+            Err(()) => ProvisionalAttestationOutcome::CannotRun {
+                reason: "malformed attestation response body".to_string(),
+            },
+        },
+        404 => ProvisionalAttestationOutcome::AmbiguousNotFound,
+        other => ProvisionalAttestationOutcome::CannotRun {
+            reason: format!("HTTP {other}"),
+        },
+    }
+}
+
+/// Whether a GitHub `Sunset` response header names a date that has already
+/// passed, used to guard against the attestations endpoint's scheduled
+/// retirement making blanket 404s look like definitive-empty. Pure (takes
+/// `now` as a parameter) for unit testing. A missing or unparseable header
+/// never counts as expired.
+fn sunset_header_expired(sunset_header: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(value) = sunset_header else {
+        return false;
+    };
+    match DateTime::parse_from_rfc2822(value) {
+        Ok(date) => date.with_timezone(&Utc) <= now,
+        Err(_) => false,
+    }
+}
+
+/// Memoizes an async probe so it runs at most once for the cache's lifetime.
+/// Backs [`ATTESTATION_REPO_PROBE_CACHE`], which shares the attestation
+/// repo-existence probe across the archive ([`verify_artifact_attestation`])
+/// and manifest attestation gates so a single update action costs at most one
+/// probe request no matter how many attestation lookups it makes.
+struct RepoProbeCache {
+    result: tokio::sync::OnceCell<bool>,
+}
+
+impl RepoProbeCache {
+    const fn new() -> Self {
+        Self {
+            result: tokio::sync::OnceCell::const_new(),
+        }
+    }
+
+    /// Returns the cached probe result, invoking `probe` only on the first
+    /// call; subsequent calls (with any closure) return the memoized value.
+    async fn get_or_probe<F, Fut>(&self, probe: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        *self.result.get_or_init(probe).await
+    }
+}
+
+/// Process-wide cache for the attestation repo-existence probe. See
+/// [`RepoProbeCache`].
+static ATTESTATION_REPO_PROBE_CACHE: RepoProbeCache = RepoProbeCache::new();
+
+/// Probes whether the attestation repository ([`ATTESTATION_REPO_SLUG`]) is
+/// reachable, used to resolve an ambiguous attestations-API 404 (ADD-001): a
+/// reachable repo turns the 404 into `DefinitiveEmpty`; an unreachable one
+/// (offline, rate-limited, repo gone) keeps it `CannotRun`.
+async fn probe_attestation_repo_exists(client: &reqwest::Client) -> bool {
+    let url = format!("{GITHUB_API_BASE_URL}/repos/{ATTESTATION_REPO_SLUG}");
+    match client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(e) => {
+            debug!("attestation repo-existence probe failed (cannot-run): {e}");
+            false
+        }
+    }
+}
+
+/// Fetches release attestation bundles for an archive digest from the GitHub
+/// attestations API, returning the fully-resolved [`AttestationFetchOutcome`].
+///
+/// Transport failures, an unreachable client, and a failed response-body read
+/// all collapse to `CannotRun` directly; a received response is classified by
+/// [`classify_attestation_response`], with an `AmbiguousNotFound` (HTTP 404)
+/// resolved via the memoized [`probe_attestation_repo_exists`] probe.
+async fn fetch_attestation_bundles(
+    sha256_hex: &str,
+) -> Result<AttestationFetchOutcome, UpdateError> {
     let client = match build_attestation_client() {
         Ok(client) => client,
         Err(e) => {
             debug!("attestation client unavailable: {e}");
-            return Ok(None);
+            return Ok(AttestationFetchOutcome::CannotRun {
+                reason: format!("attestation client unavailable: {e}"),
+            });
         }
     };
 
@@ -724,47 +862,78 @@ async fn fetch_attestation_bundles(sha256_hex: &str) -> Result<Option<Vec<String
         Ok(response) => response,
         Err(e) => {
             debug!("attestation fetch failed (cannot-run): {e}");
-            return Ok(None);
+            return Ok(AttestationFetchOutcome::CannotRun {
+                reason: format!("attestation fetch failed: {e}"),
+            });
         }
     };
 
-    if !response.status().is_success() {
-        debug!(
-            "attestation fetch returned HTTP {} (cannot-run)",
-            response.status()
-        );
-        return Ok(None);
-    }
+    let status = response.status().as_u16();
+    let sunset_expired = sunset_header_expired(
+        response
+            .headers()
+            .get("Sunset")
+            .and_then(|value| value.to_str().ok()),
+        Utc::now(),
+    );
 
     let body = match response.text().await {
         Ok(body) => body,
         Err(e) => {
             debug!("attestation response read failed (cannot-run): {e}");
-            return Ok(None);
+            return Ok(AttestationFetchOutcome::CannotRun {
+                reason: format!("attestation response read failed: {e}"),
+            });
         }
     };
 
-    Ok(parse_attestation_bundles(&body))
+    match classify_attestation_response(status, sunset_expired, &body) {
+        ProvisionalAttestationOutcome::Bundles(bundles) => {
+            Ok(AttestationFetchOutcome::Bundles(bundles))
+        }
+        ProvisionalAttestationOutcome::DefinitiveEmpty => {
+            Ok(AttestationFetchOutcome::DefinitiveEmpty)
+        }
+        ProvisionalAttestationOutcome::CannotRun { reason } => {
+            debug!("attestation response is cannot-run: {reason}");
+            Ok(AttestationFetchOutcome::CannotRun { reason })
+        }
+        ProvisionalAttestationOutcome::AmbiguousNotFound => {
+            let client_for_probe = client.clone();
+            let repo_reachable = ATTESTATION_REPO_PROBE_CACHE
+                .get_or_probe(
+                    || async move { probe_attestation_repo_exists(&client_for_probe).await },
+                )
+                .await;
+            if repo_reachable {
+                Ok(AttestationFetchOutcome::DefinitiveEmpty)
+            } else {
+                Ok(AttestationFetchOutcome::CannotRun {
+                    reason: "attestation repo existence could not be confirmed".to_string(),
+                })
+            }
+        }
+    }
 }
 
-/// Extracts the per-attestation Sigstore bundles from a GitHub attestations-API
-/// response body, returning each bundle re-serialized as a JSON string.
+/// Parses a GitHub attestations-API response body into per-attestation
+/// Sigstore bundles, re-serialized as JSON strings.
 ///
-/// Returns `None` (cannot-run) when the body does not parse or carries no
-/// bundles, so a shape change or empty list degrades to the checksum floor
-/// rather than being treated as a disproof. Pure (no IO) for unit testing.
-fn parse_attestation_bundles(body: &str) -> Option<Vec<String>> {
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    let attestations = parsed.get("attestations")?.as_array()?;
-    let bundles: Vec<String> = attestations
+/// Keeps a malformed/unexpected-shape body (`Err(())`, cannot-run) distinct
+/// from a well-formed but empty attestations list (`Ok(vec![])`,
+/// definitive-empty) — the two classify differently in
+/// [`classify_attestation_response`]. Pure (no IO) for unit testing.
+fn parse_attestation_body(body: &str) -> Result<Vec<String>, ()> {
+    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|_| ())?;
+    let attestations = parsed
+        .get("attestations")
+        .and_then(|value| value.as_array())
+        .ok_or(())?;
+    Ok(attestations
         .iter()
         .filter_map(|attestation| attestation.get("bundle"))
         .filter_map(|bundle| serde_json::to_string(bundle).ok())
-        .collect();
-    if bundles.is_empty() {
-        return None;
-    }
-    Some(bundles)
+        .collect())
 }
 
 /// Builds the HTTP client used to fetch attestation bundles. GitHub's API
@@ -779,15 +948,19 @@ fn build_attestation_client() -> Result<reqwest::Client, UpdateError> {
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("attestation http client: {e}")))
 }
 
-/// Verifies the downloaded archive's release attestation, returning a three-state
-/// outcome collapsed onto `Result`:
+/// Verifies the downloaded archive's release attestation, returning a
+/// four-state outcome collapsed onto `Result`:
 ///
 /// - verified: at least one fetched bundle verified and named the project's
 ///   release workflow -> `Ok(())`, proceed to activation.
-/// - cannot-run: no attestation material could be obtained (offline / 404 /
-///   rate-limited) -> `Ok(())` with a stderr degrade notice, proceeding on the
-///   already-passed SHA-256 checksum floor. This is deliberately distinct from a
-///   disproof so an offline or rate-limited machine is not falsely blocked.
+/// - definitive-empty: the attestations API confirmed no attestation exists
+///   for this digest (ADD-001) -> `Err(AttestationMissing)`, a hard fail that
+///   leaves the running binary untouched.
+/// - cannot-run: the outcome could not be determined (offline / unconfirmed
+///   404 / rate-limited / 5xx / past-`Sunset`) -> `Ok(())` with a stderr
+///   degrade notice, proceeding on the already-passed SHA-256 checksum floor.
+///   This is deliberately distinct from definitive-empty so an offline or
+///   rate-limited machine is not falsely blocked.
 /// - disproved: material was present but none verified (bad signature, wrong
 ///   issuer, untrusted signer, or digest mismatch) -> `Err(AttestationFailed)`,
 ///   a hard fail that leaves the running binary untouched.
@@ -796,10 +969,15 @@ async fn verify_artifact_attestation(
     archive_sha256_hex: &str,
 ) -> Result<(), UpdateError> {
     let bundles = match fetch_attestation_bundles(archive_sha256_hex).await? {
-        Some(bundles) => bundles,
-        None => {
+        AttestationFetchOutcome::Bundles(bundles) => bundles,
+        AttestationFetchOutcome::DefinitiveEmpty => {
+            return Err(UpdateError::AttestationMissing {
+                subject: format!("archive sha256:{archive_sha256_hex}"),
+            });
+        }
+        AttestationFetchOutcome::CannotRun { reason } => {
             warn!(
-                "release attestation could not be verified (no attestation material reachable); \
+                "release attestation could not be verified ({reason}); \
                  proceeding on the verified SHA-256 checksum"
             );
             return Ok(());
@@ -2190,21 +2368,134 @@ mod tests {
     }
 
     #[test]
-    fn parse_attestation_bundles_extracts_each_bundle() {
+    fn parse_attestation_body_extracts_each_bundle() {
         let body =
             r#"{"attestations":[{"bundle":{"mediaType":"a"}},{"bundle":{"mediaType":"b"}}]}"#;
-        let bundles = parse_attestation_bundles(body).expect("two bundles");
+        let bundles = parse_attestation_body(body).expect("two bundles");
         assert_eq!(bundles.len(), 2);
         assert!(bundles[0].contains("\"mediaType\":\"a\""));
         assert!(bundles[1].contains("\"mediaType\":\"b\""));
     }
 
     #[test]
-    fn parse_attestation_bundles_returns_none_for_cannot_run_shapes() {
-        // 404-style "no attestations" and shape drift both degrade (None), never
-        // a disproof.
-        assert!(parse_attestation_bundles(r#"{"attestations":[]}"#).is_none());
-        assert!(parse_attestation_bundles(r#"{"message":"Not Found"}"#).is_none());
-        assert!(parse_attestation_bundles("not json").is_none());
+    fn parse_attestation_body_ok_empty_for_well_formed_zero_bundle_list() {
+        // Well-formed but empty is distinct from malformed (Err): the caller
+        // classifies this as definitive-empty, not cannot-run.
+        assert_eq!(parse_attestation_body(r#"{"attestations":[]}"#), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_attestation_body_err_for_malformed_or_unexpected_shapes() {
+        // 404-style "no attestations" bodies and shape drift are malformed
+        // (missing the `attestations` array) -> Err, never a disproof.
+        assert_eq!(
+            parse_attestation_body(r#"{"message":"Not Found"}"#),
+            Err(())
+        );
+        assert_eq!(parse_attestation_body("not json"), Err(()));
+    }
+
+    #[test]
+    fn classify_attestation_response_200_with_bundle_is_bundles() {
+        let body = r#"{"attestations":[{"bundle":{"mediaType":"a"}}]}"#;
+        let outcome = classify_attestation_response(200, false, body);
+        match outcome {
+            ProvisionalAttestationOutcome::Bundles(bundles) => assert_eq!(bundles.len(), 1),
+            other => panic!("expected Bundles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_attestation_response_200_zero_bundles_is_definitive_empty() {
+        let outcome = classify_attestation_response(200, false, r#"{"attestations":[]}"#);
+        assert_eq!(outcome, ProvisionalAttestationOutcome::DefinitiveEmpty);
+    }
+
+    #[test]
+    fn classify_attestation_response_404_is_ambiguous_not_found() {
+        let outcome = classify_attestation_response(404, false, r#"{"message":"Not Found"}"#);
+        assert_eq!(outcome, ProvisionalAttestationOutcome::AmbiguousNotFound);
+    }
+
+    #[test]
+    fn classify_attestation_response_error_and_malformed_statuses_are_cannot_run() {
+        for status in [403, 429, 500, 503] {
+            let outcome = classify_attestation_response(status, false, "");
+            assert!(
+                matches!(outcome, ProvisionalAttestationOutcome::CannotRun { .. }),
+                "status {status} should be cannot-run, got {outcome:?}"
+            );
+        }
+        let malformed = classify_attestation_response(200, false, "not json");
+        assert!(
+            matches!(malformed, ProvisionalAttestationOutcome::CannotRun { .. }),
+            "malformed 200 body should be cannot-run, got {malformed:?}"
+        );
+    }
+
+    #[test]
+    fn classify_attestation_response_past_sunset_is_cannot_run_regardless_of_status() {
+        // Even a would-be-definitive 200 response is downgraded once the
+        // endpoint's Sunset date has passed (endpoint-retirement guard).
+        let outcome = classify_attestation_response(200, true, r#"{"attestations":[]}"#);
+        assert!(matches!(
+            outcome,
+            ProvisionalAttestationOutcome::CannotRun { .. }
+        ));
+    }
+
+    #[test]
+    fn sunset_header_expired_true_once_date_has_passed() {
+        let now = rfc3339("2029-01-01T00:00:00Z");
+        assert!(sunset_header_expired(
+            Some("Fri, 10 Mar 2028 00:00:00 GMT"),
+            now
+        ));
+    }
+
+    #[test]
+    fn sunset_header_expired_false_for_future_missing_or_unparseable_header() {
+        let now = rfc3339("2026-01-01T00:00:00Z");
+        assert!(!sunset_header_expired(
+            Some("Fri, 10 Mar 2028 00:00:00 GMT"),
+            now
+        ));
+        assert!(!sunset_header_expired(None, now));
+        assert!(!sunset_header_expired(Some("not a date"), now));
+    }
+
+    #[tokio::test]
+    async fn repo_probe_cache_runs_probe_at_most_once() {
+        let cache = RepoProbeCache::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls_first = calls.clone();
+        let first = cache
+            .get_or_probe(|| async move {
+                calls_first.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+            .await;
+
+        // A second call with a closure that would return a *different* result
+        // must still observe the memoized value and must not run again.
+        let calls_second = calls.clone();
+        let second = cache
+            .get_or_probe(|| async move {
+                calls_second.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            })
+            .await;
+
+        assert!(first);
+        assert!(
+            second,
+            "second call should return the memoized first result"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "probe should run at most once per cache lifetime"
+        );
     }
 }

@@ -247,6 +247,11 @@ pub enum UpdateError {
         "refusing update: release attestation verification failed ({detail}); the downloaded artifact is not attributable to the project's release workflow and was not installed"
     )]
     AttestationFailed { detail: String },
+
+    #[error(
+        "refusing update: no attestation exists for {subject}; the attestation service definitively confirmed none, so it was not installed"
+    )]
+    AttestationMissing { subject: String },
 }
 
 impl UpdateError {
