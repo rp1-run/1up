@@ -29,6 +29,18 @@ pub struct IndexArgs {
     #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
     pub embed_threads: Option<usize>,
 
+    /// Glob pattern to include (repeatable); overrides the persisted per-project config
+    #[arg(long = "include-glob", value_name = "GLOB")]
+    pub include_globs: Vec<String>,
+
+    /// Glob pattern to exclude (repeatable); overrides the persisted per-project config
+    #[arg(long = "exclude-glob", value_name = "GLOB")]
+    pub exclude_globs: Vec<String>,
+
+    /// Dotfile directory to index despite the default hidden-directory exclusion (repeatable)
+    #[arg(long = "index-hidden-dir", value_name = "DIR")]
+    pub index_hidden_dirs: Vec<String>,
+
     /// Stream live index progress updates until the run completes
     #[arg(long)]
     pub watch: bool,
@@ -40,6 +52,13 @@ pub struct IndexArgs {
 
 fn spin(msg: impl Into<String>, show_progress_ui: bool) -> ProgressUi {
     ProgressUi::stderr_if(ProgressState::spinner(msg), show_progress_ui)
+}
+
+/// Treats an empty repeated-flag `Vec` as "not supplied on the CLI" so
+/// `resolve_indexing_config_with_globs` falls through to the persisted
+/// registry value instead of clobbering it with an empty override.
+fn cli_globs(globs: Vec<String>) -> Option<Vec<String>> {
+    (!globs.is_empty()).then_some(globs)
 }
 
 fn should_use_direct_watch_progress_ui(format: OutputFormat) -> bool {
@@ -96,9 +115,12 @@ async fn exec_watch(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()>
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let indexing_config = config::resolve_indexing_config_with_globs(
         args.jobs,
         args.embed_threads,
+        cli_globs(args.include_globs),
+        cli_globs(args.exclude_globs),
+        cli_globs(args.index_hidden_dirs),
         registry.indexing_config_for_context(&worktree_context),
     )?;
 
@@ -180,9 +202,12 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = config::project_db_path(&project_root);
     let fmt = formatter_for(format);
     let registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let indexing_config = config::resolve_indexing_config_with_globs(
         args.jobs,
         args.embed_threads,
+        cli_globs(args.include_globs),
+        cli_globs(args.exclude_globs),
+        cli_globs(args.index_hidden_dirs),
         registry.indexing_config_for_context(&worktree_context),
     )?;
     let show_progress_ui = format == OutputFormat::Human;
