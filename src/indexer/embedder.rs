@@ -18,8 +18,8 @@ use crate::shared::constants::{
     DISABLE_MODEL_DOWNLOADS_ENV_VAR, EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     HF_BASE_URL, HF_MODEL_REPO, MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
-    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_SHA256,
-    MODEL_STAGING_DIRNAME, MODEL_VARIANT_ENV_VAR, MODEL_VARIANT_INT8_SUFFIX,
+    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_INT8_SHA256,
+    MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME, MODEL_VARIANT_ENV_VAR, MODEL_VARIANT_INT8_SUFFIX,
     MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
     XDG_STATE_DIR_MODE,
 };
@@ -32,6 +32,10 @@ use crate::shared::progress::{ProgressState, ProgressUi};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
+/// Upstream relative path for the INT8 artifact (T4, HYP-001 validated). The
+/// `avx512` build is byte-identical to the repo's arm64/avx512_vnni INT8
+/// variants (same LFS object), fetched via the shared `resolve/main` scheme.
+const MODEL_ONNX_INT8_DOWNLOAD_URL: &str = "onnx/model_qint8_avx512.onnx";
 
 struct ExpectedArtifactFile {
     filename: &'static str,
@@ -49,7 +53,13 @@ impl ExpectedArtifactFile {
     }
 }
 
-const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 2] = [
+// The INT8 artifact (T4) is a first-class third entry: the manifest records all
+// three files, and every existing staged-download / per-file digest-verify /
+// pointer-repair / `Unverifiable`-resolution path covers it with no new
+// mechanism. A pre-existing two-file verified manifest therefore stops matching
+// `matches_expected`, resolves `Unverifiable`, and is re-provisioned as a
+// complete three-file set on the next indexing pass.
+const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 3] = [
     ExpectedArtifactFile {
         filename: MODEL_FILENAME,
         relative_url: MODEL_DOWNLOAD_URL,
@@ -61,6 +71,12 @@ const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 2] = [
         relative_url: TOKENIZER_DOWNLOAD_URL,
         sha256: TOKENIZER_SHA256,
         label: "tokenizer",
+    },
+    ExpectedArtifactFile {
+        filename: MODEL_ONNX_INT8_FILENAME,
+        relative_url: MODEL_ONNX_INT8_DOWNLOAD_URL,
+        sha256: MODEL_ONNX_INT8_SHA256,
+        label: "int8 model",
     },
 ];
 
@@ -743,6 +759,25 @@ impl Embedder {
                 model_path.display()
             ))
             .into());
+        }
+
+        // INT8 load-time integrity recheck (T4, REQ-004 AC1). The compact model
+        // is re-digested against its pinned SHA-256 *before* the ORT session is
+        // created, so a post-activation corruption or tamper refuses the model
+        // with a clear expected-vs-got error rather than parsing (and serving
+        // embeddings from) untrusted bytes. FP32 keeps its activation-time-only
+        // verification. There is no cross-variant fallback: a failed recheck
+        // surfaces its own error, which the caller degrades to FTS-only (or
+        // fails as a hard error for an explicit override).
+        if variant == ModelVariant::Int8 {
+            let digest = sha256_digest_file(&model_path)?;
+            if digest != MODEL_ONNX_INT8_SHA256 {
+                return Err(EmbeddingError::ModelNotAvailable(format!(
+                    "INT8 model {} failed integrity recheck: expected SHA-256 {MODEL_ONNX_INT8_SHA256}, got {digest}",
+                    model_path.display()
+                ))
+                .into());
+            }
         }
 
         // Pin GraphOptimizationLevel::Level3 explicitly (R-004). It is ort's
@@ -1704,6 +1739,10 @@ mod tests {
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
         std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
+        // The INT8 artifact is a first-class expected file (T4); write a fake one
+        // too so the three-file verify/resolve machinery sees a complete (if
+        // tampered) set rather than treating the fixture as an incomplete cache.
+        std::fs::write(dir.join(MODEL_ONNX_INT8_FILENAME), b"fake-int8-model").unwrap();
     }
 
     fn legacy_label(activation: &LegacyActivation) -> &'static str {
@@ -1986,8 +2025,9 @@ mod tests {
         // run (or vice versa): the key folds the resolved variant AND fingerprints
         // that variant's own artifact, so the two resolve to distinct keys (T1).
         let tmp = tempfile::tempdir().unwrap();
+        // `write_fake_model_files` now also writes the INT8 artifact, so both
+        // variants have a distinct file to fingerprint.
         write_fake_model_files(tmp.path(), b"fp32-model", b"tokenizer-v1");
-        std::fs::write(tmp.path().join(MODEL_ONNX_INT8_FILENAME), b"int8-model").unwrap();
 
         let fp32 = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
             tmp.path(),
@@ -2046,8 +2086,10 @@ mod tests {
         let runtime_dir = runtime_model_dir();
         let live_model = std::fs::read(runtime_dir.join(MODEL_FILENAME)).unwrap();
         let live_tokenizer = std::fs::read(runtime_dir.join(TOKENIZER_FILENAME)).unwrap();
+        let live_int8 = std::fs::read(runtime_dir.join(MODEL_ONNX_INT8_FILENAME)).unwrap();
         std::fs::write(model_root.join(MODEL_FILENAME), &live_model).unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), &live_tokenizer).unwrap();
+        std::fs::write(model_root.join(MODEL_ONNX_INT8_FILENAME), &live_int8).unwrap();
 
         let activated = match try_activate_legacy_artifacts(&model_root).unwrap() {
             LegacyActivation::Activated(dir) => dir,
@@ -2071,6 +2113,7 @@ mod tests {
         assert!(manifest.matches_expected());
         assert!(activated.join(MODEL_FILENAME).exists());
         assert!(activated.join(TOKENIZER_FILENAME).exists());
+        assert!(activated.join(MODEL_ONNX_INT8_FILENAME).exists());
     }
 
     #[test]
@@ -2100,6 +2143,7 @@ mod tests {
 
         std::fs::write(model_root.join(MODEL_FILENAME), b"tampered-model").unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), b"tampered-tokenizer").unwrap();
+        std::fs::write(model_root.join(MODEL_ONNX_INT8_FILENAME), b"tampered-int8").unwrap();
 
         let result = try_activate_legacy_artifacts(&model_root).unwrap();
         let current: ActiveArtifactPointer =
@@ -2141,6 +2185,11 @@ mod tests {
             model_root.join(TOKENIZER_FILENAME),
         )
         .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
+        )
+        .unwrap();
 
         let first = resolve_model_dir_without_download(&model_root)
             .unwrap()
@@ -2180,6 +2229,11 @@ mod tests {
         std::fs::copy(
             runtime_dir.join(TOKENIZER_FILENAME),
             model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
         )
         .unwrap();
 
@@ -2227,6 +2281,11 @@ mod tests {
             model_root.join(TOKENIZER_FILENAME),
         )
         .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
+        )
+        .unwrap();
         resolve_model_dir_without_download(&model_root)
             .unwrap()
             .expect("legacy artifacts should activate");
@@ -2271,6 +2330,11 @@ mod tests {
         std::fs::copy(
             runtime_dir.join(TOKENIZER_FILENAME),
             model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
         )
         .unwrap();
 
@@ -2369,6 +2433,99 @@ mod tests {
         assert_eq!(current.artifact_id, active_id);
         assert!(stage_dir.exists());
         assert!(!artifact_dir_path(&model_root, candidate_id).exists());
+    }
+
+    #[test]
+    fn corrupted_int8_model_refused_at_load_with_expected_vs_got() {
+        // REQ-004 AC1: a present-but-corrupt INT8 artifact must be refused at
+        // load with a clear expected-vs-got error, *before* the ORT session is
+        // built and before any embeddings are served — and never by silently
+        // loading FP32 instead. No model is needed: the load-time digest recheck
+        // rejects the untrusted bytes first (mirrors the download-time
+        // `activate_staged_artifact` mismatch guard, applied on every load).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(MODEL_ONNX_INT8_FILENAME),
+            b"corrupt-int8-bytes-not-the-pinned-artifact",
+        )
+        .unwrap();
+
+        let err =
+            match Embedder::load_variant(tmp.path(), ModelVariant::Int8, 1, EMBEDDING_BATCH_SIZE) {
+                Ok(_) => panic!("a corrupt INT8 artifact must be refused at load"),
+                Err(err) => err,
+            };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("integrity recheck"),
+            "error must name the INT8 integrity recheck, got: {msg}"
+        );
+        assert!(
+            msg.contains(MODEL_ONNX_INT8_SHA256),
+            "error must report the expected pinned SHA-256, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_two_file_manifest_resolves_unverifiable_for_three_file_reprovision() {
+        // T4: a pre-existing verified artifact whose manifest predates the INT8
+        // artifact (two files) must stop matching the pinned three-file set and
+        // resolve `Unverifiable`, so the indexing path re-provisions all three
+        // files instead of treating the stale set as intact. Pure: no model.
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let artifact_id = "v1-legacy-two-file";
+        let artifact_dir = artifact_dir_path(&model_root, artifact_id);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join(MODEL_FILENAME), b"m").unwrap();
+        std::fs::write(artifact_dir.join(TOKENIZER_FILENAME), b"t").unwrap();
+
+        // Hand-build the historical two-file manifest (before INT8 was expected).
+        let two_file_manifest = VerifiedArtifactManifest {
+            version: MODEL_ARTIFACT_MANIFEST_VERSION,
+            artifact_id: artifact_id.to_string(),
+            files: vec![
+                VerifiedArtifactFile {
+                    filename: MODEL_FILENAME.to_string(),
+                    sha256: MODEL_ONNX_SHA256.to_string(),
+                    source_url: format!(
+                        "{HF_BASE_URL}/{HF_MODEL_REPO}/resolve/main/{MODEL_DOWNLOAD_URL}"
+                    ),
+                },
+                VerifiedArtifactFile {
+                    filename: TOKENIZER_FILENAME.to_string(),
+                    sha256: TOKENIZER_SHA256.to_string(),
+                    source_url: format!(
+                        "{HF_BASE_URL}/{HF_MODEL_REPO}/resolve/main/{TOKENIZER_DOWNLOAD_URL}"
+                    ),
+                },
+            ],
+        };
+        assert!(
+            !two_file_manifest.matches_expected(),
+            "a two-file manifest must no longer match the pinned three-file set"
+        );
+
+        std::fs::write(
+            manifest_path(&model_root, artifact_id),
+            serde_json::to_vec_pretty(&two_file_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            current_manifest_path(&model_root),
+            serde_json::to_vec_pretty(&ActiveArtifactPointer::new(artifact_id.to_string()))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let resolved = resolve_model_state(&model_root).unwrap();
+        assert!(
+            matches!(resolved, ModelResolution::Unverifiable(_)),
+            "a two-file verified manifest must resolve Unverifiable for re-provision, got {}",
+            resolution_label(&resolved)
+        );
     }
 
     #[tokio::test]
