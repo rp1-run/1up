@@ -174,20 +174,25 @@ jobs:
             --checksums "${RUNNER_TEMP}/dist/SHA256SUMS" \
             --output "${RUNNER_TEMP}/dist/release-manifest.json" \
             --commit-sha "${commit_sha}"
+          bash scripts/release/write_update_manifest.sh \
+            --input "${RUNNER_TEMP}/dist/release-manifest.json" \
+            --output "${RUNNER_TEMP}/dist/update-manifest.json"
           bash scripts/release/extract_release_notes.sh "${RELEASE_TAG}" > "${RUNNER_TEMP}/dist/release-notes.md"
 
       # Independent-channel trust: keyless-OIDC build provenance over the exact
-      # archives clients download (not the SHA256SUMS/manifest/setup.sh). The
-      # attestation is stored in the GitHub attestations API keyed by each
-      # archive's digest, so install/self-update can verify by digest later.
-      # Runs before the release is created so a release never publishes without
-      # its provenance recorded.
+      # archives clients download (not the SHA256SUMS/release-manifest/setup.sh)
+      # plus update-manifest.json, the client-fetched manifest that gates every
+      # self-update. The attestation is stored in the GitHub attestations API
+      # keyed by each subject's digest, so install/self-update can verify by
+      # digest later. Runs before the release is created so a release never
+      # publishes without its provenance recorded.
       - name: attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             ${{ runner.temp }}/dist/*.tar.gz
             ${{ runner.temp }}/dist/*.zip
+            ${{ runner.temp }}/dist/update-manifest.json
 
       - name: create or update release
         shell: bash
@@ -224,5 +229,6 @@ jobs:
             "${RUNNER_TEMP}/dist/"*.zip \
             "${RUNNER_TEMP}/dist/SHA256SUMS" \
             "${RUNNER_TEMP}/dist/release-manifest.json" \
+            "${RUNNER_TEMP}/dist/update-manifest.json" \
             "${RUNNER_TEMP}/dist/setup.sh" \
             --clobber

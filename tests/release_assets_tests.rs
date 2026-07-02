@@ -715,6 +715,80 @@ fn release_manifest_deserializes_as_update_manifest() {
             "artifact url should contain archive name"
         );
     }
+
+    let update_manifest_path = dist_dir.join("update-manifest.json");
+    let write_output = run_release_script(
+        fixture_root.path(),
+        "write_update_manifest.sh",
+        &[
+            "--input",
+            dist_dir.join("release-manifest.json").to_str().unwrap(),
+            "--output",
+            update_manifest_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        write_output.status.success(),
+        "write_update_manifest.sh unexpectedly failed: {}",
+        String::from_utf8_lossy(&write_output.stderr)
+    );
+
+    let update_raw = fs::read(&update_manifest_path).unwrap();
+    let update_manifest: oneup::shared::update::UpdateManifest =
+        serde_json::from_slice(&update_raw)
+            .expect("write_update_manifest.sh output should deserialize as UpdateManifest");
+
+    assert_eq!(update_manifest.version, manifest.version);
+    assert_eq!(update_manifest.git_tag, manifest.git_tag);
+    assert_eq!(update_manifest.published_at, manifest.published_at);
+    assert_eq!(update_manifest.expiry, manifest.expiry);
+    assert_eq!(update_manifest.notes_url, manifest.notes_url);
+    assert_eq!(update_manifest.yanked, manifest.yanked);
+    assert_eq!(
+        update_manifest.minimum_safe_version,
+        manifest.minimum_safe_version
+    );
+    assert_eq!(update_manifest.message, manifest.message);
+    assert_eq!(
+        update_manifest.channels.github_release,
+        manifest.channels.github_release
+    );
+    assert_eq!(
+        update_manifest.channels.script_install,
+        manifest.channels.script_install
+    );
+    assert_eq!(
+        update_manifest.channels.update_manifest,
+        manifest.channels.update_manifest
+    );
+    assert_eq!(update_manifest.artifacts.len(), manifest.artifacts.len());
+    for (projected, source) in update_manifest
+        .artifacts
+        .iter()
+        .zip(manifest.artifacts.iter())
+    {
+        assert_eq!(projected.target, source.target);
+        assert_eq!(projected.archive, source.archive);
+        assert_eq!(projected.sha256, source.sha256);
+        assert_eq!(projected.url, source.url);
+    }
+
+    // The projection contract drops release-generation-only fields (commit_sha,
+    // binary_name, license, checksums_file, notes_source) that are not part of
+    // the client-facing update manifest.
+    let update_value: serde_json::Value = serde_json::from_slice(&update_raw).unwrap();
+    for dropped_field in [
+        "commit_sha",
+        "binary_name",
+        "license",
+        "checksums_file",
+        "notes_source",
+    ] {
+        assert!(
+            update_value.get(dropped_field).is_none(),
+            "update-manifest.json projection must drop {dropped_field}"
+        );
+    }
 }
 
 /// Guards that the committed repo-root `update-manifest.json` never advertises a
@@ -2047,6 +2121,12 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
     let update_manifest_workflow =
         fs::read_to_string(repo_root().join(".github/workflows/publish-update-manifest.yml"))
             .unwrap();
+    // The channel projection itself now lives solely in write_update_manifest.sh
+    // (publish-update-manifest.yml propagates the attested asset verbatim, with
+    // no inline jq regeneration), so the retained-vs-removed channel checks
+    // below read the script rather than the workflow text.
+    let write_update_manifest_script =
+        fs::read_to_string(release_script("write_update_manifest.sh")).unwrap();
 
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(
@@ -2078,8 +2158,8 @@ fn release_evidence_workflow_uses_retained_security_and_native_archive_verificat
     assert!(update_manifest_workflow.contains("name: publish-update-manifest"));
     assert!(update_manifest_workflow.contains("publish update manifest to main"));
     assert!(update_manifest_workflow.contains("verify stable update manifest"));
-    assert!(update_manifest_workflow.contains("script_install"));
-    assert!(update_manifest_workflow.contains("update_manifest"));
+    assert!(write_update_manifest_script.contains("script_install"));
+    assert!(write_update_manifest_script.contains("update_manifest"));
     assert!(!update_manifest_workflow.contains("PACKAGE_PUBLISH_TOKEN"));
     assert!(!update_manifest_workflow.contains("Homebrew"));
     assert!(!update_manifest_workflow.contains("Scoop"));
@@ -2181,11 +2261,67 @@ fn release_assets_workflow_emits_build_provenance_attestation() {
         workflow.contains("/dist/*.tar.gz") && workflow.contains("/dist/*.zip"),
         "attestation subject must cover the published .tar.gz and .zip archives"
     );
+    assert!(
+        workflow.contains("/dist/update-manifest.json"),
+        "attestation subject must cover update-manifest.json so the manifest client-side gate has an attested digest to verify"
+    );
 
     // No regression: existing artifact/checksum/manifest emission still present.
     assert!(workflow.contains("write_sha256sums.sh"));
     assert!(workflow.contains("generate_release_manifest.sh"));
     assert!(workflow.contains("gh release upload \"$tag\""));
+}
+
+/// Guards REQ-001's producer side: `update-manifest.json` must be generated
+/// exactly once (via `write_update_manifest.sh`, out of line in
+/// `release-assets.yml`), attested alongside the archives, uploaded as a
+/// release asset, and then propagated to `main` byte-verbatim -- no inline jq
+/// re-projection in `publish-update-manifest.yml` that could diverge from the
+/// attested bytes.
+#[test]
+fn update_manifest_is_generated_once_and_published_verbatim() {
+    let release_assets_workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/release-assets.yml")).unwrap();
+    let publish_workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/publish-update-manifest.yml"))
+            .unwrap();
+
+    assert!(
+        release_assets_workflow.contains("write_update_manifest.sh"),
+        "release-assets must generate update-manifest.json via write_update_manifest.sh"
+    );
+    assert!(
+        release_assets_workflow.contains("update-manifest.json") && {
+            let upload_section = release_assets_workflow
+                .split("gh release upload \"$tag\"")
+                .nth(1)
+                .expect("release-assets must upload release assets via gh release upload");
+            upload_section.contains("update-manifest.json")
+        },
+        "release-assets must upload update-manifest.json as a release asset"
+    );
+
+    assert!(
+        publish_workflow.contains("--pattern update-manifest.json"),
+        "publish-update-manifest must download the attested update-manifest.json release asset"
+    );
+    assert!(
+        !publish_workflow.contains("--pattern release-manifest.json"),
+        "publish-update-manifest must not re-derive the manifest from release-manifest.json"
+    );
+    assert!(
+        !publish_workflow.contains("artifacts: [.artifacts[] | {target, archive, sha256, url}]"),
+        "publish-update-manifest must not run the inline jq projection anymore -- the projection lives solely in write_update_manifest.sh"
+    );
+    assert!(
+        publish_workflow
+            .contains("cp \"${RUNNER_TEMP}/release/update-manifest.json\" update-manifest.json"),
+        "publish-update-manifest must copy the attested asset verbatim onto main"
+    );
+    assert!(
+        publish_workflow.contains("sha256sum"),
+        "verify job must byte-compare (sha256) the raw-fetched manifest against the release asset"
+    );
 }
 
 #[test]
