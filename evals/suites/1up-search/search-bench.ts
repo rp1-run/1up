@@ -143,6 +143,31 @@ function benchmarkEnv(homeDir: string): NodeJS.ProcessEnv {
   };
 }
 
+function parseLeanSearchRows(rawOutput: string): SearchResult[] {
+  const results: SearchResult[] = [];
+
+  for (const rawLine of rawOutput.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) {
+      continue;
+    }
+
+    const fields = line.split("  ");
+    if (fields.length < 2) {
+      continue;
+    }
+
+    if (!Number.isFinite(Number(fields[0]))) {
+      continue;
+    }
+
+    const filePath = fields[1].replace(/:\d+-\d+$/, "");
+    results.push({ file_path: filePath });
+  }
+
+  return results;
+}
+
 function runOneupSearch(
   query: string,
   repoDir: string,
@@ -150,16 +175,7 @@ function runOneupSearch(
 ): SearchResult[] {
   const rawOutput = execFileSync(
     BENCHMARK_BINARY,
-    [
-      "search",
-      "-n",
-      String(SEARCH_LIMIT),
-      "--path",
-      repoDir,
-      "-f",
-      "json",
-      query,
-    ],
+    ["search", "-n", String(SEARCH_LIMIT), "--path", repoDir, query],
     {
       encoding: "utf8",
       env: benchmarkEnv(homeDir),
@@ -167,12 +183,12 @@ function runOneupSearch(
     },
   );
 
-  const parsedOutput = JSON.parse(rawOutput) as unknown;
-  if (!Array.isArray(parsedOutput) || parsedOutput.length === 0) {
+  const results = parseLeanSearchRows(rawOutput);
+  if (results.length === 0) {
     throw new Error(`search returned no results for benchmark query: ${query}`);
   }
 
-  return parsedOutput as SearchResult[];
+  return results;
 }
 
 function runBaselineSearch(
