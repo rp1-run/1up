@@ -2252,8 +2252,11 @@ fn release_assets_workflow_emits_build_provenance_attestation() {
     assert!(workflow.contains("contents: write"));
 
     // The provenance step must run and cover the exact archives clients verify.
+    // The exact pinned SHA is asserted by
+    // release_workflow_third_party_actions_are_sha_pinned; this only checks
+    // the step is present.
     assert!(
-        workflow.contains("actions/attest-build-provenance@v2"),
+        workflow.contains("actions/attest-build-provenance@"),
         "release-assets must run actions/attest-build-provenance for build provenance"
     );
     assert!(workflow.contains("subject-path:"));
@@ -2322,6 +2325,63 @@ fn update_manifest_is_generated_once_and_published_verbatim() {
         publish_workflow.contains("sha256sum"),
         "verify job must byte-compare (sha256) the raw-fetched manifest against the release asset"
     );
+}
+
+/// Guards REQ-004: every third-party GitHub Action referenced from the four
+/// release-path workflows must be pinned to a full commit SHA (not a
+/// floating tag such as `@v4` or a moving branch such as `@stable`), so a
+/// repointed tag or branch cannot inject malicious action code into a
+/// release run. Each pin must also carry a trailing `#` comment naming the
+/// resolved ref for human auditability -- most actions publish semver tags
+/// (`# v4.3.1`), but `dtolnay/rust-toolchain` has no semver releases and is
+/// commonly annotated with its tracked channel (`# stable`) instead, so the
+/// comment is required to be present rather than matching a fixed shape.
+#[test]
+fn release_workflow_third_party_actions_are_sha_pinned() {
+    const RELEASE_WORKFLOW_PATHS: [&str; 4] = [
+        ".github/workflows/release-assets.yml",
+        ".github/workflows/publish-update-manifest.yml",
+        ".github/workflows/release-please.yml",
+        ".github/workflows/release-evidence.yml",
+    ];
+
+    fn is_lowercase_hex_sha(candidate: &str) -> bool {
+        candidate.len() == 40
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    for relative_path in RELEASE_WORKFLOW_PATHS {
+        let workflow = fs::read_to_string(repo_root().join(relative_path)).unwrap();
+
+        for (index, line) in workflow.lines().enumerate() {
+            let line_number = index + 1;
+            let Some(uses_at) = line.find("uses:") else {
+                continue;
+            };
+            let reference = line[uses_at + "uses:".len()..].trim();
+
+            let Some(at) = reference.find('@') else {
+                panic!("{relative_path}:{line_number}: `uses: {reference}` has no pinned ref");
+            };
+            let action = &reference[..at];
+            let pinned = &reference[at + 1..];
+            let (sha, comment) = match pinned.split_once('#') {
+                Some((sha, comment)) => (sha.trim(), comment.trim()),
+                None => (pinned.trim(), ""),
+            };
+
+            assert!(
+                is_lowercase_hex_sha(sha),
+                "{relative_path}:{line_number}: `{action}` must be pinned to a 40-character lowercase commit SHA, found `{sha}`"
+            );
+            assert!(
+                !comment.is_empty(),
+                "{relative_path}:{line_number}: SHA-pinned `{action}` must carry a trailing `# <ref>` comment naming the resolved version"
+            );
+        }
+    }
 }
 
 #[test]
