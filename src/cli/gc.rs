@@ -47,6 +47,11 @@ enum PruneReason {
     /// embeds the branch, so a same-worktree context that is not the active one is a
     /// leftover per-branch index that rebuilds on demand if that branch is revisited.
     StaleBranchSnapshot,
+    /// A context whose `source_root` is a non-git-root subdirectory strictly inside the
+    /// active worktree's `source_root`. The resolution clamp guarantees normal usage can
+    /// no longer mint such a context, so any recorded one is a permanently unreachable
+    /// orphan from the pre-clamp subdirectory bug.
+    NestedSubdirContext,
 }
 
 impl PruneReason {
@@ -54,23 +59,27 @@ impl PruneReason {
         match self {
             PruneReason::SourceMissing => "source-missing",
             PruneReason::StaleBranchSnapshot => "stale-branch-snapshot",
+            PruneReason::NestedSubdirContext => "nested-subdir",
         }
     }
 }
 
 /// Decide whether one recorded context is prunable relative to `active` (the live
 /// worktree+branch this invocation resolved to). Pure and injected with
-/// `source_exists` so it is deterministic and unit-testable.
+/// `source_exists` and `is_git_root` so it is deterministic and unit-testable.
 ///
 /// The active context is never prunable. A context is pruned when its source
-/// directory is gone, or when it shares the active worktree's roots but not its
-/// `context_id` — a stale per-branch snapshot. Contexts belonging to other
-/// still-present worktrees are left untouched, since this invocation cannot tell
-/// which of their contexts is the live one (run `gc` from inside them instead).
+/// directory is gone, when it shares the active worktree's roots but not its
+/// `context_id` (a stale per-branch snapshot), or when its source is a non-git-root
+/// subdirectory strictly inside the active source (a nested-subdir orphan the
+/// resolution clamp can no longer mint). Contexts belonging to other still-present
+/// worktrees are left untouched, since this invocation cannot tell which of their
+/// contexts is the live one (run `gc` from inside them instead).
 fn prune_reason(
     active: &WorktreeContext,
     candidate: &IndexedContextRow,
     source_exists: &dyn Fn(&Path) -> bool,
+    is_git_root: &dyn Fn(&Path) -> bool,
 ) -> Option<PruneReason> {
     if candidate.context_id == active.context_id {
         return None;
@@ -81,7 +90,20 @@ fn prune_reason(
     if candidate.state_root == active.state_root && candidate.source_root == active.source_root {
         return Some(PruneReason::StaleBranchSnapshot);
     }
+    if candidate.state_root == active.state_root
+        && is_strict_descendant(&candidate.source_root, &active.source_root)
+        && !is_git_root(&candidate.source_root)
+    {
+        return Some(PruneReason::NestedSubdirContext);
+    }
     None
+}
+
+/// True when `descendant` lies strictly inside `ancestor` — a proper subdirectory,
+/// never the directory itself. A linked worktree nested in the main worktree is
+/// excluded separately by the `is_git_root` predicate at the call site.
+fn is_strict_descendant(descendant: &Path, ancestor: &Path) -> bool {
+    descendant != ancestor && descendant.starts_with(ancestor)
 }
 
 /// A context selected for pruning, plus the segment count that quantifies its cost.
@@ -130,9 +152,15 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
         let conn = db.connect()?;
         let contexts = segments::list_worktree_contexts(&conn).await?;
         let total = contexts.len();
+        // A `.git` entry (dir for a main worktree, file for a linked one) marks a real
+        // worktree root, so a nested candidate carrying one is never a subdir orphan.
+        let is_git_root = |p: &Path| {
+            let dot_git = p.join(".git");
+            dot_git.is_dir() || dot_git.is_file()
+        };
         let mut candidates = Vec::new();
         for ctx in &contexts {
-            if let Some(reason) = prune_reason(&active, ctx, &|p: &Path| p.exists()) {
+            if let Some(reason) = prune_reason(&active, ctx, &|p: &Path| p.exists(), &is_git_root) {
                 let segments = segments::count_segments_for_context(&conn, &ctx.context_id).await?;
                 candidates.push(GcCandidate {
                     context_id: ctx.context_id.clone(),
@@ -146,7 +174,7 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
         (total, candidates)
     };
 
-    // Stable output: source-missing before stale snapshots, then heaviest first.
+    // Stable output: grouped by reason string (alphabetical), then heaviest first.
     candidates.sort_by(|a, b| {
         a.reason
             .as_str()
@@ -398,7 +426,10 @@ mod tests {
     fn active_context_is_never_pruned() {
         let active = active_context();
         let candidate = row("active000000", "/repo", "/repo");
-        assert_eq!(prune_reason(&active, &candidate, &|_| true), None);
+        assert_eq!(
+            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            None
+        );
     }
 
     #[test]
@@ -406,7 +437,9 @@ mod tests {
         let active = active_context();
         let candidate = row("other0000001", "/gone", "/gone");
         assert_eq!(
-            prune_reason(&active, &candidate, &|p| p != Path::new("/gone")),
+            prune_reason(&active, &candidate, &|p| p != Path::new("/gone"), &|_| {
+                false
+            }),
             Some(PruneReason::SourceMissing)
         );
     }
@@ -417,7 +450,7 @@ mod tests {
         // Same roots as the active worktree, different id => an older branch's index.
         let candidate = row("oldbranch001", "/repo", "/repo");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true),
+            prune_reason(&active, &candidate, &|_| true, &|_| false),
             Some(PruneReason::StaleBranchSnapshot)
         );
     }
@@ -425,9 +458,38 @@ mod tests {
     #[test]
     fn other_live_worktree_is_left_untouched() {
         let active = active_context();
-        // A different worktree whose source still exists: not ours to judge.
+        // A different worktree whose source still exists and is not nested inside the
+        // active source: not ours to judge.
         let candidate = row("linked000001", "/repo", "/repo-feature");
-        assert_eq!(prune_reason(&active, &candidate, &|_| true), None);
+        assert_eq!(
+            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn nested_subdir_context_is_pruned() {
+        let active = active_context();
+        // A pre-clamp orphan: same state root, source strictly inside the active source,
+        // and not itself a git root.
+        let candidate = row("nested000001", "/repo", "/repo/src/search");
+        assert_eq!(
+            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            Some(PruneReason::NestedSubdirContext)
+        );
+    }
+
+    #[test]
+    fn nested_linked_worktree_is_kept() {
+        let active = active_context();
+        // A linked worktree created inside the main worktree: nested, but its source root
+        // carries a `.git` file, so the git-root predicate protects it from the rule.
+        let candidate = row("nestedwt0001", "/repo", "/repo/linked-wt");
+        assert_eq!(
+            prune_reason(&active, &candidate, &|_| true, &|p| p
+                == Path::new("/repo/linked-wt"),),
+            None
+        );
     }
 
     #[test]
