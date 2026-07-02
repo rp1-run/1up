@@ -1,0 +1,84 @@
+# Scheduled embedding-quality gate.
+#
+# Purpose: this is the only automation that exercises the *semantic* (vector)
+# retrieval path end to end and enforces the recall gate. The PR/push `ci`
+# workflow runs FTS-only (ONEUP_DISABLE_MODEL_DOWNLOADS=1) for determinism, so
+# embedding-path recall regressions are never caught there. This job fills that
+# gap: it reindexes with the default model variant, runs the recall harness
+# against the pinned baseline via `just eval-recall`, and goes red when recall
+# regresses beyond tolerance.
+#
+# Cadence: daily at 05:17 UTC — deliberately off-peak and on a non-zero minute
+# to avoid the top-of-hour scheduler congestion that delays cron runs.
+#
+# Model cache: the embedding model (all-MiniLM-L6-v2) is cached under
+# ~/.local/share/1up/models with the same key as release-evidence.yml so repeat
+# runs skip the multi-hundred-MB Hugging Face download and stay fast.
+#
+# CRITICAL: ONEUP_DISABLE_MODEL_DOWNLOADS must stay UNSET here. Setting it (as
+# `ci` does) forces the FTS-only path — the recall preflight would then fail
+# closed on a vectorless index, defeating the entire purpose of this workflow,
+# which is to measure real embedding recall on the vector path.
+#
+# Observability: scheduled workflows run only on the default branch, so the
+# trigger and outcome are verified post-merge in the Actions run history;
+# recall-results.json is uploaded on every run for inspection.
+name: embedding-quality
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recall-gate:
+    name: recall-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-embedding-quality-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-embedding-quality-
+
+      - name: cache embedding model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/1up/models
+          key: oneup-hf-model-${{ runner.os }}-all-MiniLM-L6-v2
+
+      - name: install just (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: install eval dependencies
+        working-directory: evals
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: run gated recall
+        shell: bash
+        run: just eval-recall
+
+      - name: upload recall results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-results
+          path: evals/suites/1up-search/recall-results.json
+          if-no-files-found: error
+          retention-days: 30
