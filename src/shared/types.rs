@@ -323,6 +323,10 @@ pub struct IndexingConfig {
 }
 
 impl IndexingConfig {
+    /// Test-only convenience constructor for the pre-glob 3-arg shape; no
+    /// production caller remains after `with_glob_config`/`from_sources_with_globs`
+    /// took over the CLI/registry/daemon resolution paths.
+    #[cfg(test)]
     pub fn new(
         jobs: usize,
         embed_threads: usize,
