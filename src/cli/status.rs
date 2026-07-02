@@ -68,6 +68,8 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         embeddable_segments,
         embedding_model,
         schema_version,
+        context_count,
+        reclaimable_bytes,
     ) = {
         if db_path.exists() {
             match Db::open_ro(&db_path).await {
@@ -100,20 +102,33 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
                                 let model = schema::get_embedding_model(&conn).await.ok().flatten();
                                 let version =
                                     schema::get_schema_version(&conn).await.ok().flatten();
-                                (files, segs, vectors, embeddable, model, version)
+                                let contexts = segments::list_worktree_contexts(&conn).await.ok();
+                                let context_count = contexts.as_ref().map(|rows| rows.len());
+                                let reclaimable =
+                                    reclaimable_bytes_estimate(&conn, &db_path, context_id).await;
+                                (
+                                    files,
+                                    segs,
+                                    vectors,
+                                    embeddable,
+                                    model,
+                                    version,
+                                    context_count,
+                                    reclaimable,
+                                )
                             }
                             Err(err) => {
                                 index_unavailable_reason = Some(err.to_string());
-                                (None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None, None)
                             }
                         }
                     }
-                    Err(_) => (None, None, None, None, None, None),
+                    Err(_) => (None, None, None, None, None, None, None, None),
                 },
-                Err(_) => (None, None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None, None),
             }
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         }
     };
 
@@ -142,6 +157,8 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         total_segments,
         vector_rows,
         embeddable_segments,
+        context_count,
+        reclaimable_bytes,
         embedding_model,
         schema_version,
         project_id,
@@ -177,6 +194,30 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
 
     println!("{}", fmt.format_status(&status));
     Ok(())
+}
+
+/// Estimated bytes `1up gc --apply` could reclaim: the exact `freelist_count *
+/// page_size` floor (already-free pages) plus a proxy for segments belonging to
+/// contexts whose source no longer exists on disk, sized proportionally against
+/// the current `index.db` file. Best-effort — any read failure degrades to
+/// `None` rather than a partial/misleading number.
+async fn reclaimable_bytes_estimate(
+    conn: &libsql::Connection,
+    db_path: &Path,
+    active_context_id: &str,
+) -> Option<u64> {
+    let freelist_bytes = segments::freelist_reclaimable_bytes(conn).await.ok()?;
+    let prunable_segments = segments::prunable_segments_proxy(conn, active_context_id)
+        .await
+        .ok()?;
+    let total_segments = segments::count_segments(conn).await.ok()?;
+    if prunable_segments == 0 || total_segments == 0 {
+        return Some(freelist_bytes);
+    }
+    let file_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    let proxy_bytes =
+        ((prunable_segments as f64 / total_segments as f64) * file_size as f64).round() as u64;
+    Some(freelist_bytes.saturating_add(proxy_bytes))
 }
 
 fn find_registered_project<'a>(

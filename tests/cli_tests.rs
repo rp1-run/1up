@@ -1857,6 +1857,57 @@ fn status_human_output_includes_last_index_progress() {
 }
 
 #[test]
+fn status_reports_context_count_and_reclaimable_bytes() {
+    let _guard = HideModelGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+
+    cmd()
+        .args(["init", dir.path().to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    cmd()
+        .args(["index", dir.path().to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    let output = cmd()
+        .args(["status", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = json_stdout(&output);
+    // A freshly indexed project has recorded exactly one worktree context: its own.
+    assert_eq!(
+        status["context_count"], 1,
+        "status must report the single recorded context: {status}"
+    );
+    assert!(
+        status["reclaimable_bytes"].is_u64(),
+        "status must report reclaimable_bytes as a number: {status}"
+    );
+
+    cmd()
+        .args(["status", dir.path().to_str().unwrap(), "--format", "human"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Context count: 1")
+                .and(predicate::str::contains("Reclaimable space:"))
+                .and(predicate::str::contains("(estimate")),
+        );
+}
+
+#[test]
 fn index_json_output_includes_full_run_prefilter_counters() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
