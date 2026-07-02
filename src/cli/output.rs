@@ -103,6 +103,14 @@ pub struct StatusInfo {
     pub total_segments: Option<u64>,
     pub vector_rows: Option<u64>,
     pub embeddable_segments: Option<u64>,
+    /// Variant-aware embedding-model identity recorded in the index `meta` table
+    /// (e.g. `all-MiniLM-L6-v2@int8`), read via `schema::get_embedding_model`.
+    /// `None` when the index is absent/unreadable or predates model tracking.
+    /// Consumed by the recall-gate preflight to assert the serving variant.
+    pub embedding_model: Option<String>,
+    /// Schema version stored in the index `meta` table. `None` when the index is
+    /// absent/unreadable. Lets the recall preflight assert a current schema.
+    pub schema_version: Option<u32>,
     pub project_id: Option<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
@@ -432,6 +440,8 @@ impl Formatter for JsonFormatter {
             "total_segments": status.total_segments,
             "vector_rows": status.vector_rows,
             "embeddable_segments": status.embeddable_segments,
+            "embedding_model": &status.embedding_model,
+            "schema_version": status.schema_version,
             "project_id": &status.project_id,
             "project_root": &status.project_root,
             "source_root": &status.source_root,
@@ -739,6 +749,9 @@ impl Formatter for HumanFormatter {
                     "Vector coverage: {vectors}/{embeddable} embeddable segments\n"
                 ));
             }
+        }
+        if let Some(model) = &status.embedding_model {
+            out.push_str(&format!("Embedding model: {model}\n"));
         }
         if let Some(progress) = &status.index_progress {
             let work = WorkSummary::from(progress);
@@ -2553,6 +2566,8 @@ mod tests {
             total_segments: Some(14),
             vector_rows: Some(14),
             embeddable_segments: Some(14),
+            embedding_model: Some("all-MiniLM-L6-v2@int8".to_string()),
+            schema_version: Some(18),
             project_id: Some("project-123".to_string()),
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
@@ -2706,6 +2721,34 @@ mod tests {
     }
 
     #[test]
+    fn json_status_surfaces_embedding_model_and_schema_version() {
+        // The recall-gate preflight asserts the serving variant and a current
+        // schema from `1up status -f json`; both fields must appear in the payload.
+        let json = JsonFormatter.format_status(&sample_status());
+        assert!(
+            json.contains("\"embedding_model\""),
+            "json status must surface embedding_model: {json}"
+        );
+        assert!(
+            json.contains("all-MiniLM-L6-v2@int8"),
+            "json status must carry the recorded model id: {json}"
+        );
+        assert!(
+            json.contains("\"schema_version\""),
+            "json status must surface schema_version: {json}"
+        );
+    }
+
+    #[test]
+    fn human_status_notes_embedding_model_when_present() {
+        let rendered = HumanFormatter.format_status(&sample_status());
+        assert!(
+            rendered.contains("Embedding model: all-MiniLM-L6-v2@int8"),
+            "human status must note the embedding model: {rendered}"
+        );
+    }
+
+    #[test]
     fn json_status_omits_unavailable_reason_when_readable() {
         // sample_status() is a healthy, readable index (reason is None); the
         // additive field must be omitted from JSON rather than serialized as null.
@@ -2738,6 +2781,8 @@ mod tests {
             total_segments: None,
             vector_rows: None,
             embeddable_segments: None,
+            embedding_model: None,
+            schema_version: None,
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),
@@ -2780,6 +2825,8 @@ mod tests {
             total_segments: None,
             vector_rows: None,
             embeddable_segments: None,
+            embedding_model: None,
+            schema_version: None,
             project_id: None,
             project_root: PathBuf::from("/repo"),
             source_root: PathBuf::from("/repo"),

@@ -61,7 +61,14 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
     let daemon_status = read_daemon_status_for_context(&project_root, &worktree_context.context_id);
 
     let mut index_unavailable_reason: Option<String> = None;
-    let (indexed_files, total_segments, vector_rows, embeddable_segments) = {
+    let (
+        indexed_files,
+        total_segments,
+        vector_rows,
+        embeddable_segments,
+        embedding_model,
+        schema_version,
+    ) = {
         if db_path.exists() {
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
@@ -90,20 +97,23 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
                                 )
                                 .await
                                 .ok();
-                                (files, segs, vectors, embeddable)
+                                let model = schema::get_embedding_model(&conn).await.ok().flatten();
+                                let version =
+                                    schema::get_schema_version(&conn).await.ok().flatten();
+                                (files, segs, vectors, embeddable, model, version)
                             }
                             Err(err) => {
                                 index_unavailable_reason = Some(err.to_string());
-                                (None, None, None, None)
+                                (None, None, None, None, None, None)
                             }
                         }
                     }
-                    Err(_) => (None, None, None, None),
+                    Err(_) => (None, None, None, None, None, None),
                 },
-                Err(_) => (None, None, None, None),
+                Err(_) => (None, None, None, None, None, None),
             }
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None, None)
         }
     };
 
@@ -132,6 +142,8 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         total_segments,
         vector_rows,
         embeddable_segments,
+        embedding_model,
+        schema_version,
         project_id,
         project_root,
         source_root,
