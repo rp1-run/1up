@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use libsql::Connection;
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -838,34 +839,30 @@ fn plan_embedding_work<'a>(
     misses
 }
 
-async fn build_segment_batches(
+/// The connection-touching plan for one batch: every embeddable segment's
+/// resolved content key (`embeddable`, deterministic file/segment order) plus
+/// the distinct `(content_key, embed_input)` pairs that still need embedding
+/// (`misses`, pool hits already excluded). Produced by `plan_segment_batches`,
+/// which is the *only* phase of the embed<->store flush that touches `conn`
+/// (T6): the caller must keep this lookup from overlapping the store task's
+/// write on the same connection (Open Risk mitigation), while the CPU-only
+/// `embed_planned_batch` step that follows is free to run concurrently with
+/// the previous batch's store.
+struct SegmentBatchPlan {
+    embeddable: Vec<EmbeddableSegment>,
+    misses: Vec<(String, String)>,
+}
+
+/// Phase A (connection-touching): derives content keys for every embeddable
+/// segment and looks up which are already pooled. Returns `None` when there
+/// is no active embedder, mirroring the prior no-embedder storage path.
+async fn plan_segment_batches(
     conn: &Connection,
-    context_id: &str,
     parsed_files: &[ParsedWorkItem],
-    embedder: Option<&mut Embedder>,
-    timings: &mut TimingAccumulator,
-) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
+    embedder: Option<&Embedder>,
+) -> Result<Option<SegmentBatchPlan>, OneupError> {
     let Some(embedder) = embedder else {
-        // No active embedder: segments are stored without content keys or
-        // vectors, exactly as before content-addressed pooling.
-        return Ok(parsed_files
-            .iter()
-            .map(|file| {
-                file.segments
-                    .iter()
-                    .map(|segment| {
-                        build_segment_insert(
-                            context_id,
-                            &file.relative_path,
-                            &file.file_hash,
-                            segment,
-                            None,
-                            None,
-                        )
-                    })
-                    .collect()
-            })
-            .collect());
+        return Ok(None);
     };
 
     // Fold the loaded model variant (INT8 default vs FP32 fallback, R-003/T10)
@@ -873,8 +870,8 @@ async fn build_segment_batches(
     // forces a clean re-embed instead of reusing numerically-different vectors.
     let model_id = embedder.model_id();
 
-    // Pass 1: derive the content key + embed input for every embeddable segment,
-    // in deterministic file/segment order.
+    // Derive the content key + embed input for every embeddable segment, in
+    // deterministic file/segment order.
     let embeddable: Vec<EmbeddableSegment> = parsed_files
         .iter()
         .flat_map(|file| {
@@ -908,18 +905,36 @@ async fn build_segment_batches(
             .collect()
     };
     let present = segments::existing_embedding_pool_keys(conn, &distinct_keys).await?;
-    let misses = plan_embedding_work(&embeddable, &present);
+    let misses = plan_embedding_work(&embeddable, &present)
+        .into_iter()
+        .map(|(key, input)| (key.to_string(), input.to_string()))
+        .collect();
 
-    let miss_inputs: Vec<&str> = misses.iter().map(|(_, input)| *input).collect();
+    Ok(Some(SegmentBatchPlan { embeddable, misses }))
+}
+
+/// Phase B (pure CPU): embeds the plan's misses. Never touches `conn`, so it
+/// is safe to run while a previous batch's store write is in flight on the
+/// store task (T6 double buffer).
+fn embed_planned_batch(
+    embedder: &mut Embedder,
+    plan: &SegmentBatchPlan,
+    timings: &mut TimingAccumulator,
+) -> Result<HashMap<String, String>, OneupError> {
+    let miss_inputs: Vec<&str> = plan
+        .misses
+        .iter()
+        .map(|(_, input)| input.as_str())
+        .collect();
     let embed_started_at = Instant::now();
     let vectors = embedder.embed_batch(&miss_inputs)?;
     timings.embed_ms += embed_started_at.elapsed().as_millis();
 
-    if vectors.len() != misses.len() {
+    if vectors.len() != plan.misses.len() {
         return Err(IndexingError::Pipeline(format!(
             "embedder returned {} vectors for {} miss-set inputs",
             vectors.len(),
-            misses.len()
+            plan.misses.len()
         ))
         .into());
     }
@@ -927,14 +942,22 @@ async fn build_segment_batches(
     // Map each freshly embedded key to its serialized vector. An embeddable
     // segment whose key is absent here is a pool hit: the shared vector already
     // exists, so the segment carries only its `content_key` reference.
-    let mut key_to_vec: HashMap<&str, String> = HashMap::with_capacity(misses.len());
-    for ((key, _input), vector) in misses.iter().zip(vectors) {
-        key_to_vec.insert(*key, serialize_embedding(&vector)?);
+    let mut key_to_vec: HashMap<String, String> = HashMap::with_capacity(plan.misses.len());
+    for ((key, _input), vector) in plan.misses.iter().zip(vectors) {
+        key_to_vec.insert(key.clone(), serialize_embedding(&vector)?);
     }
+    Ok(key_to_vec)
+}
 
-    // Pass 2: assemble inserts, every embeddable segment carrying its resolved
-    // content key (and, for misses, the new vector to be pooled).
-    let mut resolved_keys = embeddable.iter();
+/// Phase C (pure CPU): assembles segment inserts from the plan's resolved
+/// content keys plus the freshly embedded vectors. Never touches `conn`.
+fn assemble_segment_batches(
+    context_id: &str,
+    parsed_files: &[ParsedWorkItem],
+    plan: &SegmentBatchPlan,
+    key_to_vec: &HashMap<String, String>,
+) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
+    let mut resolved_keys = plan.embeddable.iter();
     let mut batches = Vec::with_capacity(parsed_files.len());
     for file in parsed_files {
         let mut inserts = Vec::with_capacity(file.segments.len());
@@ -970,6 +993,32 @@ async fn build_segment_batches(
     );
 
     Ok(batches)
+}
+
+/// No active embedder: segments are stored without content keys or vectors,
+/// exactly as before content-addressed pooling.
+fn assemble_without_embedder(
+    context_id: &str,
+    parsed_files: &[ParsedWorkItem],
+) -> Vec<Vec<SegmentInsert>> {
+    parsed_files
+        .iter()
+        .map(|file| {
+            file.segments
+                .iter()
+                .map(|segment| {
+                    build_segment_insert(
+                        context_id,
+                        &file.relative_path,
+                        &file.file_hash,
+                        segment,
+                        None,
+                        None,
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn build_manifest_meta(file: &ParsedWorkItem) -> IndexedFileMeta {
@@ -1015,8 +1064,143 @@ async fn replace_file_batches(
     segments::replace_file_batch_for_context_tx(conn, context_id, &file_batches).await
 }
 
+/// One fully-assembled batch (parsed files + resolved segment inserts) ready
+/// to be written to `index.db`.
+struct StoreJob {
+    parsed_files: Vec<ParsedWorkItem>,
+    segment_batches: Vec<Vec<SegmentInsert>>,
+}
+
+/// Stats produced by a completed store write, folded into the run's
+/// `PipelineStats`/`TimingAccumulator` once the producer awaits them.
+struct StoreOutcome {
+    store_ms: u128,
+    files_indexed: usize,
+    segments_stored: usize,
+}
+
+/// Overlaps the pure-CPU `Embedder::embed_batch` call for batch N+1 with the
+/// libSQL write of batch N (T6/REQ-004): a dedicated task owns the write
+/// connection and drains `StoreJob`s from a depth-1 channel while the
+/// producer keeps preparing the next batch. `await_inflight` is the single
+/// synchronization point the producer must pass through before it touches
+/// the connection again for the next batch's pool-key lookup
+/// (`plan_segment_batches`), so the lookup and the store write are never in
+/// flight on the same connection at once (Open Risk mitigation); the
+/// single-writer invariant to `index.db` is preserved because only this task
+/// ever calls `replace_file_batches`.
+struct StoreDoubleBuffer {
+    job_tx: mpsc::Sender<StoreJob>,
+    outcome_rx: mpsc::Receiver<Result<StoreOutcome, OneupError>>,
+    handle: JoinHandle<()>,
+    inflight: bool,
+    pending: Option<StoreJob>,
+}
+
+impl StoreDoubleBuffer {
+    fn spawn(conn: Connection, context_id: String) -> Self {
+        let (job_tx, mut job_rx) = mpsc::channel::<StoreJob>(1);
+        let (outcome_tx, outcome_rx) = mpsc::channel::<Result<StoreOutcome, OneupError>>(1);
+        let handle = tokio::spawn(async move {
+            while let Some(job) = job_rx.recv().await {
+                let started_at = Instant::now();
+                let files_indexed = job.parsed_files.len();
+                let segments_stored = job.segment_batches.iter().map(Vec::len).sum::<usize>();
+                let result = replace_file_batches(
+                    &conn,
+                    &context_id,
+                    &job.parsed_files,
+                    &job.segment_batches,
+                )
+                .await;
+                let outcome = result.map(|()| StoreOutcome {
+                    store_ms: started_at.elapsed().as_millis(),
+                    files_indexed,
+                    segments_stored,
+                });
+                if outcome_tx.send(outcome).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            job_tx,
+            outcome_rx,
+            handle,
+            inflight: false,
+            pending: None,
+        }
+    }
+
+    /// Blocks until the in-flight store (if any) has fully finished, folding
+    /// its stats into `stats`/`timings`. Callers must run this before
+    /// touching the connection again on the producer side.
+    async fn await_inflight(
+        &mut self,
+        stats: &mut PipelineStats,
+        timings: &mut TimingAccumulator,
+    ) -> Result<(), OneupError> {
+        if !self.inflight {
+            return Ok(());
+        }
+        self.inflight = false;
+        let outcome = self.outcome_rx.recv().await.ok_or_else(|| {
+            IndexingError::Pipeline("store task ended unexpectedly".to_string())
+        })??;
+        timings.store_ms += outcome.store_ms;
+        stats.files_indexed += outcome.files_indexed;
+        stats.segments_stored += outcome.segments_stored;
+        Ok(())
+    }
+
+    /// Hands the pending batch (already embedded and assembled by a previous
+    /// call) to the store task, if there is one. Non-blocking beyond channel
+    /// backpressure: the caller's subsequent CPU-only work overlaps with this
+    /// write.
+    async fn dispatch_pending(&mut self) -> Result<(), OneupError> {
+        let Some(job) = self.pending.take() else {
+            return Ok(());
+        };
+        self.job_tx
+            .send(job)
+            .await
+            .map_err(|_| IndexingError::Pipeline("store task unavailable".to_string()))?;
+        self.inflight = true;
+        Ok(())
+    }
+
+    fn set_pending(&mut self, job: StoreJob) {
+        self.pending = Some(job);
+    }
+
+    /// Flushes the last pending batch and waits for the store task to drain,
+    /// folding final stats into `stats`/`timings`. Must be called once, after
+    /// the last `store_ready_files` call, before embedding coverage is
+    /// verified against the database.
+    ///
+    /// Order matters: a call from the last `store_ready_files` invocation may
+    /// still have a dispatch in flight (its own `await_inflight` only waits
+    /// on the dispatch *before* it), so any outstanding write must be
+    /// awaited before the final pending batch is dispatched — otherwise two
+    /// jobs would be in flight against a depth-1 channel at once and one
+    /// batch's outcome would never be folded in.
+    async fn finish(
+        mut self,
+        stats: &mut PipelineStats,
+        timings: &mut TimingAccumulator,
+    ) -> Result<(), OneupError> {
+        self.await_inflight(stats, timings).await?;
+        self.dispatch_pending().await?;
+        self.await_inflight(stats, timings).await?;
+        drop(self.job_tx);
+        let _ = self.handle.await;
+        Ok(())
+    }
+}
+
 async fn store_ready_files(
     conn: &Connection,
+    double_buffer: &mut StoreDoubleBuffer,
     context_id: &str,
     ready_files: &mut Vec<ParsedWorkItem>,
     embedder: Option<&mut Embedder>,
@@ -1028,16 +1212,31 @@ async fn store_ready_files(
     }
 
     let parsed_files = std::mem::take(ready_files);
-    let segment_batches =
-        build_segment_batches(conn, context_id, &parsed_files, embedder, timings).await?;
-    let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
 
-    let store_started_at = Instant::now();
-    replace_file_batches(conn, context_id, &parsed_files, &segment_batches).await?;
-    timings.store_ms += store_started_at.elapsed().as_millis();
+    // The pool-key lookup below touches `conn`; make sure the store task's
+    // in-flight write (if any) has fully finished first so the lookup and the
+    // write never race on the shared connection (Open Risk mitigation).
+    double_buffer.await_inflight(stats, timings).await?;
 
-    stats.files_indexed += parsed_files.len();
-    stats.segments_stored += segment_count;
+    let plan = plan_segment_batches(conn, &parsed_files, embedder.as_deref()).await?;
+
+    // Hand the previous batch (already embedded and assembled) to the store
+    // task now, so its write overlaps with this batch's pure-CPU embed step
+    // below.
+    double_buffer.dispatch_pending().await?;
+
+    let segment_batches = match (embedder, plan) {
+        (Some(embedder), Some(plan)) => {
+            let key_to_vec = embed_planned_batch(embedder, &plan, timings)?;
+            assemble_segment_batches(context_id, &parsed_files, &plan, &key_to_vec)?
+        }
+        _ => assemble_without_embedder(context_id, &parsed_files),
+    };
+
+    double_buffer.set_pending(StoreJob {
+        parsed_files,
+        segment_batches,
+    });
     Ok(())
 }
 
@@ -1159,6 +1358,7 @@ impl FlushState<'_> {
 
 async fn flush_reorder_buffer(
     conn: &Connection,
+    double_buffer: &mut StoreDoubleBuffer,
     reorder_buffer: &mut BTreeMap<usize, ParseResultKind>,
     next_sequence: &mut usize,
     config: &IndexingConfig,
@@ -1179,6 +1379,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            double_buffer,
                             &state.context.context_id,
                             &mut ready_files,
                             embedder,
@@ -1196,6 +1397,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            double_buffer,
                             &state.context.context_id,
                             &mut ready_files,
                             embedder,
@@ -1223,6 +1425,7 @@ async fn flush_reorder_buffer(
             let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
             store_ready_files(
                 conn,
+                double_buffer,
                 &state.context.context_id,
                 &mut ready_files,
                 embedder,
@@ -1776,6 +1979,7 @@ async fn execute_run_with_inputs(
     ));
     let parse_started_at = Instant::now();
 
+    let mut double_buffer = StoreDoubleBuffer::spawn(conn.clone(), context.context_id.clone());
     let mut reorder_buffer = BTreeMap::new();
     let mut parse_workers = JoinSet::new();
     let mut next_to_dispatch = 0usize;
@@ -1804,6 +2008,9 @@ async fn execute_run_with_inputs(
             // committed batch boundary (incomplete, never corrupt).
             if cancel_token.is_cancelled() {
                 debug!("indexing cancelled at dispatch boundary; stopping at last committed batch");
+                double_buffer
+                    .finish(flush_state.stats, flush_state.timings)
+                    .await?;
                 return Err(IndexingError::Cancelled.into());
             }
 
@@ -1842,11 +2049,15 @@ async fn execute_run_with_inputs(
             // guarantees an aborted pass stops at a committed boundary.
             if cancel_token.is_cancelled() {
                 debug!("indexing cancelled before flush; stopping at last committed batch");
+                double_buffer
+                    .finish(flush_state.stats, flush_state.timings)
+                    .await?;
                 return Err(IndexingError::Cancelled.into());
             }
 
             flush_reorder_buffer(
                 conn,
+                &mut double_buffer,
                 &mut reorder_buffer,
                 &mut next_to_flush,
                 config,
@@ -1867,11 +2078,15 @@ async fn execute_run_with_inputs(
         // in-loop check above.
         if cancel_token.is_cancelled() {
             debug!("indexing cancelled before tail flush; stopping at last committed batch");
+            double_buffer
+                .finish(flush_state.stats, flush_state.timings)
+                .await?;
             return Err(IndexingError::Cancelled.into());
         }
 
         flush_reorder_buffer(
             conn,
+            &mut double_buffer,
             &mut reorder_buffer,
             &mut next_to_flush,
             config,
@@ -1880,6 +2095,8 @@ async fn execute_run_with_inputs(
         )
         .await?;
     }
+
+    double_buffer.finish(&mut stats, &mut timings).await?;
 
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
@@ -1980,6 +2197,82 @@ mod tests {
             head_oid: Some(format!("{branch_name:0>40}")),
             branch_status: BranchStatus::Named,
         }
+    }
+
+    fn synthetic_parsed_file(index: usize) -> ParsedWorkItem {
+        ParsedWorkItem {
+            relative_path: format!("synthetic_{index}.rs"),
+            file_hash: format!("hash-{index}"),
+            extension: "rs".to_string(),
+            file_size: 0,
+            modified_ns: 0,
+            segments: Vec::new(),
+        }
+    }
+
+    /// T6: the store task must decouple the producer from the write's actual
+    /// completion. `dispatch_pending` (the handoff of a prior batch to the
+    /// store task) must return well before that batch's libSQL write
+    /// finishes, so the flush stage no longer fully serializes
+    /// embed-then-store — the caller is free to spend that window on the
+    /// next batch's pure-CPU embed step. Before T6, `store_ready_files` ran
+    /// `build_segment_batches` (embed) and the write fully sequentially, so
+    /// dispatch and completion were the same event; this assertion fails
+    /// against that prior shape.
+    #[tokio::test]
+    async fn store_double_buffer_dispatch_returns_before_write_completes() {
+        let (_db, conn) = setup().await;
+        let context_id = "ctx-double-buffer";
+
+        // Large enough that the real libSQL write takes measurably longer
+        // than a bounded-channel send, making the decoupling observable
+        // without depending on the embedder (out of scope for this
+        // handoff-only assertion).
+        let file_count = 2000;
+        let parsed_files: Vec<ParsedWorkItem> =
+            (0..file_count).map(synthetic_parsed_file).collect();
+        let segment_batches: Vec<Vec<SegmentInsert>> =
+            (0..file_count).map(|_| Vec::new()).collect();
+
+        let mut double_buffer = StoreDoubleBuffer::spawn(conn.clone(), context_id.to_string());
+        double_buffer.set_pending(StoreJob {
+            parsed_files,
+            segment_batches,
+        });
+
+        let dispatch_started_at = Instant::now();
+        double_buffer.dispatch_pending().await.unwrap();
+        let dispatch_elapsed_ms = dispatch_started_at.elapsed().as_millis();
+
+        let mut stats = PipelineStats::default();
+        let mut timings = TimingAccumulator::default();
+        double_buffer
+            .await_inflight(&mut stats, &mut timings)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.files_indexed, file_count,
+            "await_inflight must attribute the completed batch's file count"
+        );
+        assert!(
+            timings.store_ms >= 5,
+            "the synthetic batch must take measurable store time to make the \
+             handoff observable, took {}ms",
+            timings.store_ms
+        );
+        assert!(
+            dispatch_elapsed_ms < timings.store_ms,
+            "dispatching a batch to the store task must return well before its \
+             write completes (dispatch={dispatch_elapsed_ms}ms, store={}ms); the \
+             flush stage must not fully serialize embed-then-store",
+            timings.store_ms
+        );
+
+        double_buffer
+            .finish(&mut stats, &mut timings)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
