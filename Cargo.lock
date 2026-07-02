@@ -2287,6 +2287,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures-util",
+ "globset",
  "ignore",
  "indicatif",
  "libc",
