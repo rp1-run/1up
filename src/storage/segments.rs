@@ -469,6 +469,20 @@ pub enum SegmentPrefixLookup {
     Ambiguous(Vec<String>),
 }
 
+/// Escape LIKE wildcards in a handle prefix so `%` and `_` match literally under the
+/// `LIKE ?||'%' ESCAPE '\'` prefix clauses. Mirrors the SQL escape character `\`:
+/// `\`→`\\`, `%`→`\%`, `_`→`\_`. A wildcard-free prefix is returned byte-identical.
+fn escape_like_prefix(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Resolve a segment handle by prefix. A full-length id resolves to exactly one row
 /// via the same `LIKE ?||'%'` path that also handles the 12-char display handle.
 #[allow(dead_code)]
@@ -480,8 +494,12 @@ pub async fn get_segment_by_prefix(
         return Ok(SegmentPrefixLookup::NotFound);
     }
 
+    let escaped_prefix = escape_like_prefix(prefix);
     let mut rows = conn
-        .query(queries::SELECT_SEGMENTS_BY_PREFIX, [prefix])
+        .query(
+            queries::SELECT_SEGMENTS_BY_PREFIX,
+            [escaped_prefix.as_str()],
+        )
         .await
         .map_err(|e| StorageError::Query(format!("query segment by prefix failed: {e}")))?;
 
@@ -517,10 +535,11 @@ pub async fn get_segment_by_prefix_for_context(
     }
     validate_context_id(context_id)?;
 
+    let escaped_prefix = escape_like_prefix(prefix);
     let mut rows = conn
         .query(
             queries::SELECT_SEGMENTS_BY_PREFIX_FOR_CONTEXT,
-            libsql::params![context_id, prefix],
+            libsql::params![context_id, escaped_prefix.as_str()],
         )
         .await
         .map_err(|e| StorageError::Query(format!("query segment by prefix failed: {e}")))?;
@@ -2815,6 +2834,46 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn prefix_lookup_escapes_like_wildcards() {
+        let (_db, conn) = setup().await;
+
+        // Hex ids carry no literal `_` or `%`, so an escaped wildcard prefix must
+        // match nothing rather than treating the wildcard as a pattern.
+        upsert_segment(
+            &conn,
+            &test_segment("a0f1e2c3d4b5f6a7", "src/lib.rs", "hash1"),
+        )
+        .await
+        .unwrap();
+
+        // `_` would wildcard-match the 'e' at that position without escaping.
+        match get_segment_by_prefix(&conn, "a0f1_2c3").await.unwrap() {
+            SegmentPrefixLookup::NotFound => {}
+            other => panic!("expected NotFound for underscore prefix, got {other:?}"),
+        }
+
+        // `%` would match the whole id without escaping.
+        match get_segment_by_prefix(&conn, "a0f1%").await.unwrap() {
+            SegmentPrefixLookup::NotFound => {}
+            other => panic!("expected NotFound for percent prefix, got {other:?}"),
+        }
+
+        // The literal (unescaped) prefix still resolves through the same path.
+        match get_segment_by_prefix(&conn, "a0f1e2c3").await.unwrap() {
+            SegmentPrefixLookup::Found(seg) => assert_eq!(seg.id, "a0f1e2c3d4b5f6a7"),
+            other => panic!("expected Found for literal prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_like_prefix_escapes_only_wildcards() {
+        assert_eq!(escape_like_prefix("a0f1e2c3"), "a0f1e2c3");
+        assert_eq!(escape_like_prefix("a_b"), "a\\_b");
+        assert_eq!(escape_like_prefix("a%b"), "a\\%b");
+        assert_eq!(escape_like_prefix("a\\b"), "a\\\\b");
     }
 
     #[tokio::test]

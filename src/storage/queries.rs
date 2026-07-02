@@ -891,7 +891,7 @@ SELECT id, file_path, language, block_type, content,
        defined_symbols, referenced_symbols, called_symbols, file_hash,
        created_at, updated_at
 FROM segments
-WHERE id LIKE ?1 || '%'
+WHERE id LIKE ?1 || '%' ESCAPE '\\'
 ORDER BY id
 LIMIT 5";
 
@@ -902,7 +902,7 @@ SELECT id, file_path, language, block_type, content,
        created_at, updated_at
 FROM segments
 WHERE context_id = ?1
-  AND id LIKE ?2 || '%'
+  AND id LIKE ?2 || '%' ESCAPE '\\'
 ORDER BY id
 LIMIT 5";
 
