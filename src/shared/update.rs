@@ -242,7 +242,15 @@ fn update_http_failure_is_permanent(status: reqwest::StatusCode) -> bool {
         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Fetches the remote update manifest over HTTPS with bounded timeouts.
+/// Fetches the remote update manifest over HTTPS with bounded timeouts,
+/// verifying the raw response bytes against an attested release build
+/// subject (REQ-001, via [`verify_manifest_attestation`]) before any content
+/// is parsed. A disproof or definitive-empty outcome rejects the manifest
+/// before this returns, so `build_update_status` / `ensure_manifest_acceptable`
+/// / a cache write never runs on unattested bytes; a cannot-run outcome
+/// degrades to TLS trust alone (unchanged posture) and proceeds to parse.
+/// `--check`, self-update, and the passive `refresh_cache_if_stale` path all
+/// verify uniformly since this signature is unchanged.
 pub async fn fetch_update_manifest(
     client: &reqwest::Client,
 ) -> Result<UpdateManifest, UpdateError> {
@@ -264,15 +272,17 @@ pub async fn fetch_update_manifest(
         });
     }
 
-    let body = response
-        .text()
+    let raw_bytes = response
+        .bytes()
         .await
         .map_err(|e| UpdateError::FetchFailed {
             detail: format!("manifest read: {e}"),
             permanent: false,
         })?;
 
-    serde_json::from_str(&body)
+    verify_manifest_attestation(&raw_bytes).await?;
+
+    serde_json::from_slice(&raw_bytes)
         .map_err(|e| UpdateError::ParseFailed(format!("manifest parse: {e}")))
 }
 
@@ -1037,6 +1047,71 @@ async fn verify_artifact_attestation(
         .map_err(|e| UpdateError::SelfUpdateFailed(format!("read archive for attestation: {e}")))?;
 
     verify_attestation_bundles(&bundles, sigstore_verify::types::Artifact::from(&artifact))
+}
+
+/// Hex-encodes the SHA-256 digest of `bytes`, matching the digest format used
+/// to key an attestation lookup (and [`verify_archive_checksum`]'s format).
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Terminal-outcome dispatch shared by [`verify_manifest_attestation`]: given
+/// an already-fetched [`AttestationFetchOutcome`] and the raw manifest bytes
+/// it was fetched for, applies the same three-state disposition as
+/// [`verify_artifact_attestation`] (verified / disproved -> fail closed,
+/// cannot-run -> degrade), reusing [`verify_attestation_bundles`] for the
+/// cryptographic check + signing-identity pin.
+///
+/// Pure and offline given `outcome` (no network call), which is what makes
+/// the tamper-rejection behavior of [`verify_manifest_attestation`] unit
+/// testable with a fixture bundle: a bundle attests a specific subject
+/// digest, so mutated/tampered `raw_bytes` never match it and
+/// [`verify_attestation_bundles`] fails closed with `AttestationFailed`.
+fn verify_manifest_attestation_outcome(
+    outcome: AttestationFetchOutcome,
+    raw_bytes: &[u8],
+    subject: &str,
+) -> Result<(), UpdateError> {
+    match outcome {
+        AttestationFetchOutcome::Bundles(bundles) => {
+            verify_attestation_bundles(&bundles, sigstore_verify::types::Artifact::from(raw_bytes))
+        }
+        AttestationFetchOutcome::DefinitiveEmpty => Err(UpdateError::AttestationMissing {
+            subject: subject.to_string(),
+        }),
+        AttestationFetchOutcome::CannotRun { reason } => {
+            warn!(
+                "manifest attestation could not be verified ({reason}); \
+                 proceeding on TLS trust alone"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Verifies that a fetched update-manifest body corresponds to an attested
+/// release build subject (REQ-001) before its bytes are parsed, called from
+/// [`fetch_update_manifest`] with the raw response bytes hashed first.
+///
+/// Reuses [`fetch_attestation_bundles`] (the same function
+/// [`verify_artifact_attestation`] calls for the archive gate) keyed by the
+/// SHA-256 digest of the manifest bytes, so an ambiguous 404 is resolved
+/// through the identical memoized [`ATTESTATION_REPO_PROBE_CACHE`] — a single
+/// update action costs at most one repo-existence probe no matter how many
+/// attestation lookups (manifest + archive) it makes. Disposition is
+/// [`verify_manifest_attestation_outcome`]: verified -> `Ok(())`;
+/// definitive-empty -> `Err(AttestationMissing)` (hard fail before the caller
+/// parses the manifest); cannot-run -> `Ok(())` with a degrade notice,
+/// proceeding on TLS trust alone (there is no separate checksum floor for the
+/// manifest itself); disproved -> `Err(AttestationFailed)`.
+async fn verify_manifest_attestation(raw_bytes: &[u8]) -> Result<(), UpdateError> {
+    let digest_hex = sha256_hex(raw_bytes);
+    let subject = format!("update manifest sha256:{digest_hex}");
+    let outcome = fetch_attestation_bundles(&digest_hex).await?;
+    verify_manifest_attestation_outcome(outcome, raw_bytes, &subject)
 }
 
 /// Extracts the 1up binary from a tar.gz archive into the staging directory.
@@ -2499,6 +2574,59 @@ mod tests {
     }
 
     #[test]
+    fn verify_manifest_attestation_outcome_rejects_tampered_bytes() {
+        // REQ-001: a fixture attestation bundle attests a specific subject
+        // digest. Tampered manifest bytes never hash to that digest, so
+        // verification must fail closed before `fetch_update_manifest` ever
+        // reaches `serde_json::from_slice`. Pure/offline: constructs the
+        // `Bundles` outcome directly rather than fetching over the network.
+        let outcome =
+            AttestationFetchOutcome::Bundles(vec![FOREIGN_GITHUB_ATTESTATION.to_string()]);
+        let tampered_bytes = br#"{"version":"9.9.9","tampered":true}"#;
+        let err = verify_manifest_attestation_outcome(
+            outcome,
+            tampered_bytes,
+            "update manifest sha256:tampered",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UpdateError::AttestationFailed { .. }),
+            "expected AttestationFailed for tampered manifest bytes, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_manifest_attestation_outcome_rejects_definitive_empty() {
+        let err = verify_manifest_attestation_outcome(
+            AttestationFetchOutcome::DefinitiveEmpty,
+            b"manifest-bytes",
+            "update manifest sha256:abc123",
+        )
+        .unwrap_err();
+        match err {
+            UpdateError::AttestationMissing { subject } => {
+                assert_eq!(subject, "update manifest sha256:abc123");
+            }
+            other => panic!("expected AttestationMissing, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_manifest_attestation_outcome_degrades_on_cannot_run() {
+        let result = verify_manifest_attestation_outcome(
+            AttestationFetchOutcome::CannotRun {
+                reason: "offline".to_string(),
+            },
+            b"manifest-bytes",
+            "update manifest sha256:abc123",
+        );
+        assert!(
+            result.is_ok(),
+            "cannot-run must degrade (proceed) rather than fail"
+        );
+    }
+
+    #[test]
     fn parse_attestation_body_extracts_each_bundle() {
         let body =
             r#"{"attestations":[{"bundle":{"mediaType":"a"}},{"bundle":{"mediaType":"b"}}]}"#;
@@ -2627,6 +2755,45 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "probe should run at most once per cache lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn attestation_repo_probe_cache_is_shared_across_manifest_and_archive_gates() {
+        // Both the archive gate (`verify_artifact_attestation`) and the
+        // manifest gate (`verify_manifest_attestation`) resolve an ambiguous
+        // 404 by calling `fetch_attestation_bundles`, which reads the single
+        // process-wide `ATTESTATION_REPO_PROBE_CACHE` static -- not a
+        // gate-local cache. Simulate one probe call as if from each gate:
+        // the second must observe the first's memoized result and must not
+        // probe again, proving a single update action costs at most one
+        // probe no matter how many attestation lookups it makes.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls_archive_gate = calls.clone();
+        let archive_gate_result = ATTESTATION_REPO_PROBE_CACHE
+            .get_or_probe(|| async move {
+                calls_archive_gate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+            .await;
+
+        let calls_manifest_gate = calls.clone();
+        let manifest_gate_result = ATTESTATION_REPO_PROBE_CACHE
+            .get_or_probe(|| async move {
+                calls_manifest_gate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            })
+            .await;
+
+        assert_eq!(
+            archive_gate_result, manifest_gate_result,
+            "both gates must observe the same memoized probe result"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the process-wide probe cache must be shared: at most one probe across both gates"
         );
     }
 }
