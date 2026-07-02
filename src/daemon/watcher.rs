@@ -1,11 +1,14 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, warn};
 
+use crate::indexer::scan_filter::ScanFilter;
+use crate::shared::config;
 use crate::shared::constants::WATCHER_DEBOUNCE_MS;
 use crate::shared::errors::{DaemonError, OneupError};
 
@@ -138,40 +141,66 @@ fn collect_event_paths(result: notify::Result<Event>, changed: &mut WatcherChang
     }
 }
 
+/// Default watcher-level exclude globs: build/dependency directories not
+/// already covered by `ScanFilter`'s dotfile-hiding (`.git`/`.1up`/`.rp1`
+/// are dotfiles and excluded by default) plus common binary extensions.
+/// Fed into the shared `ScanFilter` as the resolved `IndexingConfig`'s
+/// exclude globs so the watcher no longer keeps its own drift-prone list;
+/// secret-file exclusion (`*.pem`, `*.key`, `credentials.json`, `.env`) is
+/// covered unconditionally by `ScanFilter` itself.
+const DEFAULT_WATCHER_EXCLUDE_GLOBS: &[&str] = &[
+    "**/node_modules/**",
+    "**/target/**",
+    "**/vendor/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/__pycache__/**",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.zip",
+    "*.tar",
+    "*.gz",
+    "*.exe",
+    "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.bin",
+    "*.wasm",
+    "*.pyc",
+    "*.db",
+    "*.sqlite",
+    "*.lock",
+];
+
+fn default_scan_filter() -> &'static ScanFilter {
+    static FILTER: OnceLock<ScanFilter> = OnceLock::new();
+    FILTER.get_or_init(|| {
+        let exclude_globs: Vec<String> = DEFAULT_WATCHER_EXCLUDE_GLOBS
+            .iter()
+            .map(|glob| glob.to_string())
+            .collect();
+        let resolved = config::resolve_indexing_config_with_globs(
+            None,
+            None,
+            None,
+            Some(exclude_globs),
+            None,
+            None,
+        )
+        .expect("default watcher indexing config resolves");
+        ScanFilter::new(
+            &resolved.include_globs,
+            &resolved.exclude_globs,
+            &resolved.index_hidden_dirs,
+        )
+        .expect("default watcher scan filter compiles")
+    })
+}
+
 fn should_skip_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    let skip_dirs = [
-        "node_modules",
-        ".git",
-        "target",
-        "vendor",
-        "build",
-        "dist",
-        "__pycache__",
-        ".1up",
-        ".rp1",
-    ];
-
-    for component in path.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if skip_dirs.iter().any(|d| s == *d) {
-            return true;
-        }
-    }
-
-    let binary_exts = [
-        "png", "jpg", "jpeg", "gif", "zip", "tar", "gz", "exe", "dll", "so", "dylib", "bin",
-        "wasm", "pyc", "db", "sqlite", "lock",
-    ];
-
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if binary_exts.contains(&ext.to_lowercase().as_str()) {
-            return true;
-        }
-    }
-
-    drop(path_str);
-    false
+    default_scan_filter().is_excluded(path, false)
 }
 
 pub fn filter_changed_paths(changes: WatcherChanges) -> WatcherChanges {
@@ -212,6 +241,14 @@ mod tests {
     #[test]
     fn skip_binary_ext() {
         assert!(should_skip_path(Path::new("/project/image.png")));
+    }
+
+    #[test]
+    fn skip_secret_pattern_credentials_json() {
+        assert!(should_skip_path(Path::new("/project/credentials.json")));
+        assert!(should_skip_path(Path::new("/project/secrets/id_rsa.pem")));
+        assert!(should_skip_path(Path::new("/project/service.key")));
+        assert!(should_skip_path(Path::new("/project/.env")));
     }
 
     #[test]
