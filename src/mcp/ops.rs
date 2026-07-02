@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -304,7 +306,10 @@ pub struct OverviewEntryPoint {
 
 struct CurrentIndex {
     conn: Connection,
-    _db: Db,
+    /// Canonical `index.db` path -- the warm cache's key (REQ-001) -- so a
+    /// caller needing the per-context vector-count cache (`run_search_once`)
+    /// can look it up without re-resolving/canonicalizing the path itself.
+    db_path: PathBuf,
 }
 
 pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
@@ -793,12 +798,38 @@ async fn run_search_once(
         let embedding_status = runtime.prepare_for_search(1)?;
         let embedding_reason = embedding_unavailable_reason(&embedding_status);
         let results = if embedding_status.is_available() {
+            // Reuse the warm cache's per-context vector `COUNT(*)` instead of
+            // recomputing it on every search (REQ-001, mirrors the daemon's
+            // `ProjectState::cached_vector_count`). A cache miss computes it
+            // once and records it against the current warm-index generation;
+            // `warm_index_connection` clears the whole map entry's counts on
+            // a build-aside swap, so a populated value always reflects the
+            // currently-open index.
+            let vector_count =
+                match cached_vector_count_for_context(&current.db_path, search_scope.context_id())
+                    .await
+                {
+                    Some(count) => count,
+                    None => {
+                        let count =
+                            retrieval::count_vector_rows_for_context(&current.conn, &search_scope)
+                                .await?;
+                        record_vector_count_for_context(
+                            &current.db_path,
+                            search_scope.context_id(),
+                            count,
+                        )
+                        .await;
+                        count
+                    }
+                };
             let mut engine = HybridSearchEngine::new_scoped(
                 &current.conn,
                 runtime.current_embedder(),
                 search_scope.clone(),
             )
-            .with_has_vectors(has_vectors);
+            .with_has_vectors(has_vectors)
+            .with_vector_count(vector_count);
             engine.search(query, limit).await?
         } else {
             let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
@@ -1169,6 +1200,131 @@ async fn run_index_pipeline(
     .map_err(Into::into)
 }
 
+/// On-disk `(device, inode)` identity of an `index.db` file, or `None` when
+/// the file is absent or cannot be stat'd. Mirrors
+/// `daemon::worker::index_file_identity`: two opens of the same path yield
+/// the same identity until an atomic rename swaps a different file over it,
+/// which is exactly how a build-aside rebuild installs a refreshed index.
+type IndexFileIdentity = (u64, u64);
+
+fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(index_path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// A warm, schema-validated MCP read-index handle kept alive across calls
+/// until a build-aside swap changes the on-disk inode (REQ-001).
+struct WarmIndex {
+    // Kept alive only so `conn` (an `Arc`-backed clone) remains valid for the
+    // lifetime of the cache entry; never read directly.
+    _db: Db,
+    conn: Connection,
+    /// Always true for a cache-resident entry: an entry is only ever
+    /// inserted after `schema::ensure_current` has already succeeded against
+    /// it, so this documents that invariant rather than driving new branches.
+    schema_validated: bool,
+    identity: Option<IndexFileIdentity>,
+    /// Per-context vector `COUNT(*)`, mirroring the daemon's
+    /// `ProjectState::cached_vector_count`. Cleared in full whenever this
+    /// entry is replaced (a swapped-in index has its own vector population).
+    vector_counts: HashMap<String, usize>,
+}
+
+/// Process-global warm MCP read-index cache (REQ-001), keyed by canonical
+/// `db_path` and mirroring `fallback_embedding_runtime`'s process-global
+/// shape.
+///
+/// The MCP server is a long-lived process serving many tool calls. Without
+/// this cache, every one of the six index-reading tools re-opens the
+/// database, re-applies the tuned PRAGMA profile, and re-runs
+/// `schema::ensure_current` (dozens of `sqlite_master` round-trips) on every
+/// single call. `warm_index_connection` stats `db_path` on every call and
+/// drops + reopens the entry when the on-disk `(dev,ino)` no longer matches
+/// the cached one, so a served connection can never continue serving a
+/// superseded generation after a build-aside swap (HYP-001: a held
+/// `Connection` is pinned to the inode it opened and keeps serving the
+/// pre-swap generation, with no error, until dropped and reopened).
+fn warm_index_cache() -> &'static tokio::sync::Mutex<HashMap<PathBuf, WarmIndex>> {
+    static CACHE: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, WarmIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Return a tuned RO connection to `db_path`'s currently-served index,
+/// reusing the process-global warm cache entry when the on-disk inode is
+/// unchanged (REQ-001).
+///
+/// On a cache hit (inode match) this is a cheap clone of the already
+/// schema-validated connection -- `libsql::Connection` is `Arc`-backed, so
+/// the clone shares the underlying connection and prepared-statement cache
+/// -- with no re-open and no re-`ensure_current`. On a miss (absent entry, or
+/// an inode mismatch caused by a build-aside swap installing a fresh index)
+/// the stale entry is dropped, a fresh RO connection is opened and
+/// schema-validated once, and the entry (including its per-context
+/// vector-count cache) is replaced, so a caller can never observe a pre-swap
+/// generation through the cache.
+async fn warm_index_connection(
+    state_root: &Path,
+    db_path: &Path,
+    canonical_db_path: &Path,
+) -> anyhow::Result<Connection> {
+    let current_identity = index_file_identity(canonical_db_path);
+
+    let mut cache = warm_index_cache().lock().await;
+    if let Some(warm) = cache.get(canonical_db_path) {
+        if warm.identity == current_identity {
+            debug_assert!(
+                warm.schema_validated,
+                "a cache-resident warm index must have already passed schema validation"
+            );
+            return Ok(warm.conn.clone());
+        }
+    }
+
+    let db = Db::open_ro(db_path).await?;
+    let conn = db.connect_tuned().await?;
+    schema::ensure_current(&conn, &schema::SchemaContext::new(db_path, state_root)).await?;
+
+    let served = conn.clone();
+    cache.insert(
+        canonical_db_path.to_path_buf(),
+        WarmIndex {
+            _db: db,
+            conn,
+            schema_validated: true,
+            identity: current_identity,
+            vector_counts: HashMap::new(),
+        },
+    );
+    Ok(served)
+}
+
+/// Return the cached per-context vector count recorded against
+/// `canonical_db_path`'s warm cache entry, if any (REQ-001).
+async fn cached_vector_count_for_context(
+    canonical_db_path: &Path,
+    context_id: &str,
+) -> Option<usize> {
+    let cache = warm_index_cache().lock().await;
+    cache
+        .get(canonical_db_path)
+        .and_then(|warm| warm.vector_counts.get(context_id).copied())
+}
+
+/// Record a freshly-computed per-context vector count against
+/// `canonical_db_path`'s warm cache entry, so the next search for the same
+/// context skips its per-query `COUNT(*)` (REQ-001). A no-op if the entry was
+/// concurrently reopened (a rare inode-swap race): the recomputed count
+/// belongs to the entry that just replaced this one, not the one being
+/// updated here.
+async fn record_vector_count_for_context(canonical_db_path: &Path, context_id: &str, count: usize) {
+    let mut cache = warm_index_cache().lock().await;
+    if let Some(warm) = cache.get_mut(canonical_db_path) {
+        warm.vector_counts.insert(context_id.to_string(), count);
+    }
+}
+
 async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     let db_path = project_db_path(state_root);
     if !db_path.exists() {
@@ -1177,12 +1333,15 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
             db_path.display()
         );
     }
+    let canonical_db_path = db_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve current index path {}", db_path.display()))?;
 
-    let db = Db::open_ro(&db_path).await?;
-    let conn = db.connect_tuned().await?;
-    schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, state_root)).await?;
-
-    Ok(CurrentIndex { conn, _db: db })
+    let conn = warm_index_connection(state_root, &db_path, &canonical_db_path).await?;
+    Ok(CurrentIndex {
+        conn,
+        db_path: canonical_db_path,
+    })
 }
 
 /// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
@@ -2232,6 +2391,212 @@ mod tests {
             unscoped.results.len(),
             2,
             "no prefix supplied must leave full-repo search behavior unchanged (REQ-001 AC4)"
+        );
+    }
+
+    /// Build a self-contained, finalized staging index at
+    /// `<state_root>/.1up/index.db.rebuild-<uuid>` holding one segment for
+    /// `context_id`, ready for `swap::swap_index_into_place`. Mirrors
+    /// `daemon::worker`'s `staged_index` test helper.
+    async fn build_staged_index_with_segment(
+        state_root: &Path,
+        context_id: &str,
+        segment_id: &str,
+    ) -> PathBuf {
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_root = scratch.path().canonicalize().unwrap().join("scratch");
+        fs::create_dir_all(&scratch_root).unwrap();
+        let scratch_index = project_db_path(&scratch_root);
+        crate::shared::fs::ensure_secure_project_root(&scratch_root).unwrap();
+
+        let db = Db::open_rw(&scratch_index).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            context_id,
+            "src/new.rs",
+            &[test_segment(segment_id, "src/new.rs")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        swap::finalize_staged_db(db, &scratch_index).await.unwrap();
+
+        let staging = config::project_staging_db_path(state_root);
+        std::fs::rename(&scratch_index, &staging).unwrap();
+        staging
+    }
+
+    /// REQ-001 AC1 / T1: a second `open_current_index` call on an
+    /// unchanged-inode `db_path` must reuse the cached tuned RO connection and
+    /// skip `ensure_current`/schema re-validation, rather than opening a fresh
+    /// connection per call.
+    ///
+    /// This is observed behaviorally: SQLite `TEMP` objects are private to the
+    /// connection that created them, so a `TEMP TABLE` created on the first
+    /// call's connection is visible on the second call's connection only if
+    /// the warm cache served the *same* underlying connection rather than
+    /// opening a new one.
+    #[tokio::test]
+    async fn open_current_index_reuses_warm_connection_when_inode_is_unchanged() {
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        drop(conn);
+        drop(db);
+
+        let first = open_current_index(&root).await.unwrap();
+        first
+            .conn
+            .execute("CREATE TEMP TABLE warm_probe(x)", ())
+            .await
+            .unwrap();
+
+        let second = open_current_index(&root).await.unwrap();
+        second
+            .conn
+            .query("SELECT x FROM warm_probe", ())
+            .await
+            .expect(
+                "a second open_current_index call on an unchanged inode must reuse the \
+                 first call's warm connection instead of opening a fresh one",
+            );
+    }
+
+    /// REQ-001 AC4 / T1 (HYP-001): after a build-aside swap installs a fresh
+    /// index generation on a new inode, the next MCP read must observe the new
+    /// generation's data -- never silently continue serving the pre-swap
+    /// generation through the warm cache -- and must still surface the
+    /// correct degraded reason (here, `NO_INDEXED_EMBEDDINGS_REASON`, since
+    /// neither generation's fixture segments carry embeddings).
+    #[tokio::test]
+    async fn open_current_index_reopens_and_serves_new_generation_after_swap() {
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "src/old.rs",
+            &[test_segment("old_needle", "src/old.rs")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        drop(db);
+
+        let context = WorktreeContext {
+            context_id: "ctx-active".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        };
+
+        // Warm the process-global cache against the pre-swap generation.
+        let before = run_search(&root, &context, "old_needle", 5, None)
+            .await
+            .unwrap();
+        assert_eq!(before.results.len(), 1);
+
+        let staging = build_staged_index_with_segment(&root, "ctx-active", "new_needle").await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        let after = run_search(&root, &context, "new_needle", 5, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.results.len(),
+            1,
+            "a post-swap read must observe the new generation's data"
+        );
+        assert_eq!(after.status, OperationStatus::Degraded);
+        assert_eq!(
+            after.degraded_reason.as_deref(),
+            Some(NO_INDEXED_EMBEDDINGS_REASON),
+            "the post-swap read must carry the correct degraded reason, not a stale/silent one"
+        );
+
+        let stale = run_search(&root, &context, "old_needle", 5, None)
+            .await
+            .unwrap();
+        assert!(
+            stale.results.is_empty(),
+            "the pre-swap generation's data must not still be served through the warm cache"
+        );
+    }
+
+    /// T1: the per-context vector-count cache on a warm index entry must be
+    /// populated on demand, keyed independently per context, and cleared in
+    /// full when a build-aside swap reopens the entry -- mirroring the
+    /// daemon's `reopen_invalidates_cached_vector_count_after_swap` coverage
+    /// for `ProjectState::cached_vector_count`. A stale count surviving a
+    /// swap could silently flip `vector_search_path_for_corpus` between the
+    /// exhaustive scan and the ANN path against the wrong generation.
+    #[tokio::test]
+    async fn vector_count_cache_is_scoped_per_context_and_cleared_by_reopen() {
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        drop(conn);
+        drop(db);
+
+        let current = open_current_index(&root).await.unwrap();
+        assert_eq!(
+            cached_vector_count_for_context(&current.db_path, "ctx-a").await,
+            None
+        );
+
+        record_vector_count_for_context(&current.db_path, "ctx-a", 42).await;
+        assert_eq!(
+            cached_vector_count_for_context(&current.db_path, "ctx-a").await,
+            Some(42)
+        );
+        assert_eq!(
+            cached_vector_count_for_context(&current.db_path, "ctx-b").await,
+            None,
+            "the vector-count cache must be scoped per context, not shared across contexts"
+        );
+
+        let staging = build_staged_index_with_segment(&root, "ctx-a", "new_needle").await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        let reopened = open_current_index(&root).await.unwrap();
+        assert_eq!(
+            cached_vector_count_for_context(&reopened.db_path, "ctx-a").await,
+            None,
+            "a build-aside swap must invalidate any cached per-context vector count"
         );
     }
 
