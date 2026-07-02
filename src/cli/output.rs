@@ -120,6 +120,11 @@ pub struct StatusInfo {
     pub last_update_error: Option<String>,
     pub index_present: bool,
     pub index_readable: bool,
+    /// Verbatim `schema::ensure_current` error when the index is present but
+    /// unreadable (fail-closed schema mismatch). `None` when the index is
+    /// readable or absent; the field is omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_unavailable_reason: Option<String>,
     pub last_file_check_at: Option<DateTime<Utc>>,
     pub index_progress: Option<IndexProgress>,
 }
@@ -417,7 +422,7 @@ impl Formatter for JsonFormatter {
 
     fn format_status(&self, status: &StatusInfo) -> String {
         let index_work = status.index_progress.as_ref().map(WorkSummary::from);
-        to_json(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "lifecycle_state": status.lifecycle_state.as_str(),
             "registered": status.registered,
             "daemon_running": status.daemon_running,
@@ -446,7 +451,11 @@ impl Formatter for JsonFormatter {
             "last_file_check_at": status.last_file_check_at,
             "index_progress": &status.index_progress,
             "index_work": index_work,
-        }))
+        });
+        if let Some(reason) = &status.index_unavailable_reason {
+            payload["index_unavailable_reason"] = serde_json::json!(reason);
+        }
+        to_json(&payload)
     }
 
     fn format_stop_result(&self, result: &StopResultInfo) -> String {
@@ -700,6 +709,9 @@ impl Formatter for HumanFormatter {
             )
         ));
         out.push_str(&format!("Index: {}\n", render_index_health_human(status)));
+        if let Some(reason) = &status.index_unavailable_reason {
+            out.push_str(&format!("  reason: {reason}\n"));
+        }
         if let Some(last_file_check_at) = &status.last_file_check_at {
             out.push_str(&format!(
                 "Last file check: {} ({})\n",
@@ -2558,6 +2570,7 @@ mod tests {
             last_update_error: None,
             index_present: true,
             index_readable: true,
+            index_unavailable_reason: None,
             last_file_check_at: Some(sample_progress().updated_at),
             index_progress: Some(sample_progress()),
         }
@@ -2629,6 +2642,80 @@ mod tests {
         assert!(rendered.contains("Last run vector coverage: 14/14 embeddable segments"));
     }
 
+    #[tokio::test]
+    async fn human_and_json_status_surface_schema_mismatch_reason() {
+        use crate::storage::db::Db;
+        use crate::storage::{queries, schema};
+
+        // Produce the real fail-closed wording from a stale-schema DB so the
+        // rendered status reuses `ensure_current`'s single-sourced text verbatim
+        // instead of an invented parallel phrasing.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
+        conn.execute(
+            queries::UPSERT_META,
+            [
+                "schema_version",
+                &(crate::shared::constants::SCHEMA_VERSION - 1).to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        let reason = schema::ensure_current(
+            &conn,
+            &schema::SchemaContext::new(Path::new("/repo/.1up/index.db"), Path::new("/repo")),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        let mut status = sample_status();
+        status.index_present = true;
+        status.index_readable = false;
+        status.index_progress = None;
+        status.index_unavailable_reason = Some(reason);
+
+        let human = HumanFormatter.format_status(&status);
+        assert!(
+            human.contains("Index: unavailable"),
+            "schema mismatch must render the index as unavailable: {human}"
+        );
+        assert!(
+            human.contains("reason:"),
+            "human status must print a reason line under the index health: {human}"
+        );
+        assert!(
+            human.contains("found v") && human.contains("expected v"),
+            "rendered reason must name the found and expected schema versions: {human}"
+        );
+        assert!(
+            human.contains("run `1up reindex`"),
+            "rendered reason must carry the reindex remediation: {human}"
+        );
+
+        let json = JsonFormatter.format_status(&status);
+        assert!(
+            json.contains("\"index_unavailable_reason\""),
+            "json must emit the reason field when present: {json}"
+        );
+        assert!(
+            json.contains("found v") && json.contains("run `1up reindex`"),
+            "json reason must carry the schema-mismatch wording verbatim: {json}"
+        );
+    }
+
+    #[test]
+    fn json_status_omits_unavailable_reason_when_readable() {
+        // sample_status() is a healthy, readable index (reason is None); the
+        // additive field must be omitted from JSON rather than serialized as null.
+        let json = JsonFormatter.format_status(&sample_status());
+        assert!(
+            !json.contains("index_unavailable_reason"),
+            "a readable index must omit the reason field: {json}"
+        );
+    }
+
     #[test]
     fn plain_index_summary_keeps_unprefixed_vector_keys() {
         let formatter = PlainFormatter;
@@ -2668,6 +2755,7 @@ mod tests {
             last_update_error: None,
             index_present: false,
             index_readable: false,
+            index_unavailable_reason: None,
             last_file_check_at: None,
             index_progress: None,
         });
@@ -2709,6 +2797,7 @@ mod tests {
             last_update_error: None,
             index_present: false,
             index_readable: false,
+            index_unavailable_reason: None,
             last_file_check_at: None,
             index_progress: None,
         });
