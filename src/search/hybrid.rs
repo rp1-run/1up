@@ -1038,15 +1038,21 @@ mod tests {
     /// disables model downloads).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn query_embedding_is_bit_stable_through_block_in_place() {
-        use crate::indexer::embedder::{is_model_available, EmbeddingRuntime};
+        use crate::indexer::embedder::{
+            is_model_available, EmbeddingRuntime, Fp32VariantTestGuard,
+        };
 
+        // Pin the always-provisioned FP32 baseline: this test verifies
+        // variant-agnostic query-embedding stability and must not depend on the
+        // INT8 default artifact being present locally (provisioned by T4).
+        let _variant = Fp32VariantTestGuard::set();
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
 
         let mut runtime = EmbeddingRuntime::default();
-        let status = runtime.prepare_for_search(1);
+        let status = runtime.prepare_for_search(1).unwrap();
         assert!(
             status.is_available(),
             "expected an available embedder, got {status:?}"

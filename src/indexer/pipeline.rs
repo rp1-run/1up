@@ -2879,6 +2879,10 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_progress_reports_embed_threads_when_embeddings_enabled() {
+        // Pin the always-provisioned FP32 baseline so this embedding-path test
+        // does not depend on the INT8 default artifact being present locally
+        // (provisioned by T4).
+        let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
         }
@@ -3257,6 +3261,10 @@ mod tests {
 
     #[tokio::test]
     async fn low_semantic_chunked_files_are_indexed_without_embeddings() {
+        // Pin the always-provisioned FP32 baseline so this embedding-path test
+        // does not depend on the INT8 default artifact being present locally
+        // (provisioned by T4).
+        let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
         }

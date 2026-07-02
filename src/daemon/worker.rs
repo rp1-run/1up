@@ -1553,7 +1553,7 @@ async fn run_project(
         let status = state
             .embedding_runtime
             .prepare_for_indexing(indexing_config.embed_threads)
-            .await;
+            .await?;
         setup.model_prepare_ms = model_start.elapsed().as_millis();
         log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
         pipeline::run_with_context_scope_setup_and_progress_root(
@@ -1712,9 +1712,22 @@ async fn handle_search_request(
 
     let mut degraded_reason = None;
     let results = if has_embeddings {
-        let status = state
+        let status = match state
             .embedding_runtime
-            .prepare_for_search(indexing_config.embed_threads);
+            .prepare_for_search(indexing_config.embed_threads)
+        {
+            Ok(status) => status,
+            Err(err) => {
+                // An invalid ONEUP_MODEL_VARIANT override is a hard config error,
+                // not a degrade: refuse the request rather than silently serving
+                // FTS-only results from the wrong (or no) variant (T1).
+                warn!(
+                    "daemon search embedding preparation failed for {}: {err}",
+                    state.project_root.display()
+                );
+                return search_service::unavailable_response();
+            }
+        };
         log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
 
         if status.is_available() {

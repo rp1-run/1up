@@ -122,7 +122,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let has_vectors = retrieval::has_indexed_embeddings(&conn, &search_scope).await?;
     let results = if has_vectors {
         let mut runtime = EmbeddingRuntime::default();
-        let status = runtime.prepare_for_search(1);
+        let status = runtime.prepare_for_search(1)?;
         match &status {
             EmbeddingLoadStatus::Warm | EmbeddingLoadStatus::Loaded => {}
             EmbeddingLoadStatus::Downloaded => {

@@ -279,6 +279,14 @@ pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES
 /// artifacts, and model availability cannot flip mid-suite.
 pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS";
 
+/// Environment variable that explicitly selects the embedding model variant for
+/// a run (T1). Accepted values are `int8` and `fp32` (case-insensitive);
+/// unset or empty resolves to the established default (`int8`). Any other value
+/// is a hard error at run start — the selection is deterministic and never
+/// silently falls back to the other variant, so an operator can pin and compare
+/// the compact and full-precision models reproducibly.
+pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
+
 /// Schema version for database layout.
 ///
 /// v18: bundles the Phase-2 re-embed migration. The default embedding path is
