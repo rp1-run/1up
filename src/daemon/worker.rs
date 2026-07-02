@@ -191,6 +191,7 @@ async fn run_inner() -> Result<(), OneupError> {
     };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
+    prewarm_project_embedders(&mut projects);
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
     run_dirty_projects_until_clean_or_cancelled(
         &file_watcher,
@@ -521,6 +522,56 @@ async fn load_and_watch_projects(
     }
 
     Ok(())
+}
+
+/// Prewarm every loaded project's embedding runtime immediately after
+/// [`load_and_watch_projects`] so the first real search finds a `Warm` runtime
+/// instead of paying a cold model load past the daemon's search deadline
+/// (REQ-004 D). Mirrors the search path's own `prepare_for_search` call
+/// (`handle_search_request`) rather than the indexing path's
+/// `prepare_for_indexing`, since prewarming is not itself an indexing pass and
+/// must not trigger a model download — a project with no model available yet
+/// simply stays `Unavailable` here exactly as it would on an unprewarmed first
+/// search, degrading to FTS-only rather than blocking startup.
+///
+/// Best-effort and per-project: a resolution or load failure for one project
+/// is logged and skipped, never propagated, so one misconfigured project can
+/// never block another project's prewarm or daemon startup.
+fn prewarm_project_embedders(projects: &mut ProjectStates) {
+    for state in projects.values_mut() {
+        let indexing_config = match config::resolve_indexing_config(
+            None,
+            None,
+            state.indexing.as_ref(),
+        ) {
+            Ok(indexing_config) => indexing_config,
+            Err(err) => {
+                warn!(
+                        "failed to resolve indexing configuration while prewarming embedder for {}: {err}",
+                        state.project_root.display()
+                    );
+                continue;
+            }
+        };
+        match state
+            .embedding_runtime
+            .prepare_for_search(indexing_config.embed_threads)
+        {
+            Ok(status) => {
+                log_search_embedding_status(
+                    &state.project_root,
+                    indexing_config.embed_threads,
+                    &status,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "failed to prewarm embedding runtime for {}: {err}",
+                    state.project_root.display()
+                );
+            }
+        }
+    }
 }
 
 /// Select the recorded contexts whose source worktree directory no longer exists.
@@ -2026,6 +2077,61 @@ mod tests {
             Some(STARTUP_RECONCILIATION_REASON)
         );
         assert_eq!(state.last_refresh_state, DaemonRefreshState::Pending);
+    }
+
+    /// REQ-004 D / T9: `prewarm_project_embedders` runs once, right after
+    /// `load_and_watch_projects`, so a project's embedding runtime is already
+    /// loaded before the first real search arrives. Modeled on
+    /// `prepare_for_search_reuses_warm_runtime_when_model_is_unchanged`: proving
+    /// a post-prewarm `prepare_for_search` call returns `Warm` (a cache hit,
+    /// not a fresh load) is exactly what a first real search would observe.
+    /// Gated on model availability like the other real-inference tests
+    /// (hermetic CI disables model downloads).
+    #[test]
+    fn startup_prewarm_leaves_embedding_runtime_warm_before_first_search() {
+        use crate::indexer::embedder::{is_model_available, Fp32VariantTestGuard};
+
+        // Pin the always-provisioned FP32 baseline so this test runs on any
+        // host with the FP32 model present, independent of whether the INT8
+        // default variant's artifact has been downloaded.
+        let _variant = Fp32VariantTestGuard::set();
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut projects: ProjectStates = HashMap::new();
+        let state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+        let context_id = insert_project(&mut projects, state);
+
+        prewarm_project_embedders(&mut projects);
+
+        let state = projects.get_mut(&context_id).unwrap();
+        assert!(
+            state.embedding_runtime.current_embedder().is_some(),
+            "prewarm should leave the embedder loaded"
+        );
+        // Resolve `embed_threads` exactly as `handle_search_request` would for
+        // the first real search, so the compatibility key matches the one the
+        // prewarm pass used.
+        let indexing_config = config::resolve_indexing_config(None, None, state.indexing.as_ref())
+            .expect("default indexing config resolves");
+        let status = state
+            .embedding_runtime
+            .prepare_for_search(indexing_config.embed_threads)
+            .unwrap();
+        assert_eq!(
+            status,
+            EmbeddingLoadStatus::Warm,
+            "the first real search's prepare_for_search call should reuse the \
+             prewarmed runtime instead of loading it cold"
+        );
     }
 
     #[test]
