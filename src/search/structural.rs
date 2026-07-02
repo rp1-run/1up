@@ -7,8 +7,8 @@ use tree_sitter::{Parser, Query, QueryCursor};
 use crate::indexer::parser::SupportedLanguage;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{
-    StructuralDiagnostic, StructuralDiagnosticKind, StructuralResult, StructuralSearchReport,
-    StructuralSearchStatus,
+    IndexingConfig, StructuralDiagnostic, StructuralDiagnosticKind, StructuralResult,
+    StructuralSearchReport, StructuralSearchStatus,
 };
 use crate::storage::segments;
 
@@ -206,7 +206,8 @@ impl<'a> StructuralSearchEngine<'a> {
         }
 
         let mut paths = Vec::new();
-        let scanner_results = crate::indexer::scanner::scan_directory(self.project_root)?;
+        let scanner_results =
+            crate::indexer::scanner::scan_directory(self.project_root, &IndexingConfig::auto())?;
         for file in scanner_results {
             if SupportedLanguage::from_extension(&file.extension) == Some(*lang) {
                 if let Ok(rel) = file.path.strip_prefix(self.project_root) {
