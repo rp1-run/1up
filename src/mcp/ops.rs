@@ -12,6 +12,7 @@ use crate::indexer::embedder::{
     self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
 };
 use crate::indexer::pipeline;
+use crate::indexer::scan_filter::ScanFilter;
 use crate::mcp::types::StartMode;
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
@@ -852,8 +853,30 @@ async fn get_handles_once(
     })
 }
 
+/// Resolves the shared [`ScanFilter`] (secret defaults + configured per-project
+/// globs/dotfile overrides) governing the given worktree context, matching the
+/// same registry-backed resolution `run_index` uses for the indexer so
+/// `oneup_context` refuses exactly the files the indexer would exclude.
+/// Synchronous: reads only the project registry file, never the index DB.
+pub fn resolve_context_scan_filter(
+    worktree_context: &WorktreeContext,
+) -> anyhow::Result<ScanFilter> {
+    let registry = Registry::load()?;
+    let indexing_config = config::resolve_indexing_config(
+        None,
+        None,
+        registry.indexing_config_for_context(worktree_context),
+    )?;
+    Ok(ScanFilter::new(
+        &indexing_config.include_globs,
+        &indexing_config.exclude_globs,
+        &indexing_config.index_hidden_dirs,
+    )?)
+}
+
 pub fn read_context_locations(
     source_root: &Path,
+    scan_filter: &ScanFilter,
     locations: &[ReadLocation],
 ) -> anyhow::Result<ReadPayload> {
     let canonical_root = source_root
@@ -862,7 +885,7 @@ pub fn read_context_locations(
     let mut records = Vec::with_capacity(locations.len());
 
     for location in locations {
-        records.push(read_location_record(&canonical_root, location));
+        records.push(read_location_record(&canonical_root, scan_filter, location));
     }
 
     Ok(ReadPayload {
@@ -1233,7 +1256,11 @@ async fn resolve_handle_via_prefix(
     )
 }
 
-fn read_location_record(source_root: &Path, location: &ReadLocation) -> ReadRecord {
+fn read_location_record(
+    source_root: &Path,
+    scan_filter: &ScanFilter,
+    location: &ReadLocation,
+) -> ReadRecord {
     let source = ReadSource::Location {
         path: location.path.clone(),
         line: location.line,
@@ -1256,6 +1283,30 @@ fn read_location_record(source_root: &Path, location: &ReadLocation) -> ReadReco
             return read_message(ReadStatus::Error, source, message);
         }
     };
+
+    // `resolve_location_path` guarantees `file_path` (canonical) starts with
+    // `source_root` (also canonical), so `strip_prefix` always succeeds here.
+    // Still handled explicitly rather than falling back to the absolute path,
+    // which would wrongly trip `ScanFilter`'s dotfile check on any dot-prefixed
+    // ancestor directory outside the repository (contract: `is_excluded` takes
+    // a repo-relative path, never an absolute one).
+    let rel_path = match file_path.strip_prefix(source_root) {
+        Ok(rel_path) => rel_path,
+        Err(_) => {
+            return read_message(
+                ReadStatus::Error,
+                source,
+                "failed to resolve repository-relative path for exclusion check",
+            );
+        }
+    };
+    if scan_filter.is_excluded(rel_path, false) {
+        return read_message(
+            ReadStatus::Rejected,
+            source,
+            "path is excluded from indexing and is not served via context",
+        );
+    }
 
     match ContextEngine::retrieve_with_scope(
         &file_path,
@@ -1789,6 +1840,10 @@ mod tests {
         assert!(rebuild_in_progress(&state_root, "ctx"));
     }
 
+    fn no_op_scan_filter() -> ScanFilter {
+        ScanFilter::new(&[], &[], &[]).unwrap()
+    }
+
     #[test]
     fn read_context_locations_rejects_parent_escape() {
         let temp = tempfile::tempdir().unwrap();
@@ -1797,6 +1852,7 @@ mod tests {
 
         let payload = read_context_locations(
             &root,
+            &no_op_scan_filter(),
             &[ReadLocation {
                 path: "../outside.rs".to_string(),
                 line: 1,
@@ -1817,6 +1873,7 @@ mod tests {
 
         let payload = read_context_locations(
             &root,
+            &no_op_scan_filter(),
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
                 line: 0,
@@ -1847,6 +1904,7 @@ mod tests {
 
         let payload = read_context_locations(
             &root,
+            &no_op_scan_filter(),
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
                 line: 2,
@@ -1861,6 +1919,90 @@ mod tests {
             payload.records[0].context.as_ref().unwrap().path,
             "src/lib.rs"
         );
+    }
+
+    /// REQ-005 AC1 red-first baseline: prior to enforcing `ScanFilter` at the
+    /// context read path, `oneup_context` read secret-pattern files off disk
+    /// directly, bypassing indexer exclusions entirely. This asserts the
+    /// closed behavior — the fix under test refuses the file rather than
+    /// returning its content.
+    #[test]
+    fn read_context_locations_rejects_secret_pattern_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("credentials.json"), "{\"key\": \"super-secret\"}").unwrap();
+
+        let payload = read_context_locations(
+            &root,
+            &no_op_scan_filter(),
+            &[ReadLocation {
+                path: "credentials.json".to_string(),
+                line: 1,
+                expansion: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payload.status, OperationStatus::Empty);
+        assert_eq!(payload.records[0].status, ReadStatus::Rejected);
+        assert!(payload.records[0].context.is_none());
+        assert!(payload.records[0]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("excluded"));
+    }
+
+    #[test]
+    fn read_context_locations_rejects_configured_exclude_glob() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        fs::write(root.join("secrets/internal.txt"), "internal only").unwrap();
+
+        let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
+        let payload = read_context_locations(
+            &root,
+            &scan_filter,
+            &[ReadLocation {
+                path: "secrets/internal.txt".to_string(),
+                line: 1,
+                expansion: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payload.records[0].status, ReadStatus::Rejected);
+        assert!(payload.records[0].context.is_none());
+    }
+
+    /// REQ-005 AC2: a non-excluded file continues to be served normally even
+    /// when the project has a configured (non-matching) `ScanFilter`.
+    #[test]
+    fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+
+        let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
+        let payload = read_context_locations(
+            &root,
+            &scan_filter,
+            &[ReadLocation {
+                path: "src/lib.rs".to_string(),
+                line: 2,
+                expansion: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payload.records[0].status, ReadStatus::Found);
     }
 
     #[test]
