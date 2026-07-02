@@ -329,6 +329,24 @@ WHERE s.context_id = ?2
 ORDER BY vector_distance_cos(p.embedding_vec, vector8(?1)), s.id
 LIMIT ?3";
 
+/// Path-prefix-scoped sibling of [`SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`]
+/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// `SearchScope::path_prefix_like_pattern`. Scoped vector search is always
+/// forced onto this exhaustive path (never `vector_top_k`) so the prefix
+/// filter cannot starve out results the ANN path would otherwise truncate
+/// before the filter runs.
+pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT_SCOPED: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
+FROM segment_vectors AS sv
+JOIN embedding_pool AS p ON p.content_key = sv.content_key
+JOIN segments AS s ON s.id = sv.segment_id
+WHERE s.context_id = ?2
+  AND (s.file_path || '/') LIKE ?4 ESCAPE '\\'
+ORDER BY vector_distance_cos(p.embedding_vec, vector8(?1)), s.id
+LIMIT ?3";
+
 #[allow(dead_code)]
 pub const SELECT_FTS_CANDIDATES: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
@@ -348,6 +366,21 @@ FROM segments_fts AS f
 JOIN segments AS s ON s.rowid = f.rowid
 WHERE segments_fts MATCH ?1
   AND s.context_id = ?2
+ORDER BY f.rank, s.rowid
+LIMIT ?3";
+
+/// Path-prefix-scoped sibling of [`SELECT_FTS_CANDIDATES_FOR_CONTEXT`]
+/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// `SearchScope::path_prefix_like_pattern`.
+pub const SELECT_FTS_CANDIDATES_FOR_CONTEXT_SCOPED: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity,
+       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
+FROM segments_fts AS f
+JOIN segments AS s ON s.rowid = f.rowid
+WHERE segments_fts MATCH ?1
+  AND s.context_id = ?2
+  AND (s.file_path || '/') LIKE ?4 ESCAPE '\\'
 ORDER BY f.rank, s.rowid
 LIMIT ?3";
 
@@ -1014,6 +1047,27 @@ ORDER BY
   s.line_start,
   ss.symbol";
 
+/// Path-prefix-scoped sibling of [`SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`]
+/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// `SearchScope::path_prefix_like_pattern`.
+pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT_SCOPED: &str = "
+SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
+       s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
+       s.created_at, s.updated_at, ss.symbol, ss.canonical_symbol
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.context_id = ?1
+  AND s.context_id = ?1
+  AND ss.reference_kind = ?2
+  AND ss.canonical_symbol = ?3
+  AND (s.file_path || '/') LIKE ?4 ESCAPE '\\'
+ORDER BY
+  CASE WHEN s.block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
+  s.file_path,
+  s.line_start,
+  ss.symbol";
+
 /// Build the symbol-match statement for `canonical_count` canonical symbols
 /// within one context. Identical columns and `ORDER BY` to
 /// [`SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`], so the rows for any one
@@ -1022,8 +1076,13 @@ ORDER BY
 /// regroup rows per canonical and replay the per-canonical iteration order and
 /// dedup of the per-item path (R-013).
 /// Params: `?1` context id, `?2` reference kind,
-/// `?3..?(canonical_count + 2)` canonical symbols.
-pub fn select_symbol_matches_by_canonicals_for_context_sql(canonical_count: usize) -> String {
+/// `?3..?(canonical_count + 2)` canonical symbols, and when `path_scoped` is
+/// `true` a trailing `?(canonical_count + 3)` bound `LIKE` pattern built by
+/// `SearchScope::path_prefix_like_pattern` (REQ-001).
+pub fn select_symbol_matches_by_canonicals_for_context_sql(
+    canonical_count: usize,
+    path_scoped: bool,
+) -> String {
     let mut canonical_placeholders = String::new();
     for index in 0..canonical_count {
         if index > 0 {
@@ -1031,6 +1090,15 @@ pub fn select_symbol_matches_by_canonicals_for_context_sql(canonical_count: usiz
         }
         write!(canonical_placeholders, "?{}", index + 3).expect("write to String cannot fail");
     }
+
+    let path_filter = if path_scoped {
+        format!(
+            "\n  AND (s.file_path || '/') LIKE ?{} ESCAPE '\\'",
+            canonical_count + 3
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
@@ -1042,13 +1110,14 @@ JOIN segments AS s ON s.id = ss.segment_id
 WHERE ss.context_id = ?1
   AND s.context_id = ?1
   AND ss.reference_kind = ?2
-  AND ss.canonical_symbol IN ({canonicals})
+  AND ss.canonical_symbol IN ({canonicals}){path_filter}
 ORDER BY
   CASE WHEN s.block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
   s.file_path,
   s.line_start,
   ss.symbol",
         canonicals = canonical_placeholders,
+        path_filter = path_filter,
     )
 }
 

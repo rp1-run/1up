@@ -241,11 +241,24 @@ pub(crate) async fn fetch_vector_candidates_with_count(
 ) -> Result<Vec<CandidateRow>, OneupError> {
     let started = std::time::Instant::now();
     let query_embedding = serialize_query_embedding(query_embedding)?;
-    let vector_count = match cached_count {
-        Some(count) => count,
-        None => count_vector_rows_for_context(conn, scope).await?,
+
+    // A `path_prefix` scope forces the exhaustive scan unconditionally,
+    // bypassing both the ANN index and the count-based path selection below:
+    // `vector_top_k` applies the path filter only after truncating to its
+    // top-K budget, which would starve out in-scope results that did not
+    // survive that truncation (design decision, REQ-001).
+    let (path, vector_count) = if scope.path_prefix().is_some() {
+        (VectorSearchPath::ExhaustiveScan, None)
+    } else {
+        let vector_count = match cached_count {
+            Some(count) => count,
+            None => count_vector_rows_for_context(conn, scope).await?,
+        };
+        (
+            vector_search_path_for_corpus(vector_count),
+            Some(vector_count),
+        )
     };
-    let path = vector_search_path_for_corpus(vector_count);
 
     let results = match path {
         VectorSearchPath::ExhaustiveScan => {
@@ -257,7 +270,8 @@ pub(crate) async fn fetch_vector_candidates_with_count(
     };
 
     tracing::debug!(
-        "vector stage: {path:?} over {vector_count} context vectors returned {} candidates in {:?}",
+        "vector stage: {path:?} over {vector_count:?} context vectors (path_prefix={:?}) returned {} candidates in {:?}",
+        scope.path_prefix(),
         results.len(),
         started.elapsed()
     );
@@ -270,17 +284,32 @@ async fn fetch_vector_candidates_exhaustive(
     scope: &SearchScope,
     serialized_embedding: &str,
 ) -> Result<Vec<CandidateRow>, OneupError> {
-    let mut rows = conn
-        .query(
-            queries::SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT,
-            libsql::params![
-                serialized_embedding,
-                scope.context_id(),
-                VECTOR_PREFILTER_K as i64
-            ],
-        )
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("vector exhaustive scan: {e}")))?;
+    let mut rows = match scope.path_prefix_like_pattern() {
+        Some(pattern) => {
+            conn.query(
+                queries::SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT_SCOPED,
+                libsql::params![
+                    serialized_embedding,
+                    scope.context_id(),
+                    VECTOR_PREFILTER_K as i64,
+                    pattern
+                ],
+            )
+            .await
+        }
+        None => {
+            conn.query(
+                queries::SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT,
+                libsql::params![
+                    serialized_embedding,
+                    scope.context_id(),
+                    VECTOR_PREFILTER_K as i64
+                ],
+            )
+            .await
+        }
+    }
+    .map_err(|e| SearchError::QueryFailed(format!("vector exhaustive scan: {e}")))?;
 
     collect_candidate_rows(&mut rows, "vector exhaustive scan row iteration").await
 }
@@ -394,13 +423,28 @@ pub(crate) async fn fetch_fts_candidates(
         return Ok(Vec::new());
     }
 
-    let mut rows = conn
-        .query(
-            queries::SELECT_FTS_CANDIDATES_FOR_CONTEXT,
-            libsql::params![fts_query, scope.context_id(), VECTOR_PREFILTER_K as i64],
-        )
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
+    let mut rows = match scope.path_prefix_like_pattern() {
+        Some(pattern) => {
+            conn.query(
+                queries::SELECT_FTS_CANDIDATES_FOR_CONTEXT_SCOPED,
+                libsql::params![
+                    fts_query,
+                    scope.context_id(),
+                    VECTOR_PREFILTER_K as i64,
+                    pattern
+                ],
+            )
+            .await
+        }
+        None => {
+            conn.query(
+                queries::SELECT_FTS_CANDIDATES_FOR_CONTEXT,
+                libsql::params![fts_query, scope.context_id(), VECTOR_PREFILTER_K as i64],
+            )
+            .await
+        }
+    }
+    .map_err(|e| SearchError::QueryFailed(format!("FTS search: {e}")))?;
 
     collect_candidate_rows(&mut rows, "FTS row iteration").await
 }
@@ -1197,6 +1241,168 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].segment_id, "seg-active");
+    }
+
+    // TDD (REQ-001 AC2 / T5): the exhaustive vector path must apply the
+    // `path_prefix` directory-boundary filter so `src/foo` matches itself and
+    // its descendants but not a sibling directory that merely shares the
+    // prefix as a string (`src/foobar`).
+    #[tokio::test]
+    async fn exhaustive_scan_respects_path_prefix_boundary() {
+        let conn = setup().await;
+        let embedding = embedding_with(&[(0, 1.0)]);
+        let serialized = serialize_query_embedding(&embedding).unwrap();
+
+        insert_segment(
+            &conn,
+            "seg-exact",
+            "src/foo",
+            "fn exact_prefix_file() {}",
+            Some(&embedding),
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-descendant",
+            "src/foo/a.rs",
+            "fn descendant_item() {}",
+            Some(&embedding),
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-sibling",
+            "src/foobar/a.rs",
+            "fn sibling_item() {}",
+            Some(&embedding),
+        )
+        .await;
+
+        let scope = SearchScope::default_context().with_path_prefix("src/foo");
+        let candidates = fetch_vector_candidates_exhaustive(&conn, &scope, &serialized)
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = candidates.iter().map(|c| c.segment_id.as_str()).collect();
+        assert!(ids.contains(&"seg-exact"), "the prefix itself must match");
+        assert!(ids.contains(&"seg-descendant"), "descendants must match");
+        assert!(
+            !ids.contains(&"seg-sibling"),
+            "src/foo must not match src/foobar"
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    // TDD (REQ-001 AC2 / T5): scoped vector search must force the exhaustive
+    // scan and bypass count-based path selection entirely, even when the
+    // (cached or live) vector count is above `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`.
+    // Before this fix, a large count routed to `vector_top_k`, which has no
+    // path-prefix filter and would leak the sibling row.
+    #[tokio::test]
+    async fn vector_search_with_path_prefix_bypasses_ann_above_threshold() {
+        let conn = setup().await;
+        let embedding = embedding_with(&[(0, 1.0)]);
+
+        insert_segment(
+            &conn,
+            "seg-in-scope",
+            "src/foo/a.rs",
+            "fn scoped_item() {}",
+            Some(&embedding),
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-sibling",
+            "src/foobar/a.rs",
+            "fn sibling_item() {}",
+            Some(&embedding),
+        )
+        .await;
+
+        let scope = SearchScope::default_context().with_path_prefix("src/foo");
+        let candidates = fetch_vector_candidates_with_count(
+            &conn,
+            &scope,
+            &embedding,
+            Some(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a high cached count must not route a scoped search onto the unfiltered ANN path"
+        );
+        assert_eq!(candidates[0].segment_id, "seg-in-scope");
+    }
+
+    // TDD (REQ-001 AC1 / T5): the FTS candidate query must apply the same
+    // directory-boundary `path_prefix` filter as the vector stage.
+    #[tokio::test]
+    async fn fts_candidates_respect_path_prefix_boundary() {
+        let conn = setup().await;
+
+        insert_segment(
+            &conn,
+            "seg-in-scope",
+            "src/foo/a.rs",
+            "fn widgetsearch() {}",
+            None,
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-sibling",
+            "src/foobar/a.rs",
+            "fn widgetsearch() {}",
+            None,
+        )
+        .await;
+
+        let scope = SearchScope::default_context().with_path_prefix("src/foo");
+        let candidates = fetch_fts_candidates(&conn, &scope, "widgetsearch")
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = candidates.iter().map(|c| c.segment_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["seg-in-scope"],
+            "src/foo must not match src/foobar"
+        );
+    }
+
+    // TDD (REQ-001 AC4 / T5): an unset `path_prefix` must leave full-repo
+    // search behavior unchanged.
+    #[tokio::test]
+    async fn no_path_prefix_leaves_full_repo_behavior_unchanged() {
+        let conn = setup().await;
+
+        insert_segment(
+            &conn,
+            "seg-in-scope",
+            "src/foo/a.rs",
+            "fn widgetsearch() {}",
+            None,
+        )
+        .await;
+        insert_segment(
+            &conn,
+            "seg-sibling",
+            "src/foobar/a.rs",
+            "fn widgetsearch() {}",
+            None,
+        )
+        .await;
+
+        let candidates =
+            fetch_fts_candidates(&conn, &SearchScope::default_context(), "widgetsearch")
+                .await
+                .unwrap();
+
+        assert_eq!(candidates.len(), 2, "no prefix must return every match");
     }
 
     #[test]
