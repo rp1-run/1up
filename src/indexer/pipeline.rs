@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use libsql::Connection;
 use sha2::{Digest, Sha256};
@@ -168,7 +168,8 @@ use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{
     DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
-    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
+    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE,
+    SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -1320,6 +1321,17 @@ fn current_progress_phase(stats: &PipelineStats) -> IndexPhase {
     }
 }
 
+const PROGRESS_PERSIST_THROTTLE: Duration = Duration::from_millis(PROGRESS_PERSIST_THROTTLE_MS);
+
+/// Pure decision gate for `FlushState::refresh`: should this call actually
+/// write `index_status.json`, or is it within the throttle window of the
+/// last write? `force` (the terminal `Complete` phase) always wins.
+fn should_persist_progress(last_persisted_at: Option<Instant>, now: Instant, force: bool) -> bool {
+    force
+        || last_persisted_at
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_PERSIST_THROTTLE)
+}
+
 struct FlushState<'a> {
     stats: &'a mut PipelineStats,
     project_root: &'a Path,
@@ -1333,10 +1345,22 @@ struct FlushState<'a> {
     progress_tx: Option<ProgressSender>,
     scope: Option<IndexScopeInfo>,
     prefilter: Option<IndexPrefilterInfo>,
+    last_persisted_at: Option<Instant>,
 }
 
 impl FlushState<'_> {
     fn refresh(&mut self, phase: IndexPhase, persist: bool) {
+        self.refresh_at(phase, persist, Instant::now());
+    }
+
+    /// `now`-injectable core of `refresh`, so the throttle gate is
+    /// deterministically testable without depending on wall-clock timing.
+    fn refresh_at(&mut self, phase: IndexPhase, persist: bool, now: Instant) {
+        let persist = persist
+            && should_persist_progress(self.last_persisted_at, now, phase == IndexPhase::Complete);
+        if persist {
+            self.last_persisted_at = Some(now);
+        }
         refresh_progress(
             self.stats,
             self.project_root,
@@ -1999,6 +2023,7 @@ async fn execute_run_with_inputs(
             progress_tx: progress_tx.clone(),
             scope: scope_info.clone(),
             prefilter: prefilter_info.clone(),
+            last_persisted_at: None,
         };
 
         while next_to_dispatch < content_read_count || !parse_workers.is_empty() {
@@ -2662,6 +2687,52 @@ mod tests {
         assert!(
             breadcrumbs.contains(&Some("README > Title > Install")),
             "expected file-stem-rooted heading breadcrumb; found {breadcrumbs:?}"
+        );
+    }
+
+    #[test]
+    fn should_persist_progress_collapses_rapid_skips_into_one_write_per_window() {
+        let start = Instant::now();
+        let mut last_persisted_at: Option<Instant> = None;
+        let mut persisted_at: Vec<Instant> = Vec::new();
+
+        // 25 synthetic progress-skip events 10ms apart (0..=240ms), all
+        // strictly inside the 250ms throttle window.
+        for step in 0..25u32 {
+            let now = start + Duration::from_millis(u64::from(step) * 10);
+            if should_persist_progress(last_persisted_at, now, false) {
+                persisted_at.push(now);
+                last_persisted_at = Some(now);
+            }
+        }
+
+        assert_eq!(
+            persisted_at,
+            vec![start],
+            "many skips inside a single 250ms window must collapse to the \
+             one opening persist_progress/atomic_replace call"
+        );
+
+        // An event that finally clears the window persists again.
+        let now_past_window = start + Duration::from_millis(260);
+        assert!(
+            should_persist_progress(last_persisted_at, now_past_window, false),
+            "a skip event past the throttle window must persist again"
+        );
+    }
+
+    #[test]
+    fn should_persist_progress_forces_terminal_complete_flush() {
+        let last_persist = Instant::now();
+        let now = last_persist + Duration::from_millis(10);
+
+        assert!(
+            !should_persist_progress(Some(last_persist), now, false),
+            "sanity: a non-terminal refresh this soon after a persist must be throttled"
+        );
+        assert!(
+            should_persist_progress(Some(last_persist), now, true),
+            "the terminal Complete phase must force a flush even inside the throttle window"
         );
     }
 

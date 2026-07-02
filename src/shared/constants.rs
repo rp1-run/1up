@@ -152,6 +152,18 @@ pub const CHUNK_OVERLAP: usize = 10;
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
+/// Maximum interval between persisted `index_status.json` progress writes
+/// during a single indexing pass (`FlushState::refresh`, T7/REQ-004).
+///
+/// Before this throttle, every skipped file or stored batch triggered its own
+/// `atomic_replace` (temp-write + fsync + rename), which dominated wall time
+/// on skip-heavy incremental passes. The in-memory progress bar
+/// (`emit_progress`) stays per-event and is unaffected; only the on-disk
+/// write is gated. The terminal `Complete` phase always flushes regardless
+/// of this gate, so `1up status`/`list`/MCP readers never observe a stale
+/// non-terminal state past run completion.
+pub const PROGRESS_PERSIST_THROTTLE_MS: u64 = 250;
+
 /// How long the daemon may run with zero registered projects before it
 /// self-exits. The daemon otherwise only exits on SIGTERM, so a daemon left
 /// behind once its last project is deregistered (`1up stop`), or one orphaned
