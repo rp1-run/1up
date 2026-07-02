@@ -1214,8 +1214,11 @@ pub const SELECT_WORKTREE_CONTEXT_HEAD_OID: &str =
 
 /// Every recorded worktree context, used by `1up gc` to decide which contexts are
 /// stale branch snapshots or dead worktrees that can be pruned from the shared index.
+/// `updated_at` (bumped on every `UPSERT_WORKTREE_CONTEXT`, i.e. every successful
+/// index run for that context) is the keep-count/age signal for the
+/// `SupersededSameSource` retention policy.
 pub const SELECT_ALL_WORKTREE_CONTEXTS: &str =
-    "SELECT context_id, state_root, source_root, branch_name FROM worktree_contexts";
+    "SELECT context_id, state_root, source_root, branch_name, updated_at FROM worktree_contexts";
 
 // Context-wide deletion, used by `1up gc --apply` to evict one worktree context from
 // the shared index. `segments` is deleted last of the data tables so its AFTER DELETE

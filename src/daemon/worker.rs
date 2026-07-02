@@ -3086,6 +3086,7 @@ mod tests {
             state_root: PathBuf::from(state_root),
             source_root: PathBuf::from(source_root),
             branch_name: None,
+            updated_at: "2026-01-01 00:00:00".to_string(),
         }
     }
 

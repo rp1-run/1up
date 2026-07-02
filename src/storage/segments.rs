@@ -1067,12 +1067,17 @@ pub async fn get_worktree_context_head_oid(
 /// One row from `worktree_contexts`: a context recorded in the shared index, with
 /// the worktree paths and branch that minted its `context_id`. Consumed by `1up gc`
 /// to classify stale branch snapshots and dead worktrees.
+///
+/// `updated_at` is the raw `datetime('now')` TEXT value (`YYYY-MM-DD HH:MM:SS`,
+/// UTC), bumped on every successful index run for this context; it is the
+/// keep-count/age signal for the `SupersededSameSource` retention policy.
 #[derive(Debug, Clone)]
 pub struct IndexedContextRow {
     pub context_id: String,
     pub state_root: PathBuf,
     pub source_root: PathBuf,
     pub branch_name: Option<String>,
+    pub updated_at: String,
 }
 
 /// List every worktree context recorded in the shared index.
@@ -1102,11 +1107,15 @@ pub async fn list_worktree_contexts(
         let branch_name: Option<String> = row
             .get(3)
             .map_err(|e| StorageError::Query(format!("read branch_name failed: {e}")))?;
+        let updated_at: String = row
+            .get(4)
+            .map_err(|e| StorageError::Query(format!("read updated_at failed: {e}")))?;
         contexts.push(IndexedContextRow {
             context_id,
             state_root: PathBuf::from(state_root),
             source_root: PathBuf::from(source_root),
             branch_name,
+            updated_at,
         });
     }
     Ok(contexts)

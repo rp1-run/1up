@@ -494,3 +494,20 @@ pub const UPDATE_ARTIFACT_HOST_ALLOWLIST: [&str; 3] = [
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
+
+/// PLACEHOLDER — conservative interim value, **not** a finalized product
+/// default. Number of most-recently-updated (`worktree_contexts.updated_at`)
+/// same-source contexts `1up gc`'s `SupersededSameSource` retention policy
+/// keeps regardless of age; only contexts beyond this rank (and past
+/// [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`]) are eligible for pruning.
+/// Governance constraint (full-scan-audit-fixes-warm-path-lifecycle REQ-003):
+/// numeric GC defaults must not be invented as final; this value is
+/// finalized at the planning gate.
+pub const GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT: usize = 3;
+
+/// PLACEHOLDER — conservative interim value, **not** a finalized product
+/// default. Minimum age in days a same-source context ranked beyond
+/// [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`] must reach (by
+/// `worktree_contexts.updated_at`) before `1up gc`'s `SupersededSameSource`
+/// retention policy considers it prunable. Finalized at the planning gate.
+pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
