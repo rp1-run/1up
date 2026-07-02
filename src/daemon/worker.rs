@@ -290,7 +290,8 @@ async fn run_inner() -> Result<(), OneupError> {
                     cancel_token.cancel();
                     break;
                 }
-                let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
+                let filtered =
+                    watcher::filter_changed_paths(&file_watcher, file_watcher.drain_events());
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
                 mark_branch_context_changes(&mut file_watcher, &mut projects);
                 if filtered.is_empty() {
@@ -1292,7 +1293,7 @@ async fn run_dirty_projects_until_clean(
 
         let result = run_project(&key, projects, cancel_token).await;
 
-        let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
+        let filtered = watcher::filter_changed_paths(watcher, watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
         if !filtered.is_empty() {
             debug!(
