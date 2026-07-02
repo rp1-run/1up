@@ -1638,7 +1638,10 @@ async fn handle_search_request(
         return search_service::unavailable_response();
     }
 
-    let search_scope = SearchScope::from_worktree_context(&state.context);
+    let mut search_scope = SearchScope::from_worktree_context(&state.context);
+    if let Some(prefix) = request.path_prefix.as_deref() {
+        search_scope = search_scope.with_path_prefix(prefix);
+    }
     // Stale-but-available: the daemon detects a rebuild/refresh from its own
     // in-memory refresh state (not the MCP out-of-process detector, so the
     // daemon keeps no dependency on the MCP layer). When a pass is in flight
@@ -2324,6 +2327,7 @@ mod tests {
                 context_id: "missing-context".to_string(),
                 query: "needle".to_string(),
                 limit: 3,
+                path_prefix: None,
             },
         )
         .await;

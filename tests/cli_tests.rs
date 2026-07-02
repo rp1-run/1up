@@ -1265,6 +1265,109 @@ fn search_keeps_stdout_clean_and_notices_on_stderr() {
     );
 }
 
+/// REQ-001 AC1-4: a `--path-prefix` on a daemon-backed CLI search must
+/// constrain results to that prefix end to end (CLI -> daemon `SearchRequest`
+/// -> `SearchScope`), and an unprefixed search must remain full-repo. Before
+/// the request-layer plumbing lands, `--path-prefix` is not a recognized flag
+/// at all, so this establishes the red baseline for T6's daemon-plumbing gap
+/// (the prefix would otherwise be silently dropped by the daemon path).
+#[cfg(unix)]
+#[test]
+fn search_path_prefix_scopes_daemon_backed_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(canonical_dir.join(".git")).unwrap();
+    // Force FTS-only so the run is deterministic and never blocks on a download.
+    seed_model_download_failure(&canonical_home);
+
+    let query = "prefix_scope_probe_token";
+    fs::create_dir_all(canonical_dir.join("included")).unwrap();
+    fs::create_dir_all(canonical_dir.join("other")).unwrap();
+    fs::write(
+        canonical_dir.join("included").join("a.rs"),
+        format!("pub fn {query}() -> u32 {{\n    1\n}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        canonical_dir.join("other").join("b.rs"),
+        format!("pub fn {query}() -> u32 {{\n    2\n}}\n"),
+    )
+    .unwrap();
+
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    let start = cmd_with_home(&canonical_home)
+        .args(["start", canonical_dir.to_str().unwrap(), "--plain"])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "start should succeed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    wait_for_search(&canonical_home, &canonical_dir, query, true);
+
+    let unscoped = cmd_with_home(&canonical_home)
+        .args([
+            "search",
+            query,
+            "-n",
+            "10",
+            "--path",
+            canonical_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        unscoped.status.success(),
+        "unscoped search should succeed: {}",
+        String::from_utf8_lossy(&unscoped.stderr)
+    );
+    let unscoped_stdout = String::from_utf8(unscoped.stdout).unwrap();
+    assert!(
+        unscoped_stdout.contains("included/a.rs") && unscoped_stdout.contains("other/b.rs"),
+        "no prefix supplied must leave full-repo search behavior unchanged (REQ-001 AC4); stdout={unscoped_stdout}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let scoped_stdout = loop {
+        let scoped = cmd_with_home(&canonical_home)
+            .args([
+                "search",
+                query,
+                "-n",
+                "10",
+                "--path",
+                canonical_dir.to_str().unwrap(),
+                "--path-prefix",
+                "included",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            scoped.status.success(),
+            "scoped search should succeed: {}",
+            String::from_utf8_lossy(&scoped.stderr)
+        );
+        let stdout = String::from_utf8(scoped.stdout).unwrap();
+        if stdout.contains("included/a.rs") {
+            break stdout;
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon-backed scoped search never returned the included file; stdout={stdout}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    assert!(
+        !scoped_stdout.contains("other/b.rs"),
+        "--path-prefix included must not leak results outside the prefix across the daemon path (REQ-001 AC1); stdout={scoped_stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn start_from_worktree_uses_main_state_and_indexes_worktree_source() {

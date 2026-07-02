@@ -740,9 +740,12 @@ pub async fn run_search(
     worktree_context: &WorktreeContext,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
-    retry_on_db_lock(|| async { run_search_once(state_root, worktree_context, query, limit).await })
-        .await
+    retry_on_db_lock(|| async {
+        run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+    })
+    .await
 }
 
 /// Process-global warm embedding runtime for the in-process MCP fallback search
@@ -767,9 +770,13 @@ async fn run_search_once(
     worktree_context: &WorktreeContext,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
     let current = open_current_index(state_root).await?;
-    let search_scope = SearchScope::from_worktree_context(worktree_context);
+    let mut search_scope = SearchScope::from_worktree_context(worktree_context);
+    if let Some(prefix) = path_prefix {
+        search_scope = search_scope.with_path_prefix(prefix);
+    }
 
     // Cheap vector-presence gate first: when the index holds no embeddings
     // for this context, the embedding model must never be initialized.
@@ -2144,7 +2151,7 @@ mod tests {
             branch_status: BranchStatus::Named,
         };
 
-        let payload = run_search(&root, &context, "vectorless_needle", 5)
+        let payload = run_search(&root, &context, "vectorless_needle", 5, None)
             .await
             .unwrap();
 
@@ -2157,6 +2164,74 @@ mod tests {
         assert!(
             !payload.results.is_empty(),
             "FTS-only search should still return lexical hits"
+        );
+    }
+
+    /// REQ-001 AC1/AC4: the `mcp::ops` construction site must inject
+    /// `path_prefix` into `SearchScope` so a scoped `oneup_search` never leaks
+    /// results outside the prefix, while an unscoped call keeps the full-repo
+    /// result set (mirrors the equivalent cli::search and daemon::worker
+    /// coverage for the other two request-layer construction sites).
+    #[tokio::test]
+    async fn run_search_with_path_prefix_scopes_to_prefix() {
+        let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
+        fs::create_dir_all(&temp_root).unwrap();
+        let temp = tempfile::tempdir_in(temp_root).unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "included/a.rs",
+            &[test_segment("probetokenonly_included", "included/a.rs")],
+        )
+        .await
+        .unwrap();
+        segments::replace_file_segments_for_context_tx(
+            &conn,
+            "ctx-active",
+            "other/b.rs",
+            &[test_segment("probetokenonly_other", "other/b.rs")],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let context = WorktreeContext {
+            context_id: "ctx-active".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        };
+
+        let scoped = run_search(&root, &context, "probetokenonly", 10, Some("included"))
+            .await
+            .unwrap();
+        let scoped_paths: Vec<_> = scoped.results.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(
+            scoped_paths,
+            vec!["included/a.rs".to_string()],
+            "path_prefix must constrain oneup_search results to the prefix"
+        );
+
+        let unscoped = run_search(&root, &context, "probetokenonly", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unscoped.results.len(),
+            2,
+            "no prefix supplied must leave full-repo search behavior unchanged (REQ-001 AC4)"
         );
     }
 

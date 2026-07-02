@@ -116,6 +116,7 @@ impl OneupMcpServer {
             &roots.worktree_context,
             &input.query,
             limit,
+            input.path_prefix.as_deref(),
         )
         .await
         {

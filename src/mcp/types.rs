@@ -63,6 +63,10 @@ pub struct SearchInput {
     pub query: String,
     pub limit: Option<usize>,
     pub path: Option<String>,
+    #[schemars(
+        description = "Optional repo-relative directory prefix (e.g. \"src/foo\") to constrain results to that subtree. Distinct from `path`, which selects the repository root."
+    )]
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

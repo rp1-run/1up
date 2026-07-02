@@ -33,10 +33,9 @@ impl SearchScope {
         &self.context_id
     }
 
-    /// Scopes retrieval to a repo-relative directory prefix (wired from the
-    /// request layer in T6). Leading/trailing slashes are trimmed; a prefix
-    /// that is empty after trimming clears scoping (full-repo, unchanged).
-    #[allow(dead_code)]
+    /// Scopes retrieval to a repo-relative directory prefix, wired from the
+    /// request layer (CLI/MCP/daemon). Leading/trailing slashes are trimmed; a
+    /// prefix that is empty after trimming clears scoping (full-repo, unchanged).
     pub fn with_path_prefix(mut self, prefix: impl Into<String>) -> Self {
         let trimmed = prefix.into();
         let trimmed = trimmed.trim_matches('/');
