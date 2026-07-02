@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{
-    self, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
+    self, clear_download_failure, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
 };
 use crate::indexer::pipeline;
 use crate::indexer::scan_filter::ScanFilter;
@@ -1177,6 +1177,12 @@ async fn run_index_pipeline(
     mut setup: SetupTimings,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let model_start = Instant::now();
+    // REQ-002: MCP `oneup_start` indexing (index-if-missing/index-if-needed/
+    // reindex) is an explicit, deliberate retry signal, so clear any prior
+    // download-failure marker before the model prepare's `is_download_failed()`
+    // guard runs. Passive search (cli/search.rs) never does this, so it stays
+    // FTS-only until an explicit index/reindex clears the marker.
+    clear_download_failure();
     let mut runtime = EmbeddingRuntime::default();
     runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, false)

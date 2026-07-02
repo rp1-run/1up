@@ -649,6 +649,23 @@ pub fn clear_download_failure() {
     }
 }
 
+/// Builds the recovery hint shown after a previously failed model download:
+/// the runtime-resolved per-platform marker path from
+/// [`download_failure_marker`] (never a hardcoded `~/.local/share/...`
+/// literal, which is wrong on macOS/Windows) plus the retry command. An
+/// explicit `1up index`/`reindex` (or MCP `oneup_start` indexing) clears the
+/// marker via [`clear_download_failure`] before re-attempting the download,
+/// so this always points at a working recovery path (REQ-002).
+pub(crate) fn download_failure_marker_hint() -> String {
+    match download_failure_marker() {
+        Ok(marker) => format!(
+            " (marker at {}). Run `1up index` to retry",
+            marker.display()
+        ),
+        Err(_) => ". Run `1up index` to retry".to_string(),
+    }
+}
+
 impl Embedder {
     /// Creates a new embedder, auto-downloading the model if it is not already present.
     ///
@@ -680,10 +697,10 @@ impl Embedder {
             Some(dir) => dir,
             None => {
                 if is_download_failed() {
-                    return Err(EmbeddingError::DownloadFailed(
-                        "previous download failed; delete the marker file at ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry"
-                            .to_string(),
-                    )
+                    return Err(EmbeddingError::DownloadFailed(format!(
+                        "previous download failed{}",
+                        download_failure_marker_hint()
+                    ))
                     .into());
                 }
 
@@ -1947,6 +1964,83 @@ mod tests {
 
         clear_download_failure();
         assert!(!is_download_failed());
+    }
+
+    #[test]
+    fn download_failure_marker_hint_uses_resolved_path_not_hardcoded_literal() {
+        // REQ-002: search.rs and the dead-code path in this file both delegate
+        // to this helper, so proving it here proves neither call site can
+        // regress to the hardcoded Linux-only `~/.local/share/...` literal
+        // (which is wrong on macOS/Windows).
+        let hint = download_failure_marker_hint();
+        let marker = download_failure_marker().unwrap();
+
+        assert!(
+            hint.contains(&marker.display().to_string()),
+            "hint must contain the runtime-resolved marker path, got: {hint}"
+        );
+        assert!(
+            !hint.contains("~/.local/share"),
+            "hint must not contain the hardcoded Linux marker literal, got: {hint}"
+        );
+        assert!(
+            hint.contains("Run `1up index` to retry"),
+            "hint must tell the user to retry via `1up index`, got: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn explicit_index_retry_clears_marker_before_download_failed_guard() {
+        // REQ-002: an explicit `1up index`/`reindex` (and MCP `oneup_start`
+        // indexing) calls `clear_download_failure()` before
+        // `prepare_for_indexing_with_progress`'s `is_download_failed()` guard,
+        // so a deliberate retry re-attempts the download instead of
+        // short-circuiting to the stale `PreviousDownloadFailed` status.
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let _data_root = DataRootGuard {
+            home: std::env::var_os("HOME"),
+            xdg_data: std::env::var_os("XDG_DATA_HOME"),
+        };
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", home.join("share"));
+        // Keep this test network-free: `model_downloads_disabled` is checked
+        // before any download I/O in `download_and_activate_verified_artifacts`,
+        // so the re-attempt fails closed locally instead of hitting the network.
+        std::env::set_var(DISABLE_MODEL_DOWNLOADS_ENV_VAR, "1");
+
+        mark_download_failed();
+        assert!(is_download_failed());
+
+        // Simulate the retry entry point (src/cli/index.rs, src/cli/reindex.rs,
+        // src/mcp/ops.rs): clear the marker before calling prepare.
+        clear_download_failure();
+        assert!(!is_download_failed());
+
+        let mut runtime = EmbeddingRuntime::default();
+        let status = runtime
+            .prepare_for_indexing_with_progress(1, false)
+            .await
+            .unwrap();
+        std::env::remove_var(DISABLE_MODEL_DOWNLOADS_ENV_VAR);
+
+        match status {
+            EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::DownloadFailed(err)) => {
+                assert!(
+                    err.contains("model auto-download disabled"),
+                    "expected the disabled-download error, got: {err}"
+                );
+            }
+            other => panic!(
+                "expected a re-attempted (and disabled) download after the marker was cleared, got {other:?}"
+            ),
+        }
     }
 
     #[test]
