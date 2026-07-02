@@ -17,16 +17,24 @@ pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// Effective maximum token length for the embedding model.
 ///
-/// This is the shipped tokenizer's real cap: `tokenizer.json` sets
-/// `truncation.max_length = 128` and `padding = {Fixed: 128}`, so every
-/// encoding is already truncated and padded to 128 tokens before inference. The
-/// embedder's explicit `enc.truncate(EMBEDDING_MAX_TOKENS)` is therefore a
-/// belt-and-suspenders no-op the tokenizer has already applied. This was
-/// historically 256, a value that never took effect (256 > 128) yet
-/// misrepresented the model window; correcting it to the real 128-token cap
-/// changes no produced vector (the truncate stays a no-op) and lets
-/// length-aware callers reason against the true window.
-pub const EMBEDDING_MAX_TOKENS: usize = 128;
+/// The shipped `tokenizer.json` hard-pins `truncation.max_length = 128` and
+/// `padding = {Fixed: 128}`, so setting this constant alone is a no-op — the
+/// file-baked 128 always wins. `Embedder::load_variant` therefore applies a
+/// programmatic `with_truncation`/`with_padding` override (raising both to
+/// `EMBEDDING_MAX_TOKENS`) right after `Tokenizer::from_file`, which is what
+/// actually widens the window; the shipped file is left untouched so its
+/// `TOKENIZER_SHA256` is unchanged (see `embedder.rs`, HYP-002). Padding must be
+/// overridden alongside truncation: `run_inference` copies `ids[0..max_len]`
+/// across a mixed-length sub-batch, so leaving padding at `Fixed(128)` while
+/// truncation allows 256-token rows would read past a short row's 128-wide id
+/// buffer and panic.
+///
+/// This widens the window on the v18 re-embed: content that previously lost its
+/// tail past 128 tokens now embeds up to 256. It rides the already-bumped
+/// (unreleased) `SCHEMA_VERSION = 18` migration, and `max_tokens` is folded into
+/// `embedding_content_key` so 128- and 256-window vectors can never mix in the
+/// content-addressed pool.
+pub const EMBEDDING_MAX_TOKENS: usize = 256;
 
 /// Chunk-segment languages excluded from embedding.
 ///

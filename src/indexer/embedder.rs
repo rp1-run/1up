@@ -764,9 +764,30 @@ impl Embedder {
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
+        let mut tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
             EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
         })?;
+
+        // Programmatically widen the tokenizer window to `EMBEDDING_MAX_TOKENS`
+        // (HYP-002). The shipped `tokenizer.json` hard-pins truncation and
+        // Fixed padding to 128, so the constant alone is a no-op; overriding
+        // here (rather than editing the file) keeps `TOKENIZER_SHA256`
+        // unchanged. Existing params are preserved and only the length fields
+        // are raised, so inputs of <=128 real tokens still tokenize to
+        // byte-identical ids/mask (existing vectors reproduce). Padding must be
+        // raised in lockstep with truncation: `run_inference` copies
+        // `ids[0..max_len]` uniformly across a mixed-length sub-batch, so a
+        // `Fixed(128)` pad width under a 256-token truncation would index past a
+        // short row's id buffer and panic.
+        let mut truncation = tokenizer.get_truncation().cloned().unwrap_or_default();
+        truncation.max_length = EMBEDDING_MAX_TOKENS;
+        tokenizer.with_truncation(Some(truncation)).map_err(|e| {
+            EmbeddingError::TokenizationFailed(format!("failed to set truncation: {e}"))
+        })?;
+
+        let mut padding = tokenizer.get_padding().cloned().unwrap_or_default();
+        padding.strategy = tokenizers::PaddingStrategy::Fixed(EMBEDDING_MAX_TOKENS);
+        tokenizer.with_padding(Some(padding));
 
         Ok(Self {
             session,
@@ -799,10 +820,11 @@ impl Embedder {
     /// Inputs are length-bucketed before inference (R-005): every input is
     /// tokenized once, the set is sorted by real (un-padded) token length, and
     /// equal-length-ish inputs are grouped into the configured-size sub-batches.
-    /// Because the shipped tokenizer pads to a fixed 128 tokens but `run_inference`
-    /// trims each sub-batch's tensor to its own longest *real* sequence, grouping
-    /// short inputs together shrinks that per-sub-batch width and cuts the padding
-    /// FLOPs a mixed-length batch would otherwise waste on a 128-wide tensor.
+    /// Because the tokenizer pads to a fixed `EMBEDDING_MAX_TOKENS` width but
+    /// `run_inference` trims each sub-batch's tensor to its own longest *real*
+    /// sequence, grouping short inputs together shrinks that per-sub-batch width
+    /// and cuts the padding FLOPs a mixed-length batch would otherwise waste on a
+    /// full-width tensor.
     /// Results are scattered back to the caller's original input order via the
     /// sort permutation, so the key->vector contract (`miss_inputs[i]` ->
     /// `vectors[i]`) is preserved. Per-input vectors are byte-identical to the
@@ -859,7 +881,7 @@ impl Embedder {
         let batch_size = encodings.len();
 
         // Trim the tensor to this sub-batch's longest *real* sequence rather than
-        // the tokenizer's fixed 128-token padding. Mean-pooling masks pad
+        // the tokenizer's fixed `EMBEDDING_MAX_TOKENS` padding. Mean-pooling masks pad
         // positions, so a narrower tensor yields byte-identical vectors while
         // skipping the wasted compute on trailing pads (R-005).
         let max_len = encodings.iter().map(real_token_len).max().unwrap_or(0);
@@ -966,10 +988,10 @@ impl Embedder {
 }
 
 /// Real (un-padded) token count of an encoding: the number of attention-mask
-/// positions set to 1. The shipped tokenizer pads to a fixed 128 tokens, so
-/// `get_ids().len()` is always 128; the attention mask is the only signal of how
-/// many tokens are real. Used for both length-bucketing and per-sub-batch tensor
-/// trimming.
+/// positions set to 1. The tokenizer pads to a fixed `EMBEDDING_MAX_TOKENS`
+/// width, so `get_ids().len()` is constant; the attention mask is the only
+/// signal of how many tokens are real. Used for both length-bucketing and
+/// per-sub-batch tensor trimming.
 fn real_token_len(enc: &Encoding) -> usize {
     enc.get_attention_mask().iter().filter(|&&m| m == 1).count()
 }
@@ -2495,6 +2517,57 @@ mod tests {
             (norm - 1.0).abs() < 1e-4,
             "L2 norm should be ~1.0, got {norm}"
         );
+    }
+
+    #[test]
+    fn tokenizer_window_widens_past_128_and_mixed_batch_is_safe() {
+        // T5/REQ-005: the programmatic tokenizer override must widen the
+        // effective window past the shipped 128-token pin (a long input yields
+        // real_token_len > 128, capped at EMBEDDING_MAX_TOKENS). Before the
+        // override this fails — the file-baked truncation caps every encoding
+        // at 128. Padding is raised in lockstep with truncation, so a
+        // mixed-length sub-batch (a >128-token row next to a short row) must
+        // embed without run_inference indexing past the short row's id buffer
+        // (HYP-002).
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
+
+        // ~400 space-separated words tokenize well past 256 wordpieces, so the
+        // truncation cap (not the input length) determines the token count.
+        let long_input = "alpha beta gamma delta epsilon zeta eta theta ".repeat(50);
+        let long_enc = embedder
+            .tokenizer
+            .encode(long_input.as_str(), true)
+            .unwrap();
+        let long_len = real_token_len(&long_enc);
+        assert!(
+            long_len > 128,
+            "override must widen the window past the shipped 128-token pin, got {long_len}"
+        );
+        assert!(
+            long_len <= EMBEDDING_MAX_TOKENS,
+            "the window must stay capped at EMBEDDING_MAX_TOKENS ({EMBEDDING_MAX_TOKENS}), got {long_len}"
+        );
+
+        // Mixed-length batch: a long (>128-token) input alongside a short one
+        // must embed without panicking and yield one unit vector per input.
+        let results = embedder
+            .embed_batch(&[long_input.as_str(), "short"])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for vec in &results {
+            assert_eq!(vec.len(), EMBEDDING_DIM);
+        }
     }
 
     #[test]
