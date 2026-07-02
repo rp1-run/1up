@@ -167,7 +167,8 @@ use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{
-    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
+    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
+    GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS, HF_MODEL_REPO,
     NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE,
     SECURE_STATE_FILE_MODE,
 };
@@ -1729,6 +1730,11 @@ pub async fn run_with_context_scope_setup_and_progress_root(
 /// repository HEAD. Recording failure is logged instead of failing the run:
 /// the index data is already committed and the recorded head is advisory
 /// freshness metadata.
+///
+/// Also runs the opt-in (default OFF) migration-time `SupersededSameSource`
+/// prune when [`config::migration_gc_prune_enabled`] reports the switch is on
+/// (REQ-003 Open Risks: automatic pruning on every index run is not a
+/// default-on behavior until the planning gate finalizes enablement).
 async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
     let project_id =
         crate::shared::project::read_project_id(&context.state_root).unwrap_or_default();
@@ -1736,6 +1742,136 @@ async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
         warn!(
             "failed to record indexed head for context {}: {err}",
             context.context_id
+        );
+    }
+
+    if config::migration_gc_prune_enabled() {
+        prune_superseded_same_source_contexts_on_migration(conn, context).await;
+    }
+}
+
+/// True when `updated_at` (`worktree_contexts.updated_at`, a `datetime('now')`
+/// TEXT value `YYYY-MM-DD HH:MM:SS`, UTC) is at least `min_age` old relative to
+/// `now`. Unparseable input degrades to `false`: a migration-time prune must
+/// never fire on ambiguous data. Duplicated in miniature from `cli::gc`'s
+/// helper of the same name — see the layering note on
+/// [`superseded_same_source_context_ids`] for why this cannot be shared
+/// directly.
+fn context_age_at_least(
+    updated_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    min_age: chrono::Duration,
+) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
+        Ok(parsed) => now - parsed.and_utc() >= min_age,
+        Err(_) => false,
+    }
+}
+
+/// Determine which recorded contexts qualify for the opt-in migration-time
+/// `SupersededSameSource` prune: same `source_root` as `active` but ranked
+/// beyond [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`] most-recently-updated
+/// same-source peers (active is always present in `contexts` and, having just
+/// been recorded, is typically the most recent) and older than
+/// [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`].
+///
+/// Deliberately narrower than `cli::gc`'s four-reason `prune_reason`
+/// classifier — this hook only ever evaluates `SupersededSameSource`, never
+/// `SourceMissing`/`StaleBranchSnapshot`/`NestedSubdirContext` (those stay a
+/// manual `1up gc` decision) — and deliberately does not call into
+/// `cli::gc::prune_reason` to get it: this crate's dependency direction is
+/// `cli`/`mcp` -> `search`/`indexer` -> `storage` -> `shared` (no cycles), and
+/// `daemon` already depends on `indexer::pipeline`, so `indexer` reaching back
+/// into `cli` or `daemon` here would invert that direction into a cycle. The
+/// small amount of duplicated policy logic (this function plus
+/// [`context_age_at_least`]) is the deliberate tradeoff (patterns.md: "prefer
+/// duplication over wrong abstraction"), mirroring the daemon's own
+/// self-contained `source_missing_context_ids` rather than reusing `cli::gc`.
+fn superseded_same_source_context_ids(
+    contexts: &[segments::IndexedContextRow],
+    active: &WorktreeContext,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut same_source: Vec<&segments::IndexedContextRow> = contexts
+        .iter()
+        .filter(|c| c.source_root == active.source_root)
+        .collect();
+    same_source.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.context_id.cmp(&b.context_id))
+    });
+
+    let max_age = chrono::Duration::days(GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS);
+    same_source
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, ctx)| {
+            let rank = index + 1;
+            // `state_root == active.state_root` (same worktree, a different
+            // branch's snapshot) is `StaleBranchSnapshot` territory in
+            // `cli::gc`'s classifier, not `SupersededSameSource` — that stays a
+            // manual `1up gc` decision, never auto-pruned by this opt-in hook.
+            let qualifies = ctx.context_id != active.context_id
+                && ctx.state_root != active.state_root
+                && rank > GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT
+                && context_age_at_least(&ctx.updated_at, now, max_age);
+            qualifies.then(|| ctx.context_id.clone())
+        })
+        .collect()
+}
+
+/// Opt-in migration-time counterpart to `1up gc --apply`'s `SupersededSameSource`
+/// enforcement, run once per successful index. Mirrors the daemon startup
+/// source-missing prune (`daemon::worker::prune_source_missing_contexts_on_startup`):
+/// deletes rows only, no inline `VACUUM` (full compaction stays exclusive to
+/// explicit `1up gc --apply` under the rebuild lock, so this never competes with
+/// concurrent searches — REQ-004), and every step is best-effort so a prune
+/// failure can never fail the index run that just succeeded.
+///
+/// Registry/daemon-status bookkeeping (which `1up gc --apply` and the daemon
+/// startup prune both perform) is intentionally not attempted here for the
+/// same layering reason documented on [`superseded_same_source_context_ids`]:
+/// `crate::cli::project_status_files` and `crate::daemon::registry` both sit
+/// above `indexer` in the dependency direction. A pruned context can briefly
+/// linger in the daemon status file or project registry until the next
+/// `1up gc` or daemon restart reconciles it; the index rows themselves — the
+/// actual reclaimed space — are gone immediately.
+async fn prune_superseded_same_source_contexts_on_migration(
+    conn: &Connection,
+    context: &WorktreeContext,
+) {
+    let contexts = match segments::list_worktree_contexts(conn).await {
+        Ok(contexts) => contexts,
+        Err(err) => {
+            warn!(
+                "failed to list worktree contexts for migration-time prune of {}: {err}",
+                context.context_id
+            );
+            return;
+        }
+    };
+
+    let pruned = superseded_same_source_context_ids(&contexts, context, chrono::Utc::now());
+    if pruned.is_empty() {
+        return;
+    }
+
+    let mut removed = Vec::with_capacity(pruned.len());
+    for context_id in &pruned {
+        match segments::delete_context(conn, context_id).await {
+            Ok(_) => removed.push(context_id.as_str()),
+            Err(err) => warn!(
+                "failed to prune superseded-same-source context {context_id} at migration time: {err}"
+            ),
+        }
+    }
+    if !removed.is_empty() {
+        info!(
+            "migration-time prune removed {} superseded-same-source context(s) for {}: {}",
+            removed.len(),
+            context.source_root.display(),
+            removed.join(", ")
         );
     }
 }
@@ -2358,6 +2494,178 @@ mod tests {
             moved.head_oid,
             "a later run must replace the recorded head OID"
         );
+    }
+
+    /// Inserts a `worktree_contexts` row with an explicit `updated_at`,
+    /// bypassing `upsert_worktree_context`'s `datetime('now')` default so tests
+    /// can seed contexts of a specific age for the `SupersededSameSource`
+    /// keep-count/age policy.
+    async fn seed_worktree_context_row(
+        conn: &Connection,
+        context_id: &str,
+        source_root: &Path,
+        state_root: &Path,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO worktree_contexts (\
+                context_id, project_id, state_root, source_root, main_worktree_root, \
+                worktree_role, branch_name, branch_ref, branch_status, head_oid, \
+                git_dir, common_git_dir, updated_at\
+            ) VALUES (?1, 'migration-hook-proj', ?2, ?3, ?3, 'main', NULL, NULL, 'unknown', NULL, NULL, NULL, ?4)",
+            libsql::params![
+                context_id.to_string(),
+                state_root.to_string_lossy().into_owned(),
+                source_root.to_string_lossy().into_owned(),
+                updated_at.to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Seeds two recent (within-keep_count) and one aged, beyond-keep_count
+    /// same-source peer under fabricated `state_root`s, so the active
+    /// context recorded by the run under test ranks 1st and the aged peer
+    /// ranks 4th (beyond `GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT` = 3).
+    async fn seed_superseded_same_source_candidate(conn: &Connection, source_root: &Path) {
+        for id in ["kept-1", "kept-2"] {
+            seed_worktree_context_row(
+                conn,
+                id,
+                source_root,
+                Path::new("/other-state"),
+                "2026-06-25 00:00:00",
+            )
+            .await;
+        }
+        seed_worktree_context_row(
+            conn,
+            "superseded-1",
+            source_root,
+            Path::new("/other-state-old"),
+            "2026-01-01 00:00:00",
+        )
+        .await;
+    }
+
+    /// REQ-003/T4 AC: the opt-in migration-time `SupersededSameSource` prune
+    /// must never fire while [`GC_MIGRATION_PRUNE_ENV_VAR`] is unset (default
+    /// OFF) — a context that would otherwise qualify stays recorded.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn migration_time_prune_is_disabled_by_default() {
+        use crate::shared::constants::GC_MIGRATION_PRUNE_ENV_VAR;
+
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let saved = std::env::var_os(GC_MIGRATION_PRUNE_ENV_VAR);
+        std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR);
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        seed_superseded_same_source_candidate(&conn, tmp.path()).await;
+
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-active", "main");
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let remaining: std::collections::HashSet<String> = segments::list_worktree_contexts(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.context_id)
+            .collect();
+        assert!(
+            remaining.contains("superseded-1"),
+            "the switch is OFF by default, so a qualifying context must not be pruned at migration time"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, v),
+            None => std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR),
+        }
+    }
+
+    /// REQ-003/T4 AC: enabling [`GC_MIGRATION_PRUNE_ENV_VAR`] prunes
+    /// `SupersededSameSource` contexts at migration time via `delete_context`,
+    /// with no inline VACUUM — rows beyond the keep-count/age policy are gone,
+    /// contexts within the policy (and the active context) survive.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn migration_time_prune_removes_superseded_same_source_contexts_when_enabled() {
+        use crate::shared::constants::GC_MIGRATION_PRUNE_ENV_VAR;
+
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let saved = std::env::var_os(GC_MIGRATION_PRUNE_ENV_VAR);
+        std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, "1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        seed_superseded_same_source_candidate(&conn, tmp.path()).await;
+
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-active", "main");
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let remaining: std::collections::HashSet<String> = segments::list_worktree_contexts(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.context_id)
+            .collect();
+        assert!(
+            remaining.contains("ctx-active"),
+            "the active context must survive"
+        );
+        assert!(
+            remaining.contains("kept-1") && remaining.contains("kept-2"),
+            "within-keep_count same-source peers must survive"
+        );
+        assert!(
+            !remaining.contains("superseded-1"),
+            "beyond-keep_count, aged same-source peer must be pruned once the switch is enabled"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, v),
+            None => std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR),
+        }
     }
 
     #[tokio::test]

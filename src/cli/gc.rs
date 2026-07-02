@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -83,17 +83,13 @@ impl PruneReason {
 /// PLACEHOLDER-conservative: sourced from [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`]
 /// and [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`], both explicitly flagged as
 /// interim values pending planning-gate finalization, not invented final
-/// defaults. Evaluating this policy never mutates the index by itself —
-/// enforcing it against `1up gc --apply`'s real candidate set (T4) and gating
-/// automatic migration-time pruning behind a default-OFF opt-in switch (T4)
-/// are separate, not-yet-wired concerns.
-#[allow(dead_code)]
+/// defaults. Enforced against `1up gc --apply`'s real candidate set via
+/// [`same_source_recency_ranks`] in `exec()`'s classification pass.
 struct RetentionPolicy {
     keep_count: usize,
     max_age: Duration,
 }
 
-#[allow(dead_code)]
 impl Default for RetentionPolicy {
     fn default() -> Self {
         RetentionPolicy {
@@ -109,12 +105,9 @@ impl Default for RetentionPolicy {
 /// reference time used to compute age from `updated_at`.
 ///
 /// A `prune_reason` call passing `None` here means the policy is not
-/// evaluated for that call, so `SupersededSameSource` never fires — this is
-/// the current behavior of `1up gc`'s own candidate-collection loop, since
-/// computing a real same-source recency rank across all candidates and
-/// enforcing the policy is `gc --apply`'s policy-enforcement concern, not
-/// this primitive's.
-#[allow(dead_code)]
+/// evaluated for that call, so `SupersededSameSource` never fires. `exec()`'s
+/// classification pass always supplies `Some` for candidates sharing the
+/// active `source_root`, computed via [`same_source_recency_ranks`].
 struct SupersededSameSourceContext<'a> {
     policy: &'a RetentionPolicy,
     rank_among_same_source: usize,
@@ -126,7 +119,6 @@ struct SupersededSameSourceContext<'a> {
 /// least `min_age` old relative to `now`. Unparseable input degrades to
 /// `false` (not old enough): a retention decision must never prune on
 /// ambiguous data.
-#[allow(dead_code)]
 fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Duration) -> bool {
     match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
         Ok(parsed) => now - parsed.and_utc() >= min_age,
@@ -194,6 +186,35 @@ fn is_strict_descendant(descendant: &Path, ancestor: &Path) -> bool {
     descendant != ancestor && descendant.starts_with(ancestor)
 }
 
+/// 1-based recency rank (1 = most-recently-updated) of every recorded context
+/// whose `source_root` matches `source_root`, keyed by `context_id`. The active
+/// context is included in the ranked set — it is always present in `contexts`
+/// and is typically the most recent after a fresh index run — so `keep_count`
+/// naturally counts it as one of the retained peers. Ties in `updated_at` break
+/// by `context_id` for a deterministic order. Contexts with a different
+/// `source_root` are absent from the returned map entirely, matching
+/// `prune_reason`'s gate (the policy only ever evaluates same-source
+/// candidates).
+fn same_source_recency_ranks(
+    contexts: &[IndexedContextRow],
+    source_root: &Path,
+) -> HashMap<String, usize> {
+    let mut same_source: Vec<&IndexedContextRow> = contexts
+        .iter()
+        .filter(|c| c.source_root == source_root)
+        .collect();
+    same_source.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.context_id.cmp(&b.context_id))
+    });
+    same_source
+        .into_iter()
+        .enumerate()
+        .map(|(index, ctx)| (ctx.context_id.clone(), index + 1))
+        .collect()
+}
+
 /// A context selected for pruning, plus the segment count that quantifies its cost.
 struct GcCandidate {
     context_id: String,
@@ -246,15 +267,29 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
             let dot_git = p.join(".git");
             dot_git.is_dir() || dot_git.is_file()
         };
+        // `SupersededSameSource` enforcement against the real candidate set: rank
+        // every same-source context by recency once, then gate each candidate's
+        // reason lookup with the shared policy default.
+        let retention_policy = RetentionPolicy::default();
+        let same_source_ranks = same_source_recency_ranks(&contexts, &active.source_root);
+        let now = Utc::now();
         let mut candidates = Vec::new();
         for ctx in &contexts {
-            // `retention: None` — SupersededSameSource enforcement against the real
-            // candidate set (recency ranking + the opt-in switch) is a separate,
-            // not-yet-wired policy-enforcement concern; this loop only detects the
-            // three unconditional reasons.
-            if let Some(reason) =
-                prune_reason(&active, ctx, None, &|p: &Path| p.exists(), &is_git_root)
-            {
+            let retention =
+                same_source_ranks
+                    .get(&ctx.context_id)
+                    .map(|&rank| SupersededSameSourceContext {
+                        policy: &retention_policy,
+                        rank_among_same_source: rank,
+                        now,
+                    });
+            if let Some(reason) = prune_reason(
+                &active,
+                ctx,
+                retention.as_ref(),
+                &|p: &Path| p.exists(),
+                &is_git_root,
+            ) {
                 let segments = segments::count_segments_for_context(&conn, &ctx.context_id).await?;
                 candidates.push(GcCandidate {
                     context_id: ctx.context_id.clone(),
@@ -787,5 +822,297 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn same_source_recency_ranks_orders_by_updated_at_descending() {
+        let contexts = vec![
+            row_updated_at("a", "/state-a", "/repo", "2026-01-01 00:00:00"),
+            row_updated_at("b", "/state-b", "/repo", "2026-03-01 00:00:00"),
+            row_updated_at("c", "/state-c", "/repo", "2026-02-01 00:00:00"),
+            row_updated_at("other", "/state-d", "/other-repo", "2026-06-01 00:00:00"),
+        ];
+        let ranks = same_source_recency_ranks(&contexts, Path::new("/repo"));
+        assert_eq!(
+            ranks.get("b"),
+            Some(&1),
+            "most-recently-updated ranks first"
+        );
+        assert_eq!(ranks.get("c"), Some(&2));
+        assert_eq!(
+            ranks.get("a"),
+            Some(&3),
+            "oldest same-source peer ranks last"
+        );
+        assert_eq!(
+            ranks.get("other"),
+            None,
+            "a different source_root is excluded from the ranked set entirely"
+        );
+    }
+
+    /// Restores `HOME`/`XDG_DATA_HOME` on drop — even if an assertion panics — so a
+    /// redirected data root never leaks into other tests in this binary. Mirrors
+    /// `indexer::embedder`'s `DataRootGuard`.
+    struct DataRootGuard {
+        home: Option<std::ffi::OsString>,
+        xdg_data: Option<std::ffi::OsString>,
+    }
+
+    impl DataRootGuard {
+        fn redirect_to(dir: &Path) -> Self {
+            let guard = DataRootGuard {
+                home: std::env::var_os("HOME"),
+                xdg_data: std::env::var_os("XDG_DATA_HOME"),
+            };
+            std::env::set_var("HOME", dir);
+            std::env::set_var("XDG_DATA_HOME", dir.join(".local").join("share"));
+            guard
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            fn restore(key: &str, value: Option<std::ffi::OsString>) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            restore("HOME", self.home.take());
+            restore("XDG_DATA_HOME", self.xdg_data.take());
+        }
+    }
+
+    /// Inserts a `worktree_contexts` row with an explicit `updated_at`, bypassing
+    /// `upsert_worktree_context`'s `datetime('now')` default so tests can seed
+    /// contexts of a specific age for the `SupersededSameSource` keep-count/age
+    /// policy.
+    async fn insert_worktree_context_row(
+        conn: &libsql::Connection,
+        context_id: &str,
+        source_root: &Path,
+        state_root: &Path,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO worktree_contexts (\
+                context_id, project_id, state_root, source_root, main_worktree_root, \
+                worktree_role, branch_name, branch_ref, branch_status, head_oid, \
+                git_dir, common_git_dir, updated_at\
+            ) VALUES (?1, 'gc-t4-proj', ?2, ?3, ?3, 'main', NULL, NULL, 'unknown', NULL, NULL, NULL, ?4)",
+            libsql::params![
+                context_id.to_string(),
+                state_root.to_string_lossy().into_owned(),
+                source_root.to_string_lossy().into_owned(),
+                updated_at.to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Integration test (REQ-003/T4): `1up gc --apply` must enforce the
+    /// `SupersededSameSource` policy against its real candidate set — recency
+    /// rank computed over every recorded context, not the always-`None`
+    /// retention gate this loop used before T4 — then delete the qualifying
+    /// rows via `delete_context` and VACUUM.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gc_apply_prunes_superseded_same_source_contexts_beyond_policy_and_vacuums() {
+        use crate::storage::db::Db;
+        use crate::storage::schema;
+        use crate::storage::segments::{IndexedFileMeta, SegmentInsert};
+
+        // Every test in this binary that mutates HOME/XDG_DATA_HOME (`dirs::*`
+        // reads them at call time) must serialize on this crate-wide lock, or a
+        // concurrent mutation in another module corrupts this test's resolved
+        // registry/data paths.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _data_root_guard = DataRootGuard::redirect_to(home.path());
+
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        std::fs::create_dir_all(project_root.join(".1up")).unwrap();
+        let db_path = project_root.join(".1up").join("index.db");
+
+        // Resolve what `exec()` will independently compute as the active
+        // context, so seeded rows share its real `source_root`/`context_id`.
+        let active = resolve_project_root(&project_root)
+            .unwrap()
+            .worktree_context;
+
+        let shared_key = "gc-t4-shared-key".to_string();
+        let shared_vector = serde_json::to_string(&vec![0.1_f32; 384]).unwrap();
+        let segment_for = |context_id: &str| SegmentInsert {
+            id: format!("{context_id}-seg"),
+            file_path: format!("{context_id}.rs"),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: format!("pub fn {context_id}() {{}}\n"),
+            line_start: 1,
+            line_end: 1,
+            content_key: Some(shared_key.clone()),
+            embedding_vec: Some(shared_vector.clone()),
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: format!("[\"{context_id}\"]"),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("{context_id}-hash"),
+        };
+        let meta_for = |context_id: &str| IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: format!("{context_id}-hash"),
+            file_size: 32,
+            modified_ns: 1,
+        };
+
+        {
+            let db = Db::open_rw(&db_path).await.unwrap();
+            let conn = db.connect().unwrap();
+            schema::initialize(&conn).await.unwrap();
+
+            // Active context, recorded via the real upsert path (updated_at =
+            // now), making it the most-recently-updated same-source peer.
+            segments::upsert_worktree_context(&conn, &active, "gc-t4-proj")
+                .await
+                .unwrap();
+            crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                &conn,
+                &active.context_id,
+                &format!("{}.rs", active.context_id),
+                &[segment_for(&active.context_id)],
+                Some(&meta_for(&active.context_id)),
+            )
+            .await
+            .unwrap();
+
+            // Two same-source peers under fabricated `state_root`s, within the
+            // keep_count = 3 top-ranked slots (active + these two = 3 total):
+            // kept regardless of age.
+            for id in ["kept-1", "kept-2"] {
+                insert_worktree_context_row(
+                    &conn,
+                    id,
+                    &active.source_root,
+                    Path::new("/other-state"),
+                    "2026-06-25 00:00:00",
+                )
+                .await;
+                crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                    &conn,
+                    id,
+                    &format!("{id}.rs"),
+                    &[segment_for(id)],
+                    Some(&meta_for(id)),
+                )
+                .await
+                .unwrap();
+            }
+
+            // A fourth same-source peer: ranked beyond keep_count and older than
+            // GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS — the one candidate that
+            // must be pruned by the SupersededSameSource policy.
+            insert_worktree_context_row(
+                &conn,
+                "superseded-1",
+                &active.source_root,
+                Path::new("/other-state-old"),
+                "2026-01-01 00:00:00",
+            )
+            .await;
+            crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                &conn,
+                "superseded-1",
+                "superseded-1.rs",
+                &[segment_for("superseded-1")],
+                Some(&meta_for("superseded-1")),
+            )
+            .await
+            .unwrap();
+
+            let mut rows = conn
+                .query(
+                    "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+                    [shared_key.as_str()],
+                )
+                .await
+                .unwrap();
+            let ref_count_before: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                ref_count_before, 4,
+                "all four seeded segments must share one pooled embedding"
+            );
+        }
+
+        let args = GcArgs {
+            path: project_root.to_string_lossy().into_owned(),
+            apply: true,
+            no_vacuum: false,
+            format: None,
+        };
+        exec(args, OutputFormat::Json)
+            .await
+            .expect("gc --apply must succeed");
+
+        let db = Db::open_ro(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        let remaining = segments::list_worktree_contexts(&conn).await.unwrap();
+        let remaining_ids: HashSet<String> =
+            remaining.iter().map(|c| c.context_id.clone()).collect();
+        assert!(
+            remaining_ids.contains(&active.context_id),
+            "active context must survive"
+        );
+        assert!(
+            remaining_ids.contains("kept-1"),
+            "within-keep_count same-source peer must survive"
+        );
+        assert!(
+            remaining_ids.contains("kept-2"),
+            "within-keep_count same-source peer must survive"
+        );
+        assert!(
+            !remaining_ids.contains("superseded-1"),
+            "beyond-keep_count, aged same-source peer must be pruned by gc --apply"
+        );
+
+        // Row/refcount assertions on `delete_context`: the pruned context's
+        // segment is gone, and the shared pooled embedding's ref_count drops by
+        // exactly one (still referenced by the three survivors) rather than
+        // being reclaimed outright.
+        assert_eq!(
+            segments::count_segments_for_context(&conn, "superseded-1")
+                .await
+                .unwrap(),
+            0
+        );
+        let mut rows = conn
+            .query(
+                "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+                [shared_key.as_str()],
+            )
+            .await
+            .unwrap();
+        let ref_count_after: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            ref_count_after, 3,
+            "delete_context must decrement, not zero out, a still-referenced pooled embedding"
+        );
+
+        // `runs vacuum_database`: a successful VACUUM compacts away every freed
+        // page, so the freelist floor is back to zero after the apply.
+        assert_eq!(
+            segments::freelist_reclaimable_bytes(&conn).await.unwrap(),
+            0,
+            "gc --apply must VACUUM after pruning, leaving no freed-but-unreturned pages"
+        );
     }
 }

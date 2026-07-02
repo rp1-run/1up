@@ -523,3 +523,13 @@ pub const GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT: usize = 3;
 /// `worktree_contexts.updated_at`) before `1up gc`'s `SupersededSameSource`
 /// retention policy considers it prunable. Finalized at the planning gate.
 pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
+
+/// Env var name for the opt-in (default OFF) switch enabling automatic
+/// `SupersededSameSource` context pruning at migration time
+/// (`indexer::pipeline::record_indexed_head`). Unset, empty, or `"0"` disables
+/// it (default); any other value enables it. Governance constraint
+/// (full-scan-audit-fixes-warm-path-lifecycle REQ-003 Open Risks): automatic
+/// pruning on every index run is not a default-on behavior until the planning
+/// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
+/// switch either way.
+pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
