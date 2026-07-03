@@ -62,9 +62,12 @@ eval-summary:
 # MODEL-ENABLED: never run in-agent (it hangs); manual/scheduled DoD only.
 # `reindex` (not `index`) is used so the model-identity gate cannot fail closed
 # on a stale index. Writes evals/suites/1up-search/recall-results.json.
+# The harness's own output artifacts (recall-*.json) are excluded from the
+# index: they are rewritten between runs, and indexing them perturbs the
+# corpus enough to flap the gate (observed: +1 segment -> -2.2pp recall@20).
 eval-recall:
     cargo build --bin 1up
-    ./target/debug/1up reindex .
+    ./target/debug/1up reindex . --exclude-glob 'evals/suites/1up-search/recall-*.json'
     @cd evals && ONEUP_BENCH_BIN="$PWD/../target/debug/1up" bun run suites/1up-search/recall.ts
 
 # Capture (move) the pinned recall baseline from a fresh run, with metadata.
@@ -73,7 +76,7 @@ eval-recall:
 # manual DoD only, never in-agent.
 eval-recall-baseline:
     cargo build --bin 1up
-    ./target/debug/1up reindex .
+    ./target/debug/1up reindex . --exclude-glob 'evals/suites/1up-search/recall-*.json'
     @cd evals && RECALL_CAPTURE_BASELINE=1 ONEUP_BENCH_BIN="$PWD/../target/debug/1up" bun run suites/1up-search/recall.ts
 
 # A/B recall parity: reindex + score the fp32 leg (captured as a temp baseline),
@@ -93,13 +96,13 @@ eval-recall-ab:
     trap 'rm -f "$AB_BASELINE"' EXIT
     echo "== A/B leg 1: fp32 =="
     "$BIN" stop . || true
-    ONEUP_MODEL_VARIANT=fp32 "$BIN" reindex .
+    ONEUP_MODEL_VARIANT=fp32 "$BIN" reindex . --exclude-glob 'evals/suites/1up-search/recall-*.json'
     (cd evals && RECALL_CAPTURE_BASELINE=1 ONEUP_MODEL_VARIANT=fp32 \
         ONEUP_RECALL_BASELINE_PATH="$AB_BASELINE" \
         ONEUP_BENCH_BIN="$BIN" bun run suites/1up-search/recall.ts)
     echo "== A/B leg 2: int8 (gated vs fp32 within tolerance) =="
     "$BIN" stop . || true
-    ONEUP_MODEL_VARIANT=int8 "$BIN" reindex .
+    ONEUP_MODEL_VARIANT=int8 "$BIN" reindex . --exclude-glob 'evals/suites/1up-search/recall-*.json'
     (cd evals && ONEUP_RECALL_AB=1 ONEUP_MODEL_VARIANT=int8 \
         ONEUP_RECALL_BASELINE_PATH="$AB_BASELINE" \
         ONEUP_BENCH_BIN="$BIN" bun run suites/1up-search/recall.ts)

@@ -1,18 +1,28 @@
 {
-  "schema_version": null,
+  "schema_version": 18,
+  "vector_rows": 5300,
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2@int8",
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2@int8",
+  "max_tokens": null,
   "target_repo": "/Users/prem/Development/1up",
   "binary": "/Users/prem/Development/1up/target/debug/1up",
-  "captured_at": "2026-04-19T05:07:47.575Z",
+  "captured_at": "2026-07-03T03:52:44.116Z",
   "corpus_size": 15,
+  "corpus": {
+    "size": 15,
+    "sha256": "46800759ee4a0c896c17c2d769d414ff6194176c5f363bacef2244253dc3283d"
+  },
   "corpus_match_mode_counts": {
     "anchor": 15,
     "segment_id": 0,
     "none": 0
   },
+  "recall_at_10": 0.31666666666666665,
+  "recall_at_20": 0.3722222222222222,
   "reports": [
     {
       "k": 10,
-      "recall": 0.4611111111111111,
+      "recall": 0.31666666666666665,
       "scored_queries": 15,
       "total_queries": 15,
       "per_query": [
@@ -22,50 +32,55 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "d011c8a92915",
+              "segment_id": "78453b113740",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "841b14e0056a",
+              "segment_id": "d226589a9b67",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "76cf30b9becc",
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "7e1ac92e0377",
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "446e4bf503b1",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "836d57ba7fec",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c0",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "8ed86bd5de04",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "076945e5e1c3",
-              "file_path": "src/shared/errors.rs"
+              "segment_id": "0c84f3e9af87",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "4f0d8b58b9ce",
-              "file_path": "src/shared/update.rs"
-            },
-            {
-              "segment_id": "0ca26bf20131",
-              "file_path": "src/shared/update.rs"
+              "segment_id": "020379493780",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 2],
-          "hit_count": 2,
-          "recall": 0.6666666666666666
+          "matched_indices": [
+            0,
+            1,
+            2
+          ],
+          "hit_count": 3,
+          "recall": 1
         },
         {
           "query": "hybrid search combining vector and full-text retrieval",
@@ -73,52 +88,54 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f3769f012e9b",
+              "segment_id": "974286d29ae0",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
+            },
+            {
+              "segment_id": "4d7ff809285c",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
+            },
+            {
+              "segment_id": "208badb33334",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "7d89ffde1e38",
+              "file_path": "src/search/retrieval.rs",
+              "breadcrumb": "SqlVectorV2<'a>"
+            },
+            {
+              "segment_id": "3dc7a79333d1",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "cb2cb8e9516f",
+              "segment_id": "a763a8b05588",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "RetrievalBackend<'a>"
             },
             {
-              "segment_id": "dd69682e2259",
-              "file_path": "src/search/hybrid.rs"
+              "segment_id": "e537654ce0ca",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "b8bc560fffde",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "FtsOnly<'a>"
+              "segment_id": "5ad5c649593c",
+              "file_path": "src/cli/search.rs"
             },
             {
-              "segment_id": "dcc0fe34c1f1",
-              "file_path": "src/search/hybrid.rs"
+              "segment_id": "b97927e80cfe",
+              "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "9f6a38b1b371",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "3b4fe06cdf6c",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "cc2a910dbcaf",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "0ed3cbcc8113",
-              "file_path": "src/search/hybrid.rs"
-            },
-            {
-              "segment_id": "fce8611d9139",
-              "file_path": "src/search/ranking.rs"
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 2],
-          "hit_count": 3,
-          "recall": 0.75
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "batch insert vectors into segment_vectors table",
@@ -126,50 +143,53 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e0e25f6beafb",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "e6ad0151c7fa",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "be82820acff2",
+              "segment_id": "d8057693c232",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5bcd6303180f",
+              "segment_id": "a9c7ac1bfa8d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "3722a5b72b55",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "62a6b06d1554",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d80410c6445d",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "ae1e8edf8e52",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "39d78a1ed1d1",
-              "file_path": "src/search/retrieval.rs",
+              "segment_id": "d452f50c8a06",
+              "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbe",
+              "segment_id": "d0b645c9c860",
+              "file_path": "src/search/overview.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "945ef5d4421d",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "cfa5646d960b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "e0bfc34db24b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "b4e244411310",
               "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "71a781d5925d",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "f705c1a58623",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1],
+          "matched_indices": [
+            0,
+            1
+          ],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -179,52 +199,50 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e4f7da9830a3",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "0ba79a0400f3",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "97f90c9e6f6c",
+              "segment_id": "ae35d20feace",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "538b2280afd9",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9779b23d917b",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "cc2a910dbcaf",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "9a4ea46c811f",
+              "segment_id": "b97927e80cfe",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "f566ad54d515",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "23c9c5f85405",
-              "file_path": "src/search/ranking.rs",
-              "breadcrumb": "tests"
+              "segment_id": "208badb33334",
+              "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9f6a38b1b371",
-              "file_path": "benches/search_bench.rs"
+              "segment_id": "34437f7eaeb1",
+              "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "09738eb7df4e",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "tests"
+              "segment_id": "d3bef2d94078",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "8bc7a8f97b26",
-              "file_path": "src/search/impact.rs"
+              "segment_id": "32aa7bb2a10a",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [1],
-          "hit_count": 1,
-          "recall": 0.3333333333333333
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "libsql vector index DDL using libsql_vector_idx",
@@ -232,44 +250,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "6d9f74cc76fa",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "f3769f012e9b",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "841b14e0056a",
+              "segment_id": "460850f75ddb",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "072fbae0c631",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "3f47fdcfe67a",
+              "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "b4b6c6185fb9",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
             },
             {
-              "segment_id": "9a4ea46c811f",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "5c27a15cbb5b",
+              "segment_id": "0ba79a0400f3",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "1ed80e3e5f66",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "ae35d20feace",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "264a58c9c46e",
+              "segment_id": "945ef5d4421d",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "370af89c2f2b",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5cd7bd8c161f",
-              "file_path": "src/storage/db.rs"
+              "segment_id": "8d41f37dd80f",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "b97927e80cfe",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 2,
@@ -283,55 +302,52 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "8049f2946f34",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "5c0289cf6809",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "e5782e135c57",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "d25734271d22",
+              "segment_id": "30dd9fc22b34",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "460850f75ddb",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "2bd9c8d67316",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "446e4bf503b1",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "4821aaec0bfa",
+              "file_path": "tests/cli_tests.rs"
+            },
+            {
+              "segment_id": "e7e976a5c832",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "752b2f98f417",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "bb7841790131",
               "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "76cf30b9becc",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "883b458ef54a",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "c9854e0f32c0",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "2272522c3b6e",
-              "file_path": "src/shared/update.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "e42cdfa38591",
-              "file_path": "src/shared/update.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1],
-          "hit_count": 2,
-          "recall": 0.6666666666666666
+          "matched_indices": [
+            0
+          ],
+          "hit_count": 1,
+          "recall": 0.3333333333333333
         },
         {
           "query": "ONNX embedder producing 384-dimensional float32 vectors",
@@ -339,50 +355,50 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "7fcb139f87ff",
+              "segment_id": "e2ca63500eb0",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "5bcd6303180f",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "7a90fc8fb82e",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "59603cddb1cb",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "98f6a6ee88d4",
+              "segment_id": "ad45e94f8d04",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "bf61430a2138",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "3f2b6819af9e",
+              "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "0397aed30272",
+              "segment_id": "b743efea1fa3",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "d80410c6445d",
-              "file_path": "src/storage/schema.rs"
+              "segment_id": "47629ea6b47e",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "a0b35e0ca120",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
+              "segment_id": "eb3a076d6e17",
+              "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "be82820acff2",
+              "segment_id": "7274554bd809",
+              "file_path": "src/shared/constants.rs"
+            },
+            {
+              "segment_id": "d8057693c232",
               "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b4e244411310",
+              "file_path": "src/indexer/pipeline.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0],
+          "matched_indices": [
+            0
+          ],
           "hit_count": 1,
           "recall": 0.3333333333333333
         },
@@ -392,51 +408,54 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f19435271bcc",
+              "segment_id": "86ddd0ff8171",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "3620c9fb3092",
+              "segment_id": "76c2b19af92c",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "da8caf9b4722",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "3ee614965158",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "12a00e880933",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b20dbe3a90f7",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "2ac86536a72b",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "b149994b43d9",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "5c7bd94e3b03",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "c4d918cc24ad",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "b6bc5cb5a769",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "d13c50be90fa",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "VerifiedArtifactManifest"
-            },
-            {
-              "segment_id": "9c02990f9ea2",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "b9b86875b68d",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "4d8f7e5659ec",
+              "segment_id": "17ddcf240725",
               "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "0da186c7a0cf",
+              "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "07deb80e682d",
+              "file_path": "src/indexer/embedder.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 3],
-          "hit_count": 3,
-          "recall": 0.75
+          "matched_indices": [
+            0,
+            3
+          ],
+          "hit_count": 2,
+          "recall": 0.5
         },
         {
           "query": "deterministic segment identifier generation",
@@ -444,55 +463,51 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "a521511b1b9e",
+              "segment_id": "f5cfa941d97b",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "b51ed36327be",
+              "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "e7e0bd802cc0",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "5d8b7987bcd3",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "b8f4415e4ffe",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbe",
-              "file_path": "src/indexer/pipeline.rs"
+              "segment_id": "11a7eb8c1fa0",
+              "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "096ebba51854",
-              "file_path": "src/search/impact.rs"
+              "segment_id": "356591397df3",
+              "file_path": "src/cli/lean.rs"
             },
             {
-              "segment_id": "339a47c82870",
-              "file_path": "src/search/impact.rs",
-              "breadcrumb": "tests"
+              "segment_id": "bba48f0a08c2",
+              "file_path": "src/indexer/markdown.rs"
             },
             {
-              "segment_id": "a0a13332bacf",
-              "file_path": "src/cli/impact.rs"
+              "segment_id": "aa002dab683c",
+              "file_path": "src/mcp/tools.rs"
             },
             {
-              "segment_id": "9d9545c87f59",
-              "file_path": "src/search/impact.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "66858b4a12ca",
-              "file_path": "src/indexer/pipeline.rs"
-            },
-            {
-              "segment_id": "5ac1a640760f",
-              "file_path": "src/search/symbol.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "d43b8da1b757",
-              "file_path": "src/search/hybrid.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "6f9afec73355",
+              "segment_id": "594635261bca",
               "file_path": "src/storage/segments.rs"
             }
           ],
           "gold_size": 2,
-          "matched_indices": [0],
-          "hit_count": 1,
-          "recall": 0.5
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "impact horizon expansion with owner-aware corroboration",
@@ -500,46 +515,47 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0875af015a0a",
+              "segment_id": "02056721f00c",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "968a37891437",
+              "segment_id": "15f72512f8bf",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "56698fa7dc94",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "259f9b6f6ac8",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "8bc7a8f97b26",
+              "segment_id": "b72afcce7e32",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "a0a13332bacf",
+              "segment_id": "16d8ce80230c",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "49759998dffc",
-              "file_path": "tests/integration_tests.rs"
-            },
-            {
-              "segment_id": "9c46f322569e",
+              "segment_id": "f3516a35c40e",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "a44304e575a2",
-              "file_path": "src/cli/impact.rs",
+              "segment_id": "dfbab4f5526d",
+              "file_path": "src/mcp/tools.rs",
+              "breadcrumb": "OneupMcpServer"
+            },
+            {
+              "segment_id": "6298d80efe1b",
+              "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "fe707465bf84",
-              "file_path": "tests/integration_tests.rs"
+              "segment_id": "ae6139ca24ef",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "c7404e544e3e",
+              "file_path": "CHANGELOG.md",
+              "breadcrumb": "CHANGELOG > Changelog > 0.1.6 (2026-04-15) > Features"
+            },
+            {
+              "segment_id": "a0db9b6181e4",
+              "file_path": "src/cli/lean.rs"
             }
           ],
           "gold_size": 3,
@@ -553,52 +569,54 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0174007e2279",
+              "segment_id": "365a7f252cf4",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "32e460838e7e",
-              "file_path": "src/daemon/search_service.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "8e18b791cc34",
+              "segment_id": "7552e39c84ec",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "fb041d0f2b0e",
+              "segment_id": "bbc7bfbf28ce",
+              "file_path": "src/daemon/search_service.rs"
+            },
+            {
+              "segment_id": "fadca3b1f83f",
               "file_path": "src/daemon/ipc.rs"
             },
             {
-              "segment_id": "e07bae0a1598",
-              "file_path": "src/daemon/worker.rs",
-              "breadcrumb": "tests"
+              "segment_id": "9b217e10b946",
+              "file_path": "src/daemon/ipc.rs"
             },
             {
-              "segment_id": "3c9c85eda52e",
+              "segment_id": "f769f7f69c83",
               "file_path": "src/shared/config.rs"
             },
             {
-              "segment_id": "ed7fdf5bf3b6",
+              "segment_id": "6ff90cf8713c",
               "file_path": "src/daemon/worker.rs"
             },
             {
-              "segment_id": "ec121226761d",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "bf3380a62e0a",
+              "file_path": "src/cli/search.rs"
             },
             {
-              "segment_id": "def488b045c8",
-              "file_path": "src/shared/fs.rs"
+              "segment_id": "a1a34f80ea2c",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > Daemon And Storage Internals"
             },
             {
-              "segment_id": "de100dc1e543",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "3e3a5546e655",
+              "file_path": "src/cli/search.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [3],
-          "hit_count": 1,
-          "recall": 0.25
+          "matched_indices": [
+            2,
+            3
+          ],
+          "hit_count": 2,
+          "recall": 0.5
         },
         {
           "query": "CLI command dispatch for search and impact",
@@ -606,52 +624,56 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "1d98e6bbc7fa",
+              "segment_id": "e34bf5d71f21",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "81af6f8604c1",
-              "file_path": "src/cli/mod.rs",
-              "breadcrumb": "tests"
+              "segment_id": "bc8114d99d97",
+              "file_path": "evals/results/2026-04-19-sonnet-lean-cli.md",
+              "breadcrumb": "2026-04-19-sonnet-lean-cli > Eval Results: 1up Lean CLI (PR #32) > Changes Under Test"
             },
             {
-              "segment_id": "ca51a8fc8992",
+              "segment_id": "d3f0fa900490",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "1b02103c5f1d",
-              "file_path": "src/main.rs"
+              "segment_id": "9e4da5729ece",
+              "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "b9b76211f73a",
-              "file_path": "src/cli/lean.rs"
-            },
-            {
-              "segment_id": "61db91bc4d53",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "d718a10991ca",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "cf6df22bcd51",
-              "file_path": "src/cli/search.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "12a66deb219f",
+              "segment_id": "7b821d9936b0",
               "file_path": "evals/suites/1up-impact/prompt-1up.txt"
             },
             {
-              "segment_id": "5b9a730ca8db",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
+              "segment_id": "17b86766ee21",
+              "file_path": "evals/suites/1up-search/prompt-1up.txt"
+            },
+            {
+              "segment_id": "17efe6ded324",
+              "file_path": "evals/results/2026-04-16-sonnet-v0.1.7.md",
+              "breadcrumb": "2026-04-16-sonnet-v0.1.7 > Eval Results: 1up v0.1.7 Agent Hints + Exact Symbol Matching > Methodology"
+            },
+            {
+              "segment_id": "579da4349071",
+              "file_path": "evals/suites/shared/assertions/index.ts"
+            },
+            {
+              "segment_id": "92294d682a45",
+              "file_path": "src/main.rs"
+            },
+            {
+              "segment_id": "27799842f5fd",
+              "file_path": "evals/README.md",
+              "breadcrumb": "README > 1up evals > MCP adoption harness"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1, 2],
-          "hit_count": 3,
-          "recall": 1
+          "matched_indices": [
+            0,
+            1
+          ],
+          "hit_count": 2,
+          "recall": 0.6666666666666666
         },
         {
           "query": "rebuild index after schema version bump",
@@ -659,47 +681,45 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "5c0289cf6809",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
+              "segment_id": "97a4ceb63e19",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "StagingRebuild"
             },
             {
-              "segment_id": "841b14e0056a",
+              "segment_id": "3a9ac3f1cc4e",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "e5782e135c57",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "460850f75ddb",
+              "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "76cf30b9becc",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "883b458ef54a",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "e7e976a5c832",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "d25734271d22",
-              "file_path": "tests/rewrite_sql_verification.rs"
+              "segment_id": "7ab888d3c65a",
+              "file_path": "src/storage/swap.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "68d6e89acd17",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "a1f842b74a7c",
-              "file_path": "src/cli/impact.rs"
+              "segment_id": "2fd4ab9e92ea",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "264a58c9c46e",
-              "file_path": "src/storage/queries.rs"
+              "segment_id": "752b2f98f417",
+              "file_path": "tests/integration_tests.rs"
             }
           ],
           "gold_size": 3,
@@ -713,51 +733,56 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e5eb43f99145",
+              "segment_id": "23f8dec6732e",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "847a773129e0",
+              "segment_id": "ed7c53eb1739",
+              "file_path": "src/storage/relations.rs"
+            },
+            {
+              "segment_id": "2885c6d9cb2d",
+              "file_path": "src/storage/relations.rs"
+            },
+            {
+              "segment_id": "3345bd202699",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "687443598d6e",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "84174f758f5e",
+              "segment_id": "ef8894b432c1",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "ImpactHorizonEngine<'a>"
             },
             {
-              "segment_id": "390fbc5e7cb1",
-              "file_path": "src/storage/relations.rs"
+              "segment_id": "ba6b1269da58",
+              "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "1deba4b78526",
-              "file_path": "src/storage/relations.rs"
-            },
-            {
-              "segment_id": "06745c7c5786",
-              "file_path": "src/search/symbol.rs"
-            },
-            {
-              "segment_id": "13bb8054d1a3",
+              "segment_id": "86e83b1ac9cc",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "2f687e13797b",
+              "segment_id": "e804da021a66",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "7df7b14f6d34",
-              "file_path": "src/indexer/parser.rs"
+              "segment_id": "748ec6747672",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "a4496feb170d",
+              "file_path": "src/search/symbol.rs",
+              "breadcrumb": "SymbolSearchEngine<'a>"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 2, 3],
-          "hit_count": 4,
-          "recall": 1
+          "matched_indices": [
+            1,
+            2,
+            3
+          ],
+          "hit_count": 3,
+          "recall": 0.75
         },
         {
           "query": "benchmark parallel indexing script emitting JSON summary",
@@ -765,48 +790,47 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "cffb2b0f4db5",
+              "segment_id": "a1c87f4c9be0",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > Benchmarking"
+            },
+            {
+              "segment_id": "3ba3ffe378a2",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "3f341ac5939d",
+              "segment_id": "9e032aed5660",
+              "file_path": "scripts/benchmark_parallel_indexing.sh"
+            },
+            {
+              "segment_id": "d1945fa16fb5",
+              "file_path": "scripts/benchmark_parallel_indexing.sh"
+            },
+            {
+              "segment_id": "9d46cb877740",
               "file_path": "scripts/release/generate_release_evidence.sh"
             },
             {
-              "segment_id": "58975ec3a1a9",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
+              "segment_id": "2ea3636bd10a",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "68877eec795c",
-              "file_path": "src/indexer/pipeline.rs",
-              "breadcrumb": "tests"
+              "segment_id": "c20ddee84911",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "97acda07efb3",
+              "segment_id": "2424fdc8c9b1",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "Formatter for JsonFormatter"
             },
             {
-              "segment_id": "b88ada34b008",
-              "file_path": "scripts/benchmark_parallel_indexing.sh"
-            },
-            {
-              "segment_id": "ec445a8d4ccd",
-              "file_path": "scripts/benchmark_parallel_indexing.sh"
-            },
-            {
-              "segment_id": "9c74d36e7f58",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
-            },
-            {
-              "segment_id": "e6a84f7da2e2",
-              "file_path": "scripts/release/generate_release_evidence.sh"
-            },
-            {
-              "segment_id": "13657e94b291",
+              "segment_id": "dd70b6985856",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "14fde6407aec",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             }
           ],
           "gold_size": 3,
@@ -818,7 +842,7 @@
     },
     {
       "k": 20,
-      "recall": 0.5666666666666667,
+      "recall": 0.3722222222222222,
       "scored_queries": 15,
       "total_queries": 15,
       "per_query": [
@@ -828,92 +852,97 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "d011c8a92915",
+              "segment_id": "78453b113740",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "841b14e0056a",
+              "segment_id": "d226589a9b67",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "76cf30b9becc",
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "7e1ac92e0377",
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "446e4bf503b1",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "836d57ba7fec",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "c9854e0f32c0",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "8ed86bd5de04",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "076945e5e1c3",
-              "file_path": "src/shared/errors.rs"
+              "segment_id": "0c84f3e9af87",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "4f0d8b58b9ce",
-              "file_path": "src/shared/update.rs"
-            },
-            {
-              "segment_id": "0ca26bf20131",
-              "file_path": "src/shared/update.rs"
-            },
-            {
-              "segment_id": "c030904b5e81",
-              "file_path": "src/shared/update.rs"
-            },
-            {
-              "segment_id": "c9d899bb9827",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "3c1968a5da7a",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "ActiveArtifactPointer"
-            },
-            {
-              "segment_id": "1c76bd7d8bbf",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "1a32bc673272",
-              "file_path": "scripts/release/common.sh"
-            },
-            {
-              "segment_id": "d481e523dc16",
-              "file_path": "src/cli/update.rs"
-            },
-            {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "d25734271d22",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "883b458ef54a",
+              "segment_id": "020379493780",
               "file_path": "src/storage/segments.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "5039b52d8611",
-              "file_path": "src/cli/update.rs"
+              "segment_id": "5b54814f44fa",
+              "file_path": "src/shared/config.rs"
+            },
+            {
+              "segment_id": "e7e976a5c832",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "6e7b9bb9b392",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "2fd4ab9e92ea",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "fb5b879c889a",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "519d609a5c9c",
+              "file_path": "src/shared/errors.rs"
+            },
+            {
+              "segment_id": "752b2f98f417",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "5f887443a3c1",
+              "file_path": "src/cli/reindex.rs"
+            },
+            {
+              "segment_id": "4ce98796f67d",
+              "file_path": "src/daemon/worker.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "65e18f86d6a6",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 2],
-          "hit_count": 2,
-          "recall": 0.6666666666666666
+          "matched_indices": [
+            0,
+            1,
+            2
+          ],
+          "hit_count": 3,
+          "recall": 1
         },
         {
           "query": "hybrid search combining vector and full-text retrieval",
@@ -921,93 +950,97 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f3769f012e9b",
+              "segment_id": "974286d29ae0",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
+            },
+            {
+              "segment_id": "4d7ff809285c",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
+            },
+            {
+              "segment_id": "208badb33334",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "7d89ffde1e38",
+              "file_path": "src/search/retrieval.rs",
+              "breadcrumb": "SqlVectorV2<'a>"
+            },
+            {
+              "segment_id": "3dc7a79333d1",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "cb2cb8e9516f",
+              "segment_id": "a763a8b05588",
               "file_path": "src/search/retrieval.rs",
               "breadcrumb": "RetrievalBackend<'a>"
             },
             {
-              "segment_id": "dd69682e2259",
-              "file_path": "src/search/hybrid.rs"
+              "segment_id": "e537654ce0ca",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "b8bc560fffde",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "FtsOnly<'a>"
+              "segment_id": "5ad5c649593c",
+              "file_path": "src/cli/search.rs"
             },
             {
-              "segment_id": "dcc0fe34c1f1",
-              "file_path": "src/search/hybrid.rs"
+              "segment_id": "b97927e80cfe",
+              "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "9f6a38b1b371",
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "308f92f2ba5c",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "3b4fe06cdf6c",
+              "segment_id": "e88e5ec1f61b",
+              "file_path": "src/daemon/worker.rs"
+            },
+            {
+              "segment_id": "34437f7eaeb1",
               "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "cc2a910dbcaf",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "0ed3cbcc8113",
-              "file_path": "src/search/hybrid.rs"
-            },
-            {
-              "segment_id": "fce8611d9139",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "0a4dc7a4feb0",
-              "file_path": "src/search/symbol.rs"
-            },
-            {
-              "segment_id": "9dde4c871854",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "2ff1ccc2811a",
+              "segment_id": "7b20a63ac149",
               "file_path": "benches/search_bench.rs"
             },
             {
-              "segment_id": "45eb807d92f6",
-              "file_path": "benches/search_bench.rs"
+              "segment_id": "32aa7bb2a10a",
+              "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "31c7f3b805e6",
-              "file_path": "src/search/mod.rs"
+              "segment_id": "3f633526a7b2",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "61db91bc4d53",
+              "segment_id": "dc957bae4ea2",
               "file_path": "evals/suites/1up-search/recall.ts"
             },
             {
-              "segment_id": "d0cdf25c4f1d",
-              "file_path": "src/search/formatter.rs"
+              "segment_id": "f16bb109738a",
+              "file_path": "src/search/ranking.rs"
             },
             {
-              "segment_id": "00904fd4fa8f",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "Embedder"
+              "segment_id": "3d07f838d246",
+              "file_path": "src/daemon/worker.rs"
             },
             {
-              "segment_id": "d84a2c3e5e3f",
-              "file_path": "evals/suites/1up-search/prompt-1up.txt"
-            },
-            {
-              "segment_id": "e4f7da9830a3",
+              "segment_id": "f5b286c2c08a",
               "file_path": "src/shared/constants.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 2],
-          "hit_count": 3,
-          "recall": 0.75
+          "matched_indices": [
+            2,
+            3
+          ],
+          "hit_count": 2,
+          "recall": 0.5
         },
         {
           "query": "batch insert vectors into segment_vectors table",
@@ -1015,96 +1048,99 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e0e25f6beafb",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "e6ad0151c7fa",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "be82820acff2",
+              "segment_id": "d8057693c232",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5bcd6303180f",
+              "segment_id": "a9c7ac1bfa8d",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "3722a5b72b55",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "62a6b06d1554",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "d80410c6445d",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "ae1e8edf8e52",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "39d78a1ed1d1",
-              "file_path": "src/search/retrieval.rs",
+              "segment_id": "d452f50c8a06",
+              "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbe",
+              "segment_id": "d0b645c9c860",
+              "file_path": "src/search/overview.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "945ef5d4421d",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "cfa5646d960b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "e0bfc34db24b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "b4e244411310",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "64c626f08dc2",
+              "segment_id": "71a781d5925d",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "f705c1a58623",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "19e13d438406",
               "file_path": "src/indexer/embedder.rs",
               "breadcrumb": "Embedder"
             },
             {
-              "segment_id": "f8f2aa05ba4e",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "0929c94184ed",
+              "segment_id": "dca1f3c9959a",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "7fcb139f87ff",
-              "file_path": "src/indexer/embedder.rs"
+              "segment_id": "1d03dadc5e95",
+              "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "4c10adff7f70",
+              "segment_id": "7469b660dd86",
+              "file_path": "src/storage/schema.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "439d1aae43b8",
+              "file_path": "src/indexer/embedder.rs",
+              "breadcrumb": "Embedder"
+            },
+            {
+              "segment_id": "88aed74a830a",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "09738eb7df4e",
-              "file_path": "src/search/retrieval.rs",
+              "segment_id": "0cce27d88d08",
+              "file_path": "src/storage/swap.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "67ace961d9e9",
-              "file_path": "src/shared/types.rs",
-              "breadcrumb": "IndexingConfig"
+              "segment_id": "e2ca63500eb0",
+              "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "5619d3841e9e",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "tests"
+              "segment_id": "983f99bc312a",
+              "file_path": "CHANGELOG.md",
+              "breadcrumb": "CHANGELOG > Changelog > 0.1.1 (2026-04-11) > Performance Improvements"
             },
             {
-              "segment_id": "e23a0b4fff58",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "cc8c76946b4c",
-              "file_path": "src/search/impact.rs",
-              "breadcrumb": "tests"
+              "segment_id": "363a7dee9a16",
+              "file_path": "CHANGELOG.md",
+              "breadcrumb": "CHANGELOG > Changelog > 0.1.2 (2026-04-11) > Performance Improvements"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1],
+          "matched_indices": [
+            0,
+            1
+          ],
           "hit_count": 2,
           "recall": 0.6666666666666666
         },
@@ -1114,94 +1150,93 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e4f7da9830a3",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "0ba79a0400f3",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "97f90c9e6f6c",
+              "segment_id": "ae35d20feace",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "538b2280afd9",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9779b23d917b",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "cc2a910dbcaf",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "9a4ea46c811f",
+              "segment_id": "b97927e80cfe",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "23c9c5f85405",
-              "file_path": "src/search/ranking.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "9f6a38b1b371",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "09738eb7df4e",
-              "file_path": "src/search/retrieval.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "8bc7a8f97b26",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "e1cc60d69bc9",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "c4b296f92fbf",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "f3769f012e9b",
+              "segment_id": "f566ad54d515",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "6d9f74cc76fa",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "9e069ba89c08",
-              "file_path": "src/search/symbol.rs",
-              "breadcrumb": "SymbolSearchEngine<'a>"
-            },
-            {
-              "segment_id": "0a4dc7a4feb0",
-              "file_path": "src/search/symbol.rs"
-            },
-            {
-              "segment_id": "adfff50b0fbd",
-              "file_path": "src/search/symbol.rs",
-              "breadcrumb": "SymbolSearchEngine<'a>"
-            },
-            {
-              "segment_id": "0ed3cbcc8113",
+              "segment_id": "208badb33334",
               "file_path": "src/search/hybrid.rs"
             },
             {
-              "segment_id": "9dde4c871854",
+              "segment_id": "34437f7eaeb1",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "d3bef2d94078",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "49f5ed51c9bc",
-              "file_path": "src/search/hybrid.rs"
+              "segment_id": "32aa7bb2a10a",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "f16bb109738a",
+              "file_path": "src/search/ranking.rs"
+            },
+            {
+              "segment_id": "7b20a63ac149",
+              "file_path": "benches/search_bench.rs"
+            },
+            {
+              "segment_id": "4d7ff809285c",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
+            },
+            {
+              "segment_id": "9f50043ca1b7",
+              "file_path": "src/cli/discovery_output.rs"
+            },
+            {
+              "segment_id": "34773b3ae128",
+              "file_path": "src/search/symbol.rs",
+              "breadcrumb": "SymbolSearchEngine<'a>"
+            },
+            {
+              "segment_id": "e314f9bfae00",
+              "file_path": "CHANGELOG.md",
+              "breadcrumb": "CHANGELOG > Changelog > 0.1.8 (2026-04-19) > Features"
+            },
+            {
+              "segment_id": "6a16d9573c5b",
+              "file_path": "benches/search_bench.rs"
+            },
+            {
+              "segment_id": "e92ce7354903",
+              "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "e537654ce0ca",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "d61b7d7b88c5",
+              "file_path": "src/storage/queries.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1],
-          "hit_count": 2,
-          "recall": 0.6666666666666666
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "libsql vector index DDL using libsql_vector_idx",
@@ -1209,92 +1244,95 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "6d9f74cc76fa",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "f3769f012e9b",
-              "file_path": "src/search/retrieval.rs"
-            },
-            {
-              "segment_id": "841b14e0056a",
+              "segment_id": "460850f75ddb",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "072fbae0c631",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "3f47fdcfe67a",
+              "file_path": "tests/integration_tests.rs"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "b4b6c6185fb9",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "HybridSearchEngine<'a>"
             },
             {
-              "segment_id": "9a4ea46c811f",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "5c27a15cbb5b",
+              "segment_id": "0ba79a0400f3",
               "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "1ed80e3e5f66",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "ae35d20feace",
+              "file_path": "src/search/retrieval.rs"
             },
             {
-              "segment_id": "264a58c9c46e",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "5cd7bd8c161f",
-              "file_path": "src/storage/db.rs"
-            },
-            {
-              "segment_id": "3138e8e542d1",
-              "file_path": "src/search/symbol.rs",
-              "breadcrumb": "SymbolSearchEngine<'a>"
-            },
-            {
-              "segment_id": "cc2a910dbcaf",
-              "file_path": "src/search/ranking.rs"
-            },
-            {
-              "segment_id": "4bfb2b4c4cf3",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "e0e25f6beafb",
+              "segment_id": "945ef5d4421d",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "dbfcec33d4a5",
-              "file_path": "src/shared/config.rs",
+              "segment_id": "370af89c2f2b",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "8d41f37dd80f",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "b97927e80cfe",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "2b3bec2b22ff",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "3a9ac3f1cc4e",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "7469b660dd86",
+              "file_path": "src/storage/schema.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e265d1aa7882",
-              "file_path": "src/indexer/pipeline.rs"
+              "segment_id": "c4d246457d95",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "tests"
             },
             {
-              "segment_id": "81e5c5c86469",
-              "file_path": "scripts/baselines/vector_index_size_baseline.json"
+              "segment_id": "b930acd79831",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "5b88ecec9b36",
+              "segment_id": "0cce27d88d08",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "208badb33334",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "d9577b44637f",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "0ff83af12c7f",
+              "file_path": "README.md",
+              "breadcrumb": "README > Architecture"
+            },
+            {
+              "segment_id": "acb1893f57f9",
               "file_path": "src/search/structural.rs"
             },
             {
-              "segment_id": "f5b92d1df682",
-              "file_path": "src/storage/relations.rs"
-            },
-            {
-              "segment_id": "ff946c554f3b",
-              "file_path": "src/storage/segments.rs"
+              "segment_id": "14fde6407aec",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             }
           ],
           "gold_size": 2,
-          "matched_indices": [0, 1],
-          "hit_count": 2,
-          "recall": 1
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "reject databases with stale schema versions",
@@ -1302,98 +1340,93 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "8049f2946f34",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "5c0289cf6809",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "e5782e135c57",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
             },
             {
-              "segment_id": "d25734271d22",
+              "segment_id": "30dd9fc22b34",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "460850f75ddb",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "2bd9c8d67316",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "446e4bf503b1",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "4821aaec0bfa",
+              "file_path": "tests/cli_tests.rs"
+            },
+            {
+              "segment_id": "e7e976a5c832",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "752b2f98f417",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "bb7841790131",
               "file_path": "tests/rewrite_sql_verification.rs"
             },
             {
-              "segment_id": "76cf30b9becc",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "e00b2dd604ac",
+              "file_path": "tests/cli_tests.rs"
             },
             {
-              "segment_id": "883b458ef54a",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "c9854e0f32c0",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "2272522c3b6e",
-              "file_path": "src/shared/update.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "e42cdfa38591",
+              "segment_id": "c435f6ea9fcb",
               "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "efd6ac3b7199",
-              "file_path": "src/shared/update.rs",
-              "breadcrumb": "tests"
+              "segment_id": "d90e94b552a6",
+              "file_path": "tests/rewrite_sql_verification.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "bd7d2f3a681e",
+              "file_path": "src/cli/hint_cleanup.rs"
             },
             {
-              "segment_id": "7e1ac92e0377",
+              "segment_id": "a235e29a9ac0",
+              "file_path": "tests/rewrite_sql_verification.rs"
+            },
+            {
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "076945e5e1c3",
-              "file_path": "src/shared/errors.rs"
+              "segment_id": "8ea9cb50f499",
+              "file_path": "src/shared/update.rs"
             },
             {
-              "segment_id": "ee56cf8be368",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "97a4ceb63e19",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "StagingRebuild"
             },
             {
-              "segment_id": "7e606224b83d",
-              "file_path": "src/cli/reindex.rs"
+              "segment_id": "90c017d9ea01",
+              "file_path": "tests/cli_tests.rs"
             },
             {
-              "segment_id": "6f3cf0fc5bda",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "0b03e0feb3d7",
-              "file_path": "src/main.rs"
-            },
-            {
-              "segment_id": "133a61514216",
-              "file_path": "src/indexer/embedder.rs"
-            },
-            {
-              "segment_id": "4e0f84e5b13d",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
+              "segment_id": "3f9a31fb5ecb",
+              "file_path": "evals/suites/1up-search/recall-compare.ts"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1],
-          "hit_count": 2,
-          "recall": 0.6666666666666666
+          "matched_indices": [
+            0
+          ],
+          "hit_count": 1,
+          "recall": 0.3333333333333333
         },
         {
           "query": "ONNX embedder producing 384-dimensional float32 vectors",
@@ -1401,95 +1434,90 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "7fcb139f87ff",
+              "segment_id": "e2ca63500eb0",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "5bcd6303180f",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "7a90fc8fb82e",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "59603cddb1cb",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "98f6a6ee88d4",
+              "segment_id": "ad45e94f8d04",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "bf61430a2138",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "3f2b6819af9e",
+              "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "0397aed30272",
+              "segment_id": "b743efea1fa3",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "d80410c6445d",
-              "file_path": "src/storage/schema.rs"
-            },
-            {
-              "segment_id": "a0b35e0ca120",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "be82820acff2",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "016255ee3136",
+              "segment_id": "47629ea6b47e",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "e0e25f6beafb",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "92d0d240a600",
-              "file_path": "src/search/hybrid.rs",
-              "breadcrumb": "HybridSearchEngine<'a>"
-            },
-            {
-              "segment_id": "70b2eb5446a0",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "de0d51df9ea9",
-              "file_path": "src/indexer/pipeline.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "f7b3ffa9f131",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "ae1e8edf8e52",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "c36b574ccbb3",
+              "segment_id": "eb3a076d6e17",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "375792c359c0",
-              "file_path": "benches/search_bench.rs"
+              "segment_id": "7274554bd809",
+              "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "3ab3050586ee",
-              "file_path": "src/search/hybrid.rs",
-              "breadcrumb": "HybridSearchEngine<'a>"
+              "segment_id": "d8057693c232",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b4e244411310",
+              "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "947f1a88655c",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
+            },
+            {
+              "segment_id": "dca1f3c9959a",
+              "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "3f47fdcfe67a",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "6b614d37ba3c",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "82f6d08f14e6",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "370af89c2f2b",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "ae35d20feace",
+              "file_path": "src/search/retrieval.rs"
+            },
+            {
+              "segment_id": "e537654ce0ca",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "61a090cd53b0",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "43ada006c9ca",
+              "file_path": "src/mcp/ops.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0],
+          "matched_indices": [
+            0
+          ],
           "hit_count": 1,
           "recall": 0.3333333333333333
         },
@@ -1499,95 +1527,95 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "f19435271bcc",
+              "segment_id": "86ddd0ff8171",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "3620c9fb3092",
+              "segment_id": "76c2b19af92c",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "da8caf9b4722",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "3ee614965158",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "12a00e880933",
+              "file_path": "src/storage/queries.rs"
+            },
+            {
+              "segment_id": "b20dbe3a90f7",
+              "file_path": "src/storage/segments.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "2ac86536a72b",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "b149994b43d9",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "5c7bd94e3b03",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "c4d918cc24ad",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "b6bc5cb5a769",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "d13c50be90fa",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "VerifiedArtifactManifest"
-            },
-            {
-              "segment_id": "9c02990f9ea2",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "b9b86875b68d",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "4d8f7e5659ec",
+              "segment_id": "17ddcf240725",
               "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "90690dc4b321",
-              "file_path": "evals/suites/shared/extension.ts"
+              "segment_id": "0da186c7a0cf",
+              "file_path": "src/indexer/pipeline.rs"
             },
             {
-              "segment_id": "9ed54e43ec88",
+              "segment_id": "07deb80e682d",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "e8ddc6f075d8",
+              "segment_id": "0fe9ab70fcfa",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "ee7b8341beaf",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "28201c1ff571",
+              "file_path": "evals/suites/shared/extension.ts"
+            },
+            {
+              "segment_id": "a18be0b4a817",
+              "file_path": "src/indexer/embedder.rs"
+            },
+            {
+              "segment_id": "7b9eeb990561",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "f8f671f6ebe4",
+              "file_path": "src/indexer/scanner.rs"
+            },
+            {
+              "segment_id": "a690f1c924c9",
               "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "VerifiedArtifactManifest"
-            },
-            {
-              "segment_id": "644851af2351",
-              "file_path": "src/shared/config.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "7213c5cedec2",
-              "file_path": "src/indexer/pipeline.rs"
+              "segment_id": "2df8335504d4",
+              "file_path": "src/shared/types.rs"
             },
             {
-              "segment_id": "58bdb0eadcb9",
-              "file_path": "src/indexer/scanner.rs"
+              "segment_id": "add12041db0a",
+              "file_path": "src/daemon/watcher.rs"
             },
             {
-              "segment_id": "938019b3527e",
-              "file_path": "src/indexer/scanner.rs"
-            },
-            {
-              "segment_id": "6f51429e2118",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "ed53485ef2b9",
-              "file_path": "src/shared/config.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "18c2fa4e66f3",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
+              "segment_id": "e1bff54bb6cb",
+              "file_path": "src/shared/config.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 3],
-          "hit_count": 3,
-          "recall": 0.75
+          "matched_indices": [
+            0,
+            3
+          ],
+          "hit_count": 2,
+          "recall": 0.5
         },
         {
           "query": "deterministic segment identifier generation",
@@ -1595,101 +1623,92 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "a521511b1b9e",
+              "segment_id": "f5cfa941d97b",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "b51ed36327be",
+              "file_path": "src/search/impact.rs"
+            },
+            {
+              "segment_id": "e7e0bd802cc0",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "5d8b7987bcd3",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "b8f4415e4ffe",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "082c7e64bfbe",
-              "file_path": "src/indexer/pipeline.rs"
-            },
-            {
-              "segment_id": "096ebba51854",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "339a47c82870",
-              "file_path": "src/search/impact.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "a0a13332bacf",
-              "file_path": "src/cli/impact.rs"
-            },
-            {
-              "segment_id": "9d9545c87f59",
-              "file_path": "src/search/impact.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "66858b4a12ca",
-              "file_path": "src/indexer/pipeline.rs"
-            },
-            {
-              "segment_id": "5ac1a640760f",
-              "file_path": "src/search/symbol.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "d43b8da1b757",
-              "file_path": "src/search/hybrid.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "6f9afec73355",
-              "file_path": "src/storage/segments.rs"
-            },
-            {
-              "segment_id": "92ede847206a",
-              "file_path": "src/cli/lean.rs"
-            },
-            {
-              "segment_id": "ee7ed4f2c091",
-              "file_path": "src/storage/relations.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "566c9e4791d0",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "0e9fea4bc2f3",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "801d2c085d30",
+              "segment_id": "11a7eb8c1fa0",
               "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "9b1c61e2a181",
+              "segment_id": "356591397df3",
+              "file_path": "src/cli/lean.rs"
+            },
+            {
+              "segment_id": "bba48f0a08c2",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "aa002dab683c",
+              "file_path": "src/mcp/tools.rs"
+            },
+            {
+              "segment_id": "594635261bca",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "16d8ce80230c",
+              "file_path": "src/cli/impact.rs"
+            },
+            {
+              "segment_id": "86e692628c9a",
+              "file_path": "src/indexer/pipeline.rs"
+            },
+            {
+              "segment_id": "d6b9cac65ba5",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "07a5ea95bc7b",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "91703467dbbe",
+              "file_path": "src/search/impact.rs",
+              "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "5c3f6610e8c4",
+              "file_path": "src/search/hybrid.rs"
+            },
+            {
+              "segment_id": "291ce9f33acd",
+              "file_path": "src/cli/discovery_output.rs"
+            },
+            {
+              "segment_id": "5330a8a9daa9",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "5f6f766d8fed",
+              "segment_id": "c4fcb8957c24",
+              "file_path": "src/indexer/parser.rs"
+            },
+            {
+              "segment_id": "f6f5177b9668",
               "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "e26f0446d653",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "7071903dbfb8",
-              "file_path": "src/shared/symbols.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "c61b0226fd37",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
             }
           ],
           "gold_size": 2,
-          "matched_indices": [0],
-          "hit_count": 1,
-          "recall": 0.5
+          "matched_indices": [],
+          "hit_count": 0,
+          "recall": 0
         },
         {
           "query": "impact horizon expansion with owner-aware corroboration",
@@ -1697,90 +1716,88 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0875af015a0a",
+              "segment_id": "02056721f00c",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "968a37891437",
+              "segment_id": "15f72512f8bf",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "56698fa7dc94",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "259f9b6f6ac8",
-              "file_path": "benches/search_bench.rs"
-            },
-            {
-              "segment_id": "8bc7a8f97b26",
+              "segment_id": "b72afcce7e32",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "a0a13332bacf",
+              "segment_id": "16d8ce80230c",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "49759998dffc",
-              "file_path": "tests/integration_tests.rs"
-            },
-            {
-              "segment_id": "9c46f322569e",
+              "segment_id": "f3516a35c40e",
               "file_path": "src/cli/impact.rs"
             },
             {
-              "segment_id": "a44304e575a2",
-              "file_path": "src/cli/impact.rs",
+              "segment_id": "dfbab4f5526d",
+              "file_path": "src/mcp/tools.rs",
+              "breadcrumb": "OneupMcpServer"
+            },
+            {
+              "segment_id": "6298d80efe1b",
+              "file_path": "src/search/retrieval.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "fe707465bf84",
-              "file_path": "tests/integration_tests.rs"
+              "segment_id": "ae6139ca24ef",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "c54ac6887a1c",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
+              "segment_id": "c7404e544e3e",
+              "file_path": "CHANGELOG.md",
+              "breadcrumb": "CHANGELOG > Changelog > 0.1.6 (2026-04-15) > Features"
             },
             {
-              "segment_id": "a925f44e324c",
-              "file_path": "src/cli/lean.rs",
-              "breadcrumb": "tests"
+              "segment_id": "a0db9b6181e4",
+              "file_path": "src/cli/lean.rs"
             },
             {
-              "segment_id": "2d84ea183229",
-              "file_path": "tests/integration_tests.rs"
+              "segment_id": "3fdb3a7e13d3",
+              "file_path": "src/cli/discovery_output.rs"
             },
             {
-              "segment_id": "5012cfb00dc7",
+              "segment_id": "019cdd487b57",
+              "file_path": "src/cli/impact.rs"
+            },
+            {
+              "segment_id": "af7656ec7b13",
               "file_path": "src/search/context.rs",
               "breadcrumb": "ContextEngine"
             },
             {
-              "segment_id": "ec1b69853398",
-              "file_path": "src/indexer/parser.rs"
+              "segment_id": "4709cda12b77",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "e4f7da9830a3",
-              "file_path": "src/shared/constants.rs"
+              "segment_id": "3c4f5e789700",
+              "file_path": "src/mcp/tools.rs"
             },
             {
-              "segment_id": "cc988a6fb1fb",
-              "file_path": "src/shared/update.rs",
-              "breadcrumb": "tests"
+              "segment_id": "50977631db53",
+              "file_path": "src/search/overview.rs"
             },
             {
-              "segment_id": "133a61514216",
+              "segment_id": "fb15020dc7f0",
               "file_path": "src/indexer/embedder.rs"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "03fc188282a0",
+              "file_path": "src/mcp/tools.rs"
             },
             {
-              "segment_id": "de7f971e6454",
-              "file_path": "src/cli/context.rs"
+              "segment_id": "6c5cb887fead",
+              "file_path": "src/cli/discovery_output.rs"
+            },
+            {
+              "segment_id": "919d55a59d47",
+              "file_path": "src/indexer/embedder.rs"
             }
           ],
           "gold_size": 3,
@@ -1794,93 +1811,94 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "0174007e2279",
+              "segment_id": "365a7f252cf4",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "32e460838e7e",
-              "file_path": "src/daemon/search_service.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "8e18b791cc34",
+              "segment_id": "7552e39c84ec",
               "file_path": "src/daemon/search_service.rs"
             },
             {
-              "segment_id": "fb041d0f2b0e",
+              "segment_id": "bbc7bfbf28ce",
+              "file_path": "src/daemon/search_service.rs"
+            },
+            {
+              "segment_id": "fadca3b1f83f",
               "file_path": "src/daemon/ipc.rs"
             },
             {
-              "segment_id": "e07bae0a1598",
+              "segment_id": "9b217e10b946",
+              "file_path": "src/daemon/ipc.rs"
+            },
+            {
+              "segment_id": "f769f7f69c83",
+              "file_path": "src/shared/config.rs"
+            },
+            {
+              "segment_id": "6ff90cf8713c",
+              "file_path": "src/daemon/worker.rs"
+            },
+            {
+              "segment_id": "bf3380a62e0a",
+              "file_path": "src/cli/search.rs"
+            },
+            {
+              "segment_id": "a1a34f80ea2c",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > Daemon And Storage Internals"
+            },
+            {
+              "segment_id": "3e3a5546e655",
+              "file_path": "src/cli/search.rs"
+            },
+            {
+              "segment_id": "0b67e95b4272",
+              "file_path": "src/shared/constants.rs"
+            },
+            {
+              "segment_id": "7164bee88bc3",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "c13c4b568aff",
+              "file_path": "src/shared/fs.rs"
+            },
+            {
+              "segment_id": "ac9401127b24",
+              "file_path": "src/daemon/ipc.rs"
+            },
+            {
+              "segment_id": "0e67d5fdc39f",
+              "file_path": "src/shared/constants.rs"
+            },
+            {
+              "segment_id": "3d1b847ce14a",
+              "file_path": "src/daemon/worker.rs"
+            },
+            {
+              "segment_id": "a7948584bb5c",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "c7c7f9eb64c8",
+              "file_path": "src/daemon/lifecycle.rs"
+            },
+            {
+              "segment_id": "8b1d0209d7dc",
               "file_path": "src/daemon/worker.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "3c9c85eda52e",
-              "file_path": "src/shared/config.rs"
-            },
-            {
-              "segment_id": "ed7fdf5bf3b6",
-              "file_path": "src/daemon/worker.rs"
-            },
-            {
-              "segment_id": "ec121226761d",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "def488b045c8",
-              "file_path": "src/shared/fs.rs"
-            },
-            {
-              "segment_id": "de100dc1e543",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "e61d494aacdd",
-              "file_path": "src/cli/search.rs"
-            },
-            {
-              "segment_id": "56e8485cd39b",
-              "file_path": "src/shared/fs.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "8c8b6a12b8c7",
-              "file_path": "src/daemon/worker.rs"
-            },
-            {
-              "segment_id": "8a19eb3df8ae",
-              "file_path": "src/daemon/ipc.rs"
-            },
-            {
-              "segment_id": "c1c21784e808",
-              "file_path": "src/daemon/lifecycle.rs"
-            },
-            {
-              "segment_id": "50ff37b3ce9c",
-              "file_path": "src/shared/fs.rs",
-              "breadcrumb": "ExpectedLeaf"
-            },
-            {
-              "segment_id": "4f17f9bd6a9a",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "8c64cd8fdd10",
-              "file_path": "src/shared/errors.rs"
-            },
-            {
-              "segment_id": "4a4fbd72cacf",
-              "file_path": "src/daemon/mod.rs",
-              "breadcrumb": "ipc"
-            },
-            {
-              "segment_id": "6993f08e7801",
-              "file_path": "src/daemon/lifecycle.rs"
+              "segment_id": "784cb879a766",
+              "file_path": "src/shared/types.rs",
+              "breadcrumb": "DaemonRefreshState"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [2, 3],
+          "matched_indices": [
+            2,
+            3
+          ],
           "hit_count": 2,
           "recall": 0.5
         },
@@ -1890,93 +1908,100 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "1d98e6bbc7fa",
+              "segment_id": "e34bf5d71f21",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "81af6f8604c1",
-              "file_path": "src/cli/mod.rs",
-              "breadcrumb": "tests"
+              "segment_id": "bc8114d99d97",
+              "file_path": "evals/results/2026-04-19-sonnet-lean-cli.md",
+              "breadcrumb": "2026-04-19-sonnet-lean-cli > Eval Results: 1up Lean CLI (PR #32) > Changes Under Test"
             },
             {
-              "segment_id": "ca51a8fc8992",
+              "segment_id": "d3f0fa900490",
               "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "1b02103c5f1d",
-              "file_path": "src/main.rs"
+              "segment_id": "9e4da5729ece",
+              "file_path": "src/cli/mod.rs"
             },
             {
-              "segment_id": "b9b76211f73a",
-              "file_path": "src/cli/lean.rs"
-            },
-            {
-              "segment_id": "61db91bc4d53",
-              "file_path": "evals/suites/1up-search/recall.ts"
-            },
-            {
-              "segment_id": "d718a10991ca",
-              "file_path": "src/cli/output.rs"
-            },
-            {
-              "segment_id": "cf6df22bcd51",
-              "file_path": "src/cli/search.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "12a66deb219f",
+              "segment_id": "7b821d9936b0",
               "file_path": "evals/suites/1up-impact/prompt-1up.txt"
             },
             {
-              "segment_id": "5b9a730ca8db",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
+              "segment_id": "17b86766ee21",
+              "file_path": "evals/suites/1up-search/prompt-1up.txt"
             },
             {
-              "segment_id": "39b796738795",
-              "file_path": "src/cli/lean.rs",
+              "segment_id": "17efe6ded324",
+              "file_path": "evals/results/2026-04-16-sonnet-v0.1.7.md",
+              "breadcrumb": "2026-04-16-sonnet-v0.1.7 > Eval Results: 1up v0.1.7 Agent Hints + Exact Symbol Matching > Methodology"
+            },
+            {
+              "segment_id": "579da4349071",
+              "file_path": "evals/suites/shared/assertions/index.ts"
+            },
+            {
+              "segment_id": "92294d682a45",
+              "file_path": "src/main.rs"
+            },
+            {
+              "segment_id": "27799842f5fd",
+              "file_path": "evals/README.md",
+              "breadcrumb": "README > 1up evals > MCP adoption harness"
+            },
+            {
+              "segment_id": "26081ef0735e",
+              "file_path": "src/mcp/tools.rs"
+            },
+            {
+              "segment_id": "eef8459b4c2d",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > MCP Adoption Evals"
+            },
+            {
+              "segment_id": "33e76194af0e",
+              "file_path": "src/cli/impact.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "192b598eca8e",
-              "file_path": "evals/run-parallel.sh"
+              "segment_id": "4709cda12b77",
+              "file_path": "src/mcp/ops.rs"
             },
             {
-              "segment_id": "ccc33a8385e0",
-              "file_path": "evals/run-parallel.sh"
+              "segment_id": "a1c87f4c9be0",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > Benchmarking"
             },
             {
-              "segment_id": "f2d172fc8468",
+              "segment_id": "6dafaf0bdaa0",
               "file_path": "src/cli/lean.rs"
             },
             {
-              "segment_id": "ad17fc2a516b",
-              "file_path": "evals/suites/shared/assertions/index.ts"
+              "segment_id": "dfbab4f5526d",
+              "file_path": "src/mcp/tools.rs",
+              "breadcrumb": "OneupMcpServer"
             },
             {
-              "segment_id": "9c74d36e7f58",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
+              "segment_id": "2b21089a6676",
+              "file_path": "src/mcp/server.rs"
             },
             {
-              "segment_id": "cbcace6ee839",
-              "file_path": "tests/integration_tests.rs"
-            },
-            {
-              "segment_id": "a47ddca6cb94",
+              "segment_id": "aeebc3ba4c02",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "d2def532f944",
-              "file_path": "evals/suites/shared/assertions/index.ts"
-            },
-            {
-              "segment_id": "120e4e3a4101",
-              "file_path": "CLAUDE.md"
+              "segment_id": "a177733b5f5a",
+              "file_path": "evals/suites/1up-search/search-bench.ts"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [0, 1, 2],
-          "hit_count": 3,
-          "recall": 1
+          "matched_indices": [
+            0,
+            1
+          ],
+          "hit_count": 2,
+          "recall": 0.6666666666666666
         },
         {
           "query": "rebuild index after schema version bump",
@@ -1984,97 +2009,95 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "5c0289cf6809",
-              "file_path": "src/storage/schema.rs",
-              "breadcrumb": "tests"
+              "segment_id": "97a4ceb63e19",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "StagingRebuild"
             },
             {
-              "segment_id": "841b14e0056a",
+              "segment_id": "3a9ac3f1cc4e",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "a2a6023ed20b",
+              "segment_id": "9183831f644c",
               "file_path": "src/storage/schema.rs"
             },
             {
-              "segment_id": "e5782e135c57",
-              "file_path": "src/storage/segments.rs",
+              "segment_id": "460850f75ddb",
+              "file_path": "src/storage/schema.rs"
+            },
+            {
+              "segment_id": "699190561b76",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "e7e976a5c832",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "7ab888d3c65a",
+              "file_path": "src/storage/swap.rs"
+            },
+            {
+              "segment_id": "68d6e89acd17",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "2fd4ab9e92ea",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "752b2f98f417",
+              "file_path": "tests/integration_tests.rs"
+            },
+            {
+              "segment_id": "e2167deb8521",
+              "file_path": "src/cli/start.rs"
+            },
+            {
+              "segment_id": "e00b2dd604ac",
+              "file_path": "tests/cli_tests.rs"
+            },
+            {
+              "segment_id": "4ce98796f67d",
+              "file_path": "src/daemon/worker.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "76cf30b9becc",
+              "segment_id": "446e4bf503b1",
+              "file_path": "src/mcp/ops.rs"
+            },
+            {
+              "segment_id": "4821aaec0bfa",
+              "file_path": "tests/cli_tests.rs"
+            },
+            {
+              "segment_id": "c4c7706b3eca",
+              "file_path": "src/storage/swap.rs",
+              "breadcrumb": "Drop for StagingRebuild"
+            },
+            {
+              "segment_id": "e4d759f9e908",
               "file_path": "src/shared/constants.rs"
             },
             {
-              "segment_id": "883b458ef54a",
-              "file_path": "src/storage/segments.rs",
-              "breadcrumb": "tests"
+              "segment_id": "c37114dd5065",
+              "file_path": "src/shared/config.rs"
             },
             {
-              "segment_id": "d25734271d22",
-              "file_path": "tests/rewrite_sql_verification.rs"
+              "segment_id": "9c4fd5932742",
+              "file_path": "src/cli/reindex.rs"
             },
             {
-              "segment_id": "7c2b5e8f19ef",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "a1f842b74a7c",
-              "file_path": "src/cli/impact.rs"
-            },
-            {
-              "segment_id": "264a58c9c46e",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "7e1ac92e0377",
-              "file_path": "src/shared/constants.rs"
-            },
-            {
-              "segment_id": "21a5c754cd02",
-              "file_path": "tests/rewrite_sql_verification.rs"
-            },
-            {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "3c1968a5da7a",
-              "file_path": "src/indexer/embedder.rs",
-              "breadcrumb": "ActiveArtifactPointer"
-            },
-            {
-              "segment_id": "3075703c29ea",
-              "file_path": "src/indexer/pipeline.rs",
-              "breadcrumb": "TimingAccumulator"
-            },
-            {
-              "segment_id": "84bee24dc679",
-              "file_path": "src/shared/update.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "031b2df042dc",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
-            },
-            {
-              "segment_id": "ec833f291fd4",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "Formatter for HumanFormatter"
-            },
-            {
-              "segment_id": "3620c9fb3092",
-              "file_path": "src/indexer/pipeline.rs"
-            },
-            {
-              "segment_id": "4f0d8b58b9ce",
-              "file_path": "src/shared/update.rs"
+              "segment_id": "7d7443cd41df",
+              "file_path": "tests/cli_tests.rs"
             }
           ],
           "gold_size": 3,
-          "matched_indices": [],
-          "hit_count": 0,
-          "recall": 0
+          "matched_indices": [
+            1
+          ],
+          "hit_count": 1,
+          "recall": 0.3333333333333333
         },
         {
           "query": "relation descriptor with lookup canonical symbol and qualifier fingerprint",
@@ -2082,95 +2105,97 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "e5eb43f99145",
+              "segment_id": "23f8dec6732e",
               "file_path": "src/storage/relations.rs"
             },
             {
-              "segment_id": "847a773129e0",
+              "segment_id": "ed7c53eb1739",
+              "file_path": "src/storage/relations.rs"
+            },
+            {
+              "segment_id": "2885c6d9cb2d",
+              "file_path": "src/storage/relations.rs"
+            },
+            {
+              "segment_id": "3345bd202699",
               "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "687443598d6e",
-              "file_path": "src/search/impact.rs"
-            },
-            {
-              "segment_id": "84174f758f5e",
+              "segment_id": "ef8894b432c1",
               "file_path": "src/search/impact.rs",
               "breadcrumb": "ImpactHorizonEngine<'a>"
             },
             {
-              "segment_id": "390fbc5e7cb1",
-              "file_path": "src/storage/relations.rs"
+              "segment_id": "ba6b1269da58",
+              "file_path": "src/search/impact.rs"
             },
             {
-              "segment_id": "1deba4b78526",
-              "file_path": "src/storage/relations.rs"
-            },
-            {
-              "segment_id": "06745c7c5786",
-              "file_path": "src/search/symbol.rs"
-            },
-            {
-              "segment_id": "13bb8054d1a3",
+              "segment_id": "86e83b1ac9cc",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "2f687e13797b",
+              "segment_id": "e804da021a66",
               "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "7df7b14f6d34",
-              "file_path": "src/indexer/parser.rs"
+              "segment_id": "748ec6747672",
+              "file_path": "src/storage/queries.rs"
             },
             {
-              "segment_id": "ec1b69853398",
-              "file_path": "src/indexer/parser.rs"
-            },
-            {
-              "segment_id": "9490b04c9a7b",
+              "segment_id": "a4496feb170d",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "f3e12fa42c04",
+              "segment_id": "34773b3ae128",
               "file_path": "src/search/symbol.rs",
               "breadcrumb": "SymbolSearchEngine<'a>"
             },
             {
-              "segment_id": "864abe0d96e3",
+              "segment_id": "455bd80e615b",
               "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "ca1fd7728b4e",
-              "file_path": "src/shared/symbols.rs",
-              "breadcrumb": "tests"
-            },
-            {
-              "segment_id": "96e780a761d6",
-              "file_path": "src/storage/queries.rs"
-            },
-            {
-              "segment_id": "6f9afec73355",
+              "segment_id": "9c19c5a5e1db",
               "file_path": "src/storage/segments.rs"
             },
             {
-              "segment_id": "59fa636ab1c9",
-              "file_path": "benches/search_bench.rs"
+              "segment_id": "ab0e38f645a9",
+              "file_path": "src/search/symbol.rs"
             },
             {
-              "segment_id": "0845b98e4b22",
-              "file_path": "src/shared/symbols.rs"
+              "segment_id": "08d03cd9b19b",
+              "file_path": "src/indexer/parser.rs"
             },
             {
-              "segment_id": "9b2a1d78ddee",
-              "file_path": "src/search/hybrid.rs",
-              "breadcrumb": "tests"
+              "segment_id": "3bf9ff91ffd1",
+              "file_path": "src/indexer/parser.rs"
+            },
+            {
+              "segment_id": "8e2d26870254",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "fb2980d37c80",
+              "file_path": "src/indexer/markdown.rs"
+            },
+            {
+              "segment_id": "d6b9cac65ba5",
+              "file_path": "src/storage/segments.rs"
+            },
+            {
+              "segment_id": "26e98f404d12",
+              "file_path": "src/mcp/ops.rs"
             }
           ],
           "gold_size": 4,
-          "matched_indices": [0, 1, 2, 3],
-          "hit_count": 4,
-          "recall": 1
+          "matched_indices": [
+            1,
+            2,
+            3
+          ],
+          "hit_count": 3,
+          "recall": 0.75
         },
         {
           "query": "benchmark parallel indexing script emitting JSON summary",
@@ -2178,89 +2203,93 @@
           "match_mode": "anchor",
           "retrieved_top_k": [
             {
-              "segment_id": "cffb2b0f4db5",
+              "segment_id": "a1c87f4c9be0",
+              "file_path": "DEVELOPMENT.md",
+              "breadcrumb": "DEVELOPMENT > Development > Benchmarking"
+            },
+            {
+              "segment_id": "3ba3ffe378a2",
               "file_path": "scripts/benchmark_parallel_indexing.sh"
             },
             {
-              "segment_id": "3f341ac5939d",
+              "segment_id": "9e032aed5660",
+              "file_path": "scripts/benchmark_parallel_indexing.sh"
+            },
+            {
+              "segment_id": "d1945fa16fb5",
+              "file_path": "scripts/benchmark_parallel_indexing.sh"
+            },
+            {
+              "segment_id": "9d46cb877740",
               "file_path": "scripts/release/generate_release_evidence.sh"
             },
             {
-              "segment_id": "58975ec3a1a9",
-              "file_path": "src/cli/output.rs",
-              "breadcrumb": "tests"
+              "segment_id": "2ea3636bd10a",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "68877eec795c",
-              "file_path": "src/indexer/pipeline.rs",
-              "breadcrumb": "tests"
+              "segment_id": "c20ddee84911",
+              "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "97acda07efb3",
+              "segment_id": "2424fdc8c9b1",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "Formatter for JsonFormatter"
             },
             {
-              "segment_id": "b88ada34b008",
-              "file_path": "scripts/benchmark_parallel_indexing.sh"
-            },
-            {
-              "segment_id": "ec445a8d4ccd",
-              "file_path": "scripts/benchmark_parallel_indexing.sh"
-            },
-            {
-              "segment_id": "9c74d36e7f58",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
-            },
-            {
-              "segment_id": "e6a84f7da2e2",
-              "file_path": "scripts/release/generate_release_evidence.sh"
-            },
-            {
-              "segment_id": "13657e94b291",
+              "segment_id": "dd70b6985856",
               "file_path": "src/cli/output.rs",
               "breadcrumb": "tests"
             },
             {
-              "segment_id": "e8b09cea3f2e",
+              "segment_id": "14fde6407aec",
               "file_path": "scripts/benchmark_vector_index_size.sh"
             },
             {
-              "segment_id": "646e7e4a1099",
-              "file_path": "scripts/benchmark_vector_index_size.sh"
+              "segment_id": "da41419b2844",
+              "file_path": "src/search/hybrid.rs",
+              "breadcrumb": "tests"
             },
             {
-              "segment_id": "ff51fdbbc4da",
-              "file_path": "DEVELOPMENT.md"
+              "segment_id": "bf8103919666",
+              "file_path": "src/indexer/pipeline.rs",
+              "breadcrumb": "tests"
             },
             {
-              "segment_id": "1ec87940cee6",
-              "file_path": "evals/suites/1up-search/search-bench.ts"
-            },
-            {
-              "segment_id": "41149ad6922f",
-              "file_path": "tests/cli_tests.rs"
-            },
-            {
-              "segment_id": "fa2faf80a046",
-              "file_path": "tests/cli_tests.rs"
-            },
-            {
-              "segment_id": "a04d2c0761b6",
+              "segment_id": "a3b15eb47827",
               "file_path": "scripts/release/generate_release_evidence.sh"
             },
             {
-              "segment_id": "c087018c3f6d",
-              "file_path": "evals/summary.sh"
+              "segment_id": "f916395aafab",
+              "file_path": "README.md",
+              "breadcrumb": "README > Product Proof"
             },
             {
-              "segment_id": "0c5a33fe7381",
-              "file_path": "src/indexer/chunker.rs"
+              "segment_id": "6e76f3a2caea",
+              "file_path": "justfile"
             },
             {
-              "segment_id": "90f1cd7de522",
+              "segment_id": "4629c996167f",
+              "file_path": "scripts/release/generate_release_evidence.sh"
+            },
+            {
+              "segment_id": "6240dfc3cb9c",
               "file_path": "src/indexer/pipeline.rs",
               "breadcrumb": "tests"
+            },
+            {
+              "segment_id": "2d3184280897",
+              "file_path": "RELEASE.md",
+              "breadcrumb": "RELEASE > Release > Merge-Gate Versus Release-Time Evidence"
+            },
+            {
+              "segment_id": "947be044e6a6",
+              "file_path": "scripts/baselines/vector_index_size_baseline.json"
+            },
+            {
+              "segment_id": "20ea15247c22",
+              "file_path": "CONTRIBUTING.md",
+              "breadcrumb": "CONTRIBUTING > Contributing > Advisory Release Evidence"
             }
           ],
           "gold_size": 3,
@@ -2270,5 +2299,22 @@
         }
       ]
     }
-  ]
+  ],
+  "gates": {
+    "expected_variant": "int8",
+    "tolerance": 0.02,
+    "preflight": {
+      "ok": true,
+      "failures": []
+    },
+    "degraded_stderr_queries": [],
+    "recall": {
+      "verdict": "pass",
+      "regressions": []
+    }
+  },
+  "delta_vs_baseline": {
+    "recall_at_10": 0,
+    "recall_at_20": 0.0222222222222222
+  }
 }
