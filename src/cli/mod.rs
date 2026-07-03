@@ -133,6 +133,10 @@ What is pruned, relative to the worktree you run it in:
 branch. That branch's index rebuilds on demand the next time you search it.
   - source-missing: a context whose source directory no longer exists on disk \
 (for example a deleted linked worktree).
+  - nested-subdir: an orphan context whose source is a non-git-root subdirectory \
+inside THIS worktree. Older versions minted these when 1up was run from a \
+subdirectory; the current resolution clamp reuses the repo-root context instead, so \
+these are permanently unreachable and safe to reclaim.
 
 The active context (the branch currently checked out where you run gc) is ALWAYS \
 kept, and contexts belonging to other still-present worktrees are left untouched \

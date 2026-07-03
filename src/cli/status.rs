@@ -60,37 +60,42 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         read_daemon_context_status(&project_root, &worktree_context.context_id);
     let daemon_status = read_daemon_status_for_context(&project_root, &worktree_context.context_id);
 
+    let mut index_unavailable_reason: Option<String> = None;
     let (indexed_files, total_segments, vector_rows, embeddable_segments) = {
         if db_path.exists() {
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
-                        if schema::ensure_current(
+                        match schema::ensure_current(
                             &conn,
                             &schema::SchemaContext::new(&db_path, &source_root),
                         )
                         .await
-                        .is_ok()
                         {
-                            index_readable = true;
-                            let context_id = &worktree_context.context_id;
-                            let files = segments::count_files_for_context(&conn, context_id)
-                                .await
-                                .ok();
-                            let segs = segments::count_segments_for_context(&conn, context_id)
-                                .await
-                                .ok();
-                            let vectors =
-                                segments::count_vector_rows_for_context(&conn, context_id)
+                            Ok(()) => {
+                                index_readable = true;
+                                let context_id = &worktree_context.context_id;
+                                let files = segments::count_files_for_context(&conn, context_id)
                                     .await
                                     .ok();
-                            let embeddable =
-                                segments::count_embeddable_segments_for_context(&conn, context_id)
+                                let segs = segments::count_segments_for_context(&conn, context_id)
                                     .await
                                     .ok();
-                            (files, segs, vectors, embeddable)
-                        } else {
-                            (None, None, None, None)
+                                let vectors =
+                                    segments::count_vector_rows_for_context(&conn, context_id)
+                                        .await
+                                        .ok();
+                                let embeddable = segments::count_embeddable_segments_for_context(
+                                    &conn, context_id,
+                                )
+                                .await
+                                .ok();
+                                (files, segs, vectors, embeddable)
+                            }
+                            Err(err) => {
+                                index_unavailable_reason = Some(err.to_string());
+                                (None, None, None, None)
+                            }
                         }
                     }
                     Err(_) => (None, None, None, None),
@@ -153,6 +158,7 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
             .and_then(|status| status.last_refresh_error.clone()),
         index_present,
         index_readable,
+        index_unavailable_reason,
         last_file_check_at: daemon_status.map(|status| status.last_file_check_at),
         index_progress,
     };

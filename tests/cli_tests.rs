@@ -1499,6 +1499,80 @@ fn list_and_status_show_linked_worktree_context_sharing_main_state() {
     assert!(!canonical_worktree.join(".1up").join("project_id").exists());
 }
 
+/// REQ-001: invoking 1up from a nested subdirectory of the main worktree must
+/// reuse the repo-root context rather than minting a duplicate subdir-scoped
+/// context. Before the `source_root` clamp, a subdir invocation resolved
+/// `source_root` to the subdir, producing a different `context_id`, a search
+/// narrowed to the subdir, and a second recorded `worktree_contexts` row.
+#[test]
+fn subdir_invocation_reuses_repo_root_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Force FTS-only so the run is deterministic and never blocks on a download.
+    seed_model_download_failure(&canonical_home);
+
+    // A source file that lives OUTSIDE the subdir we will invoke from, so a
+    // full-repo search proves the subdir invocation is not narrowed.
+    let query = "subdir_clamp_outside_marker";
+    fs::create_dir_all(root.join("outside")).unwrap();
+    fs::write(
+        root.join("outside").join("outside.rs"),
+        format!("pub fn {query}() -> u32 {{\n    7\n}}\n"),
+    )
+    .unwrap();
+    let subdir = root.join("src").join("nested");
+    fs::create_dir_all(&subdir).unwrap();
+
+    cmd_with_home(&canonical_home)
+        .args(["index", root.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    let root_context_id = status_json(&canonical_home, &root)["context_id"]
+        .as_str()
+        .expect("status must report a context_id")
+        .to_string();
+    let subdir_context_id = status_json(&canonical_home, &subdir)["context_id"]
+        .as_str()
+        .expect("subdir status must report a context_id")
+        .to_string();
+    assert_eq!(
+        subdir_context_id, root_context_id,
+        "subdir invocation must reuse the repo-root context id"
+    );
+
+    let search = cmd_with_home(&canonical_home)
+        .args(["search", query, "--path", subdir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search from subdir should succeed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_stdout = String::from_utf8(search.stdout).unwrap();
+    assert!(
+        search_stdout.contains("outside/outside.rs"),
+        "subdir search must reflect the full repo-root index and hit a file \
+         outside the subdir; stdout={search_stdout}"
+    );
+
+    let contexts = block_on(async {
+        let db = Db::open_ro(&project_db_path(&root)).await.unwrap();
+        let conn = db.connect().unwrap();
+        segments::list_worktree_contexts(&conn).await.unwrap()
+    });
+    assert_eq!(
+        contexts.len(),
+        1,
+        "normal subdir usage must not record a second context; got {contexts:?}"
+    );
+    assert_eq!(contexts[0].context_id, root_context_id);
+}
+
 #[test]
 fn start_refuses_to_auto_initialize_non_git_directory() {
     let dir = tempfile::tempdir().unwrap();

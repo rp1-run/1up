@@ -212,6 +212,12 @@ pub struct ResolvedProject {
 /// state to the main worktree root while scanning files from the linked
 /// worktree. Other paths reuse the nearest existing `.1up/` ancestor before
 /// falling back to the enclosing git root.
+///
+/// Invariant: every non-linked-worktree resolution returns
+/// `source_root == state_root`. A subdirectory invocation of a main worktree
+/// therefore clamps its `source_root` to the `.1up/`-owning ancestor and reuses
+/// the repo-root `context_id` instead of minting a duplicate subdir-scoped
+/// context. Only linked worktrees keep the `state_root != source_root` split.
 pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
     let canonical = path.canonicalize()?;
 
@@ -224,7 +230,7 @@ pub fn resolve_project_root(path: &Path) -> std::io::Result<ResolvedProject> {
     }
 
     if let Some(existing_root) = find_existing_project_root(&canonical) {
-        return Ok(resolved_project(existing_root, canonical, None));
+        return Ok(resolved_project(existing_root.clone(), existing_root, None));
     }
 
     if let Some(git_root) = resolve_git_root(&canonical) {
@@ -705,7 +711,66 @@ mod tests {
 
         let resolved = resolve_project_root(&subdir).unwrap();
         assert_eq!(resolved.state_root, root);
-        assert_eq!(resolved.source_root, subdir);
+        // The clamp reuses the `.1up/`-owning ancestor as the source root instead
+        // of the invocation subdir, so a subdir invocation shares the repo-root
+        // context rather than minting a duplicate.
+        assert_eq!(resolved.source_root, root);
+    }
+
+    #[test]
+    fn resolve_project_root_clamps_subdir_source_to_state_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        let subdir = root.join("src").join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let from_subdir = resolve_project_root(&subdir).unwrap();
+        let from_root = resolve_project_root(&root).unwrap();
+
+        assert_eq!(from_subdir.state_root, root);
+        assert_eq!(
+            from_subdir.source_root, from_subdir.state_root,
+            "non-linked resolution must satisfy source_root == state_root"
+        );
+        assert_eq!(
+            from_subdir.worktree_context.context_id, from_root.worktree_context.context_id,
+            "a subdir invocation must reuse the repo-root context id"
+        );
+    }
+
+    #[test]
+    fn resolve_project_root_linked_worktree_subdir_keeps_worktree_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let main_repo = tmp_root.join("main");
+        let worktree = tmp_root.join("worktree");
+        write_main_git_branch(
+            &main_repo,
+            "main",
+            "1111111111111111111111111111111111111111",
+        );
+        write_linked_worktree_branch(
+            &main_repo,
+            &worktree,
+            "feature",
+            "2222222222222222222222222222222222222222",
+        );
+        let subdir = worktree.join("src").join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let from_subdir = resolve_project_root(&subdir).unwrap();
+        let from_worktree_root = resolve_project_root(&worktree).unwrap();
+
+        // WorktreeContext isolation is preserved: the linked worktree keeps its
+        // state_root != source_root split regardless of the invocation subdir,
+        // and the context id is unchanged across invocation locations.
+        assert_eq!(from_subdir.state_root, main_repo);
+        assert_eq!(from_subdir.source_root, worktree);
+        assert_eq!(
+            from_subdir.worktree_context.context_id,
+            from_worktree_root.worktree_context.context_id
+        );
     }
 
     #[test]

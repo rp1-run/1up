@@ -216,6 +216,27 @@ jobs:
           ' Cargo.toml)
           bash scripts/release/validate_release_metadata.sh "v${version}"
 
+  evals-typecheck:
+    # Typecheck the evals TypeScript so type errors are caught in CI. Runs the
+    # same `tsc -p tsconfig.json --noEmit` gate as `bun run typecheck`; no Rust
+    # toolchain needed.
+    name: evals-typecheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: install dependencies
+        working-directory: evals
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: typecheck evals
+        working-directory: evals
+        shell: bash
+        run: bun run typecheck
+
   setup-script-lint:
     # Shell-only lint gates for scripts/install/setup.sh. Runs fast, with no
     # Rust toolchain needed. Bash 3.2 compatibility is covered by a pinned
