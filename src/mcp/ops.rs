@@ -34,8 +34,8 @@ use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
-    count_vector_rows_for_context, get_segment_by_id_for_context,
-    get_segment_by_prefix_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
+    count_vector_rows_for_context, get_segment_by_prefix_for_context,
+    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
     StoredSegment,
 };
 use crate::storage::swap;
@@ -475,7 +475,7 @@ pub async fn classify_readiness(
         }
     };
 
-    let conn = match db.connect() {
+    let conn = match db.connect_tuned().await {
         Ok(conn) => conn,
         Err(err) => {
             if daemon_refresh_active {
@@ -523,13 +523,31 @@ pub async fn classify_readiness(
         return payload;
     }
 
+    // index_readable must imply the own-context counts were actually read. If the
+    // counts cannot be read right now (e.g. the auto-started daemon holds the write
+    // lock during a concurrent refresh), report indexing/stale rather than claiming
+    // index_readable with silently-omitted counts — that mismatch (index_readable
+    // true alongside a null count) is what made the status-count assertions flaky
+    // under parallel CI load.
+    let (indexed_files, total_segments) = match (
+        count_files_for_context(&conn, &worktree_context.context_id).await,
+        count_segments_for_context(&conn, &worktree_context.context_id).await,
+    ) {
+        (Ok(files), Ok(segments)) => (files, segments),
+        _ => {
+            if daemon_refresh_active {
+                payload.status = ReadinessStatus::Indexing;
+                payload.summary = "Indexing is currently running.".to_string();
+            } else {
+                payload.status = ReadinessStatus::Stale;
+                payload.summary = "The index exists but its contents cannot be read.".to_string();
+            }
+            return payload;
+        }
+    };
     payload.index_readable = true;
-    payload.indexed_files = count_files_for_context(&conn, &worktree_context.context_id)
-        .await
-        .ok();
-    payload.total_segments = count_segments_for_context(&conn, &worktree_context.context_id)
-        .await
-        .ok();
+    payload.indexed_files = Some(indexed_files);
+    payload.total_segments = Some(total_segments);
     payload.vector_rows = count_vector_rows_for_context(&conn, &worktree_context.context_id)
         .await
         .ok();
@@ -726,6 +744,23 @@ pub async fn run_search(
         .await
 }
 
+/// Process-global warm embedding runtime for the in-process MCP fallback search
+/// path (R-008).
+///
+/// The MCP server process serves many tool calls over its lifetime. When the
+/// daemon is unavailable, `run_search_once` embeds the query in-process; keeping a
+/// single warmed [`EmbeddingRuntime`] here lets the second and later searches
+/// reuse the already-loaded ONNX session instead of cold-loading a fresh
+/// `EmbeddingRuntime::default()` per call. A `tokio::sync::Mutex` serializes
+/// access because the cached `Embedder` is borrowed `&mut` during a search; MCP
+/// queries are served one at a time on this path, so the lock is effectively
+/// uncontended.
+fn fallback_embedding_runtime() -> &'static tokio::sync::Mutex<EmbeddingRuntime> {
+    static RUNTIME: std::sync::OnceLock<tokio::sync::Mutex<EmbeddingRuntime>> =
+        std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::sync::Mutex::new(EmbeddingRuntime::default()))
+}
+
 async fn run_search_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
@@ -739,7 +774,14 @@ async fn run_search_once(
     // for this context, the embedding model must never be initialized.
     let has_vectors = retrieval::has_indexed_embeddings(&current.conn, &search_scope).await?;
     let (results, embedding_reason) = if has_vectors {
-        let mut runtime = EmbeddingRuntime::default();
+        // Warm the in-process fallback embedding runtime instead of cold-loading
+        // `EmbeddingRuntime::default()` on every call (R-008). The MCP server is a
+        // long-lived process serving many tool calls; this in-process search path
+        // runs when the daemon is unavailable, so a per-call cold load would
+        // re-read and re-initialize the ONNX session for each query. The runtime
+        // is held in a process-global cache and `prepare_for_search` returns
+        // `Warm` (a no-op) after the first successful load.
+        let mut runtime = fallback_embedding_runtime().lock().await;
         let embedding_status = runtime.prepare_for_search(1);
         let embedding_reason = embedding_unavailable_reason(&embedding_status);
         let results = if embedding_status.is_available() {
@@ -747,7 +789,8 @@ async fn run_search_once(
                 &current.conn,
                 runtime.current_embedder(),
                 search_scope.clone(),
-            );
+            )
+            .with_has_vectors(has_vectors);
             engine.search(query, limit).await?
         } else {
             let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
@@ -800,13 +843,8 @@ async fn get_handles_once(
     handles: &[String],
 ) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
-    let mut records = Vec::with_capacity(handles.len());
-
-    for handle in handles {
-        records.push(
-            resolve_handle_record(&current.conn, &worktree_context.context_id, handle).await?,
-        );
-    }
+    let records =
+        resolve_handle_records(&current.conn, &worktree_context.context_id, handles).await?;
 
     Ok(ReadPayload {
         status: aggregate_read_status(&records),
@@ -1111,37 +1149,74 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     }
 
     let db = Db::open_ro(&db_path).await?;
-    let conn = db.connect()?;
+    let conn = db.connect_tuned().await?;
     schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, state_root)).await?;
 
     Ok(CurrentIndex { conn, _db: db })
 }
 
-async fn resolve_handle_record(
+/// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
+/// order. The exact-id pass is collapsed into a single `id IN (...)` batch
+/// lookup (R-013); only the residual handles that did not exact-match (12-char
+/// display handles and genuine misses) fall back to the per-handle prefix
+/// lookup. Each handle is resolved independently, so the per-handle
+/// Found/NotFound/Ambiguous outcome and the empty-handle rejection are identical
+/// to resolving handles one at a time.
+async fn resolve_handle_records(
     conn: &Connection,
     context_id: &str,
-    raw_handle: &str,
+    handles: &[String],
+) -> anyhow::Result<Vec<ReadRecord>> {
+    let normalized: Vec<String> = handles
+        .iter()
+        .map(|handle| normalize_handle(handle))
+        .collect();
+
+    // One batched exact-id fetch for the non-empty normalized handles. An id with
+    // no row simply misses the map and falls through to the prefix residual
+    // below — the same per-handle path as resolving exact-then-prefix one at a
+    // time. Duplicate ids are harmless (the map keys on id).
+    let exact_ids: Vec<String> = normalized
+        .iter()
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .collect();
+    let segments_by_id = get_segments_by_ids_for_context(conn, context_id, &exact_ids).await?;
+
+    let mut records = Vec::with_capacity(handles.len());
+    for (raw_handle, normalized) in handles.iter().zip(normalized) {
+        let source = ReadSource::Handle {
+            raw: raw_handle.clone(),
+            normalized: normalized.clone(),
+        };
+
+        if normalized.is_empty() {
+            records.push(read_message(
+                ReadStatus::NotFound,
+                source,
+                "empty segment handle",
+            ));
+        } else if let Some(segment) = segments_by_id.get(&normalized) {
+            records.push(read_segment(source, segment.clone()));
+        } else {
+            records.push(resolve_handle_via_prefix(conn, context_id, source, &normalized).await?);
+        }
+    }
+
+    Ok(records)
+}
+
+/// Residual prefix resolution for a handle that did not match an exact id:
+/// byte-identical to the prefix branch of the per-handle path, distinguishing
+/// unique matches from ambiguous prefixes via [`SegmentPrefixLookup`].
+async fn resolve_handle_via_prefix(
+    conn: &Connection,
+    context_id: &str,
+    source: ReadSource,
+    normalized: &str,
 ) -> anyhow::Result<ReadRecord> {
-    let normalized = normalize_handle(raw_handle);
-    let source = ReadSource::Handle {
-        raw: raw_handle.to_string(),
-        normalized: normalized.clone(),
-    };
-
-    if normalized.is_empty() {
-        return Ok(read_message(
-            ReadStatus::NotFound,
-            source,
-            "empty segment handle",
-        ));
-    }
-
-    if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
-        return Ok(read_segment(source, segment));
-    }
-
     Ok(
-        match get_segment_by_prefix_for_context(conn, context_id, &normalized).await? {
+        match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
             SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
             SegmentPrefixLookup::NotFound => {
                 read_message(ReadStatus::NotFound, source, "segment handle was not found")
@@ -1941,6 +2016,118 @@ mod tests {
             !payload.results.is_empty(),
             "FTS-only search should still return lexical hits"
         );
+    }
+
+    #[tokio::test]
+    async fn get_handles_batched_matches_per_item_outcomes_and_order() {
+        // R-013: the batched exact-id + residual-prefix resolver must return the
+        // same per-handle Found/NotFound/Ambiguous outcomes, in input order, as
+        // resolving each handle one at a time (exact id, then prefix).
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-get";
+        for (id, file) in [
+            ("aaaa1111bbbb2222", "src/a.rs"),
+            ("aaaa1111cccc3333", "src/b.rs"),
+            ("dddd4444eeee5555", "src/c.rs"),
+        ] {
+            segments::upsert_segment_for_context(&conn, ctx, &test_segment(id, file))
+                .await
+                .unwrap();
+        }
+
+        let handles = vec![
+            "dddd4444eeee5555".to_string(),  // exact id (batch) -> Found
+            ":dddd4444eeee5555".to_string(), // ':'-stripped exact id -> Found
+            "dddd4444eeee".to_string(),      // unique 12-char prefix -> residual Found
+            "aaaa1111".to_string(),          // ambiguous prefix -> residual Ambiguous
+            String::new(),                   // empty -> NotFound (empty)
+            ":".to_string(),                 // normalizes to empty -> NotFound (empty)
+            "zzzznotfound0000".to_string(),  // full id, no row -> residual NotFound
+            "dddd4444eeee5555".to_string(),  // duplicate of #1 -> Found (independent)
+        ];
+
+        let batched = resolve_handle_records(&conn, ctx, &handles).await.unwrap();
+
+        // Reconstruct the per-item baseline: exact id, then prefix, per handle.
+        let mut expected = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            expected.push(
+                resolve_handle_record_per_item(&conn, ctx, handle)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_value(&batched).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "batched get must match the per-item path field-for-field, in order"
+        );
+
+        // Pin the concrete outcomes + order so the test still has teeth if both
+        // paths regressed together.
+        let statuses: Vec<ReadStatus> = batched.iter().map(|record| record.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::Ambiguous,
+                ReadStatus::NotFound,
+                ReadStatus::NotFound,
+                ReadStatus::NotFound,
+                ReadStatus::Found,
+            ]
+        );
+        assert_eq!(
+            batched[3].matching_handles.len(),
+            2,
+            "ambiguous prefix surfaces both colliding ids"
+        );
+        assert_eq!(
+            batched[0].segment.as_ref().unwrap().handle,
+            "dddd4444eeee5555"
+        );
+        assert_eq!(
+            batched[7].segment.as_ref().unwrap().handle,
+            "dddd4444eeee5555",
+            "a duplicate handle resolves independently and preserves order"
+        );
+    }
+
+    /// Per-item baseline (relocated from the pre-R-013 `resolve_handle_record`):
+    /// resolve one handle by exact id, then by prefix. The batched
+    /// `resolve_handle_records` must match this field-for-field.
+    async fn resolve_handle_record_per_item(
+        conn: &Connection,
+        context_id: &str,
+        raw_handle: &str,
+    ) -> anyhow::Result<ReadRecord> {
+        use crate::storage::segments::get_segment_by_id_for_context;
+
+        let normalized = normalize_handle(raw_handle);
+        let source = ReadSource::Handle {
+            raw: raw_handle.to_string(),
+            normalized: normalized.clone(),
+        };
+
+        if normalized.is_empty() {
+            return Ok(read_message(
+                ReadStatus::NotFound,
+                source,
+                "empty segment handle",
+            ));
+        }
+
+        if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
+            return Ok(read_segment(source, segment));
+        }
+
+        resolve_handle_via_prefix(conn, context_id, source, &normalized).await
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use libsql::Connection;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -87,6 +88,21 @@ struct ProjectState {
     /// orphaned pre-swap inode and must be reopened before any pass touches it
     /// (HYP-002). `None` when the index was absent when `db` was opened.
     index_identity: Option<IndexFileIdentity>,
+    /// Cached per-context vector `COUNT(*)` for the open index (R-007), populated
+    /// lazily on the first search that needs it and reused across requests so the
+    /// hot path skips a per-query `COUNT(*)`. MUST be invalidated (`None`) on
+    /// `reopen_if_index_swapped` so a build-aside swap never serves a stale count
+    /// into `vector_search_path_for_corpus` (exhaustive-vs-ANN) path selection.
+    cached_vector_count: Option<usize>,
+    /// One reused tuned read [`Connection`] to the open index, serving repeated
+    /// daemon searches without a fresh per-request `connect()` + PRAGMA pass
+    /// (R-008). Created lazily on the first search and dropped (`None`) whenever
+    /// the backing `db` is reopened on a build-aside swap
+    /// (`reopen_if_index_swapped`), so a reused connection can never outlive the
+    /// inode it was opened against and serve through an orphaned pre-swap handle.
+    /// `libsql` caches prepared statements on the connection, so reusing it also
+    /// reuses the prepared statements for the repeated search queries.
+    read_conn: Option<Connection>,
     indexing: Option<IndexingConfig>,
     embedding_runtime: EmbeddingRuntime,
     run_state: ProjectRunState,
@@ -785,6 +801,8 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         context: context_from_entry(entry),
         db,
         index_identity,
+        cached_vector_count: None,
+        read_conn: None,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
         run_state: ProjectRunState::default(),
@@ -856,7 +874,45 @@ async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupEr
 
     state.db = db;
     state.index_identity = current_identity;
+    // Drop the reused read connection: it (and its cached prepared statements)
+    // was bound to the pre-swap `db`/inode, so it must be reopened against the
+    // freshly-adopted index before the next search (R-008). The next search
+    // lazily re-creates it via `connect_tuned`, which re-runs the read PRAGMA
+    // profile on the new handle.
+    state.read_conn = None;
+    // The swapped-in index has its own vector population; drop the cached count
+    // so the next search recomputes it against the refreshed index (R-007). A
+    // stale count here could flip `vector_search_path_for_corpus` between the
+    // exhaustive scan and the ANN path and silently change served candidates.
+    state.cached_vector_count = None;
     Ok(())
+}
+
+/// Return the daemon's reused tuned read connection for `state`, creating it on
+/// first use (R-008).
+///
+/// Repeated daemon searches share one [`Connection`] (and its libSQL prepared-
+/// statement cache) instead of opening a fresh connection and re-running the read
+/// PRAGMA profile per request. The connection is bound to the currently-open
+/// `state.db`; `reopen_if_index_swapped` drops it (`read_conn = None`) on a
+/// build-aside swap, so the next call here re-creates it against the adopted
+/// index — a reused connection can never outlive the inode it was opened against.
+///
+/// The returned value is a clone of the cached handle. `libsql::Connection` is an
+/// `Arc`-backed handle, so the clone shares the same underlying connection and
+/// statement cache; cloning only lets the caller use the connection without
+/// holding a borrow on `state` across the later `&mut state` accesses (cached
+/// count, embedding runtime).
+async fn ensure_read_conn(state: &mut ProjectState) -> Result<Connection, OneupError> {
+    if state.read_conn.is_none() {
+        state.read_conn = Some(state.db.connect_tuned().await?);
+    }
+    // Safe: just populated above when absent.
+    Ok(state
+        .read_conn
+        .as_ref()
+        .expect("read_conn populated")
+        .clone())
 }
 
 fn context_from_entry(entry: &ProjectEntry) -> WorktreeContext {
@@ -1600,7 +1656,14 @@ async fn handle_search_request(
         }
     };
 
-    let conn = match state.db.connect() {
+    // Reuse one tuned read connection across requests (R-008). The schema is NOT
+    // re-validated here: `ensure_current` is authoritative at index-open
+    // (`load_project_state` -> `prepare_for_write`) and on every build-aside swap
+    // (`reopen_if_index_swapped` -> `prepare_for_write`, called just above), and
+    // `read_conn` is dropped on swap, so a served connection always belongs to an
+    // index whose schema was validated when it was adopted. Hoisting the gate out
+    // of the per-request path is sound only because every (re)open re-runs it.
+    let conn = match ensure_read_conn(state).await {
         Ok(conn) => conn,
         Err(err) => {
             warn!(
@@ -1611,20 +1674,6 @@ async fn handle_search_request(
         }
     };
 
-    let schema_db_path = config::project_db_path(&state.project_root);
-    if let Err(err) = schema::ensure_current(
-        &conn,
-        &schema::SchemaContext::new(&schema_db_path, &state.source_root),
-    )
-    .await
-    {
-        warn!(
-            "daemon search index is unavailable for {}: {err}",
-            state.project_root.display()
-        );
-        return search_service::unavailable_response();
-    }
-
     let has_embeddings = match retrieval::has_indexed_embeddings(&conn, &search_scope).await {
         Ok(has_embeddings) => has_embeddings,
         Err(err) => {
@@ -1634,6 +1683,31 @@ async fn handle_search_request(
             );
             return search_service::unavailable_response();
         }
+    };
+
+    // Populate (once) and reuse the per-context vector count so the hot path
+    // skips a per-query `COUNT(*)` (R-007). The cache is invalidated on index
+    // swap by `reopen_if_index_swapped`, so a populated value always reflects the
+    // currently-open index. Only meaningful when embeddings exist.
+    let cached_vector_count = if has_embeddings {
+        match state.cached_vector_count {
+            Some(count) => Some(count),
+            None => match retrieval::count_vector_rows_for_context(&conn, &search_scope).await {
+                Ok(count) => {
+                    state.cached_vector_count = Some(count);
+                    Some(count)
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to count daemon search vectors for {}: {err}",
+                        state.project_root.display()
+                    );
+                    return search_service::unavailable_response();
+                }
+            },
+        }
+    } else {
+        None
     };
 
     let mut degraded_reason = None;
@@ -1648,7 +1722,11 @@ async fn handle_search_request(
                 &conn,
                 state.embedding_runtime.current_embedder(),
                 search_scope.clone(),
-            );
+            )
+            .with_has_vectors(has_embeddings);
+            if let Some(count) = cached_vector_count {
+                engine = engine.with_vector_count(count);
+            }
             engine.search(&request.query, request.limit).await
         } else {
             degraded_reason = Some(daemon_search_degraded_reason());
@@ -1769,6 +1847,8 @@ mod tests {
             context: test_context(project_root, source_root),
             db,
             index_identity: index_file_identity(&config::project_db_path(project_root)),
+            cached_vector_count: None,
+            read_conn: None,
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),
             run_state,
@@ -2504,6 +2584,54 @@ mod tests {
         );
     }
 
+    /// REQ-006 / T6 AC3: the per-context vector-count cache on `ProjectState`
+    /// MUST be invalidated when a build-aside rebuild swaps the index. A stale
+    /// count surviving the swap could flip `vector_search_path_for_corpus`
+    /// between the exhaustive scan and the ANN path and silently change served
+    /// candidates, so `reopen_if_index_swapped` clears it; the next search then
+    /// recomputes against the refreshed index.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_invalidates_cached_vector_count_after_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+        let root = state.project_root.clone();
+
+        // Prime the cache with a stale count from the pre-swap generation.
+        state.cached_vector_count = Some(2);
+
+        let staging = staged_index(&root, &["new1", "new2", "new3"]).await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        reopen_if_index_swapped(&mut state).await.unwrap();
+
+        assert_eq!(
+            state.cached_vector_count, None,
+            "a build-aside swap must invalidate the cached vector count"
+        );
+    }
+
+    /// REQ-006 / T6 AC3 (no-swap arm): a no-op reopen (no swap) keeps the cached
+    /// count untouched so steady-state searches reuse it and never re-`COUNT(*)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_no_swap_keeps_cached_vector_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+
+        state.cached_vector_count = Some(7);
+        reopen_if_index_swapped(&mut state).await.unwrap();
+
+        assert_eq!(
+            state.cached_vector_count,
+            Some(7),
+            "without a swap the cached count must survive a reopen no-op"
+        );
+    }
+
     /// Without a swap the reopen gate is a cheap no-op that keeps the warm handle:
     /// the recorded identity is unchanged and the handle is not reopened (a needless
     /// reopen every pass would thrash the connection and drop the warm cache).
@@ -2524,6 +2652,138 @@ mod tests {
             segment_count_via(&state.db).await,
             1,
             "the warm handle must keep serving the unchanged index"
+        );
+    }
+
+    /// Build a finalized staged index whose recorded schema version is newer than
+    /// this binary supports (`SCHEMA_VERSION + 1`), so adopting it must fail the
+    /// `ensure_current` gate. Mirrors `staged_index` but rewrites the `meta`
+    /// schema-version row before finalizing.
+    async fn incompatible_staged_index(state_root: &Path) -> PathBuf {
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_root = scratch.path().canonicalize().unwrap().join("scratch");
+        std::fs::create_dir_all(&scratch_root).unwrap();
+        let scratch_index = config::project_db_path(&scratch_root);
+        ensure_secure_project_root(&scratch_root).unwrap();
+
+        let db = Db::open_rw(&scratch_index).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+        // Stamp a version the binary cannot read so `ensure_current` rejects it as
+        // "newer than this binary supports".
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [(crate::shared::constants::SCHEMA_VERSION + 1).to_string()],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        swap::finalize_staged_db(db, &scratch_index).await.unwrap();
+
+        let staging = config::project_staging_db_path(state_root);
+        std::fs::rename(&scratch_index, &staging).unwrap();
+        staging
+    }
+
+    /// T7 AC2 / REQ-007: hoisting `ensure_current` out of the per-request path is
+    /// sound only because every index (re)open re-runs it. A build-aside swap to
+    /// an index whose schema this binary cannot serve MUST fail closed at the
+    /// reopen gate (`reopen_if_index_swapped` -> `prepare_for_write` ->
+    /// `ensure_current`), before any search is served through the adopted handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopen_fails_closed_on_swap_to_incompatible_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["old1", "old2"]).await;
+        let root = state.project_root.clone();
+        let identity_before = state.index_identity;
+
+        let staging = incompatible_staged_index(&root).await;
+        {
+            let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
+            swap::swap_index_into_place(&root, &staging).await.unwrap();
+        }
+
+        let result = reopen_if_index_swapped(&mut state).await;
+        assert!(
+            result.is_err(),
+            "adopting a swapped-in index with an unsupported schema must fail closed at the reopen gate"
+        );
+        // The schema gate is authoritative on swap; nothing is served through the
+        // incompatible index.
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("newer than this binary supports"),
+            "the reopen failure must be the schema-version rejection, got: {err}"
+        );
+        // The reopen failure leaves no reused connection bound to the rejected
+        // index for a later request to serve through.
+        assert!(
+            state.read_conn.is_none(),
+            "a failed reopen must not leave a reused read connection on the rejected index"
+        );
+        // `identity_before` is the pre-swap inode; the gate failed before adopting
+        // the new one, so callers re-attempt rather than serve a bad index.
+        let _ = identity_before;
+    }
+
+    /// T7 AC3 / REQ-007: repeated queries on the reused tuned read connection must
+    /// return identical results to a fresh per-request connection. Seeds an index,
+    /// then asserts that the same query run twice through `ensure_read_conn`'s
+    /// reused handle matches the result from an independent fresh `connect_tuned`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reused_read_conn_returns_identical_results_to_per_request_conn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = file_backed_state(&tmp, &["seg1", "seg2", "seg3"]).await;
+        let scope = SearchScope::from_worktree_context(&state.context);
+
+        // Per-request baseline: a fresh tuned connection, FTS-only (no embeddings
+        // seeded), exactly what the prior `state.db.connect()` path produced.
+        let fresh = state.db.connect_tuned().await.unwrap();
+        let baseline = HybridSearchEngine::new_scoped(&fresh, None, scope.clone())
+            .fts_only_search("fn", 10)
+            .await
+            .unwrap();
+
+        // First reused-connection query lazily creates `read_conn`.
+        let conn1 = ensure_read_conn(&mut state).await.unwrap();
+        assert!(
+            state.read_conn.is_some(),
+            "the first search must populate the reused read connection"
+        );
+        let first = HybridSearchEngine::new_scoped(&conn1, None, scope.clone())
+            .fts_only_search("fn", 10)
+            .await
+            .unwrap();
+
+        // Second reused-connection query must reuse the same handle, not reopen.
+        let identity_ptr = state.read_conn.as_ref().map(|c| c as *const _);
+        let conn2 = ensure_read_conn(&mut state).await.unwrap();
+        assert_eq!(
+            state.read_conn.as_ref().map(|c| c as *const _),
+            identity_ptr,
+            "the second search must reuse the cached connection, not replace it"
+        );
+        let second = HybridSearchEngine::new_scoped(&conn2, None, scope.clone())
+            .fts_only_search("fn", 10)
+            .await
+            .unwrap();
+
+        let ids = |rows: &[crate::shared::types::SearchResult]| {
+            rows.iter()
+                .map(|r| (r.segment_id.clone(), r.score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&first),
+            ids(&baseline),
+            "reused-connection results must equal the per-request connection results"
+        );
+        assert_eq!(
+            ids(&second),
+            ids(&baseline),
+            "repeated reused-connection queries must stay identical to the per-request results"
         );
     }
 

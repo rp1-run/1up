@@ -3,10 +3,11 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 use tokio::io::AsyncWriteExt;
 
 use crate::shared::config::{
@@ -17,9 +18,9 @@ use crate::shared::constants::{
     DISABLE_MODEL_DOWNLOADS_ENV_VAR, EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     HF_BASE_URL, HF_MODEL_REPO, MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
-    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME,
-    MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
-    XDG_STATE_DIR_MODE,
+    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_SHA256,
+    MODEL_STAGING_DIRNAME, MODEL_VARIANT_INT8_SUFFIX, MODEL_VERIFIED_DIRNAME,
+    SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256, XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::{EmbeddingError, OneupError};
 use crate::shared::fs::{
@@ -173,6 +174,41 @@ impl EmbeddingCompatibilityKey {
             tokenizer: FileFingerprint::from_path(&tokenizer_path)?,
             embed_threads,
         })
+    }
+}
+
+/// Which ONNX model variant an [`Embedder`] loaded (R-003, T10).
+///
+/// INT8 is the default CPU path when the quantized artifact is present and
+/// loads; FP32 is the always-available fallback with byte-identical numerics to
+/// the historical path. The variant feeds [`Embedder::model_id`], which is
+/// folded into the embedding `content_key` and `meta.embedding_model` so a
+/// variant swap invalidates cached vectors and forces a clean re-embed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVariant {
+    Int8,
+    Fp32,
+}
+
+impl ModelVariant {
+    /// Model-identity string folded into the content-addressed embedding key.
+    ///
+    /// FP32 keeps the bare [`HF_MODEL_REPO`] identity (so existing FP32 indexes
+    /// stay valid); INT8 appends [`MODEL_VARIANT_INT8_SUFFIX`] so its vectors
+    /// resolve to distinct keys and never collide with FP32 vectors.
+    pub fn model_id(self) -> String {
+        match self {
+            ModelVariant::Int8 => format!("{HF_MODEL_REPO}{MODEL_VARIANT_INT8_SUFFIX}"),
+            ModelVariant::Fp32 => HF_MODEL_REPO.to_string(),
+        }
+    }
+
+    /// Filename of the ONNX artifact backing this variant.
+    fn model_filename(self) -> &'static str {
+        match self {
+            ModelVariant::Int8 => MODEL_ONNX_INT8_FILENAME,
+            ModelVariant::Fp32 => MODEL_FILENAME,
+        }
     }
 }
 
@@ -409,6 +445,7 @@ pub struct Embedder {
     session: Session,
     tokenizer: Tokenizer,
     batch_size: usize,
+    variant: ModelVariant,
 }
 
 /// Reports whether the embedding model files are present on disk.
@@ -578,16 +615,7 @@ impl Embedder {
         intra_threads: usize,
         batch_size: usize,
     ) -> Result<Self, OneupError> {
-        let model_path = dir.join(MODEL_FILENAME);
         let tokenizer_path = dir.join(TOKENIZER_FILENAME);
-
-        if !model_path.exists() {
-            return Err(EmbeddingError::ModelNotAvailable(format!(
-                "model not found at {}",
-                model_path.display()
-            ))
-            .into());
-        }
         if !tokenizer_path.exists() {
             return Err(EmbeddingError::ModelNotAvailable(format!(
                 "tokenizer not found at {}",
@@ -596,14 +624,62 @@ impl Embedder {
             .into());
         }
 
+        // INT8 is the default CPU path when present (R-003, T10); FP32 is the
+        // always-present fallback. Loading the INT8 artifact can fail
+        // independently of the FP32 baseline (corrupt/incompatible quantized
+        // graph), so a failed INT8 load degrades to FP32 rather than failing the
+        // whole embedder — the FP32 numerics are byte-identical to the historical
+        // path. Only an absent *and* unloadable FP32 baseline is fatal.
+        let int8_path = dir.join(MODEL_ONNX_INT8_FILENAME);
+        if int8_path.exists() {
+            match Self::load_variant(dir, ModelVariant::Int8, intra_threads, batch_size) {
+                Ok(embedder) => return Ok(embedder),
+                Err(err) => tracing::warn!(
+                    "INT8 model present at {} but failed to load ({err}); falling back to FP32",
+                    int8_path.display()
+                ),
+            }
+        }
+
+        Self::load_variant(dir, ModelVariant::Fp32, intra_threads, batch_size)
+    }
+
+    fn load_variant(
+        dir: &Path,
+        variant: ModelVariant,
+        intra_threads: usize,
+        batch_size: usize,
+    ) -> Result<Self, OneupError> {
+        let model_path = dir.join(variant.model_filename());
+
+        if !model_path.exists() {
+            return Err(EmbeddingError::ModelNotAvailable(format!(
+                "model not found at {}",
+                model_path.display()
+            ))
+            .into());
+        }
+
+        // Pin GraphOptimizationLevel::Level3 explicitly (R-004). It is ort's
+        // default today, so this guards against a future or host default that
+        // silently lowers graph optimization rather than enabling anything new.
+        // Each batch is one serial inference call, so parallelism comes from
+        // intra-op threads (`intra_threads`); inter-op is pinned to 1 so
+        // node-level parallelism cannot add threads beyond the coordinated
+        // intra-op budget (embed_threads + parse jobs <= physical cores).
+        // Neither setting changes the produced vectors.
         let session = Session::builder()
             .map_err(|e| EmbeddingError::InferenceFailed(format!("session builder: {e}")))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set optimization level: {e}")))?
             .with_intra_threads(intra_threads)
-            .map_err(|e| EmbeddingError::InferenceFailed(format!("set threads: {e}")))?
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set intra threads: {e}")))?
+            .with_inter_threads(1)
+            .map_err(|e| EmbeddingError::InferenceFailed(format!("set inter threads: {e}")))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
             EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
         })?;
 
@@ -611,7 +687,20 @@ impl Embedder {
             session,
             tokenizer,
             batch_size,
+            variant,
         })
+    }
+
+    /// Model-identity string of the loaded variant, folded into the
+    /// content-addressed embedding key and `meta.embedding_model` (R-003, T10).
+    pub fn model_id(&self) -> String {
+        self.variant.model_id()
+    }
+
+    /// Which ONNX variant this embedder loaded (INT8 default vs FP32 fallback).
+    #[allow(dead_code)]
+    pub fn variant(&self) -> ModelVariant {
+        self.variant
     }
 
     /// Embeds a single text, returning a 384-dimensional unit vector.
@@ -622,26 +711,25 @@ impl Embedder {
 
     /// Embeds a batch of texts, returning one 384-dimensional unit vector per input.
     ///
-    /// Inputs are processed in sub-batches of the configured batch size.
+    /// Inputs are length-bucketed before inference (R-005): every input is
+    /// tokenized once, the set is sorted by real (un-padded) token length, and
+    /// equal-length-ish inputs are grouped into the configured-size sub-batches.
+    /// Because the shipped tokenizer pads to a fixed 128 tokens but `run_inference`
+    /// trims each sub-batch's tensor to its own longest *real* sequence, grouping
+    /// short inputs together shrinks that per-sub-batch width and cuts the padding
+    /// FLOPs a mixed-length batch would otherwise waste on a 128-wide tensor.
+    /// Results are scattered back to the caller's original input order via the
+    /// sort permutation, so the key->vector contract (`miss_inputs[i]` ->
+    /// `vectors[i]`) is preserved. Per-input vectors are byte-identical to the
+    /// unbucketed path: mean-pooling masks out pad positions, so the pooled vector
+    /// is independent of how many trailing pad tokens (i.e. of the tensor width) a
+    /// given input is batched with.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, OneupError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for chunk in texts.chunks(self.batch_size) {
-            let batch_embeddings = self.run_inference(chunk)?;
-            all_embeddings.extend(batch_embeddings);
-        }
-
-        Ok(all_embeddings)
-    }
-
-    fn run_inference(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, OneupError> {
-        let batch_size = texts.len();
-
-        let encodings = texts
+        let mut encodings = texts
             .iter()
             .map(|t| {
                 let mut enc = self
@@ -657,29 +745,57 @@ impl Embedder {
             })
             .collect::<Result<Vec<_>, OneupError>>()?;
 
-        let max_len = encodings
+        // Sort input indices by real token length (ascending). A stable sort keeps
+        // equal-length inputs in original order; the permutation is inverted below
+        // to restore the caller's order, so bucketing never reorders outputs.
+        let mut order: Vec<usize> = (0..encodings.len()).collect();
+        order.sort_by_key(|&i| real_token_len(&encodings[i]));
+
+        let bucketed: Vec<Encoding> = order
             .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
+            .map(|&i| std::mem::take(&mut encodings[i]))
+            .collect();
+
+        let mut bucketed_embeddings = Vec::with_capacity(bucketed.len());
+        for chunk in bucketed.chunks(self.batch_size) {
+            bucketed_embeddings.extend(self.run_inference(chunk)?);
+        }
+
+        // Scatter each bucketed result back to its original input position.
+        let mut all_embeddings: Vec<Vec<f32>> = vec![Vec::new(); bucketed_embeddings.len()];
+        for (bucket_pos, &original_pos) in order.iter().enumerate() {
+            all_embeddings[original_pos] = std::mem::take(&mut bucketed_embeddings[bucket_pos]);
+        }
+
+        Ok(all_embeddings)
+    }
+
+    fn run_inference(&mut self, encodings: &[Encoding]) -> Result<Vec<Vec<f32>>, OneupError> {
+        let batch_size = encodings.len();
+
+        // Trim the tensor to this sub-batch's longest *real* sequence rather than
+        // the tokenizer's fixed 128-token padding. Mean-pooling masks pad
+        // positions, so a narrower tensor yields byte-identical vectors while
+        // skipping the wasted compute on trailing pads (R-005).
+        let max_len = encodings.iter().map(real_token_len).max().unwrap_or(0);
 
         let mut input_ids = vec![0i64; batch_size * max_len];
         let mut attention_mask = vec![0i64; batch_size * max_len];
         let mut token_type_ids = vec![0i64; batch_size * max_len];
 
         for (i, enc) in encodings.iter().enumerate() {
+            // Copy only the first `max_len` positions: padding is Right, so these
+            // are the real tokens for this row and any tokens beyond `max_len`
+            // (always pads, since `max_len` is the sub-batch's longest real
+            // sequence) are dropped without affecting the masked mean-pool.
             let ids = enc.get_ids();
             let mask = enc.get_attention_mask();
             let type_ids = enc.get_type_ids();
             let offset = i * max_len;
-            for (j, &id) in ids.iter().enumerate() {
-                input_ids[offset + j] = id as i64;
-            }
-            for (j, &m) in mask.iter().enumerate() {
-                attention_mask[offset + j] = m as i64;
-            }
-            for (j, &t) in type_ids.iter().enumerate() {
-                token_type_ids[offset + j] = t as i64;
+            for j in 0..max_len {
+                input_ids[offset + j] = ids[j] as i64;
+                attention_mask[offset + j] = mask[j] as i64;
+                token_type_ids[offset + j] = type_ids[j] as i64;
             }
         }
 
@@ -762,6 +878,15 @@ impl Embedder {
 
         Ok(embeddings)
     }
+}
+
+/// Real (un-padded) token count of an encoding: the number of attention-mask
+/// positions set to 1. The shipped tokenizer pads to a fixed 128 tokens, so
+/// `get_ids().len()` is always 128; the attention mask is the only signal of how
+/// many tokens are real. Used for both length-bucketing and per-sub-batch tensor
+/// trimming.
+fn real_token_len(enc: &Encoding) -> usize {
+    enc.get_attention_mask().iter().filter(|&&m| m == 1).count()
 }
 
 fn ensure_secure_model_root() -> Result<PathBuf, OneupError> {
@@ -1489,6 +1614,31 @@ mod tests {
         assert!(model_downloads_disabled_value(Some(OsString::from("true"))));
     }
 
+    #[test]
+    fn model_variant_identity_distinguishes_int8_from_fp32() {
+        // R-003 (T10): FP32 keeps the bare repo identity so existing FP32 indexes
+        // stay valid; INT8 appends the suffix so its content keys never collide
+        // with FP32 vectors. This is the load-bearing correctness point: a variant
+        // swap must change the model identity (and therefore every content key),
+        // forcing a clean re-embed rather than reusing numerically-different
+        // vectors.
+        assert_eq!(ModelVariant::Fp32.model_id(), HF_MODEL_REPO);
+        assert_ne!(
+            ModelVariant::Int8.model_id(),
+            ModelVariant::Fp32.model_id(),
+            "INT8 and FP32 must resolve to distinct model identities"
+        );
+        assert!(
+            ModelVariant::Int8.model_id().starts_with(HF_MODEL_REPO),
+            "INT8 identity is the FP32 repo plus the variant suffix"
+        );
+        assert_ne!(
+            ModelVariant::Int8.model_filename(),
+            ModelVariant::Fp32.model_filename(),
+            "each variant loads a distinct ONNX artifact"
+        );
+    }
+
     /// Restores `HOME`/`XDG_DATA_HOME` on drop — even if an assertion panics — so a
     /// redirected data root never leaks to other tests in this binary.
     struct DataRootGuard {
@@ -2147,6 +2297,7 @@ mod tests {
                 .unwrap(),
             tokenizer: Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).unwrap(),
             batch_size: 2,
+            variant: ModelVariant::Fp32,
         };
 
         let texts: Vec<&str> = vec![
@@ -2160,6 +2311,56 @@ mod tests {
         assert_eq!(results.len(), 5);
         for vec in &results {
             assert_eq!(vec.len(), EMBEDDING_DIM);
+        }
+    }
+
+    #[test]
+    fn length_bucketed_batch_preserves_per_input_vectors_and_order() {
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+        let dir = runtime_model_dir();
+        // batch_size 2 forces multiple sub-batches, so length-bucketing must
+        // group across the original order and then restore it.
+        let mut embedder = Embedder {
+            session: Session::builder()
+                .unwrap()
+                .with_intra_threads(1)
+                .unwrap()
+                .commit_from_file(dir.join(MODEL_FILENAME))
+                .unwrap(),
+            tokenizer: Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).unwrap(),
+            batch_size: 2,
+            variant: ModelVariant::Fp32,
+        };
+
+        // Deliberately interleaved short/long inputs: a stable sort by token
+        // length reorders these into a different bucket order than the input
+        // order, so a missing or wrong inverse permutation flips the mapping.
+        let long = "error handling and propagation across asynchronous tokio tasks \
+            with cancellation tokens and structured concurrency in a long rust function body"
+            .to_string();
+        let texts: Vec<&str> = vec![
+            "a",
+            long.as_str(),
+            "bb",
+            "concurrent vector search over an embedding index",
+            "c",
+        ];
+
+        let bucketed = embedder.embed_batch(&texts).unwrap();
+        assert_eq!(bucketed.len(), texts.len());
+
+        // Ground truth: each input embedded on its own (order-independent). The
+        // bucketed result must equal it position-for-position and bit-for-bit.
+        for (i, &text) in texts.iter().enumerate() {
+            let standalone = embedder.embed_one(text).unwrap();
+            assert_eq!(
+                bucketed[i], standalone,
+                "bucketed vector for input {i} ({text:?}) must be byte-identical to the standalone embedding"
+            );
         }
     }
 }

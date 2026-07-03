@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use libsql::Connection;
 
@@ -132,11 +132,30 @@ impl<'a> SymbolSearchEngine<'a> {
             .await?;
         let matching_canonicals = find_matching_symbols(&fallback_canonicals, &canonical_query);
 
+        // One batched `canonical_symbol IN (...)` lookup replaces the per-canonical
+        // query loop (R-013). The batch is then regrouped per canonical and
+        // replayed in `matching_canonicals` order with the same dedup, so output
+        // is identical to issuing one query per canonical: rows for a given
+        // canonical keep the query's `ORDER BY` (the batched query uses the same
+        // ordering), and bucketing only restores the across-canonical order.
+        let tagged_matches = self
+            .load_matches_for_canonicals(reference_kind, &matching_canonicals)
+            .await?;
+        let mut matches_by_canonical: HashMap<String, Vec<SymbolMatch>> = HashMap::new();
+        for (canonical_symbol, symbol_match) in tagged_matches {
+            matches_by_canonical
+                .entry(canonical_symbol)
+                .or_default()
+                .push(symbol_match);
+        }
+
         let mut results = Vec::new();
         let mut seen = HashSet::new();
-
-        for canonical_symbol in matching_canonicals {
-            for symbol_match in self.load_matches(reference_kind, &canonical_symbol).await? {
+        for canonical_symbol in &matching_canonicals {
+            let Some(symbol_matches) = matches_by_canonical.remove(canonical_symbol) else {
+                continue;
+            };
+            for symbol_match in symbol_matches {
                 let dedupe_key =
                     format!("{}:{}", symbol_match.segment_id, symbol_match.result.name);
                 if seen.insert(dedupe_key) {
@@ -172,41 +191,48 @@ impl<'a> SymbolSearchEngine<'a> {
             .await
             .map_err(|e| SearchError::QueryFailed(format!("row iteration failed: {e}")))?
         {
-            let seg = row_to_stored_segment(&row)?;
-            let matched_name: String = row
-                .get(16)
-                .map_err(|e| SearchError::QueryFailed(format!("read symbol row failed: {e}")))?;
-            let candidate = CandidateRow {
-                segment_id: seg.id.clone(),
-                file_path: seg.file_path.clone(),
-                language: seg.language.clone(),
-                block_type: seg.block_type.clone(),
-                line_number: seg.line_start as usize,
-                line_end: seg.line_end as usize,
-                breadcrumb: seg.breadcrumb.clone(),
-                complexity: Some(seg.complexity as u32),
-                role: Some(seg.parsed_role()),
-                defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
-                referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
-                called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
-                content: seg.content.clone(),
-            };
-            results.push(SymbolMatch {
-                segment_id: seg.id.clone(),
-                result: SymbolResult {
-                    segment_id: seg.id.clone(),
-                    name: matched_name,
-                    kind: seg.block_type.clone(),
-                    file_path: seg.file_path.clone(),
-                    language: seg.language.clone(),
-                    line_start: seg.line_start as usize,
-                    line_end: seg.line_end as usize,
-                    content: seg.content.clone(),
-                    reference_kind,
-                    breadcrumb: seg.breadcrumb.clone(),
-                },
-                candidate,
-            });
+            // The matched canonical is the one queried; discard the tag here.
+            results.push(symbol_match_from_row(&row, reference_kind)?.1);
+        }
+
+        Ok(results)
+    }
+
+    /// Batched form of [`load_matches`]: resolve every canonical in `canonicals`
+    /// with one `canonical_symbol IN (...)` query instead of one query per
+    /// canonical (R-013). Each returned match is tagged with the canonical it
+    /// matched so the caller can regroup rows per canonical and preserve the
+    /// per-canonical ordering and dedup of the per-item path. Empty input issues
+    /// no query. The canonical set is bounded by the fuzzy-fallback limit
+    /// ([`SYMBOL_FALLBACK_CANONICAL_LIMIT`] per source), so a single chunk always
+    /// stays within the bound-parameter limit.
+    async fn load_matches_for_canonicals(
+        &self,
+        reference_kind: ReferenceKind,
+        canonicals: &[String],
+    ) -> Result<Vec<(String, SymbolMatch)>, OneupError> {
+        if canonicals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = queries::select_symbol_matches_by_canonicals_for_context_sql(canonicals.len());
+        let mut params: Vec<libsql::Value> = Vec::with_capacity(canonicals.len() + 2);
+        params.push(self.scope.context_id().to_string().into());
+        params.push(reference_kind_label(reference_kind).to_string().into());
+        params.extend(canonicals.iter().map(|canonical| canonical.clone().into()));
+
+        let mut rows =
+            self.conn.query(&sql, params).await.map_err(|e| {
+                SearchError::QueryFailed(format!("symbol batch lookup failed: {e}"))
+            })?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SearchError::QueryFailed(format!("row iteration failed: {e}")))?
+        {
+            results.push(symbol_match_from_row(&row, reference_kind)?);
         }
 
         Ok(results)
@@ -359,6 +385,56 @@ fn find_matching_symbols(symbols: &[String], query: &str) -> Vec<String> {
 
 fn candidate_from_symbol_match(symbol_match: SymbolMatch) -> CandidateRow {
     symbol_match.candidate
+}
+
+/// Build a [`SymbolMatch`] from a symbol-match row, returning it tagged with the
+/// row's `canonical_symbol` (column 17). Shared by the single-canonical and
+/// batched lookups so both decode rows identically; column order matches
+/// [`queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`] (segment columns
+/// 0..15, `ss.symbol` at 16, `ss.canonical_symbol` at 17).
+fn symbol_match_from_row(
+    row: &libsql::Row,
+    reference_kind: ReferenceKind,
+) -> Result<(String, SymbolMatch), OneupError> {
+    let seg = row_to_stored_segment(row)?;
+    let matched_name: String = row
+        .get(16)
+        .map_err(|e| SearchError::QueryFailed(format!("read symbol row failed: {e}")))?;
+    let canonical_symbol: String = row
+        .get(17)
+        .map_err(|e| SearchError::QueryFailed(format!("read canonical symbol failed: {e}")))?;
+    let candidate = CandidateRow {
+        segment_id: seg.id.clone(),
+        file_path: seg.file_path.clone(),
+        language: seg.language.clone(),
+        block_type: seg.block_type.clone(),
+        line_number: seg.line_start as usize,
+        line_end: seg.line_end as usize,
+        breadcrumb: seg.breadcrumb.clone(),
+        complexity: Some(seg.complexity as u32),
+        role: Some(seg.parsed_role()),
+        defined_symbols: some_if_not_empty(seg.parsed_defined_symbols()),
+        referenced_symbols: some_if_not_empty(seg.parsed_referenced_symbols()),
+        called_symbols: some_if_not_empty(seg.parsed_called_symbols()),
+        content: seg.content.clone(),
+    };
+    let symbol_match = SymbolMatch {
+        segment_id: seg.id.clone(),
+        result: SymbolResult {
+            segment_id: seg.id.clone(),
+            name: matched_name,
+            kind: seg.block_type.clone(),
+            file_path: seg.file_path.clone(),
+            language: seg.language.clone(),
+            line_start: seg.line_start as usize,
+            line_end: seg.line_end as usize,
+            content: seg.content.clone(),
+            reference_kind,
+            breadcrumb: seg.breadcrumb.clone(),
+        },
+        candidate,
+    };
+    Ok((canonical_symbol, symbol_match))
 }
 
 fn max_edit_distance(query: &str) -> usize {
@@ -699,6 +775,72 @@ mod tests {
         let results = engine.find_definitions("total", true).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "calculate_total");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_fallback_batched_matches_per_item_order_and_dedup() {
+        // R-013: batching the fuzzy-fallback canonical loop into one IN(...) query
+        // must return the same matches, in the same per-canonical order, with the
+        // same dedup, as issuing one load_matches query per canonical.
+        let (_db, conn) = setup().await;
+
+        // Distinct canonicals that all fuzzy-match "process_dat" but none match it
+        // exactly. File paths are chosen so a naive global ORDER BY (file_path)
+        // would interleave canonicals differently than the per-canonical grouping,
+        // giving the regroup logic teeth.
+        for (id, file, defined) in [
+            ("s1", "src/z.rs", r#"["process_data"]"#),
+            ("s2", "src/a.rs", r#"["process_database"]"#),
+            ("s3", "src/m.rs", r#"["process_datum"]"#),
+        ] {
+            let seg = make_segment(id, file, "function", defined, "[]");
+            segments::upsert_segment(&conn, &seg).await.unwrap();
+        }
+
+        let engine = SymbolSearchEngine::new(&conn);
+
+        // Batched production path.
+        let batched = engine.find_definitions("process_dat", true).await.unwrap();
+        assert!(
+            batched.len() >= 2,
+            "fixture must exercise multiple fuzzy canonicals (got {})",
+            batched.len()
+        );
+
+        // Per-item baseline: replay the canonical loop with one query per canonical.
+        let canonical_query = normalize_symbolish("process_dat");
+        let fallback = engine
+            .load_fallback_canonicals(ReferenceKind::Definition, &canonical_query)
+            .await
+            .unwrap();
+        let matching = find_matching_symbols(&fallback, &canonical_query);
+        let mut expected = Vec::new();
+        let mut seen = HashSet::new();
+        for canonical in &matching {
+            for symbol_match in engine
+                .load_matches(ReferenceKind::Definition, canonical)
+                .await
+                .unwrap()
+            {
+                let key = format!("{}:{}", symbol_match.segment_id, symbol_match.result.name);
+                if seen.insert(key) {
+                    expected.push(symbol_match.result);
+                }
+            }
+        }
+
+        let batched_ids: Vec<(&str, &str)> = batched
+            .iter()
+            .map(|result| (result.segment_id.as_str(), result.name.as_str()))
+            .collect();
+        let expected_ids: Vec<(&str, &str)> = expected
+            .iter()
+            .map(|result| (result.segment_id.as_str(), result.name.as_str()))
+            .collect();
+        assert_eq!(
+            batched_ids, expected_ids,
+            "batched fuzzy fallback must match the per-item (segment_id, name) order and dedup"
+        );
     }
 
     #[test]

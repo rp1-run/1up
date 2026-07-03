@@ -252,19 +252,34 @@ fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
 /// Maximum length in characters of the contextual header prepended to
 /// embedding input text.
 ///
-/// The embedder truncates input from the right at `EMBEDDING_MAX_TOKENS`, so
+/// The tokenizer truncates input from the right at `EMBEDDING_MAX_TOKENS`, so
 /// an unbounded header could crowd a segment's actual content out of the
 /// model window. 160 characters is roughly 40-80 wordpiece tokens, leaving
-/// the bulk of the 256-token budget for content.
+/// room for content within the 128-token cap.
 const EMBEDDING_HEADER_MAX_CHARS: usize = 160;
 
 /// Maximum composed embedding-input length in characters.
 ///
-/// The embedder hard-truncates at `EMBEDDING_MAX_TOKENS` (256) tokens, and
-/// wordpiece tokens practically never exceed 16 characters, so clamping here
-/// only bounds tokenizer work on oversized segments without changing what
-/// the model sees.
-const EMBEDDING_INPUT_MAX_CHARS: usize = EMBEDDING_MAX_TOKENS * 16;
+/// A coarse pre-tokenization clamp that bounds tokenizer work on pathologically
+/// long segments. The tokenizer hard-truncates at `EMBEDDING_MAX_TOKENS` (128)
+/// tokens regardless, so this clamp is kept deliberately generous — ~32
+/// characters per token, far above any realistic 128-token span (wordpiece
+/// tokens are usually a handful of characters and practically never exceed 16) —
+/// so it never trims content the 128-token truncation would have kept. The
+/// 4096-char budget is unchanged from when the cap was stated as 256; only the
+/// derivation now tracks the corrected token cap, so produced vectors are
+/// byte-identical.
+const EMBEDDING_INPUT_MAX_CHARS: usize = EMBEDDING_MAX_TOKENS * 32;
+
+// Compile-time guard: the pre-tokenization char clamp must stay at its prior
+// 4096-char value after `EMBEDDING_MAX_TOKENS` was corrected 256 -> 128.
+// Shrinking it would trim long segments before tokenization and change the text
+// the model sees, so the build breaks the instant the derivation stops yielding
+// 4096 (e.g. a future cap change that forgets to keep this budget fixed).
+const _: () = assert!(
+    EMBEDDING_INPUT_MAX_CHARS == 4096,
+    "embedding char clamp must remain 4096 to keep embedding input byte-identical"
+);
 
 /// Builds the text passed to the embedder for one segment.
 ///
@@ -839,6 +854,11 @@ async fn build_segment_batches(
             .collect());
     };
 
+    // Fold the loaded model variant (INT8 default vs FP32 fallback, R-003/T10)
+    // into the content key so swapping the variant resolves to distinct keys and
+    // forces a clean re-embed instead of reusing numerically-different vectors.
+    let model_id = embedder.model_id();
+
     // Pass 1: derive the content key + embed input for every embeddable segment,
     // in deterministic file/segment order.
     let embeddable: Vec<EmbeddableSegment> = parsed_files
@@ -849,8 +869,7 @@ async fn build_segment_batches(
                 .filter(|segment| should_embed_segment(segment))
                 .map(|segment| {
                     let embed_input = compose_embedding_text(&file.relative_path, segment);
-                    let content_key =
-                        embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+                    let content_key = embedding_content_key(&model_id, EMBEDDING_DIM, &embed_input);
                     EmbeddableSegment {
                         content_key,
                         embed_input,
@@ -1609,7 +1628,14 @@ async fn execute_run_with_inputs(
         stats.embedding_unavailable_reason =
             Some("embedding model unavailable; indexed without embeddings".to_string());
     } else {
-        schema::check_embedding_model_compatible(conn, HF_MODEL_REPO, EMBEDDING_DIM).await?;
+        // Use the loaded variant's identity (INT8 vs FP32, R-003/T10) so an index
+        // built under one variant fails closed with reindex guidance when reopened
+        // under the other while vectors exist — the FP32->INT8 re-embed gate.
+        let model_id = embedder
+            .as_ref()
+            .map(|embedder| embedder.model_id())
+            .unwrap_or_else(|| HF_MODEL_REPO.to_string());
+        schema::check_embedding_model_compatible(conn, &model_id, EMBEDDING_DIM).await?;
     }
 
     let scope_info = Some(IndexScopeInfo {

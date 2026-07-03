@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use libsql::{Builder, Connection, Database};
 
-use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS};
+use crate::shared::constants::{
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, STAGING_DB_CACHE_SIZE_KIB,
+    STAGING_WAL_AUTOCHECKPOINT_PAGES,
+};
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::fs::{ensure_secure_project_root, validate_regular_file_path};
 
@@ -95,37 +98,97 @@ impl Db {
             .map_err(|e| StorageError::Connection(e.to_string()).into())
     }
 
-    /// Create a new connection and apply project-local performance PRAGMAs.
+    /// Create a new connection and apply the read/base performance PRAGMA
+    /// profile (reads and incremental writes).
     pub async fn connect_tuned(&self) -> Result<Connection, OneupError> {
         let conn = self.connect()?;
         apply_project_pragmas(&conn).await?;
         Ok(conn)
     }
+
+    /// Create a new connection and apply the write/staging PRAGMA profile.
+    ///
+    /// Used by the cold full-rebuild staging connection ([`StagingRebuild`]):
+    /// it raises `cache_size` and `wal_autocheckpoint` over the read/base
+    /// profile to cut mid-rebuild checkpoint churn and keep more index pages
+    /// hot during a large rebuild. Every load-bearing base setting (including
+    /// the implicit `recursive_triggers=OFF`) is preserved.
+    ///
+    /// [`StagingRebuild`]: crate::storage::swap::StagingRebuild
+    pub async fn connect_tuned_staging(&self) -> Result<Connection, OneupError> {
+        let conn = self.connect()?;
+        apply_pragma_profile(&conn, PragmaProfile::WriteStaging).await?;
+        Ok(conn)
+    }
 }
 
-/// Apply performance-tuned PRAGMAs to a project-local libSQL connection.
+/// Connection PRAGMA profile.
 ///
-/// These settings optimize the local write-heavy indexing workload without
-/// changing user-visible behavior or introducing new flags.
+/// Both profiles share the load-bearing tuned base; the write/staging profile
+/// additionally raises `cache_size` and `wal_autocheckpoint` for large cold
+/// rebuilds. `recursive_triggers` is intentionally absent from both so SQLite's
+/// default (OFF) holds — the content-addressed `segments_vector_ad` AFTER DELETE
+/// trigger must never recursively re-fire (it would double-decrement
+/// `embedding_pool.ref_count`). DO NOT add `recursive_triggers` to either profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PragmaProfile {
+    /// Tuned baseline for reads and incremental writes (the historical single
+    /// profile, unchanged).
+    ReadBase,
+    /// Cold full-rebuild staging connection: the base plus raised
+    /// checkpoint/cache headroom.
+    WriteStaging,
+}
+
+/// The tuned baseline PRAGMA batch shared by both connection profiles.
 ///
-/// Uses `execute_batch` because `PRAGMA journal_mode=WAL` returns a result
-/// row and libSQL's `execute()` rejects statements that produce rows.
+/// `recursive_triggers` is deliberately omitted so SQLite's default (OFF) holds;
+/// see [`PragmaProfile`].
+const READ_BASE_PRAGMAS: &str = "PRAGMA busy_timeout=5000;\
+     PRAGMA journal_mode=WAL;\
+     PRAGMA synchronous=NORMAL;\
+     PRAGMA cache_size=-32768;\
+     PRAGMA mmap_size=268435456;\
+     PRAGMA temp_store=MEMORY;";
+
+/// Build the PRAGMA batch for `profile`.
+///
+/// The write/staging profile appends its overrides *after* the shared base, so
+/// every base setting is still applied and only `cache_size` is overridden (the
+/// last write in a batch wins) while `wal_autocheckpoint` is added. This keeps
+/// the staging profile a strict superset of the base — no base setting can be
+/// silently dropped — and leaves the read/base profile byte-identical.
+fn pragma_batch(profile: PragmaProfile) -> String {
+    match profile {
+        PragmaProfile::ReadBase => READ_BASE_PRAGMAS.to_string(),
+        PragmaProfile::WriteStaging => format!(
+            "{READ_BASE_PRAGMAS}\
+             PRAGMA cache_size={cache_size};\
+             PRAGMA wal_autocheckpoint={wal_autocheckpoint};",
+            cache_size = STAGING_DB_CACHE_SIZE_KIB,
+            wal_autocheckpoint = STAGING_WAL_AUTOCHECKPOINT_PAGES,
+        ),
+    }
+}
+
+/// Apply the read/base performance PRAGMA profile to a project-local libSQL
+/// connection. Retained as the entry point for the read/incremental-write tuned
+/// callers; the write/staging profile is applied via [`Db::connect_tuned_staging`].
 pub async fn apply_project_pragmas(conn: &Connection) -> Result<(), OneupError> {
+    apply_pragma_profile(conn, PragmaProfile::ReadBase).await
+}
+
+/// Apply `profile`'s PRAGMA batch to `conn`, retrying transient lock failures.
+///
+/// Uses `execute_batch` because `PRAGMA journal_mode=WAL` returns a result row
+/// and libSQL's `execute()` rejects statements that produce rows.
+async fn apply_pragma_profile(conn: &Connection, profile: PragmaProfile) -> Result<(), OneupError> {
+    let batch = pragma_batch(profile);
     let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
     let mut last_error = None;
 
     for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
-        match conn
-            .execute_batch(
-                "PRAGMA busy_timeout=5000;
-                 PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA cache_size=-32768;
-                 PRAGMA mmap_size=268435456;
-                 PRAGMA temp_store=MEMORY;",
-            )
-            .await
-        {
+        match conn.execute_batch(&batch).await {
             Ok(_) => return Ok(()),
             Err(err) => {
                 let err_text = err.to_string();
@@ -349,6 +412,67 @@ mod tests {
             recursive_triggers(&db.connect_tuned().await.unwrap()).await,
             0,
             "tuned project connection must keep recursive_triggers OFF"
+        );
+
+        // The write/staging profile (raised cache_size + wal_autocheckpoint) must
+        // also leave recursive_triggers OFF — it only appends those two overrides
+        // to the shared base and must not enable the recursive trigger re-fire.
+        let staging = Db::open_staging_rw(&config::project_staging_db_path(&project_root))
+            .await
+            .unwrap();
+        assert_eq!(
+            recursive_triggers(&staging.connect_tuned_staging().await.unwrap()).await,
+            0,
+            "write/staging tuned connection must keep recursive_triggers OFF"
+        );
+    }
+
+    /// Pins T9's read-vs-write/staging PRAGMA profile split: the read/base
+    /// profile (`connect_tuned`) keeps the historical tuned `cache_size` and
+    /// SQLite's default `wal_autocheckpoint`, while the write/staging profile
+    /// (`connect_tuned_staging`) raises both. Fails if the read profile drifts
+    /// from its load-bearing baseline or the staging profile fails to raise.
+    #[tokio::test]
+    async fn read_and_write_staging_pragma_profiles_differ_as_specified() {
+        async fn pragma_i64(conn: &Connection, pragma: &str) -> i64 {
+            let mut rows = conn.query(&format!("PRAGMA {pragma}"), ()).await.unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        // Read/base profile: the historical tuned baseline — DO NOT change.
+        let read_db = Db::open_rw(&config::project_db_path(&project_root))
+            .await
+            .unwrap();
+        let read = read_db.connect_tuned().await.unwrap();
+        assert_eq!(
+            pragma_i64(&read, "cache_size").await,
+            -32768,
+            "read/base cache_size must stay at the tuned 32 MiB baseline"
+        );
+        assert_eq!(
+            pragma_i64(&read, "wal_autocheckpoint").await,
+            1000,
+            "read/base profile must keep SQLite's default wal_autocheckpoint"
+        );
+
+        // Write/staging profile: raised checkpoint + cache headroom for cold rebuilds.
+        let staging_db = Db::open_staging_rw(&config::project_staging_db_path(&project_root))
+            .await
+            .unwrap();
+        let staging = staging_db.connect_tuned_staging().await.unwrap();
+        assert_eq!(
+            pragma_i64(&staging, "cache_size").await,
+            STAGING_DB_CACHE_SIZE_KIB as i64,
+            "write/staging profile must raise cache_size to 128 MiB"
+        );
+        assert_eq!(
+            pragma_i64(&staging, "wal_autocheckpoint").await,
+            STAGING_WAL_AUTOCHECKPOINT_PAGES as i64,
+            "write/staging profile must raise wal_autocheckpoint"
         );
     }
 

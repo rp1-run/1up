@@ -9,12 +9,23 @@ use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{normalize_score, SearchResult};
-use crate::storage::segments::{get_segment_by_id, StoredSegment};
 
 pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
     embedder: Option<&'a mut Embedder>,
     scope: SearchScope,
+    /// Pre-probed vector-presence flag (R-007). Every live caller already runs
+    /// the cheap `has_indexed_embeddings` probe before deciding whether to warm
+    /// the embedder, so threading the result in here removes the engine's
+    /// duplicate probe. `None` means "not supplied" and the engine falls back to
+    /// probing live, preserving the prior behaviour for callers that do not set
+    /// it (e.g. unit tests).
+    has_vectors: Option<bool>,
+    /// Pre-computed per-context vector `COUNT(*)` (R-007), cached by the daemon
+    /// on `ProjectState` and invalidated on index swap. When `Some`, the vector
+    /// stage skips its per-query `COUNT(*)` for path selection; it MUST equal the
+    /// live count so selection is identical. `None` falls back to the live count.
+    vector_count: Option<usize>,
 }
 
 impl<'a> HybridSearchEngine<'a> {
@@ -32,13 +43,42 @@ impl<'a> HybridSearchEngine<'a> {
             conn,
             embedder,
             scope,
+            has_vectors: None,
+            vector_count: None,
         }
+    }
+
+    /// Supply the already-probed vector-presence flag so the vector stage skips
+    /// its duplicate `has_indexed_embeddings` probe (R-007). The supplied value
+    /// MUST match the live probe for the open index.
+    pub fn with_has_vectors(mut self, has_vectors: bool) -> Self {
+        self.has_vectors = Some(has_vectors);
+        self
+    }
+
+    /// Supply a cached per-context vector count so the vector stage skips its
+    /// per-query `COUNT(*)` for path selection (R-007). The supplied value MUST
+    /// equal the live `COUNT(*)` for the open index.
+    pub fn with_vector_count(mut self, vector_count: usize) -> Self {
+        self.vector_count = Some(vector_count);
+        self
     }
 
     /// Hybrid search with lazy query embedding: the lexical stages, the
     /// exact-lexical short-circuit, and the cheap vector-presence probe all
     /// run before the query is ever embedded, so an index without vector rows
     /// never exercises the embedder.
+    ///
+    /// The symbol and FTS stages are independent read-only queries over the
+    /// same connection, so they run concurrently via `tokio::try_join!`
+    /// (R-002, reviving the dead `SqlVectorV2` concurrency pattern on the live
+    /// path). The vector stage stays sequenced after them because its
+    /// `is_exact_lexical_hit` / `has_indexed_embeddings` gate depends on the
+    /// lexical results — embedding it concurrently would break the
+    /// short-circuit's "an index without vector rows never exercises the
+    /// embedder" guarantee. Fusion stays timing-independent: each stage's rank
+    /// comes from its own SQL `ORDER BY`, and RRF is keyed by `segment_id`, so
+    /// overlapping the lexical reads cannot change the ranked output.
     pub async fn search(
         &mut self,
         query: &str,
@@ -49,16 +89,30 @@ impl<'a> HybridSearchEngine<'a> {
         }
 
         let intent = detect_intent(query);
-        let symbol_results = symbol_search(self.conn, &self.scope, query, intent).await?;
-        let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
+        let (symbol_results, fts_results) = tokio::try_join!(
+            symbol_search(self.conn, &self.scope, query, intent),
+            retrieval::fetch_fts_candidates(self.conn, &self.scope, query),
+        )?;
 
+        // Use the caller-supplied vector-presence flag when present, falling back
+        // to the live probe otherwise (R-007: removes the engine's duplicate
+        // `has_indexed_embeddings` probe on the live daemon/MCP/CLI paths, which
+        // already ran it before warming the embedder). The exact-lexical-hit
+        // short-circuit and `&mut embedder` discipline are unchanged.
         let should_fetch_vector = self.embedder.is_some()
             && !is_exact_lexical_hit(query, &symbol_results, &fts_results)
-            && retrieval::has_indexed_embeddings(self.conn, &self.scope).await?;
+            && self.has_indexed_embeddings().await?;
+        let cached_vector_count = self.vector_count;
         let vector_results = if should_fetch_vector {
             match self.embed_query(query) {
                 Some(embedding) => {
-                    fetch_vector_candidates_with_degrade(self.conn, &self.scope, &embedding).await
+                    fetch_vector_candidates_with_degrade(
+                        self.conn,
+                        &self.scope,
+                        &embedding,
+                        cached_vector_count,
+                    )
+                    .await
                 }
                 None => Vec::new(),
             }
@@ -67,7 +121,6 @@ impl<'a> HybridSearchEngine<'a> {
         };
 
         rank_and_hydrate(
-            self.conn,
             vector_results,
             fts_results,
             symbol_results,
@@ -75,7 +128,6 @@ impl<'a> HybridSearchEngine<'a> {
             intent,
             limit,
         )
-        .await
     }
 
     pub async fn fts_only_search(
@@ -92,7 +144,6 @@ impl<'a> HybridSearchEngine<'a> {
         let fts_results = retrieval::fetch_fts_candidates(self.conn, &self.scope, query).await?;
 
         rank_and_hydrate(
-            self.conn,
             Vec::new(),
             fts_results,
             symbol_results,
@@ -100,12 +151,35 @@ impl<'a> HybridSearchEngine<'a> {
             intent,
             limit,
         )
-        .await
+    }
+
+    /// Embeds the query for the vector stage, running the CPU-bound ONNX
+    /// inference off the cooperative scheduler so it does not stall other
+    /// async work on the multi-thread runtime (R-002).
+    ///
+    /// Uses `block_in_place` rather than `spawn_blocking`: the embedder is a
+    /// borrowed `&mut Embedder` lent by the caller's (warm) runtime, and
+    /// `spawn_blocking` requires a `'static + Send` closure, which would force
+    /// either an `Arc<Mutex<Embedder>>` or moving ownership through the engine
+    /// — both of which would break the `&mut embedder` borrow discipline the
+    /// three live callers rely on. `block_in_place` keeps that exact borrow,
+    /// runs the identical `embed_one` call (so the vector is bit-for-bit
+    /// unchanged), and tells the runtime to relocate this worker's other tasks
+    /// while the inference runs. Every live caller runs on the multi-thread
+    /// `#[tokio::main]` runtime, which `block_in_place` requires.
+    /// Vector-presence gate: the caller-supplied flag when set (R-007), else a
+    /// live probe. Identical to the live probe by contract — `with_has_vectors`
+    /// callers pass the live result they already computed.
+    async fn has_indexed_embeddings(&self) -> Result<bool, OneupError> {
+        match self.has_vectors {
+            Some(has_vectors) => Ok(has_vectors),
+            None => retrieval::has_indexed_embeddings(self.conn, &self.scope).await,
+        }
     }
 
     fn embed_query(&mut self, query: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_deref_mut()?;
-        match embedder.embed_one(query) {
+        match tokio::task::block_in_place(|| embedder.embed_one(query)) {
             Ok(embedding) => Some(embedding),
             Err(err) => {
                 eprintln!(
@@ -122,8 +196,11 @@ async fn fetch_vector_candidates_with_degrade(
     conn: &Connection,
     scope: &SearchScope,
     query_embedding: &[f32],
+    cached_count: Option<usize>,
 ) -> Vec<CandidateRow> {
-    match retrieval::fetch_vector_candidates(conn, scope, query_embedding).await {
+    match retrieval::fetch_vector_candidates_with_count(conn, scope, query_embedding, cached_count)
+        .await
+    {
         Ok(results) => results,
         Err(err) => {
             eprintln!(
@@ -135,8 +212,7 @@ async fn fetch_vector_candidates_with_degrade(
     }
 }
 
-async fn rank_and_hydrate(
-    conn: &Connection,
+fn rank_and_hydrate(
     vector_results: Vec<CandidateRow>,
     fts_results: Vec<CandidateRow>,
     symbol_results: Vec<CandidateRow>,
@@ -157,7 +233,7 @@ async fn rank_and_hydrate(
         limit,
     );
 
-    hydrate_ranked_candidates(conn, ranked).await
+    Ok(hydrate_ranked_candidates(ranked))
 }
 
 fn is_exact_lexical_hit(
@@ -270,51 +346,38 @@ fn query_words(query: &str) -> Vec<String> {
         .collect()
 }
 
-async fn hydrate_ranked_candidates(
-    conn: &Connection,
-    ranked: Vec<RankedCandidate>,
-) -> Result<Vec<SearchResult>, OneupError> {
-    let mut results = Vec::with_capacity(ranked.len());
-
-    for ranked_candidate in ranked {
-        let segment = get_segment_by_id(conn, &ranked_candidate.candidate.segment_id)
-            .await?
-            .ok_or_else(|| {
-                SearchError::QueryFailed(format!(
-                    "ranked segment '{}' disappeared before hydration",
-                    ranked_candidate.candidate.segment_id
-                ))
-            })?;
-        let mut result = search_result_from_segment(segment);
-        result.score = normalize_score(ranked_candidate.score);
-        results.push(result);
-    }
-
-    Ok(results)
+/// Builds the ranked results directly from the `CandidateRow`s already carried
+/// through ranking, with no per-result storage re-fetch.
+///
+/// Every retrieval stage (FTS, vector, symbol) SELECTs and fully populates the
+/// same `segments` columns into its `CandidateRow`, so the in-memory candidate
+/// is byte-identical to a fresh `get_segment_by_id` read of the same row. The
+/// only ranking-dependent field is `score`, taken from the fused RRF value.
+fn hydrate_ranked_candidates(ranked: Vec<RankedCandidate>) -> Vec<SearchResult> {
+    ranked
+        .into_iter()
+        .map(|ranked_candidate| {
+            search_result_from_candidate(ranked_candidate.candidate, ranked_candidate.score)
+        })
+        .collect()
 }
 
-fn search_result_from_segment(segment: StoredSegment) -> SearchResult {
-    let defined_symbols = some_if_not_empty(segment.parsed_defined_symbols());
-
+/// Maps an in-memory `CandidateRow` to a `SearchResult`, mirroring the field
+/// mapping the prior `get_segment_by_id` path produced. `score` is the
+/// normalized fused RRF rank; `defined_symbols` is already the
+/// `some_if_not_empty`-collapsed option carried on the candidate.
+fn search_result_from_candidate(candidate: CandidateRow, rrf_score: f64) -> SearchResult {
     SearchResult {
-        segment_id: segment.id,
-        file_path: segment.file_path,
-        language: segment.language,
-        block_type: segment.block_type,
-        content: segment.content,
-        score: 0,
-        line_number: segment.line_start as usize,
-        line_end: segment.line_end as usize,
-        breadcrumb: segment.breadcrumb,
-        defined_symbols,
-    }
-}
-
-fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
+        segment_id: candidate.segment_id,
+        file_path: candidate.file_path,
+        language: candidate.language,
+        block_type: candidate.block_type,
+        content: candidate.content,
+        score: normalize_score(rrf_score),
+        line_number: candidate.line_number,
+        line_end: candidate.line_end,
+        breadcrumb: candidate.breadcrumb,
+        defined_symbols: candidate.defined_symbols,
     }
 }
 
@@ -326,7 +389,54 @@ fn candidate_key(candidate: &CandidateRow) -> String {
 mod tests {
     use super::*;
 
-    use crate::shared::types::BranchStatus;
+    use crate::search::scope::SearchScope;
+    use crate::search::symbol::SymbolSearchEngine;
+    use crate::shared::types::{BranchStatus, SegmentRole};
+    use crate::storage::segments::StoredSegment;
+
+    /// Test-only reference implementation of the pre-change `get_segment_by_id`
+    /// hydration path. The equivalence test pins `search_result_from_candidate`
+    /// to this baseline so any future drift in the in-memory mapping fails CI.
+    fn search_result_from_segment(segment: StoredSegment) -> SearchResult {
+        let defined_symbols = some_if_not_empty(segment.parsed_defined_symbols());
+
+        SearchResult {
+            segment_id: segment.id,
+            file_path: segment.file_path,
+            language: segment.language,
+            block_type: segment.block_type,
+            content: segment.content,
+            score: 0,
+            line_number: segment.line_start as usize,
+            line_end: segment.line_end as usize,
+            breadcrumb: segment.breadcrumb,
+            defined_symbols,
+        }
+    }
+
+    fn some_if_not_empty(values: Vec<String>) -> Option<Vec<String>> {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    }
+
+    fn assert_search_results_equal(actual: &SearchResult, expected: &SearchResult) {
+        assert_eq!(actual.segment_id, expected.segment_id, "segment_id");
+        assert_eq!(actual.file_path, expected.file_path, "file_path");
+        assert_eq!(actual.language, expected.language, "language");
+        assert_eq!(actual.block_type, expected.block_type, "block_type");
+        assert_eq!(actual.content, expected.content, "content");
+        assert_eq!(actual.score, expected.score, "score");
+        assert_eq!(actual.line_number, expected.line_number, "line_number");
+        assert_eq!(actual.line_end, expected.line_end, "line_end");
+        assert_eq!(actual.breadcrumb, expected.breadcrumb, "breadcrumb");
+        assert_eq!(
+            actual.defined_symbols, expected.defined_symbols,
+            "defined_symbols"
+        );
+    }
 
     #[test]
     fn symbol_variants_keep_one_canonical_query() {
@@ -394,6 +504,195 @@ mod tests {
         });
 
         assert_eq!(result.segment_id, "seg-123");
+    }
+
+    /// REQ-001: building a `SearchResult` from the in-memory `CandidateRow`
+    /// (no re-fetch) must be byte-identical to the prior `StoredSegment` path
+    /// across every field, including `defined_symbols` parsing and the
+    /// `line_start -> line_number` mapping.
+    #[test]
+    fn search_result_from_candidate_matches_segment_path() {
+        let defined_json = "[\"needle\",\"helper\"]";
+        let segment = StoredSegment {
+            id: "seg-123".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn needle() { helper(); }".to_string(),
+            line_start: 7,
+            line_end: 9,
+            breadcrumb: Some("module::needle".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: defined_json.to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[\"helper\"]".to_string(),
+            file_hash: "hash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            updated_at: "2026-04-13T00:00:00Z".to_string(),
+        };
+        // The candidate carries the same row's fields, transformed exactly as
+        // `row_to_candidate_row` / the symbol stage produce them.
+        let candidate = CandidateRow {
+            segment_id: segment.id.clone(),
+            file_path: segment.file_path.clone(),
+            language: segment.language.clone(),
+            block_type: segment.block_type.clone(),
+            line_number: segment.line_start as usize,
+            line_end: segment.line_end as usize,
+            breadcrumb: segment.breadcrumb.clone(),
+            complexity: Some(segment.complexity as u32),
+            role: Some(SegmentRole::Definition),
+            defined_symbols: some_if_not_empty(segment.parsed_defined_symbols()),
+            referenced_symbols: None,
+            called_symbols: some_if_not_empty(segment.parsed_called_symbols()),
+            content: segment.content.clone(),
+        };
+
+        // `search_result_from_segment` sets score 0; compare at the same score
+        // so every other field is asserted directly.
+        let expected = search_result_from_segment(segment);
+        let actual = search_result_from_candidate(candidate, 0.0);
+
+        assert_search_results_equal(&actual, &expected);
+        assert_eq!(
+            actual.defined_symbols,
+            Some(vec!["needle".to_string(), "helper".to_string()]),
+            "defined_symbols must be parsed from the JSON column"
+        );
+        assert_eq!(
+            actual.line_number, 7,
+            "line_number must map from line_start"
+        );
+    }
+
+    /// REQ-001: empty `defined_symbols` collapses to `None` on both paths.
+    #[test]
+    fn search_result_from_candidate_collapses_empty_defined_symbols() {
+        let segment = StoredSegment {
+            id: "seg-empty".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn anon() {}".to_string(),
+            line_start: 1,
+            line_end: 1,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            file_hash: "hash".to_string(),
+            created_at: "2026-04-13T00:00:00Z".to_string(),
+            updated_at: "2026-04-13T00:00:00Z".to_string(),
+        };
+        let candidate = CandidateRow {
+            segment_id: segment.id.clone(),
+            file_path: segment.file_path.clone(),
+            language: segment.language.clone(),
+            block_type: segment.block_type.clone(),
+            line_number: segment.line_start as usize,
+            line_end: segment.line_end as usize,
+            breadcrumb: None,
+            complexity: Some(1),
+            role: Some(SegmentRole::Definition),
+            defined_symbols: some_if_not_empty(segment.parsed_defined_symbols()),
+            referenced_symbols: None,
+            called_symbols: None,
+            content: segment.content.clone(),
+        };
+
+        let expected = search_result_from_segment(segment);
+        let actual = search_result_from_candidate(candidate, 0.0);
+
+        assert_search_results_equal(&actual, &expected);
+        assert_eq!(actual.defined_symbols, None);
+    }
+
+    /// REQ-001 guard: the three retrieval stages MUST populate identical
+    /// `content`/`breadcrumb`/`defined_symbols` for the same `segment_id`.
+    /// This is the invariant that makes direct (re-fetch-free) hydration
+    /// byte-identical; a future stage SELECT dropping a column fails here.
+    #[tokio::test]
+    async fn three_stage_candidate_rows_carry_identical_hydration_fields() {
+        use crate::storage::segments::{upsert_segment, SegmentInsert};
+
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        // One segment that matches all three stages: it has a symbol, FTS-able
+        // content, and a pooled embedding so the vector stage returns it too.
+        // The real write path populates segment_symbols (symbol stage) and the
+        // external-content FTS index (FTS stage) via the schema triggers.
+        let embedding = vec![1.0_f32; 384];
+        let serialized = serde_json::to_string(&embedding).unwrap();
+        let content_key = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(serialized.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let insert = SegmentInsert {
+            id: "seg-parity".to_string(),
+            file_path: "src/parity.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn config_loader() { load(); }".to_string(),
+            line_start: 4,
+            line_end: 8,
+            content_key: Some(content_key.clone()),
+            embedding_vec: Some(serialized.clone()),
+            breadcrumb: Some("mod::config_loader".to_string()),
+            complexity: 2,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"config_loader\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[\"load\"]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-parity".to_string(),
+        };
+        upsert_segment(&conn, &insert).await.unwrap();
+
+        let scope = SearchScope::default_context();
+
+        let fts = retrieval::fetch_fts_candidates(&conn, &scope, "config loader")
+            .await
+            .unwrap();
+        let vector = retrieval::fetch_vector_candidates(&conn, &scope, &embedding)
+            .await
+            .unwrap();
+        let symbol = SymbolSearchEngine::new_scoped(&conn, scope.clone())
+            .find_definition_candidates("config_loader", true)
+            .await
+            .unwrap();
+
+        let pick = |rows: &[CandidateRow]| -> CandidateRow {
+            rows.iter()
+                .find(|c| c.segment_id == "seg-parity")
+                .expect("seg-parity must appear in every stage")
+                .clone()
+        };
+        let fts_row = pick(&fts);
+        let vector_row = pick(&vector);
+        let symbol_row = pick(&symbol);
+
+        for other in [&vector_row, &symbol_row] {
+            assert_eq!(fts_row.content, other.content, "content parity");
+            assert_eq!(fts_row.breadcrumb, other.breadcrumb, "breadcrumb parity");
+            assert_eq!(
+                fts_row.defined_symbols, other.defined_symbols,
+                "defined_symbols parity"
+            );
+            assert_eq!(fts_row.line_number, other.line_number, "line_number parity");
+            assert_eq!(fts_row.line_end, other.line_end, "line_end parity");
+        }
     }
 
     #[test]
@@ -537,6 +836,81 @@ mod tests {
         );
     }
 
+    // TDD (REQ-006 / T6 AC2): the threaded `has_vectors` flag must be the
+    // authoritative vector-presence signal — identical to the live
+    // `has_indexed_embeddings` probe the caller already ran — and replace the
+    // engine's duplicate probe. This pins both halves: `with_has_vectors(true)`
+    // matches the live probe on an index that has vectors, and the value
+    // supplied is what the gate uses (a `false` flag forces FTS-only even when
+    // the index physically holds vectors, proving the live re-probe is gone).
+    #[tokio::test]
+    async fn threaded_has_vectors_flag_drives_vector_gate_and_matches_live_probe() {
+        use crate::storage::segments::{upsert_segment, SegmentInsert};
+
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        let embedding = vec![1.0_f32; 384];
+        let serialized = serde_json::to_string(&embedding).unwrap();
+        let content_key = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(serialized.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let insert = SegmentInsert {
+            id: "seg-vec".to_string(),
+            file_path: "src/vec.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn vector_target() { run(); }".to_string(),
+            line_start: 1,
+            line_end: 3,
+            content_key: Some(content_key),
+            embedding_vec: Some(serialized),
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: "[\"vector_target\"]".to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: "hash-vec".to_string(),
+        };
+        upsert_segment(&conn, &insert).await.unwrap();
+
+        let scope = SearchScope::default_context();
+
+        // The index physically holds vectors, so the live probe is true.
+        let live = retrieval::has_indexed_embeddings(&conn, &scope)
+            .await
+            .unwrap();
+        assert!(live, "fixture seeds an indexed embedding");
+
+        // `with_has_vectors(true)` matches the live probe.
+        let engine_true =
+            HybridSearchEngine::new_scoped(&conn, None, scope.clone()).with_has_vectors(true);
+        assert_eq!(engine_true.has_indexed_embeddings().await.unwrap(), live);
+
+        // A `false` flag is authoritative — the gate uses it, not a live re-probe.
+        let engine_false =
+            HybridSearchEngine::new_scoped(&conn, None, scope.clone()).with_has_vectors(false);
+        assert!(
+            !engine_false.has_indexed_embeddings().await.unwrap(),
+            "the supplied flag must drive the gate, proving the duplicate live probe is gone"
+        );
+
+        // Unset falls back to the live probe (default behaviour preserved).
+        let engine_unset = HybridSearchEngine::new_scoped(&conn, None, scope);
+        assert_eq!(engine_unset.has_indexed_embeddings().await.unwrap(), live);
+    }
+
     #[tokio::test]
     async fn search_filters_results_to_active_context() {
         let db = crate::storage::db::Db::open_memory().await.unwrap();
@@ -558,6 +932,137 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].segment_id, "seg-main");
+    }
+
+    fn symbol_fts_insert(
+        id: &str,
+        file_path: &str,
+        content: &str,
+        defined_symbols: &str,
+    ) -> crate::storage::segments::SegmentInsert {
+        crate::storage::segments::SegmentInsert {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: content.to_string(),
+            line_start: 1,
+            line_end: 3,
+            content_key: None,
+            embedding_vec: None,
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: defined_symbols.to_string(),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("hash-{id}"),
+        }
+    }
+
+    /// REQ-002 (T2): `search` fuses the concurrently-run (`try_join!`) symbol
+    /// and FTS stages identically to the prior sequential awaits. The corpus
+    /// is split so one segment matches *only* the symbol stage and the other
+    /// *only* FTS, and the per-stage RRF weights differ (`SYMBOL_WEIGHT=4.0`
+    /// vs FTS `1.0`), so the symbol-only hit must rank first. This is the
+    /// discriminating assertion: swapping the two `try_join!` outputs (mis-
+    /// attributing symbol rows as FTS and vice versa) flips the order, so the
+    /// test fails — verified by construction. The `None` embedder keeps the
+    /// vector stage out, isolating the lexical-fusion path that changed and
+    /// keeping the test hermetic (no model required).
+    #[tokio::test]
+    async fn search_fuses_concurrent_symbol_and_fts_stages_in_weighted_order() {
+        let db = crate::storage::db::Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        crate::storage::schema::initialize(&conn).await.unwrap();
+
+        // Symbol-only hit: its canonical symbol matches "render widget"; its
+        // content carries none of the query tokens or their prefixes, so the
+        // FTS stage cannot reach it.
+        let symbol_only = symbol_fts_insert(
+            "seg-symbol-only",
+            "src/symbol.rs",
+            "fn zzz_handler() { qqq_helper(); }",
+            "[\"render_widget\"]",
+        );
+        // FTS-only hit: its content matches "render"/"widget", but its symbol
+        // does not canonicalize to the query, so the symbol stage skips it.
+        let fts_only = symbol_fts_insert(
+            "seg-fts-only",
+            "src/text.rs",
+            "// render the widget in this routine",
+            "[\"unrelated_symbol\"]",
+        );
+        crate::storage::segments::upsert_segment(&conn, &symbol_only)
+            .await
+            .unwrap();
+        crate::storage::segments::upsert_segment(&conn, &fts_only)
+            .await
+            .unwrap();
+
+        let mut engine = HybridSearchEngine::new(&conn, None);
+        let results = engine.search("render widget", 10).await.unwrap();
+
+        let ids: Vec<&str> = results.iter().map(|r| r.segment_id.as_str()).collect();
+        assert!(
+            ids.contains(&"seg-symbol-only"),
+            "symbol-only hit must surface: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"seg-fts-only"),
+            "fts-only hit must surface: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], "seg-symbol-only",
+            "symbol-stage weight ({}) must outrank the fts-stage hit ({}); a swap of the try_join! outputs would flip this: {ids:?}",
+            crate::shared::constants::SYMBOL_WEIGHT,
+            1.0
+        );
+        // The symbol-only hit carries strictly more fused weight than the
+        // fts-only hit, so its normalized score is the larger of the two.
+        let score_of = |id: &str| results.iter().find(|r| r.segment_id == id).unwrap().score;
+        assert!(
+            score_of("seg-symbol-only") > score_of("seg-fts-only"),
+            "symbol-only score must exceed fts-only score: {ids:?}"
+        );
+    }
+
+    /// REQ-002 (T2): the query embedding now runs through `block_in_place`
+    /// (off the cooperative scheduler) rather than inline. The produced vector
+    /// must be bit-for-bit identical to the direct synchronous call — the
+    /// numerics acceptance gate. Runs on a multi-thread runtime because
+    /// `block_in_place` panics on a current-thread runtime, and is gated on
+    /// model availability like the other real-inference tests (hermetic CI
+    /// disables model downloads).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_embedding_is_bit_stable_through_block_in_place() {
+        use crate::indexer::embedder::{is_model_available, EmbeddingRuntime};
+
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let mut runtime = EmbeddingRuntime::default();
+        let status = runtime.prepare_for_search(1);
+        assert!(
+            status.is_available(),
+            "expected an available embedder, got {status:?}"
+        );
+        let embedder = runtime
+            .current_embedder()
+            .expect("available runtime must expose an embedder");
+
+        let query = "where is the query embedding computed";
+        let synchronous = embedder.embed_one(query).unwrap();
+        let off_runtime = tokio::task::block_in_place(|| embedder.embed_one(query)).unwrap();
+
+        assert_eq!(
+            synchronous, off_runtime,
+            "block_in_place must run the identical inference and not perturb the vector"
+        );
     }
 
     fn scoped_insert(

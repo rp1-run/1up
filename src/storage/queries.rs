@@ -48,9 +48,6 @@ pub const CREATE_INDEX_SEGMENTS_CONTEXT_FILE_PATH: &str =
 pub const CREATE_INDEX_LANGUAGE: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_language ON segments(language)";
 
-pub const CREATE_INDEX_FILE_HASH: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segments_file_hash ON segments(file_hash)";
-
 /// Content-addressed embedding store. One row per distinct `(model_id,
 /// embedding_dim, embed_input)` content key, holding the shared vector bytes and
 /// the DiskANN index. `ref_count` tracks how many `segment_vectors` rows
@@ -72,6 +69,16 @@ CREATE TABLE IF NOT EXISTS segment_vectors (
     segment_id TEXT PRIMARY KEY,
     content_key TEXT NOT NULL
 )";
+
+/// Secondary index on `segment_vectors.content_key` (R-010). The ANN fan-out
+/// query joins `segment_vectors AS sv ON sv.content_key = p.content_key` to map a
+/// pooled `embedding_pool` row back to every referencing segment; the reverse
+/// `content_key -> segment_id` direction has no covering index otherwise
+/// (`segment_vectors`'s only index is its `segment_id` primary key), forcing a
+/// full scan per fan-out. This index makes that join key-seekable. It does not
+/// change which rows match, so ranked ordering and recall are unaffected.
+pub const CREATE_INDEX_SEGMENT_VECTORS_CONTENT_KEY: &str =
+    "CREATE INDEX IF NOT EXISTS idx_segment_vectors_content_key ON segment_vectors(content_key)";
 
 pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_symbols (
@@ -401,6 +408,22 @@ ON CONFLICT(content_key) DO NOTHING";
 /// referencing rows so `ref_count` stays equal to the referencing-row count.
 pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
     "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
+
+/// Bulk form of [`INCREMENT_EMBEDDING_POOL_REF_COUNT`] (R-011): apply every
+/// distinct key's increment from one write batch in a single statement instead
+/// of one `UPDATE` per key. `?1` is a JSON object mapping each `content_key` to
+/// the number of new referencing rows (e.g. `{"<key>": 2}`); `json_each` expands
+/// it to `(key, value)` rows and the `UPDATE ... FROM` join adds each delta to
+/// the matching pool row. Counts are identical to the per-key loop: the keys are
+/// distinct so each matches exactly one (primary-key) pool row, keys absent from
+/// `embedding_pool` match nothing and are silently skipped (as the per-key
+/// `WHERE content_key = ?1` did), and `embedding_pool` carries no UPDATE trigger
+/// so the bulk write fires nothing the loop did not.
+pub const BATCH_INCREMENT_EMBEDDING_POOL_REF_COUNTS: &str = "
+UPDATE embedding_pool
+   SET ref_count = ref_count + CAST(j.value AS INTEGER)
+  FROM json_each(?1) AS j
+ WHERE embedding_pool.content_key = j.key";
 
 /// Decrement one reference from the pool row a single segment referenced. Used
 /// by the test-only single-segment write path when it removes a segment's
@@ -883,6 +906,32 @@ WHERE context_id = ?1
 ORDER BY id
 LIMIT 5";
 
+/// Build the exact-id batch-fetch statement for `id_count` segment ids within
+/// one context. Selects the same columns in the same order as
+/// [`SELECT_SEGMENT_BY_ID_FOR_CONTEXT`], so a batched fetch returns rows
+/// byte-identical to issuing `id_count` individual id lookups (R-013).
+/// Params: `?1` context id, `?2..?(id_count + 1)` segment ids.
+pub fn select_segments_by_ids_for_context_sql(id_count: usize) -> String {
+    let mut id_placeholders = String::new();
+    for index in 0..id_count {
+        if index > 0 {
+            id_placeholders.push_str(", ");
+        }
+        write!(id_placeholders, "?{}", index + 2).expect("write to String cannot fail");
+    }
+
+    format!(
+        "SELECT id, file_path, language, block_type, content,
+       line_start, line_end, breadcrumb, complexity, role,
+       defined_symbols, referenced_symbols, called_symbols, file_hash,
+       created_at, updated_at
+FROM segments
+WHERE context_id = ?1
+  AND id IN ({ids})",
+        ids = id_placeholders,
+    )
+}
+
 pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";
@@ -937,7 +986,7 @@ pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
        s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
        s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
-       s.created_at, s.updated_at, ss.symbol
+       s.created_at, s.updated_at, ss.symbol, ss.canonical_symbol
 FROM segment_symbols AS ss
 JOIN segments AS s ON s.id = ss.segment_id
 WHERE ss.reference_kind = ?1
@@ -952,7 +1001,7 @@ pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
        s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
        s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
-       s.created_at, s.updated_at, ss.symbol
+       s.created_at, s.updated_at, ss.symbol, ss.canonical_symbol
 FROM segment_symbols AS ss
 JOIN segments AS s ON s.id = ss.segment_id
 WHERE ss.context_id = ?1
@@ -964,6 +1013,44 @@ ORDER BY
   s.file_path,
   s.line_start,
   ss.symbol";
+
+/// Build the symbol-match statement for `canonical_count` canonical symbols
+/// within one context. Identical columns and `ORDER BY` to
+/// [`SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`], so the rows for any one
+/// canonical come back in the same relative order a single-canonical lookup
+/// would return; the trailing `ss.canonical_symbol` column lets the caller
+/// regroup rows per canonical and replay the per-canonical iteration order and
+/// dedup of the per-item path (R-013).
+/// Params: `?1` context id, `?2` reference kind,
+/// `?3..?(canonical_count + 2)` canonical symbols.
+pub fn select_symbol_matches_by_canonicals_for_context_sql(canonical_count: usize) -> String {
+    let mut canonical_placeholders = String::new();
+    for index in 0..canonical_count {
+        if index > 0 {
+            canonical_placeholders.push_str(", ");
+        }
+        write!(canonical_placeholders, "?{}", index + 3).expect("write to String cannot fail");
+    }
+
+    format!(
+        "SELECT s.id, s.file_path, s.language, s.block_type, s.content,
+       s.line_start, s.line_end, s.breadcrumb, s.complexity, s.role,
+       s.defined_symbols, s.referenced_symbols, s.called_symbols, s.file_hash,
+       s.created_at, s.updated_at, ss.symbol, ss.canonical_symbol
+FROM segment_symbols AS ss
+JOIN segments AS s ON s.id = ss.segment_id
+WHERE ss.context_id = ?1
+  AND s.context_id = ?1
+  AND ss.reference_kind = ?2
+  AND ss.canonical_symbol IN ({canonicals})
+ORDER BY
+  CASE WHEN s.block_type IN ('function', 'struct', 'trait', 'class', 'interface', 'type', 'enum') THEN 0 ELSE 1 END,
+  s.file_path,
+  s.line_start,
+  ss.symbol",
+        canonicals = canonical_placeholders,
+    )
+}
 
 #[allow(dead_code)]
 pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_PREFIX: &str = "

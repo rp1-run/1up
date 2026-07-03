@@ -4,11 +4,29 @@ pub const EMBEDDING_DIM: usize = 384;
 /// 1up version from Cargo.toml, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default batch size for embedding inference.
+/// Default batch size for embedding inference (R-005).
+///
+/// Held at 32: a partial best-of-3 reindex benchmark over this repo's own ~1.5k
+/// chunk corpus showed 32 (~47.7s) slightly ahead of 64 (~49.6s), i.e. larger
+/// batches did not amortize per-call overhead enough to win once each sub-batch's
+/// tensor is already trimmed to its real token length (see `Embedder::embed_batch`
+/// length-bucketing). The exhaustive {32,64,128} release-LTO sweep is deferred to
+/// the feature-level benchmark manual item; 32 is the conservative, measured-best
+/// default among the sizes that completed.
 pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
-/// Maximum token length for the embedding model.
-pub const EMBEDDING_MAX_TOKENS: usize = 256;
+/// Effective maximum token length for the embedding model.
+///
+/// This is the shipped tokenizer's real cap: `tokenizer.json` sets
+/// `truncation.max_length = 128` and `padding = {Fixed: 128}`, so every
+/// encoding is already truncated and padded to 128 tokens before inference. The
+/// embedder's explicit `enc.truncate(EMBEDDING_MAX_TOKENS)` is therefore a
+/// belt-and-suspenders no-op the tokenizer has already applied. This was
+/// historically 256, a value that never took effect (256 > 128) yet
+/// misrepresented the model window; correcting it to the real 128-token cap
+/// changes no produced vector (the truncate stays a no-op) and lets
+/// length-aware callers reason against the true window.
+pub const EMBEDDING_MAX_TOKENS: usize = 128;
 
 /// Chunk-segment languages excluded from embedding.
 ///
@@ -190,6 +208,26 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 
+/// Write-ahead-log autocheckpoint threshold, in WAL pages, for the write/staging
+/// connection profile only.
+///
+/// SQLite's default `wal_autocheckpoint` (1000 pages) forces frequent
+/// mid-rebuild checkpoints during a large cold rebuild, each competing with the
+/// embed/write flush. Raising it to 10000 on the staging connection lets the WAL
+/// grow further between checkpoints so a full rebuild pays far fewer checkpoint
+/// stalls; the staging file is finalized with an explicit `wal_checkpoint(TRUNCATE)`
+/// at swap time, so the larger interim WAL is bounded by the rebuild's lifetime.
+/// The read/base profile keeps SQLite's default.
+pub const STAGING_WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
+
+/// Page-cache size for the write/staging connection profile only, in SQLite's
+/// negative-KiB form (`-131072` KiB = 128 MiB).
+///
+/// 128 MiB keeps more index pages hot during a large cold rebuild than the
+/// read/base profile's 32 MiB (`-32768`), cutting page churn on the write path.
+/// The read/base profile is left unchanged.
+pub const STAGING_DB_CACHE_SIZE_KIB: i32 = -131_072;
+
 /// Owner-only permissions for the XDG-managed state directory.
 #[allow(dead_code)]
 pub const XDG_STATE_DIR_MODE: u32 = 0o700;
@@ -206,8 +244,19 @@ pub const SECURE_STATE_FILE_MODE: u32 = 0o600;
 #[allow(dead_code)]
 pub const SECURE_SOCKET_MODE: u32 = 0o600;
 
-/// Conservative upper bound for auto-selected embedding threads.
-pub const MAX_AUTO_EMBED_THREADS: usize = 4;
+/// Upper bound for auto-selected embedding (ONNX intra-op) threads.
+///
+/// Embedding is the dominant indexing cost and the only sustained CPU work
+/// during the serial flush, so the embed phase scales toward physical cores
+/// rather than the legacy fixed cap of 4 (R-004). The bound stays coordinated
+/// with parse parallelism by
+/// [`crate::shared::types::IndexingConfig::default_jobs`], which reserves cores
+/// for embedding so `embed_threads + jobs` never exceeds physical cores — ONNX
+/// intra-op throughput regresses ~3.5x once the overlapping parse and embed
+/// pools over-subscribe. 8 is a benchmark-informed ceiling for the common
+/// single-repo host; the effective per-host value is further bounded by the
+/// cores left after the parse pool.
+pub const MAX_AUTO_EMBED_THREADS: usize = 8;
 
 /// Minimum number of files written per auto-selected storage transaction.
 pub const DEFAULT_INDEX_WRITE_BATCH_FILES: usize = 4;
@@ -232,6 +281,17 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 
 /// Schema version for database layout.
 ///
+/// v18: bundles the Phase-2 re-embed migration. The default embedding path is
+/// now the dynamic-INT8 model variant ([`MODEL_ONNX_INT8_FILENAME`]), whose
+/// identity is folded into the content-addressed embedding `content_key` via
+/// [`MODEL_VARIANT_INT8_SUFFIX`]; INT8 and FP32 produce numerically different
+/// vectors, so cached embeddings from a v17 (FP32-keyed) index are invalid and
+/// must be re-embedded. The required-objects set also shifts: the dead
+/// `idx_segments_file_hash` index is dropped and `idx_segment_vectors_content_key`
+/// is added for the ANN fan-out join. The physical/numeric layout therefore
+/// differs from v17, so older indexes are incompatible and fail closed with
+/// `1up reindex` (no in-place migration).
+///
 /// v17: embeddings are content-addressed. Vector bytes move out of
 /// `segment_vectors` into a shared `embedding_pool` keyed by
 /// `hash(model_id, embedding_dim, embed_input)` with a reference count;
@@ -244,13 +304,36 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 
-/// ONNX model filename.
+/// FP32 ONNX model filename (the always-present baseline / fallback artifact).
 pub const MODEL_FILENAME: &str = "model.onnx";
+
+/// INT8-quantized ONNX model filename (R-003, T10).
+///
+/// When present alongside [`MODEL_FILENAME`] in the active model directory, this
+/// dynamic-INT8 build of all-MiniLM-L6-v2 is loaded as the default CPU embedding
+/// path; when absent (or it fails to load) the embedder falls back to the FP32
+/// [`MODEL_FILENAME`] with byte-identical numerics. The file lives next to the
+/// FP32 model in the verified artifact directory; provisioning the actual
+/// quantized artifact (download + pinned-SHA verification) is the manual gate —
+/// this constant is the load-time contract the loader keys off.
+pub const MODEL_ONNX_INT8_FILENAME: &str = "model.int8.onnx";
+
+/// Model-identity suffix that distinguishes the INT8 variant from the FP32
+/// baseline inside the content-addressed embedding key (R-003, T10).
+///
+/// The embedding `content_key` and the stored `meta.embedding_model` fold the
+/// model identity (`HF_MODEL_REPO`). The INT8 and FP32 builds of the same repo
+/// produce numerically different vectors, so they MUST resolve to distinct keys:
+/// the active variant's identity is `HF_MODEL_REPO` for FP32 and
+/// `format!("{HF_MODEL_REPO}{MODEL_VARIANT_INT8_SUFFIX}")` for INT8. Swapping the
+/// variant therefore changes every key, invalidating cached vectors and forcing
+/// a clean re-embed (the load-bearing correctness point for the v18 re-embed).
+pub const MODEL_VARIANT_INT8_SUFFIX: &str = "@int8";
 
 /// Tokenizer filename.
 pub const TOKENIZER_FILENAME: &str = "tokenizer.json";

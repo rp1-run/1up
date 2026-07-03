@@ -119,7 +119,8 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let conn = db.connect()?;
     schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, &source_root)).await?;
 
-    let results = if retrieval::has_indexed_embeddings(&conn, &search_scope).await? {
+    let has_vectors = retrieval::has_indexed_embeddings(&conn, &search_scope).await?;
+    let results = if has_vectors {
         let mut runtime = EmbeddingRuntime::default();
         let status = runtime.prepare_for_search(1);
         match &status {
@@ -158,7 +159,8 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
                 &conn,
                 runtime.current_embedder(),
                 search_scope.clone(),
-            );
+            )
+            .with_has_vectors(has_vectors);
             engine.search(&args.query, args.limit).await?
         } else {
             let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope.clone());

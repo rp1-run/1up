@@ -367,13 +367,20 @@ impl IndexingConfig {
     }
 
     pub fn default_jobs() -> usize {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-            .saturating_sub(1)
-            .max(1)
+        parse_jobs_for_cores(host_parallelism())
     }
 
+    /// Auto-selects the ONNX intra-op thread count for the embed phase from the
+    /// resolved parse `jobs`.
+    ///
+    /// Embedding is the dominant indexing cost and the only sustained CPU work
+    /// during the serial flush, but up to `jobs` parse workers overlap it on
+    /// the blocking pool. The budget is bounded by [`MAX_AUTO_EMBED_THREADS`];
+    /// paired with [`Self::default_jobs`] — which reserves cores for embedding —
+    /// the default split keeps `embed_threads + jobs` within physical cores so
+    /// the two pools never over-subscribe (ONNX intra-op throughput regresses
+    /// ~3.5x past that). Kept pure in `jobs`, not the live core count, so the
+    /// value is deterministic for a given configuration regardless of host.
     pub fn default_embed_threads_for(jobs: usize) -> usize {
         jobs.clamp(1, MAX_AUTO_EMBED_THREADS)
     }
@@ -388,6 +395,35 @@ impl IndexingConfig {
     pub fn effective_write_batch_files(&self, files_total: usize) -> usize {
         self.write_batch_files.min(files_total.max(1))
     }
+}
+
+/// Parallelism reported by the runtime, floored at one.
+fn host_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+/// Pure split of `cores` physical cores into parse workers, reserving room for
+/// the embed phase.
+///
+/// Parse workers (this many) overlap the embed-bearing flush on the blocking
+/// pool, and the embed phase uses up to [`MAX_AUTO_EMBED_THREADS`] ONNX
+/// intra-op threads, so the two pools share physical cores. Total threads must
+/// stay within physical cores — ONNX intra-op throughput regresses ~3.5x once
+/// `embed_threads + jobs` over-subscribes. Once `cores` can fund a full embed
+/// pool alongside an equal-or-larger parse pool
+/// (`cores >= 2 * MAX_AUTO_EMBED_THREADS`), parse takes every core but the embed
+/// cap; below that the cores split evenly so `embed_threads == jobs`. At least
+/// one parse worker. Paired with [`IndexingConfig::default_embed_threads_for`]
+/// this guarantees `embed_threads + jobs <= cores` for every `cores >= 2`.
+fn parse_jobs_for_cores(cores: usize) -> usize {
+    let parse = if cores >= 2 * MAX_AUTO_EMBED_THREADS {
+        cores - MAX_AUTO_EMBED_THREADS
+    } else {
+        cores / 2
+    };
+    parse.max(1)
 }
 
 impl<'de> Deserialize<'de> for IndexingConfig {
@@ -708,6 +744,50 @@ mod tests {
             IndexingConfig::default_embed_threads_for(MAX_AUTO_EMBED_THREADS + 8),
             MAX_AUTO_EMBED_THREADS
         );
+    }
+
+    #[test]
+    fn embed_threads_plus_parse_jobs_never_oversubscribe_cores() {
+        // Pure gate (R-004): the default parse/embed split must keep
+        // embed_threads + jobs within physical cores at every realistic core
+        // count, because the parse pool overlaps the embed-bearing flush and
+        // ONNX intra-op throughput regresses ~3.5x once the two over-subscribe.
+        // cores=1 is the only degenerate point: parsing and embedding each need
+        // at least one thread, so the floor budget is 2.
+        for cores in 1..=128usize {
+            let jobs = parse_jobs_for_cores(cores);
+            let embed = IndexingConfig::default_embed_threads_for(jobs);
+            assert!(jobs >= 1, "cores={cores}: at least one parse worker");
+            assert!(embed >= 1, "cores={cores}: at least one embed thread");
+            let budget = cores.max(2);
+            assert!(
+                embed + jobs <= budget,
+                "cores={cores}: embed({embed}) + jobs({jobs}) = {} over-subscribes budget {budget}",
+                embed + jobs
+            );
+        }
+    }
+
+    #[test]
+    fn embed_threads_scale_past_legacy_cap_on_higher_core_hosts() {
+        // R-004 raises the embed cap past the legacy fixed value of 4. On hosts
+        // with enough cores to fund it within the gate (>= 10, where the even
+        // split leaves an embed pool > 4), the embed phase now uses more
+        // intra-op threads than the old cap while still honoring the budget. If
+        // the cap were not raised these per-core assertions would fail.
+        const LEGACY_EMBED_CAP: usize = 4;
+        for cores in 10..=64usize {
+            let jobs = parse_jobs_for_cores(cores);
+            let embed = IndexingConfig::default_embed_threads_for(jobs);
+            assert!(
+                embed > LEGACY_EMBED_CAP,
+                "cores={cores}: embed({embed}) should exceed the legacy cap {LEGACY_EMBED_CAP}"
+            );
+            assert!(
+                embed + jobs <= cores,
+                "cores={cores}: embed({embed}) + jobs({jobs}) must stay within cores"
+            );
+        }
     }
 
     #[test]
