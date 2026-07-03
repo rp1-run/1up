@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::cli::lean;
 use crate::daemon::{lifecycle, search_service};
-use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
+use crate::indexer::embedder::{
+    download_failure_marker_hint, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
+};
 use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config::project_db_path;
 use crate::shared::constants::{NO_INDEXED_EMBEDDINGS_REASON, VERSION};
@@ -141,7 +143,12 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             EmbeddingLoadStatus::Unavailable(
                 EmbeddingUnavailableReason::PreviousDownloadFailed,
             ) => {
-                eprintln!("warning: embedding model download previously failed; search is degraded to FTS-only mode. Delete ~/.local/share/1up/models/all-MiniLM-L6-v2/.download_failed to retry");
+                // REQ-002: passive search never clears the marker (no network
+                // hammering); it only prints the runtime-resolved recovery path.
+                eprintln!(
+                    "warning: embedding model download previously failed; search is degraded to FTS-only mode{}",
+                    download_failure_marker_hint()
+                );
             }
             EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::ModelMissing) => {
                 eprintln!("warning: embedding model not found; search is degraded to FTS-only mode. Run `1up index` to download the model and enable semantic search");

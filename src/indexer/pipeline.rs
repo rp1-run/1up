@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use libsql::Connection;
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -166,8 +167,10 @@ use crate::indexer::parser;
 use crate::indexer::scanner;
 use crate::shared::config;
 use crate::shared::constants::{
-    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS, HF_MODEL_REPO,
-    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
+    DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
+    GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS, HF_MODEL_REPO,
+    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE,
+    SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -838,34 +841,30 @@ fn plan_embedding_work<'a>(
     misses
 }
 
-async fn build_segment_batches(
+/// The connection-touching plan for one batch: every embeddable segment's
+/// resolved content key (`embeddable`, deterministic file/segment order) plus
+/// the distinct `(content_key, embed_input)` pairs that still need embedding
+/// (`misses`, pool hits already excluded). Produced by `plan_segment_batches`,
+/// which is the *only* phase of the embed<->store flush that touches `conn`
+/// (T6): the caller must keep this lookup from overlapping the store task's
+/// write on the same connection (Open Risk mitigation), while the CPU-only
+/// `embed_planned_batch` step that follows is free to run concurrently with
+/// the previous batch's store.
+struct SegmentBatchPlan {
+    embeddable: Vec<EmbeddableSegment>,
+    misses: Vec<(String, String)>,
+}
+
+/// Phase A (connection-touching): derives content keys for every embeddable
+/// segment and looks up which are already pooled. Returns `None` when there
+/// is no active embedder, mirroring the prior no-embedder storage path.
+async fn plan_segment_batches(
     conn: &Connection,
-    context_id: &str,
     parsed_files: &[ParsedWorkItem],
-    embedder: Option<&mut Embedder>,
-    timings: &mut TimingAccumulator,
-) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
+    embedder: Option<&Embedder>,
+) -> Result<Option<SegmentBatchPlan>, OneupError> {
     let Some(embedder) = embedder else {
-        // No active embedder: segments are stored without content keys or
-        // vectors, exactly as before content-addressed pooling.
-        return Ok(parsed_files
-            .iter()
-            .map(|file| {
-                file.segments
-                    .iter()
-                    .map(|segment| {
-                        build_segment_insert(
-                            context_id,
-                            &file.relative_path,
-                            &file.file_hash,
-                            segment,
-                            None,
-                            None,
-                        )
-                    })
-                    .collect()
-            })
-            .collect());
+        return Ok(None);
     };
 
     // Fold the loaded model variant (INT8 default vs FP32 fallback, R-003/T10)
@@ -873,8 +872,8 @@ async fn build_segment_batches(
     // forces a clean re-embed instead of reusing numerically-different vectors.
     let model_id = embedder.model_id();
 
-    // Pass 1: derive the content key + embed input for every embeddable segment,
-    // in deterministic file/segment order.
+    // Derive the content key + embed input for every embeddable segment, in
+    // deterministic file/segment order.
     let embeddable: Vec<EmbeddableSegment> = parsed_files
         .iter()
         .flat_map(|file| {
@@ -908,18 +907,36 @@ async fn build_segment_batches(
             .collect()
     };
     let present = segments::existing_embedding_pool_keys(conn, &distinct_keys).await?;
-    let misses = plan_embedding_work(&embeddable, &present);
+    let misses = plan_embedding_work(&embeddable, &present)
+        .into_iter()
+        .map(|(key, input)| (key.to_string(), input.to_string()))
+        .collect();
 
-    let miss_inputs: Vec<&str> = misses.iter().map(|(_, input)| *input).collect();
+    Ok(Some(SegmentBatchPlan { embeddable, misses }))
+}
+
+/// Phase B (pure CPU): embeds the plan's misses. Never touches `conn`, so it
+/// is safe to run while a previous batch's store write is in flight on the
+/// store task (T6 double buffer).
+fn embed_planned_batch(
+    embedder: &mut Embedder,
+    plan: &SegmentBatchPlan,
+    timings: &mut TimingAccumulator,
+) -> Result<HashMap<String, String>, OneupError> {
+    let miss_inputs: Vec<&str> = plan
+        .misses
+        .iter()
+        .map(|(_, input)| input.as_str())
+        .collect();
     let embed_started_at = Instant::now();
     let vectors = embedder.embed_batch(&miss_inputs)?;
     timings.embed_ms += embed_started_at.elapsed().as_millis();
 
-    if vectors.len() != misses.len() {
+    if vectors.len() != plan.misses.len() {
         return Err(IndexingError::Pipeline(format!(
             "embedder returned {} vectors for {} miss-set inputs",
             vectors.len(),
-            misses.len()
+            plan.misses.len()
         ))
         .into());
     }
@@ -927,14 +944,22 @@ async fn build_segment_batches(
     // Map each freshly embedded key to its serialized vector. An embeddable
     // segment whose key is absent here is a pool hit: the shared vector already
     // exists, so the segment carries only its `content_key` reference.
-    let mut key_to_vec: HashMap<&str, String> = HashMap::with_capacity(misses.len());
-    for ((key, _input), vector) in misses.iter().zip(vectors) {
-        key_to_vec.insert(*key, serialize_embedding(&vector)?);
+    let mut key_to_vec: HashMap<String, String> = HashMap::with_capacity(plan.misses.len());
+    for ((key, _input), vector) in plan.misses.iter().zip(vectors) {
+        key_to_vec.insert(key.clone(), serialize_embedding(&vector)?);
     }
+    Ok(key_to_vec)
+}
 
-    // Pass 2: assemble inserts, every embeddable segment carrying its resolved
-    // content key (and, for misses, the new vector to be pooled).
-    let mut resolved_keys = embeddable.iter();
+/// Phase C (pure CPU): assembles segment inserts from the plan's resolved
+/// content keys plus the freshly embedded vectors. Never touches `conn`.
+fn assemble_segment_batches(
+    context_id: &str,
+    parsed_files: &[ParsedWorkItem],
+    plan: &SegmentBatchPlan,
+    key_to_vec: &HashMap<String, String>,
+) -> Result<Vec<Vec<SegmentInsert>>, OneupError> {
+    let mut resolved_keys = plan.embeddable.iter();
     let mut batches = Vec::with_capacity(parsed_files.len());
     for file in parsed_files {
         let mut inserts = Vec::with_capacity(file.segments.len());
@@ -970,6 +995,32 @@ async fn build_segment_batches(
     );
 
     Ok(batches)
+}
+
+/// No active embedder: segments are stored without content keys or vectors,
+/// exactly as before content-addressed pooling.
+fn assemble_without_embedder(
+    context_id: &str,
+    parsed_files: &[ParsedWorkItem],
+) -> Vec<Vec<SegmentInsert>> {
+    parsed_files
+        .iter()
+        .map(|file| {
+            file.segments
+                .iter()
+                .map(|segment| {
+                    build_segment_insert(
+                        context_id,
+                        &file.relative_path,
+                        &file.file_hash,
+                        segment,
+                        None,
+                        None,
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn build_manifest_meta(file: &ParsedWorkItem) -> IndexedFileMeta {
@@ -1015,8 +1066,143 @@ async fn replace_file_batches(
     segments::replace_file_batch_for_context_tx(conn, context_id, &file_batches).await
 }
 
+/// One fully-assembled batch (parsed files + resolved segment inserts) ready
+/// to be written to `index.db`.
+struct StoreJob {
+    parsed_files: Vec<ParsedWorkItem>,
+    segment_batches: Vec<Vec<SegmentInsert>>,
+}
+
+/// Stats produced by a completed store write, folded into the run's
+/// `PipelineStats`/`TimingAccumulator` once the producer awaits them.
+struct StoreOutcome {
+    store_ms: u128,
+    files_indexed: usize,
+    segments_stored: usize,
+}
+
+/// Overlaps the pure-CPU `Embedder::embed_batch` call for batch N+1 with the
+/// libSQL write of batch N (T6/REQ-004): a dedicated task owns the write
+/// connection and drains `StoreJob`s from a depth-1 channel while the
+/// producer keeps preparing the next batch. `await_inflight` is the single
+/// synchronization point the producer must pass through before it touches
+/// the connection again for the next batch's pool-key lookup
+/// (`plan_segment_batches`), so the lookup and the store write are never in
+/// flight on the same connection at once (Open Risk mitigation); the
+/// single-writer invariant to `index.db` is preserved because only this task
+/// ever calls `replace_file_batches`.
+struct StoreDoubleBuffer {
+    job_tx: mpsc::Sender<StoreJob>,
+    outcome_rx: mpsc::Receiver<Result<StoreOutcome, OneupError>>,
+    handle: JoinHandle<()>,
+    inflight: bool,
+    pending: Option<StoreJob>,
+}
+
+impl StoreDoubleBuffer {
+    fn spawn(conn: Connection, context_id: String) -> Self {
+        let (job_tx, mut job_rx) = mpsc::channel::<StoreJob>(1);
+        let (outcome_tx, outcome_rx) = mpsc::channel::<Result<StoreOutcome, OneupError>>(1);
+        let handle = tokio::spawn(async move {
+            while let Some(job) = job_rx.recv().await {
+                let started_at = Instant::now();
+                let files_indexed = job.parsed_files.len();
+                let segments_stored = job.segment_batches.iter().map(Vec::len).sum::<usize>();
+                let result = replace_file_batches(
+                    &conn,
+                    &context_id,
+                    &job.parsed_files,
+                    &job.segment_batches,
+                )
+                .await;
+                let outcome = result.map(|()| StoreOutcome {
+                    store_ms: started_at.elapsed().as_millis(),
+                    files_indexed,
+                    segments_stored,
+                });
+                if outcome_tx.send(outcome).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            job_tx,
+            outcome_rx,
+            handle,
+            inflight: false,
+            pending: None,
+        }
+    }
+
+    /// Blocks until the in-flight store (if any) has fully finished, folding
+    /// its stats into `stats`/`timings`. Callers must run this before
+    /// touching the connection again on the producer side.
+    async fn await_inflight(
+        &mut self,
+        stats: &mut PipelineStats,
+        timings: &mut TimingAccumulator,
+    ) -> Result<(), OneupError> {
+        if !self.inflight {
+            return Ok(());
+        }
+        self.inflight = false;
+        let outcome = self.outcome_rx.recv().await.ok_or_else(|| {
+            IndexingError::Pipeline("store task ended unexpectedly".to_string())
+        })??;
+        timings.store_ms += outcome.store_ms;
+        stats.files_indexed += outcome.files_indexed;
+        stats.segments_stored += outcome.segments_stored;
+        Ok(())
+    }
+
+    /// Hands the pending batch (already embedded and assembled by a previous
+    /// call) to the store task, if there is one. Non-blocking beyond channel
+    /// backpressure: the caller's subsequent CPU-only work overlaps with this
+    /// write.
+    async fn dispatch_pending(&mut self) -> Result<(), OneupError> {
+        let Some(job) = self.pending.take() else {
+            return Ok(());
+        };
+        self.job_tx
+            .send(job)
+            .await
+            .map_err(|_| IndexingError::Pipeline("store task unavailable".to_string()))?;
+        self.inflight = true;
+        Ok(())
+    }
+
+    fn set_pending(&mut self, job: StoreJob) {
+        self.pending = Some(job);
+    }
+
+    /// Flushes the last pending batch and waits for the store task to drain,
+    /// folding final stats into `stats`/`timings`. Must be called once, after
+    /// the last `store_ready_files` call, before embedding coverage is
+    /// verified against the database.
+    ///
+    /// Order matters: a call from the last `store_ready_files` invocation may
+    /// still have a dispatch in flight (its own `await_inflight` only waits
+    /// on the dispatch *before* it), so any outstanding write must be
+    /// awaited before the final pending batch is dispatched — otherwise two
+    /// jobs would be in flight against a depth-1 channel at once and one
+    /// batch's outcome would never be folded in.
+    async fn finish(
+        mut self,
+        stats: &mut PipelineStats,
+        timings: &mut TimingAccumulator,
+    ) -> Result<(), OneupError> {
+        self.await_inflight(stats, timings).await?;
+        self.dispatch_pending().await?;
+        self.await_inflight(stats, timings).await?;
+        drop(self.job_tx);
+        let _ = self.handle.await;
+        Ok(())
+    }
+}
+
 async fn store_ready_files(
     conn: &Connection,
+    double_buffer: &mut StoreDoubleBuffer,
     context_id: &str,
     ready_files: &mut Vec<ParsedWorkItem>,
     embedder: Option<&mut Embedder>,
@@ -1028,16 +1214,31 @@ async fn store_ready_files(
     }
 
     let parsed_files = std::mem::take(ready_files);
-    let segment_batches =
-        build_segment_batches(conn, context_id, &parsed_files, embedder, timings).await?;
-    let segment_count = segment_batches.iter().map(Vec::len).sum::<usize>();
 
-    let store_started_at = Instant::now();
-    replace_file_batches(conn, context_id, &parsed_files, &segment_batches).await?;
-    timings.store_ms += store_started_at.elapsed().as_millis();
+    // The pool-key lookup below touches `conn`; make sure the store task's
+    // in-flight write (if any) has fully finished first so the lookup and the
+    // write never race on the shared connection (Open Risk mitigation).
+    double_buffer.await_inflight(stats, timings).await?;
 
-    stats.files_indexed += parsed_files.len();
-    stats.segments_stored += segment_count;
+    let plan = plan_segment_batches(conn, &parsed_files, embedder.as_deref()).await?;
+
+    // Hand the previous batch (already embedded and assembled) to the store
+    // task now, so its write overlaps with this batch's pure-CPU embed step
+    // below.
+    double_buffer.dispatch_pending().await?;
+
+    let segment_batches = match (embedder, plan) {
+        (Some(embedder), Some(plan)) => {
+            let key_to_vec = embed_planned_batch(embedder, &plan, timings)?;
+            assemble_segment_batches(context_id, &parsed_files, &plan, &key_to_vec)?
+        }
+        _ => assemble_without_embedder(context_id, &parsed_files),
+    };
+
+    double_buffer.set_pending(StoreJob {
+        parsed_files,
+        segment_batches,
+    });
     Ok(())
 }
 
@@ -1121,6 +1322,17 @@ fn current_progress_phase(stats: &PipelineStats) -> IndexPhase {
     }
 }
 
+const PROGRESS_PERSIST_THROTTLE: Duration = Duration::from_millis(PROGRESS_PERSIST_THROTTLE_MS);
+
+/// Pure decision gate for `FlushState::refresh`: should this call actually
+/// write `index_status.json`, or is it within the throttle window of the
+/// last write? `force` (the terminal `Complete` phase) always wins.
+fn should_persist_progress(last_persisted_at: Option<Instant>, now: Instant, force: bool) -> bool {
+    force
+        || last_persisted_at
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_PERSIST_THROTTLE)
+}
+
 struct FlushState<'a> {
     stats: &'a mut PipelineStats,
     project_root: &'a Path,
@@ -1134,10 +1346,22 @@ struct FlushState<'a> {
     progress_tx: Option<ProgressSender>,
     scope: Option<IndexScopeInfo>,
     prefilter: Option<IndexPrefilterInfo>,
+    last_persisted_at: Option<Instant>,
 }
 
 impl FlushState<'_> {
     fn refresh(&mut self, phase: IndexPhase, persist: bool) {
+        self.refresh_at(phase, persist, Instant::now());
+    }
+
+    /// `now`-injectable core of `refresh`, so the throttle gate is
+    /// deterministically testable without depending on wall-clock timing.
+    fn refresh_at(&mut self, phase: IndexPhase, persist: bool, now: Instant) {
+        let persist = persist
+            && should_persist_progress(self.last_persisted_at, now, phase == IndexPhase::Complete);
+        if persist {
+            self.last_persisted_at = Some(now);
+        }
         refresh_progress(
             self.stats,
             self.project_root,
@@ -1159,6 +1383,7 @@ impl FlushState<'_> {
 
 async fn flush_reorder_buffer(
     conn: &Connection,
+    double_buffer: &mut StoreDoubleBuffer,
     reorder_buffer: &mut BTreeMap<usize, ParseResultKind>,
     next_sequence: &mut usize,
     config: &IndexingConfig,
@@ -1179,6 +1404,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            double_buffer,
                             &state.context.context_id,
                             &mut ready_files,
                             embedder,
@@ -1196,6 +1422,7 @@ async fn flush_reorder_buffer(
                         let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
                         store_ready_files(
                             conn,
+                            double_buffer,
                             &state.context.context_id,
                             &mut ready_files,
                             embedder,
@@ -1223,6 +1450,7 @@ async fn flush_reorder_buffer(
             let embedder = embedder.as_mut().map(|embedder| &mut **embedder);
             store_ready_files(
                 conn,
+                double_buffer,
                 &state.context.context_id,
                 &mut ready_files,
                 embedder,
@@ -1502,6 +1730,11 @@ pub async fn run_with_context_scope_setup_and_progress_root(
 /// repository HEAD. Recording failure is logged instead of failing the run:
 /// the index data is already committed and the recorded head is advisory
 /// freshness metadata.
+///
+/// Also runs the opt-in (default OFF) migration-time `SupersededSameSource`
+/// prune when [`config::migration_gc_prune_enabled`] reports the switch is on
+/// (REQ-003 Open Risks: automatic pruning on every index run is not a
+/// default-on behavior until the planning gate finalizes enablement).
 async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
     let project_id =
         crate::shared::project::read_project_id(&context.state_root).unwrap_or_default();
@@ -1509,6 +1742,136 @@ async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
         warn!(
             "failed to record indexed head for context {}: {err}",
             context.context_id
+        );
+    }
+
+    if config::migration_gc_prune_enabled() {
+        prune_superseded_same_source_contexts_on_migration(conn, context).await;
+    }
+}
+
+/// True when `updated_at` (`worktree_contexts.updated_at`, a `datetime('now')`
+/// TEXT value `YYYY-MM-DD HH:MM:SS`, UTC) is at least `min_age` old relative to
+/// `now`. Unparseable input degrades to `false`: a migration-time prune must
+/// never fire on ambiguous data. Duplicated in miniature from `cli::gc`'s
+/// helper of the same name — see the layering note on
+/// [`superseded_same_source_context_ids`] for why this cannot be shared
+/// directly.
+fn context_age_at_least(
+    updated_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    min_age: chrono::Duration,
+) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
+        Ok(parsed) => now - parsed.and_utc() >= min_age,
+        Err(_) => false,
+    }
+}
+
+/// Determine which recorded contexts qualify for the opt-in migration-time
+/// `SupersededSameSource` prune: same `source_root` as `active` but ranked
+/// beyond [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`] most-recently-updated
+/// same-source peers (active is always present in `contexts` and, having just
+/// been recorded, is typically the most recent) and older than
+/// [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`].
+///
+/// Deliberately narrower than `cli::gc`'s four-reason `prune_reason`
+/// classifier — this hook only ever evaluates `SupersededSameSource`, never
+/// `SourceMissing`/`StaleBranchSnapshot`/`NestedSubdirContext` (those stay a
+/// manual `1up gc` decision) — and deliberately does not call into
+/// `cli::gc::prune_reason` to get it: this crate's dependency direction is
+/// `cli`/`mcp` -> `search`/`indexer` -> `storage` -> `shared` (no cycles), and
+/// `daemon` already depends on `indexer::pipeline`, so `indexer` reaching back
+/// into `cli` or `daemon` here would invert that direction into a cycle. The
+/// small amount of duplicated policy logic (this function plus
+/// [`context_age_at_least`]) is the deliberate tradeoff (patterns.md: "prefer
+/// duplication over wrong abstraction"), mirroring the daemon's own
+/// self-contained `source_missing_context_ids` rather than reusing `cli::gc`.
+fn superseded_same_source_context_ids(
+    contexts: &[segments::IndexedContextRow],
+    active: &WorktreeContext,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut same_source: Vec<&segments::IndexedContextRow> = contexts
+        .iter()
+        .filter(|c| c.source_root == active.source_root)
+        .collect();
+    same_source.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.context_id.cmp(&b.context_id))
+    });
+
+    let max_age = chrono::Duration::days(GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS);
+    same_source
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, ctx)| {
+            let rank = index + 1;
+            // `state_root == active.state_root` (same worktree, a different
+            // branch's snapshot) is `StaleBranchSnapshot` territory in
+            // `cli::gc`'s classifier, not `SupersededSameSource` — that stays a
+            // manual `1up gc` decision, never auto-pruned by this opt-in hook.
+            let qualifies = ctx.context_id != active.context_id
+                && ctx.state_root != active.state_root
+                && rank > GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT
+                && context_age_at_least(&ctx.updated_at, now, max_age);
+            qualifies.then(|| ctx.context_id.clone())
+        })
+        .collect()
+}
+
+/// Opt-in migration-time counterpart to `1up gc --apply`'s `SupersededSameSource`
+/// enforcement, run once per successful index. Mirrors the daemon startup
+/// source-missing prune (`daemon::worker::prune_source_missing_contexts_on_startup`):
+/// deletes rows only, no inline `VACUUM` (full compaction stays exclusive to
+/// explicit `1up gc --apply` under the rebuild lock, so this never competes with
+/// concurrent searches — REQ-004), and every step is best-effort so a prune
+/// failure can never fail the index run that just succeeded.
+///
+/// Registry/daemon-status bookkeeping (which `1up gc --apply` and the daemon
+/// startup prune both perform) is intentionally not attempted here for the
+/// same layering reason documented on [`superseded_same_source_context_ids`]:
+/// `crate::cli::project_status_files` and `crate::daemon::registry` both sit
+/// above `indexer` in the dependency direction. A pruned context can briefly
+/// linger in the daemon status file or project registry until the next
+/// `1up gc` or daemon restart reconciles it; the index rows themselves — the
+/// actual reclaimed space — are gone immediately.
+async fn prune_superseded_same_source_contexts_on_migration(
+    conn: &Connection,
+    context: &WorktreeContext,
+) {
+    let contexts = match segments::list_worktree_contexts(conn).await {
+        Ok(contexts) => contexts,
+        Err(err) => {
+            warn!(
+                "failed to list worktree contexts for migration-time prune of {}: {err}",
+                context.context_id
+            );
+            return;
+        }
+    };
+
+    let pruned = superseded_same_source_context_ids(&contexts, context, chrono::Utc::now());
+    if pruned.is_empty() {
+        return;
+    }
+
+    let mut removed = Vec::with_capacity(pruned.len());
+    for context_id in &pruned {
+        match segments::delete_context(conn, context_id).await {
+            Ok(_) => removed.push(context_id.as_str()),
+            Err(err) => warn!(
+                "failed to prune superseded-same-source context {context_id} at migration time: {err}"
+            ),
+        }
+    }
+    if !removed.is_empty() {
+        info!(
+            "migration-time prune removed {} superseded-same-source context(s) for {}: {}",
+            removed.len(),
+            context.source_root.display(),
+            removed.join(", ")
         );
     }
 }
@@ -1776,6 +2139,7 @@ async fn execute_run_with_inputs(
     ));
     let parse_started_at = Instant::now();
 
+    let mut double_buffer = StoreDoubleBuffer::spawn(conn.clone(), context.context_id.clone());
     let mut reorder_buffer = BTreeMap::new();
     let mut parse_workers = JoinSet::new();
     let mut next_to_dispatch = 0usize;
@@ -1795,6 +2159,7 @@ async fn execute_run_with_inputs(
             progress_tx: progress_tx.clone(),
             scope: scope_info.clone(),
             prefilter: prefilter_info.clone(),
+            last_persisted_at: None,
         };
 
         while next_to_dispatch < content_read_count || !parse_workers.is_empty() {
@@ -1804,6 +2169,9 @@ async fn execute_run_with_inputs(
             // committed batch boundary (incomplete, never corrupt).
             if cancel_token.is_cancelled() {
                 debug!("indexing cancelled at dispatch boundary; stopping at last committed batch");
+                double_buffer
+                    .finish(flush_state.stats, flush_state.timings)
+                    .await?;
                 return Err(IndexingError::Cancelled.into());
             }
 
@@ -1842,11 +2210,15 @@ async fn execute_run_with_inputs(
             // guarantees an aborted pass stops at a committed boundary.
             if cancel_token.is_cancelled() {
                 debug!("indexing cancelled before flush; stopping at last committed batch");
+                double_buffer
+                    .finish(flush_state.stats, flush_state.timings)
+                    .await?;
                 return Err(IndexingError::Cancelled.into());
             }
 
             flush_reorder_buffer(
                 conn,
+                &mut double_buffer,
                 &mut reorder_buffer,
                 &mut next_to_flush,
                 config,
@@ -1867,11 +2239,15 @@ async fn execute_run_with_inputs(
         // in-loop check above.
         if cancel_token.is_cancelled() {
             debug!("indexing cancelled before tail flush; stopping at last committed batch");
+            double_buffer
+                .finish(flush_state.stats, flush_state.timings)
+                .await?;
             return Err(IndexingError::Cancelled.into());
         }
 
         flush_reorder_buffer(
             conn,
+            &mut double_buffer,
             &mut reorder_buffer,
             &mut next_to_flush,
             config,
@@ -1880,6 +2256,8 @@ async fn execute_run_with_inputs(
         )
         .await?;
     }
+
+    double_buffer.finish(&mut stats, &mut timings).await?;
 
     if !unsupported_extensions.is_empty() {
         let mut exts: Vec<&str> = unsupported_extensions.iter().map(|s| s.as_str()).collect();
@@ -1982,6 +2360,82 @@ mod tests {
         }
     }
 
+    fn synthetic_parsed_file(index: usize) -> ParsedWorkItem {
+        ParsedWorkItem {
+            relative_path: format!("synthetic_{index}.rs"),
+            file_hash: format!("hash-{index}"),
+            extension: "rs".to_string(),
+            file_size: 0,
+            modified_ns: 0,
+            segments: Vec::new(),
+        }
+    }
+
+    /// T6: the store task must decouple the producer from the write's actual
+    /// completion. `dispatch_pending` (the handoff of a prior batch to the
+    /// store task) must return well before that batch's libSQL write
+    /// finishes, so the flush stage no longer fully serializes
+    /// embed-then-store — the caller is free to spend that window on the
+    /// next batch's pure-CPU embed step. Before T6, `store_ready_files` ran
+    /// `build_segment_batches` (embed) and the write fully sequentially, so
+    /// dispatch and completion were the same event; this assertion fails
+    /// against that prior shape.
+    #[tokio::test]
+    async fn store_double_buffer_dispatch_returns_before_write_completes() {
+        let (_db, conn) = setup().await;
+        let context_id = "ctx-double-buffer";
+
+        // Large enough that the real libSQL write takes measurably longer
+        // than a bounded-channel send, making the decoupling observable
+        // without depending on the embedder (out of scope for this
+        // handoff-only assertion).
+        let file_count = 2000;
+        let parsed_files: Vec<ParsedWorkItem> =
+            (0..file_count).map(synthetic_parsed_file).collect();
+        let segment_batches: Vec<Vec<SegmentInsert>> =
+            (0..file_count).map(|_| Vec::new()).collect();
+
+        let mut double_buffer = StoreDoubleBuffer::spawn(conn.clone(), context_id.to_string());
+        double_buffer.set_pending(StoreJob {
+            parsed_files,
+            segment_batches,
+        });
+
+        let dispatch_started_at = Instant::now();
+        double_buffer.dispatch_pending().await.unwrap();
+        let dispatch_elapsed_ms = dispatch_started_at.elapsed().as_millis();
+
+        let mut stats = PipelineStats::default();
+        let mut timings = TimingAccumulator::default();
+        double_buffer
+            .await_inflight(&mut stats, &mut timings)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.files_indexed, file_count,
+            "await_inflight must attribute the completed batch's file count"
+        );
+        assert!(
+            timings.store_ms >= 5,
+            "the synthetic batch must take measurable store time to make the \
+             handoff observable, took {}ms",
+            timings.store_ms
+        );
+        assert!(
+            dispatch_elapsed_ms < timings.store_ms,
+            "dispatching a batch to the store task must return well before its \
+             write completes (dispatch={dispatch_elapsed_ms}ms, store={}ms); the \
+             flush stage must not fully serialize embed-then-store",
+            timings.store_ms
+        );
+
+        double_buffer
+            .finish(&mut stats, &mut timings)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn successful_context_run_records_indexed_head_oid() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2040,6 +2494,178 @@ mod tests {
             moved.head_oid,
             "a later run must replace the recorded head OID"
         );
+    }
+
+    /// Inserts a `worktree_contexts` row with an explicit `updated_at`,
+    /// bypassing `upsert_worktree_context`'s `datetime('now')` default so tests
+    /// can seed contexts of a specific age for the `SupersededSameSource`
+    /// keep-count/age policy.
+    async fn seed_worktree_context_row(
+        conn: &Connection,
+        context_id: &str,
+        source_root: &Path,
+        state_root: &Path,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO worktree_contexts (\
+                context_id, project_id, state_root, source_root, main_worktree_root, \
+                worktree_role, branch_name, branch_ref, branch_status, head_oid, \
+                git_dir, common_git_dir, updated_at\
+            ) VALUES (?1, 'migration-hook-proj', ?2, ?3, ?3, 'main', NULL, NULL, 'unknown', NULL, NULL, NULL, ?4)",
+            libsql::params![
+                context_id.to_string(),
+                state_root.to_string_lossy().into_owned(),
+                source_root.to_string_lossy().into_owned(),
+                updated_at.to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Seeds two recent (within-keep_count) and one aged, beyond-keep_count
+    /// same-source peer under fabricated `state_root`s, so the active
+    /// context recorded by the run under test ranks 1st and the aged peer
+    /// ranks 4th (beyond `GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT` = 3).
+    async fn seed_superseded_same_source_candidate(conn: &Connection, source_root: &Path) {
+        for id in ["kept-1", "kept-2"] {
+            seed_worktree_context_row(
+                conn,
+                id,
+                source_root,
+                Path::new("/other-state"),
+                "2026-06-25 00:00:00",
+            )
+            .await;
+        }
+        seed_worktree_context_row(
+            conn,
+            "superseded-1",
+            source_root,
+            Path::new("/other-state-old"),
+            "2026-01-01 00:00:00",
+        )
+        .await;
+    }
+
+    /// REQ-003/T4 AC: the opt-in migration-time `SupersededSameSource` prune
+    /// must never fire while [`GC_MIGRATION_PRUNE_ENV_VAR`] is unset (default
+    /// OFF) — a context that would otherwise qualify stays recorded.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn migration_time_prune_is_disabled_by_default() {
+        use crate::shared::constants::GC_MIGRATION_PRUNE_ENV_VAR;
+
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let saved = std::env::var_os(GC_MIGRATION_PRUNE_ENV_VAR);
+        std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR);
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        seed_superseded_same_source_candidate(&conn, tmp.path()).await;
+
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-active", "main");
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let remaining: std::collections::HashSet<String> = segments::list_worktree_contexts(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.context_id)
+            .collect();
+        assert!(
+            remaining.contains("superseded-1"),
+            "the switch is OFF by default, so a qualifying context must not be pruned at migration time"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, v),
+            None => std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR),
+        }
+    }
+
+    /// REQ-003/T4 AC: enabling [`GC_MIGRATION_PRUNE_ENV_VAR`] prunes
+    /// `SupersededSameSource` contexts at migration time via `delete_context`,
+    /// with no inline VACUUM — rows beyond the keep-count/age policy are gone,
+    /// contexts within the policy (and the active context) survive.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn migration_time_prune_removes_superseded_same_source_contexts_when_enabled() {
+        use crate::shared::constants::GC_MIGRATION_PRUNE_ENV_VAR;
+
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let saved = std::env::var_os(GC_MIGRATION_PRUNE_ENV_VAR);
+        std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, "1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let (_db, conn) = setup().await;
+        seed_superseded_same_source_candidate(&conn, tmp.path()).await;
+
+        let config = IndexingConfig::new(2, 1, 1).unwrap();
+        let context = test_worktree_context(tmp.path(), tmp.path(), "ctx-active", "main");
+        run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            None,
+            &RunScope::Full,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let remaining: std::collections::HashSet<String> = segments::list_worktree_contexts(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.context_id)
+            .collect();
+        assert!(
+            remaining.contains("ctx-active"),
+            "the active context must survive"
+        );
+        assert!(
+            remaining.contains("kept-1") && remaining.contains("kept-2"),
+            "within-keep_count same-source peers must survive"
+        );
+        assert!(
+            !remaining.contains("superseded-1"),
+            "beyond-keep_count, aged same-source peer must be pruned once the switch is enabled"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(GC_MIGRATION_PRUNE_ENV_VAR, v),
+            None => std::env::remove_var(GC_MIGRATION_PRUNE_ENV_VAR),
+        }
     }
 
     #[tokio::test]
@@ -2369,6 +2995,52 @@ mod tests {
         assert!(
             breadcrumbs.contains(&Some("README > Title > Install")),
             "expected file-stem-rooted heading breadcrumb; found {breadcrumbs:?}"
+        );
+    }
+
+    #[test]
+    fn should_persist_progress_collapses_rapid_skips_into_one_write_per_window() {
+        let start = Instant::now();
+        let mut last_persisted_at: Option<Instant> = None;
+        let mut persisted_at: Vec<Instant> = Vec::new();
+
+        // 25 synthetic progress-skip events 10ms apart (0..=240ms), all
+        // strictly inside the 250ms throttle window.
+        for step in 0..25u32 {
+            let now = start + Duration::from_millis(u64::from(step) * 10);
+            if should_persist_progress(last_persisted_at, now, false) {
+                persisted_at.push(now);
+                last_persisted_at = Some(now);
+            }
+        }
+
+        assert_eq!(
+            persisted_at,
+            vec![start],
+            "many skips inside a single 250ms window must collapse to the \
+             one opening persist_progress/atomic_replace call"
+        );
+
+        // An event that finally clears the window persists again.
+        let now_past_window = start + Duration::from_millis(260);
+        assert!(
+            should_persist_progress(last_persisted_at, now_past_window, false),
+            "a skip event past the throttle window must persist again"
+        );
+    }
+
+    #[test]
+    fn should_persist_progress_forces_terminal_complete_flush() {
+        let last_persist = Instant::now();
+        let now = last_persist + Duration::from_millis(10);
+
+        assert!(
+            !should_persist_progress(Some(last_persist), now, false),
+            "sanity: a non-terminal refresh this soon after a persist must be throttled"
+        );
+        assert!(
+            should_persist_progress(Some(last_persist), now, true),
+            "the terminal Complete phase must force a flush even inside the throttle window"
         );
     }
 

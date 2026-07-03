@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::future;
+use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -191,12 +191,14 @@ async fn run_inner() -> Result<(), OneupError> {
     };
 
     load_and_watch_projects(&mut file_watcher, &mut projects).await?;
+    prewarm_project_embedders(&mut projects);
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
     run_dirty_projects_until_clean_or_cancelled(
         &file_watcher,
         &mut projects,
         &cancel_token,
         &mut sigterm,
+        &mut search_requests_rx,
     )
     .await;
 
@@ -263,6 +265,7 @@ async fn run_inner() -> Result<(), OneupError> {
                         &mut projects,
                         &cancel_token,
                         &mut sigterm,
+                        &mut search_requests_rx,
                     )
                     .await;
                 }
@@ -300,6 +303,7 @@ async fn run_inner() -> Result<(), OneupError> {
                         &mut projects,
                         &cancel_token,
                         &mut sigterm,
+                        &mut search_requests_rx,
                     )
                     .await;
                     continue;
@@ -316,6 +320,7 @@ async fn run_inner() -> Result<(), OneupError> {
                     &mut projects,
                     &cancel_token,
                     &mut sigterm,
+                    &mut search_requests_rx,
                 )
                 .await;
             }
@@ -517,6 +522,56 @@ async fn load_and_watch_projects(
     }
 
     Ok(())
+}
+
+/// Prewarm every loaded project's embedding runtime immediately after
+/// [`load_and_watch_projects`] so the first real search finds a `Warm` runtime
+/// instead of paying a cold model load past the daemon's search deadline
+/// (REQ-004 D). Mirrors the search path's own `prepare_for_search` call
+/// (`handle_search_request`) rather than the indexing path's
+/// `prepare_for_indexing`, since prewarming is not itself an indexing pass and
+/// must not trigger a model download — a project with no model available yet
+/// simply stays `Unavailable` here exactly as it would on an unprewarmed first
+/// search, degrading to FTS-only rather than blocking startup.
+///
+/// Best-effort and per-project: a resolution or load failure for one project
+/// is logged and skipped, never propagated, so one misconfigured project can
+/// never block another project's prewarm or daemon startup.
+fn prewarm_project_embedders(projects: &mut ProjectStates) {
+    for state in projects.values_mut() {
+        let indexing_config = match config::resolve_indexing_config(
+            None,
+            None,
+            state.indexing.as_ref(),
+        ) {
+            Ok(indexing_config) => indexing_config,
+            Err(err) => {
+                warn!(
+                        "failed to resolve indexing configuration while prewarming embedder for {}: {err}",
+                        state.project_root.display()
+                    );
+                continue;
+            }
+        };
+        match state
+            .embedding_runtime
+            .prepare_for_search(indexing_config.embed_threads)
+        {
+            Ok(status) => {
+                log_search_embedding_status(
+                    &state.project_root,
+                    indexing_config.embed_threads,
+                    &status,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "failed to prewarm embedding runtime for {}: {err}",
+                    state.project_root.display()
+                );
+            }
+        }
+    }
 }
 
 /// Select the recorded contexts whose source worktree directory no longer exists.
@@ -1259,8 +1314,9 @@ async fn run_dirty_projects_until_clean_or_cancelled(
     projects: &mut ProjectStates,
     cancel_token: &CancellationToken,
     sigterm: &mut Signal,
+    search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
-    let sweep = run_dirty_projects_until_clean(watcher, projects, cancel_token);
+    let sweep = run_dirty_projects_until_clean(watcher, projects, cancel_token, search_requests_rx);
     tokio::pin!(sweep);
 
     tokio::select! {
@@ -1279,6 +1335,7 @@ async fn run_dirty_projects_until_clean(
     watcher: &FileWatcher,
     projects: &mut ProjectStates,
     cancel_token: &CancellationToken,
+    search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
     let mut preferred_key: Option<String> = None;
 
@@ -1291,7 +1348,7 @@ async fn run_dirty_projects_until_clean(
         }
         preferred_key = None;
 
-        let result = run_project(&key, projects, cancel_token).await;
+        let result = run_project(&key, projects, cancel_token, search_requests_rx).await;
 
         let filtered = watcher::filter_changed_paths(watcher, watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
@@ -1424,10 +1481,41 @@ fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
     }
 }
 
+/// Run `unit` to completion, servicing queued daemon search requests as they
+/// arrive in the meantime.
+///
+/// HYP-002 (CONFIRMED): a refresh sweep's per-project pass can run for
+/// seconds — far past `DAEMON_READ_TIMEOUT_MS` — so yielding only at project
+/// boundaries is insufficient; a search queued while `unit` is still pending
+/// must be served without waiting for `unit` to finish. Each iteration polls
+/// `unit` and the search-request channel together: whichever is ready first
+/// wins, and if a request wins, `unit` simply gets re-polled (resuming
+/// exactly where it left off) on the next loop iteration. `handle_search_request`
+/// takes its own brief, per-call slice of `projects` (T8) rather than the
+/// long-lived borrow `unit` may or may not hold, so a search for any OTHER
+/// project never contends with `unit`'s (potentially long) execution here.
+async fn run_unit_while_servicing_search<F: Future>(
+    unit: F,
+    projects: &mut ProjectStates,
+    search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
+) -> F::Output {
+    tokio::pin!(unit);
+    loop {
+        tokio::select! {
+            result = &mut unit => return result,
+            Some(queued) = search_requests_rx.recv() => {
+                let response = handle_search_request(projects, queued.request).await;
+                let _ = queued.respond_to.send(response);
+            }
+        }
+    }
+}
+
 async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
     cancel_token: &CancellationToken,
+    search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) -> Result<pipeline::PipelineStats, OneupError> {
     // Acquire the single-writer rebuild lock BEFORE `start_run` consumes the
     // pending scope, so a contended pass leaves the project dirty (its queued
@@ -1546,36 +1634,57 @@ async fn run_project(
         }
     }
 
-    let result = {
+    // Take the embedding runtime OUT of the map-borrowed state before the
+    // (potentially multi-second) prepare+pipeline pass, so `projects` is never
+    // held across it (HYP-002/T8): a queued daemon search for ANY project runs
+    // via `run_unit_while_servicing_search` below without contending with this
+    // pass for the whole-map borrow. `EmbeddingRuntime` is cheap to move
+    // (`Default`-backed cache), so this is a pointer-swap, not a reload.
+    let mut embedding_runtime = {
         let state = projects
             .get_mut(context_id)
             .expect("dirty project must exist while preparing embeddings");
-        let model_start = std::time::Instant::now();
-        let status = state
-            .embedding_runtime
-            .prepare_for_indexing(indexing_config.embed_threads)
-            .await?;
-        setup.model_prepare_ms = model_start.elapsed().as_millis();
-        log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
-        pipeline::run_with_context_scope_setup_and_progress_root(
-            &conn,
-            &context,
-            state.embedding_runtime.current_embedder(),
-            &scope,
-            &indexing_config,
-            None,
-            true,
-            Some(setup),
-            daemon_fallback_reason,
-            Some(&project_root),
-            cancel_token,
-        )
-        .await
+        std::mem::take(&mut state.embedding_runtime)
     };
+    let model_start = std::time::Instant::now();
+    let prepare_status = embedding_runtime
+        .prepare_for_indexing(indexing_config.embed_threads)
+        .await;
+    setup.model_prepare_ms = model_start.elapsed().as_millis();
+
+    let status = match prepare_status {
+        Ok(status) => status,
+        Err(e) => {
+            let state = projects
+                .get_mut(context_id)
+                .expect("dirty project must exist while restoring a failed embedding prepare");
+            state.embedding_runtime = embedding_runtime;
+            state.run_state.finish_run();
+            mark_refresh_finished(state, Utc::now(), Err(&e));
+            return Err(e);
+        }
+    };
+    log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
+
+    let pipeline_unit = pipeline::run_with_context_scope_setup_and_progress_root(
+        &conn,
+        &context,
+        embedding_runtime.current_embedder(),
+        &scope,
+        &indexing_config,
+        None,
+        true,
+        Some(setup),
+        daemon_fallback_reason,
+        Some(&project_root),
+        cancel_token,
+    );
+    let result = run_unit_while_servicing_search(pipeline_unit, projects, search_requests_rx).await;
 
     let state = projects
         .get_mut(context_id)
         .expect("dirty project must exist while finishing a run");
+    state.embedding_runtime = embedding_runtime;
     state.run_state.finish_run();
 
     if matches!(
@@ -1714,30 +1823,61 @@ async fn handle_search_request(
         None
     };
 
+    // This context's own embedding runtime is temporarily checked out by an
+    // in-flight refresh sweep exactly while `last_refresh_state == Running`
+    // (`run_project`'s `std::mem::take`, HYP-002/T8): `Pending` (dirty but not
+    // yet started) leaves the runtime untouched, so only `Running` must divert
+    // away from it.
+    let embedder_checked_out_by_sweep = state.last_refresh_state == DaemonRefreshState::Running;
+
     let mut degraded_reason = None;
-    let results = if has_embeddings {
-        let status = match state
-            .embedding_runtime
-            .prepare_for_search(indexing_config.embed_threads)
-        {
+    let results = if !has_embeddings {
+        degraded_reason = Some(daemon_search_degraded_reason());
+        let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
+        engine.fts_only_search(&request.query, request.limit).await
+    } else if embedder_checked_out_by_sweep {
+        // Touching `state.embedding_runtime` here would either race the
+        // sweep's live embedder or force a redundant cold reload into the
+        // `Default` placeholder `run_project` left behind. Degrade to
+        // FTS-only; `STALE_REBUILD_REASON` (folded in below) already tells the
+        // caller a pass for this context is in flight.
+        let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
+        engine.fts_only_search(&request.query, request.limit).await
+    } else {
+        // Take the embedding runtime OUT of the map-borrowed state so the
+        // heavy hybrid search below runs without holding `&mut projects`
+        // (HYP-002/T8): a concurrent refresh sweep for a DIFFERENT project
+        // never contends with this call for the whole-map borrow, and WAL's
+        // concurrent-reader semantics (HYP-001) make the shared connection
+        // safe to use unlocked. Every exit path below restores it before
+        // returning, so a warm model is never dropped.
+        let mut embedding_runtime = std::mem::take(&mut state.embedding_runtime);
+        let status = match embedding_runtime.prepare_for_search(indexing_config.embed_threads) {
             Ok(status) => status,
             Err(err) => {
+                if let Some(state) = projects.get_mut(&request.context_id) {
+                    state.embedding_runtime = embedding_runtime;
+                }
                 // An invalid ONEUP_MODEL_VARIANT override is a hard config error,
                 // not a degrade: refuse the request rather than silently serving
                 // FTS-only results from the wrong (or no) variant (T1).
                 warn!(
                     "daemon search embedding preparation failed for {}: {err}",
-                    state.project_root.display()
+                    request.project_root.display()
                 );
                 return search_service::unavailable_response();
             }
         };
-        log_search_embedding_status(&state.project_root, indexing_config.embed_threads, &status);
+        log_search_embedding_status(
+            &request.project_root,
+            indexing_config.embed_threads,
+            &status,
+        );
 
-        if status.is_available() {
+        let results = if status.is_available() {
             let mut engine = HybridSearchEngine::new_scoped(
                 &conn,
-                state.embedding_runtime.current_embedder(),
+                embedding_runtime.current_embedder(),
                 search_scope.clone(),
             )
             .with_has_vectors(has_embeddings);
@@ -1749,11 +1889,12 @@ async fn handle_search_request(
             degraded_reason = Some(daemon_search_degraded_reason());
             let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
             engine.fts_only_search(&request.query, request.limit).await
+        };
+
+        if let Some(state) = projects.get_mut(&request.context_id) {
+            state.embedding_runtime = embedding_runtime;
         }
-    } else {
-        degraded_reason = Some(daemon_search_degraded_reason());
-        let engine = HybridSearchEngine::new_scoped(&conn, None, search_scope);
-        engine.fts_only_search(&request.query, request.limit).await
+        results
     };
 
     // Fold the stale-rebuild notice in through the shared combiner so it
@@ -1773,7 +1914,7 @@ async fn handle_search_request(
         Err(err) => {
             warn!(
                 "daemon search failed for {}: {err}",
-                state.project_root.display()
+                request.project_root.display()
             );
             search_service::unavailable_response()
         }
@@ -1789,6 +1930,8 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    use crate::shared::constants::DAEMON_READ_TIMEOUT_MS;
 
     #[test]
     fn should_idle_shutdown_only_when_empty_past_timeout() {
@@ -1934,6 +2077,61 @@ mod tests {
             Some(STARTUP_RECONCILIATION_REASON)
         );
         assert_eq!(state.last_refresh_state, DaemonRefreshState::Pending);
+    }
+
+    /// REQ-004 D / T9: `prewarm_project_embedders` runs once, right after
+    /// `load_and_watch_projects`, so a project's embedding runtime is already
+    /// loaded before the first real search arrives. Modeled on
+    /// `prepare_for_search_reuses_warm_runtime_when_model_is_unchanged`: proving
+    /// a post-prewarm `prepare_for_search` call returns `Warm` (a cache hit,
+    /// not a fresh load) is exactly what a first real search would observe.
+    /// Gated on model availability like the other real-inference tests
+    /// (hermetic CI disables model downloads).
+    #[test]
+    fn startup_prewarm_leaves_embedding_runtime_warm_before_first_search() {
+        use crate::indexer::embedder::{is_model_available, Fp32VariantTestGuard};
+
+        // Pin the always-provisioned FP32 baseline so this test runs on any
+        // host with the FP32 model present, independent of whether the INT8
+        // default variant's artifact has been downloaded.
+        let _variant = Fp32VariantTestGuard::set();
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = runtime.block_on(Db::open_memory()).unwrap();
+        let mut projects: ProjectStates = HashMap::new();
+        let state = project_state(&project_root, &project_root, db, ProjectRunState::default());
+        let context_id = insert_project(&mut projects, state);
+
+        prewarm_project_embedders(&mut projects);
+
+        let state = projects.get_mut(&context_id).unwrap();
+        assert!(
+            state.embedding_runtime.current_embedder().is_some(),
+            "prewarm should leave the embedder loaded"
+        );
+        // Resolve `embed_threads` exactly as `handle_search_request` would for
+        // the first real search, so the compatibility key matches the one the
+        // prewarm pass used.
+        let indexing_config = config::resolve_indexing_config(None, None, state.indexing.as_ref())
+            .expect("default indexing config resolves");
+        let status = state
+            .embedding_runtime
+            .prepare_for_search(indexing_config.embed_threads)
+            .unwrap();
+        assert_eq!(
+            status,
+            EmbeddingLoadStatus::Warm,
+            "the first real search's prepare_for_search call should reuse the \
+             prewarmed runtime instead of loading it cold"
+        );
     }
 
     #[test]
@@ -2287,7 +2485,12 @@ mod tests {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
 
-        let result = run_project(&key, &mut projects, &cancel_token).await;
+        // No search traffic is exercised in this test; an idle channel (sender
+        // kept alive, nothing ever sent) never resolves `run_project`'s internal
+        // search-servicing select arm, so the pipeline unit is the only branch
+        // that ever completes.
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let result = run_project(&key, &mut projects, &cancel_token, &mut search_requests_rx).await;
         assert!(
             matches!(
                 result,
@@ -2336,6 +2539,78 @@ mod tests {
             response,
             SearchResponse::Unavailable { ref reason } if reason == "daemon unavailable"
         ));
+    }
+
+    /// HYP-002 (CONFIRMED) / T8: per-project-boundary yielding alone is
+    /// insufficient because a single project's refresh pass can run for
+    /// seconds, far past `DAEMON_READ_TIMEOUT_MS` — the search path must be
+    /// decoupled from the sweep's `&mut projects` borrow, not merely
+    /// interleaved with it at a coarser boundary.
+    ///
+    /// This drives `run_unit_while_servicing_search` — the exact seam
+    /// `run_project` uses to run its (potentially multi-second) pipeline pass
+    /// — with an injected slow unit standing in for that pass (pipeline.rs is
+    /// out of scope to modify directly), and asserts a search queued while the
+    /// unit is still in flight is served well within `DAEMON_READ_TIMEOUT_MS`.
+    /// No embeddings are seeded, so the served response is FTS-only and the
+    /// test needs no ONNX model (hermetic, deterministic, no benchmark).
+    #[tokio::test]
+    async fn search_is_served_while_a_slow_sweep_unit_is_still_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = file_backed_state(&tmp, &["seg1"]).await;
+        let context_id = state.context.context_id.clone();
+        let project_root = state.project_root.clone();
+        let source_root = state.source_root.clone();
+        let mut projects = HashMap::new();
+        projects.insert(context_id.clone(), state);
+
+        let (tx, mut search_requests_rx) = mpsc::channel(1);
+
+        // Stands in for `run_project`'s pipeline pass: far longer than
+        // `DAEMON_READ_TIMEOUT_MS`, so a search starved until it completes
+        // would fail the assertion below.
+        let slow_unit = tokio::time::sleep(Duration::from_millis(DAEMON_READ_TIMEOUT_MS * 4));
+        let run =
+            run_unit_while_servicing_search(slow_unit, &mut projects, &mut search_requests_rx);
+        tokio::pin!(run);
+
+        let (respond_to, response_rx) = oneshot::channel();
+        tx.send(QueuedSearchRequest {
+            request: SearchRequest {
+                project_root,
+                source_root,
+                context_id,
+                query: "fn".to_string(),
+                limit: 10,
+                path_prefix: None,
+            },
+            respond_to,
+        })
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let response = tokio::select! {
+            response = response_rx => response.unwrap(),
+            _ = &mut run => panic!(
+                "the injected slow unit must not resolve before the concurrently \
+                 queued search response — search was starved until the sweep finished"
+            ),
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(DAEMON_READ_TIMEOUT_MS),
+            "search must be served within DAEMON_READ_TIMEOUT_MS while the sweep unit is \
+             still in progress, took {elapsed:?}"
+        );
+        assert!(
+            matches!(response, SearchResponse::Results { .. }),
+            "expected a served response, got {response:?}"
+        );
+
+        // Let the still-pending unit finish so nothing is left dangling.
+        run.await;
     }
 
     #[tokio::test]
@@ -2811,6 +3086,7 @@ mod tests {
             state_root: PathBuf::from(state_root),
             source_root: PathBuf::from(source_root),
             branch_name: None,
+            updated_at: "2026-01-01 00:00:00".to_string(),
         }
     }
 

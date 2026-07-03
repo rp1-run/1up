@@ -103,6 +103,16 @@ pub struct StatusInfo {
     pub total_segments: Option<u64>,
     pub vector_rows: Option<u64>,
     pub embeddable_segments: Option<u64>,
+    /// Total worktree contexts recorded in the shared index (every branch/worktree
+    /// sharing this project's `index.db`, not just the active one). `None` when the
+    /// index is absent/unreadable. Populated via `segments::list_worktree_contexts`.
+    pub context_count: Option<usize>,
+    /// Reclaimable-bytes estimate: `PRAGMA freelist_count * PRAGMA page_size`
+    /// (exact, already-free pages) plus a proportional proxy for segments in
+    /// contexts whose source no longer exists on disk. Labeled as an estimate in
+    /// rendered output — exact bytes are only known after `1up gc --apply`'s
+    /// VACUUM. `None` when the index is absent/unreadable.
+    pub reclaimable_bytes: Option<u64>,
     /// Variant-aware embedding-model identity recorded in the index `meta` table
     /// (e.g. `all-MiniLM-L6-v2@int8`), read via `schema::get_embedding_model`.
     /// `None` when the index is absent/unreadable or predates model tracking.
@@ -440,6 +450,8 @@ impl Formatter for JsonFormatter {
             "total_segments": status.total_segments,
             "vector_rows": status.vector_rows,
             "embeddable_segments": status.embeddable_segments,
+            "context_count": status.context_count,
+            "reclaimable_bytes": status.reclaimable_bytes,
             "embedding_model": &status.embedding_model,
             "schema_version": status.schema_version,
             "project_id": &status.project_id,
@@ -736,6 +748,15 @@ impl Formatter for HumanFormatter {
         }
         if let Some(segs) = status.total_segments {
             out.push_str(&format!("Total segments: {segs}\n"));
+        }
+        if let Some(count) = status.context_count {
+            out.push_str(&format!("Context count: {count}\n"));
+        }
+        if let Some(bytes) = status.reclaimable_bytes {
+            out.push_str(&format!(
+                "Reclaimable space: ~{} (estimate; run `1up gc --apply` to reclaim)\n",
+                render_bytes_human(bytes)
+            ));
         }
         if let (Some(vectors), Some(embeddable)) = (status.vector_rows, status.embeddable_segments)
         {
@@ -1243,6 +1264,12 @@ impl Formatter for PlainFormatter {
         }
         if let Some(embeddable) = status.embeddable_segments {
             out.push_str(&format!("\tembeddable_segments:{embeddable}"));
+        }
+        if let Some(count) = status.context_count {
+            out.push_str(&format!("\tcontext_count:{count}"));
+        }
+        if let Some(bytes) = status.reclaimable_bytes {
+            out.push_str(&format!("\treclaimable_bytes:{bytes}"));
         }
         if let Some(progress) = &status.index_progress {
             let work = WorkSummary::from(progress);
@@ -1788,6 +1815,25 @@ fn render_embedding_outcome_human(progress: &IndexProgress, coverage_label: &str
 
 fn render_duration_ms(duration_ms: u128) -> String {
     format!("{duration_ms}ms")
+}
+
+/// Compact human byte size (binary units) for `1up status`'s reclaimable-bytes
+/// reporting. Deliberately not shared with `cli::gc`'s own `human_bytes` (out
+/// of this change's scope) — both are small, stable pure formatters that are
+/// free to evolve independently.
+fn render_bytes_human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn render_index_watch_message(progress: &IndexProgress) -> String {
@@ -2566,6 +2612,8 @@ mod tests {
             total_segments: Some(14),
             vector_rows: Some(14),
             embeddable_segments: Some(14),
+            context_count: Some(2),
+            reclaimable_bytes: Some(2048),
             embedding_model: Some("all-MiniLM-L6-v2@int8".to_string()),
             schema_version: Some(18),
             project_id: Some("project-123".to_string()),
@@ -2740,6 +2788,45 @@ mod tests {
     }
 
     #[test]
+    fn json_status_surfaces_context_count_and_reclaimable_bytes() {
+        let json = JsonFormatter.format_status(&sample_status());
+        assert!(
+            json.contains("\"context_count\": 2"),
+            "json status must surface context_count: {json}"
+        );
+        assert!(
+            json.contains("\"reclaimable_bytes\": 2048"),
+            "json status must surface reclaimable_bytes: {json}"
+        );
+    }
+
+    #[test]
+    fn human_status_reports_context_count_and_reclaimable_bytes_as_an_estimate() {
+        let rendered = HumanFormatter.format_status(&sample_status());
+        assert!(
+            rendered.contains("Context count: 2"),
+            "human status must surface context count: {rendered}"
+        );
+        assert!(
+            rendered.contains("Reclaimable space: ~2.0 KiB (estimate"),
+            "human status must render reclaimable bytes as a labeled estimate: {rendered}"
+        );
+    }
+
+    #[test]
+    fn plain_status_reports_context_count_and_reclaimable_bytes() {
+        let rendered = PlainFormatter.format_status(&sample_status());
+        assert!(
+            rendered.contains("\tcontext_count:2"),
+            "plain status must surface context_count: {rendered}"
+        );
+        assert!(
+            rendered.contains("\treclaimable_bytes:2048"),
+            "plain status must surface reclaimable_bytes: {rendered}"
+        );
+    }
+
+    #[test]
     fn human_status_notes_embedding_model_when_present() {
         let rendered = HumanFormatter.format_status(&sample_status());
         assert!(
@@ -2781,6 +2868,8 @@ mod tests {
             total_segments: None,
             vector_rows: None,
             embeddable_segments: None,
+            context_count: None,
+            reclaimable_bytes: None,
             embedding_model: None,
             schema_version: None,
             project_id: None,
@@ -2825,6 +2914,8 @@ mod tests {
             total_segments: None,
             vector_rows: None,
             embeddable_segments: None,
+            context_count: None,
+            reclaimable_bytes: None,
             embedding_model: None,
             schema_version: None,
             project_id: None,

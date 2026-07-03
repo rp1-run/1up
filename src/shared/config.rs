@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use crate::shared::constants::{
-    EMBED_THREADS_ENV_VAR, INDEX_JOBS_ENV_VAR, INDEX_WRITE_BATCH_FILES_ENV_VAR,
-    MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_CURRENT_MANIFEST_FILENAME, MODEL_STAGING_DIRNAME,
-    MODEL_VERIFIED_DIRNAME, UPDATE_CHECK_CACHE_FILENAME,
+    EMBED_THREADS_ENV_VAR, GC_MIGRATION_PRUNE_ENV_VAR, INDEX_JOBS_ENV_VAR,
+    INDEX_WRITE_BATCH_FILES_ENV_VAR, MODEL_ARTIFACT_MANIFEST_FILENAME,
+    MODEL_CURRENT_MANIFEST_FILENAME, MODEL_STAGING_DIRNAME, MODEL_VERIFIED_DIRNAME,
+    UPDATE_CHECK_CACHE_FILENAME,
 };
 use crate::shared::errors::{ConfigError, OneupError};
 use crate::shared::types::IndexingConfig;
@@ -168,6 +169,18 @@ pub fn resolve_indexing_config_with_globs(
         cli_index_hidden_dirs.or_else(|| persisted.map(|config| config.index_hidden_dirs.clone())),
     )
     .map_err(|err| ConfigError::ReadFailed(err).into())
+}
+
+/// Reports whether automatic `SupersededSameSource` context pruning is enabled
+/// at migration time, via [`GC_MIGRATION_PRUNE_ENV_VAR`]. Default OFF: unset,
+/// empty, or `"0"` disable it; any other value enables it (mirrors
+/// `indexer::embedder`'s `model_downloads_disabled` env-flag convention).
+pub fn migration_gc_prune_enabled() -> bool {
+    migration_gc_prune_enabled_value(std::env::var_os(GC_MIGRATION_PRUNE_ENV_VAR))
+}
+
+fn migration_gc_prune_enabled_value(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|raw| !raw.is_empty() && raw != "0")
 }
 
 fn read_positive_env(name: &str) -> Result<Option<usize>, OneupError> {
@@ -395,5 +408,18 @@ mod tests {
 
         let err = resolve_indexing_config(None, None, None).unwrap_err();
         assert!(err.to_string().contains(INDEX_JOBS_ENV_VAR));
+    }
+
+    #[test]
+    fn migration_gc_prune_enabled_value_semantics() {
+        use std::ffi::OsString;
+
+        assert!(!migration_gc_prune_enabled_value(None));
+        assert!(!migration_gc_prune_enabled_value(Some(OsString::from(""))));
+        assert!(!migration_gc_prune_enabled_value(Some(OsString::from("0"))));
+        assert!(migration_gc_prune_enabled_value(Some(OsString::from("1"))));
+        assert!(migration_gc_prune_enabled_value(Some(OsString::from(
+            "true"
+        ))));
     }
 }

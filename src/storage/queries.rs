@@ -244,6 +244,18 @@ pub const WAL_CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 #[allow(dead_code)]
 pub const WAL_CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE)";
 
+/// Number of pages currently on the freelist: already-deleted rows whose pages
+/// were freed but not yet returned to the filesystem by `VACUUM` (`auto_vacuum`
+/// stays off, the project default, so deleted pages sit on the freelist for
+/// reuse). Paired with [`PRAGMA_PAGE_SIZE`] this is the exact number of bytes
+/// `1up gc --apply`'s VACUUM would reclaim from already-deleted rows alone.
+/// Used by `1up status`'s reclaimable-bytes estimate.
+pub const PRAGMA_FREELIST_COUNT: &str = "PRAGMA freelist_count";
+
+/// Page size (bytes) of the connected database, paired with
+/// [`PRAGMA_FREELIST_COUNT`] to compute exact already-free bytes.
+pub const PRAGMA_PAGE_SIZE: &str = "PRAGMA page_size";
+
 pub const SELECT_SCHEMA_OBJECT: &str =
     "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2 LIMIT 1";
 
@@ -1214,8 +1226,11 @@ pub const SELECT_WORKTREE_CONTEXT_HEAD_OID: &str =
 
 /// Every recorded worktree context, used by `1up gc` to decide which contexts are
 /// stale branch snapshots or dead worktrees that can be pruned from the shared index.
+/// `updated_at` (bumped on every `UPSERT_WORKTREE_CONTEXT`, i.e. every successful
+/// index run for that context) is the keep-count/age signal for the
+/// `SupersededSameSource` retention policy.
 pub const SELECT_ALL_WORKTREE_CONTEXTS: &str =
-    "SELECT context_id, state_root, source_root, branch_name FROM worktree_contexts";
+    "SELECT context_id, state_root, source_root, branch_name, updated_at FROM worktree_contexts";
 
 // Context-wide deletion, used by `1up gc --apply` to evict one worktree context from
 // the shared index. `segments` is deleted last of the data tables so its AFTER DELETE

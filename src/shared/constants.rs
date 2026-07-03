@@ -152,6 +152,18 @@ pub const CHUNK_OVERLAP: usize = 10;
 /// Debounce interval for file watcher events in milliseconds.
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
+/// Maximum interval between persisted `index_status.json` progress writes
+/// during a single indexing pass (`FlushState::refresh`, T7/REQ-004).
+///
+/// Before this throttle, every skipped file or stored batch triggered its own
+/// `atomic_replace` (temp-write + fsync + rename), which dominated wall time
+/// on skip-heavy incremental passes. The in-memory progress bar
+/// (`emit_progress`) stays per-event and is unaffected; only the on-disk
+/// write is gated. The terminal `Complete` phase always flushes regardless
+/// of this gate, so `1up status`/`list`/MCP readers never observe a stale
+/// non-terminal state past run completion.
+pub const PROGRESS_PERSIST_THROTTLE_MS: u64 = 250;
+
 /// How long the daemon may run with zero registered projects before it
 /// self-exits. The daemon otherwise only exits on SIGTERM, so a daemon left
 /// behind once its last project is deregistered (`1up stop`), or one orphaned
@@ -494,3 +506,30 @@ pub const UPDATE_ARTIFACT_HOST_ALLOWLIST: [&str; 3] = [
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
+
+/// PLACEHOLDER — conservative interim value, **not** a finalized product
+/// default. Number of most-recently-updated (`worktree_contexts.updated_at`)
+/// same-source contexts `1up gc`'s `SupersededSameSource` retention policy
+/// keeps regardless of age; only contexts beyond this rank (and past
+/// [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`]) are eligible for pruning.
+/// Governance constraint (full-scan-audit-fixes-warm-path-lifecycle REQ-003):
+/// numeric GC defaults must not be invented as final; this value is
+/// finalized at the planning gate.
+pub const GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT: usize = 3;
+
+/// PLACEHOLDER — conservative interim value, **not** a finalized product
+/// default. Minimum age in days a same-source context ranked beyond
+/// [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`] must reach (by
+/// `worktree_contexts.updated_at`) before `1up gc`'s `SupersededSameSource`
+/// retention policy considers it prunable. Finalized at the planning gate.
+pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
+
+/// Env var name for the opt-in (default OFF) switch enabling automatic
+/// `SupersededSameSource` context pruning at migration time
+/// (`indexer::pipeline::record_indexed_head`). Unset, empty, or `"0"` disables
+/// it (default); any other value enables it. Governance constraint
+/// (full-scan-audit-fixes-warm-path-lifecycle REQ-003 Open Risks): automatic
+/// pruning on every index run is not a default-on behavior until the planning
+/// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
+/// switch either way.
+pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";

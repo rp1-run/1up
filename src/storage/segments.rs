@@ -1067,12 +1067,17 @@ pub async fn get_worktree_context_head_oid(
 /// One row from `worktree_contexts`: a context recorded in the shared index, with
 /// the worktree paths and branch that minted its `context_id`. Consumed by `1up gc`
 /// to classify stale branch snapshots and dead worktrees.
+///
+/// `updated_at` is the raw `datetime('now')` TEXT value (`YYYY-MM-DD HH:MM:SS`,
+/// UTC), bumped on every successful index run for this context; it is the
+/// keep-count/age signal for the `SupersededSameSource` retention policy.
 #[derive(Debug, Clone)]
 pub struct IndexedContextRow {
     pub context_id: String,
     pub state_root: PathBuf,
     pub source_root: PathBuf,
     pub branch_name: Option<String>,
+    pub updated_at: String,
 }
 
 /// List every worktree context recorded in the shared index.
@@ -1102,11 +1107,15 @@ pub async fn list_worktree_contexts(
         let branch_name: Option<String> = row
             .get(3)
             .map_err(|e| StorageError::Query(format!("read branch_name failed: {e}")))?;
+        let updated_at: String = row
+            .get(4)
+            .map_err(|e| StorageError::Query(format!("read updated_at failed: {e}")))?;
         contexts.push(IndexedContextRow {
             context_id,
             state_root: PathBuf::from(state_root),
             source_root: PathBuf::from(source_root),
             branch_name,
+            updated_at,
         });
     }
     Ok(contexts)
@@ -1184,6 +1193,58 @@ pub async fn vacuum_database(conn: &Connection) -> Result<(), OneupError> {
         .await
         .map_err(|e| StorageError::Query(format!("vacuum failed: {e}")))?;
     Ok(())
+}
+
+/// Bytes already freed by prior deletes but not yet returned to the filesystem:
+/// `PRAGMA freelist_count * PRAGMA page_size`. Exact, not an estimate — the
+/// floor of `1up status`'s reclaimable-bytes reporting (see [`vacuum_database`]
+/// for why a `VACUUM` is still needed to actually shrink `index.db`).
+pub async fn freelist_reclaimable_bytes(conn: &Connection) -> Result<u64, OneupError> {
+    let freelist_count =
+        read_pragma_u64(conn, queries::PRAGMA_FREELIST_COUNT, "freelist_count").await?;
+    let page_size = read_pragma_u64(conn, queries::PRAGMA_PAGE_SIZE, "page_size").await?;
+    Ok(freelist_count.saturating_mul(page_size))
+}
+
+async fn read_pragma_u64(conn: &Connection, sql: &str, label: &str) -> Result<u64, OneupError> {
+    let mut rows = conn
+        .query(sql, ())
+        .await
+        .map_err(|e| StorageError::Query(format!("read {label} failed: {e}")))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        Some(row) => {
+            let value: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Query(format!("parse {label} failed: {e}")))?;
+            Ok(value.max(0) as u64)
+        }
+        None => Ok(0),
+    }
+}
+
+/// A conservative, self-contained proxy for segments belonging to recorded
+/// contexts (other than `active_context_id`) whose `source_root` no longer
+/// exists on disk. Deliberately lighter than `1up gc`'s full `prune_reason`
+/// classification (a stale-branch-snapshot or nested-subdir context whose
+/// source still exists is not counted here) — a proxy signal for `1up
+/// status`'s at-a-glance reclaimable-bytes estimate, not a claim that `1up gc
+/// --apply` would prune exactly this set.
+pub async fn prunable_segments_proxy(
+    conn: &Connection,
+    active_context_id: &str,
+) -> Result<u64, OneupError> {
+    let contexts = list_worktree_contexts(conn).await?;
+    let mut total = 0u64;
+    for ctx in &contexts {
+        if ctx.context_id != active_context_id && !ctx.source_root.exists() {
+            total += count_segments_for_context(conn, &ctx.context_id).await?;
+        }
+    }
+    Ok(total)
 }
 
 /// Count total number of segments in the database.
@@ -4537,5 +4598,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(capped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn freelist_reclaimable_bytes_is_zero_for_a_fresh_database() {
+        let (_db, conn) = setup().await;
+
+        assert_eq!(freelist_reclaimable_bytes(&conn).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn freelist_reclaimable_bytes_reflects_pages_freed_by_delete_without_vacuum() {
+        // A file-backed connection, not in-memory: freelist accounting is a
+        // property of the pager over the actual database file.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap();
+        let db_path = crate::shared::config::project_db_path(&project_root);
+        let db = Db::open_rw(&db_path).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let segments: Vec<SegmentInsert> = (0..500)
+            .map(|i| {
+                test_segment(
+                    &format!("seg-{i:04}"),
+                    &format!("file-{i:04}.rs"),
+                    &format!("hash-{i:04}"),
+                )
+            })
+            .collect();
+        batch_upsert_segments(&conn, &segments).await.unwrap();
+        conn.execute("DELETE FROM segments", ()).await.unwrap();
+
+        // auto_vacuum stays off (the project default), so pages freed by the
+        // DELETE above sit on the freelist rather than shrinking the file.
+        let bytes = freelist_reclaimable_bytes(&conn).await.unwrap();
+        assert!(
+            bytes > 0,
+            "deleting 500 segments without VACUUM must leave freed pages on the freelist"
+        );
+    }
+
+    #[tokio::test]
+    async fn prunable_segments_proxy_counts_only_non_active_contexts_with_missing_source() {
+        let (_db, conn) = setup().await;
+
+        let missing_dir = std::env::temp_dir().join("oneup-gc-proxy-test-missing-source-dir");
+        let _ = std::fs::remove_dir_all(&missing_dir);
+
+        let active = test_worktree_context_row_with_source(
+            "active000000",
+            "/tmp/oneup-gc-proxy-test-active",
+        );
+        let gone =
+            test_worktree_context_row_with_source("gone00000001", missing_dir.to_str().unwrap());
+        let live = test_worktree_context_row_with_source("live0000001", env!("CARGO_MANIFEST_DIR"));
+
+        for (ctx, seg_prefix) in [(&active, "a"), (&gone, "g"), (&live, "l")] {
+            upsert_worktree_context(&conn, ctx, "proj-1").await.unwrap();
+            let segment =
+                generated_test_segment(&ctx.context_id, &format!("{seg_prefix}.rs"), "h1");
+            batch_upsert_segments_for_context(&conn, &ctx.context_id, &[segment])
+                .await
+                .unwrap();
+        }
+
+        let prunable = prunable_segments_proxy(&conn, &active.context_id)
+            .await
+            .unwrap();
+
+        // Only `gone` qualifies: its source_root does not exist on disk. `active`
+        // is excluded regardless (it is the caller's own context), and `live`'s
+        // source_root is the crate's own manifest directory, which exists.
+        assert_eq!(prunable, 1);
+    }
+
+    fn test_worktree_context_row_with_source(
+        context_id: &str,
+        source_root: &str,
+    ) -> WorktreeContext {
+        WorktreeContext {
+            context_id: context_id.to_string(),
+            state_root: PathBuf::from("/tmp/state"),
+            source_root: PathBuf::from(source_root),
+            main_worktree_root: PathBuf::from("/tmp/state"),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        }
     }
 }

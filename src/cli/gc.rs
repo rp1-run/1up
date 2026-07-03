@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use serde_json::json;
 
@@ -8,6 +9,9 @@ use crate::cli::project_status_files::prune_daemon_context_status;
 use crate::daemon::lifecycle::acquire_rebuild_lock;
 use crate::daemon::registry::Registry;
 use crate::shared::config;
+use crate::shared::constants::{
+    GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS,
+};
 use crate::shared::project::resolve_project_root;
 use crate::shared::types::{OutputFormat, WorktreeContext};
 use crate::storage::db::Db;
@@ -52,6 +56,15 @@ enum PruneReason {
     /// no longer mint such a context, so any recorded one is a permanently unreachable
     /// orphan from the pre-clamp subdirectory bug.
     NestedSubdirContext,
+    /// A context sharing the active worktree's `source_root` but recorded under a
+    /// *different* `state_root` (e.g. after a state-root resolution/relocation
+    /// change) — ranked beyond the retention policy's `keep_count` most-recently-
+    /// updated same-source peers and older than its `max_age`. Unlike
+    /// `StaleBranchSnapshot` (same `state_root`, pruned unconditionally),
+    /// same-source-different-`state_root` is a softer signal, so it is
+    /// policy-gated rather than unconditional (governance: no invented numeric
+    /// defaults; automatic-on-migration application stays opt-in, default OFF).
+    SupersededSameSource,
 }
 
 impl PruneReason {
@@ -60,7 +73,56 @@ impl PruneReason {
             PruneReason::SourceMissing => "source-missing",
             PruneReason::StaleBranchSnapshot => "stale-branch-snapshot",
             PruneReason::NestedSubdirContext => "nested-subdir",
+            PruneReason::SupersededSameSource => "superseded-same-source",
         }
+    }
+}
+
+/// Keep-count/age thresholds gating the `SupersededSameSource` prune reason.
+///
+/// PLACEHOLDER-conservative: sourced from [`GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT`]
+/// and [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`], both explicitly flagged as
+/// interim values pending planning-gate finalization, not invented final
+/// defaults. Enforced against `1up gc --apply`'s real candidate set via
+/// [`same_source_recency_ranks`] in `exec()`'s classification pass.
+struct RetentionPolicy {
+    keep_count: usize,
+    max_age: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        RetentionPolicy {
+            keep_count: GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT,
+            max_age: Duration::days(GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS),
+        }
+    }
+}
+
+/// Evaluation context for the `SupersededSameSource` policy: the retention
+/// thresholds, this candidate's 1-based recency rank among all recorded
+/// contexts sharing its `source_root` (1 = most-recently-updated), and the
+/// reference time used to compute age from `updated_at`.
+///
+/// A `prune_reason` call passing `None` here means the policy is not
+/// evaluated for that call, so `SupersededSameSource` never fires. `exec()`'s
+/// classification pass always supplies `Some` for candidates sharing the
+/// active `source_root`, computed via [`same_source_recency_ranks`].
+struct SupersededSameSourceContext<'a> {
+    policy: &'a RetentionPolicy,
+    rank_among_same_source: usize,
+    now: DateTime<Utc>,
+}
+
+/// True when `updated_at` (a `datetime('now')`-formatted TEXT value,
+/// `YYYY-MM-DD HH:MM:SS`, UTC — see `worktree_contexts.updated_at`) is at
+/// least `min_age` old relative to `now`. Unparseable input degrades to
+/// `false` (not old enough): a retention decision must never prune on
+/// ambiguous data.
+fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Duration) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
+        Ok(parsed) => now - parsed.and_utc() >= min_age,
+        Err(_) => false,
     }
 }
 
@@ -75,9 +137,16 @@ impl PruneReason {
 /// resolution clamp can no longer mint). Contexts belonging to other still-present
 /// worktrees are left untouched, since this invocation cannot tell which of their
 /// contexts is the live one (run `gc` from inside them instead).
+///
+/// `retention` optionally gates a fourth, softer reason: a context sharing the
+/// active `source_root` under a *different* `state_root`, ranked beyond the
+/// policy's `keep_count` most-recently-updated same-source peers and older than
+/// `max_age`. Passing `None` disables this check entirely (see
+/// [`SupersededSameSourceContext`]).
 fn prune_reason(
     active: &WorktreeContext,
     candidate: &IndexedContextRow,
+    retention: Option<&SupersededSameSourceContext>,
     source_exists: &dyn Fn(&Path) -> bool,
     is_git_root: &dyn Fn(&Path) -> bool,
 ) -> Option<PruneReason> {
@@ -96,6 +165,17 @@ fn prune_reason(
     {
         return Some(PruneReason::NestedSubdirContext);
     }
+    // Reached only when source_root == active.source_root implies state_root
+    // differs (the equal-state-root case already returned above).
+    if candidate.source_root == active.source_root {
+        if let Some(ctx) = retention {
+            if ctx.rank_among_same_source > ctx.policy.keep_count
+                && context_age_at_least(&candidate.updated_at, ctx.now, ctx.policy.max_age)
+            {
+                return Some(PruneReason::SupersededSameSource);
+            }
+        }
+    }
     None
 }
 
@@ -104,6 +184,35 @@ fn prune_reason(
 /// excluded separately by the `is_git_root` predicate at the call site.
 fn is_strict_descendant(descendant: &Path, ancestor: &Path) -> bool {
     descendant != ancestor && descendant.starts_with(ancestor)
+}
+
+/// 1-based recency rank (1 = most-recently-updated) of every recorded context
+/// whose `source_root` matches `source_root`, keyed by `context_id`. The active
+/// context is included in the ranked set — it is always present in `contexts`
+/// and is typically the most recent after a fresh index run — so `keep_count`
+/// naturally counts it as one of the retained peers. Ties in `updated_at` break
+/// by `context_id` for a deterministic order. Contexts with a different
+/// `source_root` are absent from the returned map entirely, matching
+/// `prune_reason`'s gate (the policy only ever evaluates same-source
+/// candidates).
+fn same_source_recency_ranks(
+    contexts: &[IndexedContextRow],
+    source_root: &Path,
+) -> HashMap<String, usize> {
+    let mut same_source: Vec<&IndexedContextRow> = contexts
+        .iter()
+        .filter(|c| c.source_root == source_root)
+        .collect();
+    same_source.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.context_id.cmp(&b.context_id))
+    });
+    same_source
+        .into_iter()
+        .enumerate()
+        .map(|(index, ctx)| (ctx.context_id.clone(), index + 1))
+        .collect()
 }
 
 /// A context selected for pruning, plus the segment count that quantifies its cost.
@@ -158,9 +267,29 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
             let dot_git = p.join(".git");
             dot_git.is_dir() || dot_git.is_file()
         };
+        // `SupersededSameSource` enforcement against the real candidate set: rank
+        // every same-source context by recency once, then gate each candidate's
+        // reason lookup with the shared policy default.
+        let retention_policy = RetentionPolicy::default();
+        let same_source_ranks = same_source_recency_ranks(&contexts, &active.source_root);
+        let now = Utc::now();
         let mut candidates = Vec::new();
         for ctx in &contexts {
-            if let Some(reason) = prune_reason(&active, ctx, &|p: &Path| p.exists(), &is_git_root) {
+            let retention =
+                same_source_ranks
+                    .get(&ctx.context_id)
+                    .map(|&rank| SupersededSameSourceContext {
+                        policy: &retention_policy,
+                        rank_among_same_source: rank,
+                        now,
+                    });
+            if let Some(reason) = prune_reason(
+                &active,
+                ctx,
+                retention.as_ref(),
+                &|p: &Path| p.exists(),
+                &is_git_root,
+            ) {
                 let segments = segments::count_segments_for_context(&conn, &ctx.context_id).await?;
                 candidates.push(GcCandidate {
                     context_id: ctx.context_id.clone(),
@@ -414,11 +543,21 @@ mod tests {
     }
 
     fn row(context_id: &str, state_root: &str, source_root: &str) -> IndexedContextRow {
+        row_updated_at(context_id, state_root, source_root, "2026-07-01 00:00:00")
+    }
+
+    fn row_updated_at(
+        context_id: &str,
+        state_root: &str,
+        source_root: &str,
+        updated_at: &str,
+    ) -> IndexedContextRow {
         IndexedContextRow {
             context_id: context_id.to_string(),
             state_root: PathBuf::from(state_root),
             source_root: PathBuf::from(source_root),
             branch_name: None,
+            updated_at: updated_at.to_string(),
         }
     }
 
@@ -427,7 +566,7 @@ mod tests {
         let active = active_context();
         let candidate = row("active000000", "/repo", "/repo");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
             None
         );
     }
@@ -437,9 +576,13 @@ mod tests {
         let active = active_context();
         let candidate = row("other0000001", "/gone", "/gone");
         assert_eq!(
-            prune_reason(&active, &candidate, &|p| p != Path::new("/gone"), &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                None,
+                &|p| p != Path::new("/gone"),
+                &|_| false,
+            ),
             Some(PruneReason::SourceMissing)
         );
     }
@@ -450,7 +593,7 @@ mod tests {
         // Same roots as the active worktree, different id => an older branch's index.
         let candidate = row("oldbranch001", "/repo", "/repo");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
             Some(PruneReason::StaleBranchSnapshot)
         );
     }
@@ -462,7 +605,7 @@ mod tests {
         // active source: not ours to judge.
         let candidate = row("linked000001", "/repo", "/repo-feature");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
             None
         );
     }
@@ -474,7 +617,7 @@ mod tests {
         // and not itself a git root.
         let candidate = row("nested000001", "/repo", "/repo/src/search");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
             Some(PruneReason::NestedSubdirContext)
         );
     }
@@ -486,10 +629,192 @@ mod tests {
         // carries a `.git` file, so the git-root predicate protects it from the rule.
         let candidate = row("nestedwt0001", "/repo", "/repo/linked-wt");
         assert_eq!(
-            prune_reason(&active, &candidate, &|_| true, &|p| p
+            prune_reason(&active, &candidate, None, &|_| true, &|p| p
                 == Path::new("/repo/linked-wt"),),
             None
         );
+    }
+
+    fn old_policy() -> RetentionPolicy {
+        RetentionPolicy {
+            keep_count: 1,
+            max_age: Duration::days(30),
+        }
+    }
+
+    #[test]
+    fn superseded_same_source_beyond_keep_count_and_max_age_is_pruned() {
+        let active = active_context();
+        // Same source_root as active, but a different state_root (e.g. recorded
+        // before a state-root resolution change) and old.
+        let candidate = row_updated_at(
+            "reloc0000001",
+            "/other-state",
+            "/repo",
+            "2026-01-01 00:00:00",
+        );
+        let policy = old_policy();
+        let retention = SupersededSameSourceContext {
+            policy: &policy,
+            rank_among_same_source: 2, // beyond keep_count = 1
+            now: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(
+            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
+                false
+            }),
+            Some(PruneReason::SupersededSameSource)
+        );
+    }
+
+    #[test]
+    fn superseded_same_source_within_keep_count_is_kept() {
+        let active = active_context();
+        let candidate = row_updated_at(
+            "reloc0000002",
+            "/other-state",
+            "/repo",
+            "2026-01-01 00:00:00",
+        );
+        let policy = old_policy();
+        let retention = SupersededSameSourceContext {
+            policy: &policy,
+            rank_among_same_source: 1, // within keep_count = 1: always kept
+            now: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(
+            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
+                false
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn superseded_same_source_too_recent_is_kept() {
+        let active = active_context();
+        // Beyond keep_count, but not yet older than max_age.
+        let candidate = row_updated_at(
+            "reloc0000003",
+            "/other-state",
+            "/repo",
+            "2026-06-20 00:00:00",
+        );
+        let policy = old_policy();
+        let retention = SupersededSameSourceContext {
+            policy: &policy,
+            rank_among_same_source: 2,
+            now: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(
+            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
+                false
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn superseded_same_source_without_retention_context_is_kept() {
+        let active = active_context();
+        // Would qualify under the policy, but the caller passed `None`: the reason
+        // must never fire without an explicit retention context.
+        let candidate = row_updated_at(
+            "reloc0000004",
+            "/other-state",
+            "/repo",
+            "2020-01-01 00:00:00",
+        );
+        assert_eq!(
+            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn superseded_same_source_different_source_root_is_kept() {
+        let active = active_context();
+        // Different source_root than active: not evaluated by this policy at all,
+        // even with a retention context that would otherwise qualify.
+        let candidate = row_updated_at(
+            "otherrepo001",
+            "/other-state",
+            "/other-repo",
+            "2020-01-01 00:00:00",
+        );
+        let policy = old_policy();
+        let retention = SupersededSameSourceContext {
+            policy: &policy,
+            rank_among_same_source: 99,
+            now: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(
+            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
+                false
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_branch_snapshot_takes_priority_over_superseded_same_source() {
+        let active = active_context();
+        // Same state_root AND source_root as active: the unconditional
+        // StaleBranchSnapshot reason must win even when a retention context is
+        // supplied that would also match the softer policy.
+        let candidate = row_updated_at("oldbranch002", "/repo", "/repo", "2020-01-01 00:00:00");
+        let policy = old_policy();
+        let retention = SupersededSameSourceContext {
+            policy: &policy,
+            rank_among_same_source: 99,
+            now: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert_eq!(
+            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
+                false
+            }),
+            Some(PruneReason::StaleBranchSnapshot)
+        );
+    }
+
+    #[test]
+    fn context_age_at_least_true_when_older_than_min_age() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(context_age_at_least(
+            "2026-01-01 00:00:00",
+            now,
+            Duration::days(30)
+        ));
+    }
+
+    #[test]
+    fn context_age_at_least_false_when_younger_than_min_age() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!context_age_at_least(
+            "2026-06-20 00:00:00",
+            now,
+            Duration::days(30)
+        ));
+    }
+
+    #[test]
+    fn context_age_at_least_false_on_unparseable_input() {
+        let now = Utc::now();
+        assert!(!context_age_at_least("not-a-date", now, Duration::days(0)));
     }
 
     #[test]
@@ -497,5 +822,297 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn same_source_recency_ranks_orders_by_updated_at_descending() {
+        let contexts = vec![
+            row_updated_at("a", "/state-a", "/repo", "2026-01-01 00:00:00"),
+            row_updated_at("b", "/state-b", "/repo", "2026-03-01 00:00:00"),
+            row_updated_at("c", "/state-c", "/repo", "2026-02-01 00:00:00"),
+            row_updated_at("other", "/state-d", "/other-repo", "2026-06-01 00:00:00"),
+        ];
+        let ranks = same_source_recency_ranks(&contexts, Path::new("/repo"));
+        assert_eq!(
+            ranks.get("b"),
+            Some(&1),
+            "most-recently-updated ranks first"
+        );
+        assert_eq!(ranks.get("c"), Some(&2));
+        assert_eq!(
+            ranks.get("a"),
+            Some(&3),
+            "oldest same-source peer ranks last"
+        );
+        assert_eq!(
+            ranks.get("other"),
+            None,
+            "a different source_root is excluded from the ranked set entirely"
+        );
+    }
+
+    /// Restores `HOME`/`XDG_DATA_HOME` on drop — even if an assertion panics — so a
+    /// redirected data root never leaks into other tests in this binary. Mirrors
+    /// `indexer::embedder`'s `DataRootGuard`.
+    struct DataRootGuard {
+        home: Option<std::ffi::OsString>,
+        xdg_data: Option<std::ffi::OsString>,
+    }
+
+    impl DataRootGuard {
+        fn redirect_to(dir: &Path) -> Self {
+            let guard = DataRootGuard {
+                home: std::env::var_os("HOME"),
+                xdg_data: std::env::var_os("XDG_DATA_HOME"),
+            };
+            std::env::set_var("HOME", dir);
+            std::env::set_var("XDG_DATA_HOME", dir.join(".local").join("share"));
+            guard
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            fn restore(key: &str, value: Option<std::ffi::OsString>) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            restore("HOME", self.home.take());
+            restore("XDG_DATA_HOME", self.xdg_data.take());
+        }
+    }
+
+    /// Inserts a `worktree_contexts` row with an explicit `updated_at`, bypassing
+    /// `upsert_worktree_context`'s `datetime('now')` default so tests can seed
+    /// contexts of a specific age for the `SupersededSameSource` keep-count/age
+    /// policy.
+    async fn insert_worktree_context_row(
+        conn: &libsql::Connection,
+        context_id: &str,
+        source_root: &Path,
+        state_root: &Path,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO worktree_contexts (\
+                context_id, project_id, state_root, source_root, main_worktree_root, \
+                worktree_role, branch_name, branch_ref, branch_status, head_oid, \
+                git_dir, common_git_dir, updated_at\
+            ) VALUES (?1, 'gc-t4-proj', ?2, ?3, ?3, 'main', NULL, NULL, 'unknown', NULL, NULL, NULL, ?4)",
+            libsql::params![
+                context_id.to_string(),
+                state_root.to_string_lossy().into_owned(),
+                source_root.to_string_lossy().into_owned(),
+                updated_at.to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Integration test (REQ-003/T4): `1up gc --apply` must enforce the
+    /// `SupersededSameSource` policy against its real candidate set — recency
+    /// rank computed over every recorded context, not the always-`None`
+    /// retention gate this loop used before T4 — then delete the qualifying
+    /// rows via `delete_context` and VACUUM.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gc_apply_prunes_superseded_same_source_contexts_beyond_policy_and_vacuums() {
+        use crate::storage::db::Db;
+        use crate::storage::schema;
+        use crate::storage::segments::{IndexedFileMeta, SegmentInsert};
+
+        // Every test in this binary that mutates HOME/XDG_DATA_HOME (`dirs::*`
+        // reads them at call time) must serialize on this crate-wide lock, or a
+        // concurrent mutation in another module corrupts this test's resolved
+        // registry/data paths.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _data_root_guard = DataRootGuard::redirect_to(home.path());
+
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        std::fs::create_dir_all(project_root.join(".1up")).unwrap();
+        let db_path = project_root.join(".1up").join("index.db");
+
+        // Resolve what `exec()` will independently compute as the active
+        // context, so seeded rows share its real `source_root`/`context_id`.
+        let active = resolve_project_root(&project_root)
+            .unwrap()
+            .worktree_context;
+
+        let shared_key = "gc-t4-shared-key".to_string();
+        let shared_vector = serde_json::to_string(&vec![0.1_f32; 384]).unwrap();
+        let segment_for = |context_id: &str| SegmentInsert {
+            id: format!("{context_id}-seg"),
+            file_path: format!("{context_id}.rs"),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: format!("pub fn {context_id}() {{}}\n"),
+            line_start: 1,
+            line_end: 1,
+            content_key: Some(shared_key.clone()),
+            embedding_vec: Some(shared_vector.clone()),
+            breadcrumb: None,
+            complexity: 1,
+            role: "DEFINITION".to_string(),
+            defined_symbols: format!("[\"{context_id}\"]"),
+            referenced_symbols: "[]".to_string(),
+            referenced_relations: "[]".to_string(),
+            called_symbols: "[]".to_string(),
+            called_relations: "[]".to_string(),
+            file_hash: format!("{context_id}-hash"),
+        };
+        let meta_for = |context_id: &str| IndexedFileMeta {
+            extension: "rs".to_string(),
+            file_hash: format!("{context_id}-hash"),
+            file_size: 32,
+            modified_ns: 1,
+        };
+
+        {
+            let db = Db::open_rw(&db_path).await.unwrap();
+            let conn = db.connect().unwrap();
+            schema::initialize(&conn).await.unwrap();
+
+            // Active context, recorded via the real upsert path (updated_at =
+            // now), making it the most-recently-updated same-source peer.
+            segments::upsert_worktree_context(&conn, &active, "gc-t4-proj")
+                .await
+                .unwrap();
+            crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                &conn,
+                &active.context_id,
+                &format!("{}.rs", active.context_id),
+                &[segment_for(&active.context_id)],
+                Some(&meta_for(&active.context_id)),
+            )
+            .await
+            .unwrap();
+
+            // Two same-source peers under fabricated `state_root`s, within the
+            // keep_count = 3 top-ranked slots (active + these two = 3 total):
+            // kept regardless of age.
+            for id in ["kept-1", "kept-2"] {
+                insert_worktree_context_row(
+                    &conn,
+                    id,
+                    &active.source_root,
+                    Path::new("/other-state"),
+                    "2026-06-25 00:00:00",
+                )
+                .await;
+                crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                    &conn,
+                    id,
+                    &format!("{id}.rs"),
+                    &[segment_for(id)],
+                    Some(&meta_for(id)),
+                )
+                .await
+                .unwrap();
+            }
+
+            // A fourth same-source peer: ranked beyond keep_count and older than
+            // GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS — the one candidate that
+            // must be pruned by the SupersededSameSource policy.
+            insert_worktree_context_row(
+                &conn,
+                "superseded-1",
+                &active.source_root,
+                Path::new("/other-state-old"),
+                "2026-01-01 00:00:00",
+            )
+            .await;
+            crate::storage::segments::replace_file_segments_for_context_tx_with_meta(
+                &conn,
+                "superseded-1",
+                "superseded-1.rs",
+                &[segment_for("superseded-1")],
+                Some(&meta_for("superseded-1")),
+            )
+            .await
+            .unwrap();
+
+            let mut rows = conn
+                .query(
+                    "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+                    [shared_key.as_str()],
+                )
+                .await
+                .unwrap();
+            let ref_count_before: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                ref_count_before, 4,
+                "all four seeded segments must share one pooled embedding"
+            );
+        }
+
+        let args = GcArgs {
+            path: project_root.to_string_lossy().into_owned(),
+            apply: true,
+            no_vacuum: false,
+            format: None,
+        };
+        exec(args, OutputFormat::Json)
+            .await
+            .expect("gc --apply must succeed");
+
+        let db = Db::open_ro(&db_path).await.unwrap();
+        let conn = db.connect().unwrap();
+        let remaining = segments::list_worktree_contexts(&conn).await.unwrap();
+        let remaining_ids: HashSet<String> =
+            remaining.iter().map(|c| c.context_id.clone()).collect();
+        assert!(
+            remaining_ids.contains(&active.context_id),
+            "active context must survive"
+        );
+        assert!(
+            remaining_ids.contains("kept-1"),
+            "within-keep_count same-source peer must survive"
+        );
+        assert!(
+            remaining_ids.contains("kept-2"),
+            "within-keep_count same-source peer must survive"
+        );
+        assert!(
+            !remaining_ids.contains("superseded-1"),
+            "beyond-keep_count, aged same-source peer must be pruned by gc --apply"
+        );
+
+        // Row/refcount assertions on `delete_context`: the pruned context's
+        // segment is gone, and the shared pooled embedding's ref_count drops by
+        // exactly one (still referenced by the three survivors) rather than
+        // being reclaimed outright.
+        assert_eq!(
+            segments::count_segments_for_context(&conn, "superseded-1")
+                .await
+                .unwrap(),
+            0
+        );
+        let mut rows = conn
+            .query(
+                "SELECT ref_count FROM embedding_pool WHERE content_key = ?1",
+                [shared_key.as_str()],
+            )
+            .await
+            .unwrap();
+        let ref_count_after: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            ref_count_after, 3,
+            "delete_context must decrement, not zero out, a still-referenced pooled embedding"
+        );
+
+        // `runs vacuum_database`: a successful VACUUM compacts away every freed
+        // page, so the freelist floor is back to zero after the apply.
+        assert_eq!(
+            segments::freelist_reclaimable_bytes(&conn).await.unwrap(),
+            0,
+            "gc --apply must VACUUM after pruning, leaving no freed-but-unreturned pages"
+        );
     }
 }

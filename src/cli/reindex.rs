@@ -4,7 +4,9 @@ use clap::Args;
 
 use crate::cli::output::{formatter_for, spawn_index_watch_renderer};
 use crate::daemon::registry::Registry;
-use crate::indexer::embedder::{EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason};
+use crate::indexer::embedder::{
+    clear_download_failure, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
+};
 use crate::indexer::pipeline;
 use crate::shared::config;
 use crate::shared::constants::SCHEMA_VERSION;
@@ -267,6 +269,12 @@ async fn run_reindex_once(
     let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
     let model_start = Instant::now();
+    // REQ-002: `1up reindex` is an explicit, deliberate retry signal, so clear
+    // any prior download-failure marker before the model prepare's
+    // `is_download_failed()` guard runs. Passive search (cli/search.rs) never
+    // does this, so it stays FTS-only until an explicit index/reindex clears
+    // the marker.
+    clear_download_failure();
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)

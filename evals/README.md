@@ -81,6 +81,8 @@ just eval-recall
 
 The recipe builds the repo-local `1up`, runs `1up reindex .` (`reindex`, not `index`, so the model-identity gate cannot fail closed on a stale index), then runs the harness under Bun. Recall numbers and the gate verdict are printed to stdout and written to `suites/1up-search/recall-results.json`. Exit code is non-zero on any preflight failure, degraded response, or out-of-tolerance regression.
 
+All recall recipes reindex with `--exclude-glob 'evals/suites/1up-search/recall-*.json'`: the harness rewrites `recall-results.json` (and, when capturing, `recall-baseline.json`) inside the repo, and indexing its own outputs perturbs the corpus between runs — one extra segment was observed to shift recall@20 by more than the default tolerance. The baseline and the scored index must be computed over the same corpus, so both capture and gate runs exclude these artifacts.
+
 ### A/B parity recipe
 
 ```sh
