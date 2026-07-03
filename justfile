@@ -54,14 +54,55 @@ eval-parallel *flags:
 eval-summary:
     @cd evals && ./summary.sh
 
-# Run the deterministic recall@k harness against the current index.
-# Builds the repo-local `1up` binary, indexes the repo with it, then runs the
-# harness against that same binary so PATH-installed versions cannot mask
-# regressions. Writes evals/suites/1up-search/recall-results.json.
+# Gated recall@k run: build the repo-local `1up`, reindex, then run the harness
+# which (1) preflights the semantic path (vector_rows > 0, current schema,
+# expected embedding_model variant), (2) fails on degraded/FTS-only responses,
+# and (3) compares recall against the pinned baseline within tolerance
+# (ONEUP_RECALL_TOLERANCE, default 0.02), exiting non-zero on regression.
+# MODEL-ENABLED: never run in-agent (it hangs); manual/scheduled DoD only.
+# `reindex` (not `index`) is used so the model-identity gate cannot fail closed
+# on a stale index. Writes evals/suites/1up-search/recall-results.json.
 eval-recall:
     cargo build --bin 1up
-    ./target/debug/1up index .
+    ./target/debug/1up reindex .
     @cd evals && ONEUP_BENCH_BIN="$PWD/../target/debug/1up" bun run suites/1up-search/recall.ts
+
+# Capture (move) the pinned recall baseline from a fresh run, with metadata.
+# This is the ONLY sanctioned way to change recall-baseline.json; never
+# regenerate it to make the gate pass (see evals/README.md). MODEL-ENABLED:
+# manual DoD only, never in-agent.
+eval-recall-baseline:
+    cargo build --bin 1up
+    ./target/debug/1up reindex .
+    @cd evals && RECALL_CAPTURE_BASELINE=1 ONEUP_BENCH_BIN="$PWD/../target/debug/1up" bun run suites/1up-search/recall.ts
+
+# A/B recall parity: reindex + score the fp32 leg (captured as a temp baseline),
+# then reindex + score the int8 leg gated against it within tolerance, exiting
+# non-zero beyond it. Each leg runs `1up stop` first so a live daemon holding
+# the other variant cannot serve query embeddings for the wrong leg, and
+# `reindex` between legs is required because the model-identity gate fails
+# closed on a variant change with existing vectors. The pinned
+# recall-baseline.json is never touched (a temp file is used). MODEL-ENABLED:
+# manual pre-merge DoD only (records INT8-vs-FP32 parity), never in-agent.
+eval-recall-ab:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --bin 1up
+    BIN="$PWD/target/debug/1up"
+    AB_BASELINE="$(mktemp -t recall-ab-baseline.XXXXXX.json)"
+    trap 'rm -f "$AB_BASELINE"' EXIT
+    echo "== A/B leg 1: fp32 =="
+    "$BIN" stop . || true
+    ONEUP_MODEL_VARIANT=fp32 "$BIN" reindex .
+    (cd evals && RECALL_CAPTURE_BASELINE=1 ONEUP_MODEL_VARIANT=fp32 \
+        ONEUP_RECALL_BASELINE_PATH="$AB_BASELINE" \
+        ONEUP_BENCH_BIN="$BIN" bun run suites/1up-search/recall.ts)
+    echo "== A/B leg 2: int8 (gated vs fp32 within tolerance) =="
+    "$BIN" stop . || true
+    ONEUP_MODEL_VARIANT=int8 "$BIN" reindex .
+    (cd evals && ONEUP_RECALL_AB=1 ONEUP_MODEL_VARIANT=int8 \
+        ONEUP_RECALL_BASELINE_PATH="$AB_BASELINE" \
+        ONEUP_BENCH_BIN="$BIN" bun run suites/1up-search/recall.ts)
 
 # Exercise the local binary against a manifest URL.
 update-test url="":

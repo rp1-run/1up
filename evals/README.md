@@ -23,11 +23,14 @@ npm run eval
 npm run eval:impact
 ```
 
-## Historical recall harness
+## Recall gate
 
-The recall harness is historical vector-ranking evidence, not P5 MCP release-readiness evidence. It still invokes the manual CLI because it measures retrieval ranking directly, not agent MCP tool selection, and must produce comparable recall numbers across baseline and post-change runs.
+The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from P5 MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.
 
-**Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts)
+**MODEL-ENABLED — never run in-agent.** `just eval-recall`, `just eval-recall-ab`, and `just eval-recall-baseline` reindex with the embedding model enabled and hang inside agent sessions. Run them only as a manual pre-merge DoD step or on the scheduled `.github/workflows/embedding-quality.yml` workflow.
+
+**Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts) (impure driver)
+**Gate logic**: [`suites/1up-search/recall-compare.ts`](suites/1up-search/recall-compare.ts) (pure, unit-tested with `bun test`, no model or index)
 **Corpus**: [`suites/1up-search/recall-corpus.jsonl`](suites/1up-search/recall-corpus.jsonl)
 **Baseline**: [`suites/1up-search/recall-baseline.json`](suites/1up-search/recall-baseline.json)
 
@@ -39,53 +42,78 @@ recall@k = mean_over_scored_queries(matched_anchor_count / expected_anchor_count
 
 Rows with missing or empty anchors are recorded as `skipped_no_gold` and excluded from the mean so the output is always numeric. An empty corpus yields `recall = 0` rather than `NaN`. Legacy `expected_segment_ids` rows remain supported only for archived corpora.
 
-Output JSON envelope (`suites/1up-search/recall-results.json`):
+### Gate semantics
+
+The gate is enforced in two stages:
+
+1. **Semantic-path preflight** (before scoring). Via `1up status <repo> -f json` the harness asserts `vector_rows > 0`, a current positive `schema_version`, and that `embedding_model` matches the expected variant (`ONEUP_MODEL_VARIANT`, default `int8` — INT8 identities carry the `@int8` suffix). Per-query `search` stderr is captured (no longer discarded) and any degraded / FTS-only wording fails the run. A vectorless, schema-less, wrong-variant, or degraded run fails closed with a `FAIL:` line and exit code 1 — it never scores silently.
+2. **Baseline comparison** (after scoring). Candidate recall is compared against the pinned `recall-baseline.json` using an **absolute per-k tolerance** (default `0.02`, overridable via `ONEUP_RECALL_TOLERANCE`). Any k regressing by more than the tolerance sets `process.exitCode = 1` and prints a `FAIL:` line (mirroring `search-bench.ts`). A candidate scoring at or above baseline never fails — the gate guards regression only. A **missing baseline** or a **corpus/config mismatch** (differing `corpus.sha256`/`size`, `schema_version`, `model_id`, or `max_tokens`) is an explicit gate error, not a pass.
+
+`ONEUP_RECALL_TOLERANCE` must be a non-negative number; anything else is a gate error.
+
+Output JSON envelope (`suites/1up-search/recall-results.json`) gains `gates{}` (preflight result, expected variant, tolerance, degraded-stderr queries, and the recall verdict) plus `delta_vs_baseline`:
 
 ```json
 {
-  "schema_version": 16,
+  "schema_version": 18,
   "corpus_size": 15,
+  "recall_at_10": 0.461,
+  "recall_at_20": 0.589,
+  "delta_vs_baseline": { "recall_at_10": 0.0, "recall_at_20": 0.0 },
+  "gates": {
+    "expected_variant": "int8",
+    "tolerance": 0.02,
+    "preflight": { "ok": true, "failures": [] },
+    "degraded_stderr_queries": [],
+    "recall": { "verdict": "pass", "regressions": [] }
+  },
   "reports": [
-    {
-      "k": 10,
-      "recall": 0.461,
-      "scored_queries": 15,
-      "total_queries": 15,
-      "per_query": [ ... ]
-    }
+    { "k": 10, "recall": 0.461, "scored_queries": 15, "total_queries": 15, "per_query": [ ... ] }
   ]
 }
 ```
 
-### Run it
+### Run the gate
 
 ```sh
 just eval-recall
 ```
 
-The recipe runs `1up index .` to ensure the index is current, then invokes the harness under Bun. Recall numbers are printed to stdout and written to `suites/1up-search/recall-results.json`.
+The recipe builds the repo-local `1up`, runs `1up reindex .` (`reindex`, not `index`, so the model-identity gate cannot fail closed on a stale index), then runs the harness under Bun. Recall numbers and the gate verdict are printed to stdout and written to `suites/1up-search/recall-results.json`. Exit code is non-zero on any preflight failure, degraded response, or out-of-tolerance regression.
 
-### Historical baseline
-
-The pinned baseline at `suites/1up-search/recall-baseline.json` is retained for historical vector-quality comparison only:
-
-| k | recall |
-|---|---|
-| 10 | 0.467 |
-| 20 | 0.589 |
-
-Do not count this baseline as retained P5 release evidence. P5 readiness uses the MCP adoption suites above; recall remains useful when a change intentionally touches vector storage, the HNSW index, the embedder, or retrieval ranking.
-
-### Regenerate the baseline
-
-Only regenerate when the comparison contract itself needs to move, such as corpus expansion or repo layout changes that make anchors stale. Do not regenerate to "make the gate pass".
+### A/B parity recipe
 
 ```sh
-just eval-recall
-cp evals/suites/1up-search/recall-results.json evals/suites/1up-search/recall-baseline.json
+just eval-recall-ab
 ```
 
-Record why the baseline moved in the commit message and, when relevant, in the KB `Recent Learnings` entry.
+Confirms INT8-vs-FP32 recall parity within tolerance — the required pre-merge DoD for a variant/model change (REQ-004). It runs `1up stop` then reindexes and scores the `fp32` leg (captured to a temporary baseline), then `1up stop` + reindexes + scores the `int8` leg gated against that temp baseline within `ONEUP_RECALL_TOLERANCE`, exiting non-zero beyond it. `1up stop` per leg prevents a live daemon holding the other variant from serving query embeddings for the wrong leg; the pinned `recall-baseline.json` is never touched. Record the resulting numbers in the baseline-update commit.
+
+### Baseline-update policy
+
+The pinned `recall-baseline.json` is the structured contract the gate compares against:
+
+```json
+{
+  "captured_at": "<ISO-8601>",
+  "schema_version": 18,
+  "model_id": "<embedding model id, e.g. ...@int8>",
+  "max_tokens": 256,
+  "corpus": { "size": 15, "sha256": "<hex>" },
+  "recall_at_10": 0.461,
+  "recall_at_20": 0.589
+}
+```
+
+The baseline changes **only** via the sanctioned capture recipe:
+
+```sh
+just eval-recall-baseline
+```
+
+This reindexes and writes a fresh structured baseline (with metadata) from the current run. **Never** regenerate the baseline to make the gate pass — that defeats the gate. Move it only for a legitimate reason (an intended recall improvement you are locking in, a corpus expansion, or a repo-layout change that makes anchors stale), and record the new recall numbers and the rationale in the baseline-update commit message (and, when relevant, in the KB `Recent Learnings` entry). A structurally invalid or absent baseline (e.g. the legacy schema-v11 prose form) is treated as missing, so the gate errors with a clear "capture a baseline" message rather than passing.
+
+Recall is not P5 MCP release evidence; P5 readiness uses the MCP adoption suites above. The gate is most relevant when a change intentionally touches vector storage, the ANN index, the embedder, the tokenizer window, or retrieval ranking.
 
 ## Related scripts
 

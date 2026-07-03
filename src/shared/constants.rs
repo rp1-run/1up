@@ -17,16 +17,24 @@ pub const EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// Effective maximum token length for the embedding model.
 ///
-/// This is the shipped tokenizer's real cap: `tokenizer.json` sets
-/// `truncation.max_length = 128` and `padding = {Fixed: 128}`, so every
-/// encoding is already truncated and padded to 128 tokens before inference. The
-/// embedder's explicit `enc.truncate(EMBEDDING_MAX_TOKENS)` is therefore a
-/// belt-and-suspenders no-op the tokenizer has already applied. This was
-/// historically 256, a value that never took effect (256 > 128) yet
-/// misrepresented the model window; correcting it to the real 128-token cap
-/// changes no produced vector (the truncate stays a no-op) and lets
-/// length-aware callers reason against the true window.
-pub const EMBEDDING_MAX_TOKENS: usize = 128;
+/// The shipped `tokenizer.json` hard-pins `truncation.max_length = 128` and
+/// `padding = {Fixed: 128}`, so setting this constant alone is a no-op — the
+/// file-baked 128 always wins. `Embedder::load_variant` therefore applies a
+/// programmatic `with_truncation`/`with_padding` override (raising both to
+/// `EMBEDDING_MAX_TOKENS`) right after `Tokenizer::from_file`, which is what
+/// actually widens the window; the shipped file is left untouched so its
+/// `TOKENIZER_SHA256` is unchanged (see `embedder.rs`, HYP-002). Padding must be
+/// overridden alongside truncation: `run_inference` copies `ids[0..max_len]`
+/// across a mixed-length sub-batch, so leaving padding at `Fixed(128)` while
+/// truncation allows 256-token rows would read past a short row's 128-wide id
+/// buffer and panic.
+///
+/// This widens the window on the v18 re-embed: content that previously lost its
+/// tail past 128 tokens now embeds up to 256. It rides the already-bumped
+/// (unreleased) `SCHEMA_VERSION = 18` migration, and `max_tokens` is folded into
+/// `embedding_content_key` so 128- and 256-window vectors can never mix in the
+/// content-addressed pool.
+pub const EMBEDDING_MAX_TOKENS: usize = 256;
 
 /// Chunk-segment languages excluded from embedding.
 ///
@@ -279,6 +287,14 @@ pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES
 /// artifacts, and model availability cannot flip mid-suite.
 pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS";
 
+/// Environment variable that explicitly selects the embedding model variant for
+/// a run (T1). Accepted values are `int8` and `fp32` (case-insensitive);
+/// unset or empty resolves to the established default (`int8`). Any other value
+/// is a hard error at run start — the selection is deterministic and never
+/// silently falls back to the other variant, so an operator can pin and compare
+/// the compact and full-precision models reproducibly.
+pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
+
 /// Schema version for database layout.
 ///
 /// v18: bundles the Phase-2 re-embed migration. The default embedding path is
@@ -312,15 +328,18 @@ pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 /// FP32 ONNX model filename (the always-present baseline / fallback artifact).
 pub const MODEL_FILENAME: &str = "model.onnx";
 
-/// INT8-quantized ONNX model filename (R-003, T10).
+/// INT8-quantized ONNX model filename (R-003, T10; integrity-pinned in T4).
 ///
-/// When present alongside [`MODEL_FILENAME`] in the active model directory, this
-/// dynamic-INT8 build of all-MiniLM-L6-v2 is loaded as the default CPU embedding
-/// path; when absent (or it fails to load) the embedder falls back to the FP32
-/// [`MODEL_FILENAME`] with byte-identical numerics. The file lives next to the
-/// FP32 model in the verified artifact directory; provisioning the actual
-/// quantized artifact (download + pinned-SHA verification) is the manual gate —
-/// this constant is the load-time contract the loader keys off.
+/// This dynamic-INT8 build of all-MiniLM-L6-v2 is the v18 default CPU embedding
+/// path. It is a first-class, integrity-verified artifact: a third entry in the
+/// embedder's `EXPECTED_ARTIFACT_FILES` alongside [`MODEL_FILENAME`] and
+/// [`TOKENIZER_FILENAME`], provisioned through the same staged-download +
+/// pinned-SHA verification + manifest machinery, and re-digested against
+/// [`MODEL_ONNX_INT8_SHA256`] at load time. There is no presence-based
+/// auto-selection and no cross-variant fallback: variant selection is
+/// deterministic (`ONEUP_MODEL_VARIANT` override > default `Int8`), and a
+/// corrupt or missing INT8 artifact fails closed (FTS-only degrade with a clear
+/// reason) rather than quietly serving the numerically different FP32 model.
 pub const MODEL_ONNX_INT8_FILENAME: &str = "model.int8.onnx";
 
 /// Model-identity suffix that distinguishes the INT8 variant from the FP32
@@ -359,9 +378,20 @@ pub const MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Total request timeout for model downloads.
 pub const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
-/// Pinned SHA-256 digest for the ONNX embedding model.
+/// Pinned SHA-256 digest for the FP32 ONNX embedding model.
 pub const MODEL_ONNX_SHA256: &str =
     "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
+
+/// Pinned SHA-256 digest for the INT8-quantized ONNX embedding model (T4).
+///
+/// The upstream artifact is `onnx/model_qint8_avx512.onnx` in [`HF_MODEL_REPO`]
+/// (byte-identical to the repo's arm64 and avx512_vnni INT8 variants — same LFS
+/// object). This digest is verified both at download/activation time (like every
+/// other artifact) and again at load time in `load_variant(Int8)`, so a
+/// post-activation corruption or tamper refuses the model with a clear
+/// expected-vs-got error instead of serving embeddings from it (REQ-004).
+pub const MODEL_ONNX_INT8_SHA256: &str =
+    "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474";
 
 /// Pinned SHA-256 digest for the tokenizer artifact.
 pub const TOKENIZER_SHA256: &str =

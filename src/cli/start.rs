@@ -730,7 +730,7 @@ async fn run_initial_index(
     let mut runtime = EmbeddingRuntime::default();
     let status = runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, show_progress_ui)
-        .await;
+        .await?;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
     let status_message = model_status_message(&status);
     match &status {

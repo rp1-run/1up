@@ -50,6 +50,22 @@
  *   recorded with status="skipped_no_gold" so the harness never produces NaN.
  * - An empty corpus produces recall = 0 (not NaN) with empty per_query.
  *
+ * Quality gate (feature task T2):
+ * - Before scoring, a semantic-path preflight asserts (via `1up status <repo> -f json`)
+ *   that the index has embeddings (`vector_rows > 0`), reports a current `schema_version`,
+ *   and serves the expected `embedding_model` variant (`ONEUP_MODEL_VARIANT`, default int8).
+ *   A vectorless/schema-less/wrong-variant run fails closed instead of scoring silently.
+ * - Per-query search stderr is captured (no longer discarded) and any degraded / FTS-only
+ *   wording fails the run.
+ * - After scoring, recall is compared against the pinned `recall-baseline.json` within an
+ *   absolute per-k tolerance (default 0.02, override `ONEUP_RECALL_TOLERANCE`). An
+ *   out-of-tolerance regression sets `process.exitCode = 1` and prints a `FAIL:` line;
+ *   a missing baseline or corpus/config mismatch is an explicit gate error.
+ * - `recall-results.json` gains `gates{}` and `delta_vs_baseline`. Setting
+ *   `RECALL_CAPTURE_BASELINE=1` writes a fresh structured `recall-baseline.json` from the
+ *   current run (the only sanctioned way to move the baseline — see evals/README.md) and
+ *   skips the regression comparison.
+ *
  * Target repo selection (in priority order):
  *   1. `RECALL_TARGET_REPO` env var (absolute path)
  *   2. Git toplevel of this file (the 1up repo root)
@@ -59,10 +75,26 @@
  *   3. `1up` on PATH
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  type CorpusIdentity,
+  type ModelVariant,
+  type PreflightResult,
+  type RecallBaseline,
+  type RecallCandidate,
+  RecallCompareError,
+  type RecallComparison,
+  compareRecall,
+  detectDegradedStderr,
+  evaluateStatusPreflight,
+  resolveExpectedVariant,
+  resolveTolerance,
+} from "./recall-compare.ts";
 
 interface Anchor {
   file: string;
@@ -117,19 +149,41 @@ interface RecallReport {
   per_query: PerQueryResult[];
 }
 
+interface RecallGates {
+  expected_variant: ModelVariant;
+  tolerance: number;
+  preflight: PreflightResult;
+  degraded_stderr_queries: Array<{ query: string; markers: string[] }>;
+  recall: {
+    verdict: "pass" | "fail" | "error";
+    error?: string;
+    regressions?: RecallComparison["regressions"];
+  } | null;
+}
+
 interface HarnessOutput {
   schema_version: number | null;
+  vector_rows: number | null;
+  embedding_model: string | null;
+  model_id: string | null;
+  max_tokens: number | null;
   target_repo: string;
   binary: string;
   captured_at: string;
   corpus_size: number;
+  corpus: CorpusIdentity;
   corpus_match_mode_counts: Record<MatchMode | "none", number>;
+  recall_at_10: number | null;
+  recall_at_20: number | null;
   reports: RecallReport[];
+  gates: RecallGates;
+  delta_vs_baseline: { recall_at_10: number; recall_at_20: number } | null;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CORPUS_PATH = join(__dirname, "recall-corpus.jsonl");
 const RESULTS_PATH = join(__dirname, "recall-results.json");
+const BASELINE_PATH = join(__dirname, "recall-baseline.json");
 const K_VALUES = [10, 20] as const;
 const MAX_K = Math.max(...K_VALUES);
 
@@ -254,13 +308,18 @@ function parseLeanRow(line: string): SearchResultJson | null {
   };
 }
 
+/**
+ * Run one search, returning parsed rows *and* the captured stderr. stderr is no
+ * longer discarded (as the old `execFileSync` did): the preflight gate inspects
+ * it for degraded / FTS-only wording so a vectorless run cannot score silently.
+ */
 function runSearch(
   binary: string,
   query: string,
   repoDir: string,
   k: number,
-): SearchResultJson[] {
-  const rawOutput = execFileSync(
+): { rows: SearchResultJson[]; stderr: string } {
+  const result = spawnSync(
     binary,
     ["search", "-n", String(k), "--path", repoDir, query],
     {
@@ -269,14 +328,22 @@ function runSearch(
       cwd: repoDir,
     },
   );
+  if (result.error) {
+    throw result.error;
+  }
+  if (typeof result.status === "number" && result.status !== 0) {
+    throw new Error(
+      `1up search exited ${result.status} for query "${query}": ${result.stderr ?? ""}`,
+    );
+  }
   const rows: SearchResultJson[] = [];
-  for (const rawLine of rawOutput.split("\n")) {
+  for (const rawLine of (result.stdout ?? "").split("\n")) {
     const parsed = parseLeanRow(rawLine);
     if (parsed !== null) {
       rows.push(parsed);
     }
   }
-  return rows;
+  return { rows, stderr: result.stderr ?? "" };
 }
 
 /**
@@ -532,22 +599,85 @@ function scoreSegmentIdRow(
   };
 }
 
-function readSchemaVersion(repoDir: string, binary: string): number | null {
+interface StatusSnapshot {
+  schema_version: number | null;
+  vector_rows: number | null;
+  embedding_model: string | null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readStatus(repoDir: string, binary: string): StatusSnapshot {
   // `status` remains a maintenance command that keeps the `-f json` envelope,
   // so we still parse it with JSON here (the lean grammar is scoped to core
-  // commands only — design §2.1).
+  // commands only — design §2.1). `schema_version` and `embedding_model` are
+  // surfaced by the status command itself (status variant surfacing); when the
+  // running binary predates that surfacing the fields read as null and the
+  // preflight fails closed.
   try {
     const raw = execFileSync(binary, ["status", repoDir, "-f", "json"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const parsed = JSON.parse(raw) as { schema_version?: number };
-    return typeof parsed.schema_version === "number"
-      ? parsed.schema_version
-      : null;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      schema_version: numberOrNull(parsed.schema_version),
+      vector_rows: numberOrNull(parsed.vector_rows),
+      embedding_model: stringOrNull(parsed.embedding_model),
+    };
   } catch {
+    return { schema_version: null, vector_rows: null, embedding_model: null };
+  }
+}
+
+function computeCorpusIdentity(
+  rawCorpus: string,
+  rowCount: number,
+): CorpusIdentity {
+  const sha256 = createHash("sha256").update(rawCorpus, "utf8").digest("hex");
+  return { size: rowCount, sha256 };
+}
+
+function readBaseline(baselinePath: string): RecallBaseline | null {
+  if (!existsSync(baselinePath)) {
     return null;
   }
+  const parsed = JSON.parse(readFileSync(baselinePath, "utf8")) as Partial<
+    RecallBaseline & { corpus?: Partial<CorpusIdentity> }
+  >;
+  // A structurally invalid baseline (e.g. the legacy schema-v11 prose form that
+  // predates the gate) is treated as absent so the gate reports a clear
+  // "capture a baseline" error rather than throwing on a missing field.
+  if (
+    typeof parsed.schema_version !== "number" ||
+    typeof parsed.model_id !== "string" ||
+    typeof parsed.recall_at_10 !== "number" ||
+    typeof parsed.recall_at_20 !== "number" ||
+    typeof parsed.corpus?.sha256 !== "string" ||
+    typeof parsed.corpus?.size !== "number"
+  ) {
+    return null;
+  }
+  return {
+    captured_at: parsed.captured_at,
+    schema_version: parsed.schema_version,
+    model_id: parsed.model_id,
+    max_tokens: numberOrNull(parsed.max_tokens),
+    corpus: { size: parsed.corpus.size, sha256: parsed.corpus.sha256 },
+    recall_at_10: parsed.recall_at_10,
+    recall_at_20: parsed.recall_at_20,
+  };
+}
+
+function reportRecall(reports: RecallReport[], k: number): number | null {
+  const report = reports.find((r) => r.k === k);
+  return report ? report.recall : null;
 }
 
 function formatRecall(value: number): string {
@@ -564,11 +694,17 @@ function rowMatchMode(row: CorpusRow): MatchMode | null {
   return null;
 }
 
-function runHarness(): HarnessOutput {
-  const binary = resolveBinary();
-  const targetRepo = resolveTargetRepo();
-  const corpus = readCorpus();
-  const schemaVersion = readSchemaVersion(targetRepo, binary);
+interface ScoredHarness {
+  reports: RecallReport[];
+  modeCounts: Record<MatchMode | "none", number>;
+  degradedQueries: Array<{ query: string; markers: string[] }>;
+}
+
+function runHarness(
+  binary: string,
+  targetRepo: string,
+  corpus: CorpusRow[],
+): ScoredHarness {
   const hydrate = makeHydrator(binary, targetRepo);
 
   const modeCounts: Record<MatchMode | "none", number> = {
@@ -586,11 +722,17 @@ function runHarness(): HarnessOutput {
   }
 
   // Pre-fetch top-MAX_K once per query, then slice per k. Keep the raw result objects so
-  // anchor matching can inspect content / defined_symbols / breadcrumb.
+  // anchor matching can inspect content / defined_symbols / breadcrumb. Capture each
+  // query's stderr so a degraded / FTS-only response fails the run instead of scoring.
   const perQueryTopK = new Map<string, SearchResultJson[]>();
+  const degradedQueries: Array<{ query: string; markers: string[] }> = [];
   for (const row of corpus) {
-    const raw = runSearch(binary, row.query, targetRepo, MAX_K);
-    perQueryTopK.set(row.query, raw.slice(0, MAX_K));
+    const { rows, stderr } = runSearch(binary, row.query, targetRepo, MAX_K);
+    perQueryTopK.set(row.query, rows.slice(0, MAX_K));
+    const markers = detectDegradedStderr(stderr);
+    if (markers.length > 0) {
+      degradedQueries.push({ query: row.query, markers });
+    }
   }
 
   const reports: RecallReport[] = [];
@@ -663,26 +805,192 @@ function runHarness(): HarnessOutput {
     });
   }
 
-  return {
-    schema_version: schemaVersion,
+  return { reports, modeCounts, degradedQueries };
+}
+
+function emptyModeCounts(): Record<MatchMode | "none", number> {
+  return { anchor: 0, segment_id: 0, none: 0 };
+}
+
+function writeResults(output: HarnessOutput): void {
+  writeFileSync(RESULTS_PATH, `${JSON.stringify(output, null, 2)}\n`);
+}
+
+function printSummary(output: HarnessOutput): void {
+  console.log(
+    `1up recall@k harness: schema=v${output.schema_version ?? "?"} model=${output.embedding_model ?? "?"} corpus=${output.corpus_size} (anchor=${output.corpus_match_mode_counts.anchor} segment_id=${output.corpus_match_mode_counts.segment_id} none=${output.corpus_match_mode_counts.none}) target=${output.target_repo}`,
+  );
+  for (const report of output.reports) {
+    console.log(
+      `  recall@${report.k} = ${formatRecall(report.recall)}  (${report.scored_queries}/${report.total_queries} scored)`,
+    );
+  }
+  console.log(`Wrote ${RESULTS_PATH}`);
+}
+
+function main(): void {
+  const binary = resolveBinary();
+  const targetRepo = resolveTargetRepo();
+  const rawCorpus = readFileSync(CORPUS_PATH, "utf8");
+  const corpus = readCorpus();
+  const corpus_identity = computeCorpusIdentity(rawCorpus, corpus.length);
+  const status = readStatus(targetRepo, binary);
+  const expectedVariant = resolveExpectedVariant(
+    process.env.ONEUP_MODEL_VARIANT,
+  );
+  const tolerance = resolveTolerance(process.env.ONEUP_RECALL_TOLERANCE);
+  const captureBaseline = process.env.RECALL_CAPTURE_BASELINE === "1";
+  // A/B mode compares two variant legs (fp32 vs int8) for parity, so the
+  // model_id is expected to differ between baseline and candidate.
+  const abMode = process.env.ONEUP_RECALL_AB === "1";
+  // The A/B recipe points leg 2 at leg 1's captured baseline via this override
+  // so the pinned recall-baseline.json is never touched by A/B runs.
+  const baselinePath =
+    process.env.ONEUP_RECALL_BASELINE_PATH !== undefined &&
+    process.env.ONEUP_RECALL_BASELINE_PATH.length > 0
+      ? resolve(process.cwd(), process.env.ONEUP_RECALL_BASELINE_PATH)
+      : BASELINE_PATH;
+  const maxTokens = numberOrNull(
+    process.env.ONEUP_RECALL_MAX_TOKENS !== undefined
+      ? Number(process.env.ONEUP_RECALL_MAX_TOKENS)
+      : undefined,
+  );
+  const capturedAt = new Date().toISOString();
+
+  const preflight = evaluateStatusPreflight(status, expectedVariant);
+
+  const baseOutput: HarnessOutput = {
+    schema_version: status.schema_version,
+    vector_rows: status.vector_rows,
+    embedding_model: status.embedding_model,
+    model_id: status.embedding_model,
+    max_tokens: maxTokens,
     target_repo: targetRepo,
     binary,
-    captured_at: new Date().toISOString(),
+    captured_at: capturedAt,
     corpus_size: corpus.length,
-    corpus_match_mode_counts: modeCounts,
-    reports,
+    corpus: corpus_identity,
+    corpus_match_mode_counts: emptyModeCounts(),
+    recall_at_10: null,
+    recall_at_20: null,
+    reports: [],
+    gates: {
+      expected_variant: expectedVariant,
+      tolerance,
+      preflight,
+      degraded_stderr_queries: [],
+      recall: null,
+    },
+    delta_vs_baseline: null,
   };
+
+  // Fail-closed before scoring: a vectorless / schema-less / wrong-variant index
+  // makes recall numbers meaningless, so never score it.
+  if (!preflight.ok) {
+    writeResults(baseOutput);
+    printSummary(baseOutput);
+    console.error(
+      `FAIL: recall preflight failed — ${preflight.failures.join("; ")}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const scored = runHarness(binary, targetRepo, corpus);
+  const recallAt10 = reportRecall(scored.reports, 10);
+  const recallAt20 = reportRecall(scored.reports, 20);
+
+  const output: HarnessOutput = {
+    ...baseOutput,
+    corpus_match_mode_counts: scored.modeCounts,
+    recall_at_10: recallAt10,
+    recall_at_20: recallAt20,
+    reports: scored.reports,
+    gates: {
+      ...baseOutput.gates,
+      degraded_stderr_queries: scored.degradedQueries,
+    },
+  };
+
+  // A degraded / FTS-only response on any query means the semantic path wasn't
+  // exercised for that query; fail the run and skip the (meaningless) compare.
+  if (scored.degradedQueries.length > 0) {
+    writeResults(output);
+    printSummary(output);
+    const summary = scored.degradedQueries
+      .map((d) => `"${d.query}" [${d.markers.join(", ")}]`)
+      .join("; ");
+    console.error(`FAIL: degraded search responses detected — ${summary}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const candidate: RecallCandidate = {
+    schema_version: status.schema_version,
+    model_id: status.embedding_model,
+    max_tokens: maxTokens,
+    corpus: corpus_identity,
+    recall_at_10: recallAt10 ?? 0,
+    recall_at_20: recallAt20 ?? 0,
+  };
+
+  if (captureBaseline) {
+    const baseline: RecallBaseline = {
+      captured_at: capturedAt,
+      schema_version: candidate.schema_version ?? 0,
+      model_id: candidate.model_id ?? "",
+      max_tokens: candidate.max_tokens,
+      corpus: candidate.corpus,
+      recall_at_10: candidate.recall_at_10,
+      recall_at_20: candidate.recall_at_20,
+    };
+    writeFileSync(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`);
+    writeResults(output);
+    printSummary(output);
+    console.log(`Captured recall baseline -> ${baselinePath}`);
+    return;
+  }
+
+  const baseline = readBaseline(baselinePath);
+  try {
+    const comparison = compareRecall(baseline, candidate, tolerance, {
+      allowModelIdMismatch: abMode,
+    });
+    output.delta_vs_baseline = comparison.deltas;
+    output.gates.recall = {
+      verdict: comparison.verdict,
+      regressions: comparison.regressions,
+    };
+    writeResults(output);
+    printSummary(output);
+    console.log(
+      `  delta vs baseline: @10 ${comparison.deltas.recall_at_10.toFixed(4)}  @20 ${comparison.deltas.recall_at_20.toFixed(4)}  (tolerance ${tolerance})`,
+    );
+    if (comparison.verdict === "fail") {
+      const detail = comparison.regressions
+        .map(
+          (r) =>
+            `recall@${r.k} ${formatRecall(r.candidate)} vs baseline ${formatRecall(r.baseline)} (delta ${r.delta.toFixed(4)})`,
+        )
+        .join("; ");
+      console.error(
+        `FAIL: recall regression beyond tolerance ${tolerance} — ${detail}`,
+      );
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    const message =
+      error instanceof RecallCompareError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    output.gates.recall = { verdict: "error", error: message };
+    writeResults(output);
+    printSummary(output);
+    console.error(`FAIL: recall gate error — ${message}`);
+    process.exitCode = 1;
+  }
 }
 
-const output = runHarness();
-writeFileSync(RESULTS_PATH, `${JSON.stringify(output, null, 2)}\n`);
-
-console.log(
-  `1up recall@k harness: schema=v${output.schema_version ?? "?"} corpus=${output.corpus_size} (anchor=${output.corpus_match_mode_counts.anchor} segment_id=${output.corpus_match_mode_counts.segment_id} none=${output.corpus_match_mode_counts.none}) target=${output.target_repo}`,
-);
-for (const report of output.reports) {
-  console.log(
-    `  recall@${report.k} = ${formatRecall(report.recall)}  (${report.scored_queries}/${report.total_queries} scored)`,
-  );
-}
-console.log(`Wrote ${RESULTS_PATH}`);
+main();

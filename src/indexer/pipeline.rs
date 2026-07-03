@@ -254,31 +254,32 @@ fn serialize_embedding(vec: &[f32]) -> Result<String, OneupError> {
 ///
 /// The tokenizer truncates input from the right at `EMBEDDING_MAX_TOKENS`, so
 /// an unbounded header could crowd a segment's actual content out of the
-/// model window. 160 characters is roughly 40-80 wordpiece tokens, leaving
-/// room for content within the 128-token cap.
+/// model window. 160 characters is roughly 40-80 wordpiece tokens, a small
+/// fraction of the 256-token cap, so the header stays a topical prefix and
+/// leaves the bulk of the window for segment content.
 const EMBEDDING_HEADER_MAX_CHARS: usize = 160;
 
 /// Maximum composed embedding-input length in characters.
 ///
 /// A coarse pre-tokenization clamp that bounds tokenizer work on pathologically
-/// long segments. The tokenizer hard-truncates at `EMBEDDING_MAX_TOKENS` (128)
+/// long segments. The tokenizer hard-truncates at `EMBEDDING_MAX_TOKENS` (256)
 /// tokens regardless, so this clamp is kept deliberately generous — ~32
-/// characters per token, far above any realistic 128-token span (wordpiece
+/// characters per token, far above any realistic 256-token span (wordpiece
 /// tokens are usually a handful of characters and practically never exceed 16) —
-/// so it never trims content the 128-token truncation would have kept. The
-/// 4096-char budget is unchanged from when the cap was stated as 256; only the
-/// derivation now tracks the corrected token cap, so produced vectors are
-/// byte-identical.
+/// so it never trims content the 256-token truncation would have kept. It
+/// scales with the token cap (`EMBEDDING_MAX_TOKENS * 32`), so widening the
+/// window to 256 doubled the budget from 4096 to 8192 in lockstep.
 const EMBEDDING_INPUT_MAX_CHARS: usize = EMBEDDING_MAX_TOKENS * 32;
 
-// Compile-time guard: the pre-tokenization char clamp must stay at its prior
-// 4096-char value after `EMBEDDING_MAX_TOKENS` was corrected 256 -> 128.
-// Shrinking it would trim long segments before tokenization and change the text
-// the model sees, so the build breaks the instant the derivation stops yielding
-// 4096 (e.g. a future cap change that forgets to keep this budget fixed).
+// Compile-time guard: the pre-tokenization char clamp tracks the 256-token
+// window (`EMBEDDING_MAX_TOKENS * 32 == 8192`). It breaks the build the instant
+// the derivation stops yielding 8192 — either because the char-per-token factor
+// drifts or the token cap moves without a conscious review of this budget.
+// Shrinking it would trim long segments before tokenization and starve the
+// wider window of the very content it was widened to capture.
 const _: () = assert!(
-    EMBEDDING_INPUT_MAX_CHARS == 4096,
-    "embedding char clamp must remain 4096 to keep embedding input byte-identical"
+    EMBEDDING_INPUT_MAX_CHARS == 8192,
+    "embedding char clamp must remain 8192 to feed the full 256-token window"
 );
 
 /// Builds the text passed to the embedder for one segment.
@@ -336,26 +337,37 @@ fn truncate_chars(mut text: String, max_chars: usize) -> String {
 /// Deterministic SHA-256 hex over the embedding-model identity (`model_id` plus
 /// `embedding_dim` — the same identity gated by
 /// [`schema::check_embedding_model_compatible`] and recorded as
-/// `meta.embedding_model`) followed by the exact embedder input produced by
-/// [`compose_embedding_text`].
+/// `meta.embedding_model`), the token window (`max_tokens`), and the exact
+/// embedder input produced by [`compose_embedding_text`].
 ///
 /// Because the embed input uses repository-relative paths, it is identical
 /// across branch/worktree contexts, so identical content yields an identical
 /// key and is embedded and stored exactly once in `embedding_pool` (REQ-006).
 /// Folding the model identity into the key makes embeddings produced by a
 /// different model resolve to a different key, so changing the model
-/// automatically invalidates reuse of older vectors.
+/// automatically invalidates reuse of older vectors. `max_tokens` is folded in
+/// for the same reason: the same text embedded at a 128- vs 256-token window
+/// yields numerically different vectors once its tail crosses 128 tokens, so
+/// mixing windows in the content-addressed pool would silently serve stale
+/// truncated vectors after the v18 window widening.
 ///
 /// The full 256-bit digest is returned (rather than the 128-bit prefix used for
 /// segment ids) because a key collision would silently share a wrong embedding
 /// across distinct content, which must never happen for the search-identical
-/// guarantee. The `model_id`/`embedding_dim`/`embed_input` fields are
-/// `\0`-delimited so adjacent fields can never bleed into one another.
-fn embedding_content_key(model_id: &str, embedding_dim: usize, embed_input: &str) -> String {
+/// guarantee. The `model_id`/`embedding_dim`/`max_tokens`/`embed_input` fields
+/// are `\0`-delimited so adjacent fields can never bleed into one another.
+fn embedding_content_key(
+    model_id: &str,
+    embedding_dim: usize,
+    max_tokens: usize,
+    embed_input: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(model_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(embedding_dim.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(max_tokens.to_string().as_bytes());
     hasher.update(b"\0");
     hasher.update(embed_input.as_bytes());
     let hash = hasher.finalize();
@@ -869,7 +881,12 @@ async fn build_segment_batches(
                 .filter(|segment| should_embed_segment(segment))
                 .map(|segment| {
                     let embed_input = compose_embedding_text(&file.relative_path, segment);
-                    let content_key = embedding_content_key(&model_id, EMBEDDING_DIM, &embed_input);
+                    let content_key = embedding_content_key(
+                        &model_id,
+                        EMBEDDING_DIM,
+                        EMBEDDING_MAX_TOKENS,
+                        &embed_input,
+                    );
                     EmbeddableSegment {
                         content_key,
                         embed_input,
@@ -2879,6 +2896,10 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_progress_reports_embed_threads_when_embeddings_enabled() {
+        // Pin the always-provisioned FP32 baseline so this embedding-path test
+        // does not depend on the INT8 default artifact being present locally
+        // (provisioned by T4).
+        let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
         }
@@ -3133,8 +3154,18 @@ mod tests {
         // hold the same chunk produce the byte-identical embed input that any
         // context would, and therefore the same content key (REQ-006).
         let embed_input = compose_embedding_text("src/search/impact.rs", &segment);
-        let key_ctx_a = embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
-        let key_ctx_b = embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &embed_input);
+        let key_ctx_a = embedding_content_key(
+            HF_MODEL_REPO,
+            EMBEDDING_DIM,
+            EMBEDDING_MAX_TOKENS,
+            &embed_input,
+        );
+        let key_ctx_b = embedding_content_key(
+            HF_MODEL_REPO,
+            EMBEDDING_DIM,
+            EMBEDDING_MAX_TOKENS,
+            &embed_input,
+        );
         assert_eq!(
             key_ctx_a, key_ctx_b,
             "identical content must yield an identical key across contexts"
@@ -3151,7 +3182,12 @@ mod tests {
             s
         });
         assert_ne!(
-            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, &other_input),
+            embedding_content_key(
+                HF_MODEL_REPO,
+                EMBEDDING_DIM,
+                EMBEDDING_MAX_TOKENS,
+                &other_input
+            ),
             key_ctx_a,
             "distinct content must not collide"
         );
@@ -3159,22 +3195,46 @@ mod tests {
         // Changing the model identity must invalidate reuse: a different model
         // id or embedding dimension yields a different key for the same input.
         assert_ne!(
-            embedding_content_key("org/other-model", EMBEDDING_DIM, &embed_input),
+            embedding_content_key(
+                "org/other-model",
+                EMBEDDING_DIM,
+                EMBEDDING_MAX_TOKENS,
+                &embed_input
+            ),
             key_ctx_a,
             "a different model id must change the key"
         );
         assert_ne!(
-            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM + 1, &embed_input),
+            embedding_content_key(
+                HF_MODEL_REPO,
+                EMBEDDING_DIM + 1,
+                EMBEDDING_MAX_TOKENS,
+                &embed_input
+            ),
             key_ctx_a,
             "a different embedding dimension must change the key"
         );
 
-        // Fields are delimited so a longer model id cannot alias a shorter one
-        // with a leading-digit dimension (e.g. ("ab", 1, ...) vs ("a", 12, ...)).
+        // Changing the token window must invalidate reuse: the same content
+        // embedded at a 128- vs 256-token window can diverge numerically once
+        // its tail crosses 128 tokens, so the key must not alias across windows.
         assert_ne!(
-            embedding_content_key("ab", 1, &embed_input),
-            embedding_content_key("a", 12, &embed_input),
+            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, 128, &embed_input),
+            embedding_content_key(HF_MODEL_REPO, EMBEDDING_DIM, 256, &embed_input),
+            "a different max_tokens window must change the key"
+        );
+
+        // Fields are delimited so adjacent numeric/string fields cannot alias by
+        // shifting a digit across a boundary (e.g. dim/max_tokens 1|2 vs 12|... ).
+        assert_ne!(
+            embedding_content_key("ab", 1, 2, &embed_input),
+            embedding_content_key("a", 12, 2, &embed_input),
             "field boundaries must be unambiguous"
+        );
+        assert_ne!(
+            embedding_content_key("m", 1, 23, &embed_input),
+            embedding_content_key("m", 12, 3, &embed_input),
+            "dim/max_tokens boundary must be unambiguous"
         );
     }
 
@@ -3257,6 +3317,10 @@ mod tests {
 
     #[tokio::test]
     async fn low_semantic_chunked_files_are_indexed_without_embeddings() {
+        // Pin the always-provisioned FP32 baseline so this embedding-path test
+        // does not depend on the INT8 default artifact being present locally
+        // (provisioned by T4).
+        let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
         }

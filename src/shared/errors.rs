@@ -96,6 +96,9 @@ pub enum EmbeddingError {
     #[error("model download failed: {0}")]
     DownloadFailed(String),
 
+    #[error("invalid model variant override {0:?}: expected `int8` or `fp32`")]
+    InvalidVariant(String),
+
     #[error("inference failed: {0}")]
     InferenceFailed(String),
 

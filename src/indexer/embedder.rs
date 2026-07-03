@@ -18,9 +18,10 @@ use crate::shared::constants::{
     DISABLE_MODEL_DOWNLOADS_ENV_VAR, EMBEDDING_BATCH_SIZE, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     HF_BASE_URL, HF_MODEL_REPO, MODEL_ARTIFACT_MANIFEST_FILENAME, MODEL_ARTIFACT_MANIFEST_VERSION,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_DOWNLOAD_CONNECT_TIMEOUT_SECS,
-    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_SHA256,
-    MODEL_STAGING_DIRNAME, MODEL_VARIANT_INT8_SUFFIX, MODEL_VERIFIED_DIRNAME,
-    SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256, XDG_STATE_DIR_MODE,
+    MODEL_DOWNLOAD_TIMEOUT_SECS, MODEL_FILENAME, MODEL_ONNX_INT8_FILENAME, MODEL_ONNX_INT8_SHA256,
+    MODEL_ONNX_SHA256, MODEL_STAGING_DIRNAME, MODEL_VARIANT_ENV_VAR, MODEL_VARIANT_INT8_SUFFIX,
+    MODEL_VERIFIED_DIRNAME, SECURE_STATE_FILE_MODE, TOKENIZER_FILENAME, TOKENIZER_SHA256,
+    XDG_STATE_DIR_MODE,
 };
 use crate::shared::errors::{EmbeddingError, OneupError};
 use crate::shared::fs::{
@@ -31,6 +32,10 @@ use crate::shared::progress::{ProgressState, ProgressUi};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
+/// Upstream relative path for the INT8 artifact (T4, HYP-001 validated). The
+/// `avx512` build is byte-identical to the repo's arm64/avx512_vnni INT8
+/// variants (same LFS object), fetched via the shared `resolve/main` scheme.
+const MODEL_ONNX_INT8_DOWNLOAD_URL: &str = "onnx/model_qint8_avx512.onnx";
 
 struct ExpectedArtifactFile {
     filename: &'static str,
@@ -48,7 +53,13 @@ impl ExpectedArtifactFile {
     }
 }
 
-const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 2] = [
+// The INT8 artifact (T4) is a first-class third entry: the manifest records all
+// three files, and every existing staged-download / per-file digest-verify /
+// pointer-repair / `Unverifiable`-resolution path covers it with no new
+// mechanism. A pre-existing two-file verified manifest therefore stops matching
+// `matches_expected`, resolves `Unverifiable`, and is re-provisioned as a
+// complete three-file set on the next indexing pass.
+const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 3] = [
     ExpectedArtifactFile {
         filename: MODEL_FILENAME,
         relative_url: MODEL_DOWNLOAD_URL,
@@ -60,6 +71,12 @@ const EXPECTED_ARTIFACT_FILES: [ExpectedArtifactFile; 2] = [
         relative_url: TOKENIZER_DOWNLOAD_URL,
         sha256: TOKENIZER_SHA256,
         label: "tokenizer",
+    },
+    ExpectedArtifactFile {
+        filename: MODEL_ONNX_INT8_FILENAME,
+        relative_url: MODEL_ONNX_INT8_DOWNLOAD_URL,
+        sha256: MODEL_ONNX_INT8_SHA256,
+        label: "int8 model",
     },
 ];
 
@@ -157,19 +174,29 @@ impl FileFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmbeddingCompatibilityKey {
     model_dir: PathBuf,
+    variant: ModelVariant,
     model: FileFingerprint,
     tokenizer: FileFingerprint,
     embed_threads: usize,
 }
 
 impl EmbeddingCompatibilityKey {
-    fn from_dir_with_threads(dir: &Path, embed_threads: usize) -> Result<Self, OneupError> {
+    fn from_dir_with_variant_and_threads(
+        dir: &Path,
+        variant: ModelVariant,
+        embed_threads: usize,
+    ) -> Result<Self, OneupError> {
         let model_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        let model_path = model_dir.join(MODEL_FILENAME);
+        // Fingerprint the artifact backing the *resolved* variant so a variant
+        // swap changes the key (a long-lived daemon can never reuse a warm INT8
+        // embedder for an FP32 run or vice versa), on top of the identity change
+        // already folded via `ModelVariant::model_id`.
+        let model_path = model_dir.join(variant.model_filename());
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
 
         Ok(Self {
             model_dir,
+            variant,
             model: FileFingerprint::from_path(&model_path)?,
             tokenizer: FileFingerprint::from_path(&tokenizer_path)?,
             embed_threads,
@@ -209,6 +236,49 @@ impl ModelVariant {
             ModelVariant::Int8 => MODEL_ONNX_INT8_FILENAME,
             ModelVariant::Fp32 => MODEL_FILENAME,
         }
+    }
+}
+
+/// The variant used when no [`MODEL_VARIANT_ENV_VAR`] override is set (T1).
+///
+/// INT8 is the v18 established default CPU embedding path. Selection is
+/// deterministic: an explicit override wins, otherwise this default is loaded.
+/// There is no presence-based auto-selection and no cross-variant fallback — a
+/// resolved variant that fails to load surfaces its own error rather than
+/// quietly serving the other variant's (numerically different) embeddings.
+const DEFAULT_MODEL_VARIANT: ModelVariant = ModelVariant::Int8;
+
+/// Resolves the embedding model variant from the process environment (T1).
+///
+/// Precedence is explicit [`MODEL_VARIANT_ENV_VAR`] override > [`DEFAULT_MODEL_VARIANT`].
+/// An unrecognized override is a hard error propagated at run start — never a
+/// degrade through [`EmbeddingUnavailableReason`] and never a silent fallback.
+fn resolve_model_variant() -> Result<ModelVariant, OneupError> {
+    Ok(parse_model_variant(std::env::var_os(
+        MODEL_VARIANT_ENV_VAR,
+    ))?)
+}
+
+/// Pure parser for the [`MODEL_VARIANT_ENV_VAR`] override value (T1).
+///
+/// Follows the [`model_downloads_disabled_value`] shape: unset or empty (after
+/// trimming) resolves to [`DEFAULT_MODEL_VARIANT`]; `int8`/`fp32`
+/// (case-insensitive) select the named variant; any other value is
+/// [`EmbeddingError::InvalidVariant`] so a typo aborts the run instead of
+/// silently changing (or keeping) the served model.
+fn parse_model_variant(value: Option<std::ffi::OsString>) -> Result<ModelVariant, EmbeddingError> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_MODEL_VARIANT);
+    };
+    let text = raw.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_MODEL_VARIANT);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "int8" => Ok(ModelVariant::Int8),
+        "fp32" => Ok(ModelVariant::Fp32),
+        _ => Err(EmbeddingError::InvalidVariant(trimmed.to_string())),
     }
 }
 
@@ -279,7 +349,10 @@ impl<T> Default for WarmRuntime<T> {
 }
 
 impl EmbeddingRuntime {
-    pub async fn prepare_for_indexing(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+    pub async fn prepare_for_indexing(
+        &mut self,
+        embed_threads: usize,
+    ) -> Result<EmbeddingLoadStatus, OneupError> {
         self.prepare_for_indexing_with_progress(embed_threads, true)
             .await
     }
@@ -288,20 +361,25 @@ impl EmbeddingRuntime {
         &mut self,
         embed_threads: usize,
         show_progress_ui: bool,
-    ) -> EmbeddingLoadStatus {
+    ) -> Result<EmbeddingLoadStatus, OneupError> {
+        // Resolve the variant first, before touching the filesystem: an invalid
+        // override is a hard error at run start (T1), never a degrade through
+        // `EmbeddingUnavailableReason` and never a silent cross-variant fallback.
+        let variant = resolve_model_variant()?;
+
         let model_root = match ensure_secure_model_root() {
             Ok(dir) => dir,
             Err(err) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(
+                return Ok(EmbeddingLoadStatus::Unavailable(
                     EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
-                );
+                ));
             }
         };
 
         match resolve_model_state(&model_root) {
             Ok(ModelResolution::Active(dir)) => {
-                return self.prepare_from_model_dir(&dir, embed_threads)
+                return Ok(self.prepare_from_model_dir(&dir, variant, embed_threads))
             }
             Ok(ModelResolution::Unverifiable(detail)) => {
                 // Artifacts are present but failed verification: re-download a
@@ -311,38 +389,47 @@ impl EmbeddingRuntime {
                 tracing::warn!(
                     "model artifacts present but unverifiable ({detail}); re-downloading"
                 );
-                return self
-                    .prepare_with_download(&model_root, embed_threads, show_progress_ui)
-                    .await;
+                return Ok(self
+                    .prepare_with_download(&model_root, variant, embed_threads, show_progress_ui)
+                    .await);
             }
             Ok(ModelResolution::Missing) => {}
             Err(err) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
-                    err.to_string(),
+                return Ok(EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::LoadFailed(err.to_string()),
                 ));
             }
         }
 
         if is_download_failed() {
             self.cache.clear();
-            return EmbeddingLoadStatus::Unavailable(
+            return Ok(EmbeddingLoadStatus::Unavailable(
                 EmbeddingUnavailableReason::PreviousDownloadFailed,
-            );
+            ));
         }
 
-        self.prepare_with_download(&model_root, embed_threads, show_progress_ui)
-            .await
+        Ok(self
+            .prepare_with_download(&model_root, variant, embed_threads, show_progress_ui)
+            .await)
     }
 
-    pub fn prepare_for_search(&mut self, embed_threads: usize) -> EmbeddingLoadStatus {
+    pub fn prepare_for_search(
+        &mut self,
+        embed_threads: usize,
+    ) -> Result<EmbeddingLoadStatus, OneupError> {
+        // Same fail-closed variant resolution as the indexing path (T1): a bad
+        // override aborts the run rather than degrading query embedding to
+        // FTS-only or serving the other variant.
+        let variant = resolve_model_variant()?;
+
         let model_root = match ensure_secure_model_root() {
             Ok(dir) => dir,
             Err(err) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(
+                return Ok(EmbeddingLoadStatus::Unavailable(
                     EmbeddingUnavailableReason::ModelDirUnavailable(err.to_string()),
-                );
+                ));
             }
         };
 
@@ -350,27 +437,27 @@ impl EmbeddingRuntime {
             Ok(ModelResolution::Active(dir)) => dir,
             Ok(ModelResolution::Unverifiable(detail)) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(
+                return Ok(EmbeddingLoadStatus::Unavailable(
                     EmbeddingUnavailableReason::ArtifactsUnverifiable(detail),
-                );
+                ));
             }
             Ok(ModelResolution::Missing) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(if is_download_failed() {
+                return Ok(EmbeddingLoadStatus::Unavailable(if is_download_failed() {
                     EmbeddingUnavailableReason::PreviousDownloadFailed
                 } else {
                     EmbeddingUnavailableReason::ModelMissing
-                });
+                }));
             }
             Err(err) => {
                 self.cache.clear();
-                return EmbeddingLoadStatus::Unavailable(EmbeddingUnavailableReason::LoadFailed(
-                    err.to_string(),
+                return Ok(EmbeddingLoadStatus::Unavailable(
+                    EmbeddingUnavailableReason::LoadFailed(err.to_string()),
                 ));
             }
         };
 
-        self.prepare_from_model_dir(&model_dir, embed_threads)
+        Ok(self.prepare_from_model_dir(&model_dir, variant, embed_threads))
     }
 
     pub fn current_embedder(&mut self) -> Option<&mut Embedder> {
@@ -380,9 +467,14 @@ impl EmbeddingRuntime {
     fn prepare_from_model_dir(
         &mut self,
         model_dir: &Path,
+        variant: ModelVariant,
         embed_threads: usize,
     ) -> EmbeddingLoadStatus {
-        let key = match EmbeddingCompatibilityKey::from_dir_with_threads(model_dir, embed_threads) {
+        let key = match EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            model_dir,
+            variant,
+            embed_threads,
+        ) {
             Ok(key) => key,
             Err(err) => {
                 self.cache.clear();
@@ -396,7 +488,12 @@ impl EmbeddingRuntime {
             return EmbeddingLoadStatus::Warm;
         }
 
-        match Embedder::from_dir_with_threads(&key.model_dir, embed_threads) {
+        match Embedder::from_dir_with_variant(
+            &key.model_dir,
+            variant,
+            embed_threads,
+            EMBEDDING_BATCH_SIZE,
+        ) {
             Ok(embedder) => {
                 self.cache.store(key, embedder);
                 EmbeddingLoadStatus::Loaded
@@ -413,13 +510,14 @@ impl EmbeddingRuntime {
     async fn prepare_with_download(
         &mut self,
         model_root: &Path,
+        variant: ModelVariant,
         embed_threads: usize,
         show_progress_ui: bool,
     ) -> EmbeddingLoadStatus {
         match download_and_activate_verified_artifacts(model_root, show_progress_ui).await {
             Ok(model_dir) => {
                 clear_download_failure();
-                match self.prepare_from_model_dir(&model_dir, embed_threads) {
+                match self.prepare_from_model_dir(&model_dir, variant, embed_threads) {
                     EmbeddingLoadStatus::Loaded | EmbeddingLoadStatus::Warm => {
                         EmbeddingLoadStatus::Downloaded
                     }
@@ -602,16 +700,29 @@ impl Embedder {
             }
         };
 
-        Self::from_dir_with_batch_size(&model_dir, intra_threads, batch_size)
+        let variant = resolve_model_variant()?;
+        Self::from_dir_with_variant(&model_dir, variant, intra_threads, batch_size)
     }
 
-    /// Creates an embedder from pre-existing model files at a custom path and thread count.
+    /// Creates an embedder from pre-existing model files at a custom path and
+    /// thread count, resolving the variant from the environment (T1).
+    #[allow(dead_code)]
     pub fn from_dir_with_threads(dir: &Path, intra_threads: usize) -> Result<Self, OneupError> {
-        Self::from_dir_with_batch_size(dir, intra_threads, EMBEDDING_BATCH_SIZE)
+        let variant = resolve_model_variant()?;
+        Self::from_dir_with_variant(dir, variant, intra_threads, EMBEDDING_BATCH_SIZE)
     }
 
-    fn from_dir_with_batch_size(
+    /// Loads the explicitly resolved model variant (T1).
+    ///
+    /// Selection is deterministic and already decided by `resolve_model_variant`
+    /// (override > default `Int8`): this loads exactly `variant` and never probes
+    /// for the other artifact or falls back to it. A failed load surfaces its own
+    /// error so an unavailable variant degrades to FTS-only (or a hard error for
+    /// an invalid override) rather than silently serving the other variant's
+    /// numerically different embeddings.
+    fn from_dir_with_variant(
         dir: &Path,
+        variant: ModelVariant,
         intra_threads: usize,
         batch_size: usize,
     ) -> Result<Self, OneupError> {
@@ -624,24 +735,14 @@ impl Embedder {
             .into());
         }
 
-        // INT8 is the default CPU path when present (R-003, T10); FP32 is the
-        // always-present fallback. Loading the INT8 artifact can fail
-        // independently of the FP32 baseline (corrupt/incompatible quantized
-        // graph), so a failed INT8 load degrades to FP32 rather than failing the
-        // whole embedder — the FP32 numerics are byte-identical to the historical
-        // path. Only an absent *and* unloadable FP32 baseline is fatal.
-        let int8_path = dir.join(MODEL_ONNX_INT8_FILENAME);
-        if int8_path.exists() {
-            match Self::load_variant(dir, ModelVariant::Int8, intra_threads, batch_size) {
-                Ok(embedder) => return Ok(embedder),
-                Err(err) => tracing::warn!(
-                    "INT8 model present at {} but failed to load ({err}); falling back to FP32",
-                    int8_path.display()
-                ),
-            }
-        }
+        tracing::info!(
+            "loading embedding model variant {} ({}) from {}",
+            variant.model_id(),
+            variant.model_filename(),
+            dir.display()
+        );
 
-        Self::load_variant(dir, ModelVariant::Fp32, intra_threads, batch_size)
+        Self::load_variant(dir, variant, intra_threads, batch_size)
     }
 
     fn load_variant(
@@ -658,6 +759,25 @@ impl Embedder {
                 model_path.display()
             ))
             .into());
+        }
+
+        // INT8 load-time integrity recheck (T4, REQ-004 AC1). The compact model
+        // is re-digested against its pinned SHA-256 *before* the ORT session is
+        // created, so a post-activation corruption or tamper refuses the model
+        // with a clear expected-vs-got error rather than parsing (and serving
+        // embeddings from) untrusted bytes. FP32 keeps its activation-time-only
+        // verification. There is no cross-variant fallback: a failed recheck
+        // surfaces its own error, which the caller degrades to FTS-only (or
+        // fails as a hard error for an explicit override).
+        if variant == ModelVariant::Int8 {
+            let digest = sha256_digest_file(&model_path)?;
+            if digest != MODEL_ONNX_INT8_SHA256 {
+                return Err(EmbeddingError::ModelNotAvailable(format!(
+                    "INT8 model {} failed integrity recheck: expected SHA-256 {MODEL_ONNX_INT8_SHA256}, got {digest}",
+                    model_path.display()
+                ))
+                .into());
+            }
         }
 
         // Pin GraphOptimizationLevel::Level3 explicitly (R-004). It is ort's
@@ -679,9 +799,30 @@ impl Embedder {
             .commit_from_file(&model_path)
             .map_err(|e| EmbeddingError::ModelNotAvailable(format!("failed to load model: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
+        let mut tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILENAME)).map_err(|e| {
             EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
         })?;
+
+        // Programmatically widen the tokenizer window to `EMBEDDING_MAX_TOKENS`
+        // (HYP-002). The shipped `tokenizer.json` hard-pins truncation and
+        // Fixed padding to 128, so the constant alone is a no-op; overriding
+        // here (rather than editing the file) keeps `TOKENIZER_SHA256`
+        // unchanged. Existing params are preserved and only the length fields
+        // are raised, so inputs of <=128 real tokens still tokenize to
+        // byte-identical ids/mask (existing vectors reproduce). Padding must be
+        // raised in lockstep with truncation: `run_inference` copies
+        // `ids[0..max_len]` uniformly across a mixed-length sub-batch, so a
+        // `Fixed(128)` pad width under a 256-token truncation would index past a
+        // short row's id buffer and panic.
+        let mut truncation = tokenizer.get_truncation().cloned().unwrap_or_default();
+        truncation.max_length = EMBEDDING_MAX_TOKENS;
+        tokenizer.with_truncation(Some(truncation)).map_err(|e| {
+            EmbeddingError::TokenizationFailed(format!("failed to set truncation: {e}"))
+        })?;
+
+        let mut padding = tokenizer.get_padding().cloned().unwrap_or_default();
+        padding.strategy = tokenizers::PaddingStrategy::Fixed(EMBEDDING_MAX_TOKENS);
+        tokenizer.with_padding(Some(padding));
 
         Ok(Self {
             session,
@@ -714,10 +855,11 @@ impl Embedder {
     /// Inputs are length-bucketed before inference (R-005): every input is
     /// tokenized once, the set is sorted by real (un-padded) token length, and
     /// equal-length-ish inputs are grouped into the configured-size sub-batches.
-    /// Because the shipped tokenizer pads to a fixed 128 tokens but `run_inference`
-    /// trims each sub-batch's tensor to its own longest *real* sequence, grouping
-    /// short inputs together shrinks that per-sub-batch width and cuts the padding
-    /// FLOPs a mixed-length batch would otherwise waste on a 128-wide tensor.
+    /// Because the tokenizer pads to a fixed `EMBEDDING_MAX_TOKENS` width but
+    /// `run_inference` trims each sub-batch's tensor to its own longest *real*
+    /// sequence, grouping short inputs together shrinks that per-sub-batch width
+    /// and cuts the padding FLOPs a mixed-length batch would otherwise waste on a
+    /// full-width tensor.
     /// Results are scattered back to the caller's original input order via the
     /// sort permutation, so the key->vector contract (`miss_inputs[i]` ->
     /// `vectors[i]`) is preserved. Per-input vectors are byte-identical to the
@@ -774,7 +916,7 @@ impl Embedder {
         let batch_size = encodings.len();
 
         // Trim the tensor to this sub-batch's longest *real* sequence rather than
-        // the tokenizer's fixed 128-token padding. Mean-pooling masks pad
+        // the tokenizer's fixed `EMBEDDING_MAX_TOKENS` padding. Mean-pooling masks pad
         // positions, so a narrower tensor yields byte-identical vectors while
         // skipping the wasted compute on trailing pads (R-005).
         let max_len = encodings.iter().map(real_token_len).max().unwrap_or(0);
@@ -881,10 +1023,10 @@ impl Embedder {
 }
 
 /// Real (un-padded) token count of an encoding: the number of attention-mask
-/// positions set to 1. The shipped tokenizer pads to a fixed 128 tokens, so
-/// `get_ids().len()` is always 128; the attention mask is the only signal of how
-/// many tokens are real. Used for both length-bucketing and per-sub-batch tensor
-/// trimming.
+/// positions set to 1. The tokenizer pads to a fixed `EMBEDDING_MAX_TOKENS`
+/// width, so `get_ids().len()` is constant; the attention mask is the only
+/// signal of how many tokens are real. Used for both length-bucketing and
+/// per-sub-batch tensor trimming.
 fn real_token_len(enc: &Encoding) -> usize {
     enc.get_attention_mask().iter().filter(|&&m| m == 1).count()
 }
@@ -1544,6 +1686,46 @@ fn set_path_mode(path: &Path, mode: u32) -> Result<(), OneupError> {
     }
 }
 
+/// Test-only guard that pins `ONEUP_MODEL_VARIANT=fp32` and restores the prior
+/// value on drop, serialized via `ENV_MUTEX`.
+///
+/// The FP32 baseline (`model.onnx`) is the always-provisioned artifact, so
+/// pinning it keeps variant-agnostic model-gated tests (embedding mechanics,
+/// warm-cache reuse, query-embedding stability, pipeline embedding) runnable on
+/// any host with the FP32 model present, regardless of whether the INT8 default
+/// variant's artifact — provisioned separately (T4) — has been downloaded.
+/// Shared across the `embedder`, `pipeline`, and `hybrid` test modules.
+#[cfg(test)]
+pub(crate) struct Fp32VariantTestGuard {
+    _env_lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Fp32VariantTestGuard {
+    pub(crate) fn set() -> Self {
+        let env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let prior = std::env::var_os(MODEL_VARIANT_ENV_VAR);
+        std::env::set_var(MODEL_VARIANT_ENV_VAR, "fp32");
+        Self {
+            _env_lock: env_lock,
+            prior,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Fp32VariantTestGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(value) => std::env::set_var(MODEL_VARIANT_ENV_VAR, value),
+            None => std::env::remove_var(MODEL_VARIANT_ENV_VAR),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,6 +1739,10 @@ mod tests {
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
         std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
+        // The INT8 artifact is a first-class expected file (T4); write a fake one
+        // too so the three-file verify/resolve machinery sees a complete (if
+        // tampered) set rather than treating the fixture as an incomplete cache.
+        std::fs::write(dir.join(MODEL_ONNX_INT8_FILENAME), b"fake-int8-model").unwrap();
     }
 
     fn legacy_label(activation: &LegacyActivation) -> &'static str {
@@ -1612,6 +1798,75 @@ mod tests {
         assert!(!model_downloads_disabled_value(Some(OsString::from("0"))));
         assert!(model_downloads_disabled_value(Some(OsString::from("1"))));
         assert!(model_downloads_disabled_value(Some(OsString::from("true"))));
+    }
+
+    #[test]
+    fn parse_model_variant_semantics() {
+        use std::ffi::OsString;
+
+        // Unset and empty/whitespace resolve to the established default (int8),
+        // mirroring `model_downloads_disabled_value`'s unset==default shape.
+        assert_eq!(parse_model_variant(None).unwrap(), DEFAULT_MODEL_VARIANT);
+        assert_eq!(
+            parse_model_variant(Some(OsString::from(""))).unwrap(),
+            DEFAULT_MODEL_VARIANT
+        );
+        assert_eq!(
+            parse_model_variant(Some(OsString::from("   "))).unwrap(),
+            DEFAULT_MODEL_VARIANT
+        );
+
+        // Named variants select the corresponding artifact, case-insensitively
+        // and tolerant of surrounding whitespace.
+        assert_eq!(
+            parse_model_variant(Some(OsString::from("int8"))).unwrap(),
+            ModelVariant::Int8
+        );
+        assert_eq!(
+            parse_model_variant(Some(OsString::from("fp32"))).unwrap(),
+            ModelVariant::Fp32
+        );
+        assert_eq!(
+            parse_model_variant(Some(OsString::from("FP32"))).unwrap(),
+            ModelVariant::Fp32
+        );
+        assert_eq!(
+            parse_model_variant(Some(OsString::from("  Int8  "))).unwrap(),
+            ModelVariant::Int8
+        );
+
+        // Anything else is a hard error carrying the offending value — never a
+        // silent fallback to a default or the other variant.
+        let err = parse_model_variant(Some(OsString::from("int4"))).unwrap_err();
+        assert!(matches!(err, EmbeddingError::InvalidVariant(v) if v == "int4"));
+        assert!(parse_model_variant(Some(OsString::from("fp16"))).is_err());
+        assert!(parse_model_variant(Some(OsString::from("true"))).is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn invalid_variant_override_propagates_from_prepare_for_indexing() {
+        // A bad ONEUP_MODEL_VARIANT must abort at run start as a hard error, not
+        // degrade to FTS-only or silently pick a variant (REQ-001 AC3). Resolution
+        // happens before any filesystem/model access, so this holds with no model.
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        std::env::set_var(MODEL_VARIANT_ENV_VAR, "int4");
+        let mut runtime = EmbeddingRuntime::default();
+        let result = runtime.prepare_for_indexing(1).await;
+        std::env::remove_var(MODEL_VARIANT_ENV_VAR);
+
+        let err = result.expect_err("invalid override must be a hard error");
+        assert!(
+            matches!(
+                err,
+                OneupError::Embedding(EmbeddingError::InvalidVariant(ref v)) if v == "int4"
+            ),
+            "expected InvalidVariant, got {err:?}"
+        );
     }
 
     #[test]
@@ -1725,8 +1980,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
 
-        let key_a = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 1).unwrap();
-        let key_b = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+        let key_a = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            1,
+        )
+        .unwrap();
+        let key_b = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            2,
+        )
+        .unwrap();
 
         assert_ne!(key_a, key_b);
     }
@@ -1736,12 +2001,48 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
 
-        let key_before = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+        let key_before = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            2,
+        )
+        .unwrap();
 
         write_fake_model_files(tmp.path(), b"model-v2-with-different-size", b"tokenizer-v1");
 
-        let key_after = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
+        let key_after = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            2,
+        )
+        .unwrap();
         assert_ne!(key_before, key_after);
+    }
+
+    #[test]
+    fn compatibility_key_changes_when_variant_changes() {
+        // A long-lived daemon must never reuse a warm INT8 embedder for an FP32
+        // run (or vice versa): the key folds the resolved variant AND fingerprints
+        // that variant's own artifact, so the two resolve to distinct keys (T1).
+        let tmp = tempfile::tempdir().unwrap();
+        // `write_fake_model_files` now also writes the INT8 artifact, so both
+        // variants have a distinct file to fingerprint.
+        write_fake_model_files(tmp.path(), b"fp32-model", b"tokenizer-v1");
+
+        let fp32 = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            2,
+        )
+        .unwrap();
+        let int8 = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Int8,
+            2,
+        )
+        .unwrap();
+
+        assert_ne!(fp32, int8);
     }
 
     #[test]
@@ -1749,8 +2050,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_model_files(tmp.path(), b"model-v1", b"tokenizer-v1");
 
-        let key_a = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 2).unwrap();
-        let key_b = EmbeddingCompatibilityKey::from_dir_with_threads(tmp.path(), 3).unwrap();
+        let key_a = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            2,
+        )
+        .unwrap();
+        let key_b = EmbeddingCompatibilityKey::from_dir_with_variant_and_threads(
+            tmp.path(),
+            ModelVariant::Fp32,
+            3,
+        )
+        .unwrap();
 
         let mut cache = WarmRuntime::default();
         cache.store(key_a.clone(), 7usize);
@@ -1775,8 +2086,10 @@ mod tests {
         let runtime_dir = runtime_model_dir();
         let live_model = std::fs::read(runtime_dir.join(MODEL_FILENAME)).unwrap();
         let live_tokenizer = std::fs::read(runtime_dir.join(TOKENIZER_FILENAME)).unwrap();
+        let live_int8 = std::fs::read(runtime_dir.join(MODEL_ONNX_INT8_FILENAME)).unwrap();
         std::fs::write(model_root.join(MODEL_FILENAME), &live_model).unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), &live_tokenizer).unwrap();
+        std::fs::write(model_root.join(MODEL_ONNX_INT8_FILENAME), &live_int8).unwrap();
 
         let activated = match try_activate_legacy_artifacts(&model_root).unwrap() {
             LegacyActivation::Activated(dir) => dir,
@@ -1800,6 +2113,7 @@ mod tests {
         assert!(manifest.matches_expected());
         assert!(activated.join(MODEL_FILENAME).exists());
         assert!(activated.join(TOKENIZER_FILENAME).exists());
+        assert!(activated.join(MODEL_ONNX_INT8_FILENAME).exists());
     }
 
     #[test]
@@ -1829,6 +2143,7 @@ mod tests {
 
         std::fs::write(model_root.join(MODEL_FILENAME), b"tampered-model").unwrap();
         std::fs::write(model_root.join(TOKENIZER_FILENAME), b"tampered-tokenizer").unwrap();
+        std::fs::write(model_root.join(MODEL_ONNX_INT8_FILENAME), b"tampered-int8").unwrap();
 
         let result = try_activate_legacy_artifacts(&model_root).unwrap();
         let current: ActiveArtifactPointer =
@@ -1870,6 +2185,11 @@ mod tests {
             model_root.join(TOKENIZER_FILENAME),
         )
         .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
+        )
+        .unwrap();
 
         let first = resolve_model_dir_without_download(&model_root)
             .unwrap()
@@ -1909,6 +2229,11 @@ mod tests {
         std::fs::copy(
             runtime_dir.join(TOKENIZER_FILENAME),
             model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
         )
         .unwrap();
 
@@ -1956,6 +2281,11 @@ mod tests {
             model_root.join(TOKENIZER_FILENAME),
         )
         .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
+        )
+        .unwrap();
         resolve_model_dir_without_download(&model_root)
             .unwrap()
             .expect("legacy artifacts should activate");
@@ -2000,6 +2330,11 @@ mod tests {
         std::fs::copy(
             runtime_dir.join(TOKENIZER_FILENAME),
             model_root.join(TOKENIZER_FILENAME),
+        )
+        .unwrap();
+        std::fs::copy(
+            runtime_dir.join(MODEL_ONNX_INT8_FILENAME),
+            model_root.join(MODEL_ONNX_INT8_FILENAME),
         )
         .unwrap();
 
@@ -2100,6 +2435,99 @@ mod tests {
         assert!(!artifact_dir_path(&model_root, candidate_id).exists());
     }
 
+    #[test]
+    fn corrupted_int8_model_refused_at_load_with_expected_vs_got() {
+        // REQ-004 AC1: a present-but-corrupt INT8 artifact must be refused at
+        // load with a clear expected-vs-got error, *before* the ORT session is
+        // built and before any embeddings are served — and never by silently
+        // loading FP32 instead. No model is needed: the load-time digest recheck
+        // rejects the untrusted bytes first (mirrors the download-time
+        // `activate_staged_artifact` mismatch guard, applied on every load).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(MODEL_ONNX_INT8_FILENAME),
+            b"corrupt-int8-bytes-not-the-pinned-artifact",
+        )
+        .unwrap();
+
+        let err =
+            match Embedder::load_variant(tmp.path(), ModelVariant::Int8, 1, EMBEDDING_BATCH_SIZE) {
+                Ok(_) => panic!("a corrupt INT8 artifact must be refused at load"),
+                Err(err) => err,
+            };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("integrity recheck"),
+            "error must name the INT8 integrity recheck, got: {msg}"
+        );
+        assert!(
+            msg.contains(MODEL_ONNX_INT8_SHA256),
+            "error must report the expected pinned SHA-256, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_two_file_manifest_resolves_unverifiable_for_three_file_reprovision() {
+        // T4: a pre-existing verified artifact whose manifest predates the INT8
+        // artifact (two files) must stop matching the pinned three-file set and
+        // resolve `Unverifiable`, so the indexing path re-provisions all three
+        // files instead of treating the stale set as intact. Pure: no model.
+        let tmp = tempfile::tempdir().unwrap();
+        let model_root = tmp.path().canonicalize().unwrap().join("models");
+        std::fs::create_dir_all(&model_root).unwrap();
+
+        let artifact_id = "v1-legacy-two-file";
+        let artifact_dir = artifact_dir_path(&model_root, artifact_id);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join(MODEL_FILENAME), b"m").unwrap();
+        std::fs::write(artifact_dir.join(TOKENIZER_FILENAME), b"t").unwrap();
+
+        // Hand-build the historical two-file manifest (before INT8 was expected).
+        let two_file_manifest = VerifiedArtifactManifest {
+            version: MODEL_ARTIFACT_MANIFEST_VERSION,
+            artifact_id: artifact_id.to_string(),
+            files: vec![
+                VerifiedArtifactFile {
+                    filename: MODEL_FILENAME.to_string(),
+                    sha256: MODEL_ONNX_SHA256.to_string(),
+                    source_url: format!(
+                        "{HF_BASE_URL}/{HF_MODEL_REPO}/resolve/main/{MODEL_DOWNLOAD_URL}"
+                    ),
+                },
+                VerifiedArtifactFile {
+                    filename: TOKENIZER_FILENAME.to_string(),
+                    sha256: TOKENIZER_SHA256.to_string(),
+                    source_url: format!(
+                        "{HF_BASE_URL}/{HF_MODEL_REPO}/resolve/main/{TOKENIZER_DOWNLOAD_URL}"
+                    ),
+                },
+            ],
+        };
+        assert!(
+            !two_file_manifest.matches_expected(),
+            "a two-file manifest must no longer match the pinned three-file set"
+        );
+
+        std::fs::write(
+            manifest_path(&model_root, artifact_id),
+            serde_json::to_vec_pretty(&two_file_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            current_manifest_path(&model_root),
+            serde_json::to_vec_pretty(&ActiveArtifactPointer::new(artifact_id.to_string()))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let resolved = resolve_model_state(&model_root).unwrap();
+        assert!(
+            matches!(resolved, ModelResolution::Unverifiable(_)),
+            "a two-file verified manifest must resolve Unverifiable for re-provision, got {}",
+            resolution_label(&resolved)
+        );
+    }
+
     #[tokio::test]
     async fn download_file_to_stage_rejects_partial_http_responses() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2144,13 +2572,14 @@ mod tests {
     #[test]
     fn prepare_for_search_reuses_warm_runtime_when_model_is_unchanged() {
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _variant = Fp32VariantTestGuard::set();
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
 
         let mut runtime = EmbeddingRuntime::default();
-        let first = runtime.prepare_for_search(1);
+        let first = runtime.prepare_for_search(1).unwrap();
         assert!(
             matches!(
                 first,
@@ -2160,7 +2589,7 @@ mod tests {
         );
         assert!(runtime.current_embedder().is_some());
 
-        let second = runtime.prepare_for_search(1);
+        let second = runtime.prepare_for_search(1).unwrap();
         assert_eq!(second, EmbeddingLoadStatus::Warm);
     }
 
@@ -2168,13 +2597,14 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn prepare_for_indexing_reuses_warm_runtime_when_model_is_unchanged() {
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _variant = Fp32VariantTestGuard::set();
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
 
         let mut runtime = EmbeddingRuntime::default();
-        let first = runtime.prepare_for_indexing(1).await;
+        let first = runtime.prepare_for_indexing(1).await.unwrap();
         assert!(
             matches!(
                 first,
@@ -2184,7 +2614,7 @@ mod tests {
         );
         assert!(runtime.current_embedder().is_some());
 
-        let second = runtime.prepare_for_indexing(1).await;
+        let second = runtime.prepare_for_indexing(1).await.unwrap();
         assert_eq!(second, EmbeddingLoadStatus::Warm);
     }
 
@@ -2195,7 +2625,13 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
         let result = embedder.embed_batch(&[]).unwrap();
         assert!(result.is_empty());
     }
@@ -2207,7 +2643,13 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
         let vec = embedder.embed_one("hello world").unwrap();
         assert_eq!(vec.len(), EMBEDDING_DIM);
     }
@@ -2219,7 +2661,13 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
         let vec = embedder.embed_one("the quick brown fox").unwrap();
         let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
@@ -2229,13 +2677,70 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_window_widens_past_128_and_mixed_batch_is_safe() {
+        // T5/REQ-005: the programmatic tokenizer override must widen the
+        // effective window past the shipped 128-token pin (a long input yields
+        // real_token_len > 128, capped at EMBEDDING_MAX_TOKENS). Before the
+        // override this fails — the file-baked truncation caps every encoding
+        // at 128. Padding is raised in lockstep with truncation, so a
+        // mixed-length sub-batch (a >128-token row next to a short row) must
+        // embed without run_inference indexing past the short row's id buffer
+        // (HYP-002).
+        let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        if !is_model_available() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
+
+        // ~400 space-separated words tokenize well past 256 wordpieces, so the
+        // truncation cap (not the input length) determines the token count.
+        let long_input = "alpha beta gamma delta epsilon zeta eta theta ".repeat(50);
+        let long_enc = embedder
+            .tokenizer
+            .encode(long_input.as_str(), true)
+            .unwrap();
+        let long_len = real_token_len(&long_enc);
+        assert!(
+            long_len > 128,
+            "override must widen the window past the shipped 128-token pin, got {long_len}"
+        );
+        assert!(
+            long_len <= EMBEDDING_MAX_TOKENS,
+            "the window must stay capped at EMBEDDING_MAX_TOKENS ({EMBEDDING_MAX_TOKENS}), got {long_len}"
+        );
+
+        // Mixed-length batch: a long (>128-token) input alongside a short one
+        // must embed without panicking and yield one unit vector per input.
+        let results = embedder
+            .embed_batch(&[long_input.as_str(), "short"])
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for vec in &results {
+            assert_eq!(vec.len(), EMBEDDING_DIM);
+        }
+    }
+
+    #[test]
     fn embed_batch_multiple_texts() {
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
         let texts = vec![
             "error handling in rust",
             "machine learning algorithms",
@@ -2260,7 +2765,13 @@ mod tests {
             eprintln!("skipping: model not available");
             return;
         }
-        let mut embedder = Embedder::from_dir_with_threads(&runtime_model_dir(), 1).unwrap();
+        let mut embedder = Embedder::from_dir_with_variant(
+            &runtime_model_dir(),
+            ModelVariant::Fp32,
+            1,
+            EMBEDDING_BATCH_SIZE,
+        )
+        .unwrap();
         let vecs = embedder
             .embed_batch(&[
                 "how to handle errors in rust",

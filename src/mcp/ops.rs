@@ -782,7 +782,7 @@ async fn run_search_once(
         // is held in a process-global cache and `prepare_for_search` returns
         // `Warm` (a no-op) after the first successful load.
         let mut runtime = fallback_embedding_runtime().lock().await;
-        let embedding_status = runtime.prepare_for_search(1);
+        let embedding_status = runtime.prepare_for_search(1)?;
         let embedding_reason = embedding_unavailable_reason(&embedding_status);
         let results = if embedding_status.is_available() {
             let mut engine = HybridSearchEngine::new_scoped(
@@ -1119,7 +1119,7 @@ async fn run_index_pipeline(
     let mut runtime = EmbeddingRuntime::default();
     runtime
         .prepare_for_indexing_with_progress(indexing_config.embed_threads, false)
-        .await;
+        .await?;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
     pipeline::run_with_context_scope_setup_and_progress_root(
