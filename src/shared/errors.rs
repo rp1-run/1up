@@ -247,6 +247,16 @@ pub enum UpdateError {
         "refusing update: release attestation verification failed ({detail}); the downloaded artifact is not attributable to the project's release workflow and was not installed"
     )]
     AttestationFailed { detail: String },
+
+    #[error(
+        "refusing update: no attestation exists for {subject}; the attestation service definitively confirmed none, so it was not installed"
+    )]
+    AttestationMissing { subject: String },
+
+    #[error(
+        "refusing download: host {host} is not on the artifact download allowlist; the update manifest or a redirect target may have been tampered with"
+    )]
+    DownloadHostNotAllowed { host: String },
 }
 
 impl UpdateError {
