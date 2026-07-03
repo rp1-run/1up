@@ -6145,11 +6145,13 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
     // Reopen a FRESH handle on the same on-disk DB: it must validate cleanly,
     // be readable, and expose a STRICTLY-PARTIAL committed prefix (0 < n < FILES)
     // — proof the pass stopped at a committed batch boundary mid-way, not at 0
-    // (pre-cancel) and not at FILES (no cancellation). With the jobs=1 +
-    // write_batch=1 config the prefix is deterministically exactly 1, so we
-    // assert that precise value (a stronger guard than the bare 0 < n < FILES
-    // invariant: it also catches any future regression that lets a single flush
-    // drain more than one batch before a cancel safe-point).
+    // (pre-cancel) and not at FILES (no cancellation). With jobs=1 +
+    // write_batch=1 the depth-1 store double-buffer bounds the prefix to at
+    // most 3: when the first batch's committed write fires the cancel, one
+    // batch may already be executing in the store task and one more may be
+    // queued in the depth-1 channel (both drain at a committed boundary)
+    // before the embed loop observes the cancel safe-point. Asserting 1..=3
+    // still catches any regression that drains unboundedly past a cancel.
     block_on(async {
         let db = Db::open_rw(&db_path).await.unwrap();
         let conn = db.connect_tuned().await.unwrap();
@@ -6164,10 +6166,11 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
             "a mid-pass cancellation must leave a non-zero, incomplete committed prefix; \
              got {prefix} of {FILES}"
         );
-        assert_eq!(
-            prefix, 1,
-            "with jobs=1 + write_batch=1 the cancel must land deterministically after \
-             exactly one committed batch; got {prefix} of {FILES}"
+        assert!(
+            (1..=3).contains(&prefix),
+            "with jobs=1 + write_batch=1 and a depth-1 store double-buffer the cancel \
+             must land within the pipeline window (triggering commit + in-flight + \
+             queued = at most three committed batches); got {prefix} of {FILES}"
         );
 
         // A subsequent uncancelled pass resumes the remainder against the

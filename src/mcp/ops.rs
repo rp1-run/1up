@@ -1211,13 +1211,29 @@ async fn run_index_pipeline(
 /// `daemon::worker::index_file_identity`: two opens of the same path yield
 /// the same identity until an atomic rename swaps a different file over it,
 /// which is exactly how a build-aside rebuild installs a refreshed index.
+#[cfg(unix)]
 type IndexFileIdentity = (u64, u64);
+/// Non-Unix fallback identity: `(len, modified)`. There is no stable
+/// `(dev, ino)` equivalent on Windows, but a build-aside swap installs a
+/// freshly written file, so its length and/or mtime always differ from the
+/// generation it replaces — sufficient to force the drop + reopen.
+#[cfg(not(unix))]
+type IndexFileIdentity = (u64, std::time::SystemTime);
 
 fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(index_path)
-        .ok()
-        .map(|meta| (meta.dev(), meta.ino()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(index_path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(index_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok().map(|mtime| (meta.len(), mtime)))
+    }
 }
 
 /// A warm, schema-validated MCP read-index handle kept alive across calls
