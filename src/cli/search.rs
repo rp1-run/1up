@@ -27,6 +27,10 @@ pub struct SearchArgs {
     /// Project root directory (defaults to current directory)
     #[arg(long, default_value = ".")]
     pub path: String,
+
+    /// Repo-relative directory prefix to constrain results to (e.g. "src/foo")
+    #[arg(long)]
+    pub path_prefix: Option<String>,
 }
 
 const DAEMON_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
@@ -35,7 +39,11 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     let resolved = crate::shared::project::resolve_project_root(std::path::Path::new(&args.path))?;
     let project_root = resolved.state_root;
     let source_root = resolved.source_root;
-    let search_scope = SearchScope::from_worktree_context(&resolved.worktree_context);
+    let mut search_scope = SearchScope::from_worktree_context(&resolved.worktree_context);
+    if let Some(prefix) = args.path_prefix.as_deref() {
+        search_scope = search_scope.with_path_prefix(prefix);
+    }
+    let path_prefix = search_scope.path_prefix().map(str::to_string);
     let db_path = project_db_path(&project_root);
 
     warn_if_degraded_branch_context(&search_scope);
@@ -52,6 +60,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
         search_scope.context_id(),
         &args.query,
         args.limit,
+        path_prefix.as_deref(),
     )
     .await
     {
@@ -88,6 +97,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
                     search_scope.context_id(),
                     &args.query,
                     args.limit,
+                    path_prefix.as_deref(),
                 )
                 .await
                 {
@@ -235,10 +245,18 @@ async fn try_daemon_search(
     context_id: &str,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> Option<(Vec<SearchResult>, Option<String>, Option<String>)> {
     let result = tokio::time::timeout(
         DAEMON_SEARCH_TIMEOUT,
-        search_service::request_search(project_root, source_root, context_id, query, limit),
+        search_service::request_search(
+            project_root,
+            source_root,
+            context_id,
+            query,
+            limit,
+            path_prefix,
+        ),
     )
     .await;
 

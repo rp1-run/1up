@@ -518,8 +518,9 @@ async fn prepare_full_run_inputs(
     conn: &Connection,
     project_root: &Path,
     context_id: &str,
+    config: &IndexingConfig,
 ) -> Result<RunInputs, OneupError> {
-    let scanned = scanner::scan_directory(project_root)?;
+    let scanned = scanner::scan_directory(project_root, config)?;
     let discovered_count = scanned.len();
     let manifest = segments::get_all_indexed_files_for_context(conn, context_id).await?;
 
@@ -584,6 +585,7 @@ async fn prepare_scoped_run_inputs(
     project_root: &Path,
     context_id: &str,
     changed_paths: &std::collections::BTreeSet<PathBuf>,
+    config: &IndexingConfig,
 ) -> Result<ScopePreparation, OneupError> {
     if changed_paths.is_empty() {
         return Ok(ScopePreparation::Ready(RunInputs {
@@ -594,7 +596,7 @@ async fn prepare_scoped_run_inputs(
         }));
     }
 
-    let scoped_scan = scanner::scan_paths(project_root, changed_paths)?;
+    let scoped_scan = scanner::scan_paths(project_root, changed_paths, config)?;
     let discovered_count = scoped_scan.len();
     let mut scoped_scan_results: HashMap<String, scanner::ScannedFile> = scoped_scan
         .into_iter()
@@ -1531,7 +1533,7 @@ async fn run_with_index_context_scope_setup_and_progress_root(
     let resolution = match scope {
         RunScope::Full => {
             let run_inputs =
-                prepare_full_run_inputs(conn, project_root, &context.context_id).await?;
+                prepare_full_run_inputs(conn, project_root, &context.context_id, config).await?;
             let changed_count = run_inputs.scanned_files.len();
             ScopeResolution {
                 inputs: run_inputs,
@@ -1543,8 +1545,14 @@ async fn run_with_index_context_scope_setup_and_progress_root(
         }
         RunScope::Paths(changed_paths) => {
             let requested_count = changed_paths.len();
-            match prepare_scoped_run_inputs(conn, project_root, &context.context_id, changed_paths)
-                .await?
+            match prepare_scoped_run_inputs(
+                conn,
+                project_root,
+                &context.context_id,
+                changed_paths,
+                config,
+            )
+            .await?
             {
                 ScopePreparation::Ready(run_inputs) => {
                     let changed_count = run_inputs.scanned_files.len();
@@ -1563,7 +1571,8 @@ async fn run_with_index_context_scope_setup_and_progress_root(
                         reason
                     );
                     let run_inputs =
-                        prepare_full_run_inputs(conn, project_root, &context.context_id).await?;
+                        prepare_full_run_inputs(conn, project_root, &context.context_id, config)
+                            .await?;
                     let changed_count = run_inputs.scanned_files.len();
                     ScopeResolution {
                         inputs: run_inputs,

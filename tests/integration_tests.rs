@@ -6084,7 +6084,8 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
     // safe-point is reached. (Real-world cancel granularity is fine regardless —
     // validated separately by HYP-003: files parse over time and flush
     // incrementally, giving 17-53ms interruption. This knob is test-only.)
-    let config = IndexingConfig::new(1, 1, 1).unwrap();
+    let config =
+        IndexingConfig::with_glob_config(1, 1, 1, Vec::new(), Vec::new(), Vec::new()).unwrap();
 
     block_on(async {
         let db = Db::open_rw(&db_path).await.unwrap();

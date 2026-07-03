@@ -172,18 +172,34 @@ impl<'a> SymbolSearchEngine<'a> {
         reference_kind: ReferenceKind,
         canonical_symbol: &str,
     ) -> Result<Vec<SymbolMatch>, OneupError> {
-        let mut rows = self
-            .conn
-            .query(
-                queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT,
-                libsql::params![
-                    self.scope.context_id(),
-                    reference_kind_label(reference_kind),
-                    canonical_symbol
-                ],
-            )
-            .await
-            .map_err(|e| SearchError::QueryFailed(format!("symbol lookup failed: {e}")))?;
+        let mut rows = match self.scope.path_prefix_like_pattern() {
+            Some(pattern) => {
+                self.conn
+                    .query(
+                        queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT_SCOPED,
+                        libsql::params![
+                            self.scope.context_id(),
+                            reference_kind_label(reference_kind),
+                            canonical_symbol,
+                            pattern
+                        ],
+                    )
+                    .await
+            }
+            None => {
+                self.conn
+                    .query(
+                        queries::SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT,
+                        libsql::params![
+                            self.scope.context_id(),
+                            reference_kind_label(reference_kind),
+                            canonical_symbol
+                        ],
+                    )
+                    .await
+            }
+        }
+        .map_err(|e| SearchError::QueryFailed(format!("symbol lookup failed: {e}")))?;
 
         let mut results = Vec::new();
         while let Some(row) = rows
@@ -215,11 +231,18 @@ impl<'a> SymbolSearchEngine<'a> {
             return Ok(Vec::new());
         }
 
-        let sql = queries::select_symbol_matches_by_canonicals_for_context_sql(canonicals.len());
-        let mut params: Vec<libsql::Value> = Vec::with_capacity(canonicals.len() + 2);
+        let path_pattern = self.scope.path_prefix_like_pattern();
+        let sql = queries::select_symbol_matches_by_canonicals_for_context_sql(
+            canonicals.len(),
+            path_pattern.is_some(),
+        );
+        let mut params: Vec<libsql::Value> = Vec::with_capacity(canonicals.len() + 3);
         params.push(self.scope.context_id().to_string().into());
         params.push(reference_kind_label(reference_kind).to_string().into());
         params.extend(canonicals.iter().map(|canonical| canonical.clone().into()));
+        if let Some(pattern) = path_pattern {
+            params.push(pattern.into());
+        }
 
         let mut rows =
             self.conn.query(&sql, params).await.map_err(|e| {
@@ -677,6 +700,79 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].segment_id, "s-main");
+    }
+
+    // TDD (REQ-001 AC3 / T5): the exact-canonical symbol lookup must apply the
+    // same directory-boundary `path_prefix` filter as FTS/vector, so `src/foo`
+    // matches itself and its descendants but not a sibling that merely shares
+    // the prefix as a string (`src/foobar`).
+    #[tokio::test]
+    async fn symbol_lookup_respects_path_prefix_boundary() {
+        let (_db, conn) = setup().await;
+
+        let in_scope = make_segment(
+            "s-in-scope",
+            "src/foo/a.rs",
+            "function",
+            r#"["Widget"]"#,
+            "[]",
+        );
+        let sibling = make_segment(
+            "s-sibling",
+            "src/foobar/a.rs",
+            "function",
+            r#"["Widget"]"#,
+            "[]",
+        );
+        segments::upsert_segment(&conn, &in_scope).await.unwrap();
+        segments::upsert_segment(&conn, &sibling).await.unwrap();
+
+        let engine = SymbolSearchEngine::new_scoped(
+            &conn,
+            SearchScope::default_context().with_path_prefix("src/foo"),
+        );
+        let results = engine.find_definitions("Widget", false).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "src/foo/a.rs");
+    }
+
+    // TDD (REQ-001 AC3 / T5): the batched fuzzy-fallback symbol lookup
+    // (`load_matches_for_canonicals`) must apply the same `path_prefix` filter
+    // as the exact-canonical path, so a scoped fuzzy search does not leak
+    // sibling-directory matches.
+    #[tokio::test]
+    async fn fuzzy_symbol_lookup_respects_path_prefix_boundary() {
+        let (_db, conn) = setup().await;
+
+        let in_scope = make_segment(
+            "s-in-scope",
+            "src/foo/a.rs",
+            "function",
+            r#"["widget_handler"]"#,
+            "[]",
+        );
+        let sibling = make_segment(
+            "s-sibling",
+            "src/foobar/a.rs",
+            "function",
+            r#"["widget_handler"]"#,
+            "[]",
+        );
+        segments::upsert_segment(&conn, &in_scope).await.unwrap();
+        segments::upsert_segment(&conn, &sibling).await.unwrap();
+
+        let engine = SymbolSearchEngine::new_scoped(
+            &conn,
+            SearchScope::default_context().with_path_prefix("src/foo"),
+        );
+        let results = engine
+            .find_definitions("widget_handle", true)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "src/foo/a.rs");
     }
 
     #[tokio::test]

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 
+use crate::indexer::scan_filter::ScanFilter;
 use crate::shared::errors::{IndexingError, OneupError};
+use crate::shared::types::IndexingConfig;
 
 const BINARY_EXTENSIONS: &[&str] = &[
     // Images
@@ -89,7 +91,20 @@ pub fn is_scannable_file(path: &Path) -> bool {
     indexable_extension(path).is_some()
 }
 
-fn build_walker(root: &Path, path: &Path) -> Result<WalkBuilder, OneupError> {
+/// Builds the walker plus the shared `ScanFilter` that governs dotfile
+/// visibility, secret-file exclusion, and per-project globs.
+///
+/// `DEFAULT_IGNORE_DIRS` stays a negations-only `OverrideBuilder` (no
+/// positive whitelist glob), avoiding the `ignore::OverrideBuilder` whitelist
+/// pitfall (HYP-001). Dotfile pruning is disabled at the walker level
+/// (`.hidden(false)`) because `ScanFilter` — applied by callers via
+/// `filter_entry` — owns the full dotfile decision so a configured
+/// dotfile-directory override can re-admit specific hidden directories.
+fn build_walker(
+    root: &Path,
+    path: &Path,
+    config: &IndexingConfig,
+) -> Result<(WalkBuilder, ScanFilter), OneupError> {
     let mut overrides = OverrideBuilder::new(root);
     for pattern in DEFAULT_IGNORE_DIRS {
         overrides.add(pattern).map_err(|e| {
@@ -102,12 +117,19 @@ fn build_walker(root: &Path, path: &Path) -> Result<WalkBuilder, OneupError> {
 
     let mut builder = WalkBuilder::new(path);
     builder
-        .hidden(true)
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .overrides(overrides);
-    Ok(builder)
+
+    let scan_filter = ScanFilter::new(
+        &config.include_globs,
+        &config.exclude_globs,
+        &config.index_hidden_dirs,
+    )?;
+
+    Ok((builder, scan_filter))
 }
 
 fn file_modified_ns(metadata: &std::fs::Metadata) -> i64 {
@@ -151,17 +173,37 @@ fn collect_scanned_files(walker: ignore::Walk) -> Result<Vec<ScannedFile>, Oneup
     Ok(files)
 }
 
-/// Scan a directory for source files, respecting .gitignore and default ignores.
+/// Scan a directory for source files, respecting .gitignore, default
+/// ignores, and the resolved `ScanFilter` (secret patterns, per-project
+/// globs, and dotfile-directory overrides).
 ///
 /// Returns a list of files with their extensions, skipping binary files,
-/// hidden directories, and common build artifact directories.
-pub fn scan_directory(root: &Path) -> Result<Vec<ScannedFile>, OneupError> {
-    collect_scanned_files(build_walker(root, root)?.build())
+/// hidden directories (unless overridden), and common build artifact
+/// directories.
+pub fn scan_directory(
+    root: &Path,
+    config: &IndexingConfig,
+) -> Result<Vec<ScannedFile>, OneupError> {
+    let (mut walker, scan_filter) = build_walker(root, root, config)?;
+    let root = root.to_path_buf();
+    walker.filter_entry(move |entry| {
+        let Ok(relative_path) = entry.path().strip_prefix(&root) else {
+            return false;
+        };
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        !scan_filter.is_excluded(relative_path, is_dir)
+    });
+    collect_scanned_files(walker.build())
 }
 
+/// Scan a specific set of repo-relative paths, composing the target-path
+/// filter with the shared `ScanFilter` by logical AND (both predicates are
+/// directory-descent-aware, so composing them cannot re-admit a path either
+/// one excludes).
 pub fn scan_paths(
     root: &Path,
     relative_paths: &BTreeSet<PathBuf>,
+    config: &IndexingConfig,
 ) -> Result<Vec<ScannedFile>, OneupError> {
     if relative_paths.is_empty() {
         return Ok(Vec::new());
@@ -169,13 +211,18 @@ pub fn scan_paths(
 
     let root = root.to_path_buf();
     let target_paths = relative_paths.clone();
-    let mut walker = build_walker(&root, &root)?;
+    let (mut walker, scan_filter) = build_walker(&root, &root, config)?;
     walker.filter_entry(move |entry| {
         let Ok(relative_path) = entry.path().strip_prefix(&root) else {
             return false;
         };
 
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        if scan_filter.is_excluded(relative_path, is_dir) {
+            return false;
+        }
+
+        if is_dir {
             target_paths
                 .iter()
                 .any(|target_path| target_path.starts_with(relative_path))
@@ -192,6 +239,22 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn default_config() -> IndexingConfig {
+        IndexingConfig::auto()
+    }
+
+    fn config_with(include: &[&str], exclude: &[&str], overrides: &[&str]) -> IndexingConfig {
+        IndexingConfig::with_glob_config(
+            1,
+            1,
+            1,
+            include.iter().map(|s| s.to_string()).collect(),
+            exclude.iter().map(|s| s.to_string()).collect(),
+            overrides.iter().map(|s| s.to_string()).collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn scan_finds_source_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -199,7 +262,7 @@ mod tests {
         fs::write(tmp.path().join("lib.py"), "def foo(): pass").unwrap();
         fs::write(tmp.path().join("readme.md"), "# Readme").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert_eq!(files.len(), 3);
 
         let extensions: Vec<&str> = files.iter().map(|f| f.extension.as_str()).collect();
@@ -215,7 +278,7 @@ mod tests {
         fs::write(tmp.path().join("image.png"), [0u8; 100]).unwrap();
         fs::write(tmp.path().join("archive.zip"), [0u8; 50]).unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].extension, "rs");
     }
@@ -228,7 +291,7 @@ mod tests {
         fs::create_dir_all(&nm).unwrap();
         fs::write(nm.join("index.js"), "// dep").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, tmp.path().join("index.js"));
     }
@@ -240,7 +303,7 @@ mod tests {
         fs::write(tmp.path().join("main.go"), "package main").unwrap();
         fs::write(tmp.path().join("notes"), "plain text").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert_eq!(files.len(), 2);
 
         let extensions: Vec<&str> = files.iter().map(|f| f.extension.as_str()).collect();
@@ -258,7 +321,7 @@ mod tests {
         fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
         fs::write(tmp.path().join("ignored.rs"), "fn ignored() {}").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         let names: Vec<&str> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
@@ -277,7 +340,7 @@ mod tests {
 
         let paths = BTreeSet::from([PathBuf::from("main.rs"), PathBuf::from("ignored.rs")]);
 
-        let files = scan_paths(tmp.path(), &paths).unwrap();
+        let files = scan_paths(tmp.path(), &paths, &default_config()).unwrap();
         let names: Vec<&str> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
@@ -294,7 +357,7 @@ mod tests {
 
         let paths = BTreeSet::from([PathBuf::from("main.rs"), PathBuf::from(".hidden.rs")]);
 
-        let files = scan_paths(tmp.path(), &paths).unwrap();
+        let files = scan_paths(tmp.path(), &paths, &default_config()).unwrap();
         let names: Vec<&str> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
@@ -317,7 +380,7 @@ mod tests {
 
         let paths = BTreeSet::from([PathBuf::from("main.rs"), PathBuf::from("ignored.rs")]);
 
-        let files = scan_paths(tmp.path(), &paths).unwrap();
+        let files = scan_paths(tmp.path(), &paths, &default_config()).unwrap();
         let names: Vec<&str> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap())
@@ -329,7 +392,7 @@ mod tests {
     #[test]
     fn scan_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -341,7 +404,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("build.rs"), "// build script").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].extension, "rs");
     }
@@ -352,9 +415,115 @@ mod tests {
         fs::write(tmp.path().join("Dockerfile"), "FROM rust:1.0").unwrap();
         fs::write(tmp.path().join("justfile"), "fmt:\n  cargo fmt").unwrap();
 
-        let files = scan_directory(tmp.path()).unwrap();
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
         let extensions: Vec<&str> = files.iter().map(|f| f.extension.as_str()).collect();
         assert!(extensions.contains(&"dockerfile"));
         assert!(extensions.contains(&"justfile"));
+    }
+
+    #[test]
+    fn scan_directory_excludes_secret_files_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join("id_rsa.pem"), "-----BEGIN-----").unwrap();
+        fs::write(tmp.path().join("service.key"), "secret").unwrap();
+        fs::write(tmp.path().join("credentials.json"), "{}").unwrap();
+        fs::write(tmp.path().join(".env"), "SECRET=1").unwrap();
+
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"main.rs"));
+        assert!(!names.contains(&"id_rsa.pem"));
+        assert!(!names.contains(&"service.key"));
+        assert!(!names.contains(&"credentials.json"));
+        assert!(!names.contains(&".env"));
+    }
+
+    #[test]
+    fn scan_directory_include_only_glob_does_not_drop_non_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join("readme.md"), "# Readme").unwrap();
+
+        let config = config_with(&["*.rs"], &[], &[]);
+        let files = scan_directory(tmp.path(), &config).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"main.rs"));
+        assert!(names.contains(&"readme.md"));
+    }
+
+    #[test]
+    fn scan_directory_exclude_glob_excludes_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join("debug.log"), "trace").unwrap();
+
+        let config = config_with(&[], &["*.log"], &[]);
+        let files = scan_directory(tmp.path(), &config).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"main.rs"));
+        assert!(!names.contains(&"debug.log"));
+    }
+
+    #[test]
+    fn scan_directory_dotfile_dir_excluded_without_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = tmp.path().join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("ci.yml"), "name: ci").unwrap();
+
+        let files = scan_directory(tmp.path(), &default_config()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn scan_directory_dotfile_override_indexes_configured_dir_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = tmp.path().join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("ci.yml"), "name: ci").unwrap();
+        fs::write(tmp.path().join(".github").join("foo.txt"), "not overridden").unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let config = config_with(&[], &[], &[".github/workflows"]);
+        let files = scan_directory(tmp.path(), &config).unwrap();
+        let names: Vec<PathBuf> = files
+            .iter()
+            .map(|f| f.path.strip_prefix(tmp.path()).unwrap().to_path_buf())
+            .collect();
+
+        assert!(names.contains(&PathBuf::from("main.rs")));
+        assert!(names.iter().any(|p| p.ends_with("ci.yml")));
+        assert!(!names.iter().any(|p| p.ends_with("foo.txt")));
+    }
+
+    #[test]
+    fn scan_paths_excludes_secret_pattern_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
+        fs::write(tmp.path().join("credentials.json"), "{}").unwrap();
+
+        let paths = BTreeSet::from([PathBuf::from("main.rs"), PathBuf::from("credentials.json")]);
+
+        let files = scan_paths(tmp.path(), &paths, &default_config()).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"main.rs"));
+        assert!(!names.contains(&"credentials.json"));
     }
 }

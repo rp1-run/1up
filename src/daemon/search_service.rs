@@ -33,6 +33,8 @@ pub(crate) struct SearchRequest {
     pub context_id: String,
     pub query: String,
     pub limit: usize,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +100,7 @@ pub(crate) async fn request_search(
     context_id: &str,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> Result<Option<(Vec<SearchResult>, Option<String>, Option<String>)>, OneupError> {
     request_search_at(
         &config::daemon_socket_path()?,
@@ -106,6 +109,7 @@ pub(crate) async fn request_search(
         context_id,
         query,
         limit,
+        path_prefix,
     )
     .await
 }
@@ -185,6 +189,7 @@ async fn request_search_at(
     context_id: &str,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> Result<Option<(Vec<SearchResult>, Option<String>, Option<String>)>, OneupError> {
     let mut stream = UnixStream::connect(socket_path).await.map_err(|err| {
         DaemonError::RequestError(format!(
@@ -199,6 +204,7 @@ async fn request_search_at(
         context_id: context_id.to_string(),
         query: query.to_string(),
         limit,
+        path_prefix: path_prefix.map(str::to_string),
     };
     ipc::write_json_frame(
         &mut stream,
@@ -251,12 +257,22 @@ fn sanitize_request(request: SearchRequest) -> Result<SearchRequest, OneupError>
         .into());
     }
 
+    // Empty-after-trim collapses to `None` (unscoped), matching
+    // `SearchScope::with_path_prefix`'s own empty-clears-scoping semantics so
+    // sanitization and scope construction never disagree about what "no
+    // prefix" means.
+    let path_prefix = request
+        .path_prefix
+        .map(|prefix| prefix.trim().to_string())
+        .filter(|prefix| !prefix.is_empty());
+
     Ok(SearchRequest {
         project_root,
         source_root,
         context_id: context_id.to_string(),
         query: request.query,
         limit: request.limit.clamp(1, MAX_SEARCH_RESULTS),
+        path_prefix,
     })
 }
 
@@ -328,6 +344,7 @@ mod tests {
                     context_id: "ctx-main".to_string(),
                     query: "needle".to_string(),
                     limit: 7,
+                    path_prefix: None,
                 }
             );
             send_response(
@@ -360,6 +377,7 @@ mod tests {
             "ctx-main",
             "needle",
             7,
+            None,
         )
         .await
         .unwrap()
@@ -397,12 +415,56 @@ mod tests {
             "ctx-main",
             "needle",
             7,
+            None,
         )
         .await
         .unwrap();
 
         server.await.unwrap();
         assert!(results.is_none());
+    }
+
+    /// REQ-001: the daemon `SearchRequest` frame must carry `path_prefix` end
+    /// to end over the IPC socket — the daemon path silently dropping it would
+    /// return unfiltered full-repo results despite the CLI/MCP request asking
+    /// for a scoped search.
+    #[tokio::test]
+    async fn request_search_at_carries_path_prefix_over_ipc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = test_socket_path(&tmp);
+        let listener = bind_test_listener(&socket_path).await.unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut stream = accept_connection(&listener).await.unwrap().unwrap();
+            let request = read_request(&mut stream).await.unwrap();
+            assert_eq!(request.path_prefix.as_deref(), Some("src/foo"));
+            send_response(
+                &mut stream,
+                &SearchResponse::Results {
+                    results: vec![],
+                    daemon_version: None,
+                    degraded_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        request_search_at(
+            &socket_path,
+            &project_root,
+            &project_root,
+            "ctx-main",
+            "needle",
+            7,
+            Some("src/foo"),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
     }
 
     #[test]
@@ -417,6 +479,7 @@ mod tests {
             context_id: "ctx-main".to_string(),
             query: "needle".to_string(),
             limit: MAX_SEARCH_RESULTS + 10,
+            path_prefix: None,
         })
         .unwrap();
 
@@ -424,6 +487,50 @@ mod tests {
         assert_eq!(request.source_root, project_root.canonicalize().unwrap());
         assert_eq!(request.context_id, "ctx-main");
         assert_eq!(request.limit, MAX_SEARCH_RESULTS);
+        assert_eq!(request.path_prefix, None);
+    }
+
+    /// REQ-001: an empty-after-trim `path_prefix` sanitizes to `None`, matching
+    /// `SearchScope::with_path_prefix`'s own empty-clears-scoping semantics so
+    /// the two layers never disagree about what "no prefix" means.
+    #[test]
+    fn sanitize_request_collapses_blank_path_prefix_to_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let request = sanitize_request(SearchRequest {
+            project_root: project_root.clone(),
+            source_root: project_root.clone(),
+            context_id: "ctx-main".to_string(),
+            query: "needle".to_string(),
+            limit: 5,
+            path_prefix: Some("   ".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(request.path_prefix, None);
+    }
+
+    /// REQ-001: a non-blank `path_prefix` survives sanitization (trimmed but
+    /// otherwise preserved) so the daemon worker receives it unmangled.
+    #[test]
+    fn sanitize_request_trims_path_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let request = sanitize_request(SearchRequest {
+            project_root: project_root.clone(),
+            source_root: project_root.clone(),
+            context_id: "ctx-main".to_string(),
+            query: "needle".to_string(),
+            limit: 5,
+            path_prefix: Some("  src/foo  ".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(request.path_prefix.as_deref(), Some("src/foo"));
     }
 
     #[test]

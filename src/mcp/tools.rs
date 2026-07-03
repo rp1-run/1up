@@ -116,6 +116,7 @@ impl OneupMcpServer {
             &roots.worktree_context,
             &input.query,
             limit,
+            input.path_prefix.as_deref(),
         )
         .await
         {
@@ -199,6 +200,10 @@ impl OneupMcpServer {
             Ok(roots) => roots,
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
+        let scan_filter = match ops::resolve_context_scan_filter(&roots.worktree_context) {
+            Ok(scan_filter) => scan_filter,
+            Err(err) => return error_result("error", err.to_string(), vec![]),
+        };
 
         let locations = input
             .locations
@@ -210,7 +215,7 @@ impl OneupMcpServer {
             })
             .collect::<Vec<_>>();
 
-        match ops::read_context_locations(&roots.source_root, &locations) {
+        match ops::read_context_locations(&roots.source_root, &scan_filter, &locations) {
             Ok(payload) => {
                 let summary = read_summary(&payload);
                 let next_actions = read_next_actions(&payload);

@@ -290,7 +290,8 @@ async fn run_inner() -> Result<(), OneupError> {
                     cancel_token.cancel();
                     break;
                 }
-                let filtered = watcher::filter_changed_paths(file_watcher.drain_events());
+                let filtered =
+                    watcher::filter_changed_paths(&file_watcher, file_watcher.drain_events());
                 record_file_check_for_all_projects(&mut projects, Utc::now(), false);
                 mark_branch_context_changes(&mut file_watcher, &mut projects);
                 if filtered.is_empty() {
@@ -1292,7 +1293,7 @@ async fn run_dirty_projects_until_clean(
 
         let result = run_project(&key, projects, cancel_token).await;
 
-        let filtered = watcher::filter_changed_paths(watcher.drain_events_nowait());
+        let filtered = watcher::filter_changed_paths(watcher, watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
         if !filtered.is_empty() {
             debug!(
@@ -1637,7 +1638,10 @@ async fn handle_search_request(
         return search_service::unavailable_response();
     }
 
-    let search_scope = SearchScope::from_worktree_context(&state.context);
+    let mut search_scope = SearchScope::from_worktree_context(&state.context);
+    if let Some(prefix) = request.path_prefix.as_deref() {
+        search_scope = search_scope.with_path_prefix(prefix);
+    }
     // Stale-but-available: the daemon detects a rebuild/refresh from its own
     // in-memory refresh state (not the MCP out-of-process detector, so the
     // daemon keeps no dependency on the MCP layer). When a pass is in flight
@@ -2323,6 +2327,7 @@ mod tests {
                 context_id: "missing-context".to_string(),
                 query: "needle".to_string(),
                 limit: 3,
+                path_prefix: None,
             },
         )
         .await;

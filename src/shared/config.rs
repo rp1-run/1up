@@ -132,11 +132,30 @@ pub fn resolve_indexing_config(
     cli_embed_threads: Option<usize>,
     persisted: Option<&IndexingConfig>,
 ) -> Result<IndexingConfig, OneupError> {
+    resolve_indexing_config_with_globs(cli_jobs, cli_embed_threads, None, None, None, persisted)
+}
+
+/// Like [`resolve_indexing_config`], additionally resolving the per-project
+/// include/exclude glob and dotfile-override fields. CLI-supplied values take
+/// precedence over the persisted registry entry, which in turn wins over the
+/// empty default (no env-var layer: these are list-shaped project config, not
+/// scalar tuning knobs). Callers with no CLI-level glob surface (e.g. `1up
+/// start`, MCP, the daemon worker) pass `None` and still inherit whatever was
+/// persisted, so `ScanFilter` construction downstream stays consistent
+/// regardless of entry point.
+pub fn resolve_indexing_config_with_globs(
+    cli_jobs: Option<usize>,
+    cli_embed_threads: Option<usize>,
+    cli_include_globs: Option<Vec<String>>,
+    cli_exclude_globs: Option<Vec<String>>,
+    cli_index_hidden_dirs: Option<Vec<String>>,
+    persisted: Option<&IndexingConfig>,
+) -> Result<IndexingConfig, OneupError> {
     let env_jobs = read_positive_env(INDEX_JOBS_ENV_VAR)?;
     let env_embed_threads = read_positive_env(EMBED_THREADS_ENV_VAR)?;
     let env_write_batch_files = read_positive_env(INDEX_WRITE_BATCH_FILES_ENV_VAR)?;
 
-    IndexingConfig::from_sources(
+    IndexingConfig::from_sources_with_globs(
         cli_jobs
             .or(env_jobs)
             .or(persisted.map(|config| config.jobs)),
@@ -144,6 +163,9 @@ pub fn resolve_indexing_config(
             .or(env_embed_threads)
             .or(persisted.map(|config| config.embed_threads)),
         env_write_batch_files.or(persisted.map(|config| config.write_batch_files)),
+        cli_include_globs.or_else(|| persisted.map(|config| config.include_globs.clone())),
+        cli_exclude_globs.or_else(|| persisted.map(|config| config.exclude_globs.clone())),
+        cli_index_hidden_dirs.or_else(|| persisted.map(|config| config.index_hidden_dirs.clone())),
     )
     .map_err(|err| ConfigError::ReadFailed(err).into())
 }
@@ -282,6 +304,81 @@ mod tests {
         let resolved = resolve_indexing_config(None, None, Some(&persisted)).unwrap();
 
         assert_eq!(resolved.write_batch_files, 1);
+    }
+
+    #[test]
+    fn resolve_indexing_config_with_globs_prefers_cli_over_registry() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new(&[
+            INDEX_JOBS_ENV_VAR,
+            EMBED_THREADS_ENV_VAR,
+            INDEX_WRITE_BATCH_FILES_ENV_VAR,
+        ]);
+        clear_indexing_env();
+
+        let persisted = IndexingConfig::with_glob_config(
+            3,
+            2,
+            1,
+            vec!["persisted-include/**".to_string()],
+            vec!["persisted-exclude/**".to_string()],
+            vec![".persisted-dir".to_string()],
+        )
+        .unwrap();
+
+        let resolved = resolve_indexing_config_with_globs(
+            None,
+            None,
+            Some(vec!["cli-include/**".to_string()]),
+            Some(vec!["cli-exclude/**".to_string()]),
+            Some(vec![".github/workflows".to_string()]),
+            Some(&persisted),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.include_globs, vec!["cli-include/**".to_string()]);
+        assert_eq!(resolved.exclude_globs, vec!["cli-exclude/**".to_string()]);
+        assert_eq!(
+            resolved.index_hidden_dirs,
+            vec![".github/workflows".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_indexing_config_with_globs_falls_back_to_registry_then_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new(&[
+            INDEX_JOBS_ENV_VAR,
+            EMBED_THREADS_ENV_VAR,
+            INDEX_WRITE_BATCH_FILES_ENV_VAR,
+        ]);
+        clear_indexing_env();
+
+        let persisted = IndexingConfig::with_glob_config(
+            3,
+            2,
+            1,
+            vec!["persisted-include/**".to_string()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_indexing_config_with_globs(None, None, None, None, None, Some(&persisted))
+                .unwrap();
+        assert_eq!(
+            resolved.include_globs,
+            vec!["persisted-include/**".to_string()]
+        );
+        assert!(resolved.exclude_globs.is_empty());
+        assert!(resolved.index_hidden_dirs.is_empty());
+
+        let no_registry =
+            resolve_indexing_config_with_globs(None, None, None, None, None, None).unwrap();
+        assert!(no_registry.include_globs.is_empty());
+        assert!(no_registry.exclude_globs.is_empty());
+        assert!(no_registry.index_hidden_dirs.is_empty());
     }
 
     #[test]

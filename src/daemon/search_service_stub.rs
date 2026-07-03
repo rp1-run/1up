@@ -9,6 +9,7 @@ pub(crate) async fn request_search(
     _context_id: &str,
     _query: &str,
     _limit: usize,
+    _path_prefix: Option<&str>,
 ) -> Result<Option<(Vec<SearchResult>, Option<String>, Option<String>)>, OneupError> {
     Ok(None)
 }
@@ -19,7 +20,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_search_returns_local_fallback_signal() {
-        let results = request_search(Path::new("."), Path::new("."), "ctx", "needle", 5)
+        let results = request_search(Path::new("."), Path::new("."), "ctx", "needle", 5, None)
             .await
             .unwrap();
         assert!(results.is_none());

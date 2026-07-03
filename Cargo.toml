@@ -54,6 +54,8 @@ notify = "7"
 
 # File scanning (.gitignore-aware)
 ignore = "0.4"
+# Glob matching for ScanFilter (already transitively pulled in by `ignore`)
+globset = "0.4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -307,13 +307,52 @@ pub struct IndexingConfig {
     pub jobs: usize,
     pub embed_threads: usize,
     pub write_batch_files: usize,
+    /// Per-project include globs; a non-empty set re-admits matching files
+    /// without treating the absence of a match as exclusion (avoids the
+    /// `ignore::OverrideBuilder` whitelist pitfall). Additive, defaults empty.
+    #[serde(default)]
+    pub include_globs: Vec<String>,
+    /// Per-project exclude globs, additive on top of the default secret-file
+    /// exclusions applied by `ScanFilter`. Defaults empty.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Dotfile-directory paths explicitly re-admitted despite the
+    /// default-hidden dotfile policy (e.g. `.github/workflows`). Defaults empty.
+    #[serde(default)]
+    pub index_hidden_dirs: Vec<String>,
 }
 
 impl IndexingConfig {
+    /// Test-only convenience constructor for the pre-glob 3-arg shape; no
+    /// production caller remains after `with_glob_config`/`from_sources_with_globs`
+    /// took over the CLI/registry/daemon resolution paths.
+    #[cfg(test)]
     pub fn new(
         jobs: usize,
         embed_threads: usize,
         write_batch_files: usize,
+    ) -> Result<Self, String> {
+        Self::with_glob_config(
+            jobs,
+            embed_threads,
+            write_batch_files,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Like [`Self::new`], additionally setting the glob/dotfile-override
+    /// fields directly (used by config resolution and registry deserialization,
+    /// which already have concrete `Vec<String>` values to set rather than
+    /// per-source `Option`s).
+    pub fn with_glob_config(
+        jobs: usize,
+        embed_threads: usize,
+        write_batch_files: usize,
+        include_globs: Vec<String>,
+        exclude_globs: Vec<String>,
+        index_hidden_dirs: Vec<String>,
     ) -> Result<Self, String> {
         if jobs == 0 {
             return Err("jobs must be at least 1".to_string());
@@ -329,6 +368,9 @@ impl IndexingConfig {
             jobs,
             embed_threads,
             write_batch_files,
+            include_globs,
+            exclude_globs,
+            index_hidden_dirs,
         })
     }
 
@@ -342,12 +384,34 @@ impl IndexingConfig {
         embed_threads: Option<usize>,
         write_batch_files: Option<usize>,
     ) -> Result<Self, String> {
+        Self::from_sources_with_globs(jobs, embed_threads, write_batch_files, None, None, None)
+    }
+
+    /// Like [`Self::from_sources`], additionally resolving the glob/dotfile-
+    /// override fields from an optional source (e.g. CLI flags or a persisted
+    /// registry entry), defaulting to empty when `None` so repos with no globs
+    /// configured see no behavior change.
+    pub fn from_sources_with_globs(
+        jobs: Option<usize>,
+        embed_threads: Option<usize>,
+        write_batch_files: Option<usize>,
+        include_globs: Option<Vec<String>>,
+        exclude_globs: Option<Vec<String>>,
+        index_hidden_dirs: Option<Vec<String>>,
+    ) -> Result<Self, String> {
         let jobs = jobs.unwrap_or_else(Self::default_jobs);
         let embed_threads = embed_threads.unwrap_or_else(|| Self::default_embed_threads_for(jobs));
         let write_batch_files =
             write_batch_files.unwrap_or_else(|| Self::default_write_batch_files_for(jobs));
 
-        Self::new(jobs, embed_threads, write_batch_files)
+        Self::with_glob_config(
+            jobs,
+            embed_threads,
+            write_batch_files,
+            include_globs.unwrap_or_default(),
+            exclude_globs.unwrap_or_default(),
+            index_hidden_dirs.unwrap_or_default(),
+        )
     }
 
     pub fn reporting_parallelism(
@@ -436,11 +500,24 @@ impl<'de> Deserialize<'de> for IndexingConfig {
             jobs: Option<usize>,
             embed_threads: Option<usize>,
             write_batch_files: Option<usize>,
+            #[serde(default)]
+            include_globs: Vec<String>,
+            #[serde(default)]
+            exclude_globs: Vec<String>,
+            #[serde(default)]
+            index_hidden_dirs: Vec<String>,
         }
 
         let raw = RawIndexingConfig::deserialize(deserializer)?;
-        IndexingConfig::from_sources(raw.jobs, raw.embed_threads, raw.write_batch_files)
-            .map_err(de::Error::custom)
+        IndexingConfig::from_sources_with_globs(
+            raw.jobs,
+            raw.embed_threads,
+            raw.write_batch_files,
+            Some(raw.include_globs),
+            Some(raw.exclude_globs),
+            Some(raw.index_hidden_dirs),
+        )
+        .map_err(de::Error::custom)
     }
 }
 
@@ -810,6 +887,41 @@ mod tests {
         assert_eq!(config.effective_write_batch_files(1), 1);
         assert_eq!(config.effective_write_batch_files(3), 3);
         assert_eq!(config.effective_write_batch_files(12), 8);
+    }
+
+    #[test]
+    fn indexing_config_deserializes_pre_change_json_with_empty_glob_defaults() {
+        let legacy_json = r#"{"jobs": 4, "embed_threads": 2, "write_batch_files": 1}"#;
+
+        let config: IndexingConfig = serde_json::from_str(legacy_json).unwrap();
+
+        assert_eq!(config.jobs, 4);
+        assert_eq!(config.embed_threads, 2);
+        assert_eq!(config.write_batch_files, 1);
+        assert!(config.include_globs.is_empty());
+        assert!(config.exclude_globs.is_empty());
+        assert!(config.index_hidden_dirs.is_empty());
+    }
+
+    #[test]
+    fn indexing_config_deserializes_globs_when_present() {
+        let json = r#"{
+            "jobs": 4,
+            "embed_threads": 2,
+            "write_batch_files": 1,
+            "include_globs": ["src/**"],
+            "exclude_globs": ["vendor/**"],
+            "index_hidden_dirs": [".github/workflows"]
+        }"#;
+
+        let config: IndexingConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.include_globs, vec!["src/**".to_string()]);
+        assert_eq!(config.exclude_globs, vec!["vendor/**".to_string()]);
+        assert_eq!(
+            config.index_hidden_dirs,
+            vec![".github/workflows".to_string()]
+        );
     }
 
     #[test]
