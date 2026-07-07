@@ -276,12 +276,23 @@ pub fn ensure_project_id_for_auto_init(project_root: &Path) -> Result<(String, b
 fn find_existing_project_root(canonical: &Path) -> Option<PathBuf> {
     let mut current = Some(canonical);
     while let Some(dir) = current {
-        if dir.join(".1up").is_dir() {
+        let dot_1up = dir.join(".1up");
+        if dot_1up.is_dir() && is_valid_project_marker(&dot_1up) {
             return Some(dir.to_path_buf());
         }
         current = dir.parent();
     }
     None
+}
+
+fn is_valid_project_marker(dot_1up: &Path) -> bool {
+    // A valid project marker is a .1up directory containing at least one of:
+    // - index.db (existing or built index)
+    // - project_id (initialized project)
+    // - rebuild.lock (active rebuild)
+    dot_1up.join("index.db").exists()
+        || dot_1up.join("project_id").exists()
+        || dot_1up.join("rebuild.lock").exists()
 }
 
 fn resolve_git_root(start: &Path) -> Option<PathBuf> {
@@ -695,6 +706,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(".1up")).unwrap();
+        write_project_id(&root).unwrap();
 
         let resolved = resolve_project_root(&root).unwrap();
         assert_eq!(resolved.state_root, root);
@@ -706,6 +718,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(".1up")).unwrap();
+        write_project_id(&root).unwrap();
         let subdir = root.join("deep").join("nested").join("dir");
         fs::create_dir_all(&subdir).unwrap();
 
@@ -722,6 +735,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(".1up")).unwrap();
+        write_project_id(&root).unwrap();
         let subdir = root.join("src").join("nested");
         fs::create_dir_all(&subdir).unwrap();
 
@@ -807,6 +821,51 @@ mod tests {
         let subdir = repo.join("src").join("nested");
         fs::create_dir_all(&subdir).unwrap();
 
+        let resolved = resolve_project_root(&subdir).unwrap();
+        assert_eq!(resolved.state_root, repo);
+        assert_eq!(resolved.source_root, repo);
+    }
+
+    #[test]
+    fn resolve_project_root_ignores_empty_dot_1up_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        // Create a stray empty .1up ancestor (e.g., installer cruft)
+        let ancestor = tmp_root.join("ancestor");
+        fs::create_dir_all(ancestor.join(".1up")).unwrap();
+
+        // Create a git repo below the empty .1up
+        let repo = ancestor.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let subdir = repo.join("src").join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        // Resolution should prefer the git root over the empty .1up ancestor
+        let resolved = resolve_project_root(&subdir).unwrap();
+        assert_eq!(resolved.state_root, repo);
+        assert_eq!(resolved.source_root, repo);
+        assert_ne!(resolved.state_root, ancestor);
+    }
+
+    #[test]
+    fn resolve_project_root_prefers_valid_dot_1up_over_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        // Create a git repo with a valid .1up (containing project_id)
+        let repo = tmp_root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join(".1up")).unwrap();
+        write_project_id(&repo).unwrap();
+
+        // Create a nested git repo below the first one (simulating a submodule scenario)
+        let nested = repo.join("nested").join("repo");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        let subdir = nested.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+
+        // Resolution should prefer the valid .1up ancestor over the immediate git root
         let resolved = resolve_project_root(&subdir).unwrap();
         assert_eq!(resolved.state_root, repo);
         assert_eq!(resolved.source_root, repo);
