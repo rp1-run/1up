@@ -797,7 +797,12 @@ pub struct IndexProgress {
     pub parallelism: Option<IndexParallelism>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IndexStageTimings>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "scope_recorded",
+        alias = "scope"
+    )]
     pub scope: Option<IndexScopeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilter: Option<IndexPrefilterInfo>,

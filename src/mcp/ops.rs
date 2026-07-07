@@ -656,7 +656,9 @@ pub async fn classify_readiness(
         }
         // REQ-002: If scope not in progress yet, try reading from database meta (rebuild in progress)
         if payload.index_scope.is_none() {
-            if let Ok(Some(scope)) = compute_index_scope(state_root, source_root).await {
+            if let Ok(Some(scope)) =
+                compute_index_scope(state_root, source_root, &worktree_context.context_id).await
+            {
                 payload.index_scope = Some(scope);
             }
         }
@@ -854,7 +856,9 @@ pub async fn classify_readiness(
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
 
     // Compute and populate index scope for coverage disclosure
-    if let Ok(Some(scope)) = compute_index_scope(state_root, source_root).await {
+    if let Ok(Some(scope)) =
+        compute_index_scope(state_root, source_root, &worktree_context.context_id).await
+    {
         payload.index_scope = Some(scope);
     }
 
@@ -1001,7 +1005,7 @@ pub async fn run_search(
                         "Search timed out during ongoing rebuild; try again after rebuilding completes."
                             .to_string(),
                     ),
-                    index_scope: compute_index_scope(state_root, &worktree_context.source_root)
+                    index_scope: compute_index_scope(state_root, &worktree_context.source_root, &worktree_context.context_id)
                         .await
                         .ok()
                         .flatten(),
@@ -1124,10 +1128,14 @@ async fn run_search_once(
     };
 
     // Compute and populate index scope for coverage disclosure
-    let index_scope = compute_index_scope(state_root, &worktree_context.source_root)
-        .await
-        .ok()
-        .flatten();
+    let index_scope = compute_index_scope(
+        state_root,
+        &worktree_context.source_root,
+        &worktree_context.context_id,
+    )
+    .await
+    .ok()
+    .flatten();
 
     Ok(SearchPayload {
         status,
@@ -1478,7 +1486,9 @@ async fn run_index(
             updated_at: chrono::Utc::now(),
         };
         // Write progress file so scope is visible immediately
-        let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
+        let dot_dir = config::project_dot_dir(&roots.state_root);
+        let _ = tokio::fs::create_dir_all(&dot_dir).await; // Ensure directory exists
+        let progress_path = dot_dir.join("index_status.json");
         if let Err(e) =
             tokio::fs::write(&progress_path, serde_json::to_string(&initial_progress)?).await
         {
@@ -2737,6 +2747,7 @@ pub async fn generate_facts_envelope(
 pub async fn compute_index_scope(
     state_root: &Path,
     source_root: &Path,
+    context_id: &str,
 ) -> Result<Option<IndexScope>, OneupError> {
     // Try to open the database
     let db_path = project_db_path(state_root);
@@ -2750,8 +2761,9 @@ pub async fn compute_index_scope(
     // Read scope roots from meta table
     let scope_roots = schema::read_scope_from_meta(&conn).await?;
 
-    // Count indexed files: get all file paths with segments
-    let indexed_file_paths = crate::storage::segments::get_all_file_paths(&conn).await?;
+    // Count indexed files: get all file paths with segments for this context
+    let indexed_file_paths =
+        crate::storage::segments::get_all_file_paths_for_context(&conn, context_id).await?;
     let indexed_files = indexed_file_paths.len();
 
     // Count total files in the repository
