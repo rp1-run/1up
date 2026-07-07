@@ -246,6 +246,8 @@ pub struct ContextRecord {
     pub content: String,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_of_scope_disclosure: Option<String>,
 }
 
 /// Orientation digest payload for `oneup_overview`. Section sizes are bounded
@@ -1057,7 +1059,28 @@ pub fn resolve_context_scan_filter(
     )?)
 }
 
-pub fn read_context_locations(
+async fn read_scope_for_context(state_root: &Path) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let db = Db::open_ro(&db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open index: {}", e))?;
+    let conn = db
+        .connect_tuned()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to index: {}", e))?;
+
+    schema::read_scope_from_meta(&conn)
+        .await
+        .map(|opt| opt.unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("failed to read scope: {}", e))
+}
+
+pub async fn read_context_locations(
+    state_root: &Path,
     source_root: &Path,
     scan_filter: &ScanFilter,
     locations: &[ReadLocation],
@@ -1065,10 +1088,19 @@ pub fn read_context_locations(
     let canonical_root = source_root
         .canonicalize()
         .with_context(|| format!("failed to resolve source root {}", source_root.display()))?;
+
+    // Read scope from database to check if files are out-of-scope
+    let scope = read_scope_for_context(state_root).await.unwrap_or_default();
+
     let mut records = Vec::with_capacity(locations.len());
 
     for location in locations {
-        records.push(read_location_record(&canonical_root, scan_filter, location));
+        records.push(read_location_record(
+            &canonical_root,
+            scan_filter,
+            location,
+            &scope,
+        ));
     }
 
     Ok(ReadPayload {
@@ -1611,6 +1643,7 @@ fn read_location_record(
     source_root: &Path,
     scan_filter: &ScanFilter,
     location: &ReadLocation,
+    scope_roots: &[String],
 ) -> ReadRecord {
     let source = ReadSource::Location {
         path: location.path.clone(),
@@ -1659,15 +1692,41 @@ fn read_location_record(
         );
     }
 
+    // Check if file is within indexed scope
+    let is_in_scope = check_path_in_scope(rel_path, scope_roots);
+    let out_of_scope_disclosure = if !is_in_scope && !scope_roots.is_empty() {
+        Some(format_out_of_scope_disclosure(scope_roots))
+    } else {
+        None
+    };
+
     match ContextEngine::retrieve_with_scope(
         &file_path,
         location.line,
         location.expansion,
         ContextAccessScope::ProjectRoot,
     ) {
-        Ok(context) => read_context(source, source_root, context),
+        Ok(context) => read_context(source, source_root, context, out_of_scope_disclosure),
         Err(err) => read_message(ReadStatus::Error, source, err.to_string()),
     }
+}
+
+fn check_path_in_scope(rel_path: &Path, scope_roots: &[String]) -> bool {
+    if scope_roots.is_empty() {
+        return true;
+    }
+
+    let rel_path_str = rel_path.to_string_lossy();
+    scope_roots.iter().any(|root| {
+        rel_path_str.starts_with(root)
+            && (rel_path_str.len() == root.len()
+                || rel_path_str.chars().nth(root.len()) == Some('/'))
+    })
+}
+
+fn format_out_of_scope_disclosure(scope_roots: &[String]) -> String {
+    let dirs = scope_roots.join(", ");
+    format!("This path is outside indexed scope [{}]; content read from file system only. Expand scope to index this file.", dirs)
 }
 
 fn resolve_location_path(source_root: &Path, raw_path: &str) -> Result<PathBuf, LocationError> {
@@ -1734,7 +1793,12 @@ fn read_segment(source: ReadSource, segment: StoredSegment) -> ReadRecord {
     }
 }
 
-fn read_context(source: ReadSource, source_root: &Path, context: ContextResult) -> ReadRecord {
+fn read_context(
+    source: ReadSource,
+    source_root: &Path,
+    context: ContextResult,
+    out_of_scope_disclosure: Option<String>,
+) -> ReadRecord {
     let path = Path::new(&context.file_path)
         .strip_prefix(source_root)
         .map(relative_path_string)
@@ -1751,6 +1815,7 @@ fn read_context(source: ReadSource, source_root: &Path, context: ContextResult) 
             content: context.content,
             line_start: context.line_start,
             line_end: context.line_end,
+            out_of_scope_disclosure,
         }),
         matching_handles: Vec::new(),
         message: None,
@@ -2445,13 +2510,14 @@ mod tests {
         ScanFilter::new(&[], &[], &[]).unwrap()
     }
 
-    #[test]
-    fn read_context_locations_rejects_parent_escape() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_parent_escape() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2460,19 +2526,21 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
         assert_eq!(payload.records[0].status, ReadStatus::Rejected);
     }
 
-    #[test]
-    fn read_context_locations_rejects_zero_line_as_structured_record() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_zero_line_as_structured_record() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2481,6 +2549,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
@@ -2492,8 +2561,8 @@ mod tests {
             .contains("1-based"));
     }
 
-    #[test]
-    fn read_context_locations_reads_repo_relative_file() {
+    #[tokio::test]
+    async fn read_context_locations_reads_repo_relative_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -2505,6 +2574,7 @@ mod tests {
 
         let payload = read_context_locations(
             &root,
+            &root,
             &no_op_scan_filter(),
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -2512,6 +2582,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Ok);
@@ -2527,14 +2598,15 @@ mod tests {
     /// directly, bypassing indexer exclusions entirely. This asserts the
     /// closed behavior — the fix under test refuses the file rather than
     /// returning its content.
-    #[test]
-    fn read_context_locations_rejects_secret_pattern_file() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_secret_pattern_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("credentials.json"), "{\"key\": \"super-secret\"}").unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2543,6 +2615,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
@@ -2555,8 +2628,8 @@ mod tests {
             .contains("excluded"));
     }
 
-    #[test]
-    fn read_context_locations_rejects_configured_exclude_glob() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_configured_exclude_glob() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("secrets")).unwrap();
@@ -2565,6 +2638,7 @@ mod tests {
         let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
         let payload = read_context_locations(
             &root,
+            &root,
             &scan_filter,
             &[ReadLocation {
                 path: "secrets/internal.txt".to_string(),
@@ -2572,6 +2646,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.records[0].status, ReadStatus::Rejected);
@@ -2580,8 +2655,8 @@ mod tests {
 
     /// REQ-005 AC2: a non-excluded file continues to be served normally even
     /// when the project has a configured (non-matching) `ScanFilter`.
-    #[test]
-    fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
+    #[tokio::test]
+    async fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -2594,6 +2669,7 @@ mod tests {
         let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
         let payload = read_context_locations(
             &root,
+            &root,
             &scan_filter,
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -2601,9 +2677,71 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.records[0].status, ReadStatus::Found);
+    }
+
+    #[test]
+    fn check_path_in_scope_matches_root_files() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("src/lib.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_matches_nested_files() {
+        let scope = vec!["src/components".to_string()];
+        let path = std::path::Path::new("src/components/button.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_rejects_different_prefix() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("extra/utils.rs");
+        assert!(!check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_rejects_partial_prefix_match() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("src_extra/file.rs");
+        assert!(!check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_accepts_multiple_roots() {
+        let scope = vec!["src".to_string(), "lib".to_string()];
+        assert!(check_path_in_scope(
+            std::path::Path::new("src/main.rs"),
+            &scope
+        ));
+        assert!(check_path_in_scope(
+            std::path::Path::new("lib/util.rs"),
+            &scope
+        ));
+        assert!(!check_path_in_scope(
+            std::path::Path::new("extra/other.rs"),
+            &scope
+        ));
+    }
+
+    #[test]
+    fn check_path_in_scope_empty_scope_returns_true() {
+        let scope: Vec<String> = vec![];
+        let path = std::path::Path::new("any/file.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn format_out_of_scope_disclosure_formats_correctly() {
+        let scope = vec!["src".to_string(), "lib".to_string()];
+        let disclosure = format_out_of_scope_disclosure(&scope);
+        assert!(disclosure.contains("outside indexed scope"));
+        assert!(disclosure.contains("src, lib"));
+        assert!(disclosure.contains("Expand scope"));
     }
 
     #[test]

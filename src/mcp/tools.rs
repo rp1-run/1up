@@ -282,7 +282,14 @@ impl OneupMcpServer {
             })
             .collect::<Vec<_>>();
 
-        match ops::read_context_locations(&roots.source_root, &scan_filter, &locations) {
+        match ops::read_context_locations(
+            &self.state_root,
+            &roots.source_root,
+            &scan_filter,
+            &locations,
+        )
+        .await
+        {
             Ok(payload) => {
                 let summary = read_summary(&payload);
                 let next_actions = read_next_actions(&payload);
