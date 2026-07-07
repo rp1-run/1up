@@ -50,6 +50,10 @@ pub struct McpProjectRoots {
     pub state_root: PathBuf,
     pub source_root: PathBuf,
     pub worktree_context: WorktreeContext,
+    /// The initial launch directory (CWD before project root resolution).
+    /// Used to suggest default scope in facts envelope for monorepos.
+    /// None if launched from project root or outside any recognized project.
+    pub launch_subdir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -317,11 +321,29 @@ struct CurrentIndex {
 }
 
 pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
+    // Canonicalize the input path first to get the actual launch directory
+    let canonical_launch_dir = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => path.to_path_buf(),
+    };
+
     let resolved = project::resolve_project_root(path)?;
+
+    // Capture launch_subdir if the launch directory differs from the clamped source_root.
+    // This indicates the user launched from a subdirectory that got clamped to the project root.
+    let launch_subdir = if canonical_launch_dir != resolved.source_root
+        && canonical_launch_dir.starts_with(&resolved.source_root)
+    {
+        Some(canonical_launch_dir)
+    } else {
+        None
+    };
+
     Ok(McpProjectRoots {
         state_root: resolved.state_root,
         source_root: resolved.source_root,
         worktree_context: resolved.worktree_context,
+        launch_subdir,
     })
 }
 
@@ -3311,5 +3333,38 @@ mod tests {
         let description = scope.coverage_description();
         assert!(description.contains("0 files indexed of 0 total"));
         assert!(description.contains("0%"));
+    }
+
+    #[test]
+    fn resolve_project_captures_launch_subdir_when_invoked_from_subdirectory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_root = temp_dir.path().canonicalize().unwrap();
+        let services_dir = repo_root.join("services");
+        let auth_dir = services_dir.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // Invoke from subdirectory
+        let roots = resolve_project(&auth_dir).expect("should resolve project");
+
+        // Verify launch_subdir is captured
+        assert_eq!(roots.source_root, repo_root);
+        assert!(roots.launch_subdir.is_some());
+        let launch_subdir = roots.launch_subdir.unwrap();
+        assert_eq!(launch_subdir, auth_dir);
+    }
+
+    #[test]
+    fn resolve_project_sets_launch_subdir_none_when_invoked_from_project_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_root = temp_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // Invoke from project root
+        let roots = resolve_project(&repo_root).expect("should resolve project");
+
+        // Verify launch_subdir is None when invoked from root
+        assert_eq!(roots.source_root, repo_root);
+        assert!(roots.launch_subdir.is_none());
     }
 }
