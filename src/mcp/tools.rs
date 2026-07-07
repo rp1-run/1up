@@ -82,7 +82,12 @@ impl OneupMcpServer {
             {
                 if should_return_facts {
                     // Generate and return facts envelope instead of indexing
-                    let facts = match ops::generate_facts_envelope(&roots.source_root, roots.launch_subdir.clone()).await {
+                    let facts = match ops::generate_facts_envelope(
+                        &roots.source_root,
+                        roots.launch_subdir.clone(),
+                    )
+                    .await
+                    {
                         Ok(facts) => facts,
                         Err(err) => return indexed_tool_error(err.to_string()),
                     };
