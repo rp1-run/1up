@@ -2146,50 +2146,56 @@ fn get_file_count_threshold() -> usize {
 
 /// Counts files per top-level directory (metadata-only walk, no parsing).
 /// Returns a map of directory name to (file_count, estimated_vectors).
+/// Gitignore-aware directory file count walk.
+/// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
+/// the indexer's actual file counts and exclude untracked build trees.
 fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+    use ignore::WalkBuilder;
+
     let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    // Simple metadata-only walk: no filtering, just count files per top-level dir.
-    for entry in std::fs::read_dir(source_root).map_err(|e| {
-        OneupError::Project(ProjectError::ReadFailed(format!(
-            "cannot read repo root: {e}"
-        )))
-    })? {
-        let entry = entry.map_err(|e| {
-            OneupError::Project(ProjectError::ReadFailed(format!(
-                "directory walk error: {e}"
-            )))
-        })?;
+    // Build a gitignore-aware walker that respects .gitignore rules
+    let walker = WalkBuilder::new(source_root)
+        .hidden(false)
+        .ignore(true) // Respect .gitignore!
+        .build();
 
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string());
-
-        let Some(dir_name) = name else {
-            continue;
-        };
-
-        // Skip hidden directories and common non-code directories
-        if dir_name.starts_with('.') {
-            continue;
-        }
-
-        // Walk this directory recursively and count files
-        let file_count = count_files_recursive(&path);
-        if file_count > 0 {
-            dir_counts.insert(dir_name, file_count);
+    // Aggregate files by their top-level directory
+    for result in walker {
+        if let Ok(entry) = result {
+            // Only count files, not directories
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                // Get the relative path from source_root
+                if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                    // Extract the first component (top-level directory)
+                    if let Some(top_level) = rel_path.components().next() {
+                        if let Component::Normal(name) = top_level {
+                            if let Some(dir_name) = name.to_str() {
+                                *dir_counts.entry(dir_name.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    } else {
+                        // File at root level
+                        *dir_counts.entry(".".to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
         }
     }
 
     // If no top-level directories were counted, count files at the root directly
     if dir_counts.is_empty() {
-        let root_count = count_files_recursive(source_root);
+        let walker = WalkBuilder::new(source_root)
+            .hidden(false)
+            .ignore(true)
+            .build();
+
+        let mut root_count = 0;
+        for entry in walker.flatten() {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                root_count += 1;
+            }
+        }
         if root_count > 0 {
             dir_counts.insert(".".to_string(), root_count);
         }
@@ -2198,28 +2204,104 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
     Ok(dir_counts)
 }
 
-/// Recursively counts files in a directory (fast metadata-only walk).
-fn count_files_recursive(path: &Path) -> usize {
-    let mut count = 0;
+/// Counts total tracked files in repository using gitignore-aware walk.
+/// Returns the gitignore-aware tracked file count (same definition used by indexer).
+#[allow(dead_code)]
+fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
+    use ignore::WalkBuilder;
 
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            match entry.path() {
-                p if p.is_file() => count += 1,
-                p if p.is_dir() => {
-                    // Skip hidden directories
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if !name.starts_with('.') && name != "node_modules" && name != "target" {
-                            count += count_files_recursive(&p);
-                        }
-                    }
-                }
-                _ => {}
+    let walker = WalkBuilder::new(source_root)
+        .hidden(false)
+        .ignore(true) // Respect .gitignore
+        .build();
+
+    let count = walker
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .count();
+
+    Ok(count)
+}
+
+/// Calibrates vector estimate based on measured language densities.
+/// Returns (total_estimate, basis_explanation, low_bound, high_bound).
+///
+/// REQ-006: Vector estimate must be calibrated against real embedding density.
+/// Measured densities:
+/// - Rust: 37.02 segments/file (measured on 1up: 148 files → 5479 segments)
+/// - Kotlin/Java: ~28 segments/file (cash-server validation)
+/// - Unmeasured: 15-30 conservative range
+fn estimate_vector_count(
+    total_tracked_files: usize,
+    source_root: &Path,
+) -> Result<(usize, String, usize, usize), OneupError> {
+    // Per-language/extension calibrated density based on measured data
+    // Format: (extension_pattern, segments_per_file)
+    let density_table: &[(&str, f64)] = &[
+        ("rs", 37.0),   // Rust: measured 37.02 segments/file
+        ("kt", 28.0),   // Kotlin: measured ~28 segments/file
+        ("java", 28.0), // Java: same as Kotlin
+        ("py", 30.0),   // Python: estimated conservative pending measurement
+        ("go", 15.0),   // Go: estimated conservative pending measurement
+        ("js", 25.0),   // JavaScript: estimated conservative pending measurement
+        ("ts", 25.0),   // TypeScript: estimated conservative pending measurement
+    ];
+
+    // Analyze file distribution by extension in the repo
+    use ignore::WalkBuilder;
+
+    let walker = WalkBuilder::new(source_root)
+        .hidden(false)
+        .ignore(true) // Respect .gitignore
+        .build();
+
+    let mut files_by_ext: HashMap<String, usize> = HashMap::new();
+    for entry in walker.flatten() {
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                *files_by_ext.entry(ext.to_string()).or_insert(0) += 1;
             }
         }
     }
 
-    count
+    // Compute average density for this repo
+    let mut total_density = 0.0;
+    let mut files_by_known_ext = 0;
+
+    for (ext, count) in &files_by_ext {
+        if let Some((_, density)) = density_table.iter().find(|(e, _)| ext.ends_with(e)) {
+            total_density += density * *count as f64;
+            files_by_known_ext += count;
+        }
+    }
+
+    // Use measured average for known extensions, fall back to conservative estimate for unmeasured
+    let avg_segments_per_file = if files_by_known_ext > 0 {
+        total_density / files_by_known_ext as f64
+    } else {
+        // Fallback for completely unmeasured ecosystems: conservative estimate
+        15.0
+    };
+
+    let estimated_count = (total_tracked_files as f64 * avg_segments_per_file) as usize;
+
+    // Label the basis so agents understand confidence
+    let basis = if files_by_known_ext > 0 {
+        format!(
+            "estimated ~{:.1} segments per file based on measured Rust (37.02) and Kotlin/Java (28.0) densities, with conservative estimates for unmeasured languages (15-30 range). Actual density varies by language; use this as a rough cost indicator, not a hard budget.",
+            avg_segments_per_file
+        )
+    } else {
+        "estimated ~15 segments per file (unmeasured ecosystem; use as rough indicator only)"
+            .to_string()
+    };
+
+    // Conservative lower and pessimistic upper bounds
+    let low_bound = (total_tracked_files as f64 * 15.0) as usize;
+    let high_bound = (total_tracked_files as f64 * 40.0) as usize;
+
+    Ok((estimated_count, basis, low_bound, high_bound))
 }
 
 /// Detects workspace manifest files in the repo.
@@ -2309,27 +2391,32 @@ pub async fn should_return_facts_envelope(
 }
 
 /// Generates a facts envelope for a large monorepo on first-run.
+/// Uses gitignore-aware file counts and calibrated vector estimates based on measured
+/// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
 pub async fn generate_facts_envelope(
     source_root: &Path,
     launch_subdir: Option<PathBuf>,
 ) -> Result<FactsEnvelope, OneupError> {
-    // Count files per top-level directory
+    // Count files per top-level directory (gitignore-aware)
     let dir_counts = count_files_per_directory(source_root)?;
-
     let file_count_total: usize = dir_counts.values().sum();
-    let vector_estimate_total = file_count_total.div_ceil(10); // Conservative: ~10 files per vector
 
+    // Build directory stats with calibrated estimates
     let mut per_directory_stats: Vec<DirectoryStats> = dir_counts
         .into_iter()
         .map(|(directory, file_count)| DirectoryStats {
             directory,
             file_count,
-            estimated_vectors: file_count.div_ceil(10),
+            estimated_vectors: file_count.div_ceil(10), // Placeholder; will be calibrated per-directory
         })
         .collect();
 
     // Sort by file count descending (largest first)
     per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
+
+    // Calibrate vector estimate based on measured language densities
+    let (vector_estimate_total, basis, low_bound, high_bound) =
+        estimate_vector_count(file_count_total, source_root)?;
 
     let workspace_manifests = detect_workspace_manifests(source_root);
     let sparse_checkout = get_sparse_checkout_info(source_root);
@@ -2347,6 +2434,9 @@ pub async fn generate_facts_envelope(
         launch_subdir: launch_subdir_str,
         file_count_total,
         vector_estimate_total,
+        vector_estimate_basis: Some(basis),
+        vector_estimate_low: Some(low_bound),
+        vector_estimate_high: Some(high_bound),
     })
 }
 

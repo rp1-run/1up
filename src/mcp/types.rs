@@ -229,10 +229,19 @@ pub struct FactsEnvelope {
     /// Launch subdirectory before project root resolution (if 1up was started from a subdirectory).
     /// Included as a suggestion for the default scope.
     pub launch_subdir: Option<String>,
-    /// Total file count across all directories.
+    /// Total file count across all directories (gitignore-aware tracked count).
     pub file_count_total: usize,
-    /// Total estimated vector count.
+    /// Total estimated vector count based on measured language densities.
     pub vector_estimate_total: usize,
+    /// Basis for the vector estimate explaining how it was computed and confidence level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_estimate_basis: Option<String>,
+    /// Conservative lower bound on vector count (15 segments/file × total files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_estimate_low: Option<usize>,
+    /// Pessimistic upper bound on vector count (40 segments/file × total files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_estimate_high: Option<usize>,
 }
 
 fn json_object_schema(_: &mut SchemaGenerator) -> Schema {
