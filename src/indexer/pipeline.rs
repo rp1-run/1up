@@ -129,6 +129,10 @@ fn refresh_progress(
     progress_tx: Option<&ProgressSender>,
     update: ProgressUpdate,
 ) {
+    // REQ-002: Preserve scope once it's recorded in the first progress update.
+    // Subsequent updates may not include scope, but we don't want to overwrite it with None.
+    let scope = update.scope.or_else(|| stats.progress.scope.clone());
+
     stats.progress = IndexProgress {
         state: update.state,
         phase: update.phase,
@@ -150,7 +154,7 @@ fn refresh_progress(
         message: pipeline_progress_message(stats, update.phase, update.files_total),
         parallelism: update.parallelism,
         timings: update.timings,
-        scope: update.scope,
+        scope,
         prefilter: update.prefilter,
         indexer_pid: Some(std::process::id()),
         updated_at: chrono::Utc::now(),
@@ -1986,10 +1990,23 @@ async fn run_with_index_context_scope_setup_and_progress_root(
             let run_inputs =
                 prepare_full_run_inputs(conn, project_root, &context.context_id, config).await?;
             let changed_count = run_inputs.scanned_files.len();
+
+            // REQ-002: Detect scope applied via include_globs (MCP path with scope_roots)
+            let (requested_scope_str, executed_scope_str) = if !config.scope_roots.is_empty() {
+                // Scoped via include_globs: requested = scope root count, executed = actual scanned
+                (
+                    format!("scoped:{}", config.scope_roots.len()),
+                    format!("scoped:{}", changed_count),
+                )
+            } else {
+                // Unscoped full scan
+                ("full".to_string(), "full".to_string())
+            };
+
             ScopeResolution {
                 inputs: run_inputs,
-                requested_scope: "full".to_string(),
-                executed_scope: "full".to_string(),
+                requested_scope: requested_scope_str,
+                executed_scope: executed_scope_str,
                 changed_path_count: changed_count,
                 fallback_reason: daemon_fallback_reason,
             }
@@ -2120,6 +2137,8 @@ async fn execute_run_with_inputs(
         executed: executed_scope,
         changed_paths: changed_path_count,
         fallback_reason,
+        // REQ-002: Include scope roots from config if this is a scoped run
+        roots: config.scope_roots.clone(),
     });
 
     refresh_progress(

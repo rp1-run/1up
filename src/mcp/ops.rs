@@ -415,6 +415,7 @@ async fn compute_new_scope(
 /// Applies scope roots to IndexingConfig by converting them to include_globs.
 ///
 /// Scope roots are converted to glob patterns: "dir1/**", "dir2/**", etc.
+/// REQ-002: Also stores the actual scope roots so they can be recorded in progress.
 fn apply_scope_to_indexing_config(
     config: &mut IndexingConfig,
     scope_roots: &[String],
@@ -426,6 +427,8 @@ fn apply_scope_to_indexing_config(
             .map(|root| format!("{}/**", root))
             .collect();
         config.include_globs = scope_globs;
+        // REQ-002: Store the actual scope roots for progress recording
+        config.scope_roots = scope_roots.to_vec();
     }
     Ok(())
 }
@@ -2125,22 +2128,16 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
 /// Extract scope info from progress file during indexing.
 /// REQ-002: Scope should be visible during indexing, independent of swap completion.
 fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
-    // Only extract scope during indexing if progress has scope info recorded.
-    // Don't create empty IndexScope objects that might affect search filtering.
-    progress.scope.as_ref().and_then(|_scope_info| {
-        // Only return IndexScope if we have meaningful content during the scan phase
-        // (when files_total is known). The scope roots will be properly populated
-        // from the database when the index is ready.
-        if progress.files_total > 0 {
-            Some(IndexScope {
-                roots: vec![], // Will be populated from database when ready
-                indexed_files: progress.files_indexed,
-                total_files: progress.files_total,
-            })
-        } else {
-            // During early phases (Preparing, LoadingModel) before scanning,
-            // don't create an IndexScope yet
-            None
+    // REQ-002: Extract scope from progress during indexing.
+    // The scope roots come from IndexScopeInfo recorded during pipeline startup.
+    // Return IndexScope as soon as scope_info is available, even if files_total is 0,
+    // so scope is visible from the start of indexing (not just during scanning).
+    progress.scope.as_ref().map(|scope_info| {
+        IndexScope {
+            // REQ-002: Use roots from scope_info (recorded during pipeline startup)
+            roots: scope_info.roots.clone(),
+            indexed_files: progress.files_indexed,
+            total_files: progress.files_total,
         }
     })
 }
@@ -3654,6 +3651,7 @@ mod tests {
             include_globs: vec![],
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
+            scope_roots: vec![],
         };
         let result = apply_scope_to_indexing_config(&mut config, &[]);
         assert!(result.is_ok());
@@ -3669,6 +3667,7 @@ mod tests {
             include_globs: vec![],
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
+            scope_roots: vec![],
         };
         let scope = vec!["services/auth".to_string()];
         let result = apply_scope_to_indexing_config(&mut config, &scope);
@@ -3685,6 +3684,7 @@ mod tests {
             include_globs: vec![],
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
+            scope_roots: vec![],
         };
         let scope = vec!["services/auth".to_string(), "libs/core".to_string()];
         let result = apply_scope_to_indexing_config(&mut config, &scope);
@@ -3875,6 +3875,7 @@ mod tests {
                 executed: "scoped:50".to_string(),
                 changed_paths: 50,
                 fallback_reason: None,
+                roots: vec!["services/auth".to_string(), "libs/core".to_string()],
             }),
             prefilter: None,
             indexer_pid: None,
@@ -3887,7 +3888,11 @@ mod tests {
         // Verify scope is extracted correctly
         assert!(scope.is_some());
         let scope = scope.unwrap();
-        assert_eq!(scope.roots, vec![] as Vec<String>); // Roots are populated from database at completion
+        // REQ-002: Roots should now be populated from IndexScopeInfo during indexing
+        assert_eq!(
+            scope.roots,
+            vec!["services/auth".to_string(), "libs/core".to_string()]
+        );
         assert_eq!(scope.indexed_files, 20);
         assert_eq!(scope.total_files, 100);
     }

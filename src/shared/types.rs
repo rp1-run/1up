@@ -354,6 +354,11 @@ pub struct IndexingConfig {
     /// default-hidden dotfile policy (e.g. `.github/workflows`). Defaults empty.
     #[serde(default)]
     pub index_hidden_dirs: Vec<String>,
+    /// REQ-002: Scope roots that were converted to include_globs for this config.
+    /// Used to record scope information in the progress file during indexing.
+    /// When non-empty, indicates this is a scoped index (not a full index).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_roots: Vec<String>,
 }
 
 impl IndexingConfig {
@@ -405,6 +410,7 @@ impl IndexingConfig {
             include_globs,
             exclude_globs,
             index_hidden_dirs,
+            scope_roots: Vec::new(),
         })
     }
 
@@ -712,6 +718,11 @@ pub struct IndexScopeInfo {
     pub changed_paths: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// REQ-002: Actual scope roots (e.g., ["services/auth", "libs/core"]).
+    /// Present when scope was applied (requested/executed start with "scoped:").
+    /// Empty for full scans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
 }
 
 /// Prefilter counters for an indexing run.
