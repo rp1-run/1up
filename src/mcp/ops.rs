@@ -431,6 +431,10 @@ fn apply_scope_to_indexing_config(
     config: &mut IndexingConfig,
     scope_roots: &[String],
 ) -> anyhow::Result<()> {
+    // REQ-002: Always store scope roots in config, even if empty, so they're available
+    // during progress recording. Empty scope_roots indicates unscoped (full) index.
+    config.scope_roots = scope_roots.to_vec();
+
     if !scope_roots.is_empty() {
         // Convert scope roots to include_globs: "dir/**" for each root
         let scope_globs: Vec<String> = scope_roots
@@ -443,8 +447,8 @@ fn apply_scope_to_indexing_config(
             scope_globs
         );
         config.include_globs = scope_globs;
-        // REQ-002: Store the actual scope roots for progress recording
-        config.scope_roots = scope_roots.to_vec();
+    } else {
+        tracing::debug!("apply_scope_to_indexing_config: no scope, using empty include_globs");
     }
     Ok(())
 }
@@ -495,14 +499,16 @@ pub async fn start(
     // Determine if a rebuild (vs incremental write) is needed based on scope changes
     // and index state:
     // - scope_narrow always requires rebuild (atomic rebuild via StagingRebuild)
-    // - scope_add with missing index requires rebuild (create from scratch)
+    // - scope_add always requires rebuild (fresh staging DB, prevents metadata match against old scope)
     // - Reindex mode requires rebuild
     let scope_affects_rebuild = scope_add.is_some() || scope_narrow.is_some();
     let rebuild_mode = if scope_narrow.is_some() {
         // Narrowing always requires full rebuild via StagingRebuild
         true
-    } else if scope_add.is_some() && readiness.status == ReadinessStatus::Missing {
-        // scope_add with no existing index requires rebuild to create the database
+    } else if scope_add.is_some() {
+        // REQ-002: scope_add always requires rebuild (not just when missing).
+        // Ensures fresh staging database with no metadata from prior unscoped index,
+        // preventing all files from being metadata-matched when scope changes.
         true
     } else {
         // For other mode-based decisions, follow the original mode logic
@@ -645,6 +651,12 @@ pub async fn classify_readiness(
         // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
         if let Some(progress) = &payload.index_progress {
             payload.index_scope = extract_scope_from_progress(progress);
+        }
+        // REQ-002: If scope not in progress yet, try reading from database meta (rebuild in progress)
+        if payload.index_scope.is_none() {
+            if let Ok(Some(scope)) = compute_index_scope(state_root, source_root).await {
+                payload.index_scope = Some(scope);
+            }
         }
         return payload;
     }
@@ -1420,6 +1432,58 @@ async fn run_index(
 
     // Apply scope to include_globs for ScanFilter
     apply_scope_to_indexing_config(&mut indexing_config, &new_scope)?;
+
+    // REQ-002: Write initial progress file with scope info BEFORE rebuild lock acquisition.
+    // This ensures scope is visible during the rebuilding phase, even if the progress file
+    // isn't updated again until the pipeline starts running.
+    let initial_scope_info = if !new_scope.is_empty() {
+        Some(crate::shared::types::IndexScopeInfo {
+            requested: format!("scoped:{}", new_scope.len()),
+            executed: String::new(), // Will be updated by pipeline
+            changed_paths: 0,
+            fallback_reason: None,
+            roots: new_scope.clone(),
+        })
+    } else {
+        None
+    };
+
+    if let Some(scope_info) = &initial_scope_info {
+        let initial_progress = crate::shared::types::IndexProgress {
+            state: crate::shared::types::IndexState::Running,
+            phase: crate::shared::types::IndexPhase::Pending,
+            context_id: Some(roots.worktree_context.context_id.clone()),
+            source_root: Some(roots.source_root.clone()),
+            branch_name: roots.worktree_context.branch_name.clone(),
+            branch_status: Some(roots.worktree_context.branch_status),
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: Some("Preparing to index...".to_string()),
+            parallelism: None,
+            timings: None,
+            scope: Some(scope_info.clone()),
+            prefilter: None,
+            indexer_pid: Some(std::process::id()),
+            updated_at: chrono::Utc::now(),
+        };
+        // Write progress file so scope is visible immediately
+        let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
+        if let Err(e) =
+            tokio::fs::write(&progress_path, serde_json::to_string(&initial_progress)?).await
+        {
+            tracing::warn!("failed to write initial progress with scope info: {}", e);
+            // Continue anyway - initial progress write is best-effort
+        }
+    }
 
     let mut setup = SetupTimings::new(Instant::now());
 

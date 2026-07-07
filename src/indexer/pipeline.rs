@@ -538,6 +538,11 @@ async fn prepare_full_run_inputs(
         config.include_globs
     );
     let manifest = segments::get_all_indexed_files_for_context(conn, context_id).await?;
+    tracing::debug!(
+        "prepare_full_run_inputs: loaded manifest with {} entries for context_id={}",
+        manifest.len(),
+        context_id
+    );
 
     let project_root_canonical = project_root
         .canonicalize()
