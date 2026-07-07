@@ -17,8 +17,8 @@ use crate::mcp::server::OneupMcpServer;
 use crate::mcp::types::{
     ContextInput, FactsEnvelope, GetInput, ImpactInput, NextAction, OverviewInput,
     ReadinessContextMetadata, SearchInput, StartInput, StartMode, StatusInput, StructuralInput,
-    SymbolIncludeInput, SymbolInput, ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT,
-    TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    SymbolIncludeInput, SymbolInput, ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET,
+    TOOL_IMPACT, TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::MAX_SEARCH_RESULTS;
@@ -105,7 +105,8 @@ impl OneupMcpServer {
                         .map(|d| d.directory.clone())
                     {
                         if next_actions.is_empty()
-                            || facts.launch_subdir.as_ref().map(|s| s.as_str()) != Some(&largest_dir)
+                            || facts.launch_subdir.as_ref().map(|s| s.as_str())
+                                != Some(&largest_dir)
                         {
                             next_actions.push(action(
                                 TOOL_START,
@@ -133,10 +134,11 @@ impl OneupMcpServer {
             }
         }
 
-        let mut payload = match ops::start(&roots, input.mode).await {
-            Ok(payload) => payload,
-            Err(err) => return indexed_tool_error(err.to_string()),
-        };
+        let mut payload =
+            match ops::start(&roots, input.mode, input.scope_add, input.scope_narrow).await {
+                Ok(payload) => payload,
+                Err(err) => return indexed_tool_error(err.to_string()),
+            };
         apply_branch_readiness(&mut payload, &roots.worktree_context);
         let metadata = readiness_context_metadata(&roots, &payload);
 

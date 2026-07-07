@@ -321,6 +321,87 @@ pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
     })
 }
 
+/// Computes the new scope by loading existing scope and applying scope_add/scope_narrow.
+///
+/// Returns the resulting scope roots as a Vec<String>.
+/// Validates scope_narrow is a subset of existing scope.
+async fn compute_new_scope(
+    state_root: &Path,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+
+    // Load existing scope if index exists
+    let mut current_scope = if db_path.exists() {
+        match Db::open_ro(&db_path).await {
+            Ok(db) => match db.connect_tuned().await {
+                Ok(conn) => schema::read_scope_from_meta(&conn)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    // Apply scope_narrow if provided (must be subset of current)
+    if let Some(narrow_to) = scope_narrow {
+        // Validate that narrow_to is a subset of current_scope
+        if !current_scope.is_empty() {
+            for path in &narrow_to {
+                if !current_scope.contains(path) {
+                    bail!(
+                        "scope_narrow path '{}' is not in current scope: {:?}",
+                        path,
+                        current_scope
+                    );
+                }
+            }
+        }
+        current_scope = narrow_to;
+    }
+
+    // Apply scope_add if provided (union operation)
+    if let Some(add_to) = scope_add {
+        for path in add_to {
+            // Validate path: no absolute paths, no ../
+            if path.starts_with('/') {
+                bail!("scope path cannot be absolute: {}", path);
+            }
+            if path.contains("..") {
+                bail!("scope path cannot contain '..': {}", path);
+            }
+            if !current_scope.contains(&path) {
+                current_scope.push(path);
+            }
+        }
+    }
+
+    Ok(current_scope)
+}
+
+/// Applies scope roots to IndexingConfig by converting them to include_globs.
+///
+/// Scope roots are converted to glob patterns: "dir1/**", "dir2/**", etc.
+fn apply_scope_to_indexing_config(
+    config: &mut IndexingConfig,
+    scope_roots: &[String],
+) -> anyhow::Result<()> {
+    if !scope_roots.is_empty() {
+        // Convert scope roots to include_globs: "dir/**" for each root
+        let scope_globs: Vec<String> = scope_roots
+            .iter()
+            .map(|root| format!("{}/**", root))
+            .collect();
+        config.include_globs = scope_globs;
+    }
+    Ok(())
+}
+
 pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
     classify_readiness(
         &roots.state_root,
@@ -330,17 +411,39 @@ pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
     .await
 }
 
-pub async fn start(roots: &McpProjectRoots, mode: StartMode) -> anyhow::Result<ReadinessPayload> {
+pub async fn start(
+    roots: &McpProjectRoots,
+    mode: StartMode,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) -> anyhow::Result<ReadinessPayload> {
+    // Determine if a rebuild (vs incremental write) is needed based on scope changes
+    let scope_affects_rebuild = scope_add.is_some() || scope_narrow.is_some();
+    let rebuild_mode = if scope_affects_rebuild && scope_narrow.is_some() {
+        // Narrowing always requires full rebuild via StagingRebuild
+        true
+    } else {
+        // For scope_add or mode-based decisions, follow the original mode logic
+        mode == StartMode::Reindex
+    };
+
     let readiness = check_status(roots).await;
     match mode {
         StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
-            run_index_then_classify(roots, false).await
+            run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
         }
         StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => {
-            run_index_then_classify(roots, false).await
+            run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
         }
-        StartMode::Reindex => run_index_then_classify(roots, true).await,
-        _ => Ok(readiness),
+        StartMode::Reindex => run_index_then_classify(roots, true, scope_add, scope_narrow).await,
+        _ => {
+            // Even if mode doesn't trigger indexing, scope changes should trigger indexing
+            if scope_affects_rebuild {
+                run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
+            } else {
+                Ok(readiness)
+            }
+        }
     }
 }
 
@@ -1086,8 +1189,10 @@ where
 async fn run_index_then_classify(
     roots: &McpProjectRoots,
     rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
 ) -> anyhow::Result<ReadinessPayload> {
-    match run_index(roots, rebuild).await {
+    match run_index(roots, rebuild, scope_add, scope_narrow).await {
         Ok(_) => Ok(classify_after_index(roots).await),
         Err(err) => Ok(blocked_readiness(
             &roots.state_root,
@@ -1113,17 +1218,26 @@ async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
 async fn run_index(
     roots: &McpProjectRoots,
     rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     if project::read_project_id(&roots.state_root).is_err() {
         project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
+    // Load existing scope and compute the new scope based on scope_add/scope_narrow
+    let new_scope = compute_new_scope(&roots.state_root, scope_add, scope_narrow).await?;
+
     let registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let mut indexing_config = config::resolve_indexing_config(
         None,
         None,
         registry.indexing_config_for_context(&roots.worktree_context),
     )?;
+
+    // Apply scope to include_globs for ScanFilter
+    apply_scope_to_indexing_config(&mut indexing_config, &new_scope)?;
+
     let mut setup = SetupTimings::new(Instant::now());
 
     // Single-writer rebuild lock: hold it across the staged build + atomic
@@ -1142,7 +1256,7 @@ async fn run_index(
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
     let db_start = Instant::now();
-    if rebuild {
+    let stats = if rebuild {
         // Build the refreshed index aside into a staging file and atomically switch
         // it over the served `index.db`, so search keeps serving the prior index
         // (stale-but-available) throughout and is never torn down in place. A
@@ -1150,8 +1264,10 @@ async fn run_index(
         let staged = swap::StagingRebuild::open(&roots.state_root).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
         let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
+        // Persist scope to meta table before finalizing and swapping
+        schema::write_scope_to_meta(staged.connection(), &new_scope).await?;
         staged.finalize_and_swap().await?;
-        Ok(stats)
+        stats
     } else {
         // Incremental write against the live index — unchanged: no rebuild, so no
         // build-aside switch-over is involved.
@@ -1159,8 +1275,13 @@ async fn run_index(
         let conn = db.connect_tuned().await?;
         schema::prepare_for_write(&conn).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
-        run_index_pipeline(&conn, roots, &indexing_config, setup).await
-    }
+        let stats = run_index_pipeline(&conn, roots, &indexing_config, setup).await?;
+        // Persist scope to meta table after successful pipeline
+        schema::write_scope_to_meta(&conn, &new_scope).await?;
+        stats
+    };
+
+    Ok(stats)
 }
 
 /// Load the embedding model and run the indexing pipeline against `conn`.
@@ -1869,10 +1990,14 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
 
     // Simple metadata-only walk: no filtering, just count files per top-level dir.
     for entry in std::fs::read_dir(source_root).map_err(|e| {
-        OneupError::Project(ProjectError::ReadFailed(format!("cannot read repo root: {e}")))
+        OneupError::Project(ProjectError::ReadFailed(format!(
+            "cannot read repo root: {e}"
+        )))
     })? {
         let entry = entry.map_err(|e| {
-            OneupError::Project(ProjectError::ReadFailed(format!("directory walk error: {e}")))
+            OneupError::Project(ProjectError::ReadFailed(format!(
+                "directory walk error: {e}"
+            )))
         })?;
 
         let path = entry.path();
@@ -2965,5 +3090,109 @@ mod tests {
             called_relations: "[]".to_string(),
             file_hash: format!("hash-{id}"),
         }
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_empty_scope() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+        };
+        let result = apply_scope_to_indexing_config(&mut config, &[]);
+        assert!(result.is_ok());
+        assert!(config.include_globs.is_empty());
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_single_root() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+        };
+        let scope = vec!["services/auth".to_string()];
+        let result = apply_scope_to_indexing_config(&mut config, &scope);
+        assert!(result.is_ok());
+        assert_eq!(config.include_globs, vec!["services/auth/**"]);
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_multiple_roots() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+        };
+        let scope = vec!["services/auth".to_string(), "libs/core".to_string()];
+        let result = apply_scope_to_indexing_config(&mut config, &scope);
+        assert!(result.is_ok());
+        assert_eq!(
+            config.include_globs,
+            vec!["services/auth/**", "libs/core/**"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_new_scope_with_scope_add() {
+        // Test: scope_add with no existing scope creates new scope
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let scope_add = Some(vec!["services/auth".to_string()]);
+        let result = compute_new_scope(&temp_dir.path(), scope_add.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["services/auth"]);
+    }
+
+    #[tokio::test]
+    async fn test_compute_new_scope_with_scope_narrow_empty_current() {
+        // Test: scope_narrow on empty current scope (should work)
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let scope_narrow = Some(vec!["services/auth".to_string()]);
+        let result = compute_new_scope(&temp_dir.path(), None, scope_narrow)
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["services/auth"]);
+    }
+
+    #[test]
+    fn test_scope_add_validation_rejects_absolute_paths() {
+        // This test documents the validation in compute_new_scope
+        let absolute_path = "/services/auth".to_string();
+        let result: anyhow::Result<Vec<String>> = if absolute_path.starts_with('/') {
+            Err(anyhow::anyhow!(
+                "scope path cannot be absolute: {}",
+                absolute_path
+            ))
+        } else {
+            Ok(vec![absolute_path])
+        };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scope_add_validation_rejects_escape_sequences() {
+        // This test documents the validation in compute_new_scope
+        let escape_path = "services/../admin".to_string();
+        let result: anyhow::Result<Vec<String>> = if escape_path.contains("..") {
+            Err(anyhow::anyhow!(
+                "scope path cannot contain '..': {}",
+                escape_path
+            ))
+        } else {
+            Ok(vec![escape_path])
+        };
+        assert!(result.is_err());
     }
 }

@@ -55,6 +55,16 @@ pub struct StartInput {
     #[serde(default)]
     pub mode: StartMode,
     pub path: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional list of repo-relative directory cones to add to the indexed scope (union operation). Each path must be repo-relative and cannot contain `../` or absolute paths. Scope roots are persisted per state_root and survive branch switches and daemon restarts."
+    )]
+    pub scope_add: Option<Vec<String>>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional list of repo-relative directory cones to narrow the indexed scope to. Must be a subset of the currently indexed scope. Narrowing triggers a full rebuild via atomic StagingRebuild and is never an implicit side effect."
+    )]
+    pub scope_narrow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
