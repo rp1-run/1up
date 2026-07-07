@@ -343,9 +343,10 @@ fn truncate_chars(mut text: String, max_chars: usize) -> String {
 /// `meta.embedding_model`), the token window (`max_tokens`), and the exact
 /// embedder input produced by [`compose_embedding_text`].
 ///
-/// Because the embed input uses repository-relative paths, it is identical
-/// across branch/worktree contexts, so identical content yields an identical
-/// key and is embedded and stored exactly once in `embedding_pool` (REQ-006).
+/// Because the embedding input uses the file stem (e.g., "utils" from
+/// "services/auth/utils.rs"), it is identical for the same file name across
+/// different directories and scope cones, so identical content in different cones
+/// yields an identical key and shares a single embedding pool row (REQ-012).
 /// Folding the model identity into the key makes embeddings produced by a
 /// different model resolve to a different key, so changing the model
 /// automatically invalidates reuse of older vectors. `max_tokens` is folded in
