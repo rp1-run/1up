@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context};
 use libsql::Connection;
@@ -2071,7 +2071,7 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
 fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
     // Only extract scope during indexing if progress has scope info recorded.
     // Don't create empty IndexScope objects that might affect search filtering.
-    progress.scope.as_ref().and_then(|scope_info| {
+    progress.scope.as_ref().and_then(|_scope_info| {
         // Only return IndexScope if we have meaningful content during the scan phase
         // (when files_total is known). The scope roots will be properly populated
         // from the database when the index is ready.
@@ -2145,6 +2145,61 @@ enum LocationError {
     Error(String),
 }
 
+// REQ-005: Cache key for directory walk results, invalidating on repo identity change or HEAD drift.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+struct DirectoryWalkCacheKey {
+    repo_identity: String,       // e.g., source_root canonical path
+    head_commit: Option<String>, // git HEAD OID, or None if not in a git repo
+    root_mtime: Option<u64>,     // filesystem mtime in seconds, or None on error
+}
+
+// REQ-005: Static cache for directory walk results. First gate response computed once,
+// repeat calls cache-hit <1s latency as per acceptance criteria.
+static DIRECTORY_WALK_CACHE: OnceLock<
+    Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>>,
+> = OnceLock::new();
+
+fn get_directory_walk_cache(
+) -> &'static Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>> {
+    DIRECTORY_WALK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts git HEAD OID from the repository.
+/// Returns None if not in a git repo or if HEAD cannot be read.
+fn get_head_commit(source_root: &Path) -> Option<String> {
+    // Try to read HEAD using git command as a simple, reliable approach
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !commit.is_empty() && commit.len() == 40 {
+            // Validate it's a hex OID (40 chars for SHA1)
+            if commit.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(commit);
+            }
+        }
+    }
+    None
+}
+
+/// Gets the root directory mtime as a cache invalidation signal.
+/// Returns None if metadata cannot be read.
+fn get_root_mtime(source_root: &Path) -> Option<u64> {
+    std::fs::metadata(source_root)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 /// Gets the configured file count threshold for facts envelope gate, with env var override.
 fn get_file_count_threshold() -> usize {
     std::env::var(FILE_COUNT_THRESHOLD_ENV_VAR)
@@ -2153,12 +2208,47 @@ fn get_file_count_threshold() -> usize {
         .unwrap_or(FILE_COUNT_THRESHOLD)
 }
 
+/// Counts files per top-level directory with result caching (REQ-005).
+/// Returns a map of directory name to file_count.
+/// Cache invalidates on git HEAD drift or root directory mtime change,
+/// ensuring <1s repeat call latency while maintaining correctness.
+fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+    // Build cache key from repo identity and current state
+    let cache_key = DirectoryWalkCacheKey {
+        repo_identity: source_root
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
+        head_commit: get_head_commit(source_root),
+        root_mtime: get_root_mtime(source_root),
+    };
+
+    // Check cache first
+    if let Ok(cache) = get_directory_walk_cache().lock() {
+        if let Some(cached_result) = cache.get(&cache_key) {
+            return Ok(cached_result.clone());
+        }
+    }
+
+    // Not in cache, compute via gitignore-aware walk
+    let result = count_files_per_directory_uncached(source_root)?;
+
+    // Store in cache for next call
+    if let Ok(mut cache) = get_directory_walk_cache().lock() {
+        cache.insert(cache_key, result.clone());
+    }
+
+    Ok(result)
+}
+
 /// Counts files per top-level directory (metadata-only walk, no parsing).
-/// Returns a map of directory name to (file_count, estimated_vectors).
 /// Gitignore-aware directory file count walk.
 /// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
 /// the indexer's actual file counts and exclude untracked build trees.
-fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+fn count_files_per_directory_uncached(
+    source_root: &Path,
+) -> Result<BTreeMap<String, usize>, OneupError> {
     use ignore::WalkBuilder;
 
     let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -2170,23 +2260,21 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
         .build();
 
     // Aggregate files by their top-level directory
-    for result in walker {
-        if let Ok(entry) = result {
-            // Only count files, not directories
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                // Get the relative path from source_root
-                if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
-                    // Extract the first component (top-level directory)
-                    if let Some(top_level) = rel_path.components().next() {
-                        if let Component::Normal(name) = top_level {
-                            if let Some(dir_name) = name.to_str() {
-                                *dir_counts.entry(dir_name.to_string()).or_insert(0) += 1;
-                            }
+    for entry in walker.flatten() {
+        // Only count files, not directories
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            // Get the relative path from source_root
+            if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                // Extract the first component (top-level directory)
+                if let Some(top_level) = rel_path.components().next() {
+                    if let Component::Normal(name) = top_level {
+                        if let Some(dir_name) = name.to_str() {
+                            *dir_counts.entry(dir_name.to_string()).or_insert(0) += 1;
                         }
-                    } else {
-                        // File at root level
-                        *dir_counts.entry(".".to_string()).or_insert(0) += 1;
                     }
+                } else {
+                    // File at root level
+                    *dir_counts.entry(".".to_string()).or_insert(0) += 1;
                 }
             }
         }
