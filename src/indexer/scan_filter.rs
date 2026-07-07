@@ -12,8 +12,9 @@ const DEFAULT_SECRET_GLOBS: &[&str] = &["*.pem", "*.key", "credentials.json", ".
 /// between the three consumers.
 ///
 /// Precedence (highest to lowest): secret pattern (non-overridable) >
-/// configured include glob or dotfile-directory override > configured user
-/// exclude glob > default dotfile/dot-directory hiding > include by default.
+/// configured include glob or dotfile-directory override > scope_globs (exclusive,
+/// only when scoped) > configured user exclude glob > default dotfile/dot-directory
+/// hiding > include by default.
 ///
 /// Pure and I/O-free: callers supply the repo-relative path and whether it
 /// names a directory.
@@ -22,6 +23,10 @@ pub struct ScanFilter {
     include_globs: GlobSet,
     exclude_globs: GlobSet,
     override_dirs: Vec<PathBuf>,
+    /// Exclusive scope patterns (e.g., "services/**") populated only when scope
+    /// filtering is active. When set, only files matching scope_globs are included.
+    /// This is distinct from include_globs which only guarantees inclusion.
+    scope_globs: GlobSet,
 }
 
 fn build_globset<S: AsRef<str>>(
@@ -71,6 +76,25 @@ impl ScanFilter {
             include_globs: build_globset(include_globs)?,
             exclude_globs: build_globset(exclude_globs)?,
             override_dirs: override_dirs.iter().map(PathBuf::from).collect(),
+            scope_globs: build_globset(Vec::<String>::new())?,
+        })
+    }
+
+    /// Build a filter with exclusive scope patterns (for scoped indexing).
+    /// Scope globs define an exclusive cone: only files matching any scope glob
+    /// are included. This is used when scope_roots are applied.
+    pub fn with_scope_globs(
+        include_globs: &[String],
+        exclude_globs: &[String],
+        override_dirs: &[String],
+        scope_globs_patterns: &[String],
+    ) -> Result<Self, OneupError> {
+        Ok(Self {
+            secret_globs: build_globset(DEFAULT_SECRET_GLOBS)?,
+            include_globs: build_globset(include_globs)?,
+            exclude_globs: build_globset(exclude_globs)?,
+            override_dirs: override_dirs.iter().map(PathBuf::from).collect(),
+            scope_globs: build_globset(scope_globs_patterns)?,
         })
     }
 
@@ -89,20 +113,16 @@ impl ScanFilter {
         if glob_matches(&self.include_globs, rel_path) || self.matches_override(rel_path, is_dir) {
             return false;
         }
-        // REQ-002: If include_globs is configured, check if this path is a parent
-        // of a matching path. For scoped indexing, we need to allow directories
-        // that contain scope roots (e.g., "services" should not be excluded even
-        // though the glob is "services/**"). For files, exclude if no match.
-        if !self.include_globs.is_empty() {
+        // Scope filtering: if scope_globs is active (scoped indexing), use exclusive cone.
+        // For directories, allow descent so we can check files within scope roots.
+        // For files, exclude if not matching any scope glob.
+        if !self.scope_globs.is_empty() {
             if is_dir {
-                // For directories, check if any include glob could match a child path
-                // by testing common path extensions (dir/subdir, dir/file.ext, etc.)
-                // A simple heuristic: don't exclude dirs, let the walk descend and filter files
-                // This way "services" dir is not excluded, and "services/file.rs" can be checked
                 return false;
             } else {
-                // For files, if include_globs is set and file doesn't match, exclude it
-                return true;
+                if !glob_matches(&self.scope_globs, rel_path) {
+                    return true;
+                }
             }
         }
         if glob_matches(&self.exclude_globs, rel_path) {

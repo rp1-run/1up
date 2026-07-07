@@ -436,7 +436,9 @@ fn apply_scope_to_indexing_config(
     config.scope_roots = scope_roots.to_vec();
 
     if !scope_roots.is_empty() {
-        // Convert scope roots to include_globs: "dir/**" for each root
+        // Convert scope roots to scope_globs: "dir/**" for each root.
+        // These are exclusive patterns used for scoped indexing, distinct from include_globs
+        // which only guarantee inclusion and never exclude non-matching files.
         let scope_globs: Vec<String> = scope_roots
             .iter()
             .map(|root| format!("{}/**", root))
@@ -446,9 +448,9 @@ fn apply_scope_to_indexing_config(
             scope_roots,
             scope_globs
         );
-        config.include_globs = scope_globs;
+        config.scope_globs = scope_globs;
     } else {
-        tracing::debug!("apply_scope_to_indexing_config: no scope, using empty include_globs");
+        tracing::debug!("apply_scope_to_indexing_config: no scope, using empty scope_globs");
     }
     Ok(())
 }
@@ -3750,10 +3752,11 @@ mod tests {
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
             scope_roots: vec![],
+            scope_globs: vec![],
         };
         let result = apply_scope_to_indexing_config(&mut config, &[]);
         assert!(result.is_ok());
-        assert!(config.include_globs.is_empty());
+        assert!(config.scope_globs.is_empty());
     }
 
     #[test]
@@ -3766,11 +3769,12 @@ mod tests {
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
             scope_roots: vec![],
+            scope_globs: vec![],
         };
         let scope = vec!["services/auth".to_string()];
         let result = apply_scope_to_indexing_config(&mut config, &scope);
         assert!(result.is_ok());
-        assert_eq!(config.include_globs, vec!["services/auth/**"]);
+        assert_eq!(config.scope_globs, vec!["services/auth/**"]);
     }
 
     #[test]
@@ -3783,14 +3787,12 @@ mod tests {
             exclude_globs: vec![],
             index_hidden_dirs: vec![],
             scope_roots: vec![],
+            scope_globs: vec![],
         };
         let scope = vec!["services/auth".to_string(), "libs/core".to_string()];
         let result = apply_scope_to_indexing_config(&mut config, &scope);
         assert!(result.is_ok());
-        assert_eq!(
-            config.include_globs,
-            vec!["services/auth/**", "libs/core/**"]
-        );
+        assert_eq!(config.scope_globs, vec!["services/auth/**", "libs/core/**"]);
     }
 
     #[tokio::test]

@@ -123,11 +123,20 @@ fn build_walker(
         .git_exclude(true)
         .overrides(overrides);
 
-    let scan_filter = ScanFilter::new(
-        &config.include_globs,
-        &config.exclude_globs,
-        &config.index_hidden_dirs,
-    )?;
+    let scan_filter = if !config.scope_globs.is_empty() {
+        ScanFilter::with_scope_globs(
+            &config.include_globs,
+            &config.exclude_globs,
+            &config.index_hidden_dirs,
+            &config.scope_globs,
+        )?
+    } else {
+        ScanFilter::new(
+            &config.include_globs,
+            &config.exclude_globs,
+            &config.index_hidden_dirs,
+        )?
+    };
 
     Ok((builder, scan_filter))
 }
