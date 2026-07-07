@@ -32,7 +32,7 @@ use crate::shared::project::canonical_project_root;
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
     combine_degraded_reasons, DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus,
-    DaemonRefreshState, DaemonWatchStatus, IndexingConfig, RunScope, SetupTimings,
+    DaemonRefreshState, DaemonWatchStatus, IndexScopeInfo, IndexingConfig, RunScope, SetupTimings,
 };
 use crate::storage::segments::{self, IndexedContextRow};
 use crate::storage::{db::Db, schema};
@@ -1478,6 +1478,87 @@ async fn run_dirty_projects_until_clean(
     }
 }
 
+/// REQ-013: Persist carried scope to the progress file so the new context's
+/// rebuild applies the scope from the prior context. This is an interim guard
+/// rail; v1.1 will implement per-cone drift tracking and full branch-context
+/// retention.
+fn persist_carried_scope(
+    state_root: &Path,
+    scope_info: &IndexScopeInfo,
+) -> Result<(), std::io::Error> {
+    use crate::shared::types::{IndexPhase, IndexProgress, IndexState};
+
+    let status_path = config::project_dot_dir(state_root).join("index_status.json");
+
+    // Read existing progress or create a new one
+    let mut progress: IndexProgress = if status_path.exists() {
+        let content = std::fs::read_to_string(&status_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| IndexProgress {
+            state: IndexState::Idle,
+            phase: IndexPhase::Pending,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: None,
+            updated_at: Utc::now(),
+        })
+    } else {
+        IndexProgress {
+            state: IndexState::Idle,
+            phase: IndexPhase::Pending,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: None,
+            updated_at: Utc::now(),
+        }
+    };
+
+    // Update the scope while preserving other fields
+    progress.scope = Some(scope_info.clone());
+    progress.updated_at = Utc::now();
+
+    // Write back to file
+    let json = serde_json::to_string_pretty(&progress)?;
+    std::fs::write(&status_path, json)?;
+
+    Ok(())
+}
+
 fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut ProjectStates) {
     let changed_contexts: Vec<(String, WorktreeContext)> = projects
         .iter()
@@ -1523,12 +1604,18 @@ fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut Project
                 Some("branch_context_changed".to_string()),
             );
             // REQ-013: If prior context had scope, carry it to prevent rebuild multiplication
-            if let Some(_scope_info) = prior_scope {
+            if let Some(scope_info) = prior_scope {
                 info!(
                     "Carrying scope from prior branch context to {} (interim guard rail for v1.1 per-cone drift)",
                     new_context_id
                 );
-                // The scope will be reapplied when the new context rebuilds
+                // Persist the scope to the progress file so the new context's rebuild applies it
+                if let Err(err) = persist_carried_scope(&state.project_root, &scope_info) {
+                    warn!(
+                        "failed to persist carried scope for {}: {}",
+                        new_context_id, err
+                    );
+                }
             }
             if !source_root_is_still_tracked(projects, &old_source_root) {
                 if let Err(err) = watcher.unwatch(&old_source_root) {

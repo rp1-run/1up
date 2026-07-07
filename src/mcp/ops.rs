@@ -439,6 +439,24 @@ pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
     .await
 }
 
+/// REQ-012: Spawn an indexing rebuild in the background task so oneup_start
+/// returns promptly. The rebuild runs asynchronously and updates progress via
+/// index_status.json, which agents can poll with oneup_status.
+fn spawn_rebuild_task(
+    roots: &McpProjectRoots,
+    rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) {
+    let roots = roots.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_index_then_classify(&roots, rebuild, scope_add, scope_narrow).await {
+            // Log the error but don't fail the task; progress is still available via status
+            tracing::warn!("background rebuild task failed: {}", err);
+        }
+    });
+}
+
 pub async fn start(
     roots: &McpProjectRoots,
     mode: StartMode,
@@ -465,22 +483,22 @@ pub async fn start(
         mode == StartMode::Reindex
     };
 
-    match mode {
-        StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
-            run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
-        }
-        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => {
-            run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
-        }
-        StartMode::Reindex => run_index_then_classify(roots, true, scope_add, scope_narrow).await,
-        _ => {
-            // Even if mode doesn't trigger indexing, scope changes should trigger indexing
-            if scope_affects_rebuild {
-                run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
-            } else {
-                Ok(readiness)
-            }
-        }
+    // REQ-012: Make oneup_start non-blocking. Spawn indexing in the background
+    // and return immediately with status Indexing + progress metadata.
+    let should_spawn = match mode {
+        StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => true,
+        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => true,
+        StartMode::Reindex => true,
+        _ => scope_affects_rebuild,
+    };
+
+    if should_spawn {
+        // Spawn the rebuild in the background so oneup_start returns promptly
+        spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
+        // Return immediately with Indexing status and progress
+        Ok(check_status(roots).await)
+    } else {
+        Ok(readiness)
     }
 }
 
@@ -4024,5 +4042,57 @@ mod tests {
 
         // Running state without a PID can't be checked for liveness, so not stale
         assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[tokio::test]
+    async fn spawn_rebuild_task_spawns_non_blocking() {
+        use std::time::Instant;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let state_root = tmp.path().to_path_buf();
+        let source_root = tmp.path().to_path_buf();
+
+        // Create minimal project structure
+        std::fs::create_dir_all(state_root.join(".1up")).unwrap();
+
+        // Create a minimal WorktreeContext
+        let worktree_context = WorktreeContext {
+            context_id: "test".to_string(),
+            state_root: state_root.clone(),
+            source_root: source_root.clone(),
+            main_worktree_root: source_root.clone(),
+            worktree_role: crate::shared::types::WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: crate::shared::types::BranchStatus::Unknown,
+        };
+
+        let roots = McpProjectRoots {
+            state_root: state_root.clone(),
+            source_root: source_root.clone(),
+            worktree_context,
+            launch_subdir: None,
+        };
+
+        // Measure time to call spawn_rebuild_task
+        let start = Instant::now();
+        spawn_rebuild_task(&roots, true, None, None);
+        let elapsed = start.elapsed();
+
+        // Should return almost immediately, not await the full pipeline
+        // (which would take seconds or more). A spawned task should return
+        // in just a few milliseconds.
+        assert!(
+            elapsed.as_millis() < 100,
+            "spawn_rebuild_task should return immediately, took {} ms",
+            elapsed.as_millis()
+        );
+
+        // Give spawned task a brief moment to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
