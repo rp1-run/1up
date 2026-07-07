@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::cli::project_status_files::prune_daemon_context_status;
+use crate::cli::project_status_files::{prune_daemon_context_status, read_index_progress};
 use crate::daemon::lifecycle;
 use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::daemon::search_service::{self, SearchRequest, SearchResponse};
@@ -1572,6 +1572,25 @@ async fn run_unit_while_servicing_search<F: Future>(
     }
 }
 
+/// Count files in a gitignore-aware manner for gate-check purposes.
+/// Returns the count of regular files that are not ignored by .gitignore.
+fn count_files_gitignore_aware(source_root: &Path) -> Result<usize, OneupError> {
+    use ignore::WalkBuilder;
+
+    let walker = WalkBuilder::new(source_root)
+        .hidden(false)
+        .ignore(true) // Respect .gitignore
+        .build();
+
+    let count = walker
+        .into_iter()
+        .filter_map(|result| result.ok())
+        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .count();
+
+    Ok(count)
+}
+
 async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
@@ -1623,6 +1642,54 @@ async fn run_project(
             );
             mark_refresh_finished(state, Utc::now(), Err(&e));
             return Err(e);
+        }
+    }
+
+    // REQ-001: Gate check for first-time large monorepo indexing.
+    // Before starting a first index, check if file count is over threshold without scope.
+    // If so, stay idle and let the MCP oneup_start path handle the gate.
+    {
+        let state = projects
+            .get(context_id)
+            .expect("dirty project must exist while gating");
+        let state_root = &state.project_root;
+        let source_root = &state.source_root;
+
+        // Check if this is a first index (no index.db exists)
+        let index_path = config::project_db_path(state_root);
+        if !index_path.exists() {
+            // First index: check the gate
+            let threshold = std::env::var(crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
+
+            let file_count = count_files_gitignore_aware(source_root).unwrap_or(0);
+
+            // Check if scope is recorded in the progress file
+            let scope_recorded = read_index_progress(state_root)
+                .and_then(|progress| progress.scope)
+                .is_some();
+
+            // Check the gate
+            if !lifecycle::should_start_first_index(
+                state_root,
+                file_count,
+                threshold,
+                scope_recorded,
+            )? {
+                debug!(
+                    "daemon gate fired for {}: over-threshold ({} > {}) without scope; staying idle",
+                    state_root.display(),
+                    file_count,
+                    threshold
+                );
+                // Re-mark the project as dirty so it stays queued for a later retry
+                let state = projects.get_mut(context_id).expect("must exist");
+                mark_refresh_pending(state, RunScope::Full, None);
+                mark_refresh_finished(state, Utc::now(), Ok(()));
+                return Ok(pipeline::PipelineStats::default());
+            }
         }
     }
 

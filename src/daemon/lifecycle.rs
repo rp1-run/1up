@@ -626,6 +626,42 @@ pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
     Ok(())
 }
 
+/// REQ-001: Check if a first-time index should be started based on file count and scope.
+/// Used by the daemon to gate large monorepo indexing until a scope is provided.
+///
+/// Returns:
+/// - Ok(true) if the index should proceed:
+///   - Index already exists (not a first index), OR
+///   - File count is under threshold, OR
+///   - File count is over threshold AND scope is recorded
+/// - Ok(false) if the index should be blocked (gate fires):
+///   - File count is over threshold AND no scope is recorded
+pub fn should_start_first_index(
+    state_root: &Path,
+    file_count: usize,
+    threshold: usize,
+    scope_recorded: bool,
+) -> Result<bool, OneupError> {
+    let index_path = config::project_db_path(state_root);
+
+    // If index already exists, this is not a first index; always proceed
+    if index_path.exists() {
+        return Ok(true);
+    }
+
+    // This is a first index. Check the gate: over-threshold without scope?
+    if file_count > threshold && !scope_recorded {
+        debug!(
+            "daemon gate: over-threshold ({} > {}) without scope; staying idle",
+            file_count, threshold
+        );
+        return Ok(false);
+    }
+
+    // Under threshold or scope is recorded; proceed with indexing
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +680,31 @@ mod tests {
     #[test]
     fn nonexistent_process_is_not_alive() {
         assert!(!is_process_alive(99999));
+    }
+
+    #[test]
+    fn test_should_start_first_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = tmp.path();
+        let threshold = 3_000;
+
+        // Case 1: Under threshold, no scope → should start
+        assert!(should_start_first_index(state_root, 2_500, threshold, false).unwrap());
+
+        // Case 2: Under threshold, with scope → should start
+        assert!(should_start_first_index(state_root, 2_500, threshold, true).unwrap());
+
+        // Case 3: Over threshold, with scope → should start
+        assert!(should_start_first_index(state_root, 5_000, threshold, true).unwrap());
+
+        // Case 4: Over threshold, no scope → should NOT start (gate fires)
+        assert!(!should_start_first_index(state_root, 5_000, threshold, false).unwrap());
+
+        // Case 5: Over threshold, no scope, but index exists → should start (not first index)
+        let index_path = config::project_db_path(state_root);
+        std::fs::create_dir_all(state_root.join(".1up")).unwrap();
+        std::fs::File::create(&index_path).unwrap();
+        assert!(should_start_first_index(state_root, 5_000, threshold, false).unwrap());
     }
 
     #[test]
