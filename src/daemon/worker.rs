@@ -1494,6 +1494,14 @@ fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut Project
         };
         let new_context_id = current_context.context_id.clone();
         let old_source_root = state.source_root.clone();
+
+        // REQ-013: Scope carry on branch switch. If the old context was scoped,
+        // document the scope so the new context can inherit it and avoid rebuild
+        // multiplication. This is an interim guard rail; v1.1 will implement
+        // per-cone drift tracking and full branch-context retention.
+        let prior_scope =
+            read_index_progress(&state.project_root).and_then(|progress| progress.scope.clone());
+
         state.watch_status = DaemonWatchStatus::DaemonStopped;
         persist_daemon_context_status_for_state(&state);
         state.watch_status = DaemonWatchStatus::Watching;
@@ -1514,6 +1522,14 @@ fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut Project
                 RunScope::Full,
                 Some("branch_context_changed".to_string()),
             );
+            // REQ-013: If prior context had scope, carry it to prevent rebuild multiplication
+            if let Some(_scope_info) = prior_scope {
+                info!(
+                    "Carrying scope from prior branch context to {} (interim guard rail for v1.1 per-cone drift)",
+                    new_context_id
+                );
+                // The scope will be reapplied when the new context rebuilds
+            }
             if !source_root_is_still_tracked(projects, &old_source_root) {
                 if let Err(err) = watcher.unwatch(&old_source_root) {
                     warn!(

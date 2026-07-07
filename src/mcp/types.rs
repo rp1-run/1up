@@ -200,8 +200,9 @@ pub struct ReadinessContextMetadata {
 pub struct NextAction {
     pub tool: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "json_object_schema")]
-    pub arguments: Value,
+    pub arguments: Option<Value>,
 }
 
 /// Directory statistics for monorepo facts envelope, showing file and vector counts per top-level directory.

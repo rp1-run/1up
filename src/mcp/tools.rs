@@ -104,10 +104,10 @@ impl OneupMcpServer {
                             next_actions.push(action(
                                 TOOL_START,
                                 format!("Index the launch subdirectory first: {}", launch_subdir),
-                                json!({
+                                Some(json!({
                                     "mode": "index_if_needed",
                                     "scope_add": [launch_subdir]
-                                }),
+                                })),
                             ));
                         }
 
@@ -122,10 +122,10 @@ impl OneupMcpServer {
                                 next_actions.push(action(
                                     TOOL_START,
                                     format!("Or index the largest directory: {}", largest_dir),
-                                    json!({
+                                    Some(json!({
                                         "mode": "index_if_needed",
                                         "scope_add": [largest_dir]
-                                    }),
+                                    })),
                                 ));
                             }
                         }
@@ -171,7 +171,7 @@ impl OneupMcpServer {
                 vec![action(
                     TOOL_SEARCH,
                     "Retry with a natural-language code discovery query.",
-                    json!({ "query": "<code discovery query>" }),
+                    None,
                 )],
             );
         }
@@ -222,7 +222,7 @@ impl OneupMcpServer {
                 vec![action(
                     TOOL_SEARCH,
                     "Search first to obtain durable handles for oneup_get.",
-                    json!({ "query": "<code discovery query>" }),
+                    None,
                 )],
             );
         }
@@ -266,7 +266,7 @@ impl OneupMcpServer {
                 vec![action(
                     TOOL_SEARCH,
                     "Search first to find relevant source locations for oneup_context.",
-                    json!({ "query": "<code discovery query>" }),
+                    None,
                 )],
             );
         }
@@ -328,7 +328,7 @@ impl OneupMcpServer {
                 vec![action(
                     TOOL_SEARCH,
                     "Search for the behavior first, then verify a discovered symbol.",
-                    json!({ "query": "<behavior or symbol intent>" }),
+                    None,
                 )],
             );
         }
@@ -375,12 +375,12 @@ impl OneupMcpServer {
                         action(
                             TOOL_SEARCH,
                             "Search to obtain a precise result handle for impact exploration.",
-                            json!({ "query": "<code discovery query>" }),
+                            None,
                         ),
                         action(
                             TOOL_SYMBOL,
                             "Verify a known symbol before using it as an impact anchor.",
-                            json!({ "name": "<symbol>", "include": "both" }),
+                            None,
                         ),
                     ],
                 );
@@ -642,39 +642,39 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
         ReadinessStatus::Ready => vec![action(
             TOOL_SEARCH,
             "Start discovery with a task-specific code search.",
-            json!({ "query": "<code discovery query>" }),
+            None,
         )],
         ReadinessStatus::Degraded => vec![
             action(
                 TOOL_SEARCH,
                 "Search is available, but results may be degraded.",
-                json!({ "query": "<code discovery query>" }),
+                None,
             ),
             action(
                 TOOL_STATUS,
                 "Refresh readiness after fixing the degraded index state.",
-                json!({}),
+                Some(json!({})),
             ),
         ],
         ReadinessStatus::Missing => vec![action(
             TOOL_START,
             "Create the local 1up index explicitly before searching.",
-            json!({ "mode": "index_if_missing" }),
+            Some(json!({ "mode": "index_if_missing" })),
         )],
         ReadinessStatus::Indexing => vec![action(
             TOOL_STATUS,
             "Poll readiness until indexing completes.",
-            json!({}),
+            Some(json!({})),
         )],
         ReadinessStatus::Stale => vec![action(
             TOOL_START,
             "Rebuild the local index explicitly before searching.",
-            json!({ "mode": "reindex" }),
+            Some(json!({ "mode": "reindex" })),
         )],
         ReadinessStatus::Blocked => vec![action(
             TOOL_STATUS,
             "Retry readiness after correcting the local repository path or project state.",
-            json!({}),
+            Some(json!({})),
         )],
     };
 
@@ -682,7 +682,7 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
         actions.push(action(
             TOOL_START,
             "The repository HEAD moved after the last index; refresh the index to pick up the changes.",
-            json!({ "mode": "index_if_needed" }),
+            Some(json!({ "mode": "index_if_needed" })),
         ));
     }
 
@@ -694,25 +694,29 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
         // If empty search results with scope, suggest widening scope
         if let Some(scope) = &payload.index_scope {
             if !scope.roots.is_empty() {
+                // REQ-008: Placeholder-free output. When results are empty and scoped,
+                // suggest widening scope but omit arguments for the search action
+                // since we cannot synthesize a real refined query.
                 let actions = vec![
                     action(
                         TOOL_START,
                         "Expand the indexed scope to include more code.",
-                        json!({ "scope_add": ["<additional_directory>"] }),
+                        None,
                     ),
                     action(
                         TOOL_SEARCH,
                         "Try a narrower or differently worded discovery query.",
-                        json!({ "query": "<refined code discovery query>" }),
+                        None,
                     ),
                 ];
                 return actions;
             }
         }
+        // Empty results, unscoped. Omit arguments since we cannot synthesize a real query.
         return vec![action(
             TOOL_SEARCH,
             "Try a narrower or differently worded discovery query.",
-            json!({ "query": "<refined code discovery query>" }),
+            None,
         )];
     };
 
@@ -720,12 +724,12 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
         action(
             TOOL_GET,
             "Hydrate the top search result before editing or concluding.",
-            json!({ "handles": [format!(":{}", first.handle)] }),
+            Some(json!({ "handles": [format!(":{}", first.handle)] })),
         ),
         action(
             TOOL_CONTEXT,
             "Retrieve file-line context around the top search result.",
-            json!({ "locations": [location_argument(&first.path, first.line_start)] }),
+            Some(json!({ "locations": [location_argument(&first.path, first.line_start)] })),
         ),
     ];
 
@@ -733,7 +737,7 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
         actions.push(action(
             TOOL_SYMBOL,
             "Verify definitions and references when completeness matters.",
-            json!({ "name": symbol, "include": "both", "fuzzy": true }),
+            Some(json!({ "name": symbol, "include": "both", "fuzzy": true })),
         ));
     }
 
@@ -750,13 +754,13 @@ fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
         let mut actions = vec![action(
             TOOL_CONTEXT,
             "Retrieve file-line context around the hydrated segment.",
-            json!({ "locations": [location_argument(&segment.path, segment.line_start)] }),
+            Some(json!({ "locations": [location_argument(&segment.path, segment.line_start)] })),
         )];
         if let Some(symbol) = segment.defined_symbols.first() {
             actions.push(action(
                 TOOL_SYMBOL,
                 "Verify references for the symbol defined in this segment.",
-                json!({ "name": symbol, "include": "both", "fuzzy": true }),
+                Some(json!({ "name": symbol, "include": "both", "fuzzy": true })),
             ));
         }
         return actions;
@@ -771,14 +775,15 @@ fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
         return vec![action(
             TOOL_SEARCH,
             "Search indexed code if this file-line context needs more evidence.",
-            json!({ "query": format!("{} {}", context.path, context.scope_type) }),
+            Some(json!({ "query": format!("{} {}", context.path, context.scope_type) })),
         )];
     }
 
+    // REQ-008: Placeholder-free output. Omit arguments when we cannot synthesize a real query.
     vec![action(
         TOOL_SEARCH,
         "Search again to obtain a valid handle or precise file location.",
-        json!({ "query": "<code discovery query>" }),
+        None,
     )]
 }
 
@@ -798,7 +803,7 @@ fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
         return vec![action(
             TOOL_SEARCH,
             "Search by behavior or context to find candidate symbols.",
-            json!({ "query": name }),
+            Some(json!({ "query": name })),
         )];
     }
 
@@ -811,12 +816,12 @@ fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
         action(
             TOOL_GET,
             "Read the symbol matches before using them as evidence.",
-            json!({ "handles": handles }),
+            Some(json!({ "handles": handles })),
         ),
         action(
             TOOL_CONTEXT,
             "Retrieve file-line context around the symbol matches.",
-            json!({ "locations": locations }),
+            Some(json!({ "locations": locations })),
         ),
     ]
 }
@@ -840,20 +845,22 @@ fn structural_next_actions(payload: &StructuralSearchReport, pattern: &str) -> V
         return vec![action(
             TOOL_CONTEXT,
             "Retrieve file-line context around the structural match.",
-            json!({ "locations": [location_argument(&first.file_path, first.line_start)] }),
+            Some(json!({ "locations": [location_argument(&first.file_path, first.line_start)] })),
         )];
     }
 
+    // REQ-008: Placeholder-free output. When results are empty, suggest alternatives
+    // without placeholder arguments.
     vec![
         action(
             TOOL_STRUCTURAL,
             "Retry with an adjusted tree-sitter pattern, language, or query scope.",
-            json!({ "pattern": pattern, "language": "<supported language>" }),
+            Some(json!({ "pattern": pattern })),
         ),
         action(
             TOOL_SEARCH,
             "Use ranked search if a structural pattern is too narrow.",
-            json!({ "query": "<code discovery query>" }),
+            None,
         ),
     ]
 }
@@ -863,7 +870,7 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
         return vec![action(
             TOOL_GET,
             "Read primary likely-impact results before making changes.",
-            json!({ "handles": [format!(":{}", first.segment_id)] }),
+            Some(json!({ "handles": [format!(":{}", first.segment_id)] })),
         )];
     }
 
@@ -875,7 +882,7 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
         return vec![action(
             TOOL_GET,
             "Read contextual impact guidance when no primary result is available.",
-            json!({ "handles": [format!(":{}", contextual.segment_id)] }),
+            Some(json!({ "handles": [format!(":{}", contextual.segment_id)] })),
         )];
     }
 
@@ -884,22 +891,23 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
             return vec![action(
                 TOOL_IMPACT,
                 "Retry impact with the suggested narrower result handle.",
-                json!({ "handle": format!(":{segment_id}") }),
+                Some(json!({ "handle": format!(":{segment_id}") })),
             )];
         }
         if let Some(scope) = &hint.suggested_scope {
             return vec![action(
                 TOOL_SEARCH,
                 "Search within the suggested scope to find a narrower anchor.",
-                json!({ "query": scope }),
+                Some(json!({ "query": scope })),
             )];
         }
     }
 
+    // REQ-008: Placeholder-free output. Omit arguments when we cannot synthesize a real narrower anchor.
     vec![action(
         TOOL_SEARCH,
         "Search for a narrower segment or symbol before retrying impact.",
-        json!({ "query": "<narrower impact anchor>" }),
+        None,
     )]
 }
 
@@ -914,21 +922,21 @@ fn overview_next_actions(payload: &OverviewPayload) -> Vec<NextAction> {
         actions.push(action(
             TOOL_SYMBOL,
             "Inspect the definition and references of the most-referenced type.",
-            json!({ "name": top.name }),
+            Some(json!({ "name": top.name })),
         ));
     }
     if let Some(densest) = payload.modules.first() {
         actions.push(action(
             TOOL_SEARCH,
             "Start targeted discovery inside the densest module.",
-            json!({ "query": format!("{} module responsibilities", densest.module) }),
+            Some(json!({ "query": format!("{} module responsibilities", densest.module) })),
         ));
     }
     if actions.is_empty() {
         actions.push(action(
             TOOL_STATUS,
             "Check readiness and indexing options before retrying the overview.",
-            json!({}),
+            Some(json!({})),
         ));
     }
 
@@ -1221,7 +1229,7 @@ fn indexed_tool_error(message: String) -> CallToolResult {
         vec![action(
             TOOL_STATUS,
             "Check readiness and index state before retrying this MCP call.",
-            json!({}),
+            Some(json!({})),
         )],
     )
 }
@@ -1284,7 +1292,7 @@ fn envelope(
     }
 }
 
-fn action(tool: &str, reason: impl Into<String>, arguments: Value) -> NextAction {
+fn action(tool: &str, reason: impl Into<String>, arguments: Option<Value>) -> NextAction {
     debug_assert!(
         RETAINED_PUBLIC_TOOLS.contains(&tool),
         "next action points to non-retained MCP tool: {tool}"
@@ -1359,7 +1367,11 @@ mod tests {
         assert_eq!(drift_actions.len(), clean_actions.len() + 1);
         let appended = drift_actions.last().unwrap();
         assert_eq!(appended.tool, TOOL_START);
-        assert_eq!(appended.arguments["mode"], "index_if_needed");
+        if let Some(args) = &appended.arguments {
+            assert_eq!(args["mode"], "index_if_needed");
+        } else {
+            panic!("expected arguments to be Some");
+        }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
     }
 
@@ -1427,7 +1439,10 @@ mod tests {
         let actions = impact_next_actions(&payload);
 
         assert_eq!(actions[0].tool, TOOL_IMPACT);
-        assert_eq!(actions[0].arguments, json!({ "handle": ":abcdef012345" }));
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "handle": ":abcdef012345" }))
+        );
     }
 
     fn overview_payload_fixture(
@@ -1480,11 +1495,11 @@ mod tests {
 
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[0].tool, TOOL_SYMBOL);
-        assert_eq!(actions[0].arguments, json!({ "name": "Db" }));
+        assert_eq!(actions[0].arguments, Some(json!({ "name": "Db" })));
         assert_eq!(actions[1].tool, TOOL_SEARCH);
         assert_eq!(
             actions[1].arguments,
-            json!({ "query": "src/cli module responsibilities" })
+            Some(json!({ "query": "src/cli module responsibilities" }))
         );
     }
 
@@ -1496,7 +1511,7 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].tool, TOOL_STATUS);
-        assert_eq!(actions[0].arguments, json!({}));
+        assert_eq!(actions[0].arguments, Some(json!({})));
     }
 
     #[test]
@@ -1510,7 +1525,7 @@ mod tests {
         assert_eq!(actions[0].tool, TOOL_SEARCH);
         assert_eq!(
             actions[0].arguments,
-            json!({ "query": "scripts module responsibilities" })
+            Some(json!({ "query": "scripts module responsibilities" }))
         );
     }
 }

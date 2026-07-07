@@ -916,10 +916,40 @@ pub async fn run_search(
     limit: usize,
     path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
-    retry_on_db_lock(|| async {
-        run_search_once(state_root, worktree_context, query, limit, path_prefix).await
-    })
-    .await
+    // REQ-012: Bound search latency to <10s during rebuild. If rebuild is in progress,
+    // apply a timeout; otherwise search without timeout (expected to be fast on idle index).
+    if rebuild_in_progress(state_root, &worktree_context.context_id) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            retry_on_db_lock(|| async {
+                run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Timeout: return degraded response with empty results
+                Ok(SearchPayload {
+                    status: OperationStatus::Degraded,
+                    results: vec![],
+                    degraded_reason: Some(
+                        "Search timed out during ongoing rebuild; try again after rebuilding completes."
+                            .to_string(),
+                    ),
+                    index_scope: compute_index_scope(state_root, &worktree_context.source_root)
+                        .await
+                        .ok()
+                        .flatten(),
+                })
+            }
+        }
+    } else {
+        retry_on_db_lock(|| async {
+            run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+        })
+        .await
+    }
 }
 
 /// Process-global warm embedding runtime for the in-process MCP fallback search
