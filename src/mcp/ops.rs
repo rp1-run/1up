@@ -445,17 +445,26 @@ pub async fn start(
     scope_add: Option<Vec<String>>,
     scope_narrow: Option<Vec<String>>,
 ) -> anyhow::Result<ReadinessPayload> {
+    // Check readiness first to determine rebuild requirements
+    let readiness = check_status(roots).await;
+
     // Determine if a rebuild (vs incremental write) is needed based on scope changes
+    // and index state:
+    // - scope_narrow always requires rebuild (atomic rebuild via StagingRebuild)
+    // - scope_add with missing index requires rebuild (create from scratch)
+    // - Reindex mode requires rebuild
     let scope_affects_rebuild = scope_add.is_some() || scope_narrow.is_some();
-    let rebuild_mode = if scope_affects_rebuild && scope_narrow.is_some() {
+    let rebuild_mode = if scope_narrow.is_some() {
         // Narrowing always requires full rebuild via StagingRebuild
         true
+    } else if scope_add.is_some() && readiness.status == ReadinessStatus::Missing {
+        // scope_add with no existing index requires rebuild to create the database
+        true
     } else {
-        // For scope_add or mode-based decisions, follow the original mode logic
+        // For other mode-based decisions, follow the original mode logic
         mode == StartMode::Reindex
     };
 
-    let readiness = check_status(roots).await;
     match mode {
         StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
             run_index_then_classify(roots, rebuild_mode, scope_add, scope_narrow).await
@@ -3505,4 +3514,5 @@ mod tests {
         assert_eq!(roots.source_root, repo_root);
         assert!(roots.launch_subdir.is_none());
     }
+
 }

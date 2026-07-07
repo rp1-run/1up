@@ -73,68 +73,73 @@ impl OneupMcpServer {
             }
         };
 
-        // Check if we should return facts envelope for a large monorepo
+        // Check if we should return facts envelope for a large monorepo.
+        // Only return facts if NO scope has been provided yet (user hasn't decided).
+        // If scope_add or scope_narrow is provided, proceed with indexing.
         let readiness = ops::check_status(&roots).await;
         if input.mode == StartMode::IndexIfMissing || input.mode == StartMode::IndexIfNeeded {
-            if let Ok(should_return_facts) =
-                ops::should_return_facts_envelope(&roots.state_root, &roots.source_root, &readiness)
-                    .await
-            {
-                if should_return_facts {
-                    // Generate and return facts envelope instead of indexing
-                    let facts = match ops::generate_facts_envelope(
-                        &roots.source_root,
-                        roots.launch_subdir.clone(),
-                    )
-                    .await
-                    {
-                        Ok(facts) => facts,
-                        Err(err) => return indexed_tool_error(err.to_string()),
-                    };
-
-                    let mut next_actions = vec![];
-                    if let Some(launch_subdir) = facts.launch_subdir.as_ref() {
-                        next_actions.push(action(
-                            TOOL_START,
-                            format!("Index the launch subdirectory first: {}", launch_subdir),
-                            json!({
-                                "mode": "index_if_needed",
-                                "scope_add": [launch_subdir]
-                            }),
-                        ));
-                    }
-
-                    if let Some(largest_dir) = facts
-                        .per_directory_stats
-                        .first()
-                        .map(|d| d.directory.clone())
-                    {
-                        if next_actions.is_empty()
-                            || facts.launch_subdir.as_ref().map(|s| s.as_str())
-                                != Some(&largest_dir)
+            // Skip facts envelope if scope has already been provided
+            if input.scope_add.is_none() && input.scope_narrow.is_none() {
+                if let Ok(should_return_facts) =
+                    ops::should_return_facts_envelope(&roots.state_root, &roots.source_root, &readiness)
+                        .await
+                {
+                    if should_return_facts {
+                        // Generate and return facts envelope instead of indexing
+                        let facts = match ops::generate_facts_envelope(
+                            &roots.source_root,
+                            roots.launch_subdir.clone(),
+                        )
+                        .await
                         {
+                            Ok(facts) => facts,
+                            Err(err) => return indexed_tool_error(err.to_string()),
+                        };
+
+                        let mut next_actions = vec![];
+                        if let Some(launch_subdir) = facts.launch_subdir.as_ref() {
                             next_actions.push(action(
                                 TOOL_START,
-                                format!("Or index the largest directory: {}", largest_dir),
+                                format!("Index the launch subdirectory first: {}", launch_subdir),
                                 json!({
                                     "mode": "index_if_needed",
-                                    "scope_add": [largest_dir]
+                                    "scope_add": [launch_subdir]
                                 }),
                             ));
                         }
-                    }
 
-                    let env = envelope(
-                        "refuse_and_propose_scope",
-                        format!(
-                            "Large repository ({} files) requires scope selection before indexing. \
-                             Review available directories and call oneup_start with scope_add.",
-                            facts.file_count_total
-                        ),
-                        serde_json::to_value(&facts).unwrap_or_else(|_| json!({})),
-                        next_actions,
-                    );
-                    return result(env);
+                        if let Some(largest_dir) = facts
+                            .per_directory_stats
+                            .first()
+                            .map(|d| d.directory.clone())
+                        {
+                            if next_actions.is_empty()
+                                || facts.launch_subdir.as_ref().map(|s| s.as_str())
+                                    != Some(&largest_dir)
+                            {
+                                next_actions.push(action(
+                                    TOOL_START,
+                                    format!("Or index the largest directory: {}", largest_dir),
+                                    json!({
+                                        "mode": "index_if_needed",
+                                        "scope_add": [largest_dir]
+                                    }),
+                                ));
+                            }
+                        }
+
+                        let env = envelope(
+                            "refuse_and_propose_scope",
+                            format!(
+                                "Large repository ({} files) requires scope selection before indexing. \
+                                 Review available directories and call oneup_start with scope_add.",
+                                facts.file_count_total
+                            ),
+                            serde_json::to_value(&facts).unwrap_or_else(|_| json!({})),
+                            next_actions,
+                        );
+                        return result(env);
+                    }
                 }
             }
         }
