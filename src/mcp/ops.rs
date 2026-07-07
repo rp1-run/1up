@@ -3693,6 +3693,7 @@ mod tests {
                 fallback_reason: None,
             }),
             prefilter: None,
+            indexer_pid: None,
             updated_at: Utc::now(),
         };
 
@@ -3736,6 +3737,7 @@ mod tests {
             timings: None,
             scope: None, // No scope info
             prefilter: None,
+            indexer_pid: None,
             updated_at: Utc::now(),
         };
 

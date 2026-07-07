@@ -784,6 +784,9 @@ pub struct IndexProgress {
     pub scope: Option<IndexScopeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilter: Option<IndexPrefilterInfo>,
+    /// REQ-010: PID of the indexing process, used for liveness checks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexer_pid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -812,6 +815,7 @@ impl IndexProgress {
             timings: None,
             scope: None,
             prefilter: None,
+            indexer_pid: None,
             updated_at: Utc::now(),
         }
     }

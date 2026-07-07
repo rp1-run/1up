@@ -152,6 +152,7 @@ fn refresh_progress(
         timings: update.timings,
         scope: update.scope,
         prefilter: update.prefilter,
+        indexer_pid: Some(std::process::id()),
         updated_at: chrono::Utc::now(),
     };
     if update.persist {
