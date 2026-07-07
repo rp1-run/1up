@@ -30,8 +30,8 @@ use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
-    IndexProgress, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult, SegmentRole,
-    SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
+    IndexProgress, IndexScope, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult,
+    SegmentRole, SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
@@ -103,6 +103,8 @@ pub struct ReadinessPayload {
     pub index_progress: Option<IndexProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon_status: Option<DaemonProjectStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +113,8 @@ pub struct SearchPayload {
     pub results: Vec<SearchHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -535,6 +539,7 @@ pub async fn classify_readiness(
         reason: None,
         index_progress,
         daemon_status,
+        index_scope: None,
     };
 
     if let Err(err) = project_id_result {
@@ -730,6 +735,12 @@ pub async fn classify_readiness(
 
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
+
+    // Compute and populate index scope for coverage disclosure
+    if let Ok(Some(scope)) = compute_index_scope(state_root, source_root).await {
+        payload.index_scope = Some(scope);
+    }
+
     payload
 }
 
@@ -816,6 +827,7 @@ pub fn blocked_readiness(
         reason: Some(reason.into()),
         index_progress,
         daemon_status,
+        index_scope: None,
     }
 }
 
@@ -840,6 +852,7 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         reason: Some(reason.into()),
         index_progress: None,
         daemon_status: None,
+        index_scope: None,
     }
 }
 
@@ -963,10 +976,17 @@ async fn run_search_once(
         None => OperationStatus::Ok,
     };
 
+    // Compute and populate index scope for coverage disclosure
+    let index_scope = compute_index_scope(state_root, &worktree_context.source_root)
+        .await
+        .ok()
+        .flatten();
+
     Ok(SearchPayload {
         status,
         results: results.into_iter().map(search_hit).collect(),
         degraded_reason,
+        index_scope,
     })
 }
 
@@ -2189,6 +2209,42 @@ pub async fn generate_facts_envelope(
     })
 }
 
+/// Computes the current index scope coverage information from the database and filesystem.
+///
+/// Reads the scope roots from the meta table, counts indexed files from the database,
+/// and counts total files in the repository. Returns None if the index is not present
+/// or readable.
+pub async fn compute_index_scope(
+    state_root: &Path,
+    source_root: &Path,
+) -> Result<Option<IndexScope>, OneupError> {
+    // Try to open the database
+    let db_path = project_db_path(state_root);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let db = Db::open_ro(&db_path).await?;
+    let conn = db.connect_tuned().await?;
+
+    // Read scope roots from meta table
+    let scope_roots = schema::read_scope_from_meta(&conn).await?;
+
+    // Count indexed files: get all file paths with segments
+    let indexed_file_paths = crate::storage::segments::get_all_file_paths(&conn).await?;
+    let indexed_files = indexed_file_paths.len();
+
+    // Count total files in the repository
+    let dir_counts = count_files_per_directory(source_root)?;
+    let total_files: usize = dir_counts.values().sum();
+
+    Ok(Some(IndexScope {
+        roots: scope_roots.unwrap_or_default(),
+        indexed_files,
+        total_files,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3194,5 +3250,66 @@ mod tests {
             Ok(vec![escape_path])
         };
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_scope_serializes_and_deserializes() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string(), "libs/core".to_string()],
+            indexed_files: 150,
+            total_files: 2500,
+        };
+
+        let json = serde_json::to_string(&scope).expect("should serialize");
+        let deserialized: IndexScope = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(deserialized.roots, scope.roots);
+        assert_eq!(deserialized.indexed_files, scope.indexed_files);
+        assert_eq!(deserialized.total_files, scope.total_files);
+    }
+
+    #[test]
+    fn index_scope_coverage_description_for_empty_scope() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec![],
+            indexed_files: 0,
+            total_files: 1000,
+        };
+
+        assert_eq!(scope.coverage_description(), "No scope configured");
+    }
+
+    #[test]
+    fn index_scope_coverage_description_calculates_percentage() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string()],
+            indexed_files: 150,
+            total_files: 600,
+        };
+
+        let description = scope.coverage_description();
+        assert!(description.contains("150 files indexed of 600 total"));
+        assert!(description.contains("25%"));
+    }
+
+    #[test]
+    fn index_scope_coverage_description_handles_zero_total() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string()],
+            indexed_files: 0,
+            total_files: 0,
+        };
+
+        let description = scope.coverage_description();
+        assert!(description.contains("0 files indexed of 0 total"));
+        assert!(description.contains("0%"));
     }
 }

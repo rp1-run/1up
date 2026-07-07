@@ -15,10 +15,10 @@ use crate::mcp::ops::{
 };
 use crate::mcp::server::OneupMcpServer;
 use crate::mcp::types::{
-    ContextInput, FactsEnvelope, GetInput, ImpactInput, NextAction, OverviewInput,
-    ReadinessContextMetadata, SearchInput, StartInput, StartMode, StatusInput, StructuralInput,
-    SymbolIncludeInput, SymbolInput, ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET,
-    TOOL_IMPACT, TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    ContextInput, GetInput, ImpactInput, NextAction, OverviewInput, ReadinessContextMetadata,
+    SearchInput, StartInput, StartMode, StatusInput, StructuralInput, SymbolIncludeInput,
+    SymbolInput, ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT,
+    TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::MAX_SEARCH_RESULTS;
@@ -671,6 +671,24 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
 
 fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
     let Some(first) = payload.results.first() else {
+        // If empty search results with scope, suggest widening scope
+        if let Some(scope) = &payload.index_scope {
+            if !scope.roots.is_empty() {
+                let actions = vec![
+                    action(
+                        TOOL_START,
+                        "Expand the indexed scope to include more code.",
+                        json!({ "scope_add": ["<additional_directory>"] }),
+                    ),
+                    action(
+                        TOOL_SEARCH,
+                        "Try a narrower or differently worded discovery query.",
+                        json!({ "query": "<refined code discovery query>" }),
+                    ),
+                ];
+                return actions;
+            }
+        }
         return vec![action(
             TOOL_SEARCH,
             "Try a narrower or differently worded discovery query.",
@@ -922,7 +940,21 @@ fn search_summary(payload: &SearchPayload, query: &str) -> String {
             payload.results.len(),
             query
         ),
-        OperationStatus::Empty => format!("No indexed code matched \"{}\".", query),
+        OperationStatus::Empty => {
+            // If empty search with scope, provide scope-aware message
+            if let Some(scope) = &payload.index_scope {
+                if !scope.roots.is_empty() {
+                    let scope_list = scope.roots.join(", ");
+                    return format!(
+                        "No results found in indexed scope [{}] for \"{}\". {}",
+                        scope_list,
+                        query,
+                        scope.coverage_description()
+                    );
+                }
+            }
+            format!("No indexed code matched \"{}\".", query)
+        }
         OperationStatus::Partial => format!(
             "Found {} partial 1up search result(s) for \"{}\".",
             payload.results.len(),

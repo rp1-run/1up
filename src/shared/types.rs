@@ -78,6 +78,40 @@ pub struct SearchResult {
     pub defined_symbols: Option<Vec<String>>,
 }
 
+/// Index scope coverage information showing what directory cones are indexed and repository coverage.
+///
+/// Disclosed on every readiness check and search result to ensure agents never assume
+/// code doesn't exist just because a search was empty. Explicit coverage disclosure forces
+/// the next-action (widen scope) to be visible in the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexScope {
+    /// Repo-relative directory roots currently indexed (e.g., ["services/auth", "libs/core"]).
+    pub roots: Vec<String>,
+    /// Number of files indexed in the current scope (count of segments/files with content).
+    pub indexed_files: usize,
+    /// Total files in the repository (denominator for coverage calculation).
+    pub total_files: usize,
+}
+
+impl IndexScope {
+    /// Returns a human-readable coverage percentage or description.
+    pub fn coverage_description(&self) -> String {
+        if self.roots.is_empty() {
+            "No scope configured".to_string()
+        } else {
+            let coverage_pct = if self.total_files > 0 {
+                (self.indexed_files as f64 / self.total_files as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            format!(
+                "{} files indexed of {} total ({}%)",
+                self.indexed_files, self.total_files, coverage_pct
+            )
+        }
+    }
+}
+
 /// Normalize a raw RRF score in `[0, ~1]` to an integer in `[0, 100]`.
 ///
 /// The mapping is monotonic, so ordering is preserved. Ties within one
