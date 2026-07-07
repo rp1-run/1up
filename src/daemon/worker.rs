@@ -1579,8 +1579,22 @@ async fn run_project(
         let db_start = std::time::Instant::now();
         let conn_setup = async {
             let conn = state.db.connect_tuned().await?;
-            let indexing_config =
+            let mut indexing_config =
                 config::resolve_indexing_config(None, None, state.indexing.as_ref())?;
+
+            // REQ-002: Daemon path must apply recorded scope identically to MCP path.
+            // Load scope from meta table and apply as include_globs so the file walk
+            // respects the scoped boundaries. This ensures both daemon and in-process
+            // paths produce identical scope behavior.
+            if let Ok(Some(scope_roots)) = crate::storage::schema::read_scope_from_meta(&conn).await
+            {
+                let scope_globs: Vec<String> = scope_roots
+                    .iter()
+                    .map(|root| format!("{}/**", root))
+                    .collect();
+                indexing_config.include_globs = scope_globs;
+            }
+
             Ok::<_, OneupError>((conn, indexing_config))
         }
         .await;

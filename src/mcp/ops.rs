@@ -592,6 +592,10 @@ pub async fn classify_readiness(
     {
         payload.status = ReadinessStatus::Indexing;
         payload.summary = "Indexing is currently running.".to_string();
+        // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+        if let Some(progress) = &payload.index_progress {
+            payload.index_scope = extract_scope_from_progress(progress);
+        }
         return payload;
     }
 
@@ -599,6 +603,10 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
+            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            if let Some(progress) = &payload.index_progress {
+                payload.index_scope = extract_scope_from_progress(progress);
+            }
             return payload;
         }
         payload.status = ReadinessStatus::Missing;
@@ -613,6 +621,10 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
+                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                if let Some(progress) = &payload.index_progress {
+                    payload.index_scope = extract_scope_from_progress(progress);
+                }
                 return payload;
             }
             payload.status = ReadinessStatus::Stale;
@@ -628,6 +640,10 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
+                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                if let Some(progress) = &payload.index_progress {
+                    payload.index_scope = extract_scope_from_progress(progress);
+                }
                 return payload;
             }
             payload.status = ReadinessStatus::Stale;
@@ -648,6 +664,10 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
+            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            if let Some(progress) = &payload.index_progress {
+                payload.index_scope = extract_scope_from_progress(progress);
+            }
             return payload;
         }
         // A freshly-initializing index (DB file and tables present, but the
@@ -1338,6 +1358,13 @@ async fn run_index(
     let _rebuild_lock =
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
+    // REQ-002: Write scope to index_status.json BEFORE the pipeline starts,
+    // ensuring scope is visible to `oneup_status` during indexing (not dependent
+    // on finalize_and_swap completion). This is done by the pipeline's initial
+    // progress update via IndexRunContext scope information. The scope is already
+    // applied to indexing_config.include_globs above, so the file walk will
+    // respect the scope globs.
+
     let db_start = Instant::now();
     let stats = if rebuild {
         // Build the refreshed index aside into a staging file and atomically switch
@@ -1393,6 +1420,10 @@ async fn run_index_pipeline(
         .await?;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
+    // REQ-002: Scope is always Full in the MCP path because scope is applied
+    // via include_globs in IndexingConfig. The pipeline respects include_globs
+    // during the scan, so all code paths (scoped and unscoped) use RunScope::Full
+    // with appropriate include_globs set or empty.
     pipeline::run_with_context_scope_setup_and_progress_root(
         conn,
         &roots.worktree_context,
@@ -2032,6 +2063,20 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
             .context_id
             .as_deref()
             .is_none_or(|progress_context_id| progress_context_id == context_id)
+    })
+}
+
+/// Extract scope info from progress file during indexing.
+/// REQ-002: Scope should be visible during indexing, independent of swap completion.
+fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
+    progress.scope.as_ref().map(|_scope_info| {
+        // During indexing, we populate from progress counters
+        // The roots will be populated from database at completion
+        IndexScope {
+            roots: vec![], // Will be populated from database when ready
+            indexed_files: progress.files_indexed,
+            total_files: progress.files_total,
+        }
     })
 }
 
@@ -3513,5 +3558,92 @@ mod tests {
         // Verify launch_subdir is None when invoked from root
         assert_eq!(roots.source_root, repo_root);
         assert!(roots.launch_subdir.is_none());
+    }
+
+    #[test]
+    fn extract_scope_from_progress_extracts_scope_info() {
+        use crate::shared::types::{BranchStatus, IndexPhase, IndexScopeInfo};
+        use chrono::Utc;
+
+        // Create a progress with scope info
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: Some("test".to_string()),
+            source_root: None,
+            branch_name: None,
+            branch_status: Some(BranchStatus::Unknown),
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 25,
+            files_indexed: 20,
+            files_skipped: 5,
+            files_deleted: 0,
+            segments_stored: 100,
+            embeddings_enabled: true,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: Some(IndexScopeInfo {
+                requested: "scoped:2".to_string(),
+                executed: "scoped:50".to_string(),
+                changed_paths: 50,
+                fallback_reason: None,
+            }),
+            prefilter: None,
+            updated_at: Utc::now(),
+        };
+
+        // Extract scope from progress
+        let scope = extract_scope_from_progress(&progress);
+
+        // Verify scope is extracted correctly
+        assert!(scope.is_some());
+        let scope = scope.unwrap();
+        assert_eq!(scope.roots, vec![] as Vec<String>); // Roots are populated from database at completion
+        assert_eq!(scope.indexed_files, 20);
+        assert_eq!(scope.total_files, 100);
+    }
+
+    #[test]
+    fn extract_scope_from_progress_returns_none_when_no_scope_info() {
+        use crate::shared::types::{BranchStatus, IndexPhase};
+        use chrono::Utc;
+
+        // Create a progress without scope info
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: Some("test".to_string()),
+            source_root: None,
+            branch_name: None,
+            branch_status: Some(BranchStatus::Unknown),
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 25,
+            files_indexed: 20,
+            files_skipped: 5,
+            files_deleted: 0,
+            segments_stored: 100,
+            embeddings_enabled: true,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None, // No scope info
+            prefilter: None,
+            updated_at: Utc::now(),
+        };
+
+        // Extract scope from progress
+        let scope = extract_scope_from_progress(&progress);
+
+        // Verify scope is None when no scope info
+        assert!(scope.is_none());
     }
 }
