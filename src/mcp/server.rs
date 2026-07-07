@@ -14,14 +14,16 @@ const SERVER_GUIDANCE: &str = "Use 1up as the primary code-search interface for 
 pub(crate) struct OneupMcpServer {
     pub(crate) state_root: PathBuf,
     pub(crate) source_root: PathBuf,
+    pub(crate) launch_subdir: Option<PathBuf>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl OneupMcpServer {
-    fn new(state_root: PathBuf, source_root: PathBuf) -> Self {
+    fn new(state_root: PathBuf, source_root: PathBuf, launch_subdir: Option<PathBuf>) -> Self {
         Self {
             state_root,
             source_root,
+            launch_subdir,
             tool_router: Self::tool_router(),
         }
     }
@@ -48,8 +50,12 @@ impl ServerHandler for OneupMcpServer {
     }
 }
 
-pub async fn serve_stdio(state_root: PathBuf, source_root: PathBuf) -> anyhow::Result<()> {
-    let service = OneupMcpServer::new(state_root, source_root);
+pub async fn serve_stdio(
+    state_root: PathBuf,
+    source_root: PathBuf,
+    launch_subdir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let service = OneupMcpServer::new(state_root, source_root, launch_subdir);
     let running = service.serve(stdio()).await?;
     let _quit_reason = running.waiting().await?;
     Ok(())
@@ -76,7 +82,7 @@ mod tests {
         let source_root = PathBuf::from(
             "/Users/some-developer/Development/workspaces/example-organization/example-monorepo-with-a-long-name/.worktrees/feature-branch-with-a-descriptive-name",
         );
-        OneupMcpServer::new(state_root, source_root)
+        OneupMcpServer::new(state_root, source_root, None)
     }
 
     #[test]

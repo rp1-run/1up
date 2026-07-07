@@ -494,7 +494,7 @@ impl OneupMcpServer {
                     &self.state_root,
                     &self.source_root,
                 ),
-                launch_subdir: None,
+                launch_subdir: self.launch_subdir.clone(),
             }),
         }
     }
