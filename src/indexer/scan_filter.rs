@@ -89,6 +89,22 @@ impl ScanFilter {
         if glob_matches(&self.include_globs, rel_path) || self.matches_override(rel_path, is_dir) {
             return false;
         }
+        // REQ-002: If include_globs is configured, check if this path is a parent
+        // of a matching path. For scoped indexing, we need to allow directories
+        // that contain scope roots (e.g., "services" should not be excluded even
+        // though the glob is "services/**"). For files, exclude if no match.
+        if !self.include_globs.is_empty() {
+            if is_dir {
+                // For directories, check if any include glob could match a child path
+                // by testing common path extensions (dir/subdir, dir/file.ext, etc.)
+                // A simple heuristic: don't exclude dirs, let the walk descend and filter files
+                // This way "services" dir is not excluded, and "services/file.rs" can be checked
+                return false;
+            } else {
+                // For files, if include_globs is set and file doesn't match, exclude it
+                return true;
+            }
+        }
         if glob_matches(&self.exclude_globs, rel_path) {
             return true;
         }

@@ -76,6 +76,8 @@ impl OneupMcpServer {
         // Check if we should return facts envelope for a large monorepo.
         // Only return facts if NO scope has been provided yet (user hasn't decided).
         // If scope_add or scope_narrow is provided, proceed with indexing.
+        // CRITICAL: Check this BEFORE calling ops::start() to prevent background
+        // spawning when gate fires (REQ-001).
         let readiness = ops::check_status(&roots).await;
         if input.mode == StartMode::IndexIfMissing || input.mode == StartMode::IndexIfNeeded {
             // Skip facts envelope if scope has already been provided
@@ -89,6 +91,7 @@ impl OneupMcpServer {
                 {
                     if should_return_facts {
                         // Generate and return facts envelope instead of indexing
+                        // REQ-001: Gate fires before ops::start to prevent background spawning
                         let facts = match ops::generate_facts_envelope(
                             &roots.source_root,
                             roots.launch_subdir.clone(),
@@ -146,6 +149,7 @@ impl OneupMcpServer {
             }
         }
 
+        // Only call ops::start() if gate did not fire (i.e., we reach this point)
         let mut payload =
             match ops::start(&roots, input.mode, input.scope_add, input.scope_narrow).await {
                 Ok(payload) => payload,

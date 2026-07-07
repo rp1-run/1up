@@ -376,6 +376,13 @@ async fn compute_new_scope(
         vec![]
     };
 
+    tracing::debug!(
+        "compute_new_scope: current_scope={:?}, scope_add={:?}, scope_narrow={:?}",
+        current_scope,
+        scope_add,
+        scope_narrow
+    );
+
     // Apply scope_narrow if provided (must be subset of current)
     if let Some(narrow_to) = scope_narrow {
         // Validate that narrow_to is a subset of current_scope
@@ -409,6 +416,10 @@ async fn compute_new_scope(
         }
     }
 
+    tracing::debug!(
+        "compute_new_scope: returning final_scope={:?}",
+        current_scope
+    );
     Ok(current_scope)
 }
 
@@ -426,6 +437,11 @@ fn apply_scope_to_indexing_config(
             .iter()
             .map(|root| format!("{}/**", root))
             .collect();
+        tracing::debug!(
+            "apply_scope_to_indexing_config: scope_roots={:?}, scope_globs={:?}",
+            scope_roots,
+            scope_globs
+        );
         config.include_globs = scope_globs;
         // REQ-002: Store the actual scope roots for progress recording
         config.scope_roots = scope_roots.to_vec();
@@ -469,6 +485,13 @@ pub async fn start(
     // Check readiness first to determine rebuild requirements
     let readiness = check_status(roots).await;
 
+    tracing::debug!(
+        "ops::start: mode={:?}, scope_add={:?}, status={:?}",
+        mode,
+        scope_add,
+        readiness.status
+    );
+
     // Determine if a rebuild (vs incremental write) is needed based on scope changes
     // and index state:
     // - scope_narrow always requires rebuild (atomic rebuild via StagingRebuild)
@@ -497,10 +520,16 @@ pub async fn start(
 
     if should_spawn {
         // Spawn the rebuild in the background so oneup_start returns promptly
+        tracing::debug!(
+            "ops::start: spawning rebuild (rebuild_mode={}, scope_add={:?})",
+            rebuild_mode,
+            scope_add
+        );
         spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
         // Return immediately with Indexing status and progress
         Ok(check_status(roots).await)
     } else {
+        tracing::debug!("ops::start: NOT spawning (should_spawn=false)");
         Ok(readiness)
     }
 }
@@ -1424,9 +1453,12 @@ async fn run_index(
         // failure before the switch drops the guard, leaving the prior index intact.
         let staged = swap::StagingRebuild::open(&roots.state_root).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
-        let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
-        // Persist scope to meta table before finalizing and swapping
+
+        // REQ-002 & REQ-005: Write scope to meta table BEFORE pipeline starts
+        // so clamp_deletion_on_scope_loss can read it during the pipeline
         schema::write_scope_to_meta(staged.connection(), &new_scope).await?;
+
+        let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
         staged.finalize_and_swap().await?;
         stats
     } else {
@@ -1436,9 +1468,11 @@ async fn run_index(
         let conn = db.connect_tuned().await?;
         schema::prepare_for_write(&conn).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
-        let stats = run_index_pipeline(&conn, roots, &indexing_config, setup).await?;
-        // Persist scope to meta table after successful pipeline
+
+        // REQ-002: Write scope to meta table BEFORE pipeline starts
         schema::write_scope_to_meta(&conn, &new_scope).await?;
+
+        let stats = run_index_pipeline(&conn, roots, &indexing_config, setup).await?;
         stats
     };
 

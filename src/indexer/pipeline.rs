@@ -531,6 +531,12 @@ async fn prepare_full_run_inputs(
 ) -> Result<RunInputs, OneupError> {
     let scanned = scanner::scan_directory(project_root, config)?;
     let discovered_count = scanned.len();
+    tracing::debug!(
+        "prepare_full_run_inputs: discovered {} files, scope_roots={:?}, include_globs={:?}",
+        discovered_count,
+        config.scope_roots,
+        config.include_globs
+    );
     let manifest = segments::get_all_indexed_files_for_context(conn, context_id).await?;
 
     let project_root_canonical = project_root

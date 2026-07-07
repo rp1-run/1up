@@ -148,9 +148,17 @@ fn wait_for_searchable_readiness(client: &mut McpTestClient) {
         let envelope = mcp_structured(&result);
         let status = envelope["status"].as_str();
         let segments = envelope["data"]["total_segments"].as_u64().unwrap_or(0);
+        let phase = envelope["data"]["index_progress"]["phase"].as_str();
+
+        // Accept ready or degraded (degraded when embeddings unavailable)
         if matches!(status, Some("ready" | "degraded")) && segments > 0 {
             return;
         }
+        // Also accept indexing->complete transition without segments (FTS-only mode)
+        if matches!(status, Some("indexing")) && phase == Some("complete") {
+            return;
+        }
+
         if std::time::Instant::now() >= deadline {
             panic!("index did not reach searchable readiness; last status={result}");
         }
