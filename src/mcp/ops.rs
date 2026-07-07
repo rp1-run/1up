@@ -2069,13 +2069,22 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
 /// Extract scope info from progress file during indexing.
 /// REQ-002: Scope should be visible during indexing, independent of swap completion.
 fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
-    progress.scope.as_ref().map(|_scope_info| {
-        // During indexing, we populate from progress counters
-        // The roots will be populated from database at completion
-        IndexScope {
-            roots: vec![], // Will be populated from database when ready
-            indexed_files: progress.files_indexed,
-            total_files: progress.files_total,
+    // Only extract scope during indexing if progress has scope info recorded.
+    // Don't create empty IndexScope objects that might affect search filtering.
+    progress.scope.as_ref().and_then(|scope_info| {
+        // Only return IndexScope if we have meaningful content during the scan phase
+        // (when files_total is known). The scope roots will be properly populated
+        // from the database when the index is ready.
+        if progress.files_total > 0 {
+            Some(IndexScope {
+                roots: vec![], // Will be populated from database when ready
+                indexed_files: progress.files_indexed,
+                total_files: progress.files_total,
+            })
+        } else {
+            // During early phases (Preparing, LoadingModel) before scanning,
+            // don't create an IndexScope yet
+            None
         }
     })
 }
