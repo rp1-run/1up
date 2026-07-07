@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use libsql::Connection;
@@ -155,6 +156,63 @@ fn should_idle_shutdown(
     is_empty && empty_for.is_some_and(|elapsed| elapsed >= idle_timeout)
 }
 
+/// REQ-011: Set up parent-death signaling to ensure workers don't outlive their parent.
+/// On Unix platforms (Linux/macOS), this installs signal handlers or OS mechanisms
+/// that will terminate the worker if its parent process dies.
+/// This prevents orphaned __worker processes from consuming resources.
+#[allow(dead_code)]
+fn setup_parent_death_signal() {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::prctl::{self, PrctlOption};
+
+        // On Linux, use prctl(PR_SET_PDEATHSIG) to receive SIGTERM when parent dies
+        match prctl::prctl(PrctlOption::SetPdeathsig(nix::sys::signal::Signal::SIGTERM)) {
+            Ok(_) => debug!("parent-death signaling configured: SIGTERM on parent exit"),
+            Err(e) => warn!("failed to set parent-death signal: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use nix::sys::signal::{signal, SigHandler, Signal};
+        use nix::unistd;
+
+        // On macOS, install a SIGTERM handler and spawn a monitor thread
+        // to detect when parent dies (parent PID becomes 1 / init)
+        let _parent_pid = unistd::getppid();
+
+        // Register SIGTERM handler
+        extern "C" fn handle_sigterm(_sig: i32) {
+            std::process::exit(1);
+        }
+
+        unsafe {
+            let _ = signal(Signal::SIGTERM, SigHandler::Handler(handle_sigterm));
+        }
+
+        // Spawn monitor thread to check if parent is still alive
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+
+                // If parent PID becomes 1 (init), parent is dead
+                let current_ppid = unistd::getppid().as_raw() as u32;
+                if current_ppid == 1 {
+                    std::process::exit(1);
+                }
+            }
+        });
+
+        debug!("parent-death signaling configured: monitor thread on macOS");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        debug!("parent-death signaling not supported on this platform");
+    }
+}
+
 pub async fn run() -> Result<(), OneupError> {
     let _daemon_lock = lifecycle::acquire_daemon_lock()?;
 
@@ -163,6 +221,9 @@ pub async fn run() -> Result<(), OneupError> {
 
 async fn run_inner() -> Result<(), OneupError> {
     info!("daemon worker starting (pid={})", std::process::id());
+
+    // REQ-011: Set up parent-death signaling to prevent orphaned worker processes
+    setup_parent_death_signal();
 
     let mut sighup = signal(SignalKind::hangup()).map_err(|e| {
         crate::shared::errors::DaemonError::SignalError(format!("SIGHUP handler: {e}"))

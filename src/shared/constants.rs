@@ -222,6 +222,11 @@ pub const REBUILD_LOCK_CONTENTION_TIMEOUT_MS: u64 = 5_000;
 /// Poll interval while waiting for a contended rebuild lock to be released.
 pub const REBUILD_LOCK_RETRY_INTERVAL_MS: u64 = 200;
 
+/// REQ-010/REQ-011: Threshold in seconds to determine if a status file or rebuild lock is stale.
+/// If a file claims Running/Locked state but the owning process is dead and file age exceeds this,
+/// the file is treated as stale and auto-reconciled or cleared.
+pub const STALENESS_THRESHOLD_SECS: u64 = 300; // 5 minutes
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 

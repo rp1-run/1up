@@ -2053,8 +2053,16 @@ fn only_references(results: Vec<SymbolResult>) -> Vec<SymbolResult> {
 
 fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let path = project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = std::fs::read_to_string(&path).ok()?;
+    let progress = serde_json::from_str(&content).ok()?;
+
+    // REQ-010: Check if the progress file is stale (Running state, dead process, age > 5 min).
+    // Treat stale progress as if no index exists, so agents don't poll indefinitely.
+    if is_index_progress_stale(&progress, &path) {
+        return None;
+    }
+
+    Some(progress)
 }
 
 fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Option<IndexProgress> {
@@ -2087,6 +2095,45 @@ fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
             None
         }
     })
+}
+
+/// REQ-010: Check if an index progress file is stale.
+/// A progress file is stale if it claims Running state but the owning process (indexer_pid)
+/// is dead AND the file is older than STALENESS_THRESHOLD_SECS (5 minutes).
+/// This prevents agents from indefinitely polling a stuck indexing state.
+fn is_index_progress_stale(progress: &IndexProgress, status_path: &Path) -> bool {
+    use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+    use std::fs;
+
+    // Only consider Running state as potentially stale
+    if progress.state != IndexState::Running {
+        return false;
+    }
+
+    // Must have a PID to check liveness
+    let Some(pid) = progress.indexer_pid else {
+        return false;
+    };
+
+    // Process is still alive: not stale
+    if lifecycle::is_process_alive(pid) {
+        return false;
+    }
+
+    // Process is dead. Check file age against staleness threshold.
+    let Ok(metadata) = fs::metadata(status_path) else {
+        return false;
+    };
+
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+
+    let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+
+    elapsed.as_secs() > STALENESS_THRESHOLD_SECS
 }
 
 fn embedding_unavailable_reason(status: &EmbeddingLoadStatus) -> Option<String> {
@@ -2577,9 +2624,10 @@ pub async fn compute_index_scope(
 mod tests {
     use super::*;
     use crate::shared::types::{
-        BranchStatus, DaemonRefreshState, StructuralSearchStatus, WorktreeRole,
+        BranchStatus, DaemonRefreshState, IndexPhase, StructuralSearchStatus, WorktreeRole,
     };
     use crate::storage::segments::{self, SegmentInsert};
+    use chrono::Utc;
     use std::fs;
 
     fn readiness_fixture() -> ReadinessPayload {
@@ -3834,5 +3882,117 @@ mod tests {
 
         // Verify scope is None when no scope info
         assert!(scope.is_none());
+    }
+
+    #[test]
+    fn progress_with_idle_state_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+
+        let progress = IndexProgress {
+            state: IndexState::Idle,
+            phase: IndexPhase::Pending,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: Some(std::process::id()),
+            updated_at: Utc::now(),
+        };
+
+        // Idle state should never be stale regardless of process or file age
+        assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[test]
+    fn running_progress_with_live_process_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+
+        // Create the status file so we can check its mtime
+        fs::write(&status_path, "{}").unwrap();
+
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: Some(std::process::id()), // Current process is alive
+            updated_at: Utc::now(),
+        };
+
+        // Running state with a live process should not be stale
+        assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[test]
+    fn running_progress_without_pid_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+        fs::write(&status_path, "{}").unwrap();
+
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: None, // No PID recorded
+            updated_at: Utc::now(),
+        };
+
+        // Running state without a PID can't be checked for liveness, so not stale
+        assert!(!is_index_progress_stale(&progress, &status_path));
     }
 }

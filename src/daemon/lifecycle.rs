@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -546,6 +546,80 @@ fn acquire_rebuild_lock_with_bound(
     .into())
 }
 
+/// REQ-010: Check if a rebuild lock file is stale.
+/// A lock is stale if the file age exceeds STALENESS_THRESHOLD_SECS (5 minutes) AND
+/// no process currently holds the lock (non-blocking lock succeeds).
+/// This allows auto-clearing of locks from dead processes so they don't block forever.
+pub fn is_rebuild_lock_stale(state_root: &Path) -> Result<bool, OneupError> {
+    use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+    use std::fs;
+
+    let lock_path = config::project_rebuild_lock_path(state_root);
+
+    // If the lock file doesn't exist, it's not stale (non-existent is fine)
+    let metadata = match fs::metadata(&lock_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(
+                DaemonError::RebuildLockError(format!("failed to stat lock file: {e}")).into(),
+            )
+        }
+    };
+
+    // Check file age
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+
+    let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
+        return Ok(false);
+    };
+
+    // If file is newer than threshold, it's not stale
+    if elapsed.as_secs() <= STALENESS_THRESHOLD_SECS {
+        return Ok(false);
+    }
+
+    // File is old. Try to acquire lock without blocking. If we can acquire it,
+    // that means no one else holds it, so it's stale.
+    match try_acquire_rebuild_lock(state_root) {
+        Ok(Some(_lock)) => {
+            // We got the lock, which means it was free. The old file is stale.
+            // The guard will release on drop.
+            Ok(true)
+        }
+        Ok(None) => {
+            // Someone still holds it, so it's not stale
+            Ok(false)
+        }
+        Err(_) => {
+            // Error checking; assume not stale to be conservative
+            Ok(false)
+        }
+    }
+}
+
+/// REQ-010: Clear a stale rebuild lock file.
+/// Only clears if the lock is confirmed stale (old file, no holder).
+pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
+    if is_rebuild_lock_stale(state_root)? {
+        let lock_path = config::project_rebuild_lock_path(state_root);
+        if let Err(e) = std::fs::remove_file(&lock_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "failed to remove stale rebuild lock {}: {}",
+                    lock_path.display(),
+                    e
+                );
+            }
+        } else {
+            info!("cleared stale rebuild lock: {}", lock_path.display());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +911,31 @@ mod tests {
         assert!(
             try_acquire_rebuild_lock(&state_root_b).unwrap().is_some(),
             "a different state root must use an independent lock"
+        );
+    }
+
+    #[test]
+    fn recent_rebuild_lock_is_not_stale() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // Acquire the lock (it's fresh)
+        let _lock = acquire_rebuild_lock(&state_root).unwrap();
+
+        // A recently created lock should not be stale
+        assert!(
+            !is_rebuild_lock_stale(&state_root).unwrap(),
+            "recent lock should not be stale"
+        );
+    }
+
+    #[test]
+    fn rebuild_lock_missing_is_not_stale() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // If lock file doesn't exist, it's not stale
+        assert!(
+            !is_rebuild_lock_stale(&state_root).unwrap(),
+            "missing lock file should not be stale"
         );
     }
 }
