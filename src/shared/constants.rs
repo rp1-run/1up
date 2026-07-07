@@ -309,6 +309,15 @@ pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 
 /// Schema version for database layout.
 ///
+/// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta
+/// table as `scope_roots_v1` (JSON-serialized `Vec<String>`), applied uniformly
+/// across all contexts in a state_root. Scope is applied via `ScanFilter` at
+/// indexing time; scope roots are never mixed with unscoped segments, so a
+/// scoped index and an unscoped index are mutually exclusive per state_root.
+/// Fresh indexes initialize scope as `None` (unscoped); existing unscoped indexes
+/// migrated to v19 on first write (no in-place migration). Pre-feature binaries
+/// fail closed on encountering a scoped index.
+///
 /// v18: bundles the Phase-2 re-embed migration. The default embedding path is
 /// now the dynamic-INT8 model variant ([`MODEL_ONNX_INT8_FILENAME`]), whose
 /// identity is folded into the content-addressed embedding `content_key` via
@@ -332,7 +341,7 @@ pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
