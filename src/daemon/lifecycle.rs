@@ -522,6 +522,11 @@ fn acquire_rebuild_lock_with_bound(
     timeout: Duration,
     retry_interval: Duration,
 ) -> Result<RebuildLock, OneupError> {
+    // REQ-010: Clear stale rebuild lock before attempting acquisition.
+    // This ensures that a stale lock from a dead process doesn't block indefinitely.
+    // The function checks both age (>5 min) and holder liveness before clearing.
+    let _ = clear_stale_rebuild_lock(state_root);
+
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -602,6 +607,7 @@ pub fn is_rebuild_lock_stale(state_root: &Path) -> Result<bool, OneupError> {
 
 /// REQ-010: Clear a stale rebuild lock file.
 /// Only clears if the lock is confirmed stale (old file, no holder).
+/// Called before rebuild lock acquisition to prevent indefinite blocking on stale locks from dead processes.
 pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
     if is_rebuild_lock_stale(state_root)? {
         let lock_path = config::project_rebuild_lock_path(state_root);
@@ -911,6 +917,66 @@ mod tests {
         assert!(
             try_acquire_rebuild_lock(&state_root_b).unwrap().is_some(),
             "a different state root must use an independent lock"
+        );
+    }
+
+    #[test]
+    fn stale_rebuild_lock_is_auto_cleared_before_acquisition() {
+        use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+
+        let (_tmp, state_root) = state_root_dir();
+
+        // Create a lock file and immediately age it beyond the staleness threshold.
+        {
+            let _lock = acquire_rebuild_lock(&state_root).unwrap();
+            let lock_path = crate::shared::config::project_rebuild_lock_path(&state_root);
+
+            // Set file mtime to well past the staleness threshold
+            let old_time = SystemTime::now() - Duration::from_secs(STALENESS_THRESHOLD_SECS + 60);
+            filetime::set_file_mtime(&lock_path, old_time.into()).unwrap();
+        }
+        // Guard dropped; lock file remains on disk but no process holds it
+
+        // Now try to acquire: the stale lock should be auto-cleared and acquisition succeeds
+        let result = acquire_rebuild_lock_with_bound(
+            &state_root,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            result.is_ok(),
+            "acquire_rebuild_lock_with_bound must auto-clear the stale lock and succeed"
+        );
+    }
+
+    #[test]
+    fn fresh_rebuild_lock_held_by_live_process_is_not_cleared() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // Hold the lock with the current process (which is alive)
+        let _held = acquire_rebuild_lock(&state_root).unwrap();
+
+        // The lock is fresh and held by a live process; clearing check should find it not stale
+        let is_stale = is_rebuild_lock_stale(&state_root).unwrap();
+        assert!(
+            !is_stale,
+            "fresh lock held by live process should not be marked stale"
+        );
+
+        // Try to acquire (with short timeout to avoid waiting): should get contention error, not success
+        let result = acquire_rebuild_lock_with_bound(
+            &state_root,
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(OneupError::Daemon(DaemonError::RebuildLockContended { .. }))
+            ),
+            "acquire should fail with contention, not succeed (lock should not be cleared)"
         );
     }
 

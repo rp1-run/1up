@@ -141,6 +141,8 @@ tokio-util = { version = "0.7", default-features = false }
 # cancel an in-flight indexing pass at a committed-batch boundary (mirrors
 # the main-crate pin; reuses the same Cargo.lock version, no new tree).
 libsql = { version = "0.9", default-features = false, features = ["core"] }
+# Set file modification times in tests for staleness verification
+filetime = "0.2"
 
 [[bench]]
 name = "search_bench"
