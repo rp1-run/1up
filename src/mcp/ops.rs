@@ -2272,19 +2272,19 @@ pub async fn generate_facts_envelope(
     let dir_counts = count_files_per_directory(source_root)?;
 
     let file_count_total: usize = dir_counts.values().sum();
-    let vector_estimate_total = (file_count_total + 9) / 10; // Conservative: ~10 files per vector
+    let vector_estimate_total = file_count_total.div_ceil(10); // Conservative: ~10 files per vector
 
     let mut per_directory_stats: Vec<DirectoryStats> = dir_counts
         .into_iter()
         .map(|(directory, file_count)| DirectoryStats {
             directory,
             file_count,
-            estimated_vectors: (file_count + 9) / 10,
+            estimated_vectors: file_count.div_ceil(10),
         })
         .collect();
 
     // Sort by file count descending (largest first)
-    per_directory_stats.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
 
     let workspace_manifests = detect_workspace_manifests(source_root);
     let sparse_checkout = get_sparse_checkout_info(source_root);
@@ -3373,7 +3373,7 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let scope_add = Some(vec!["services/auth".to_string()]);
-        let result = compute_new_scope(&temp_dir.path(), scope_add.clone(), None)
+        let result = compute_new_scope(temp_dir.path(), scope_add.clone(), None)
             .await
             .unwrap();
         assert_eq!(result, vec!["services/auth"]);
@@ -3385,7 +3385,7 @@ mod tests {
         use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
         let scope_narrow = Some(vec!["services/auth".to_string()]);
-        let result = compute_new_scope(&temp_dir.path(), None, scope_narrow)
+        let result = compute_new_scope(temp_dir.path(), None, scope_narrow)
             .await
             .unwrap();
         assert_eq!(result, vec!["services/auth"]);
@@ -3514,5 +3514,4 @@ mod tests {
         assert_eq!(roots.source_root, repo_root);
         assert!(roots.launch_subdir.is_none());
     }
-
 }

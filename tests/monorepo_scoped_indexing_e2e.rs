@@ -199,7 +199,11 @@ fn create_test_monorepo(root: &Path, num_cones: usize) {
     fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
     // Create a default branch reference so git can determine branch context
-    fs::write(git_dir.join("refs").join("heads").join("main"), "0000000000000000000000000000000000000000\n").unwrap();
+    fs::write(
+        git_dir.join("refs").join("heads").join("main"),
+        "0000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
 
     // Create Cargo.toml in root
     fs::write(

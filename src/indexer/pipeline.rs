@@ -1318,7 +1318,11 @@ async fn clamp_deletion_on_scope_loss(
     };
 
     // Get all recorded file paths (coverage that exists in the index).
-    let recorded_paths: HashSet<String> = match segments::get_all_file_paths_for_context(conn, context_id).await {
+    let recorded_paths: HashSet<String> = match segments::get_all_file_paths_for_context(
+        conn, context_id,
+    )
+    .await
+    {
         Ok(paths) => paths.into_iter().collect(),
         Err(err) => {
             warn!(
@@ -2182,15 +2186,12 @@ async fn execute_run_with_inputs(
         // If scope was configured but metadata is lost, clamp to recorded coverage
         // and emit a warning. Never silently delete all segments and re-index.
         let (clamped_deletes, scope_loss_warning) =
-            clamp_deletion_on_scope_loss(conn, &context.context_id, &deleted_paths)
-                .await?;
+            clamp_deletion_on_scope_loss(conn, &context.context_id, &deleted_paths).await?;
 
         if let Some(warning_msg) = scope_loss_warning {
             warn!("scope metadata loss detected: {}", warning_msg);
-            stats.embedding_unavailable_reason = Some(format!(
-                "scope metadata loss on rebuild: {}",
-                warning_msg
-            ));
+            stats.embedding_unavailable_reason =
+                Some(format!("scope metadata loss on rebuild: {}", warning_msg));
         }
 
         let store_before_delete = timings.store_ms;
@@ -4263,7 +4264,9 @@ mod tests {
         let config = IndexingConfig::new(2, 1, 1).unwrap();
 
         // Index files to create coverage
-        run_with_config(&conn, tmp.path(), None, &config).await.unwrap();
+        run_with_config(&conn, tmp.path(), None, &config)
+            .await
+            .unwrap();
 
         // Verify coverage exists
         let recorded = segments::get_all_file_paths_for_context(&conn, context_id)
@@ -4321,7 +4324,8 @@ mod tests {
         // Verify it's in the live DB
         let read_scope = schema::read_scope_from_meta(&conn).await.unwrap();
         assert_eq!(
-            read_scope, Some(initial_scope.clone()),
+            read_scope,
+            Some(initial_scope.clone()),
             "initial scope should be written to live DB"
         );
 
@@ -4342,14 +4346,16 @@ mod tests {
         // Verify scope is in staging DB
         let staged_scope = schema::read_scope_from_meta(&staging_conn).await.unwrap();
         assert_eq!(
-            staged_scope, Some(new_scope.clone()),
+            staged_scope,
+            Some(new_scope.clone()),
             "scope should be stamped into staging DB before swap"
         );
 
         // The live DB should still have the old scope (not yet swapped)
         let live_scope = schema::read_scope_from_meta(&conn).await.unwrap();
         assert_eq!(
-            live_scope, Some(initial_scope),
+            live_scope,
+            Some(initial_scope),
             "live DB should retain original scope until swap completes"
         );
     }

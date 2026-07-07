@@ -80,9 +80,12 @@ impl OneupMcpServer {
         if input.mode == StartMode::IndexIfMissing || input.mode == StartMode::IndexIfNeeded {
             // Skip facts envelope if scope has already been provided
             if input.scope_add.is_none() && input.scope_narrow.is_none() {
-                if let Ok(should_return_facts) =
-                    ops::should_return_facts_envelope(&roots.state_root, &roots.source_root, &readiness)
-                        .await
+                if let Ok(should_return_facts) = ops::should_return_facts_envelope(
+                    &roots.state_root,
+                    &roots.source_root,
+                    &readiness,
+                )
+                .await
                 {
                     if should_return_facts {
                         // Generate and return facts envelope instead of indexing
@@ -114,8 +117,7 @@ impl OneupMcpServer {
                             .map(|d| d.directory.clone())
                         {
                             if next_actions.is_empty()
-                                || facts.launch_subdir.as_ref().map(|s| s.as_str())
-                                    != Some(&largest_dir)
+                                || facts.launch_subdir.as_deref() != Some(&largest_dir)
                             {
                                 next_actions.push(action(
                                     TOOL_START,
