@@ -15,10 +15,10 @@ use crate::mcp::ops::{
 };
 use crate::mcp::server::OneupMcpServer;
 use crate::mcp::types::{
-    ContextInput, GetInput, ImpactInput, NextAction, OverviewInput, ReadinessContextMetadata,
-    SearchInput, StartInput, StatusInput, StructuralInput, SymbolIncludeInput, SymbolInput,
-    ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_SEARCH,
-    TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
+    ContextInput, FactsEnvelope, GetInput, ImpactInput, NextAction, OverviewInput,
+    ReadinessContextMetadata, SearchInput, StartInput, StartMode, StatusInput, StructuralInput,
+    SymbolIncludeInput, SymbolInput, ToolEnvelope, RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT,
+    TOOL_GET, TOOL_IMPACT, TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::MAX_SEARCH_RESULTS;
@@ -72,6 +72,66 @@ impl OneupMcpServer {
                 return result(readiness_result(payload, None));
             }
         };
+
+        // Check if we should return facts envelope for a large monorepo
+        let readiness = ops::check_status(&roots).await;
+        if input.mode == StartMode::IndexIfMissing || input.mode == StartMode::IndexIfNeeded {
+            if let Ok(should_return_facts) =
+                ops::should_return_facts_envelope(&roots.state_root, &roots.source_root, &readiness)
+                    .await
+            {
+                if should_return_facts {
+                    // Generate and return facts envelope instead of indexing
+                    let facts = match ops::generate_facts_envelope(&roots.source_root, None).await {
+                        Ok(facts) => facts,
+                        Err(err) => return indexed_tool_error(err.to_string()),
+                    };
+
+                    let mut next_actions = vec![];
+                    if let Some(launch_subdir) = facts.launch_subdir.as_ref() {
+                        next_actions.push(action(
+                            TOOL_START,
+                            format!("Index the launch subdirectory first: {}", launch_subdir),
+                            json!({
+                                "mode": "index_if_needed",
+                                "scope_add": [launch_subdir]
+                            }),
+                        ));
+                    }
+
+                    if let Some(largest_dir) = facts
+                        .per_directory_stats
+                        .first()
+                        .map(|d| d.directory.clone())
+                    {
+                        if next_actions.is_empty()
+                            || facts.launch_subdir.as_ref().map(|s| s.as_str()) != Some(&largest_dir)
+                        {
+                            next_actions.push(action(
+                                TOOL_START,
+                                format!("Or index the largest directory: {}", largest_dir),
+                                json!({
+                                    "mode": "index_if_needed",
+                                    "scope_add": [largest_dir]
+                                }),
+                            ));
+                        }
+                    }
+
+                    let env = envelope(
+                        "refuse_and_propose_scope",
+                        format!(
+                            "Large repository ({} files) requires scope selection before indexing. \
+                             Review available directories and call oneup_start with scope_add.",
+                            facts.file_count_total
+                        ),
+                        serde_json::to_value(&facts).unwrap_or_else(|_| json!({})),
+                        next_actions,
+                    );
+                    return result(env);
+                }
+            }
+        }
 
         let mut payload = match ops::start(&roots, input.mode).await {
             Ok(payload) => payload,

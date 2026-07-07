@@ -27,7 +27,7 @@ pub const RETAINED_PUBLIC_TOOLS: [&str; 9] = [
     TOOL_OVERVIEW,
 ];
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StartMode {
     #[default]
@@ -192,6 +192,37 @@ pub struct NextAction {
     pub reason: String,
     #[schemars(schema_with = "json_object_schema")]
     pub arguments: Value,
+}
+
+/// Directory statistics for monorepo facts envelope, showing file and vector counts per top-level directory.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DirectoryStats {
+    /// Directory name relative to repo root (e.g., "services", "libs", "tools").
+    pub directory: String,
+    /// Number of files in this directory (recursive count).
+    pub file_count: usize,
+    /// Estimated vector count: file_count / 10 (conservative assumption of ~10 vectors per file).
+    pub estimated_vectors: usize,
+}
+
+/// Facts envelope returned on first-run gate in large monorepos.
+/// Provides directory statistics, workspace manifests, and sparse-checkout info so agents can make informed scope decisions.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FactsEnvelope {
+    /// Per-directory file and vector statistics for the top-level directories.
+    pub per_directory_stats: Vec<DirectoryStats>,
+    /// Paths to workspace manifest files detected (e.g., Cargo.toml, package.json).
+    /// These are paths relative to the repo root where manifest-like files were found.
+    pub workspace_manifests: Vec<String>,
+    /// Output of `git sparse-checkout list` if sparse-checkout is active; None otherwise.
+    pub sparse_checkout: Option<String>,
+    /// Launch subdirectory before project root resolution (if 1up was started from a subdirectory).
+    /// Included as a suggestion for the default scope.
+    pub launch_subdir: Option<String>,
+    /// Total file count across all directories.
+    pub file_count_total: usize,
+    /// Total estimated vector count.
+    pub vector_estimate_total: usize,
 }
 
 fn json_object_schema(_: &mut SchemaGenerator) -> Schema {

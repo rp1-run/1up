@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,7 +15,7 @@ use crate::indexer::embedder::{
 };
 use crate::indexer::pipeline;
 use crate::indexer::scan_filter::ScanFilter;
-use crate::mcp::types::StartMode;
+use crate::mcp::types::{DirectoryStats, FactsEnvelope, StartMode};
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::overview;
@@ -23,8 +23,8 @@ use crate::search::retrieval;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
-    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
-    STALE_REBUILD_REASON,
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
+    FILE_COUNT_THRESHOLD_ENV_VAR, NO_INDEXED_EMBEDDINGS_REASON, STALE_REBUILD_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
@@ -1852,6 +1852,216 @@ fn is_not_initialized(err: &OneupError) -> bool {
 enum LocationError {
     Rejected(String),
     Error(String),
+}
+
+/// Gets the configured file count threshold for facts envelope gate, with env var override.
+fn get_file_count_threshold() -> usize {
+    std::env::var(FILE_COUNT_THRESHOLD_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(FILE_COUNT_THRESHOLD)
+}
+
+/// Counts files per top-level directory (metadata-only walk, no parsing).
+/// Returns a map of directory name to (file_count, estimated_vectors).
+fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+    let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    // Simple metadata-only walk: no filtering, just count files per top-level dir.
+    for entry in std::fs::read_dir(source_root).map_err(|e| {
+        OneupError::Project(ProjectError::ReadFailed(format!("cannot read repo root: {e}")))
+    })? {
+        let entry = entry.map_err(|e| {
+            OneupError::Project(ProjectError::ReadFailed(format!("directory walk error: {e}")))
+        })?;
+
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+
+        let Some(dir_name) = name else {
+            continue;
+        };
+
+        // Skip hidden directories and common non-code directories
+        if dir_name.starts_with('.') {
+            continue;
+        }
+
+        // Walk this directory recursively and count files
+        let file_count = count_files_recursive(&path);
+        if file_count > 0 {
+            dir_counts.insert(dir_name, file_count);
+        }
+    }
+
+    // If no top-level directories were counted, count files at the root directly
+    if dir_counts.is_empty() {
+        let root_count = count_files_recursive(source_root);
+        if root_count > 0 {
+            dir_counts.insert(".".to_string(), root_count);
+        }
+    }
+
+    Ok(dir_counts)
+}
+
+/// Recursively counts files in a directory (fast metadata-only walk).
+fn count_files_recursive(path: &Path) -> usize {
+    let mut count = 0;
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            match entry.path() {
+                p if p.is_file() => count += 1,
+                p if p.is_dir() => {
+                    // Skip hidden directories
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if !name.starts_with('.') && name != "node_modules" && name != "target" {
+                            count += count_files_recursive(&p);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    count
+}
+
+/// Detects workspace manifest files in the repo.
+fn detect_workspace_manifests(source_root: &Path) -> Vec<String> {
+    let mut manifests = Vec::new();
+
+    let manifest_names = ["Cargo.toml", "package.json"];
+
+    // Check root
+    for name in manifest_names {
+        if source_root.join(name).exists() {
+            manifests.push(name.to_string());
+        }
+    }
+
+    // Check top-level directories for manifests
+    if let Ok(entries) = std::fs::read_dir(source_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !dir_name.starts_with('.') {
+                        for name in manifest_names {
+                            let manifest_path = path.join(name);
+                            if manifest_path.exists() {
+                                let rel_path = format!("{}/{}", dir_name, name);
+                                if !manifests.contains(&rel_path) {
+                                    manifests.push(rel_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    manifests.sort();
+    manifests
+}
+
+/// Parses git sparse-checkout if active.
+fn get_sparse_checkout_info(source_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("sparse-checkout")
+        .arg("list")
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if !trimmed.is_empty() {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Checks if a facts envelope should be returned instead of indexing.
+/// Returns true if:
+/// 1. No index exists (status: Missing)
+/// 2. No scope has been configured (scope_roots is None in meta table)
+/// 3. File count exceeds the threshold
+pub async fn should_return_facts_envelope(
+    _state_root: &Path,
+    source_root: &Path,
+    readiness: &ReadinessPayload,
+) -> Result<bool, OneupError> {
+    // Only return facts on first-run when index is missing
+    if readiness.status != ReadinessStatus::Missing {
+        return Ok(false);
+    }
+
+    let threshold = get_file_count_threshold();
+
+    // Quick file count: check directory sizes
+    let dir_counts = count_files_per_directory(source_root)?;
+    let total_files: usize = dir_counts.values().sum();
+
+    Ok(total_files > threshold)
+}
+
+/// Generates a facts envelope for a large monorepo on first-run.
+pub async fn generate_facts_envelope(
+    source_root: &Path,
+    launch_subdir: Option<PathBuf>,
+) -> Result<FactsEnvelope, OneupError> {
+    // Count files per top-level directory
+    let dir_counts = count_files_per_directory(source_root)?;
+
+    let file_count_total: usize = dir_counts.values().sum();
+    let vector_estimate_total = (file_count_total + 9) / 10; // Conservative: ~10 files per vector
+
+    let mut per_directory_stats: Vec<DirectoryStats> = dir_counts
+        .into_iter()
+        .map(|(directory, file_count)| DirectoryStats {
+            directory,
+            file_count,
+            estimated_vectors: (file_count + 9) / 10,
+        })
+        .collect();
+
+    // Sort by file count descending (largest first)
+    per_directory_stats.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+
+    let workspace_manifests = detect_workspace_manifests(source_root);
+    let sparse_checkout = get_sparse_checkout_info(source_root);
+
+    let launch_subdir_str = launch_subdir.and_then(|p| {
+        p.strip_prefix(source_root)
+            .ok()
+            .and_then(|rel| rel.to_str().map(|s| s.to_string()))
+    });
+
+    Ok(FactsEnvelope {
+        per_directory_stats,
+        workspace_manifests,
+        sparse_checkout,
+        launch_subdir: launch_subdir_str,
+        file_count_total,
+        vector_estimate_total,
+    })
 }
 
 #[cfg(test)]

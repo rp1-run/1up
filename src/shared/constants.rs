@@ -307,6 +307,20 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 /// the compact and full-precision models reproducibly.
 pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 
+/// File count threshold for triggering the first-run facts envelope in monorepos.
+///
+/// When a monorepo exceeds this file count and has no scope configured, 1up
+/// returns a facts envelope (refuse-and-propose) with per-directory statistics
+/// instead of attempting to index everything. Agents receive the facts and
+/// decide scope via scope_add. Conservatively set to 3000 files, which
+/// corresponds to ~30k vectors at ~10 vectors/file average — below the
+/// VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS cliff of 262k. Overridable via
+/// `ONEUP_FILE_COUNT_THRESHOLD` env var for testing and operator tuning.
+pub const FILE_COUNT_THRESHOLD: usize = 3_000;
+
+/// Environment variable to override the file count threshold for monorepo facts envelope.
+pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
+
 /// Schema version for database layout.
 ///
 /// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta
