@@ -472,14 +472,39 @@ fn spawn_rebuild_task(
     rebuild: bool,
     scope_add: Option<Vec<String>>,
     scope_narrow: Option<Vec<String>>,
-) {
+) -> tokio::task::JoinHandle<ReadinessPayload> {
     let roots = roots.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_index_then_classify(&roots, rebuild, scope_add, scope_narrow).await {
-            // Log the error but don't fail the task; progress is still available via status
-            tracing::warn!("background rebuild task failed: {}", err);
+        match run_index_then_classify(&roots, rebuild, scope_add, scope_narrow).await {
+            Ok(payload) => payload,
+            Err(err) => {
+                // Surface the failure as blocked readiness rather than losing it
+                // to a log line; progress remains available via status.
+                tracing::warn!("background rebuild task failed: {}", err);
+                blocked_readiness(
+                    &roots.state_root,
+                    &roots.source_root,
+                    &roots.worktree_context,
+                    err.to_string(),
+                )
+            }
         }
-    });
+    })
+}
+
+/// REQ-012: how long `oneup_start` waits for a spawned rebuild before
+/// detaching and returning progress. Fast operations (small repos, drift
+/// refreshes, auto-init failures) complete inside the budget so callers get
+/// the final readiness — drift cleared, blocked surfaced with its reason —
+/// preserving the pre-existing MCP contract. Long rebuilds detach at the
+/// budget (well under the 5s acceptance bound) and callers poll
+/// `oneup_status`. Env-tunable for tests.
+fn start_response_budget() -> std::time::Duration {
+    let ms = std::env::var("ONEUP_START_RESPONSE_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2_000);
+    std::time::Duration::from_millis(ms)
 }
 
 pub async fn start(
@@ -533,9 +558,18 @@ pub async fn start(
             rebuild_mode,
             scope_add
         );
-        spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
-        // Return immediately with Indexing status and progress
-        Ok(check_status(roots).await)
+        let rebuild_handle = spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
+        // REQ-012: bounded wait — return the final readiness when the rebuild
+        // completes inside the budget; otherwise detach (the task keeps
+        // running) and return current status with progress for polling.
+        match tokio::time::timeout(start_response_budget(), rebuild_handle).await {
+            Ok(Ok(payload)) => Ok(payload),
+            Ok(Err(join_err)) => {
+                tracing::warn!("background rebuild task panicked: {join_err}");
+                Ok(check_status(roots).await)
+            }
+            Err(_elapsed) => Ok(check_status(roots).await),
+        }
     } else {
         tracing::debug!("ops::start: NOT spawning (should_spawn=false)");
         Ok(readiness)
@@ -4197,7 +4231,7 @@ mod tests {
 
         // Measure time to call spawn_rebuild_task
         let start = Instant::now();
-        spawn_rebuild_task(&roots, true, None, None);
+        let _rebuild_handle = spawn_rebuild_task(&roots, true, None, None);
         let elapsed = start.elapsed();
 
         // Should return almost immediately, not await the full pipeline

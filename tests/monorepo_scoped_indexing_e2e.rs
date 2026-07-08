@@ -48,6 +48,10 @@ struct McpTestClient {
 
 impl McpTestClient {
     fn start_with_isolated_state(path: &Path) -> Self {
+        Self::start_with_isolated_state_and_envs(path, &[])
+    }
+
+    fn start_with_isolated_state_and_envs(path: &Path, envs: &[(&str, &str)]) -> Self {
         let state_home = TempDir::new().unwrap();
         let home_path = state_home.path().canonicalize().unwrap();
         seed_model_download_failure(&home_path);
@@ -62,6 +66,9 @@ impl McpTestClient {
             .env("HOME", &home_path)
             .env("XDG_DATA_HOME", home_path.join("data"))
             .env("XDG_CONFIG_HOME", home_path.join("config"));
+        for (key, value) in envs {
+            command.env(key, value);
+        }
 
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -1178,7 +1185,13 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         total_files
     );
 
-    let mut client = McpTestClient::start_with_isolated_state(&root);
+    // This test observes index_scope DURING indexing, so disable the
+    // REQ-012 bounded wait: with a budget, a fast FTS-only rebuild can
+    // complete inside oneup_start and close the mid-indexing window.
+    let mut client = McpTestClient::start_with_isolated_state_and_envs(
+        &root,
+        &[("ONEUP_START_RESPONSE_BUDGET_MS", "0")],
+    );
 
     // Get facts and trigger scoped indexing
     let facts_result = client.call_tool(
