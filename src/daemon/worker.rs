@@ -1702,9 +1702,15 @@ async fn run_project(
         let state_root = &state.project_root;
         let source_root = &state.source_root;
 
-        // Check if this is a first index (no index.db exists)
-        let index_path = config::project_db_path(state_root);
-        if !index_path.exists() {
+        // Check if this is a first index: index.db exists but has no indexed content
+        // (empty schema created at startup). This is more robust than checking file existence,
+        // which would be defeated by the empty DB created in build_project_state.
+        let is_first_index = {
+            let conn = state.db.connect_tuned().await?;
+            segments::count_segments(&conn).await.unwrap_or(0) == 0
+        };
+
+        if is_first_index {
             // First index: check the gate
             let threshold = std::env::var(crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR)
                 .ok()
@@ -1718,13 +1724,8 @@ async fn run_project(
                 .and_then(|progress| progress.scope)
                 .is_some();
 
-            // Check the gate
-            if !lifecycle::should_start_first_index(
-                state_root,
-                file_count,
-                threshold,
-                scope_recorded,
-            )? {
+            // Check the gate: over-threshold without scope = block the startup refresh
+            if file_count > threshold && !scope_recorded {
                 debug!(
                     "daemon gate fired for {}: over-threshold ({} > {}) without scope; staying idle",
                     state_root.display(),

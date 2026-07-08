@@ -856,6 +856,14 @@ pub async fn classify_readiness(
     let embedding_reason = embedder::model_unavailable_reason_for_status()
         .map(|reason| unavailable_reason_text(&reason));
 
+    // Compute and populate index scope for coverage disclosure (REQ-002)
+    // This happens before status classification so it's available on all readable states
+    if let Ok(Some(scope)) =
+        compute_index_scope(state_root, source_root, &worktree_context.context_id).await
+    {
+        payload.index_scope = Some(scope);
+    }
+
     if progress_without_embeddings || embedding_reason.is_some() {
         payload.status = ReadinessStatus::Degraded;
         payload.summary =
@@ -888,13 +896,6 @@ pub async fn classify_readiness(
 
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
-
-    // Compute and populate index scope for coverage disclosure
-    if let Ok(Some(scope)) =
-        compute_index_scope(state_root, source_root, &worktree_context.context_id).await
-    {
-        payload.index_scope = Some(scope);
-    }
 
     payload
 }
