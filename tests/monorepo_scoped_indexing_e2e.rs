@@ -148,6 +148,28 @@ fn mcp_structured(result: &serde_json::Value) -> &serde_json::Value {
     &result["structuredContent"]
 }
 
+/// Poll `oneup_status` until `predicate` holds on the structured envelope, or
+/// panic with the last envelope after the deadline. `oneup_start` is
+/// non-blocking (REQ-012) and the daemon indexes concurrently, so tests must
+/// assert eventual stable states rather than single-shot status reads.
+fn wait_for_status<F: Fn(&serde_json::Value) -> bool>(
+    client: &mut McpTestClient,
+    what: &str,
+    predicate: F,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+        if predicate(mcp_structured(&result)) {
+            return result;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("{what} not reached within 120s; last status={result:?}");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn wait_for_searchable_readiness(client: &mut McpTestClient) {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -355,8 +377,10 @@ fn monorepo_incremental_widening() {
     // Wait for first cone to be indexed
     wait_for_searchable_readiness(&mut client);
 
-    // Get status to check index_scope
-    let result1 = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // Wait for the first cone's scope to publish (non-blocking start).
+    let result1 = wait_for_status(&mut client, "first cone index_scope", |env| {
+        env["data"]["index_scope"]["roots"].is_array()
+    });
     let envelope1 = mcp_structured(&result1);
     let scope1 = &envelope1["data"]["index_scope"]["roots"];
     assert!(scope1.is_array(), "should have index_scope roots");
@@ -372,8 +396,13 @@ fn monorepo_incremental_widening() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Check that both are now in scope
-    let result2 = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // Check that both cones eventually appear in scope (the widening rebuild
+    // publishes its scope when it lands, not when oneup_start returns).
+    let result2 = wait_for_status(&mut client, "widened index_scope with both cones", |env| {
+        env["data"]["index_scope"]["roots"]
+            .as_array()
+            .is_some_and(|roots| roots.len() >= 2)
+    });
     let envelope2 = mcp_structured(&result2);
     let roots = envelope2["data"]["index_scope"]["roots"]
         .as_array()
@@ -686,8 +715,17 @@ fn monorepo_readiness_includes_scope_coverage() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Get status and verify index_scope
-    let result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // Get status and verify index_scope. oneup_start is non-blocking
+    // (REQ-012), so poll until the scoped rebuild publishes index_scope
+    // rather than asserting on the first readable status.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    while !mcp_structured(&result)["data"]["index_scope"].is_object()
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(500));
+        result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    }
     let envelope = mcp_structured(&result);
 
     let scope = &envelope["data"]["index_scope"];
@@ -991,34 +1029,32 @@ fn test_daemon_alive_scoped_start_applies_scope() {
     let start_envelope = mcp_structured(&start_result);
     let start_status = start_envelope["status"].as_str();
 
+    // "degraded" is the completed state in FTS-only mode (embeddings
+    // unavailable); the REQ-012 bounded wait means a fast cone build can
+    // finish inside oneup_start rather than returning mid-flight.
     assert!(
-        matches!(start_status, Some("indexing") | Some("ready")),
-        "should begin indexing after scope_add"
+        matches!(
+            start_status,
+            Some("indexing") | Some("ready") | Some("degraded")
+        ),
+        "should begin (or complete) indexing after scope_add; got {start_status:?}"
     );
 
-    // 2. Wait for indexing to complete
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let status_result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
-        let status_envelope = mcp_structured(&status_result);
-        let status = status_envelope["status"].as_str();
-
-        if matches!(status, Some("ready")) {
-            break;
-        }
-
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "indexing did not complete; last status={:?}",
-                status_envelope
-            );
-        }
-
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    // 3. Verify index_scope is present and cone file count is reasonable
-    let final_status = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // 2+3. Wait for the scoped index to reach its stable terminal state:
+    // searchable (ready, or degraded = FTS-only complete), with index_scope
+    // published and a cone-sized (not full-repo) file count. "degraded" is
+    // also reported transiently while the daemon is mid-index (index present
+    // but scope not yet published), so the predicate requires the full stable
+    // shape rather than status alone.
+    let final_status = wait_for_status(&mut client, "scoped cone index with index_scope", |env| {
+        let indexed = env["data"]["index_scope"]["indexed_files"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+        matches!(env["status"].as_str(), Some("ready") | Some("degraded"))
+            && env["data"]["index_scope"].is_object()
+            && indexed > 0
+            && indexed < total_files
+    });
     let final_envelope = mcp_structured(&final_status);
 
     let index_scope = &final_envelope["data"]["index_scope"];

@@ -1758,16 +1758,40 @@ async fn run_project(
                 config::resolve_indexing_config(None, None, state.indexing.as_ref())?;
 
             // REQ-002: Daemon path must apply recorded scope identically to MCP path.
-            // Load scope from meta table and apply as include_globs so the file walk
-            // respects the scoped boundaries. This ensures both daemon and in-process
-            // paths produce identical scope behavior.
-            if let Ok(Some(scope_roots)) = crate::storage::schema::read_scope_from_meta(&conn).await
-            {
-                let scope_globs: Vec<String> = scope_roots
+            // Load scope from meta table and apply as scope_globs (the exclusive
+            // scope filter) — include_globs only guarantee inclusion and never
+            // exclude, so assigning them here would silently full-index a scoped
+            // repo on every daemon refresh.
+            //
+            // The gate opens on the scope decision recorded in the progress file,
+            // which an in-flight scoped rebuild writes before its meta write lands
+            // in the database; fall back to it so a daemon refresh in that window
+            // never runs unscoped over a scoped repo.
+            let scope_roots = crate::storage::schema::read_scope_from_meta(&conn)
+                .await
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    read_index_progress(&project_root)
+                        .and_then(|progress| progress.scope)
+                        .map(|scope_info| scope_info.roots)
+                        .filter(|roots| !roots.is_empty())
+                });
+            if let Some(scope_roots) = scope_roots {
+                // Persist the applied scope so index_scope/status and later
+                // refreshes read the same decision regardless of which writer
+                // (daemon or MCP rebuild) builds the index first. Idempotent
+                // when the meta row already exists.
+                if let Err(err) =
+                    crate::storage::schema::write_scope_to_meta(&conn, &scope_roots).await
+                {
+                    warn!("failed to persist applied scope to meta: {err}");
+                }
+                indexing_config.scope_roots = scope_roots.clone();
+                indexing_config.scope_globs = scope_roots
                     .iter()
                     .map(|root| format!("{}/**", root))
                     .collect();
-                indexing_config.include_globs = scope_globs;
             }
 
             Ok::<_, OneupError>((conn, indexing_config))
