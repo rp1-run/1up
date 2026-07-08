@@ -1732,9 +1732,14 @@ async fn run_project(
                     file_count,
                     threshold
                 );
-                // Re-mark the project as dirty so it stays queued for a later retry
+                // Do NOT re-queue for retry: self-requeue makes the daemon
+                // re-run the gitignore-aware gate walk back-to-back forever
+                // (observed pinning a core on a 186k-file repo). The gated
+                // project stays idle until a real dirty signal arrives; the
+                // first scoped index runs through the MCP start path anyway,
+                // after which segments exist and first-index gating no longer
+                // applies.
                 let state = projects.get_mut(context_id).expect("must exist");
-                mark_refresh_pending(state, RunScope::Full, None);
                 mark_refresh_finished(state, Utc::now(), Ok(()));
                 return Ok(pipeline::PipelineStats::default());
             }
