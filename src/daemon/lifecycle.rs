@@ -636,6 +636,10 @@ pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
 ///   - File count is over threshold AND scope is recorded
 /// - Ok(false) if the index should be blocked (gate fires):
 ///   - File count is over threshold AND no scope is recorded
+///
+/// Note: The daemon has migrated to checking for actual indexed content instead
+/// of checking file existence, but this function is retained for testing purposes.
+#[allow(dead_code)]
 pub fn should_start_first_index(
     state_root: &Path,
     file_count: usize,
