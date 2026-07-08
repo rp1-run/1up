@@ -1740,8 +1740,13 @@ async fn run_project(
                 .and_then(|progress| progress.scope)
                 .is_some();
 
-            // Check the gate: over-threshold without scope = block the startup refresh
-            if file_count > threshold && !scope_recorded {
+            // Check the gate using the pure decision logic
+            if !lifecycle::gate_allows_first_index(
+                is_first_index,
+                file_count,
+                threshold,
+                scope_recorded,
+            ) {
                 debug!(
                     "daemon gate fired for {}: over-threshold ({} > {}) without scope; staying idle",
                     state_root.display(),

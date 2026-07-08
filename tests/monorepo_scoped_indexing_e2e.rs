@@ -277,6 +277,29 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
 
+/// Pre-create an empty schema index database at the given project root.
+/// This reproduces the real startup sequence where build_project_state creates
+/// an empty schema db BEFORE the daemon gate check runs (HYP-001).
+/// The gate logic checks segment count (not file existence) to survive this
+/// pre-creation; this test verifies that the gate decision is robust to an
+/// empty-but-present db.
+fn create_empty_schema_db(project_root: &Path) {
+    use oneup::shared::config;
+    use oneup::storage::schema;
+
+    let db_path = config::project_db_path(project_root);
+
+    // Create the parent directory if needed
+    fs::create_dir_all(project_root.join(".1up")).unwrap();
+
+    // Open RW (creates if missing) and initialize schema
+    let db = block_on(Db::open_rw(&db_path)).expect("failed to open db");
+    let conn = block_on(db.connect_tuned()).expect("failed to get connection");
+    block_on(schema::prepare_for_write(&conn)).expect("failed to prepare schema");
+
+    // db and conn are dropped here, releasing the connection and committing the schema
+}
+
 /// Test scenario: Large monorepo facts envelope gate on first oneup_start
 /// - Create monorepo with multiple cones
 /// - First call to oneup_start triggers facts envelope (no args)
@@ -896,6 +919,15 @@ edition = "2021"
 /// Acceptance: On an over-threshold Missing repo, launch MCP server with daemon alive,
 /// wait, call oneup_status -> still missing; oneup_start without scope -> facts envelope;
 /// ZERO indexing activity until a scoped/confirmed start.
+///
+/// Regression test for P0 F1: The daemon gate was defeated by an empty index.db
+/// pre-created during build_project_state. This test reproduces the real startup
+/// sequence by pre-creating an empty schema db before the gate check, ensuring:
+/// - The gate decision is based on segment count (not file existence)
+/// - Under the old !index.db-exists() semantics, the gate would incorrectly ALLOW
+///   indexing because the db would exist
+/// - Under the new segments::count_segments()==0 semantics, the gate correctly
+///   BLOCKS indexing until scope is recorded
 #[test]
 fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
     let _guard = HideModelGuard::new();
@@ -909,6 +941,11 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
         "fixture should have >3000 tracked files to exceed threshold; got {}",
         total_files
     );
+
+    // CRITICAL: Pre-create empty schema db to reproduce the real startup sequence.
+    // Real startup (build_project_state) creates this BEFORE the daemon runs the gate.
+    // This is the condition that defeated the old !index.db-exists() gate predicate.
+    create_empty_schema_db(&root);
 
     // MCP server acts as daemon; create client
     let mut client = McpTestClient::start_with_isolated_state(&root);

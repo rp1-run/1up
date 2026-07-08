@@ -637,33 +637,40 @@ pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
 /// - Ok(false) if the index should be blocked (gate fires):
 ///   - File count is over threshold AND no scope is recorded
 ///
-/// Note: The daemon has migrated to checking for actual indexed content instead
-/// of checking file existence, but this function is retained for testing purposes.
-#[allow(dead_code)]
-pub fn should_start_first_index(
-    state_root: &Path,
+/// Pure gate decision logic: determines whether to allow a first index based on
+/// live semantics (segment count, not file existence). Extracted for testability.
+///
+/// # Arguments
+/// - `is_first_index`: true if segment count is 0 (first index); false if segments exist
+/// - `file_count`: number of files in the repo (gitignore-aware walk)
+/// - `threshold`: FILE_COUNT_THRESHOLD to gate on
+/// - `scope_recorded`: true if index progress file has a recorded scope
+///
+/// # Returns
+/// true if indexing should proceed; false if the gate fires (over-threshold without scope)
+pub fn gate_allows_first_index(
+    is_first_index: bool,
     file_count: usize,
     threshold: usize,
     scope_recorded: bool,
-) -> Result<bool, OneupError> {
-    let index_path = config::project_db_path(state_root);
-
-    // If index already exists, this is not a first index; always proceed
-    if index_path.exists() {
-        return Ok(true);
+) -> bool {
+    // If not a first index (segments exist), always allow indexing
+    if !is_first_index {
+        return true;
     }
 
-    // This is a first index. Check the gate: over-threshold without scope?
+    // For a first index: check the gate
+    // Gate fires (blocks) if: over-threshold AND no scope recorded
     if file_count > threshold && !scope_recorded {
         debug!(
             "daemon gate: over-threshold ({} > {}) without scope; staying idle",
             file_count, threshold
         );
-        return Ok(false);
+        return false;
     }
 
-    // Under threshold or scope is recorded; proceed with indexing
-    Ok(true)
+    // Under threshold OR scope recorded; allow indexing
+    true
 }
 
 #[cfg(test)]
@@ -687,28 +694,32 @@ mod tests {
     }
 
     #[test]
-    fn test_should_start_first_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state_root = tmp.path();
+    fn test_gate_allows_first_index() {
         let threshold = 3_000;
 
-        // Case 1: Under threshold, no scope → should start
-        assert!(should_start_first_index(state_root, 2_500, threshold, false).unwrap());
+        // Case 1: Not a first index (segments exist) → always allow
+        // Over-threshold, no scope, but is_first_index=false → allow
+        assert!(gate_allows_first_index(false, 5_000, threshold, false));
 
-        // Case 2: Under threshold, with scope → should start
-        assert!(should_start_first_index(state_root, 2_500, threshold, true).unwrap());
+        // Case 2: First index, under threshold, no scope → allow
+        assert!(gate_allows_first_index(true, 2_500, threshold, false));
 
-        // Case 3: Over threshold, with scope → should start
-        assert!(should_start_first_index(state_root, 5_000, threshold, true).unwrap());
+        // Case 3: First index, under threshold, with scope → allow
+        assert!(gate_allows_first_index(true, 2_500, threshold, true));
 
-        // Case 4: Over threshold, no scope → should NOT start (gate fires)
-        assert!(!should_start_first_index(state_root, 5_000, threshold, false).unwrap());
+        // Case 4: First index, over threshold, with scope → allow
+        // (scope is recorded, so gate doesn't fire)
+        assert!(gate_allows_first_index(true, 5_000, threshold, true));
 
-        // Case 5: Over threshold, no scope, but index exists → should start (not first index)
-        let index_path = config::project_db_path(state_root);
-        std::fs::create_dir_all(state_root.join(".1up")).unwrap();
-        std::fs::File::create(&index_path).unwrap();
-        assert!(should_start_first_index(state_root, 5_000, threshold, false).unwrap());
+        // Case 5: First index, over threshold, no scope → BLOCK (gate fires)
+        // This is the P0 gate condition: too many files without scope decision
+        assert!(!gate_allows_first_index(true, 5_000, threshold, false));
+
+        // Case 6: Edge case - exactly at threshold, no scope → allow
+        assert!(gate_allows_first_index(true, 3_000, threshold, false));
+
+        // Case 7: Edge case - one above threshold, no scope → BLOCK
+        assert!(!gate_allows_first_index(true, 3_001, threshold, false));
     }
 
     #[test]
