@@ -4576,30 +4576,33 @@ mod tests {
         fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
         fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
 
-        // First call should compute and cache
+        // First call should compute and populate the cache. Assert cache
+        // STATE rather than wall-clock timing: a duration assertion flakes
+        // under full parallel suite load regardless of cache behavior.
         let density1 =
             compute_avg_density_for_repo(root).expect("first density computation should work");
 
-        // Second call should hit cache (same path, same state)
-        // We can't directly measure cache hits, but verify the result is identical
-        // and completes instantly (would take longer if re-walking)
-        let start = std::time::Instant::now();
+        let canonical_root = root.canonicalize().unwrap();
+        let cached_entries = get_density_cache()
+            .lock()
+            .map(|cache| {
+                cache
+                    .keys()
+                    .filter(|key| key.repo_identity == canonical_root.to_string_lossy())
+                    .count()
+            })
+            .unwrap();
+        assert!(
+            cached_entries > 0,
+            "first density computation should populate the cache for this repo"
+        );
+
+        // Second call must return the identical cached value.
         let density2 =
             compute_avg_density_for_repo(root).expect("second density computation should work");
-        let elapsed = start.elapsed();
-
-        // Results should be identical
         assert_eq!(
             density1, density2,
             "density should be consistent across calls"
-        );
-
-        // Second call should be nearly instant (cache hit) - should take <20ms
-        // if it were re-walking it could take 100s of ms or more
-        assert!(
-            elapsed.as_millis() < 20,
-            "cached density lookup should be instant, took {}ms",
-            elapsed.as_millis()
         );
     }
 
