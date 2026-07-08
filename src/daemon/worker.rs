@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use libsql::Connection;
@@ -164,10 +163,10 @@ fn should_idle_shutdown(
 fn setup_parent_death_signal() {
     #[cfg(target_os = "linux")]
     {
-        use nix::sys::prctl::{self, PrctlOption};
+        use nix::sys::prctl;
 
         // On Linux, use prctl(PR_SET_PDEATHSIG) to receive SIGTERM when parent dies
-        match prctl::prctl(PrctlOption::SetPdeathsig(nix::sys::signal::Signal::SIGTERM)) {
+        match prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM) {
             Ok(_) => debug!("parent-death signaling configured: SIGTERM on parent exit"),
             Err(e) => warn!("failed to set parent-death signal: {e}"),
         }
@@ -194,7 +193,7 @@ fn setup_parent_death_signal() {
         // Spawn monitor thread to check if parent is still alive
         std::thread::spawn(|| {
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(std::time::Duration::from_secs(1));
 
                 // If parent PID becomes 1 (init), parent is dead
                 let current_ppid = unistd::getppid().as_raw() as u32;
