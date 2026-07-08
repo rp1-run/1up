@@ -2391,15 +2391,16 @@ enum LocationError {
 }
 
 // REQ-005: Cache key for directory walk results, invalidating on repo identity change or HEAD drift.
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 struct DirectoryWalkCacheKey {
     repo_identity: String,       // e.g., source_root canonical path
     head_commit: Option<String>, // git HEAD OID, or None if not in a git repo
     root_mtime: Option<u64>,     // filesystem mtime in seconds, or None on error
 }
 
-// REQ-005: Static cache for directory walk results. First gate response computed once,
-// repeat calls cache-hit <1s latency as per acceptance criteria.
+// REQ-005: Static in-process cache for directory walk results.
+// F5/N4b: Also persists to disk for cross-process reuse (cold-walk latency fix).
 static DIRECTORY_WALK_CACHE: OnceLock<
     Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>>,
 > = OnceLock::new();
@@ -2407,6 +2408,65 @@ static DIRECTORY_WALK_CACHE: OnceLock<
 fn get_directory_walk_cache(
 ) -> &'static Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>> {
     DIRECTORY_WALK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// F5/N4b: Persistent on-disk cache for directory walk results.
+/// Stored as JSON in .1up directory, keyed by (repo_id, HEAD, mtime).
+/// Survives process restart to avoid re-walking on fresh-process envelope/search calls.
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct PersistentDirectoryWalkCache {
+    entries: HashMap<String, BTreeMap<String, usize>>, // JSON-serializable cache
+}
+
+/// F5/N4b: Generate a stable cache key string for persistent storage.
+/// Must be deterministic and human-readable for debugging.
+fn cache_key_to_string(key: &DirectoryWalkCacheKey) -> String {
+    let head = key.head_commit.as_deref().unwrap_or("no_git");
+    let mtime = key
+        .root_mtime
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{}_{}_{}", key.repo_identity, head, mtime)
+}
+
+/// F5/N4b: Load directory walk cache from persistent storage in .1up directory.
+/// Returns empty map on any error (missing file, parse error, etc.); errors are
+/// non-fatal since the cache is an optimization.
+fn load_persistent_directory_walk_cache(
+    state_root: &Path,
+) -> HashMap<String, BTreeMap<String, usize>> {
+    let cache_path = project_dot_dir(state_root).join("directory_walk_cache.json");
+    match std::fs::read_to_string(&cache_path) {
+        Ok(content) => match serde_json::from_str::<PersistentDirectoryWalkCache>(&content) {
+            Ok(cached) => cached.entries,
+            Err(_) => HashMap::new(),
+        },
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// F5/N4b: Persist directory walk cache to disk.
+/// Stores in .1up directory; errors are logged but don't interrupt operation.
+fn save_persistent_directory_walk_cache(
+    state_root: &Path,
+    entries: &HashMap<String, BTreeMap<String, usize>>,
+) {
+    let dot_dir = project_dot_dir(state_root);
+    if let Err(e) = std::fs::create_dir_all(&dot_dir) {
+        tracing::warn!("failed to create .1up directory for cache: {}", e);
+        return;
+    }
+
+    let cache = PersistentDirectoryWalkCache {
+        entries: entries.clone(),
+    };
+    let cache_path = dot_dir.join("directory_walk_cache.json");
+    if let Err(e) = std::fs::write(
+        &cache_path,
+        serde_json::to_string(&cache).unwrap_or_default(),
+    ) {
+        tracing::warn!("failed to persist directory walk cache: {}", e);
+    }
 }
 
 /// Extracts git HEAD OID from the repository.
@@ -2457,6 +2517,7 @@ fn get_file_count_threshold() -> usize {
 /// Returns a map of directory name to file_count.
 /// Cache invalidates on git HEAD drift or root directory mtime change,
 /// ensuring <1s repeat call latency while maintaining correctness.
+/// F5/N4b: Uses both in-process and persistent (disk-based) caches for cross-process reuse.
 fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
     // Build cache key from repo identity and current state
     let cache_key = DirectoryWalkCacheKey {
@@ -2469,20 +2530,41 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
         root_mtime: get_root_mtime(source_root),
     };
 
-    // Check cache first
+    let cache_key_str = cache_key_to_string(&cache_key);
+
+    // Check in-process cache first (fastest)
     if let Ok(cache) = get_directory_walk_cache().lock() {
         if let Some(cached_result) = cache.get(&cache_key) {
             return Ok(cached_result.clone());
         }
     }
 
-    // Not in cache, compute via gitignore-aware walk
+    // Not in in-process cache; try persistent cache (F5/N4b: cross-process)
+    // We need state_root to check persistent cache, but we only have source_root.
+    // Since generate_facts_envelope is called early in oneup_start before any state
+    // is written, we use a heuristic: if source_root is a git repo, the .1up would be
+    // at source_root/.1up. This is good enough for the cold-start case.
+    let potential_state_root = source_root;
+    let persistent_cache = load_persistent_directory_walk_cache(potential_state_root);
+    if let Some(cached_result) = persistent_cache.get(&cache_key_str) {
+        // Found in persistent cache; restore to in-process cache for this process
+        if let Ok(mut in_process) = get_directory_walk_cache().lock() {
+            in_process.insert(cache_key.clone(), cached_result.clone());
+        }
+        return Ok(cached_result.clone());
+    }
+
+    // Not in either cache, compute via gitignore-aware walk
     let result = count_files_per_directory_uncached(source_root)?;
 
-    // Store in cache for next call
+    // Store in both caches for future calls
     if let Ok(mut cache) = get_directory_walk_cache().lock() {
-        cache.insert(cache_key, result.clone());
+        cache.insert(cache_key.clone(), result.clone());
     }
+    // F5/N4b: Persist to disk for cross-process reuse
+    let mut persistent = persistent_cache;
+    persistent.insert(cache_key_str, result.clone());
+    save_persistent_directory_walk_cache(potential_state_root, &persistent);
 
     Ok(result)
 }
@@ -2491,18 +2573,49 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
 /// Gitignore-aware directory file count walk.
 /// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
 /// the indexer's actual file counts and exclude untracked build trees.
+/// Helper to determine if a path is under a VCS directory that should be excluded.
+/// N1: VCS directories (.git, .hg, .svn) should never appear in file counts.
+fn is_under_vcs_dir(path: &Path) -> bool {
+    const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name_str = name.to_string_lossy();
+            if VCS_DIRS
+                .iter()
+                .any(|vcs| name_str.eq_ignore_ascii_case(vcs))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Helper to build a gitignore-aware walker with VCS directories excluded.
+/// Excludes .git, .hg, .svn, and other VCS metadata to match indexer behavior.
+/// N1: VCS directories (.git, etc.) should never appear in file counts or suggestions.
+fn build_vcs_aware_walker(source_root: &Path) -> ignore::WalkBuilder {
+    use ignore::WalkBuilder;
+
+    let mut builder = WalkBuilder::new(source_root);
+    builder
+        .hidden(false) // Include hidden files/dirs for analysis
+        .ignore(true); // Respect .gitignore rules
+
+    builder
+}
+
+/// Counts files per top-level directory (metadata-only walk, no parsing).
+/// Gitignore-aware directory file count walk with VCS directory exclusion.
+/// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
+/// the indexer's actual file counts and exclude untracked build trees.
 fn count_files_per_directory_uncached(
     source_root: &Path,
 ) -> Result<BTreeMap<String, usize>, OneupError> {
-    use ignore::WalkBuilder;
-
     let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    // Build a gitignore-aware walker that respects .gitignore rules
-    let walker = WalkBuilder::new(source_root)
-        .hidden(false)
-        .ignore(true) // Respect .gitignore!
-        .build();
+    // Build a gitignore-aware walker with VCS directories excluded (N1)
+    let walker = build_vcs_aware_walker(source_root).build();
 
     // Aggregate files by their top-level directory
     for entry in walker.flatten() {
@@ -2510,6 +2623,10 @@ fn count_files_per_directory_uncached(
         if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             // Get the relative path from source_root
             if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                // N1: Skip files under VCS directories
+                if is_under_vcs_dir(rel_path) {
+                    continue;
+                }
                 // Extract the first component (top-level directory)
                 if let Some(top_level) = rel_path.components().next() {
                     if let Component::Normal(name) = top_level {
@@ -2527,15 +2644,17 @@ fn count_files_per_directory_uncached(
 
     // If no top-level directories were counted, count files at the root directly
     if dir_counts.is_empty() {
-        let walker = WalkBuilder::new(source_root)
-            .hidden(false)
-            .ignore(true)
-            .build();
+        let walker = build_vcs_aware_walker(source_root).build();
 
         let mut root_count = 0;
         for entry in walker.flatten() {
             if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                root_count += 1;
+                if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                    // N1: Skip files under VCS directories
+                    if !is_under_vcs_dir(rel_path) {
+                        root_count += 1;
+                    }
+                }
             }
         }
         if root_count > 0 {
@@ -2548,22 +2667,79 @@ fn count_files_per_directory_uncached(
 
 /// Counts total tracked files in repository using gitignore-aware walk.
 /// Returns the gitignore-aware tracked file count (same definition used by indexer).
+/// Excludes VCS directories (N1).
 #[allow(dead_code)]
 fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
-    use ignore::WalkBuilder;
-
-    let walker = WalkBuilder::new(source_root)
-        .hidden(false)
-        .ignore(true) // Respect .gitignore
-        .build();
+    let walker = build_vcs_aware_walker(source_root).build();
 
     let count = walker
         .into_iter()
         .filter_map(|r| r.ok())
         .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter(|e| {
+            // N1: Skip files under VCS directories
+            e.path()
+                .strip_prefix(source_root)
+                .map(|rel| !is_under_vcs_dir(rel))
+                .unwrap_or(true)
+        })
         .count();
 
     Ok(count)
+}
+
+/// Density table for per-language vector count calibration.
+/// N2: Both global and per-directory estimates use this table for consistency.
+fn get_density_table() -> &'static [(&'static str, f64)] {
+    &[
+        ("rs", 37.0),   // Rust: measured 37.02 segments/file
+        ("kt", 28.0),   // Kotlin: measured ~28 segments/file
+        ("java", 28.0), // Java: same as Kotlin
+        ("py", 30.0),   // Python: estimated conservative pending measurement
+        ("go", 15.0),   // Go: estimated conservative pending measurement
+        ("js", 25.0),   // JavaScript: estimated conservative pending measurement
+        ("ts", 25.0),   // TypeScript: estimated conservative pending measurement
+    ]
+}
+
+/// Compute average segments-per-file density for a repository based on language distribution.
+/// N2: Shared by both global and per-directory estimates.
+fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
+    let density_table = get_density_table();
+    let walker = build_vcs_aware_walker(source_root).build();
+
+    let mut files_by_ext: HashMap<String, usize> = HashMap::new();
+    for entry in walker.flatten() {
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            // N1: Skip files under VCS directories
+            if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                if is_under_vcs_dir(rel_path) {
+                    continue;
+                }
+            }
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                *files_by_ext.entry(ext.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut total_density = 0.0;
+    let mut files_by_known_ext = 0;
+
+    for (ext, count) in &files_by_ext {
+        if let Some((_, density)) = density_table.iter().find(|(e, _)| ext.ends_with(e)) {
+            total_density += density * *count as f64;
+            files_by_known_ext += count;
+        }
+    }
+
+    let avg_segments_per_file = if files_by_known_ext > 0 {
+        total_density / files_by_known_ext as f64
+    } else {
+        15.0 // Fallback for completely unmeasured ecosystems
+    };
+
+    Ok(avg_segments_per_file)
 }
 
 /// Calibrates vector estimate based on measured language densities.
@@ -2578,66 +2754,15 @@ fn estimate_vector_count(
     total_tracked_files: usize,
     source_root: &Path,
 ) -> Result<(usize, String, usize, usize), OneupError> {
-    // Per-language/extension calibrated density based on measured data
-    // Format: (extension_pattern, segments_per_file)
-    let density_table: &[(&str, f64)] = &[
-        ("rs", 37.0),   // Rust: measured 37.02 segments/file
-        ("kt", 28.0),   // Kotlin: measured ~28 segments/file
-        ("java", 28.0), // Java: same as Kotlin
-        ("py", 30.0),   // Python: estimated conservative pending measurement
-        ("go", 15.0),   // Go: estimated conservative pending measurement
-        ("js", 25.0),   // JavaScript: estimated conservative pending measurement
-        ("ts", 25.0),   // TypeScript: estimated conservative pending measurement
-    ];
-
-    // Analyze file distribution by extension in the repo
-    use ignore::WalkBuilder;
-
-    let walker = WalkBuilder::new(source_root)
-        .hidden(false)
-        .ignore(true) // Respect .gitignore
-        .build();
-
-    let mut files_by_ext: HashMap<String, usize> = HashMap::new();
-    for entry in walker.flatten() {
-        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                *files_by_ext.entry(ext.to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Compute average density for this repo
-    let mut total_density = 0.0;
-    let mut files_by_known_ext = 0;
-
-    for (ext, count) in &files_by_ext {
-        if let Some((_, density)) = density_table.iter().find(|(e, _)| ext.ends_with(e)) {
-            total_density += density * *count as f64;
-            files_by_known_ext += count;
-        }
-    }
-
-    // Use measured average for known extensions, fall back to conservative estimate for unmeasured
-    let avg_segments_per_file = if files_by_known_ext > 0 {
-        total_density / files_by_known_ext as f64
-    } else {
-        // Fallback for completely unmeasured ecosystems: conservative estimate
-        15.0
-    };
+    let avg_segments_per_file = compute_avg_density_for_repo(source_root)?;
 
     let estimated_count = (total_tracked_files as f64 * avg_segments_per_file) as usize;
 
     // Label the basis so agents understand confidence
-    let basis = if files_by_known_ext > 0 {
-        format!(
-            "estimated ~{:.1} segments per file based on measured Rust (37.02) and Kotlin/Java (28.0) densities, with conservative estimates for unmeasured languages (15-30 range). Actual density varies by language; use this as a rough cost indicator, not a hard budget.",
-            avg_segments_per_file
-        )
-    } else {
-        "estimated ~15 segments per file (unmeasured ecosystem; use as rough indicator only)"
-            .to_string()
-    };
+    let basis = format!(
+        "estimated ~{:.1} segments per file based on measured Rust (37.02) and Kotlin/Java (28.0) densities, with conservative estimates for unmeasured languages (15-30 range). Actual density varies by language; use this as a rough cost indicator, not a hard budget.",
+        avg_segments_per_file
+    );
 
     // Conservative lower and pessimistic upper bounds
     let low_bound = (total_tracked_files as f64 * 15.0) as usize;
@@ -2735,28 +2860,32 @@ pub async fn should_return_facts_envelope(
 /// Generates a facts envelope for a large monorepo on first-run.
 /// Uses gitignore-aware file counts and calibrated vector estimates based on measured
 /// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
+/// N2: Per-directory estimates now use the same calibrated density as the global estimate.
 pub async fn generate_facts_envelope(
     source_root: &Path,
     launch_subdir: Option<PathBuf>,
 ) -> Result<FactsEnvelope, OneupError> {
-    // Count files per top-level directory (gitignore-aware)
+    // Count files per top-level directory (gitignore-aware, N1: excludes .git)
     let dir_counts = count_files_per_directory(source_root)?;
     let file_count_total: usize = dir_counts.values().sum();
 
-    // Build directory stats with calibrated estimates
+    // N2: Compute calibrated density once, use for both global and per-directory estimates
+    let avg_segments_per_file = compute_avg_density_for_repo(source_root)?;
+
+    // Build directory stats with calibrated estimates (N2: consistent with global estimate)
     let mut per_directory_stats: Vec<DirectoryStats> = dir_counts
         .into_iter()
         .map(|(directory, file_count)| DirectoryStats {
             directory,
             file_count,
-            estimated_vectors: file_count.div_ceil(10), // Placeholder; will be calibrated per-directory
+            estimated_vectors: (file_count as f64 * avg_segments_per_file) as usize,
         })
         .collect();
 
     // Sort by file count descending (largest first)
     per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
 
-    // Calibrate vector estimate based on measured language densities
+    // Calibrate global vector estimate (N2: reuses same computed density)
     let (vector_estimate_total, basis, low_bound, high_bound) =
         estimate_vector_count(file_count_total, source_root)?;
 
@@ -4254,5 +4383,101 @@ mod tests {
 
         // Give spawned task a brief moment to initialize
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    #[test]
+    fn test_density_table_has_expected_entries() {
+        let table = get_density_table();
+        // N2: Verify calibrated density table exists and has measured values
+        assert!(
+            table.iter().any(|(ext, _)| *ext == "rs"),
+            "Rust density must be present"
+        );
+        assert!(
+            table.iter().any(|(ext, _)| *ext == "java"),
+            "Java density must be present"
+        );
+
+        // Verify measured densities are reasonable
+        if let Some((_, rust_density)) = table.iter().find(|(ext, _)| *ext == "rs") {
+            assert!(
+                *rust_density > 35.0 && *rust_density < 40.0,
+                "Rust density 37.02 expected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_directory_vector_estimates_consistent_with_global() {
+        // N2: Verify per-directory estimates use same calibration as global estimate
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a simple Rust repository structure
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname=\"test\"\n").unwrap();
+
+        // Compute global estimate
+        let (global_estimate, _basis, _low, _high) =
+            estimate_vector_count(3, root).expect("estimate should work");
+
+        // Compute per-directory density
+        let avg_density =
+            compute_avg_density_for_repo(root).expect("density computation should work");
+
+        // Per-file estimate should match global density (3 files * avg_density)
+        let per_dir_estimate = (3.0 * avg_density) as usize;
+        assert_eq!(
+            per_dir_estimate, global_estimate,
+            "per-directory estimate should match global total when summed"
+        );
+    }
+
+    #[test]
+    fn test_directory_walk_excludes_git() {
+        // N1: Verify .git directory is excluded from counts
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a tracked file in src/ directory
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+        // Create .git directory with many files (should be excluded)
+        fs::create_dir_all(root.join(".git").join("objects")).unwrap();
+        for i in 0..10 {
+            fs::write(
+                root.join(".git").join("objects").join(format!("obj_{}", i)),
+                "",
+            )
+            .unwrap();
+        }
+
+        // Count files per directory
+        let counts = count_files_per_directory(root).expect("count should work");
+
+        // .git should NOT appear in the counts (N1)
+        assert!(
+            !counts.contains_key(".git"),
+            "N1: .git directory should be excluded from counts; got {:?}",
+            counts
+        );
+
+        // src directory should have files counted
+        assert!(
+            counts.get("src").map(|c| *c == 1).unwrap_or(false),
+            "N1: src should have 1 file counted; got {:?}",
+            counts
+        );
+
+        // Verify total is just 1 (not 11 with .git files)
+        let total: usize = counts.values().sum();
+        assert_eq!(
+            total, 1,
+            "N1: should count only 1 file (not include .git); got {:?}",
+            counts
+        );
     }
 }

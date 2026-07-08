@@ -955,7 +955,7 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
         "facts should have next_actions with suggestions"
     );
 
-    // 3. Verify suggestions exclude .gitignore'd directories
+    // 3. Verify suggestions exclude .gitignore'd directories and VCS directories
     let stats = start_envelope["data"]["per_directory_stats"]
         .as_array()
         .unwrap();
@@ -966,7 +966,28 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
             "suggestions should exclude gitignored dirs; got {}",
             dir
         );
+        // N1: Verify .git is never suggested (VCS metadata should never appear)
+        // Only check for exact ".git" match since we're looking at top-level directory names
+        assert!(
+            dir != ".git" && dir != ".hg" && dir != ".svn",
+            "N1: VCS directories must be excluded from suggestions; got {}",
+            dir
+        );
     }
+
+    // Verify file counts don't include .git files
+    let file_count_total = start_envelope["data"]["file_count_total"]
+        .as_u64()
+        .unwrap_or(0) as usize;
+    // The fixture creates ~3450 tracked files in the cones.
+    // If .git was included, it would be much higher (80k+ on a real repo).
+    // Since this is a minimal fixture, just verify it's reasonable.
+    // The key thing is .git is NOT in per_directory_stats.
+    assert!(
+        file_count_total > 0 && file_count_total < 5_000,
+        "N1: file_count_total should be reasonable count of tracked files; got {}",
+        file_count_total
+    );
 
     // 4. Calling oneup_start without scope fires the gate successfully.
     // The daemon may auto-start in background, but the gate prevented immediate indexing
