@@ -349,6 +349,58 @@ pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
     })
 }
 
+/// Loads the current scope from the index if it exists.
+/// Returns an empty vec if no scope is recorded or if the index doesn't exist.
+async fn load_current_scope(state_root: &Path) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
+
+    match Db::open_ro(&db_path).await {
+        Ok(db) => match db.connect_tuned().await {
+            Ok(conn) => Ok(schema::read_scope_from_meta(&conn)
+                .await
+                .unwrap_or_default()
+                .unwrap_or_default()),
+            Err(_) => Ok(vec![]),
+        },
+        Err(_) => Ok(vec![]),
+    }
+}
+
+/// Determines the correct rebuild mode for the given scope operation.
+///
+/// - scope_narrow always requires rebuild (atomic rebuild)
+/// - scope_add on an unscoped index (first scoped) requires rebuild to avoid stale metadata
+/// - scope_add on an already-scoped index (widening) can be incremental
+async fn determine_rebuild_mode_for_scope(
+    state_root: &Path,
+    scope_add: Option<&Vec<String>>,
+    scope_narrow: Option<&Vec<String>>,
+) -> anyhow::Result<bool> {
+    if scope_narrow.is_some() {
+        // scope_narrow always requires atomic rebuild
+        return Ok(true);
+    }
+
+    if scope_add.is_some() {
+        // scope_add: check if we're converting from unscoped to scoped
+        let current_scope = load_current_scope(state_root).await?;
+        if current_scope.is_empty() {
+            // First scoped index after unscoped - need rebuild to avoid stale metadata
+            return Ok(true);
+        } else {
+            // Widening existing scope - can be incremental
+            return Ok(false);
+        }
+    }
+
+    // Default: no rebuild needed for other operations
+    Ok(false)
+}
+
 /// Computes the new scope by loading existing scope and applying scope_add/scope_narrow.
 ///
 /// Returns the resulting scope roots as a Vec<String>.
@@ -526,19 +578,30 @@ pub async fn start(
     // Determine if a rebuild (vs incremental write) is needed based on scope changes
     // and index state:
     // - scope_narrow always requires rebuild (atomic rebuild via StagingRebuild)
-    // - scope_add always requires rebuild (fresh staging DB, prevents metadata match against old scope)
+    // - scope_add on unscoped index requires rebuild (fresh staging DB, prevents metadata match)
+    // - scope_add on already-scoped index can be incremental (widening existing scope)
     // - Reindex mode requires rebuild
     let scope_affects_rebuild = scope_add.is_some() || scope_narrow.is_some();
-    let rebuild_mode = if scope_narrow.is_some() {
-        // Narrowing always requires full rebuild via StagingRebuild
-        true
-    } else if scope_add.is_some() {
-        // REQ-002: scope_add always requires rebuild (not just when missing).
-        // Ensures fresh staging database with no metadata from prior unscoped index,
-        // preventing all files from being metadata-matched when scope changes.
-        true
+    let rebuild_mode = if scope_affects_rebuild {
+        // Use scope-aware rebuild decision: check if this is first scoped or widening
+        match determine_rebuild_mode_for_scope(
+            &roots.state_root,
+            scope_add.as_ref(),
+            scope_narrow.as_ref(),
+        )
+        .await
+        {
+            Ok(mode) => mode,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to determine scope-based rebuild mode, defaulting to rebuild: {}",
+                    e
+                );
+                true // Default to rebuild on error
+            }
+        }
     } else {
-        // For other mode-based decisions, follow the original mode logic
+        // For non-scope operations, follow the mode logic
         mode == StartMode::Reindex
     };
 

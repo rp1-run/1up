@@ -3,6 +3,7 @@ use std::future::{self, Future};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow;
 use chrono::{DateTime, Utc};
 use libsql::Connection;
 use tokio::net::UnixStream;
@@ -1621,7 +1622,11 @@ async fn run_unit_while_servicing_search<F: Future>(
 
 /// Count files in a gitignore-aware manner for gate-check purposes.
 /// Returns the count of regular files that are not ignored by .gitignore.
-fn count_files_gitignore_aware(source_root: &Path) -> Result<usize, OneupError> {
+/// Checks the cancellation token every 100 entries to allow SIGTERM interruption.
+fn count_files_gitignore_aware(
+    source_root: &Path,
+    cancel_token: &CancellationToken,
+) -> Result<usize, OneupError> {
     use ignore::WalkBuilder;
 
     let walker = WalkBuilder::new(source_root)
@@ -1629,11 +1634,22 @@ fn count_files_gitignore_aware(source_root: &Path) -> Result<usize, OneupError> 
         .ignore(true) // Respect .gitignore
         .build();
 
-    let count = walker
-        .into_iter()
-        .filter_map(|result| result.ok())
-        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-        .count();
+    let mut count = 0;
+    for (idx, result) in walker.into_iter().enumerate() {
+        // Check cancellation every 100 entries to allow timely SIGTERM exit
+        if idx % 100 == 0 && cancel_token.is_cancelled() {
+            debug!("count_files_gitignore_aware cancelled at {} entries", count);
+            return Err(OneupError::Other(anyhow::anyhow!(
+                "walk cancelled by SIGTERM"
+            )));
+        }
+
+        if let Ok(entry) = result {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                count += 1;
+            }
+        }
+    }
 
     Ok(count)
 }
@@ -1717,7 +1733,7 @@ async fn run_project(
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
-            let file_count = count_files_gitignore_aware(source_root).unwrap_or(0);
+            let file_count = count_files_gitignore_aware(source_root, cancel_token).unwrap_or(0);
 
             // Check if scope is recorded in the progress file
             let scope_recorded = read_index_progress(state_root)
