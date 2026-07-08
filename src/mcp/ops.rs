@@ -37,9 +37,9 @@ use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
-    count_vector_rows_for_context, get_segment_by_prefix_for_context,
-    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
-    StoredSegment,
+    count_vector_rows_for_context, get_all_file_paths_for_context,
+    get_segment_by_prefix_for_context, get_segments_by_ids_for_context,
+    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
 };
 use crate::storage::swap;
 
@@ -857,11 +857,19 @@ pub async fn classify_readiness(
         .map(|reason| unavailable_reason_text(&reason));
 
     // Compute and populate index scope for coverage disclosure (REQ-002)
-    // This happens before status classification so it's available on all readable states
-    if let Ok(Some(scope)) =
-        compute_index_scope(state_root, source_root, &worktree_context.context_id).await
-    {
-        payload.index_scope = Some(scope);
+    // Use the existing connection to avoid contention
+    if let Ok(scope_roots) = schema::read_scope_from_meta(&conn).await {
+        let indexed_file_paths =
+            get_all_file_paths_for_context(&conn, &worktree_context.context_id)
+                .await
+                .unwrap_or_default();
+        let dir_counts = count_files_per_directory(source_root).unwrap_or_default();
+        let total_files: usize = dir_counts.values().sum();
+        payload.index_scope = Some(IndexScope {
+            roots: scope_roots.unwrap_or_default(),
+            indexed_files: indexed_file_paths.len(),
+            total_files,
+        });
     }
 
     if progress_without_embeddings || embedding_reason.is_some() {
