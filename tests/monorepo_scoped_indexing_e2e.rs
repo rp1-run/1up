@@ -824,7 +824,7 @@ edition = "2021"
 
     // Create untracked gitignored target/ tree
     let target_dir = root.join("target");
-    fs::create_dir_all(&target_dir.join("debug")).unwrap();
+    fs::create_dir_all(target_dir.join("debug")).unwrap();
     for i in 0..300 {
         let file_path = target_dir.join("debug").join(format!("dep_{:04}.rlib", i));
         fs::write(&file_path, format!("library artifact {}\n", i)).unwrap();
@@ -1059,7 +1059,7 @@ fn test_daemon_alive_no_worker_process_leaks() {
 
     // Kill any existing worker processes from prior test runs
     let _ = Command::new("pkill")
-        .args(&["-9", "-f", "__worker"])
+        .args(["-9", "-f", "__worker"])
         .output();
 
     let mut client = McpTestClient::start_with_isolated_state(&root);
@@ -1105,7 +1105,7 @@ fn test_daemon_alive_no_worker_process_leaks() {
 
     // Check that no __worker processes exist
     let output = Command::new("pgrep")
-        .args(&["-f", "__worker"])
+        .args(["-f", "__worker"])
         .output()
         .expect("pgrep should run");
 

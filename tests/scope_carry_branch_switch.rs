@@ -6,8 +6,6 @@
 // does the carried scope reach it when persist_carried_scope() only writes to the
 // progress file (index_status.json)?
 
-mod common;
-
 use oneup::shared::config;
 use oneup::shared::types::{IndexPhase, IndexProgress, IndexScopeInfo, IndexState};
 use oneup::storage::db::Db;
@@ -267,19 +265,19 @@ async fn scope_carry_with_fresh_staging_database() {
 // Helpers
 fn git_init_repo(path: &std::path::Path) {
     std::process::Command::new("git")
-        .args(&["init"])
+        .args(["init"])
         .current_dir(path)
         .output()
         .expect("git init failed");
 
     std::process::Command::new("git")
-        .args(&["config", "user.email", "test@example.com"])
+        .args(["config", "user.email", "test@example.com"])
         .current_dir(path)
         .output()
         .expect("git config user.email failed");
 
     std::process::Command::new("git")
-        .args(&["config", "user.name", "Test User"])
+        .args(["config", "user.name", "Test User"])
         .current_dir(path)
         .output()
         .expect("git config user.name failed");
@@ -293,13 +291,13 @@ fn create_test_file(repo_path: &std::path::Path, rel_path: &str, content: &str) 
 
 fn git_commit(path: &std::path::Path, message: &str) {
     std::process::Command::new("git")
-        .args(&["add", "."])
+        .args(["add", "."])
         .current_dir(path)
         .output()
         .expect("git add failed");
 
     std::process::Command::new("git")
-        .args(&["commit", "-m", message])
+        .args(["commit", "-m", message])
         .current_dir(path)
         .output()
         .expect("git commit failed");
@@ -307,7 +305,7 @@ fn git_commit(path: &std::path::Path, message: &str) {
 
 fn git_checkout_new_branch(path: &std::path::Path, branch: &str) {
     std::process::Command::new("git")
-        .args(&["checkout", "-b", branch])
+        .args(["checkout", "-b", branch])
         .current_dir(path)
         .output()
         .expect("git checkout -b failed");
