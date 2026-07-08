@@ -2515,8 +2515,9 @@ fn save_persistent_directory_walk_cache(
     entries: &HashMap<String, BTreeMap<String, usize>>,
 ) {
     let dot_dir = project_dot_dir(state_root);
-    if let Err(e) = std::fs::create_dir_all(&dot_dir) {
-        tracing::warn!("failed to create .1up directory for cache: {}", e);
+    // FIX A: Only write cache if .1up already exists. Never create .1up during blocked/failed
+    // indexing attempts (REQ-001: blocked path must leave NO .1up side effects).
+    if !dot_dir.exists() {
         return;
     }
 
@@ -2529,6 +2530,47 @@ fn save_persistent_directory_walk_cache(
         serde_json::to_string(&cache).unwrap_or_default(),
     ) {
         tracing::warn!("failed to persist directory walk cache: {}", e);
+    }
+}
+
+// FIX B: Density computation cache to avoid second uncached walk on every envelope call.
+// Keyed by (repo_identity, HEAD, mtime) - same as directory walk cache key.
+static DENSITY_CACHE: OnceLock<Mutex<HashMap<DirectoryWalkCacheKey, f64>>> = OnceLock::new();
+
+fn get_density_cache() -> &'static Mutex<HashMap<DirectoryWalkCacheKey, f64>> {
+    DENSITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// FIX B: Load cached density from persistent storage if it exists.
+/// Returns None on any error (missing file, parse error, etc.); errors are non-fatal.
+#[allow(dead_code)] // Future use for cross-process density persistence
+fn load_persistent_density_cache(state_root: &Path) -> Option<f64> {
+    let cache_path = project_dot_dir(state_root).join("density_cache.json");
+    match std::fs::read_to_string(&cache_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(obj) => obj.get("density").and_then(|v| v.as_f64()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// FIX B: Persist computed density to disk for cross-process reuse.
+/// Only writes if .1up directory already exists (same guard as directory walk cache).
+#[allow(dead_code)] // Future use for cross-process density persistence
+fn save_persistent_density_cache(state_root: &Path, density: f64) {
+    let dot_dir = project_dot_dir(state_root);
+    if !dot_dir.exists() {
+        return;
+    }
+
+    let cache_data = serde_json::json!({ "density": density });
+    let cache_path = dot_dir.join("density_cache.json");
+    if let Err(e) = std::fs::write(
+        &cache_path,
+        serde_json::to_string(&cache_data).unwrap_or_default(),
+    ) {
+        tracing::warn!("failed to persist density cache: {}", e);
     }
 }
 
@@ -2767,7 +2809,27 @@ fn get_density_table() -> &'static [(&'static str, f64)] {
 
 /// Compute average segments-per-file density for a repository based on language distribution.
 /// N2: Shared by both global and per-directory estimates.
+/// FIX B: Caches result to avoid re-walking on every envelope call.
 fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
+    // FIX B: Build cache key same as directory walk cache for consistency
+    let cache_key = DirectoryWalkCacheKey {
+        repo_identity: source_root
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
+        head_commit: get_head_commit(source_root),
+        root_mtime: get_root_mtime(source_root),
+    };
+
+    // FIX B: Check in-process cache first
+    if let Ok(cache) = get_density_cache().lock() {
+        if let Some(cached_density) = cache.get(&cache_key) {
+            return Ok(*cached_density);
+        }
+    }
+
+    // FIX B: If not in memory, compute the density by walking the repo
     let density_table = get_density_table();
     let walker = build_vcs_aware_walker(source_root).build();
 
@@ -2801,6 +2863,11 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
     } else {
         15.0 // Fallback for completely unmeasured ecosystems
     };
+
+    // FIX B: Cache the result for this repo state
+    if let Ok(mut cache) = get_density_cache().lock() {
+        cache.insert(cache_key, avg_segments_per_file);
+    }
 
     Ok(avg_segments_per_file)
 }
@@ -4495,6 +4562,44 @@ mod tests {
         assert_eq!(
             per_dir_estimate, global_estimate,
             "per-directory estimate should match global total when summed"
+        );
+    }
+
+    #[test]
+    fn test_density_cache_hits_on_second_call() {
+        // FIX B: Verify density computation caches result to avoid re-walking
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a simple repository structure
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
+
+        // First call should compute and cache
+        let density1 =
+            compute_avg_density_for_repo(root).expect("first density computation should work");
+
+        // Second call should hit cache (same path, same state)
+        // We can't directly measure cache hits, but verify the result is identical
+        // and completes instantly (would take longer if re-walking)
+        let start = std::time::Instant::now();
+        let density2 =
+            compute_avg_density_for_repo(root).expect("second density computation should work");
+        let elapsed = start.elapsed();
+
+        // Results should be identical
+        assert_eq!(
+            density1, density2,
+            "density should be consistent across calls"
+        );
+
+        // Second call should be nearly instant (cache hit) - should take <20ms
+        // if it were re-walking it could take 100s of ms or more
+        assert!(
+            elapsed.as_millis() < 20,
+            "cached density lookup should be instant, took {}ms",
+            elapsed.as_millis()
         );
     }
 

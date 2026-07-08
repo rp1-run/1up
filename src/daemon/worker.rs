@@ -1733,7 +1733,18 @@ async fn run_project(
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
-            let file_count = count_files_gitignore_aware(source_root, cancel_token).unwrap_or(0);
+            // FIX C: Run the gate walk in spawn_blocking so the async executor
+            // stays responsive to SIGTERM signals and can cancel the token.
+            let source_root_clone = source_root.to_path_buf();
+            let cancel_token_clone = cancel_token.clone();
+            let file_count = tokio::task::spawn_blocking(move || {
+                count_files_gitignore_aware(&source_root_clone, &cancel_token_clone)
+            })
+            .await
+            .unwrap_or(Err(OneupError::Other(anyhow::anyhow!(
+                "blocking task panicked"
+            ))))
+            .unwrap_or(0);
 
             // Check if scope is recorded in the progress file
             let scope_recorded = read_index_progress(state_root)
