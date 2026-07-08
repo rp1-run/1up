@@ -240,7 +240,7 @@ fn wait_for_search(home: &Path, project: &Path, query: &str, should_find: bool) 
 
 #[cfg(unix)]
 fn assert_fallback_reason_in(status: &serde_json::Value, allowed: &[&str]) {
-    let reason = status["index_progress"]["scope"]["fallback_reason"]
+    let reason = status["index_progress"]["scope_recorded"]["fallback_reason"]
         .as_str()
         .unwrap_or("");
     assert!(
@@ -2262,7 +2262,7 @@ fn write_lifecycle_progress_fixture(project: &Path, project_id: &str) {
                 "model_prepare_ms": 6,
                 "input_prep_ms": 7
             },
-            "scope": {
+            "scope_recorded": {
                 "requested": "scoped",
                 "executed": "full",
                 "changed_paths": 2,

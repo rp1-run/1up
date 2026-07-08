@@ -76,6 +76,7 @@ async fn scope_carry_branch_switch_database_sharing() {
             executed: "scoped:2".to_string(),
             changed_paths: 2,
             fallback_reason: None,
+            roots: vec!["services/auth".to_string(), "libs/core".to_string()],
         }),
         prefilter: None,
         indexer_pid: None,
