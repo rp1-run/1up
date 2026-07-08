@@ -460,22 +460,35 @@ fn monorepo_scope_persistence_in_meta_table() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Verify scope is persisted in meta table
+    // Verify scope is persisted in meta table. oneup_start is non-blocking
+    // (REQ-012) and a daemon refresh can win the first-searchable race with an
+    // unscoped build, so poll until the scoped rebuild's meta write lands
+    // rather than reading once.
     block_on(async {
         let index_path = root.join(".1up").join("index.db");
-        if index_path.exists() {
-            let db = Db::open_rw(&index_path).await.unwrap();
-            let conn = db.connect().unwrap();
-            let scope = oneup::storage::schema::read_scope_from_meta(&conn)
-                .await
-                .unwrap();
-            assert!(scope.is_some(), "scope should be persisted in meta table");
-            let roots = scope.unwrap();
-            assert!(
-                roots.iter().any(|r| r.contains("auth")),
-                "scope should contain services/auth"
-            );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut last_scope: Option<Vec<String>> = None;
+        loop {
+            if index_path.exists() {
+                let db = Db::open_rw(&index_path).await.unwrap();
+                let conn = db.connect().unwrap();
+                last_scope = oneup::storage::schema::read_scope_from_meta(&conn)
+                    .await
+                    .unwrap();
+                if last_scope.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        let roots = last_scope.expect("scope should be persisted in meta table within 30s");
+        assert!(
+            roots.iter().any(|r| r.contains("auth")),
+            "scope should contain services/auth; got {roots:?}"
+        );
     });
 }
 
@@ -1041,11 +1054,18 @@ fn test_daemon_alive_scoped_start_applies_scope() {
     });
 }
 
-/// T8.3: No __worker processes leaked after test completion
+/// T8.3 (REQ-011/F11): the project daemon is not SIGTERM-immune.
 ///
-/// Acceptance: Test asserts zero `__worker` processes leaked after test completion
+/// The daemon intentionally persists after its launching parent exits
+/// (`1up start` returns immediately; the cli_tests daemon lifecycle suite
+/// asserts persistence). The F11 regression was orphaned `__worker` daemons
+/// that ignored SIGTERM and kept burning CPU, so the meaningful assertion
+/// is that the daemon spawned for this isolated project exits promptly on
+/// SIGTERM. Everything is scoped to that daemon's own pid — a machine-wide
+/// pkill/pgrep would race with unrelated daemons on the host.
 #[test]
-fn test_daemon_alive_no_worker_process_leaks() {
+#[cfg(unix)]
+fn test_daemon_alive_worker_not_sigterm_immune() {
     let _guard = HideModelGuard::new();
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -1057,68 +1077,88 @@ fn test_daemon_alive_no_worker_process_leaks() {
         total_files
     );
 
-    // Kill any existing worker processes from prior test runs
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", "__worker"])
-        .output();
-
     let mut client = McpTestClient::start_with_isolated_state(&root);
+    let server_pid = client.child.id();
 
-    // Trigger indexing with a scope
+    // Gate fires on the over-threshold repo; accept the suggested scope so the
+    // server has a reason to spawn and use the project daemon.
     let facts_result = client.call_tool(
         TOOL_START,
         serde_json::json!({
             "mode": "index_if_missing"
         }),
     );
-
     let facts_envelope = mcp_structured(&facts_result);
-    let actions = facts_envelope["next_actions"]
+    let suggested_scope: Vec<String> = facts_envelope["next_actions"][0]["arguments"]["scope_add"]
         .as_array()
-        .expect("should have next_actions");
-
-    let first_action = &actions[0];
-    let scope_add = first_action["arguments"]["scope_add"]
-        .as_array()
-        .expect("scope_add should be array");
-    let suggested_scope: Vec<String> = scope_add
-        .iter()
-        .filter_map(|s| s.as_str().map(String::from))
-        .collect();
-
+        .map(|scope_add| {
+            scope_add
+                .iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let _ = client.call_tool(
         TOOL_START,
         serde_json::json!({
             "mode": "index_if_missing",
-            "scope_add": suggested_scope.clone()
+            "scope_add": suggested_scope
         }),
     );
 
-    // Wait briefly for indexing to start
-    thread::sleep(Duration::from_millis(1000));
+    // The daemon is spawned as a direct child of our MCP server, so discover
+    // its pid via the parent relationship — never a machine-wide pattern match.
+    let mut daemon_pid: Option<i32> = None;
+    for _ in 0..30 {
+        let output = std::process::Command::new("pgrep")
+            .args(["-P", &server_pid.to_string(), "-f", "__worker"])
+            .output()
+            .expect("pgrep should run");
+        if let Some(pid) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<i32>().ok())
+        {
+            daemon_pid = Some(pid);
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let daemon_pid = daemon_pid.expect("MCP server should spawn a __worker daemon child");
 
-    // Kill MCP process (simulating parent exit)
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    // Parent exit: the daemon must survive its launcher (persistence contract).
     drop(client);
-
-    // Wait for worker cleanup
     thread::sleep(Duration::from_secs(2));
+    assert!(
+        alive(daemon_pid),
+        "daemon (pid {daemon_pid}) should persist after its parent exits"
+    );
 
-    // Check that no __worker processes exist
-    let output = Command::new("pgrep")
-        .args(["-f", "__worker"])
-        .output()
-        .expect("pgrep should run");
-
-    let worker_count = if output.stdout.is_empty() {
-        0
-    } else {
-        output.stdout.iter().filter(|&&b| b == b'\n').count() + 1
-    };
-
-    assert_eq!(
-        worker_count, 0,
-        "should have no leaked __worker processes after daemon stops; found {}",
-        worker_count
+    // F11 regression: SIGTERM must terminate it promptly.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+    let mut exited = false;
+    for _ in 0..20 {
+        if !alive(daemon_pid) {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    if !exited {
+        // Do not leak the daemon past the test on failure.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        exited,
+        "daemon (pid {daemon_pid}) did not exit within 10s of SIGTERM (F11: SIGTERM-immune worker)"
     );
 }
 
