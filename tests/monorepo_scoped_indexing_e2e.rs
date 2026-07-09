@@ -1404,8 +1404,8 @@ pub fn main_logic() {
     // Index the repository
     let _ = client.call_tool(TOOL_START, serde_json::json!({"mode": "index_if_needed"}));
 
-    // Wait for indexing to complete
-    thread::sleep(Duration::from_millis(500));
+    // Wait for indexing to complete using eventual-state polling
+    wait_for_searchable_readiness(&mut client);
 
     // Search for a term that will match code (e.g., "add" function)
     let search_result = client.call_tool(
@@ -1444,7 +1444,10 @@ pub fn main_logic() {
     let records = default_envelope["data"]["records"]
         .as_array()
         .expect("response should have records");
-    assert!(!records.is_empty(), "response should contain at least one record");
+    assert!(
+        !records.is_empty(),
+        "response should contain at least one record"
+    );
 
     let default_record = &records[0]["segment"];
     // Verify symbols are omitted (empty or absent) with default verbosity
@@ -1498,7 +1501,10 @@ pub fn main_logic() {
     let full_records = full_envelope["data"]["records"]
         .as_array()
         .expect("response should have records");
-    assert!(!full_records.is_empty(), "response should contain at least one record");
+    assert!(
+        !full_records.is_empty(),
+        "response should contain at least one record"
+    );
 
     let full_record = &full_records[0]["segment"];
 
@@ -1506,10 +1512,7 @@ pub fn main_logic() {
     // The fields may be empty arrays and thus skipped during serialization (skip_serializing_if = "Vec::is_empty")
     // Just verify that the structure is consistent and content is present
     // (symbol population depends on whether the segment has extractable symbols)
-    assert!(
-        full_record.is_object(),
-        "segment should be an object"
-    );
+    assert!(full_record.is_object(), "segment should be an object");
 
     // Verify content is still present in full request
     assert!(
@@ -1522,10 +1525,7 @@ pub fn main_logic() {
     );
 
     // Verify that the core segment fields are present in both requests
-    assert!(
-        default_record["path"].is_string(),
-        "path should be present"
-    );
+    assert!(default_record["path"].is_string(), "path should be present");
     assert!(
         full_record["path"].is_string(),
         "path should be present in full request"
