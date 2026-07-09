@@ -2924,7 +2924,7 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
 /// REQ-006: Vector estimate must be calibrated against real embedding density.
 /// Measured densities:
 /// - Rust: 37.02 segments/file (measured on 1up: 148 files → 5479 segments)
-/// - Kotlin/Java: ~28 segments/file (cash-server validation)
+/// - Kotlin/Java: ~28 segments/file (measured on a large production monorepo)
 /// - Unmeasured: 15-30 conservative range
 fn estimate_vector_count(
     total_tracked_files: usize,
