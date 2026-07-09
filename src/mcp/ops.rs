@@ -3048,6 +3048,9 @@ pub async fn generate_facts_envelope(
 /// Reads the scope roots from the meta table, counts indexed files from the database,
 /// and counts total files in the repository. Returns None if the index is not present
 /// or readable.
+///
+/// When roots is empty (unscoped full index), populates eligibility_note to explain
+/// why indexed_files < total_files (lockfiles, vendor dirs, excluded by .gitignore, etc).
 pub async fn compute_index_scope(
     state_root: &Path,
     source_root: &Path,
@@ -3074,11 +3077,24 @@ pub async fn compute_index_scope(
     let dir_counts = count_files_per_directory(source_root)?;
     let total_files: usize = dir_counts.values().sum();
 
+    let roots = scope_roots.unwrap_or_default();
+
+    // When roots is empty (unscoped index), populate eligibility_note explaining the gap
+    let eligibility_note = if roots.is_empty() {
+        Some(
+            "Full index (no scope recorded). Indexed files = code and doc files. \
+             Total files = all git-tracked files + gitignore-excluded files walked for statistics."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     Ok(Some(IndexScope {
-        roots: scope_roots.unwrap_or_default(),
+        roots,
         indexed_files,
         total_files,
-        eligibility_note: None,
+        eligibility_note,
     }))
 }
 
@@ -4229,6 +4245,43 @@ mod tests {
         let description = scope.coverage_description();
         assert!(description.contains("0 files indexed of 0 total"));
         assert!(description.contains("0%"));
+    }
+
+    #[test]
+    fn index_scope_eligibility_note_populated_for_unscoped_index() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec![],
+            indexed_files: 149,
+            total_files: 210,
+            eligibility_note: Some(
+                "Full index (no scope recorded). Indexed files = code and doc files. \
+                 Total files = all git-tracked files + gitignore-excluded files walked for statistics."
+                    .to_string(),
+            ),
+        };
+
+        assert!(scope.eligibility_note.is_some());
+        let note = scope.eligibility_note.unwrap();
+        assert!(note.contains("Full index"));
+        assert!(note.contains("no scope recorded"));
+        assert!(note.contains("Indexed files"));
+        assert!(note.contains("Total files"));
+    }
+
+    #[test]
+    fn index_scope_eligibility_note_absent_for_scoped_index() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string(), "libs/core".to_string()],
+            indexed_files: 150,
+            total_files: 2500,
+            eligibility_note: None,
+        };
+
+        assert!(scope.eligibility_note.is_none());
     }
 
     #[test]
