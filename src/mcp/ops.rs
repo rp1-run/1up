@@ -932,6 +932,7 @@ pub async fn classify_readiness(
             roots: scope_roots.unwrap_or_default(),
             indexed_files: indexed_file_paths.len(),
             total_files,
+            eligibility_note: None,
         });
     }
 
@@ -2354,6 +2355,7 @@ fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
             roots: scope_info.roots.clone(),
             indexed_files: progress.files_indexed,
             total_files: progress.files_total,
+            eligibility_note: None,
         }
     })
 }
@@ -3076,6 +3078,7 @@ pub async fn compute_index_scope(
         roots: scope_roots.unwrap_or_default(),
         indexed_files,
         total_files,
+        eligibility_note: None,
     }))
 }
 
@@ -4171,6 +4174,7 @@ mod tests {
             roots: vec!["services/auth".to_string(), "libs/core".to_string()],
             indexed_files: 150,
             total_files: 2500,
+            eligibility_note: None,
         };
 
         let json = serde_json::to_string(&scope).expect("should serialize");
@@ -4189,6 +4193,7 @@ mod tests {
             roots: vec![],
             indexed_files: 0,
             total_files: 1000,
+            eligibility_note: None,
         };
 
         assert_eq!(scope.coverage_description(), "No scope configured");
@@ -4202,6 +4207,7 @@ mod tests {
             roots: vec!["services/auth".to_string()],
             indexed_files: 150,
             total_files: 600,
+            eligibility_note: None,
         };
 
         let description = scope.coverage_description();
@@ -4217,6 +4223,7 @@ mod tests {
             roots: vec!["services/auth".to_string()],
             indexed_files: 0,
             total_files: 0,
+            eligibility_note: None,
         };
 
         let description = scope.coverage_description();

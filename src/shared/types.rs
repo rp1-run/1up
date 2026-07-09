@@ -91,6 +91,11 @@ pub struct IndexScope {
     pub indexed_files: usize,
     /// Total files in the repository (denominator for coverage calculation).
     pub total_files: usize,
+    /// Plain-text explanation of the unscoped index gap (shown only when roots is empty).
+    /// Describes how indexed_files and total_files differ and why (e.g., lockfiles, vendored code, excluded by .gitignore).
+    /// Omitted when scope roots are populated (scoped index case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility_note: Option<String>,
 }
 
 impl IndexScope {
