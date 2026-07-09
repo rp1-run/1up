@@ -4797,4 +4797,109 @@ mod tests {
             counts
         );
     }
+
+    #[tokio::test]
+    async fn test_generate_facts_envelope_excludes_dot_directories() {
+        // T8: Verify that tool/editor dot-directories are filtered from
+        // per_directory_stats in the facts envelope. The envelope is used for
+        // scope suggestions; dot-directories are noise and should not appear.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a repo structure with real directories and tool/editor dot-directories
+        // Real directories (should appear in stats):
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod utils;").unwrap();
+
+        fs::create_dir_all(root.join("libs")).unwrap();
+        fs::write(root.join("libs/helper.rs"), "pub fn help() {}").unwrap();
+
+        // Tool/editor dot-directories (should be EXCLUDED from stats):
+        fs::create_dir_all(root.join(".idea")).unwrap();
+        for i in 0..3 {
+            fs::write(
+                root.join(".idea").join(format!("config_{}", i)),
+                "IDE config",
+            )
+            .unwrap();
+        }
+
+        fs::create_dir_all(root.join(".vscode")).unwrap();
+        fs::write(root.join(".vscode/settings.json"), "{}").unwrap();
+        fs::write(root.join(".vscode/launch.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        fs::write(root.join(".1up/cache.db"), "cache").unwrap();
+        fs::write(root.join(".1up/meta.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join(".agentdocs")).unwrap();
+        fs::write(root.join(".agentdocs/index.md"), "# Docs").unwrap();
+
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join(".claude/config.json"), "{}").unwrap();
+
+        // Generate the facts envelope
+        let envelope = generate_facts_envelope(root, None)
+            .await
+            .expect("facts envelope should be generated");
+
+        // Verify real directories are present
+        let dir_names: Vec<&str> = envelope
+            .per_directory_stats
+            .iter()
+            .map(|s| s.directory.as_str())
+            .collect();
+
+        assert!(
+            dir_names.contains(&"src"),
+            "src directory should appear in per_directory_stats; got {:?}",
+            dir_names
+        );
+
+        assert!(
+            dir_names.contains(&"libs"),
+            "libs directory should appear in per_directory_stats; got {:?}",
+            dir_names
+        );
+
+        // Verify NO dot-directories appear (acceptance criterion 3)
+        for dir in &envelope.per_directory_stats {
+            assert!(
+                !dir.directory.starts_with('.'),
+                "Dot-directory should be filtered out; found: {}",
+                dir.directory
+            );
+        }
+
+        // Verify specific excluded dot-directories are NOT present
+        let excluded = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
+        for excluded_dir in &excluded {
+            assert!(
+                !dir_names.contains(excluded_dir),
+                "Excluded dot-directory {} should not appear; got {:?}",
+                excluded_dir,
+                dir_names
+            );
+        }
+
+        // Verify ordering: largest real directory comes first (src has 2 files, libs has 1)
+        assert_eq!(
+            envelope.per_directory_stats[0].directory, "src",
+            "Largest real directory (src) should be first after filtering and sorting"
+        );
+        assert_eq!(
+            envelope.per_directory_stats[0].file_count, 2,
+            "src should have 2 files"
+        );
+
+        assert_eq!(
+            envelope.per_directory_stats[1].directory, "libs",
+            "Second largest directory (libs) should be second"
+        );
+        assert_eq!(
+            envelope.per_directory_stats[1].file_count, 1,
+            "libs should have 1 file"
+        );
+    }
 }
