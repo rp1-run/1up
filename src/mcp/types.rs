@@ -86,6 +86,11 @@ pub struct GetInput {
     #[schemars(description = "Durable result handles returned by oneup_search or oneup_symbol.")]
     pub handles: Vec<String>,
     pub path: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional verbosity level: \"default\" omits symbol lists and redundant summaries; \"full\" includes detailed symbol metadata. Defaults to \"default\"."
+    )]
+    pub verbosity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -221,6 +226,7 @@ pub struct DirectoryStats {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct FactsEnvelope {
     /// Per-directory file and vector statistics for the top-level directories.
+    /// Excludes tool/editor dot-directories (.idea, .claude, .vscode, .1up, .agentdocs).
     pub per_directory_stats: Vec<DirectoryStats>,
     /// Paths to workspace manifest files detected (e.g., Cargo.toml, package.json).
     /// These are paths relative to the repo root where manifest-like files were found.
@@ -230,6 +236,10 @@ pub struct FactsEnvelope {
     /// Launch subdirectory before project root resolution (if 1up was started from a subdirectory).
     /// Included as a suggestion for the default scope.
     pub launch_subdir: Option<String>,
+    /// Ranked suggestions for scope cones based on largest directories.
+    /// Formatted without leading "Or" phrasing for coherent agent consumption.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
     /// Total file count across all directories (gitignore-aware tracked count).
     pub file_count_total: usize,
     /// Total estimated vector count based on measured language densities.

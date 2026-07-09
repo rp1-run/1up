@@ -230,12 +230,20 @@ pub struct SegmentRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breadcrumb: Option<String>,
     pub role: SegmentRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub defined_symbols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub referenced_symbols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub called_symbols: Vec<String>,
+    /// First symbol defined by the underlying segment, captured before the
+    /// verbosity gating applied to `defined_symbols`. Never serialized into
+    /// the hydration payload; envelope next_actions read it so defining
+    /// segments keep offering oneup_symbol verification at any verbosity.
+    #[serde(skip)]
+    pub symbol_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -928,8 +936,10 @@ pub async fn classify_readiness(
                 .unwrap_or_default();
         let dir_counts = count_files_per_directory(source_root).unwrap_or_default();
         let total_files: usize = dir_counts.values().sum();
+        let roots = scope_roots.unwrap_or_default();
         payload.index_scope = Some(IndexScope {
-            roots: scope_roots.unwrap_or_default(),
+            eligibility_note: unscoped_eligibility_note(&roots),
+            roots,
             indexed_files: indexed_file_paths.len(),
             total_files,
         });
@@ -1255,19 +1265,28 @@ pub async fn get_handles(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
-    retry_on_db_lock(|| async { get_handles_once(state_root, worktree_context, handles).await })
-        .await
+    retry_on_db_lock(|| async {
+        get_handles_once(state_root, worktree_context, handles, verbosity).await
+    })
+    .await
 }
 
 async fn get_handles_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
-    let records =
-        resolve_handle_records(&current.conn, &worktree_context.context_id, handles).await?;
+    let records = resolve_handle_records(
+        &current.conn,
+        &worktree_context.context_id,
+        handles,
+        verbosity,
+    )
+    .await?;
 
     Ok(ReadPayload {
         status: aggregate_read_status(&records),
@@ -1879,6 +1898,7 @@ async fn resolve_handle_records(
     conn: &Connection,
     context_id: &str,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<Vec<ReadRecord>> {
     let normalized: Vec<String> = handles
         .iter()
@@ -1910,9 +1930,11 @@ async fn resolve_handle_records(
                 "empty segment handle",
             ));
         } else if let Some(segment) = segments_by_id.get(&normalized) {
-            records.push(read_segment(source, segment.clone()));
+            records.push(read_segment(source, segment.clone(), verbosity));
         } else {
-            records.push(resolve_handle_via_prefix(conn, context_id, source, &normalized).await?);
+            records.push(
+                resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await?,
+            );
         }
     }
 
@@ -1927,10 +1949,11 @@ async fn resolve_handle_via_prefix(
     context_id: &str,
     source: ReadSource,
     normalized: &str,
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadRecord> {
     Ok(
         match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
-            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
+            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment, verbosity),
             SegmentPrefixLookup::NotFound => {
                 read_message(ReadStatus::NotFound, source, "segment handle was not found")
             }
@@ -2089,11 +2112,11 @@ fn join_repo_relative(source_root: &Path, raw: &Path) -> Result<PathBuf, Locatio
     Ok(candidate)
 }
 
-fn read_segment(source: ReadSource, segment: StoredSegment) -> ReadRecord {
+fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&str>) -> ReadRecord {
     ReadRecord {
         status: ReadStatus::Found,
         source,
-        segment: Some(segment_record(segment)),
+        segment: Some(segment_record(segment, verbosity)),
         context: None,
         matching_handles: Vec::new(),
         message: None,
@@ -2140,11 +2163,31 @@ fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<Strin
     }
 }
 
-fn segment_record(segment: StoredSegment) -> SegmentRecord {
+fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRecord {
     let role = segment.parsed_role();
-    let defined_symbols = segment.parsed_defined_symbols();
-    let referenced_symbols = segment.parsed_referenced_symbols();
-    let called_symbols = segment.parsed_called_symbols();
+    let is_verbose = verbosity.map(|v| v == "full").unwrap_or(false);
+
+    // The symbol hint is derived from the underlying segment data before any
+    // verbosity gating so next_actions never lose the oneup_symbol follow-up.
+    let parsed_defined_symbols = segment.parsed_defined_symbols();
+    let symbol_hint = parsed_defined_symbols.first().cloned();
+
+    // Only populate symbols if verbosity is "full"; default to empty lists.
+    let defined_symbols = if is_verbose {
+        parsed_defined_symbols
+    } else {
+        Vec::new()
+    };
+    let referenced_symbols = if is_verbose {
+        segment.parsed_referenced_symbols()
+    } else {
+        Vec::new()
+    };
+    let called_symbols = if is_verbose {
+        segment.parsed_called_symbols()
+    } else {
+        Vec::new()
+    };
 
     SegmentRecord {
         handle: segment.id,
@@ -2156,9 +2199,11 @@ fn segment_record(segment: StoredSegment) -> SegmentRecord {
         line_end: usize_from_i64(segment.line_end),
         breadcrumb: segment.breadcrumb,
         role,
+        summary: None,
         defined_symbols,
         referenced_symbols,
         called_symbols,
+        symbol_hint,
     }
 }
 
@@ -2354,6 +2399,7 @@ fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
             roots: scope_info.roots.clone(),
             indexed_files: progress.files_indexed,
             total_files: progress.files_total,
+            eligibility_note: None,
         }
     })
 }
@@ -2878,7 +2924,7 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
 /// REQ-006: Vector estimate must be calibrated against real embedding density.
 /// Measured densities:
 /// - Rust: 37.02 segments/file (measured on 1up: 148 files → 5479 segments)
-/// - Kotlin/Java: ~28 segments/file (cash-server validation)
+/// - Kotlin/Java: ~28 segments/file (measured on a large production monorepo)
 /// - Unmeasured: 15-30 conservative range
 fn estimate_vector_count(
     total_tracked_files: usize,
@@ -2987,6 +3033,59 @@ pub async fn should_return_facts_envelope(
     Ok(total_files > threshold)
 }
 
+/// Generates ranked scope suggestions from top-level directories.
+/// T9: Provides multiple ranked suggestions without dangling "Or" wording.
+/// Returns up to 3 suggestions formatted as actionable scope cone names.
+/// Excludes launch_subdir from suggestions if already matched (avoids duplication).
+fn generate_ranked_suggestions(
+    per_directory_stats: &[DirectoryStats],
+    launch_subdir: &Option<String>,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    for (idx, stat) in per_directory_stats.iter().take(3).enumerate() {
+        // Skip suggesting the launch_subdir (redundant with top-level launch_subdir suggestion)
+        if let Some(subdir) = launch_subdir {
+            if &stat.directory == subdir {
+                continue;
+            }
+        }
+
+        let suggestion = if suggestions.is_empty() {
+            // First emitted suggestion is primary (no "Or"), even when the
+            // top-ranked directory was skipped as the launch_subdir.
+            if idx == 0 {
+                format!("Index the largest directory: {}", stat.directory)
+            } else {
+                // Keep the ordinal truthful to the actual rank, not the
+                // emitted position.
+                format!(
+                    "Index the {} largest directory: {}",
+                    ordinal(idx + 1),
+                    stat.directory
+                )
+            }
+        } else {
+            // Subsequent suggestions are ranked alternatives
+            format!("Or index {}: {}", ordinal(idx + 1), stat.directory)
+        };
+
+        suggestions.push(suggestion);
+    }
+
+    suggestions
+}
+
+/// Helper to convert numeric position to ordinal (1st, 2nd, 3rd, etc.)
+fn ordinal(n: usize) -> &'static str {
+    match n {
+        1 => "1st",
+        2 => "2nd",
+        3 => "3rd",
+        _ => "next",
+    }
+}
+
 /// Generates a facts envelope for a large monorepo on first-run.
 /// Uses gitignore-aware file counts and calibrated vector estimates based on measured
 /// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
@@ -3015,6 +3114,11 @@ pub async fn generate_facts_envelope(
     // Sort by file count descending (largest first)
     per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
 
+    // T8: Filter out tool/editor dot-directories from stats
+    // Excludes: .idea, .claude, .vscode, .1up, .agentdocs (noise in suggestions)
+    let excluded_dot_dirs = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
+    per_directory_stats.retain(|stat| !excluded_dot_dirs.contains(&stat.directory.as_str()));
+
     // Calibrate global vector estimate (N2: reuses same computed density)
     let (vector_estimate_total, basis, low_bound, high_bound) =
         estimate_vector_count(file_count_total, source_root)?;
@@ -3028,11 +3132,16 @@ pub async fn generate_facts_envelope(
             .and_then(|rel| rel.to_str().map(|s| s.to_string()))
     });
 
+    // T9: Generate ranked suggestions without dangling "Or" wording
+    // Provide up to 3 top directories as ranked suggestions
+    let suggestions = generate_ranked_suggestions(&per_directory_stats, &launch_subdir_str);
+
     Ok(FactsEnvelope {
         per_directory_stats,
         workspace_manifests,
         sparse_checkout,
         launch_subdir: launch_subdir_str,
+        suggestions,
         file_count_total,
         vector_estimate_total,
         vector_estimate_basis: Some(basis),
@@ -3046,6 +3155,9 @@ pub async fn generate_facts_envelope(
 /// Reads the scope roots from the meta table, counts indexed files from the database,
 /// and counts total files in the repository. Returns None if the index is not present
 /// or readable.
+///
+/// When roots is empty (unscoped full index), populates eligibility_note to explain
+/// why indexed_files < total_files (lockfiles, vendor dirs, excluded by .gitignore, etc).
 pub async fn compute_index_scope(
     state_root: &Path,
     source_root: &Path,
@@ -3072,11 +3184,31 @@ pub async fn compute_index_scope(
     let dir_counts = count_files_per_directory(source_root)?;
     let total_files: usize = dir_counts.values().sum();
 
+    let roots = scope_roots.unwrap_or_default();
+    let eligibility_note = unscoped_eligibility_note(&roots);
+
     Ok(Some(IndexScope {
-        roots: scope_roots.unwrap_or_default(),
+        roots,
         indexed_files,
         total_files,
+        eligibility_note,
     }))
+}
+
+/// Eligibility note explaining the indexed/total gap for an unscoped (full)
+/// index. Single-sourced here so the readiness/status and search paths
+/// disclose identical semantics: populated only when `roots` is empty, and
+/// always absent for scoped indexes.
+fn unscoped_eligibility_note(roots: &[String]) -> Option<String> {
+    if roots.is_empty() {
+        Some(
+            "Full index (no scope recorded). Indexed files = code and doc files. \
+             Total files = all git-tracked files + gitignore-excluded files walked for statistics."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3952,13 +4084,15 @@ mod tests {
             "dddd4444eeee5555".to_string(),  // duplicate of #1 -> Found (independent)
         ];
 
-        let batched = resolve_handle_records(&conn, ctx, &handles).await.unwrap();
+        let batched = resolve_handle_records(&conn, ctx, &handles, None)
+            .await
+            .unwrap();
 
         // Reconstruct the per-item baseline: exact id, then prefix, per handle.
         let mut expected = Vec::with_capacity(handles.len());
         for handle in &handles {
             expected.push(
-                resolve_handle_record_per_item(&conn, ctx, handle)
+                resolve_handle_record_per_item(&conn, ctx, handle, None)
                     .await
                     .unwrap(),
             );
@@ -4009,6 +4143,7 @@ mod tests {
         conn: &Connection,
         context_id: &str,
         raw_handle: &str,
+        verbosity: Option<&str>,
     ) -> anyhow::Result<ReadRecord> {
         use crate::storage::segments::get_segment_by_id_for_context;
 
@@ -4027,10 +4162,10 @@ mod tests {
         }
 
         if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
-            return Ok(read_segment(source, segment));
+            return Ok(read_segment(source, segment, verbosity));
         }
 
-        resolve_handle_via_prefix(conn, context_id, source, &normalized).await
+        resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {
@@ -4171,6 +4306,7 @@ mod tests {
             roots: vec!["services/auth".to_string(), "libs/core".to_string()],
             indexed_files: 150,
             total_files: 2500,
+            eligibility_note: None,
         };
 
         let json = serde_json::to_string(&scope).expect("should serialize");
@@ -4189,6 +4325,7 @@ mod tests {
             roots: vec![],
             indexed_files: 0,
             total_files: 1000,
+            eligibility_note: None,
         };
 
         assert_eq!(scope.coverage_description(), "No scope configured");
@@ -4202,6 +4339,7 @@ mod tests {
             roots: vec!["services/auth".to_string()],
             indexed_files: 150,
             total_files: 600,
+            eligibility_note: None,
         };
 
         let description = scope.coverage_description();
@@ -4217,11 +4355,59 @@ mod tests {
             roots: vec!["services/auth".to_string()],
             indexed_files: 0,
             total_files: 0,
+            eligibility_note: None,
         };
 
         let description = scope.coverage_description();
         assert!(description.contains("0 files indexed of 0 total"));
         assert!(description.contains("0%"));
+    }
+
+    #[test]
+    fn index_scope_eligibility_note_populated_for_unscoped_index() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec![],
+            indexed_files: 149,
+            total_files: 210,
+            eligibility_note: Some(
+                "Full index (no scope recorded). Indexed files = code and doc files. \
+                 Total files = all git-tracked files + gitignore-excluded files walked for statistics."
+                    .to_string(),
+            ),
+        };
+
+        assert!(scope.eligibility_note.is_some());
+        let note = scope.eligibility_note.unwrap();
+        assert!(note.contains("Full index"));
+        assert!(note.contains("no scope recorded"));
+        assert!(note.contains("Indexed files"));
+        assert!(note.contains("Total files"));
+    }
+
+    #[test]
+    fn unscoped_eligibility_note_populated_only_for_empty_roots() {
+        let note = unscoped_eligibility_note(&[]).expect("unscoped index must carry a note");
+        assert!(!note.is_empty());
+        assert!(note.contains("Full index"));
+        assert!(note.contains("no scope recorded"));
+
+        assert!(unscoped_eligibility_note(&["services/auth".to_string()]).is_none());
+    }
+
+    #[test]
+    fn index_scope_eligibility_note_absent_for_scoped_index() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string(), "libs/core".to_string()],
+            indexed_files: 150,
+            total_files: 2500,
+            eligibility_note: None,
+        };
+
+        assert!(scope.eligibility_note.is_none());
     }
 
     #[test]
@@ -4649,6 +4835,195 @@ mod tests {
             total, 1,
             "N1: should count only 1 file (not include .git); got {:?}",
             counts
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_facts_envelope_excludes_dot_directories() {
+        // T8: Verify that tool/editor dot-directories are filtered from
+        // per_directory_stats in the facts envelope. The envelope is used for
+        // scope suggestions; dot-directories are noise and should not appear.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a repo structure with real directories and tool/editor dot-directories
+        // Real directories (should appear in stats):
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod utils;").unwrap();
+
+        fs::create_dir_all(root.join("libs")).unwrap();
+        fs::write(root.join("libs/helper.rs"), "pub fn help() {}").unwrap();
+
+        // Tool/editor dot-directories (should be EXCLUDED from stats):
+        fs::create_dir_all(root.join(".idea")).unwrap();
+        for i in 0..3 {
+            fs::write(
+                root.join(".idea").join(format!("config_{}", i)),
+                "IDE config",
+            )
+            .unwrap();
+        }
+
+        fs::create_dir_all(root.join(".vscode")).unwrap();
+        fs::write(root.join(".vscode/settings.json"), "{}").unwrap();
+        fs::write(root.join(".vscode/launch.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        fs::write(root.join(".1up/cache.db"), "cache").unwrap();
+        fs::write(root.join(".1up/meta.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join(".agentdocs")).unwrap();
+        fs::write(root.join(".agentdocs/index.md"), "# Docs").unwrap();
+
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join(".claude/config.json"), "{}").unwrap();
+
+        // Generate the facts envelope
+        let envelope = generate_facts_envelope(root, None)
+            .await
+            .expect("facts envelope should be generated");
+
+        // Verify real directories are present
+        let dir_names: Vec<&str> = envelope
+            .per_directory_stats
+            .iter()
+            .map(|s| s.directory.as_str())
+            .collect();
+
+        assert!(
+            dir_names.contains(&"src"),
+            "src directory should appear in per_directory_stats; got {:?}",
+            dir_names
+        );
+
+        assert!(
+            dir_names.contains(&"libs"),
+            "libs directory should appear in per_directory_stats; got {:?}",
+            dir_names
+        );
+
+        // Verify NO dot-directories appear (acceptance criterion 3)
+        for dir in &envelope.per_directory_stats {
+            assert!(
+                !dir.directory.starts_with('.'),
+                "Dot-directory should be filtered out; found: {}",
+                dir.directory
+            );
+        }
+
+        // Verify specific excluded dot-directories are NOT present
+        let excluded = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
+        for excluded_dir in &excluded {
+            assert!(
+                !dir_names.contains(excluded_dir),
+                "Excluded dot-directory {} should not appear; got {:?}",
+                excluded_dir,
+                dir_names
+            );
+        }
+
+        // Verify ordering: largest real directory comes first (src has 2 files, libs has 1)
+        assert_eq!(
+            envelope.per_directory_stats[0].directory, "src",
+            "Largest real directory (src) should be first after filtering and sorting"
+        );
+        assert_eq!(
+            envelope.per_directory_stats[0].file_count, 2,
+            "src should have 2 files"
+        );
+
+        assert_eq!(
+            envelope.per_directory_stats[1].directory, "libs",
+            "Second largest directory (libs) should be second"
+        );
+        assert_eq!(
+            envelope.per_directory_stats[1].file_count, 1,
+            "libs should have 1 file"
+        );
+    }
+
+    fn ranked_stats(directories: &[&str]) -> Vec<DirectoryStats> {
+        directories
+            .iter()
+            .enumerate()
+            .map(|(idx, directory)| DirectoryStats {
+                directory: directory.to_string(),
+                file_count: 100 - idx * 10,
+                estimated_vectors: (100 - idx * 10) * 10,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ranked_suggestions_no_leading_or_when_top_dir_is_launch_subdir() {
+        // T9: when the launch_subdir is the top-ranked directory, the first
+        // emitted suggestion must not start with "Or" and must keep the
+        // truthful rank ordinal.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+        let launch_subdir = Some("services".to_string());
+
+        let suggestions = generate_ranked_suggestions(&stats, &launch_subdir);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the 2nd largest directory: libs".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
+        );
+        assert!(
+            !suggestions[0].starts_with("Or"),
+            "first suggestion must never start with 'Or'; got {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_without_launch_subdir_keep_existing_shape() {
+        // Regression: no launch_subdir leaves the original output unchanged.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+
+        let suggestions = generate_ranked_suggestions(&stats, &None);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the largest directory: services".to_string(),
+                "Or index 2nd: libs".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_single_directory() {
+        let stats = ranked_stats(&["services"]);
+
+        let suggestions = generate_ranked_suggestions(&stats, &None);
+
+        assert_eq!(
+            suggestions,
+            vec!["Index the largest directory: services".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_skip_second_ranked_launch_subdir() {
+        // When the launch_subdir is a non-top-ranked directory, the primary
+        // suggestion is unchanged and the "Or" alternatives skip the subdir
+        // while keeping truthful ordinals.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+        let launch_subdir = Some("libs".to_string());
+
+        let suggestions = generate_ranked_suggestions(&stats, &launch_subdir);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the largest directory: services".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
         );
     }
 }

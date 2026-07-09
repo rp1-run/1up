@@ -203,7 +203,13 @@ impl SupportedLanguage {
 
     fn container_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::Rust => &["impl_item", "trait_item", "mod_item"],
+            Self::Rust => &[
+                "impl_item",
+                "trait_item",
+                "mod_item",
+                "struct_item",
+                "enum_item",
+            ],
             Self::Python => &["class_definition"],
             Self::JavaScript | Self::TypeScript => &["class_declaration"],
             Self::Go => &[],
@@ -235,7 +241,13 @@ impl SupportedLanguage {
 
     fn nested_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::Rust => &["function_item", "const_item", "type_item"],
+            Self::Rust => &[
+                "function_item",
+                "const_item",
+                "type_item",
+                "field_declaration",
+                "enum_variant",
+            ],
             Self::Python => &["function_definition", "decorated_definition"],
             Self::JavaScript | Self::TypeScript => &[
                 "method_definition",
@@ -707,6 +719,12 @@ fn extract_nested(
     let nested_kinds = lang.nested_kinds();
     let comment_kinds = lang.comment_kinds();
 
+    // Rust struct fields and enum variants are extracted via the generic body
+    // walk below: struct_item bodies are field_declaration_list nodes with
+    // field_declaration children, enum_item bodies are enum_variant_list nodes
+    // with enum_variant children, and both child kinds are in nested_kinds().
+    // (Neither node exposes a "field_declaration_list" field name; the body is
+    // reached through the "body" field via find_body_node.)
     let body = find_body_node(container, lang);
     let search_node = body.as_ref().unwrap_or(container);
 
@@ -819,6 +837,8 @@ fn classify_block_type(node: &Node, lang: SupportedLanguage) -> String {
             "mod_item" => "module",
             "use_declaration" => "import",
             "macro_definition" => "macro",
+            "field_declaration" => "field",
+            "enum_variant" => "variant",
             _ => kind,
         },
         SupportedLanguage::Python => match kind {
@@ -986,6 +1006,8 @@ fn classify_role(node: &Node, lang: SupportedLanguage) -> SegmentRole {
             "impl_item" => SegmentRole::Implementation,
             "mod_item" => SegmentRole::Orchestration,
             "macro_definition" => SegmentRole::Definition,
+            "field_declaration" => SegmentRole::Definition,
+            "enum_variant" => SegmentRole::Definition,
             _ => SegmentRole::Definition,
         },
         SupportedLanguage::Python => match kind {
@@ -1109,7 +1131,8 @@ fn collect_defined_symbols_inner(
     match lang {
         SupportedLanguage::Rust => match kind {
             "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
-            | "const_item" | "static_item" | "macro_definition" => {
+            | "const_item" | "static_item" | "macro_definition" | "field_declaration"
+            | "enum_variant" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
                         symbols.push(text.to_string());
@@ -3251,5 +3274,201 @@ fn main() {
 
         let impl_seg = segments.iter().find(|s| s.block_type == "impl").unwrap();
         assert_eq!(impl_seg.role, SegmentRole::Implementation);
+    }
+
+    #[test]
+    fn test_rust_field_doc_comment_extraction() {
+        let source = r#"
+/// A filter for scanning files.
+pub struct ScanFilter {
+    /// The scope exclusion cone preventing out-of-scope files from being indexed.
+    scope_globs: GlobSet,
+
+    /// Secrets patterns to exclude from indexing.
+    secrets_filter: SecretFilter,
+
+    /// Whether to include dotfiles.
+    include_dotfiles: bool,
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let struct_seg = segments.iter().find(|s| s.block_type == "struct").unwrap();
+        assert!(struct_seg
+            .defined_symbols
+            .contains(&"ScanFilter".to_string()));
+        assert_eq!(struct_seg.role, SegmentRole::Definition);
+
+        let field_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "field" && s.breadcrumb.as_deref() == Some("ScanFilter"))
+            .collect();
+        assert_eq!(
+            field_segments.len(),
+            3,
+            "Expected 3 field segments, found {}",
+            field_segments.len()
+        );
+
+        let scope_globs_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"scope_globs".to_string()))
+            .expect("scope_globs field not found");
+        assert!(
+            scope_globs_field.content.contains("exclusion cone"),
+            "scope_globs field content should contain doc comment"
+        );
+        assert_eq!(scope_globs_field.role, SegmentRole::Definition);
+
+        let secrets_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"secrets_filter".to_string()))
+            .expect("secrets_filter field not found");
+        assert!(
+            secrets_field.content.contains("Secrets patterns"),
+            "secrets_filter field content should contain doc comment"
+        );
+
+        let dotfiles_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"include_dotfiles".to_string()))
+            .expect("include_dotfiles field not found");
+        assert!(
+            dotfiles_field.content.contains("dotfiles"),
+            "include_dotfiles field content should contain doc comment"
+        );
+
+        // Verify source locations are correct for fields
+        assert!(scope_globs_field.line_start > struct_seg.line_start);
+        assert!(secrets_field.line_start > struct_seg.line_start);
+        assert!(dotfiles_field.line_start > struct_seg.line_start);
+    }
+
+    #[test]
+    fn test_rust_field_without_doc_comment() {
+        let source = r#"
+struct SimpleStruct {
+    name: String,
+    value: i32,
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let field_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "field" && s.breadcrumb.as_deref() == Some("SimpleStruct"))
+            .collect();
+        assert_eq!(field_segments.len(), 2);
+
+        let name_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"name".to_string()))
+            .unwrap();
+        assert!(name_field.content.contains("name: String"));
+
+        let value_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"value".to_string()))
+            .unwrap();
+        assert!(value_field.content.contains("value: i32"));
+    }
+
+    #[test]
+    fn test_rust_enum_variant_doc_comment_extraction() {
+        let source = r#"
+/// The readiness state of an index.
+pub enum ReadinessState {
+    /// The index is missing and must be built from scratch.
+    Missing,
+
+    /// The index exists but lags behind the working tree.
+    Stale(String),
+
+    /// The index is fully built and current.
+    Ready { head: String },
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let enum_seg = segments.iter().find(|s| s.block_type == "enum").unwrap();
+        assert!(enum_seg
+            .defined_symbols
+            .contains(&"ReadinessState".to_string()));
+        assert_eq!(enum_seg.role, SegmentRole::Definition);
+
+        let variant_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| {
+                s.block_type == "variant" && s.breadcrumb.as_deref() == Some("ReadinessState")
+            })
+            .collect();
+        assert_eq!(
+            variant_segments.len(),
+            3,
+            "Expected 3 variant segments, found {}",
+            variant_segments.len()
+        );
+
+        let missing_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Missing".to_string()))
+            .expect("Missing variant not found");
+        assert!(
+            missing_variant.content.contains("built from scratch"),
+            "Missing variant content should contain doc comment"
+        );
+        assert_eq!(missing_variant.role, SegmentRole::Definition);
+
+        let stale_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Stale".to_string()))
+            .expect("Stale variant not found");
+        assert!(
+            stale_variant.content.contains("lags behind"),
+            "Stale variant content should contain doc comment"
+        );
+
+        let ready_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Ready".to_string()))
+            .expect("Ready variant not found");
+        assert!(
+            ready_variant.content.contains("fully built"),
+            "Ready variant content should contain doc comment"
+        );
+
+        // Verify source locations are correct for variants
+        assert!(missing_variant.line_start > enum_seg.line_start);
+        assert!(stale_variant.line_start > enum_seg.line_start);
+        assert!(ready_variant.line_start > enum_seg.line_start);
+    }
+
+    #[test]
+    fn test_rust_enum_variant_without_doc_comment() {
+        let source = r#"
+enum SimpleEnum {
+    First,
+    Second(u32),
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let variant_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "variant" && s.breadcrumb.as_deref() == Some("SimpleEnum"))
+            .collect();
+        assert_eq!(variant_segments.len(), 2);
+
+        let first_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"First".to_string()))
+            .unwrap();
+        assert!(first_variant.content.contains("First"));
+
+        let second_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Second".to_string()))
+            .unwrap();
+        assert!(second_variant.content.contains("Second(u32)"));
     }
 }

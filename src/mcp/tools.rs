@@ -235,7 +235,14 @@ impl OneupMcpServer {
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
 
-        match ops::get_handles(&roots.state_root, &roots.worktree_context, &input.handles).await {
+        match ops::get_handles(
+            &roots.state_root,
+            &roots.worktree_context,
+            &input.handles,
+            input.verbosity.as_deref(),
+        )
+        .await
+        {
             Ok(payload) => {
                 let summary = read_summary(&payload);
                 let next_actions = read_next_actions(&payload);
@@ -760,7 +767,10 @@ fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
             "Retrieve file-line context around the hydrated segment.",
             Some(json!({ "locations": [location_argument(&segment.path, segment.line_start)] })),
         )];
-        if let Some(symbol) = segment.defined_symbols.first() {
+        // Use the pre-gating symbol hint: defined_symbols is emptied at default
+        // verbosity (T5 payload cleanup), but defining segments must still
+        // offer symbol verification.
+        if let Some(symbol) = segment.symbol_hint.as_deref() {
             actions.push(action(
                 TOOL_SYMBOL,
                 "Verify references for the symbol defined in this segment.",
