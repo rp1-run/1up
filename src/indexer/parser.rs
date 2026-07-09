@@ -246,6 +246,7 @@ impl SupportedLanguage {
                 "const_item",
                 "type_item",
                 "field_declaration",
+                "enum_variant",
             ],
             Self::Python => &["function_definition", "decorated_definition"],
             Self::JavaScript | Self::TypeScript => &[
@@ -718,23 +719,12 @@ fn extract_nested(
     let nested_kinds = lang.nested_kinds();
     let comment_kinds = lang.comment_kinds();
 
-    // For Rust structs/enums, extract fields from field_declaration_list
-    if lang == SupportedLanguage::Rust
-        && (container.kind() == "struct_item" || container.kind() == "enum_item")
-    {
-        if let Some(field_list) = container.child_by_field_name("field_declaration_list") {
-            extract_fields_from_list(
-                &field_list,
-                source,
-                lang,
-                parent_name,
-                comment_kinds,
-                segments,
-            );
-            return;
-        }
-    }
-
+    // Rust struct fields and enum variants are extracted via the generic body
+    // walk below: struct_item bodies are field_declaration_list nodes with
+    // field_declaration children, enum_item bodies are enum_variant_list nodes
+    // with enum_variant children, and both child kinds are in nested_kinds().
+    // (Neither node exposes a "field_declaration_list" field name; the body is
+    // reached through the "body" field via find_body_node.)
     let body = find_body_node(container, lang);
     let search_node = body.as_ref().unwrap_or(container);
 
@@ -757,25 +747,6 @@ fn extract_nested(
 
         if nested_kinds.contains(&kind) {
             let comments = collect_leading_comments(search_node, i, comment_kinds, source);
-            let segment = extract_segment(&child, source, lang, &comments, Some(parent_name));
-            segments.push(segment);
-        }
-    }
-}
-
-fn extract_fields_from_list(
-    field_list: &Node,
-    source: &[u8],
-    lang: SupportedLanguage,
-    parent_name: &str,
-    comment_kinds: &[&str],
-    segments: &mut Vec<ParsedSegment>,
-) {
-    let child_count = field_list.named_child_count();
-    for i in 0..child_count {
-        let child = field_list.named_child(i as u32).unwrap();
-        if child.kind() == "field_declaration" {
-            let comments = collect_leading_comments(field_list, i, comment_kinds, source);
             let segment = extract_segment(&child, source, lang, &comments, Some(parent_name));
             segments.push(segment);
         }
@@ -867,6 +838,7 @@ fn classify_block_type(node: &Node, lang: SupportedLanguage) -> String {
             "use_declaration" => "import",
             "macro_definition" => "macro",
             "field_declaration" => "field",
+            "enum_variant" => "variant",
             _ => kind,
         },
         SupportedLanguage::Python => match kind {
@@ -1035,6 +1007,7 @@ fn classify_role(node: &Node, lang: SupportedLanguage) -> SegmentRole {
             "mod_item" => SegmentRole::Orchestration,
             "macro_definition" => SegmentRole::Definition,
             "field_declaration" => SegmentRole::Definition,
+            "enum_variant" => SegmentRole::Definition,
             _ => SegmentRole::Definition,
         },
         SupportedLanguage::Python => match kind {
@@ -1158,7 +1131,8 @@ fn collect_defined_symbols_inner(
     match lang {
         SupportedLanguage::Rust => match kind {
             "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
-            | "const_item" | "static_item" | "macro_definition" | "field_declaration" => {
+            | "const_item" | "static_item" | "macro_definition" | "field_declaration"
+            | "enum_variant" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
                         symbols.push(text.to_string());
@@ -3397,5 +3371,104 @@ struct SimpleStruct {
             .find(|s| s.defined_symbols.contains(&"value".to_string()))
             .unwrap();
         assert!(value_field.content.contains("value: i32"));
+    }
+
+    #[test]
+    fn test_rust_enum_variant_doc_comment_extraction() {
+        let source = r#"
+/// The readiness state of an index.
+pub enum ReadinessState {
+    /// The index is missing and must be built from scratch.
+    Missing,
+
+    /// The index exists but lags behind the working tree.
+    Stale(String),
+
+    /// The index is fully built and current.
+    Ready { head: String },
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let enum_seg = segments.iter().find(|s| s.block_type == "enum").unwrap();
+        assert!(enum_seg
+            .defined_symbols
+            .contains(&"ReadinessState".to_string()));
+        assert_eq!(enum_seg.role, SegmentRole::Definition);
+
+        let variant_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| {
+                s.block_type == "variant" && s.breadcrumb.as_deref() == Some("ReadinessState")
+            })
+            .collect();
+        assert_eq!(
+            variant_segments.len(),
+            3,
+            "Expected 3 variant segments, found {}",
+            variant_segments.len()
+        );
+
+        let missing_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Missing".to_string()))
+            .expect("Missing variant not found");
+        assert!(
+            missing_variant.content.contains("built from scratch"),
+            "Missing variant content should contain doc comment"
+        );
+        assert_eq!(missing_variant.role, SegmentRole::Definition);
+
+        let stale_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Stale".to_string()))
+            .expect("Stale variant not found");
+        assert!(
+            stale_variant.content.contains("lags behind"),
+            "Stale variant content should contain doc comment"
+        );
+
+        let ready_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Ready".to_string()))
+            .expect("Ready variant not found");
+        assert!(
+            ready_variant.content.contains("fully built"),
+            "Ready variant content should contain doc comment"
+        );
+
+        // Verify source locations are correct for variants
+        assert!(missing_variant.line_start > enum_seg.line_start);
+        assert!(stale_variant.line_start > enum_seg.line_start);
+        assert!(ready_variant.line_start > enum_seg.line_start);
+    }
+
+    #[test]
+    fn test_rust_enum_variant_without_doc_comment() {
+        let source = r#"
+enum SimpleEnum {
+    First,
+    Second(u32),
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let variant_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "variant" && s.breadcrumb.as_deref() == Some("SimpleEnum"))
+            .collect();
+        assert_eq!(variant_segments.len(), 2);
+
+        let first_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"First".to_string()))
+            .unwrap();
+        assert!(first_variant.content.contains("First"));
+
+        let second_variant = variant_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"Second".to_string()))
+            .unwrap();
+        assert!(second_variant.content.contains("Second(u32)"));
     }
 }
