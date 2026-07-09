@@ -78,6 +78,40 @@ pub struct SearchResult {
     pub defined_symbols: Option<Vec<String>>,
 }
 
+/// Index scope coverage information showing what directory cones are indexed and repository coverage.
+///
+/// Disclosed on every readiness check and search result to ensure agents never assume
+/// code doesn't exist just because a search was empty. Explicit coverage disclosure forces
+/// the next-action (widen scope) to be visible in the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexScope {
+    /// Repo-relative directory roots currently indexed (e.g., ["services/auth", "libs/core"]).
+    pub roots: Vec<String>,
+    /// Number of files indexed in the current scope (count of segments/files with content).
+    pub indexed_files: usize,
+    /// Total files in the repository (denominator for coverage calculation).
+    pub total_files: usize,
+}
+
+impl IndexScope {
+    /// Returns a human-readable coverage percentage or description.
+    pub fn coverage_description(&self) -> String {
+        if self.roots.is_empty() {
+            "No scope configured".to_string()
+        } else {
+            let coverage_pct = if self.total_files > 0 {
+                (self.indexed_files as f64 / self.total_files as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            format!(
+                "{} files indexed of {} total ({}%)",
+                self.indexed_files, self.total_files, coverage_pct
+            )
+        }
+    }
+}
+
 /// Normalize a raw RRF score in `[0, ~1]` to an integer in `[0, 100]`.
 ///
 /// The mapping is monotonic, so ordering is preserved. Ties within one
@@ -320,6 +354,16 @@ pub struct IndexingConfig {
     /// default-hidden dotfile policy (e.g. `.github/workflows`). Defaults empty.
     #[serde(default)]
     pub index_hidden_dirs: Vec<String>,
+    /// REQ-002: Scope roots that were converted to scope_globs for this config.
+    /// Used to record scope information in the progress file during indexing.
+    /// When non-empty, indicates this is a scoped index (not a full index).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_roots: Vec<String>,
+    /// Exclusive scope patterns (e.g., "services/**") populated only when scoped indexing
+    /// is active. When non-empty, only files matching scope_globs are included.
+    /// This is distinct from include_globs which only guarantees inclusion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_globs: Vec<String>,
 }
 
 impl IndexingConfig {
@@ -371,6 +415,8 @@ impl IndexingConfig {
             include_globs,
             exclude_globs,
             index_hidden_dirs,
+            scope_roots: Vec::new(),
+            scope_globs: Vec::new(),
         })
     }
 
@@ -566,6 +612,109 @@ pub struct IndexStageTimings {
     pub input_prep_ms: Option<u128>,
 }
 
+/// Scope roots for selective monorepo indexing.
+///
+/// Stores a list of repo-relative directory roots to be indexed. Enforces
+/// validation: paths must be repo-relative (no absolute paths or `../` escapes).
+/// Paths are canonicalized (trailing slashes trimmed) for consistent comparison.
+///
+/// REQ-002: Repo-relative paths, no escapes, validation on construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ScopeRoots {
+    roots: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl ScopeRoots {
+    /// Creates a new ScopeRoots from a list of repo-relative paths.
+    ///
+    /// Validates that all paths are repo-relative (no absolute paths or `../` escapes),
+    /// then canonicalizes each path (trims trailing slashes).
+    ///
+    /// Returns `Err` if any path fails validation.
+    pub fn new(paths: Vec<String>) -> Result<Self, String> {
+        let roots: Result<Vec<_>, String> = paths
+            .into_iter()
+            .map(|path| Self::validate_and_canonicalize(&path))
+            .collect();
+
+        Ok(Self { roots: roots? })
+    }
+
+    /// Returns `true` if this scope has any roots, `false` if empty.
+    ///
+    /// Used to determine if a scope has been set.
+    pub fn is_scoped(&self) -> bool {
+        !self.roots.is_empty()
+    }
+
+    /// Returns the list of scope roots.
+    pub fn roots(&self) -> &[String] {
+        &self.roots
+    }
+
+    /// Checks if a given file path is contained within any scope root.
+    ///
+    /// A path is considered contained if it starts with one of the scope roots
+    /// (with proper path separator handling). For example, `services/auth/main.rs`
+    /// is contained by scope root `services/auth` or `services`.
+    ///
+    /// Empty scope (no roots) always returns `false` for containment.
+    pub fn contains_path(&self, path: &str) -> bool {
+        if !self.is_scoped() {
+            return false;
+        }
+
+        let path = path.trim_end_matches('/');
+
+        for root in &self.roots {
+            if path == root {
+                return true;
+            }
+            if path.starts_with(&format!("{}/", root)) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Validates and canonicalizes a single path.
+    ///
+    /// - Rejects absolute paths (starting with `/`)
+    /// - Rejects paths containing `../` (directory escape)
+    /// - Trims trailing slashes for consistent comparison
+    /// - Ensures path is not empty after trimming
+    fn validate_and_canonicalize(path: &str) -> Result<String, String> {
+        let trimmed = path.trim_end_matches('/');
+
+        // Reject empty paths
+        if trimmed.is_empty() {
+            return Err("scope path cannot be empty".to_string());
+        }
+
+        // Reject absolute paths
+        if trimmed.starts_with('/') {
+            return Err(format!(
+                "scope path must be repo-relative, not absolute: {}",
+                trimmed
+            ));
+        }
+
+        // Reject directory escapes
+        if trimmed.contains("../") || trimmed.contains("/..") || trimmed == ".." {
+            return Err(format!(
+                "scope path cannot contain directory escapes: {}",
+                trimmed
+            ));
+        }
+
+        // Return canonicalized path (trailing slashes removed)
+        Ok(trimmed.to_string())
+    }
+}
+
 /// Scope metadata for an indexing run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexScopeInfo {
@@ -575,6 +724,11 @@ pub struct IndexScopeInfo {
     pub changed_paths: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// REQ-002: Actual scope roots (e.g., ["services/auth", "libs/core"]).
+    /// Present when scope was applied (requested/executed start with "scoped:").
+    /// Empty for full scans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
 }
 
 /// Prefilter counters for an indexing run.
@@ -643,10 +797,18 @@ pub struct IndexProgress {
     pub parallelism: Option<IndexParallelism>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IndexStageTimings>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "scope_recorded",
+        alias = "scope"
+    )]
     pub scope: Option<IndexScopeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilter: Option<IndexPrefilterInfo>,
+    /// REQ-010: PID of the indexing process, used for liveness checks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexer_pid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -675,6 +837,7 @@ impl IndexProgress {
             timings: None,
             scope: None,
             prefilter: None,
+            indexer_pid: None,
             updated_at: Utc::now(),
         }
     }
@@ -990,5 +1153,137 @@ mod tests {
         );
         // No stale reason (rebuild idle) leaves no stale fragment (REQ-003 AC3).
         assert_eq!(combine_degraded_reasons(None, None), None);
+    }
+
+    // ScopeRoots validation and helper tests (REQ-002, T2)
+
+    #[test]
+    fn scope_roots_accepts_valid_repo_relative_paths() {
+        let roots = ScopeRoots::new(vec!["services/auth".to_string(), "libs/core".to_string()])
+            .expect("valid repo-relative paths");
+
+        assert!(roots.is_scoped());
+        assert_eq!(roots.roots(), &["services/auth", "libs/core"]);
+    }
+
+    #[test]
+    fn scope_roots_accepts_single_level_paths() {
+        let roots =
+            ScopeRoots::new(vec!["src".to_string()]).expect("single-level repo-relative path");
+
+        assert!(roots.is_scoped());
+        assert_eq!(roots.roots(), &["src"]);
+    }
+
+    #[test]
+    fn scope_roots_canonicalizes_trailing_slashes() {
+        let roots = ScopeRoots::new(vec!["services/auth/".to_string(), "libs/core/".to_string()])
+            .expect("paths with trailing slashes");
+
+        // Trailing slashes trimmed
+        assert_eq!(roots.roots(), &["services/auth", "libs/core"]);
+    }
+
+    #[test]
+    fn scope_roots_rejects_absolute_paths() {
+        let result = ScopeRoots::new(vec!["/repo/services".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute"));
+    }
+
+    #[test]
+    fn scope_roots_rejects_parent_directory_escapes() {
+        let result = ScopeRoots::new(vec!["../other".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escape"));
+
+        let result = ScopeRoots::new(vec!["services/../etc".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escape"));
+
+        let result = ScopeRoots::new(vec!["services/auth/..".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escape"));
+    }
+
+    #[test]
+    fn scope_roots_rejects_empty_paths() {
+        let result = ScopeRoots::new(vec!["".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+
+        let result = ScopeRoots::new(vec!["/".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scope_roots_empty_scope_not_scoped() {
+        let roots = ScopeRoots::new(vec![]).expect("empty list is valid");
+        assert!(!roots.is_scoped());
+        assert_eq!(roots.roots(), &[] as &[String]);
+    }
+
+    #[test]
+    fn scope_roots_contains_path_checks_membership() {
+        let roots = ScopeRoots::new(vec!["services/auth".to_string(), "libs".to_string()])
+            .expect("valid paths");
+
+        // Exact root match
+        assert!(roots.contains_path("services/auth"));
+        assert!(roots.contains_path("libs"));
+
+        // Paths under root
+        assert!(roots.contains_path("services/auth/main.rs"));
+        assert!(roots.contains_path("services/auth/handlers/mod.rs"));
+        assert!(roots.contains_path("libs/utils.rs"));
+        assert!(roots.contains_path("libs/core/types.rs"));
+
+        // Paths outside scope
+        assert!(!roots.contains_path("services/web"));
+        assert!(!roots.contains_path("services"));
+        assert!(!roots.contains_path("tools/deploy.sh"));
+        assert!(!roots.contains_path(""));
+    }
+
+    #[test]
+    fn scope_roots_contains_path_handles_trailing_slashes() {
+        let roots = ScopeRoots::new(vec!["services".to_string()]).expect("valid path");
+
+        // Should work with or without trailing slash
+        assert!(roots.contains_path("services/"));
+        assert!(roots.contains_path("services"));
+        assert!(roots.contains_path("services/auth/"));
+        assert!(roots.contains_path("services/auth"));
+    }
+
+    #[test]
+    fn scope_roots_contains_path_false_for_empty_scope() {
+        let roots = ScopeRoots::new(vec![]).expect("empty list");
+
+        assert!(!roots.contains_path("services/auth"));
+        assert!(!roots.contains_path("any/path"));
+    }
+
+    #[test]
+    fn scope_roots_serialization_deserialize_roundtrip() {
+        let original = ScopeRoots::new(vec!["services/auth".to_string(), "libs/core".to_string()])
+            .expect("valid paths");
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: ScopeRoots = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original, deserialized);
+        assert_eq!(deserialized.roots(), &["services/auth", "libs/core"]);
+    }
+
+    #[test]
+    fn scope_roots_serialization_empty_scope() {
+        let empty = ScopeRoots::new(vec![]).expect("empty list");
+
+        let json = serde_json::to_string(&empty).expect("serialize");
+        let deserialized: ScopeRoots = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(empty, deserialized);
+        assert!(!deserialized.is_scoped());
     }
 }

@@ -222,6 +222,11 @@ pub const REBUILD_LOCK_CONTENTION_TIMEOUT_MS: u64 = 5_000;
 /// Poll interval while waiting for a contended rebuild lock to be released.
 pub const REBUILD_LOCK_RETRY_INTERVAL_MS: u64 = 200;
 
+/// REQ-010/REQ-011: Threshold in seconds to determine if a status file or rebuild lock is stale.
+/// If a file claims Running/Locked state but the owning process is dead and file age exceeds this,
+/// the file is treated as stale and auto-reconciled or cleared.
+pub const STALENESS_THRESHOLD_SECS: u64 = 300; // 5 minutes
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 
@@ -307,7 +312,30 @@ pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS
 /// the compact and full-precision models reproducibly.
 pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 
+/// File count threshold for triggering the first-run facts envelope in monorepos.
+///
+/// When a monorepo exceeds this file count and has no scope configured, 1up
+/// returns a facts envelope (refuse-and-propose) with per-directory statistics
+/// instead of attempting to index everything. Agents receive the facts and
+/// decide scope via scope_add. Conservatively set to 3000 files, which
+/// corresponds to ~30k vectors at ~10 vectors/file average — below the
+/// VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS cliff of 262k. Overridable via
+/// `ONEUP_FILE_COUNT_THRESHOLD` env var for testing and operator tuning.
+pub const FILE_COUNT_THRESHOLD: usize = 3_000;
+
+/// Environment variable to override the file count threshold for monorepo facts envelope.
+pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
+
 /// Schema version for database layout.
+///
+/// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta
+/// table as `scope_roots_v1` (JSON-serialized `Vec<String>`), applied uniformly
+/// across all contexts in a state_root. Scope is applied via `ScanFilter` at
+/// indexing time; scope roots are never mixed with unscoped segments, so a
+/// scoped index and an unscoped index are mutually exclusive per state_root.
+/// Fresh indexes initialize scope as `None` (unscoped); existing unscoped indexes
+/// migrated to v19 on first write (no in-place migration). Pre-feature binaries
+/// fail closed on encountering a scoped index.
 ///
 /// v18: bundles the Phase-2 re-embed migration. The default embedding path is
 /// now the dynamic-INT8 model variant ([`MODEL_ONNX_INT8_FILENAME`]), whose
@@ -332,7 +360,7 @@ pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";

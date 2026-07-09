@@ -172,6 +172,12 @@ jobs:
 
       - name: functional index and status smoke
         shell: bash
+        env:
+          # `1up index` clears the .download_failed marker by design (explicit
+          # retry signal, PR #81), so the marker alone no longer keeps this
+          # smoke FTS-only; the env kill-switch is what actually prevents the
+          # windows dev-build download/ORT hang.
+          ONEUP_DISABLE_MODEL_DOWNLOADS: "1"
         run: |
           # Force FTS-only indexing: this smoke verifies path and project
           # semantics, and the embedding path (model download + dynamic ORT

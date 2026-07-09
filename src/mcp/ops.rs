@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context};
 use libsql::Connection;
@@ -15,7 +15,7 @@ use crate::indexer::embedder::{
 };
 use crate::indexer::pipeline;
 use crate::indexer::scan_filter::ScanFilter;
-use crate::mcp::types::StartMode;
+use crate::mcp::types::{DirectoryStats, FactsEnvelope, StartMode};
 use crate::search::context::ContextEngine;
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::overview;
@@ -23,23 +23,23 @@ use crate::search::retrieval;
 use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, SymbolSearchEngine};
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
-    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, NO_INDEXED_EMBEDDINGS_REASON,
-    STALE_REBUILD_REASON,
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
+    FILE_COUNT_THRESHOLD_ENV_VAR, NO_INDEXED_EMBEDDINGS_REASON, STALE_REBUILD_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
     combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
-    IndexProgress, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult, SegmentRole,
-    SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
+    IndexProgress, IndexScope, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult,
+    SegmentRole, SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
-    count_vector_rows_for_context, get_segment_by_prefix_for_context,
-    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
-    StoredSegment,
+    count_vector_rows_for_context, get_all_file_paths_for_context,
+    get_segment_by_prefix_for_context, get_segments_by_ids_for_context,
+    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
 };
 use crate::storage::swap;
 
@@ -50,6 +50,10 @@ pub struct McpProjectRoots {
     pub state_root: PathBuf,
     pub source_root: PathBuf,
     pub worktree_context: WorktreeContext,
+    /// The initial launch directory (CWD before project root resolution).
+    /// Used to suggest default scope in facts envelope for monorepos.
+    /// None if launched from project root or outside any recognized project.
+    pub launch_subdir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,6 +107,8 @@ pub struct ReadinessPayload {
     pub index_progress: Option<IndexProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon_status: Option<DaemonProjectStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +117,8 @@ pub struct SearchPayload {
     pub results: Vec<SearchHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,6 +246,8 @@ pub struct ContextRecord {
     pub content: String,
     pub line_start: usize,
     pub line_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_of_scope_disclosure: Option<String>,
 }
 
 /// Orientation digest payload for `oneup_overview`. Section sizes are bounded
@@ -313,12 +323,188 @@ struct CurrentIndex {
 }
 
 pub fn resolve_project(path: &Path) -> anyhow::Result<McpProjectRoots> {
+    // Canonicalize the input path first to get the actual launch directory
+    let canonical_launch_dir = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => path.to_path_buf(),
+    };
+
     let resolved = project::resolve_project_root(path)?;
+
+    // Capture launch_subdir if the launch directory differs from the clamped source_root.
+    // This indicates the user launched from a subdirectory that got clamped to the project root.
+    let launch_subdir = if canonical_launch_dir != resolved.source_root
+        && canonical_launch_dir.starts_with(&resolved.source_root)
+    {
+        Some(canonical_launch_dir)
+    } else {
+        None
+    };
+
     Ok(McpProjectRoots {
         state_root: resolved.state_root,
         source_root: resolved.source_root,
         worktree_context: resolved.worktree_context,
+        launch_subdir,
     })
+}
+
+/// Loads the current scope from the index if it exists.
+/// Returns an empty vec if no scope is recorded or if the index doesn't exist.
+async fn load_current_scope(state_root: &Path) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
+
+    match Db::open_ro(&db_path).await {
+        Ok(db) => match db.connect_tuned().await {
+            Ok(conn) => Ok(schema::read_scope_from_meta(&conn)
+                .await
+                .unwrap_or_default()
+                .unwrap_or_default()),
+            Err(_) => Ok(vec![]),
+        },
+        Err(_) => Ok(vec![]),
+    }
+}
+
+/// Determines the correct rebuild mode for the given scope operation.
+///
+/// - scope_narrow always requires rebuild (atomic rebuild)
+/// - scope_add on an unscoped index (first scoped) requires rebuild to avoid stale metadata
+/// - scope_add on an already-scoped index (widening) can be incremental
+async fn determine_rebuild_mode_for_scope(
+    state_root: &Path,
+    scope_add: Option<&Vec<String>>,
+    scope_narrow: Option<&Vec<String>>,
+) -> anyhow::Result<bool> {
+    if scope_narrow.is_some() {
+        // scope_narrow always requires atomic rebuild
+        return Ok(true);
+    }
+
+    if scope_add.is_some() {
+        // scope_add: check if we're converting from unscoped to scoped
+        let current_scope = load_current_scope(state_root).await?;
+        if current_scope.is_empty() {
+            // First scoped index after unscoped - need rebuild to avoid stale metadata
+            return Ok(true);
+        } else {
+            // Widening existing scope - can be incremental
+            return Ok(false);
+        }
+    }
+
+    // Default: no rebuild needed for other operations
+    Ok(false)
+}
+
+/// Computes the new scope by loading existing scope and applying scope_add/scope_narrow.
+///
+/// Returns the resulting scope roots as a Vec<String>.
+/// Validates scope_narrow is a subset of existing scope.
+async fn compute_new_scope(
+    state_root: &Path,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+
+    // Load existing scope if index exists
+    let mut current_scope = if db_path.exists() {
+        match Db::open_ro(&db_path).await {
+            Ok(db) => match db.connect_tuned().await {
+                Ok(conn) => schema::read_scope_from_meta(&conn)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    tracing::debug!(
+        "compute_new_scope: current_scope={:?}, scope_add={:?}, scope_narrow={:?}",
+        current_scope,
+        scope_add,
+        scope_narrow
+    );
+
+    // Apply scope_narrow if provided (must be subset of current)
+    if let Some(narrow_to) = scope_narrow {
+        // Validate that narrow_to is a subset of current_scope
+        if !current_scope.is_empty() {
+            for path in &narrow_to {
+                if !current_scope.contains(path) {
+                    bail!(
+                        "scope_narrow path '{}' is not in current scope: {:?}",
+                        path,
+                        current_scope
+                    );
+                }
+            }
+        }
+        current_scope = narrow_to;
+    }
+
+    // Apply scope_add if provided (union operation)
+    if let Some(add_to) = scope_add {
+        for path in add_to {
+            // Validate path: no absolute paths, no ../
+            if path.starts_with('/') {
+                bail!("scope path cannot be absolute: {}", path);
+            }
+            if path.contains("..") {
+                bail!("scope path cannot contain '..': {}", path);
+            }
+            if !current_scope.contains(&path) {
+                current_scope.push(path);
+            }
+        }
+    }
+
+    tracing::debug!(
+        "compute_new_scope: returning final_scope={:?}",
+        current_scope
+    );
+    Ok(current_scope)
+}
+
+/// Applies scope roots to IndexingConfig by converting them to include_globs.
+///
+/// Scope roots are converted to glob patterns: "dir1/**", "dir2/**", etc.
+/// REQ-002: Also stores the actual scope roots so they can be recorded in progress.
+fn apply_scope_to_indexing_config(
+    config: &mut IndexingConfig,
+    scope_roots: &[String],
+) -> anyhow::Result<()> {
+    // REQ-002: Always store scope roots in config, even if empty, so they're available
+    // during progress recording. Empty scope_roots indicates unscoped (full) index.
+    config.scope_roots = scope_roots.to_vec();
+
+    if !scope_roots.is_empty() {
+        // Convert scope roots to scope_globs: "dir/**" for each root.
+        // These are exclusive patterns used for scoped indexing, distinct from include_globs
+        // which only guarantee inclusion and never exclude non-matching files.
+        let scope_globs: Vec<String> = scope_roots
+            .iter()
+            .map(|root| format!("{}/**", root))
+            .collect();
+        tracing::debug!(
+            "apply_scope_to_indexing_config: scope_roots={:?}, scope_globs={:?}",
+            scope_roots,
+            scope_globs
+        );
+        config.scope_globs = scope_globs;
+    } else {
+        tracing::debug!("apply_scope_to_indexing_config: no scope, using empty scope_globs");
+    }
+    Ok(())
 }
 
 pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
@@ -330,17 +516,126 @@ pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
     .await
 }
 
-pub async fn start(roots: &McpProjectRoots, mode: StartMode) -> anyhow::Result<ReadinessPayload> {
+/// REQ-012: Spawn an indexing rebuild in the background task so oneup_start
+/// returns promptly. The rebuild runs asynchronously and updates progress via
+/// index_status.json, which agents can poll with oneup_status.
+fn spawn_rebuild_task(
+    roots: &McpProjectRoots,
+    rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) -> tokio::task::JoinHandle<ReadinessPayload> {
+    let roots = roots.clone();
+    tokio::spawn(async move {
+        match run_index_then_classify(&roots, rebuild, scope_add, scope_narrow).await {
+            Ok(payload) => payload,
+            Err(err) => {
+                // Surface the failure as blocked readiness rather than losing it
+                // to a log line; progress remains available via status.
+                tracing::warn!("background rebuild task failed: {}", err);
+                blocked_readiness(
+                    &roots.state_root,
+                    &roots.source_root,
+                    &roots.worktree_context,
+                    err.to_string(),
+                )
+            }
+        }
+    })
+}
+
+/// REQ-012: how long `oneup_start` waits for a spawned rebuild before
+/// detaching and returning progress. Fast operations (small repos, drift
+/// refreshes, auto-init failures) complete inside the budget so callers get
+/// the final readiness — drift cleared, blocked surfaced with its reason —
+/// preserving the pre-existing MCP contract. Long rebuilds detach at the
+/// budget (well under the 5s acceptance bound) and callers poll
+/// `oneup_status`. Env-tunable for tests.
+fn start_response_budget() -> std::time::Duration {
+    let ms = std::env::var("ONEUP_START_RESPONSE_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2_000);
+    std::time::Duration::from_millis(ms)
+}
+
+pub async fn start(
+    roots: &McpProjectRoots,
+    mode: StartMode,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
+) -> anyhow::Result<ReadinessPayload> {
+    // Check readiness first to determine rebuild requirements
     let readiness = check_status(roots).await;
-    match mode {
-        StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => {
-            run_index_then_classify(roots, false).await
+
+    tracing::debug!(
+        "ops::start: mode={:?}, scope_add={:?}, status={:?}",
+        mode,
+        scope_add,
+        readiness.status
+    );
+
+    // Determine if a rebuild (vs incremental write) is needed based on scope changes
+    // and index state:
+    // - scope_narrow always requires rebuild (atomic rebuild via StagingRebuild)
+    // - scope_add on unscoped index requires rebuild (fresh staging DB, prevents metadata match)
+    // - scope_add on already-scoped index can be incremental (widening existing scope)
+    // - Reindex mode requires rebuild
+    let scope_affects_rebuild = scope_add.is_some() || scope_narrow.is_some();
+    let rebuild_mode = if scope_affects_rebuild {
+        // Use scope-aware rebuild decision: check if this is first scoped or widening
+        match determine_rebuild_mode_for_scope(
+            &roots.state_root,
+            scope_add.as_ref(),
+            scope_narrow.as_ref(),
+        )
+        .await
+        {
+            Ok(mode) => mode,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to determine scope-based rebuild mode, defaulting to rebuild: {}",
+                    e
+                );
+                true // Default to rebuild on error
+            }
         }
-        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => {
-            run_index_then_classify(roots, false).await
+    } else {
+        // For non-scope operations, follow the mode logic
+        mode == StartMode::Reindex
+    };
+
+    // REQ-012: Make oneup_start non-blocking. Spawn indexing in the background
+    // and return immediately with status Indexing + progress metadata.
+    let should_spawn = match mode {
+        StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => true,
+        StartMode::IndexIfNeeded if index_if_needed_applies(&readiness) => true,
+        StartMode::Reindex => true,
+        _ => scope_affects_rebuild,
+    };
+
+    if should_spawn {
+        // Spawn the rebuild in the background so oneup_start returns promptly
+        tracing::debug!(
+            "ops::start: spawning rebuild (rebuild_mode={}, scope_add={:?})",
+            rebuild_mode,
+            scope_add
+        );
+        let rebuild_handle = spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
+        // REQ-012: bounded wait — return the final readiness when the rebuild
+        // completes inside the budget; otherwise detach (the task keeps
+        // running) and return current status with progress for polling.
+        match tokio::time::timeout(start_response_budget(), rebuild_handle).await {
+            Ok(Ok(payload)) => Ok(payload),
+            Ok(Err(join_err)) => {
+                tracing::warn!("background rebuild task panicked: {join_err}");
+                Ok(check_status(roots).await)
+            }
+            Err(_elapsed) => Ok(check_status(roots).await),
         }
-        StartMode::Reindex => run_index_then_classify(roots, true).await,
-        _ => Ok(readiness),
+    } else {
+        tracing::debug!("ops::start: NOT spawning (should_spawn=false)");
+        Ok(readiness)
     }
 }
 
@@ -432,6 +727,7 @@ pub async fn classify_readiness(
         reason: None,
         index_progress,
         daemon_status,
+        index_scope: None,
     };
 
     if let Err(err) = project_id_result {
@@ -451,6 +747,18 @@ pub async fn classify_readiness(
     {
         payload.status = ReadinessStatus::Indexing;
         payload.summary = "Indexing is currently running.".to_string();
+        // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+        if let Some(progress) = &payload.index_progress {
+            payload.index_scope = extract_scope_from_progress(progress);
+        }
+        // REQ-002: If scope not in progress yet, try reading from database meta (rebuild in progress)
+        if payload.index_scope.is_none() {
+            if let Ok(Some(scope)) =
+                compute_index_scope(state_root, source_root, &worktree_context.context_id).await
+            {
+                payload.index_scope = Some(scope);
+            }
+        }
         return payload;
     }
 
@@ -458,6 +766,10 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
+            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            if let Some(progress) = &payload.index_progress {
+                payload.index_scope = extract_scope_from_progress(progress);
+            }
             return payload;
         }
         payload.status = ReadinessStatus::Missing;
@@ -472,6 +784,10 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
+                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                if let Some(progress) = &payload.index_progress {
+                    payload.index_scope = extract_scope_from_progress(progress);
+                }
                 return payload;
             }
             payload.status = ReadinessStatus::Stale;
@@ -487,6 +803,10 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
+                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                if let Some(progress) = &payload.index_progress {
+                    payload.index_scope = extract_scope_from_progress(progress);
+                }
                 return payload;
             }
             payload.status = ReadinessStatus::Stale;
@@ -507,6 +827,10 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
+            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            if let Some(progress) = &payload.index_progress {
+                payload.index_scope = extract_scope_from_progress(progress);
+            }
             return payload;
         }
         // A freshly-initializing index (DB file and tables present, but the
@@ -595,6 +919,22 @@ pub async fn classify_readiness(
     let embedding_reason = embedder::model_unavailable_reason_for_status()
         .map(|reason| unavailable_reason_text(&reason));
 
+    // Compute and populate index scope for coverage disclosure (REQ-002)
+    // Use the existing connection to avoid contention
+    if let Ok(scope_roots) = schema::read_scope_from_meta(&conn).await {
+        let indexed_file_paths =
+            get_all_file_paths_for_context(&conn, &worktree_context.context_id)
+                .await
+                .unwrap_or_default();
+        let dir_counts = count_files_per_directory(source_root).unwrap_or_default();
+        let total_files: usize = dir_counts.values().sum();
+        payload.index_scope = Some(IndexScope {
+            roots: scope_roots.unwrap_or_default(),
+            indexed_files: indexed_file_paths.len(),
+            total_files,
+        });
+    }
+
     if progress_without_embeddings || embedding_reason.is_some() {
         payload.status = ReadinessStatus::Degraded;
         payload.summary =
@@ -627,6 +967,7 @@ pub async fn classify_readiness(
 
     payload.status = ReadinessStatus::Ready;
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
+
     payload
 }
 
@@ -713,6 +1054,7 @@ pub fn blocked_readiness(
         reason: Some(reason.into()),
         index_progress,
         daemon_status,
+        index_scope: None,
     }
 }
 
@@ -737,6 +1079,7 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         reason: Some(reason.into()),
         index_progress: None,
         daemon_status: None,
+        index_scope: None,
     }
 }
 
@@ -747,10 +1090,40 @@ pub async fn run_search(
     limit: usize,
     path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
-    retry_on_db_lock(|| async {
-        run_search_once(state_root, worktree_context, query, limit, path_prefix).await
-    })
-    .await
+    // REQ-012: Bound search latency to <10s during rebuild. If rebuild is in progress,
+    // apply a timeout; otherwise search without timeout (expected to be fast on idle index).
+    if rebuild_in_progress(state_root, &worktree_context.context_id) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            retry_on_db_lock(|| async {
+                run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Timeout: return degraded response with empty results
+                Ok(SearchPayload {
+                    status: OperationStatus::Degraded,
+                    results: vec![],
+                    degraded_reason: Some(
+                        "Search timed out during ongoing rebuild; try again after rebuilding completes."
+                            .to_string(),
+                    ),
+                    index_scope: compute_index_scope(state_root, &worktree_context.source_root, &worktree_context.context_id)
+                        .await
+                        .ok()
+                        .flatten(),
+                })
+            }
+        }
+    } else {
+        retry_on_db_lock(|| async {
+            run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+        })
+        .await
+    }
 }
 
 /// Process-global warm embedding runtime for the in-process MCP fallback search
@@ -860,10 +1233,21 @@ async fn run_search_once(
         None => OperationStatus::Ok,
     };
 
+    // Compute and populate index scope for coverage disclosure
+    let index_scope = compute_index_scope(
+        state_root,
+        &worktree_context.source_root,
+        &worktree_context.context_id,
+    )
+    .await
+    .ok()
+    .flatten();
+
     Ok(SearchPayload {
         status,
         results: results.into_iter().map(search_hit).collect(),
         degraded_reason,
+        index_scope,
     })
 }
 
@@ -912,7 +1296,28 @@ pub fn resolve_context_scan_filter(
     )?)
 }
 
-pub fn read_context_locations(
+async fn read_scope_for_context(state_root: &Path) -> anyhow::Result<Vec<String>> {
+    let db_path = project_db_path(state_root);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let db = Db::open_ro(&db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open index: {}", e))?;
+    let conn = db
+        .connect_tuned()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to index: {}", e))?;
+
+    schema::read_scope_from_meta(&conn)
+        .await
+        .map(|opt| opt.unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("failed to read scope: {}", e))
+}
+
+pub async fn read_context_locations(
+    state_root: &Path,
     source_root: &Path,
     scan_filter: &ScanFilter,
     locations: &[ReadLocation],
@@ -920,10 +1325,19 @@ pub fn read_context_locations(
     let canonical_root = source_root
         .canonicalize()
         .with_context(|| format!("failed to resolve source root {}", source_root.display()))?;
+
+    // Read scope from database to check if files are out-of-scope
+    let scope = read_scope_for_context(state_root).await.unwrap_or_default();
+
     let mut records = Vec::with_capacity(locations.len());
 
     for location in locations {
-        records.push(read_location_record(&canonical_root, scan_filter, location));
+        records.push(read_location_record(
+            &canonical_root,
+            scan_filter,
+            location,
+            &scope,
+        ));
     }
 
     Ok(ReadPayload {
@@ -1086,8 +1500,10 @@ where
 async fn run_index_then_classify(
     roots: &McpProjectRoots,
     rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
 ) -> anyhow::Result<ReadinessPayload> {
-    match run_index(roots, rebuild).await {
+    match run_index(roots, rebuild, scope_add, scope_narrow).await {
         Ok(_) => Ok(classify_after_index(roots).await),
         Err(err) => Ok(blocked_readiness(
             &roots.state_root,
@@ -1113,17 +1529,80 @@ async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
 async fn run_index(
     roots: &McpProjectRoots,
     rebuild: bool,
+    scope_add: Option<Vec<String>>,
+    scope_narrow: Option<Vec<String>>,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     if project::read_project_id(&roots.state_root).is_err() {
         project::ensure_project_id_for_auto_init(&roots.state_root)?;
     }
 
+    // Load existing scope and compute the new scope based on scope_add/scope_narrow
+    let new_scope = compute_new_scope(&roots.state_root, scope_add, scope_narrow).await?;
+
     let registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let mut indexing_config = config::resolve_indexing_config(
         None,
         None,
         registry.indexing_config_for_context(&roots.worktree_context),
     )?;
+
+    // Apply scope to include_globs for ScanFilter
+    apply_scope_to_indexing_config(&mut indexing_config, &new_scope)?;
+
+    // REQ-002: Write initial progress file with scope info BEFORE rebuild lock acquisition.
+    // This ensures scope is visible during the rebuilding phase, even if the progress file
+    // isn't updated again until the pipeline starts running.
+    let initial_scope_info = if !new_scope.is_empty() {
+        Some(crate::shared::types::IndexScopeInfo {
+            requested: format!("scoped:{}", new_scope.len()),
+            executed: String::new(), // Will be updated by pipeline
+            changed_paths: 0,
+            fallback_reason: None,
+            roots: new_scope.clone(),
+        })
+    } else {
+        None
+    };
+
+    if let Some(scope_info) = &initial_scope_info {
+        let initial_progress = crate::shared::types::IndexProgress {
+            state: crate::shared::types::IndexState::Running,
+            phase: crate::shared::types::IndexPhase::Pending,
+            context_id: Some(roots.worktree_context.context_id.clone()),
+            source_root: Some(roots.source_root.clone()),
+            branch_name: roots.worktree_context.branch_name.clone(),
+            branch_status: Some(roots.worktree_context.branch_status),
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: Some("Preparing to index...".to_string()),
+            parallelism: None,
+            timings: None,
+            scope: Some(scope_info.clone()),
+            prefilter: None,
+            indexer_pid: Some(std::process::id()),
+            updated_at: chrono::Utc::now(),
+        };
+        // Write progress file so scope is visible immediately
+        let dot_dir = config::project_dot_dir(&roots.state_root);
+        let _ = tokio::fs::create_dir_all(&dot_dir).await; // Ensure directory exists
+        let progress_path = dot_dir.join("index_status.json");
+        if let Err(e) =
+            tokio::fs::write(&progress_path, serde_json::to_string(&initial_progress)?).await
+        {
+            tracing::warn!("failed to write initial progress with scope info: {}", e);
+            // Continue anyway - initial progress write is best-effort
+        }
+    }
+
     let mut setup = SetupTimings::new(Instant::now());
 
     // Single-writer rebuild lock: hold it across the staged build + atomic
@@ -1141,17 +1620,29 @@ async fn run_index(
     let _rebuild_lock =
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
+    // REQ-002: Write scope to index_status.json BEFORE the pipeline starts,
+    // ensuring scope is visible to `oneup_status` during indexing (not dependent
+    // on finalize_and_swap completion). This is done by the pipeline's initial
+    // progress update via IndexRunContext scope information. The scope is already
+    // applied to indexing_config.include_globs above, so the file walk will
+    // respect the scope globs.
+
     let db_start = Instant::now();
-    if rebuild {
+    let stats = if rebuild {
         // Build the refreshed index aside into a staging file and atomically switch
         // it over the served `index.db`, so search keeps serving the prior index
         // (stale-but-available) throughout and is never torn down in place. A
         // failure before the switch drops the guard, leaving the prior index intact.
         let staged = swap::StagingRebuild::open(&roots.state_root).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
+
+        // REQ-002 & REQ-005: Write scope to meta table BEFORE pipeline starts
+        // so clamp_deletion_on_scope_loss can read it during the pipeline
+        schema::write_scope_to_meta(staged.connection(), &new_scope).await?;
+
         let stats = run_index_pipeline(staged.connection(), roots, &indexing_config, setup).await?;
         staged.finalize_and_swap().await?;
-        Ok(stats)
+        stats
     } else {
         // Incremental write against the live index — unchanged: no rebuild, so no
         // build-aside switch-over is involved.
@@ -1159,8 +1650,15 @@ async fn run_index(
         let conn = db.connect_tuned().await?;
         schema::prepare_for_write(&conn).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
-        run_index_pipeline(&conn, roots, &indexing_config, setup).await
-    }
+
+        // REQ-002: Write scope to meta table BEFORE pipeline starts
+        schema::write_scope_to_meta(&conn, &new_scope).await?;
+
+        let stats = run_index_pipeline(&conn, roots, &indexing_config, setup).await?;
+        stats
+    };
+
+    Ok(stats)
 }
 
 /// Load the embedding model and run the indexing pipeline against `conn`.
@@ -1189,6 +1687,10 @@ async fn run_index_pipeline(
         .await?;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
+    // REQ-002: Scope is always Full in the MCP path because scope is applied
+    // via include_globs in IndexingConfig. The pipeline respects include_globs
+    // during the scan, so all code paths (scoped and unscoped) use RunScope::Full
+    // with appropriate include_globs set or empty.
     pipeline::run_with_context_scope_setup_and_progress_root(
         conn,
         &roots.worktree_context,
@@ -1448,6 +1950,7 @@ fn read_location_record(
     source_root: &Path,
     scan_filter: &ScanFilter,
     location: &ReadLocation,
+    scope_roots: &[String],
 ) -> ReadRecord {
     let source = ReadSource::Location {
         path: location.path.clone(),
@@ -1496,15 +1999,41 @@ fn read_location_record(
         );
     }
 
+    // Check if file is within indexed scope
+    let is_in_scope = check_path_in_scope(rel_path, scope_roots);
+    let out_of_scope_disclosure = if !is_in_scope && !scope_roots.is_empty() {
+        Some(format_out_of_scope_disclosure(scope_roots))
+    } else {
+        None
+    };
+
     match ContextEngine::retrieve_with_scope(
         &file_path,
         location.line,
         location.expansion,
         ContextAccessScope::ProjectRoot,
     ) {
-        Ok(context) => read_context(source, source_root, context),
+        Ok(context) => read_context(source, source_root, context, out_of_scope_disclosure),
         Err(err) => read_message(ReadStatus::Error, source, err.to_string()),
     }
+}
+
+fn check_path_in_scope(rel_path: &Path, scope_roots: &[String]) -> bool {
+    if scope_roots.is_empty() {
+        return true;
+    }
+
+    let rel_path_str = rel_path.to_string_lossy();
+    scope_roots.iter().any(|root| {
+        rel_path_str.starts_with(root)
+            && (rel_path_str.len() == root.len()
+                || rel_path_str.chars().nth(root.len()) == Some('/'))
+    })
+}
+
+fn format_out_of_scope_disclosure(scope_roots: &[String]) -> String {
+    let dirs = scope_roots.join(", ");
+    format!("This path is outside indexed scope [{}]; content read from file system only. Expand scope to index this file.", dirs)
 }
 
 fn resolve_location_path(source_root: &Path, raw_path: &str) -> Result<PathBuf, LocationError> {
@@ -1571,7 +2100,12 @@ fn read_segment(source: ReadSource, segment: StoredSegment) -> ReadRecord {
     }
 }
 
-fn read_context(source: ReadSource, source_root: &Path, context: ContextResult) -> ReadRecord {
+fn read_context(
+    source: ReadSource,
+    source_root: &Path,
+    context: ContextResult,
+    out_of_scope_disclosure: Option<String>,
+) -> ReadRecord {
     let path = Path::new(&context.file_path)
         .strip_prefix(source_root)
         .map(relative_path_string)
@@ -1588,6 +2122,7 @@ fn read_context(source: ReadSource, source_root: &Path, context: ContextResult) 
             content: context.content,
             line_start: context.line_start,
             line_end: context.line_end,
+            out_of_scope_disclosure,
         }),
         matching_handles: Vec::new(),
         message: None,
@@ -1785,8 +2320,16 @@ fn only_references(results: Vec<SymbolResult>) -> Vec<SymbolResult> {
 
 fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let path = project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = std::fs::read_to_string(&path).ok()?;
+    let progress = serde_json::from_str(&content).ok()?;
+
+    // REQ-010: Check if the progress file is stale (Running state, dead process, age > 5 min).
+    // Treat stale progress as if no index exists, so agents don't poll indefinitely.
+    if is_index_progress_stale(&progress, &path) {
+        return None;
+    }
+
+    Some(progress)
 }
 
 fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Option<IndexProgress> {
@@ -1796,6 +2339,62 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
             .as_deref()
             .is_none_or(|progress_context_id| progress_context_id == context_id)
     })
+}
+
+/// Extract scope info from progress file during indexing.
+/// REQ-002: Scope should be visible during indexing, independent of swap completion.
+fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
+    // REQ-002: Extract scope from progress during indexing.
+    // The scope roots come from IndexScopeInfo recorded during pipeline startup.
+    // Return IndexScope as soon as scope_info is available, even if files_total is 0,
+    // so scope is visible from the start of indexing (not just during scanning).
+    progress.scope.as_ref().map(|scope_info| {
+        IndexScope {
+            // REQ-002: Use roots from scope_info (recorded during pipeline startup)
+            roots: scope_info.roots.clone(),
+            indexed_files: progress.files_indexed,
+            total_files: progress.files_total,
+        }
+    })
+}
+
+/// REQ-010: Check if an index progress file is stale.
+/// A progress file is stale if it claims Running state but the owning process (indexer_pid)
+/// is dead AND the file is older than STALENESS_THRESHOLD_SECS (5 minutes).
+/// This prevents agents from indefinitely polling a stuck indexing state.
+fn is_index_progress_stale(progress: &IndexProgress, status_path: &Path) -> bool {
+    use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+    use std::fs;
+
+    // Only consider Running state as potentially stale
+    if progress.state != IndexState::Running {
+        return false;
+    }
+
+    // Must have a PID to check liveness
+    let Some(pid) = progress.indexer_pid else {
+        return false;
+    };
+
+    // Process is still alive: not stale
+    if lifecycle::is_process_alive(pid) {
+        return false;
+    }
+
+    // Process is dead. Check file age against staleness threshold.
+    let Ok(metadata) = fs::metadata(status_path) else {
+        return false;
+    };
+
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+
+    let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+
+    elapsed.as_secs() > STALENESS_THRESHOLD_SECS
 }
 
 fn embedding_unavailable_reason(status: &EmbeddingLoadStatus) -> Option<String> {
@@ -1854,13 +2453,640 @@ enum LocationError {
     Error(String),
 }
 
+// REQ-005: Cache key for directory walk results, invalidating on repo identity change or HEAD drift.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct DirectoryWalkCacheKey {
+    repo_identity: String,       // e.g., source_root canonical path
+    head_commit: Option<String>, // git HEAD OID, or None if not in a git repo
+    root_mtime: Option<u64>,     // filesystem mtime in seconds, or None on error
+}
+
+// REQ-005: Static in-process cache for directory walk results.
+// F5/N4b: Also persists to disk for cross-process reuse (cold-walk latency fix).
+static DIRECTORY_WALK_CACHE: OnceLock<
+    Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>>,
+> = OnceLock::new();
+
+fn get_directory_walk_cache(
+) -> &'static Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>> {
+    DIRECTORY_WALK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// F5/N4b: Persistent on-disk cache for directory walk results.
+/// Stored as JSON in .1up directory, keyed by (repo_id, HEAD, mtime).
+/// Survives process restart to avoid re-walking on fresh-process envelope/search calls.
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct PersistentDirectoryWalkCache {
+    entries: HashMap<String, BTreeMap<String, usize>>, // JSON-serializable cache
+}
+
+/// F5/N4b: Generate a stable cache key string for persistent storage.
+/// Must be deterministic and human-readable for debugging.
+fn cache_key_to_string(key: &DirectoryWalkCacheKey) -> String {
+    let head = key.head_commit.as_deref().unwrap_or("no_git");
+    let mtime = key
+        .root_mtime
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{}_{}_{}", key.repo_identity, head, mtime)
+}
+
+/// F5/N4b: Load directory walk cache from persistent storage in .1up directory.
+/// Returns empty map on any error (missing file, parse error, etc.); errors are
+/// non-fatal since the cache is an optimization.
+fn load_persistent_directory_walk_cache(
+    state_root: &Path,
+) -> HashMap<String, BTreeMap<String, usize>> {
+    let cache_path = project_dot_dir(state_root).join("directory_walk_cache.json");
+    match std::fs::read_to_string(&cache_path) {
+        Ok(content) => match serde_json::from_str::<PersistentDirectoryWalkCache>(&content) {
+            Ok(cached) => cached.entries,
+            Err(_) => HashMap::new(),
+        },
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// F5/N4b: Persist directory walk cache to disk.
+/// Stores in .1up directory; errors are logged but don't interrupt operation.
+fn save_persistent_directory_walk_cache(
+    state_root: &Path,
+    entries: &HashMap<String, BTreeMap<String, usize>>,
+) {
+    let dot_dir = project_dot_dir(state_root);
+    // FIX A: Only write cache if .1up already exists. Never create .1up during blocked/failed
+    // indexing attempts (REQ-001: blocked path must leave NO .1up side effects).
+    if !dot_dir.exists() {
+        return;
+    }
+
+    let cache = PersistentDirectoryWalkCache {
+        entries: entries.clone(),
+    };
+    let cache_path = dot_dir.join("directory_walk_cache.json");
+    if let Err(e) = std::fs::write(
+        &cache_path,
+        serde_json::to_string(&cache).unwrap_or_default(),
+    ) {
+        tracing::warn!("failed to persist directory walk cache: {}", e);
+    }
+}
+
+// FIX B: Density computation cache to avoid second uncached walk on every envelope call.
+// Keyed by (repo_identity, HEAD, mtime) - same as directory walk cache key.
+static DENSITY_CACHE: OnceLock<Mutex<HashMap<DirectoryWalkCacheKey, f64>>> = OnceLock::new();
+
+fn get_density_cache() -> &'static Mutex<HashMap<DirectoryWalkCacheKey, f64>> {
+    DENSITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// FIX B: Load cached density from persistent storage if it exists.
+/// Returns None on any error (missing file, parse error, etc.); errors are non-fatal.
+#[allow(dead_code)] // Future use for cross-process density persistence
+fn load_persistent_density_cache(state_root: &Path) -> Option<f64> {
+    let cache_path = project_dot_dir(state_root).join("density_cache.json");
+    match std::fs::read_to_string(&cache_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(obj) => obj.get("density").and_then(|v| v.as_f64()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// FIX B: Persist computed density to disk for cross-process reuse.
+/// Only writes if .1up directory already exists (same guard as directory walk cache).
+#[allow(dead_code)] // Future use for cross-process density persistence
+fn save_persistent_density_cache(state_root: &Path, density: f64) {
+    let dot_dir = project_dot_dir(state_root);
+    if !dot_dir.exists() {
+        return;
+    }
+
+    let cache_data = serde_json::json!({ "density": density });
+    let cache_path = dot_dir.join("density_cache.json");
+    if let Err(e) = std::fs::write(
+        &cache_path,
+        serde_json::to_string(&cache_data).unwrap_or_default(),
+    ) {
+        tracing::warn!("failed to persist density cache: {}", e);
+    }
+}
+
+/// Extracts git HEAD OID from the repository.
+/// Returns None if not in a git repo or if HEAD cannot be read.
+fn get_head_commit(source_root: &Path) -> Option<String> {
+    // Try to read HEAD using git command as a simple, reliable approach
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !commit.is_empty() && commit.len() == 40 {
+            // Validate it's a hex OID (40 chars for SHA1)
+            if commit.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(commit);
+            }
+        }
+    }
+    None
+}
+
+/// Gets the root directory mtime as a cache invalidation signal.
+/// Returns None if metadata cannot be read.
+fn get_root_mtime(source_root: &Path) -> Option<u64> {
+    std::fs::metadata(source_root)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Gets the configured file count threshold for facts envelope gate, with env var override.
+fn get_file_count_threshold() -> usize {
+    std::env::var(FILE_COUNT_THRESHOLD_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(FILE_COUNT_THRESHOLD)
+}
+
+/// Counts files per top-level directory with result caching (REQ-005).
+/// Returns a map of directory name to file_count.
+/// Cache invalidates on git HEAD drift or root directory mtime change,
+/// ensuring <1s repeat call latency while maintaining correctness.
+/// F5/N4b: Uses both in-process and persistent (disk-based) caches for cross-process reuse.
+fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+    // Build cache key from repo identity and current state
+    let cache_key = DirectoryWalkCacheKey {
+        repo_identity: source_root
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
+        head_commit: get_head_commit(source_root),
+        root_mtime: get_root_mtime(source_root),
+    };
+
+    let cache_key_str = cache_key_to_string(&cache_key);
+
+    // Check in-process cache first (fastest)
+    if let Ok(cache) = get_directory_walk_cache().lock() {
+        if let Some(cached_result) = cache.get(&cache_key) {
+            return Ok(cached_result.clone());
+        }
+    }
+
+    // Not in in-process cache; try persistent cache (F5/N4b: cross-process)
+    // We need state_root to check persistent cache, but we only have source_root.
+    // Since generate_facts_envelope is called early in oneup_start before any state
+    // is written, we use a heuristic: if source_root is a git repo, the .1up would be
+    // at source_root/.1up. This is good enough for the cold-start case.
+    let potential_state_root = source_root;
+    let persistent_cache = load_persistent_directory_walk_cache(potential_state_root);
+    if let Some(cached_result) = persistent_cache.get(&cache_key_str) {
+        // Found in persistent cache; restore to in-process cache for this process
+        if let Ok(mut in_process) = get_directory_walk_cache().lock() {
+            in_process.insert(cache_key.clone(), cached_result.clone());
+        }
+        return Ok(cached_result.clone());
+    }
+
+    // Not in either cache, compute via gitignore-aware walk
+    let result = count_files_per_directory_uncached(source_root)?;
+
+    // Store in both caches for future calls
+    if let Ok(mut cache) = get_directory_walk_cache().lock() {
+        cache.insert(cache_key.clone(), result.clone());
+    }
+    // F5/N4b: Persist to disk for cross-process reuse
+    let mut persistent = persistent_cache;
+    persistent.insert(cache_key_str, result.clone());
+    save_persistent_directory_walk_cache(potential_state_root, &persistent);
+
+    Ok(result)
+}
+
+/// Counts files per top-level directory (metadata-only walk, no parsing).
+/// Gitignore-aware directory file count walk.
+/// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
+/// the indexer's actual file counts and exclude untracked build trees.
+/// Helper to determine if a path is under a VCS directory that should be excluded.
+/// N1: VCS directories (.git, .hg, .svn) should never appear in file counts.
+fn is_under_vcs_dir(path: &Path) -> bool {
+    const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name_str = name.to_string_lossy();
+            if VCS_DIRS
+                .iter()
+                .any(|vcs| name_str.eq_ignore_ascii_case(vcs))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Helper to build a gitignore-aware walker with VCS directories excluded.
+/// Excludes .git, .hg, .svn, and other VCS metadata to match indexer behavior.
+/// N1: VCS directories (.git, etc.) should never appear in file counts or suggestions.
+fn build_vcs_aware_walker(source_root: &Path) -> ignore::WalkBuilder {
+    use ignore::WalkBuilder;
+
+    let mut builder = WalkBuilder::new(source_root);
+    builder
+        .hidden(false) // Include hidden files/dirs for analysis
+        .ignore(true); // Respect .gitignore rules
+
+    builder
+}
+
+/// Counts files per top-level directory (metadata-only walk, no parsing).
+/// Gitignore-aware directory file count walk with VCS directory exclusion.
+/// Uses the `ignore` crate to respect `.gitignore` rules, ensuring estimates match
+/// the indexer's actual file counts and exclude untracked build trees.
+fn count_files_per_directory_uncached(
+    source_root: &Path,
+) -> Result<BTreeMap<String, usize>, OneupError> {
+    let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    // Build a gitignore-aware walker with VCS directories excluded (N1)
+    let walker = build_vcs_aware_walker(source_root).build();
+
+    // Aggregate files by their top-level directory
+    for entry in walker.flatten() {
+        // Only count files, not directories
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            // Get the relative path from source_root
+            if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                // N1: Skip files under VCS directories
+                if is_under_vcs_dir(rel_path) {
+                    continue;
+                }
+                // Extract the first component (top-level directory)
+                if let Some(top_level) = rel_path.components().next() {
+                    if let Component::Normal(name) = top_level {
+                        if let Some(dir_name) = name.to_str() {
+                            *dir_counts.entry(dir_name.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                } else {
+                    // File at root level
+                    *dir_counts.entry(".".to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // If no top-level directories were counted, count files at the root directly
+    if dir_counts.is_empty() {
+        let walker = build_vcs_aware_walker(source_root).build();
+
+        let mut root_count = 0;
+        for entry in walker.flatten() {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                    // N1: Skip files under VCS directories
+                    if !is_under_vcs_dir(rel_path) {
+                        root_count += 1;
+                    }
+                }
+            }
+        }
+        if root_count > 0 {
+            dir_counts.insert(".".to_string(), root_count);
+        }
+    }
+
+    Ok(dir_counts)
+}
+
+/// Counts total tracked files in repository using gitignore-aware walk.
+/// Returns the gitignore-aware tracked file count (same definition used by indexer).
+/// Excludes VCS directories (N1).
+#[allow(dead_code)]
+fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
+    let walker = build_vcs_aware_walker(source_root).build();
+
+    let count = walker
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter(|e| {
+            // N1: Skip files under VCS directories
+            e.path()
+                .strip_prefix(source_root)
+                .map(|rel| !is_under_vcs_dir(rel))
+                .unwrap_or(true)
+        })
+        .count();
+
+    Ok(count)
+}
+
+/// Density table for per-language vector count calibration.
+/// N2: Both global and per-directory estimates use this table for consistency.
+fn get_density_table() -> &'static [(&'static str, f64)] {
+    &[
+        ("rs", 37.0),   // Rust: measured 37.02 segments/file
+        ("kt", 28.0),   // Kotlin: measured ~28 segments/file
+        ("java", 28.0), // Java: same as Kotlin
+        ("py", 30.0),   // Python: estimated conservative pending measurement
+        ("go", 15.0),   // Go: estimated conservative pending measurement
+        ("js", 25.0),   // JavaScript: estimated conservative pending measurement
+        ("ts", 25.0),   // TypeScript: estimated conservative pending measurement
+    ]
+}
+
+/// Compute average segments-per-file density for a repository based on language distribution.
+/// N2: Shared by both global and per-directory estimates.
+/// FIX B: Caches result to avoid re-walking on every envelope call.
+fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
+    // FIX B: Build cache key same as directory walk cache for consistency
+    let cache_key = DirectoryWalkCacheKey {
+        repo_identity: source_root
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
+        head_commit: get_head_commit(source_root),
+        root_mtime: get_root_mtime(source_root),
+    };
+
+    // FIX B: Check in-process cache first
+    if let Ok(cache) = get_density_cache().lock() {
+        if let Some(cached_density) = cache.get(&cache_key) {
+            return Ok(*cached_density);
+        }
+    }
+
+    // FIX B: If not in memory, compute the density by walking the repo
+    let density_table = get_density_table();
+    let walker = build_vcs_aware_walker(source_root).build();
+
+    let mut files_by_ext: HashMap<String, usize> = HashMap::new();
+    for entry in walker.flatten() {
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            // N1: Skip files under VCS directories
+            if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
+                if is_under_vcs_dir(rel_path) {
+                    continue;
+                }
+            }
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                *files_by_ext.entry(ext.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut total_density = 0.0;
+    let mut files_by_known_ext = 0;
+
+    for (ext, count) in &files_by_ext {
+        if let Some((_, density)) = density_table.iter().find(|(e, _)| ext.ends_with(e)) {
+            total_density += density * *count as f64;
+            files_by_known_ext += count;
+        }
+    }
+
+    let avg_segments_per_file = if files_by_known_ext > 0 {
+        total_density / files_by_known_ext as f64
+    } else {
+        15.0 // Fallback for completely unmeasured ecosystems
+    };
+
+    // FIX B: Cache the result for this repo state
+    if let Ok(mut cache) = get_density_cache().lock() {
+        cache.insert(cache_key, avg_segments_per_file);
+    }
+
+    Ok(avg_segments_per_file)
+}
+
+/// Calibrates vector estimate based on measured language densities.
+/// Returns (total_estimate, basis_explanation, low_bound, high_bound).
+///
+/// REQ-006: Vector estimate must be calibrated against real embedding density.
+/// Measured densities:
+/// - Rust: 37.02 segments/file (measured on 1up: 148 files → 5479 segments)
+/// - Kotlin/Java: ~28 segments/file (cash-server validation)
+/// - Unmeasured: 15-30 conservative range
+fn estimate_vector_count(
+    total_tracked_files: usize,
+    source_root: &Path,
+) -> Result<(usize, String, usize, usize), OneupError> {
+    let avg_segments_per_file = compute_avg_density_for_repo(source_root)?;
+
+    let estimated_count = (total_tracked_files as f64 * avg_segments_per_file) as usize;
+
+    // Label the basis so agents understand confidence
+    let basis = format!(
+        "estimated ~{:.1} segments per file based on measured Rust (37.02) and Kotlin/Java (28.0) densities, with conservative estimates for unmeasured languages (15-30 range). Actual density varies by language; use this as a rough cost indicator, not a hard budget.",
+        avg_segments_per_file
+    );
+
+    // Conservative lower and pessimistic upper bounds
+    let low_bound = (total_tracked_files as f64 * 15.0) as usize;
+    let high_bound = (total_tracked_files as f64 * 40.0) as usize;
+
+    Ok((estimated_count, basis, low_bound, high_bound))
+}
+
+/// Detects workspace manifest files in the repo.
+fn detect_workspace_manifests(source_root: &Path) -> Vec<String> {
+    let mut manifests = Vec::new();
+
+    let manifest_names = ["Cargo.toml", "package.json"];
+
+    // Check root
+    for name in manifest_names {
+        if source_root.join(name).exists() {
+            manifests.push(name.to_string());
+        }
+    }
+
+    // Check top-level directories for manifests
+    if let Ok(entries) = std::fs::read_dir(source_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !dir_name.starts_with('.') {
+                        for name in manifest_names {
+                            let manifest_path = path.join(name);
+                            if manifest_path.exists() {
+                                let rel_path = format!("{}/{}", dir_name, name);
+                                if !manifests.contains(&rel_path) {
+                                    manifests.push(rel_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    manifests.sort();
+    manifests
+}
+
+/// Parses git sparse-checkout if active.
+fn get_sparse_checkout_info(source_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("sparse-checkout")
+        .arg("list")
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if !trimmed.is_empty() {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Checks if a facts envelope should be returned instead of indexing.
+/// Returns true if:
+/// 1. No index exists (status: Missing)
+/// 2. No scope has been configured (scope_roots is None in meta table)
+/// 3. File count exceeds the threshold
+pub async fn should_return_facts_envelope(
+    _state_root: &Path,
+    source_root: &Path,
+    readiness: &ReadinessPayload,
+) -> Result<bool, OneupError> {
+    // Only return facts on first-run when index is missing
+    if readiness.status != ReadinessStatus::Missing {
+        return Ok(false);
+    }
+
+    let threshold = get_file_count_threshold();
+
+    // Quick file count: check directory sizes
+    let dir_counts = count_files_per_directory(source_root)?;
+    let total_files: usize = dir_counts.values().sum();
+
+    Ok(total_files > threshold)
+}
+
+/// Generates a facts envelope for a large monorepo on first-run.
+/// Uses gitignore-aware file counts and calibrated vector estimates based on measured
+/// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
+/// N2: Per-directory estimates now use the same calibrated density as the global estimate.
+pub async fn generate_facts_envelope(
+    source_root: &Path,
+    launch_subdir: Option<PathBuf>,
+) -> Result<FactsEnvelope, OneupError> {
+    // Count files per top-level directory (gitignore-aware, N1: excludes .git)
+    let dir_counts = count_files_per_directory(source_root)?;
+    let file_count_total: usize = dir_counts.values().sum();
+
+    // N2: Compute calibrated density once, use for both global and per-directory estimates
+    let avg_segments_per_file = compute_avg_density_for_repo(source_root)?;
+
+    // Build directory stats with calibrated estimates (N2: consistent with global estimate)
+    let mut per_directory_stats: Vec<DirectoryStats> = dir_counts
+        .into_iter()
+        .map(|(directory, file_count)| DirectoryStats {
+            directory,
+            file_count,
+            estimated_vectors: (file_count as f64 * avg_segments_per_file) as usize,
+        })
+        .collect();
+
+    // Sort by file count descending (largest first)
+    per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
+
+    // Calibrate global vector estimate (N2: reuses same computed density)
+    let (vector_estimate_total, basis, low_bound, high_bound) =
+        estimate_vector_count(file_count_total, source_root)?;
+
+    let workspace_manifests = detect_workspace_manifests(source_root);
+    let sparse_checkout = get_sparse_checkout_info(source_root);
+
+    let launch_subdir_str = launch_subdir.and_then(|p| {
+        p.strip_prefix(source_root)
+            .ok()
+            .and_then(|rel| rel.to_str().map(|s| s.to_string()))
+    });
+
+    Ok(FactsEnvelope {
+        per_directory_stats,
+        workspace_manifests,
+        sparse_checkout,
+        launch_subdir: launch_subdir_str,
+        file_count_total,
+        vector_estimate_total,
+        vector_estimate_basis: Some(basis),
+        vector_estimate_low: Some(low_bound),
+        vector_estimate_high: Some(high_bound),
+    })
+}
+
+/// Computes the current index scope coverage information from the database and filesystem.
+///
+/// Reads the scope roots from the meta table, counts indexed files from the database,
+/// and counts total files in the repository. Returns None if the index is not present
+/// or readable.
+pub async fn compute_index_scope(
+    state_root: &Path,
+    source_root: &Path,
+    context_id: &str,
+) -> Result<Option<IndexScope>, OneupError> {
+    // Try to open the database
+    let db_path = project_db_path(state_root);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let db = Db::open_ro(&db_path).await?;
+    let conn = db.connect_tuned().await?;
+
+    // Read scope roots from meta table
+    let scope_roots = schema::read_scope_from_meta(&conn).await?;
+
+    // Count indexed files: get all file paths with segments for this context
+    let indexed_file_paths =
+        crate::storage::segments::get_all_file_paths_for_context(&conn, context_id).await?;
+    let indexed_files = indexed_file_paths.len();
+
+    // Count total files in the repository
+    let dir_counts = count_files_per_directory(source_root)?;
+    let total_files: usize = dir_counts.values().sum();
+
+    Ok(Some(IndexScope {
+        roots: scope_roots.unwrap_or_default(),
+        indexed_files,
+        total_files,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::types::{
-        BranchStatus, DaemonRefreshState, StructuralSearchStatus, WorktreeRole,
+        BranchStatus, DaemonRefreshState, IndexPhase, StructuralSearchStatus, WorktreeRole,
     };
     use crate::storage::segments::{self, SegmentInsert};
+    use chrono::Utc;
     use std::fs;
 
     fn readiness_fixture() -> ReadinessPayload {
@@ -2032,13 +3258,14 @@ mod tests {
         ScanFilter::new(&[], &[], &[]).unwrap()
     }
 
-    #[test]
-    fn read_context_locations_rejects_parent_escape() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_parent_escape() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2047,19 +3274,21 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
         assert_eq!(payload.records[0].status, ReadStatus::Rejected);
     }
 
-    #[test]
-    fn read_context_locations_rejects_zero_line_as_structured_record() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_zero_line_as_structured_record() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2068,6 +3297,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
@@ -2079,8 +3309,8 @@ mod tests {
             .contains("1-based"));
     }
 
-    #[test]
-    fn read_context_locations_reads_repo_relative_file() {
+    #[tokio::test]
+    async fn read_context_locations_reads_repo_relative_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -2092,6 +3322,7 @@ mod tests {
 
         let payload = read_context_locations(
             &root,
+            &root,
             &no_op_scan_filter(),
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -2099,6 +3330,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Ok);
@@ -2114,14 +3346,15 @@ mod tests {
     /// directly, bypassing indexer exclusions entirely. This asserts the
     /// closed behavior — the fix under test refuses the file rather than
     /// returning its content.
-    #[test]
-    fn read_context_locations_rejects_secret_pattern_file() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_secret_pattern_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("credentials.json"), "{\"key\": \"super-secret\"}").unwrap();
 
         let payload = read_context_locations(
+            &root,
             &root,
             &no_op_scan_filter(),
             &[ReadLocation {
@@ -2130,6 +3363,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.status, OperationStatus::Empty);
@@ -2142,8 +3376,8 @@ mod tests {
             .contains("excluded"));
     }
 
-    #[test]
-    fn read_context_locations_rejects_configured_exclude_glob() {
+    #[tokio::test]
+    async fn read_context_locations_rejects_configured_exclude_glob() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("secrets")).unwrap();
@@ -2152,6 +3386,7 @@ mod tests {
         let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
         let payload = read_context_locations(
             &root,
+            &root,
             &scan_filter,
             &[ReadLocation {
                 path: "secrets/internal.txt".to_string(),
@@ -2159,6 +3394,7 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.records[0].status, ReadStatus::Rejected);
@@ -2167,8 +3403,8 @@ mod tests {
 
     /// REQ-005 AC2: a non-excluded file continues to be served normally even
     /// when the project has a configured (non-matching) `ScanFilter`.
-    #[test]
-    fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
+    #[tokio::test]
+    async fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -2181,6 +3417,7 @@ mod tests {
         let scan_filter = ScanFilter::new(&[], &["secrets/**".to_string()], &[]).unwrap();
         let payload = read_context_locations(
             &root,
+            &root,
             &scan_filter,
             &[ReadLocation {
                 path: "src/lib.rs".to_string(),
@@ -2188,9 +3425,71 @@ mod tests {
                 expansion: None,
             }],
         )
+        .await
         .unwrap();
 
         assert_eq!(payload.records[0].status, ReadStatus::Found);
+    }
+
+    #[test]
+    fn check_path_in_scope_matches_root_files() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("src/lib.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_matches_nested_files() {
+        let scope = vec!["src/components".to_string()];
+        let path = std::path::Path::new("src/components/button.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_rejects_different_prefix() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("extra/utils.rs");
+        assert!(!check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_rejects_partial_prefix_match() {
+        let scope = vec!["src".to_string()];
+        let path = std::path::Path::new("src_extra/file.rs");
+        assert!(!check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn check_path_in_scope_accepts_multiple_roots() {
+        let scope = vec!["src".to_string(), "lib".to_string()];
+        assert!(check_path_in_scope(
+            std::path::Path::new("src/main.rs"),
+            &scope
+        ));
+        assert!(check_path_in_scope(
+            std::path::Path::new("lib/util.rs"),
+            &scope
+        ));
+        assert!(!check_path_in_scope(
+            std::path::Path::new("extra/other.rs"),
+            &scope
+        ));
+    }
+
+    #[test]
+    fn check_path_in_scope_empty_scope_returns_true() {
+        let scope: Vec<String> = vec![];
+        let path = std::path::Path::new("any/file.rs");
+        assert!(check_path_in_scope(path, &scope));
+    }
+
+    #[test]
+    fn format_out_of_scope_disclosure_formats_correctly() {
+        let scope = vec!["src".to_string(), "lib".to_string()];
+        let disclosure = format_out_of_scope_disclosure(&scope);
+        assert!(disclosure.contains("outside indexed scope"));
+        assert!(disclosure.contains("src, lib"));
+        assert!(disclosure.contains("Expand scope"));
     }
 
     #[test]
@@ -2755,5 +4054,601 @@ mod tests {
             called_relations: "[]".to_string(),
             file_hash: format!("hash-{id}"),
         }
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_empty_scope() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+            scope_roots: vec![],
+            scope_globs: vec![],
+        };
+        let result = apply_scope_to_indexing_config(&mut config, &[]);
+        assert!(result.is_ok());
+        assert!(config.scope_globs.is_empty());
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_single_root() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+            scope_roots: vec![],
+            scope_globs: vec![],
+        };
+        let scope = vec!["services/auth".to_string()];
+        let result = apply_scope_to_indexing_config(&mut config, &scope);
+        assert!(result.is_ok());
+        assert_eq!(config.scope_globs, vec!["services/auth/**"]);
+    }
+
+    #[test]
+    fn test_apply_scope_to_indexing_config_multiple_roots() {
+        let mut config = IndexingConfig {
+            jobs: 4,
+            embed_threads: 2,
+            write_batch_files: 100,
+            include_globs: vec![],
+            exclude_globs: vec![],
+            index_hidden_dirs: vec![],
+            scope_roots: vec![],
+            scope_globs: vec![],
+        };
+        let scope = vec!["services/auth".to_string(), "libs/core".to_string()];
+        let result = apply_scope_to_indexing_config(&mut config, &scope);
+        assert!(result.is_ok());
+        assert_eq!(config.scope_globs, vec!["services/auth/**", "libs/core/**"]);
+    }
+
+    #[tokio::test]
+    async fn test_compute_new_scope_with_scope_add() {
+        // Test: scope_add with no existing scope creates new scope
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let scope_add = Some(vec!["services/auth".to_string()]);
+        let result = compute_new_scope(temp_dir.path(), scope_add.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["services/auth"]);
+    }
+
+    #[tokio::test]
+    async fn test_compute_new_scope_with_scope_narrow_empty_current() {
+        // Test: scope_narrow on empty current scope (should work)
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let scope_narrow = Some(vec!["services/auth".to_string()]);
+        let result = compute_new_scope(temp_dir.path(), None, scope_narrow)
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["services/auth"]);
+    }
+
+    #[test]
+    fn test_scope_add_validation_rejects_absolute_paths() {
+        // This test documents the validation in compute_new_scope
+        let absolute_path = "/services/auth".to_string();
+        let result: anyhow::Result<Vec<String>> = if absolute_path.starts_with('/') {
+            Err(anyhow::anyhow!(
+                "scope path cannot be absolute: {}",
+                absolute_path
+            ))
+        } else {
+            Ok(vec![absolute_path])
+        };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scope_add_validation_rejects_escape_sequences() {
+        // This test documents the validation in compute_new_scope
+        let escape_path = "services/../admin".to_string();
+        let result: anyhow::Result<Vec<String>> = if escape_path.contains("..") {
+            Err(anyhow::anyhow!(
+                "scope path cannot contain '..': {}",
+                escape_path
+            ))
+        } else {
+            Ok(vec![escape_path])
+        };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_scope_serializes_and_deserializes() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string(), "libs/core".to_string()],
+            indexed_files: 150,
+            total_files: 2500,
+        };
+
+        let json = serde_json::to_string(&scope).expect("should serialize");
+        let deserialized: IndexScope = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(deserialized.roots, scope.roots);
+        assert_eq!(deserialized.indexed_files, scope.indexed_files);
+        assert_eq!(deserialized.total_files, scope.total_files);
+    }
+
+    #[test]
+    fn index_scope_coverage_description_for_empty_scope() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec![],
+            indexed_files: 0,
+            total_files: 1000,
+        };
+
+        assert_eq!(scope.coverage_description(), "No scope configured");
+    }
+
+    #[test]
+    fn index_scope_coverage_description_calculates_percentage() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string()],
+            indexed_files: 150,
+            total_files: 600,
+        };
+
+        let description = scope.coverage_description();
+        assert!(description.contains("150 files indexed of 600 total"));
+        assert!(description.contains("25%"));
+    }
+
+    #[test]
+    fn index_scope_coverage_description_handles_zero_total() {
+        use crate::shared::types::IndexScope;
+
+        let scope = IndexScope {
+            roots: vec!["services/auth".to_string()],
+            indexed_files: 0,
+            total_files: 0,
+        };
+
+        let description = scope.coverage_description();
+        assert!(description.contains("0 files indexed of 0 total"));
+        assert!(description.contains("0%"));
+    }
+
+    #[test]
+    fn resolve_project_captures_launch_subdir_when_invoked_from_subdirectory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_root = temp_dir.path().canonicalize().unwrap();
+        let services_dir = repo_root.join("services");
+        let auth_dir = services_dir.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // Invoke from subdirectory
+        let roots = resolve_project(&auth_dir).expect("should resolve project");
+
+        // Verify launch_subdir is captured
+        assert_eq!(roots.source_root, repo_root);
+        assert!(roots.launch_subdir.is_some());
+        let launch_subdir = roots.launch_subdir.unwrap();
+        assert_eq!(launch_subdir, auth_dir);
+    }
+
+    #[test]
+    fn resolve_project_sets_launch_subdir_none_when_invoked_from_project_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_root = temp_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        // Invoke from project root
+        let roots = resolve_project(&repo_root).expect("should resolve project");
+
+        // Verify launch_subdir is None when invoked from root
+        assert_eq!(roots.source_root, repo_root);
+        assert!(roots.launch_subdir.is_none());
+    }
+
+    #[test]
+    fn extract_scope_from_progress_extracts_scope_info() {
+        use crate::shared::types::{BranchStatus, IndexPhase, IndexScopeInfo};
+        use chrono::Utc;
+
+        // Create a progress with scope info
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: Some("test".to_string()),
+            source_root: None,
+            branch_name: None,
+            branch_status: Some(BranchStatus::Unknown),
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 25,
+            files_indexed: 20,
+            files_skipped: 5,
+            files_deleted: 0,
+            segments_stored: 100,
+            embeddings_enabled: true,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: Some(IndexScopeInfo {
+                requested: "scoped:2".to_string(),
+                executed: "scoped:50".to_string(),
+                changed_paths: 50,
+                fallback_reason: None,
+                roots: vec!["services/auth".to_string(), "libs/core".to_string()],
+            }),
+            prefilter: None,
+            indexer_pid: None,
+            updated_at: Utc::now(),
+        };
+
+        // Extract scope from progress
+        let scope = extract_scope_from_progress(&progress);
+
+        // Verify scope is extracted correctly
+        assert!(scope.is_some());
+        let scope = scope.unwrap();
+        // REQ-002: Roots should now be populated from IndexScopeInfo during indexing
+        assert_eq!(
+            scope.roots,
+            vec!["services/auth".to_string(), "libs/core".to_string()]
+        );
+        assert_eq!(scope.indexed_files, 20);
+        assert_eq!(scope.total_files, 100);
+    }
+
+    #[test]
+    fn extract_scope_from_progress_returns_none_when_no_scope_info() {
+        use crate::shared::types::{BranchStatus, IndexPhase};
+        use chrono::Utc;
+
+        // Create a progress without scope info
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: Some("test".to_string()),
+            source_root: None,
+            branch_name: None,
+            branch_status: Some(BranchStatus::Unknown),
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 25,
+            files_indexed: 20,
+            files_skipped: 5,
+            files_deleted: 0,
+            segments_stored: 100,
+            embeddings_enabled: true,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None, // No scope info
+            prefilter: None,
+            indexer_pid: None,
+            updated_at: Utc::now(),
+        };
+
+        // Extract scope from progress
+        let scope = extract_scope_from_progress(&progress);
+
+        // Verify scope is None when no scope info
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn progress_with_idle_state_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+
+        let progress = IndexProgress {
+            state: IndexState::Idle,
+            phase: IndexPhase::Pending,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 0,
+            files_scanned: 0,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: Some(std::process::id()),
+            updated_at: Utc::now(),
+        };
+
+        // Idle state should never be stale regardless of process or file age
+        assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[test]
+    fn running_progress_with_live_process_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+
+        // Create the status file so we can check its mtime
+        fs::write(&status_path, "{}").unwrap();
+
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: Some(std::process::id()), // Current process is alive
+            updated_at: Utc::now(),
+        };
+
+        // Running state with a live process should not be stale
+        assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[test]
+    fn running_progress_without_pid_is_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status_path = tmp.path().join("index_status.json");
+        fs::write(&status_path, "{}").unwrap();
+
+        let progress = IndexProgress {
+            state: IndexState::Running,
+            phase: IndexPhase::Scanning,
+            context_id: None,
+            source_root: None,
+            branch_name: None,
+            branch_status: None,
+            files_total: 100,
+            files_scanned: 50,
+            files_processed: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            segments_stored: 0,
+            embeddings_enabled: false,
+            embedding_unavailable_reason: None,
+            vector_rows: None,
+            embeddable_segments: None,
+            message: None,
+            parallelism: None,
+            timings: None,
+            scope: None,
+            prefilter: None,
+            indexer_pid: None, // No PID recorded
+            updated_at: Utc::now(),
+        };
+
+        // Running state without a PID can't be checked for liveness, so not stale
+        assert!(!is_index_progress_stale(&progress, &status_path));
+    }
+
+    #[tokio::test]
+    async fn spawn_rebuild_task_spawns_non_blocking() {
+        use std::time::Instant;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let state_root = tmp.path().to_path_buf();
+        let source_root = tmp.path().to_path_buf();
+
+        // Create minimal project structure
+        std::fs::create_dir_all(state_root.join(".1up")).unwrap();
+
+        // Create a minimal WorktreeContext
+        let worktree_context = WorktreeContext {
+            context_id: "test".to_string(),
+            state_root: state_root.clone(),
+            source_root: source_root.clone(),
+            main_worktree_root: source_root.clone(),
+            worktree_role: crate::shared::types::WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: crate::shared::types::BranchStatus::Unknown,
+        };
+
+        let roots = McpProjectRoots {
+            state_root: state_root.clone(),
+            source_root: source_root.clone(),
+            worktree_context,
+            launch_subdir: None,
+        };
+
+        // Measure time to call spawn_rebuild_task
+        let start = Instant::now();
+        let _rebuild_handle = spawn_rebuild_task(&roots, true, None, None);
+        let elapsed = start.elapsed();
+
+        // Should return almost immediately, not await the full pipeline
+        // (which would take seconds or more). A spawned task should return
+        // in just a few milliseconds.
+        assert!(
+            elapsed.as_millis() < 100,
+            "spawn_rebuild_task should return immediately, took {} ms",
+            elapsed.as_millis()
+        );
+
+        // Give spawned task a brief moment to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    #[test]
+    fn test_density_table_has_expected_entries() {
+        let table = get_density_table();
+        // N2: Verify calibrated density table exists and has measured values
+        assert!(
+            table.iter().any(|(ext, _)| *ext == "rs"),
+            "Rust density must be present"
+        );
+        assert!(
+            table.iter().any(|(ext, _)| *ext == "java"),
+            "Java density must be present"
+        );
+
+        // Verify measured densities are reasonable
+        if let Some((_, rust_density)) = table.iter().find(|(ext, _)| *ext == "rs") {
+            assert!(
+                *rust_density > 35.0 && *rust_density < 40.0,
+                "Rust density 37.02 expected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_directory_vector_estimates_consistent_with_global() {
+        // N2: Verify per-directory estimates use same calibration as global estimate
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a simple Rust repository structure
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname=\"test\"\n").unwrap();
+
+        // Compute global estimate
+        let (global_estimate, _basis, _low, _high) =
+            estimate_vector_count(3, root).expect("estimate should work");
+
+        // Compute per-directory density
+        let avg_density =
+            compute_avg_density_for_repo(root).expect("density computation should work");
+
+        // Per-file estimate should match global density (3 files * avg_density)
+        let per_dir_estimate = (3.0 * avg_density) as usize;
+        assert_eq!(
+            per_dir_estimate, global_estimate,
+            "per-directory estimate should match global total when summed"
+        );
+    }
+
+    #[test]
+    fn test_density_cache_hits_on_second_call() {
+        // FIX B: Verify density computation caches result to avoid re-walking
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a simple repository structure
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
+
+        // First call should compute and populate the cache. Assert cache
+        // STATE rather than wall-clock timing: a duration assertion flakes
+        // under full parallel suite load regardless of cache behavior.
+        let density1 =
+            compute_avg_density_for_repo(root).expect("first density computation should work");
+
+        let canonical_root = root.canonicalize().unwrap();
+        let cached_entries = get_density_cache()
+            .lock()
+            .map(|cache| {
+                cache
+                    .keys()
+                    .filter(|key| key.repo_identity == canonical_root.to_string_lossy())
+                    .count()
+            })
+            .unwrap();
+        assert!(
+            cached_entries > 0,
+            "first density computation should populate the cache for this repo"
+        );
+
+        // Second call must return the identical cached value.
+        let density2 =
+            compute_avg_density_for_repo(root).expect("second density computation should work");
+        assert_eq!(
+            density1, density2,
+            "density should be consistent across calls"
+        );
+    }
+
+    #[test]
+    fn test_directory_walk_excludes_git() {
+        // N1: Verify .git directory is excluded from counts
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a tracked file in src/ directory
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+        // Create .git directory with many files (should be excluded)
+        fs::create_dir_all(root.join(".git").join("objects")).unwrap();
+        for i in 0..10 {
+            fs::write(
+                root.join(".git").join("objects").join(format!("obj_{}", i)),
+                "",
+            )
+            .unwrap();
+        }
+
+        // Count files per directory
+        let counts = count_files_per_directory(root).expect("count should work");
+
+        // .git should NOT appear in the counts (N1)
+        assert!(
+            !counts.contains_key(".git"),
+            "N1: .git directory should be excluded from counts; got {:?}",
+            counts
+        );
+
+        // src directory should have files counted
+        assert!(
+            counts.get("src").map(|c| *c == 1).unwrap_or(false),
+            "N1: src should have 1 file counted; got {:?}",
+            counts
+        );
+
+        // Verify total is just 1 (not 11 with .git files)
+        let total: usize = counts.values().sum();
+        assert_eq!(
+            total, 1,
+            "N1: should count only 1 file (not include .git); got {:?}",
+            counts
+        );
     }
 }

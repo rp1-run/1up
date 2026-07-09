@@ -29,10 +29,27 @@ pub struct McpArgs {
 }
 
 pub async fn exec(args: McpArgs) -> anyhow::Result<()> {
-    let resolved = project::resolve_project_root(Path::new(&args.path))?;
+    // Capture launch_subdir before normalization
+    let launch_path = Path::new(&args.path);
+    let canonical_launch_dir = match launch_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => launch_path.to_path_buf(),
+    };
+
+    let resolved = project::resolve_project_root(launch_path)?;
     let _instance_lock = acquire_mcp_instance_lock(&resolved.state_root)?;
     ensure_daemon_for_mcp(&resolved.state_root, &resolved.source_root);
-    crate::mcp::server::serve_stdio(resolved.state_root, resolved.source_root).await
+
+    // Determine launch_subdir as the relative portion if the launch dir differs from source_root
+    let launch_subdir = if canonical_launch_dir != resolved.source_root
+        && canonical_launch_dir.starts_with(&resolved.source_root)
+    {
+        Some(canonical_launch_dir)
+    } else {
+        None
+    };
+
+    crate::mcp::server::serve_stdio(resolved.state_root, resolved.source_root, launch_subdir).await
 }
 
 fn ensure_daemon_for_mcp(project_root: &Path, source_root: &Path) {

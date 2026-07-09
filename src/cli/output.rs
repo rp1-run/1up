@@ -2382,6 +2382,7 @@ mod tests {
             }),
             scope: None,
             prefilter: None,
+            indexer_pid: None,
             updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:08Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),

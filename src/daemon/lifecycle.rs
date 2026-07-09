@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -522,6 +522,11 @@ fn acquire_rebuild_lock_with_bound(
     timeout: Duration,
     retry_interval: Duration,
 ) -> Result<RebuildLock, OneupError> {
+    // REQ-010: Clear stale rebuild lock before attempting acquisition.
+    // This ensures that a stale lock from a dead process doesn't block indefinitely.
+    // The function checks both age (>5 min) and holder liveness before clearing.
+    let _ = clear_stale_rebuild_lock(state_root);
+
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -546,6 +551,128 @@ fn acquire_rebuild_lock_with_bound(
     .into())
 }
 
+/// REQ-010: Check if a rebuild lock file is stale.
+/// A lock is stale if the file age exceeds STALENESS_THRESHOLD_SECS (5 minutes) AND
+/// no process currently holds the lock (non-blocking lock succeeds).
+/// This allows auto-clearing of locks from dead processes so they don't block forever.
+pub fn is_rebuild_lock_stale(state_root: &Path) -> Result<bool, OneupError> {
+    use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+    use std::fs;
+
+    let lock_path = config::project_rebuild_lock_path(state_root);
+
+    // If the lock file doesn't exist, it's not stale (non-existent is fine)
+    let metadata = match fs::metadata(&lock_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(
+                DaemonError::RebuildLockError(format!("failed to stat lock file: {e}")).into(),
+            )
+        }
+    };
+
+    // Check file age
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+
+    let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
+        return Ok(false);
+    };
+
+    // If file is newer than threshold, it's not stale
+    if elapsed.as_secs() <= STALENESS_THRESHOLD_SECS {
+        return Ok(false);
+    }
+
+    // File is old. Try to acquire lock without blocking. If we can acquire it,
+    // that means no one else holds it, so it's stale.
+    match try_acquire_rebuild_lock(state_root) {
+        Ok(Some(_lock)) => {
+            // We got the lock, which means it was free. The old file is stale.
+            // The guard will release on drop.
+            Ok(true)
+        }
+        Ok(None) => {
+            // Someone still holds it, so it's not stale
+            Ok(false)
+        }
+        Err(_) => {
+            // Error checking; assume not stale to be conservative
+            Ok(false)
+        }
+    }
+}
+
+/// REQ-010: Clear a stale rebuild lock file.
+/// Only clears if the lock is confirmed stale (old file, no holder).
+/// Called before rebuild lock acquisition to prevent indefinite blocking on stale locks from dead processes.
+pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
+    if is_rebuild_lock_stale(state_root)? {
+        let lock_path = config::project_rebuild_lock_path(state_root);
+        if let Err(e) = std::fs::remove_file(&lock_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "failed to remove stale rebuild lock {}: {}",
+                    lock_path.display(),
+                    e
+                );
+            }
+        } else {
+            info!("cleared stale rebuild lock: {}", lock_path.display());
+        }
+    }
+    Ok(())
+}
+
+/// REQ-001: Check if a first-time index should be started based on file count and scope.
+/// Used by the daemon to gate large monorepo indexing until a scope is provided.
+///
+/// Returns:
+/// - Ok(true) if the index should proceed:
+///   - Index already exists (not a first index), OR
+///   - File count is under threshold, OR
+///   - File count is over threshold AND scope is recorded
+/// - Ok(false) if the index should be blocked (gate fires):
+///   - File count is over threshold AND no scope is recorded
+///
+/// Pure gate decision logic: determines whether to allow a first index based on
+/// live semantics (segment count, not file existence). Extracted for testability.
+///
+/// # Arguments
+/// - `is_first_index`: true if segment count is 0 (first index); false if segments exist
+/// - `file_count`: number of files in the repo (gitignore-aware walk)
+/// - `threshold`: FILE_COUNT_THRESHOLD to gate on
+/// - `scope_recorded`: true if index progress file has a recorded scope
+///
+/// # Returns
+/// true if indexing should proceed; false if the gate fires (over-threshold without scope)
+pub fn gate_allows_first_index(
+    is_first_index: bool,
+    file_count: usize,
+    threshold: usize,
+    scope_recorded: bool,
+) -> bool {
+    // If not a first index (segments exist), always allow indexing
+    if !is_first_index {
+        return true;
+    }
+
+    // For a first index: check the gate
+    // Gate fires (blocks) if: over-threshold AND no scope recorded
+    if file_count > threshold && !scope_recorded {
+        debug!(
+            "daemon gate: over-threshold ({} > {}) without scope; staying idle",
+            file_count, threshold
+        );
+        return false;
+    }
+
+    // Under threshold OR scope recorded; allow indexing
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +691,35 @@ mod tests {
     #[test]
     fn nonexistent_process_is_not_alive() {
         assert!(!is_process_alive(99999));
+    }
+
+    #[test]
+    fn test_gate_allows_first_index() {
+        let threshold = 3_000;
+
+        // Case 1: Not a first index (segments exist) → always allow
+        // Over-threshold, no scope, but is_first_index=false → allow
+        assert!(gate_allows_first_index(false, 5_000, threshold, false));
+
+        // Case 2: First index, under threshold, no scope → allow
+        assert!(gate_allows_first_index(true, 2_500, threshold, false));
+
+        // Case 3: First index, under threshold, with scope → allow
+        assert!(gate_allows_first_index(true, 2_500, threshold, true));
+
+        // Case 4: First index, over threshold, with scope → allow
+        // (scope is recorded, so gate doesn't fire)
+        assert!(gate_allows_first_index(true, 5_000, threshold, true));
+
+        // Case 5: First index, over threshold, no scope → BLOCK (gate fires)
+        // This is the P0 gate condition: too many files without scope decision
+        assert!(!gate_allows_first_index(true, 5_000, threshold, false));
+
+        // Case 6: Edge case - exactly at threshold, no scope → allow
+        assert!(gate_allows_first_index(true, 3_000, threshold, false));
+
+        // Case 7: Edge case - one above threshold, no scope → BLOCK
+        assert!(!gate_allows_first_index(true, 3_001, threshold, false));
     }
 
     #[test]
@@ -837,6 +993,91 @@ mod tests {
         assert!(
             try_acquire_rebuild_lock(&state_root_b).unwrap().is_some(),
             "a different state root must use an independent lock"
+        );
+    }
+
+    #[test]
+    fn stale_rebuild_lock_is_auto_cleared_before_acquisition() {
+        use crate::shared::constants::STALENESS_THRESHOLD_SECS;
+
+        let (_tmp, state_root) = state_root_dir();
+
+        // Create a lock file and immediately age it beyond the staleness threshold.
+        {
+            let _lock = acquire_rebuild_lock(&state_root).unwrap();
+            let lock_path = crate::shared::config::project_rebuild_lock_path(&state_root);
+
+            // Set file mtime to well past the staleness threshold
+            let old_time = SystemTime::now() - Duration::from_secs(STALENESS_THRESHOLD_SECS + 60);
+            filetime::set_file_mtime(&lock_path, old_time.into()).unwrap();
+        }
+        // Guard dropped; lock file remains on disk but no process holds it
+
+        // Now try to acquire: the stale lock should be auto-cleared and acquisition succeeds
+        let result = acquire_rebuild_lock_with_bound(
+            &state_root,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            result.is_ok(),
+            "acquire_rebuild_lock_with_bound must auto-clear the stale lock and succeed"
+        );
+    }
+
+    #[test]
+    fn fresh_rebuild_lock_held_by_live_process_is_not_cleared() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // Hold the lock with the current process (which is alive)
+        let _held = acquire_rebuild_lock(&state_root).unwrap();
+
+        // The lock is fresh and held by a live process; clearing check should find it not stale
+        let is_stale = is_rebuild_lock_stale(&state_root).unwrap();
+        assert!(
+            !is_stale,
+            "fresh lock held by live process should not be marked stale"
+        );
+
+        // Try to acquire (with short timeout to avoid waiting): should get contention error, not success
+        let result = acquire_rebuild_lock_with_bound(
+            &state_root,
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(OneupError::Daemon(DaemonError::RebuildLockContended { .. }))
+            ),
+            "acquire should fail with contention, not succeed (lock should not be cleared)"
+        );
+    }
+
+    #[test]
+    fn recent_rebuild_lock_is_not_stale() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // Acquire the lock (it's fresh)
+        let _lock = acquire_rebuild_lock(&state_root).unwrap();
+
+        // A recently created lock should not be stale
+        assert!(
+            !is_rebuild_lock_stale(&state_root).unwrap(),
+            "recent lock should not be stale"
+        );
+    }
+
+    #[test]
+    fn rebuild_lock_missing_is_not_stale() {
+        let (_tmp, state_root) = state_root_dir();
+
+        // If lock file doesn't exist, it's not stale
+        assert!(
+            !is_rebuild_lock_stale(&state_root).unwrap(),
+            "missing lock file should not be stale"
         );
     }
 }

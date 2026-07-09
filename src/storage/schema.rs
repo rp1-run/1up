@@ -12,6 +12,7 @@ use crate::storage::queries;
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
 const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
+const META_KEY_SCOPE_ROOTS: &str = "scope_roots_v1";
 
 /// Stable message fragment emitted by [`ensure_current`] when the database has
 /// user tables but no readable `schema_version` row.
@@ -644,6 +645,50 @@ pub async fn check_embedding_model_compatible(
     }
 }
 
+/// Reads scope roots from the meta table for monorepo-scoped indexing.
+///
+/// Returns `None` if no scope has been set yet (unscoped index), or a JSON-serialized
+/// vector of repo-relative directory roots if scope metadata is present. Fresh indexes
+/// initialize scope as `None` (unscoped); existing unscoped indexes are migrated on
+/// first write (no in-place migration).
+pub async fn read_scope_from_meta(conn: &Connection) -> Result<Option<Vec<String>>, OneupError> {
+    if !schema_object_exists(conn, "table", "meta").await? {
+        return Ok(None);
+    }
+
+    let mut rows = conn
+        .query(queries::SELECT_META, [META_KEY_SCOPE_ROOTS])
+        .await
+        .map_err(|e| StorageError::Query(format!("failed to read scope metadata: {e}")))?;
+
+    match rows.next().await {
+        Ok(Some(row)) => {
+            let json_str: String = row.get(0).map_err(|e| {
+                StorageError::Query(format!("failed to read scope metadata value: {e}"))
+            })?;
+            let roots: Vec<String> = serde_json::from_str(&json_str)
+                .map_err(|e| StorageError::Query(format!("invalid scope metadata JSON: {e}")))?;
+            Ok(Some(roots))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(StorageError::Query(format!("scope metadata query failed: {e}")).into()),
+    }
+}
+
+/// Writes scope roots to the meta table for monorepo-scoped indexing.
+///
+/// Persists a JSON-serialized vector of repo-relative directory roots. Called
+/// after a successful incremental or full rebuild to ensure scope metadata survives
+/// branch switches, daemon restarts, and context reloads.
+pub async fn write_scope_to_meta(conn: &Connection, roots: &[String]) -> Result<(), OneupError> {
+    let json_str = serde_json::to_string(roots)
+        .map_err(|e| StorageError::Migration(format!("failed to serialize scope metadata: {e}")))?;
+    conn.execute(queries::UPSERT_META, [META_KEY_SCOPE_ROOTS, &json_str])
+        .await
+        .map_err(|e| StorageError::Migration(format!("failed to write scope metadata: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_initializes_v18() {
+    async fn prepare_for_write_initializes_v19() {
         let (_db, conn) = setup().await;
 
         prepare_for_write(&conn).await.unwrap();
@@ -928,7 +973,7 @@ mod tests {
             get_schema_version(&conn).await.unwrap(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(SCHEMA_VERSION, 18);
+        assert_eq!(SCHEMA_VERSION, 19);
         assert!(schema_object_exists(&conn, "table", "worktree_contexts")
             .await
             .unwrap());
@@ -1040,21 +1085,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_write_rejects_v17_schema() {
-        // Fail-closed at the v17 -> v18 boundary: a content-addressed v17 index
-        // (FP32-keyed embeddings, pre-INT8 default) is refused with reindex
-        // guidance naming found (17) vs expected (18), forcing the re-embed
-        // migration with no in-place migration attempted.
+    async fn prepare_for_write_rejects_v18_schema() {
+        // Fail-closed at the v18 -> v19 boundary: a v18 index (pre-scoping)
+        // is refused with reindex guidance naming found (18) vs expected (19),
+        // forcing reindex with no in-place migration attempted.
         let (_db, conn) = setup().await;
 
         conn.execute(queries::CREATE_META_TABLE, ()).await.unwrap();
-        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "17"])
+        conn.execute(queries::UPSERT_META, [META_KEY_SCHEMA_VERSION, "18"])
             .await
             .unwrap();
 
         let err = prepare_for_write(&conn).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("found v17, expected v18"));
+        assert!(msg.contains("found v18, expected v19"));
         assert!(msg.contains("run `1up reindex`"));
     }
 
@@ -1333,6 +1377,66 @@ mod tests {
         assert!(
             !msg.contains("for worktree"),
             "unspecified context must not render a location clause; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_scope_from_meta_returns_none_for_unscoped_index() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        let scope = read_scope_from_meta(&conn).await.unwrap();
+        assert_eq!(scope, None, "fresh index should have no scope metadata");
+    }
+
+    #[tokio::test]
+    async fn write_scope_to_meta_persists_roots() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        let roots = vec!["services/auth".to_string(), "libs/core".to_string()];
+        write_scope_to_meta(&conn, &roots).await.unwrap();
+
+        let stored = read_scope_from_meta(&conn).await.unwrap();
+        assert_eq!(stored, Some(roots), "written scope should be readable");
+    }
+
+    #[tokio::test]
+    async fn write_scope_to_meta_overwrites_existing_scope() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        let roots1 = vec!["services/auth".to_string()];
+        write_scope_to_meta(&conn, &roots1).await.unwrap();
+
+        let roots2 = vec![
+            "services/auth".to_string(),
+            "libs/core".to_string(),
+            "tools".to_string(),
+        ];
+        write_scope_to_meta(&conn, &roots2).await.unwrap();
+
+        let stored = read_scope_from_meta(&conn).await.unwrap();
+        assert_eq!(
+            stored,
+            Some(roots2),
+            "subsequent write should overwrite prior scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_scope_to_meta_handles_empty_scope() {
+        let (_db, conn) = setup().await;
+        prepare_for_write(&conn).await.unwrap();
+
+        let roots: Vec<String> = vec![];
+        write_scope_to_meta(&conn, &roots).await.unwrap();
+
+        let stored = read_scope_from_meta(&conn).await.unwrap();
+        assert_eq!(
+            stored,
+            Some(roots),
+            "empty scope vector should be persisted and readable"
         );
     }
 }
