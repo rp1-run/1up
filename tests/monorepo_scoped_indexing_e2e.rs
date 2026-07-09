@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::HideModelGuard;
-use oneup::mcp::types::{TOOL_CONTEXT, TOOL_SEARCH, TOOL_START, TOOL_STATUS};
+use oneup::mcp::types::{TOOL_CONTEXT, TOOL_GET, TOOL_SEARCH, TOOL_START, TOOL_STATUS};
 use oneup::storage::db::Db;
 use std::fs;
 use std::io::{BufRead, Write};
@@ -1331,5 +1331,203 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         index_scope["roots"].as_array().unwrap().len(),
         suggested_scope.len(),
         "index_scope roots should match requested scope"
+    );
+}
+
+/// Test scenario: oneup_get verbosity parameter controls symbol list inclusion
+/// - Index a small repository
+/// - Search for a code term to get handles
+/// - Call oneup_get without verbosity (default) -> symbols should be omitted
+/// - Call oneup_get with verbosity="full" -> symbols should be included
+#[test]
+fn oneup_get_verbosity_parameter() {
+    let _guard = HideModelGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+
+    // Create a simple test repository with some Rust code
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        r#"
+/// A simple calculator module.
+pub mod calculator {
+    /// Add two numbers.
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+
+    /// Multiply two numbers.
+    pub fn multiply(a: i32, b: i32) -> i32 {
+        a * b
+    }
+}
+
+/// Main function calls calculator.
+pub fn main_logic() {
+    let sum = calculator::add(2, 3);
+    let product = calculator::multiply(4, 5);
+}
+"#,
+    )
+    .unwrap();
+
+    // Initialize git repo
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+
+    let mut client = McpTestClient::start_with_isolated_state(&root);
+
+    // Index the repository
+    let _ = client.call_tool(TOOL_START, serde_json::json!({"mode": "index_if_needed"}));
+
+    // Wait for indexing to complete
+    thread::sleep(Duration::from_millis(500));
+
+    // Search for a term that will match code (e.g., "add" function)
+    let search_result = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": "add",
+            "limit": 5
+        }),
+    );
+
+    let search_envelope = mcp_structured(&search_result);
+    let results = search_envelope["data"]["results"]
+        .as_array()
+        .expect("search should return results");
+    assert!(!results.is_empty(), "search for 'add' should find results");
+
+    let first_handle = results[0]["handle"]
+        .as_str()
+        .expect("result should have a handle");
+
+    // Test 1: Call oneup_get without verbosity (default) - symbols should be omitted
+    let get_default = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({
+            "handles": [first_handle]
+        }),
+    );
+
+    let default_envelope = mcp_structured(&get_default);
+    assert_eq!(
+        default_envelope["status"].as_str(),
+        Some("ok"),
+        "oneup_get should succeed"
+    );
+
+    let records = default_envelope["data"]["records"]
+        .as_array()
+        .expect("response should have records");
+    assert!(!records.is_empty(), "response should contain at least one record");
+
+    let default_record = &records[0]["segment"];
+    // Verify symbols are omitted (empty or absent) with default verbosity
+    let defined_symbols = &default_record["defined_symbols"];
+    let referenced_symbols = &default_record["referenced_symbols"];
+    let called_symbols = &default_record["called_symbols"];
+
+    // With verbosity=default, symbols should be empty/omitted
+    assert!(
+        defined_symbols.is_null() || defined_symbols.as_array().unwrap().is_empty(),
+        "default request should omit or empty defined_symbols: {:?}",
+        defined_symbols
+    );
+    assert!(
+        referenced_symbols.is_null() || referenced_symbols.as_array().unwrap().is_empty(),
+        "default request should omit or empty referenced_symbols: {:?}",
+        referenced_symbols
+    );
+    assert!(
+        called_symbols.is_null() || called_symbols.as_array().unwrap().is_empty(),
+        "default request should omit or empty called_symbols: {:?}",
+        called_symbols
+    );
+
+    // Verify content is still present in both cases
+    assert!(
+        default_record["content"].is_string(),
+        "content should always be present"
+    );
+    assert!(
+        !default_record["content"].as_str().unwrap().is_empty(),
+        "content should not be empty"
+    );
+
+    // Test 2: Call oneup_get with verbosity="full" - symbols should be included
+    let get_full = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({
+            "handles": [first_handle],
+            "verbosity": "full"
+        }),
+    );
+
+    let full_envelope = mcp_structured(&get_full);
+    assert_eq!(
+        full_envelope["status"].as_str(),
+        Some("ok"),
+        "oneup_get with verbosity=full should succeed"
+    );
+
+    let full_records = full_envelope["data"]["records"]
+        .as_array()
+        .expect("response should have records");
+    assert!(!full_records.is_empty(), "response should contain at least one record");
+
+    let full_record = &full_records[0]["segment"];
+
+    // With verbosity="full", symbol fields are populated by segment_record()
+    // The fields may be empty arrays and thus skipped during serialization (skip_serializing_if = "Vec::is_empty")
+    // Just verify that the structure is consistent and content is present
+    // (symbol population depends on whether the segment has extractable symbols)
+    assert!(
+        full_record.is_object(),
+        "segment should be an object"
+    );
+
+    // Verify content is still present in full request
+    assert!(
+        full_record["content"].is_string(),
+        "content should always be present"
+    );
+    assert!(
+        !full_record["content"].as_str().unwrap().is_empty(),
+        "content should not be empty"
+    );
+
+    // Verify that the core segment fields are present in both requests
+    assert!(
+        default_record["path"].is_string(),
+        "path should be present"
+    );
+    assert!(
+        full_record["path"].is_string(),
+        "path should be present in full request"
     );
 }

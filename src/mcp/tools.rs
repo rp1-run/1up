@@ -239,7 +239,7 @@ impl OneupMcpServer {
             &roots.state_root,
             &roots.worktree_context,
             &input.handles,
-            None,
+            input.verbosity.as_deref(),
         )
         .await
         {
