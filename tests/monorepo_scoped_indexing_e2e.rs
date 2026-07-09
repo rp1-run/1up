@@ -764,6 +764,81 @@ fn monorepo_readiness_includes_scope_coverage() {
     );
 }
 
+/// Regression test: the status/readiness path must carry the same
+/// eligibility_note semantics as the search path. On an unscoped (full)
+/// index, oneup_status's index_scope must disclose a non-empty
+/// eligibility_note explaining the indexed_files/total_files gap.
+#[test]
+fn oneup_status_unscoped_index_scope_includes_eligibility_note() {
+    let _guard = HideModelGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "/// Add two numbers.\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .unwrap();
+
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+
+    let mut client = McpTestClient::start_with_isolated_state(&root);
+
+    // Index without any scope_add: small repo, no facts gate, unscoped index.
+    let _ = client.call_tool(TOOL_START, serde_json::json!({"mode": "index_if_needed"}));
+    wait_for_searchable_readiness(&mut client);
+
+    // oneup_start is non-blocking (REQ-012), so poll until the completed
+    // unscoped index publishes index_scope with the eligibility note.
+    let result = wait_for_status(
+        &mut client,
+        "unscoped index_scope with eligibility_note",
+        |env| {
+            env["data"]["index_scope"]["eligibility_note"]
+                .as_str()
+                .is_some_and(|note| !note.is_empty())
+        },
+    );
+    let envelope = mcp_structured(&result);
+    let scope = &envelope["data"]["index_scope"];
+    assert!(
+        scope["roots"]
+            .as_array()
+            .is_some_and(|roots| roots.is_empty()),
+        "index is unscoped, so roots should be empty: {scope:?}"
+    );
+    let note = scope["eligibility_note"].as_str().unwrap();
+    assert!(
+        note.contains("Full index"),
+        "eligibility_note should explain the unscoped coverage gap: {note}"
+    );
+}
+
 /// Test scenario: Scope added to include_globs correctly
 /// - This is implicit in the incremental_widening test
 /// - But verifiable by checking that new scopes only index specified cones

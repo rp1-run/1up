@@ -936,11 +936,12 @@ pub async fn classify_readiness(
                 .unwrap_or_default();
         let dir_counts = count_files_per_directory(source_root).unwrap_or_default();
         let total_files: usize = dir_counts.values().sum();
+        let roots = scope_roots.unwrap_or_default();
         payload.index_scope = Some(IndexScope {
-            roots: scope_roots.unwrap_or_default(),
+            eligibility_note: unscoped_eligibility_note(&roots),
+            roots,
             indexed_files: indexed_file_paths.len(),
             total_files,
-            eligibility_note: None,
         });
     }
 
@@ -3173,17 +3174,7 @@ pub async fn compute_index_scope(
     let total_files: usize = dir_counts.values().sum();
 
     let roots = scope_roots.unwrap_or_default();
-
-    // When roots is empty (unscoped index), populate eligibility_note explaining the gap
-    let eligibility_note = if roots.is_empty() {
-        Some(
-            "Full index (no scope recorded). Indexed files = code and doc files. \
-             Total files = all git-tracked files + gitignore-excluded files walked for statistics."
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    let eligibility_note = unscoped_eligibility_note(&roots);
 
     Ok(Some(IndexScope {
         roots,
@@ -3191,6 +3182,22 @@ pub async fn compute_index_scope(
         total_files,
         eligibility_note,
     }))
+}
+
+/// Eligibility note explaining the indexed/total gap for an unscoped (full)
+/// index. Single-sourced here so the readiness/status and search paths
+/// disclose identical semantics: populated only when `roots` is empty, and
+/// always absent for scoped indexes.
+fn unscoped_eligibility_note(roots: &[String]) -> Option<String> {
+    if roots.is_empty() {
+        Some(
+            "Full index (no scope recorded). Indexed files = code and doc files. \
+             Total files = all git-tracked files + gitignore-excluded files walked for statistics."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -4366,6 +4373,16 @@ mod tests {
         assert!(note.contains("no scope recorded"));
         assert!(note.contains("Indexed files"));
         assert!(note.contains("Total files"));
+    }
+
+    #[test]
+    fn unscoped_eligibility_note_populated_only_for_empty_roots() {
+        let note = unscoped_eligibility_note(&[]).expect("unscoped index must carry a note");
+        assert!(!note.is_empty());
+        assert!(note.contains("Full index"));
+        assert!(note.contains("no scope recorded"));
+
+        assert!(unscoped_eligibility_note(&["services/auth".to_string()]).is_none());
     }
 
     #[test]
