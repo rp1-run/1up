@@ -235,7 +235,14 @@ impl OneupMcpServer {
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
 
-        match ops::get_handles(&roots.state_root, &roots.worktree_context, &input.handles).await {
+        match ops::get_handles(
+            &roots.state_root,
+            &roots.worktree_context,
+            &input.handles,
+            None,
+        )
+        .await
+        {
             Ok(payload) => {
                 let summary = read_summary(&payload);
                 let next_actions = read_next_actions(&payload);

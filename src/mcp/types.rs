@@ -86,6 +86,11 @@ pub struct GetInput {
     #[schemars(description = "Durable result handles returned by oneup_search or oneup_symbol.")]
     pub handles: Vec<String>,
     pub path: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional verbosity level: \"default\" omits symbol lists and redundant summaries; \"full\" includes detailed symbol metadata. Defaults to \"default\"."
+    )]
+    pub verbosity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

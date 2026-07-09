@@ -230,6 +230,8 @@ pub struct SegmentRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breadcrumb: Option<String>,
     pub role: SegmentRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub defined_symbols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1256,19 +1258,28 @@ pub async fn get_handles(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
-    retry_on_db_lock(|| async { get_handles_once(state_root, worktree_context, handles).await })
-        .await
+    retry_on_db_lock(|| async {
+        get_handles_once(state_root, worktree_context, handles, verbosity).await
+    })
+    .await
 }
 
 async fn get_handles_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
-    let records =
-        resolve_handle_records(&current.conn, &worktree_context.context_id, handles).await?;
+    let records = resolve_handle_records(
+        &current.conn,
+        &worktree_context.context_id,
+        handles,
+        verbosity,
+    )
+    .await?;
 
     Ok(ReadPayload {
         status: aggregate_read_status(&records),
@@ -1880,6 +1891,7 @@ async fn resolve_handle_records(
     conn: &Connection,
     context_id: &str,
     handles: &[String],
+    verbosity: Option<&str>,
 ) -> anyhow::Result<Vec<ReadRecord>> {
     let normalized: Vec<String> = handles
         .iter()
@@ -1911,9 +1923,11 @@ async fn resolve_handle_records(
                 "empty segment handle",
             ));
         } else if let Some(segment) = segments_by_id.get(&normalized) {
-            records.push(read_segment(source, segment.clone()));
+            records.push(read_segment(source, segment.clone(), verbosity));
         } else {
-            records.push(resolve_handle_via_prefix(conn, context_id, source, &normalized).await?);
+            records.push(
+                resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await?,
+            );
         }
     }
 
@@ -1928,10 +1942,11 @@ async fn resolve_handle_via_prefix(
     context_id: &str,
     source: ReadSource,
     normalized: &str,
+    verbosity: Option<&str>,
 ) -> anyhow::Result<ReadRecord> {
     Ok(
         match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
-            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment),
+            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment, verbosity),
             SegmentPrefixLookup::NotFound => {
                 read_message(ReadStatus::NotFound, source, "segment handle was not found")
             }
@@ -2090,11 +2105,11 @@ fn join_repo_relative(source_root: &Path, raw: &Path) -> Result<PathBuf, Locatio
     Ok(candidate)
 }
 
-fn read_segment(source: ReadSource, segment: StoredSegment) -> ReadRecord {
+fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&str>) -> ReadRecord {
     ReadRecord {
         status: ReadStatus::Found,
         source,
-        segment: Some(segment_record(segment)),
+        segment: Some(segment_record(segment, verbosity)),
         context: None,
         matching_handles: Vec::new(),
         message: None,
@@ -2141,11 +2156,26 @@ fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<Strin
     }
 }
 
-fn segment_record(segment: StoredSegment) -> SegmentRecord {
+fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRecord {
     let role = segment.parsed_role();
-    let defined_symbols = segment.parsed_defined_symbols();
-    let referenced_symbols = segment.parsed_referenced_symbols();
-    let called_symbols = segment.parsed_called_symbols();
+    let is_verbose = verbosity.map(|v| v == "full").unwrap_or(false);
+
+    // Only populate symbols if verbosity is "full"; default to empty lists.
+    let defined_symbols = if is_verbose {
+        segment.parsed_defined_symbols()
+    } else {
+        Vec::new()
+    };
+    let referenced_symbols = if is_verbose {
+        segment.parsed_referenced_symbols()
+    } else {
+        Vec::new()
+    };
+    let called_symbols = if is_verbose {
+        segment.parsed_called_symbols()
+    } else {
+        Vec::new()
+    };
 
     SegmentRecord {
         handle: segment.id,
@@ -2157,6 +2187,7 @@ fn segment_record(segment: StoredSegment) -> SegmentRecord {
         line_end: usize_from_i64(segment.line_end),
         breadcrumb: segment.breadcrumb,
         role,
+        summary: None,
         defined_symbols,
         referenced_symbols,
         called_symbols,
@@ -3971,13 +4002,15 @@ mod tests {
             "dddd4444eeee5555".to_string(),  // duplicate of #1 -> Found (independent)
         ];
 
-        let batched = resolve_handle_records(&conn, ctx, &handles).await.unwrap();
+        let batched = resolve_handle_records(&conn, ctx, &handles, None)
+            .await
+            .unwrap();
 
         // Reconstruct the per-item baseline: exact id, then prefix, per handle.
         let mut expected = Vec::with_capacity(handles.len());
         for handle in &handles {
             expected.push(
-                resolve_handle_record_per_item(&conn, ctx, handle)
+                resolve_handle_record_per_item(&conn, ctx, handle, None)
                     .await
                     .unwrap(),
             );
@@ -4028,6 +4061,7 @@ mod tests {
         conn: &Connection,
         context_id: &str,
         raw_handle: &str,
+        verbosity: Option<&str>,
     ) -> anyhow::Result<ReadRecord> {
         use crate::storage::segments::get_segment_by_id_for_context;
 
@@ -4046,10 +4080,10 @@ mod tests {
         }
 
         if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
-            return Ok(read_segment(source, segment));
+            return Ok(read_segment(source, segment, verbosity));
         }
 
-        resolve_handle_via_prefix(conn, context_id, source, &normalized).await
+        resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {
