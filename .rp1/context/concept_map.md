@@ -9,7 +9,7 @@ strictness: strict
 # Domain Concepts & Terminology
 
 **Project**: 1up (`oneup`) — local code-discovery engine
-**Domain**: A tree-sitter + ONNX-embedding + libSQL index over a repository, exposed to agents through nine read-only/lifecycle MCP tools so semantic search, symbol lookup, file-line context, structural queries, likely-impact, and an orientation digest become the primary discovery path before raw grep/find.
+**Domain**: A tree-sitter + ONNX-embedding + libSQL index over a repository, exposed to agents through nine read-only/lifecycle MCP tools so semantic search, symbol lookup, file-line context, structural queries, likely-impact, and an orientation digest become the primary discovery path before raw grep/find. Since v0.1.13 the index can be **scoped to directory cones** on large monorepos behind a refuse-and-propose gate.
 
 ## Core Concepts
 
@@ -23,6 +23,11 @@ strictness: strict
 - **RebuildLock** *(new)* — single-writer flock on `<state_root>/.1up/rebuild.lock`. One-shot CLI/MCP rebuilds acquire with a bounded wait then fail closed (`RebuildLockContended`); the daemon try-acquires non-blocking and defers.
 - **ReadinessPayload** — `oneup_status` classification: ready/missing/indexing/stale/degraded/blocked, plus stats, schema_version, vector coverage, head-drift, and daemon status.
 - **RepositoryOverview** — deterministic, size-bounded orientation digest (stats, top symbols, module map, dependency edges, entry points); recommended first call (`oneup_overview`).
+- **Scope Roots / scope_globs** *(new v0.1.13)* — validated repo-relative directory cones (no absolute/`../` paths) persisted in DB meta (`scope_roots_v1`); converted to exclusive `dir/**` scope_globs. Survive branch switches and daemon restarts (scope carry). Distinct from additive `include_globs`.
+- **First-Index Gate + Facts Envelope** *(new)* — REQ-001 refuse-and-propose: a first index (segments == 0, robust to the empty schema DB created at startup) of an over-threshold repo (`ONEUP_FILE_COUNT_THRESHOLD`, default 3000) without a recorded scope stays idle and returns a `FactsEnvelope` — gitignore-aware per-directory stats, workspace manifests, sparse-checkout, `launch_subdir` first-suggestion, calibrated vector estimates (measured density, low/high bounds + basis). Gated daemon consumes the pending run and idles (no walk loop).
+- **IndexScope** *(new)* — coverage disclosure on readiness/search payloads: roots, indexed_files, total_files, `coverage_description()`; agents must never infer absence from empty scoped results.
+- **Embedding Pool** *(v17+)* — content-addressed dedup: `content_key` (hash of content + token window) → shared vector + `ref_count`; DiskANN built deferred (`VectorIndexBuild::Deferred`) after pool load, before swap. Replaces per-segment 1:1 vectors.
+- **Non-Blocking Start** *(new)* — REQ-012: `oneup_start` spawns the rebuild (`spawn_rebuild_task`) and waits a bounded budget (`ONEUP_START_RESPONSE_BUDGET_MS`, default 2s); fast ops return final readiness (drift cleared, blocked surfaced), long rebuilds detach and callers poll `oneup_status`.
 
 ## Terminology
 
@@ -43,7 +48,10 @@ strictness: strict
 - **Hybrid Search** — candidate-first fusion of vector + FTS + symbol via weighted RRF (`RRF_K=60`, `VECTOR_WEIGHT=1.5`, `SYMBOL_WEIGHT=4.0`) before hydration.
 - **exhaustive scan vs ANN index** *(corrected)* — exact `vector_distance_cos` scan at/below `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS` (**now 262144**, raised from 16384), else the disk-based `vector_top_k` DiskANN. The exact scan is a linear pass that stays sub-second past 256k vectors; `vector_top_k` *worsens* with corpus size (~7s @ 4.5k, ~45s @ 27k) — the prior "amortizes at scale" claim was inverted by measurement.
 - **VECTOR_PREFILTER_K** — candidate count (400), scaled by indexed-context count up to `VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT` (8).
-- **SCHEMA_VERSION** — currently **16**; validated before every read/write; older → reindex, newer → upgrade; no in-place migration.
+- **SCHEMA_VERSION** — currently **19** (v17 embedding pool, v18 256-token window/perf, v19 scope metadata); validated before every read/write; older → reindex (fail-closed with `1up reindex` guidance and an MCP `oneup_start {mode: reindex}` next_action), newer → upgrade; no in-place migration.
+- **stale-state liveness** *(new)* — REQ-010: rebuild locks older than 5 min with no live holder auto-clear before acquisition; `Running` progress whose `indexer_pid` is dead is treated as missing. Daemons stay SIGTERM-responsive mid-index via the cancellation token (gate walk runs on `spawn_blocking`).
+- **valid project marker** *(new)* — a `.1up` ancestor anchors project resolution only if it contains `index.db`/`project_id`/`rebuild.lock`; empty installer cruft cannot hijack resolution (F9).
+- **launch_subdir** *(new)* — invocation directory captured before root clamping; threaded through `serve_stdio` and offered as the first scope suggestion.
 - **SERVER_GUIDANCE** *(new)* — single-sourced agent routing guidance in `src/mcp/server.rs`, front-loaded to survive 2KB truncation and drift-guarded so every `oneup_*` token it names exists in `RETAINED_PUBLIC_TOOLS`.
 
 ## Key Relationships
@@ -54,12 +62,15 @@ strictness: strict
 - `self_update` **sequences** anti-rollback/expiry gate → checksum floor → three-state attestation → atomic replace.
 - CLI search **validates** `daemon_version` == `VERSION` before trusting daemon results.
 - `SERVER_GUIDANCE` is **constrained by** `RETAINED_PUBLIC_TOOLS` (drift-guard test).
+- First-Index Gate **emits** Facts Envelope; a scoped `oneup_start` **records** scope (progress decision + DB meta) which the daemon refresh **reads** (meta, falling back to the recorded decision) and **re-persists** — every rebuild path writes scope to the staging connection so `finalize_and_swap` preserves it.
+- `ScanFilter` precedence: secrets > scope_globs (exclusive cone) > include_globs/override dirs > exclude_globs > dotfile hiding — configured includes cannot punch through the cone.
 
 ## Bounded Contexts
 
 1. **Code Discovery (MCP)** — `src/mcp`: nine `oneup_*` tools, `ToolEnvelope`/`next_actions`, status enums, single-sourced guidance.
 2. **Search & Retrieval** — `src/search`: hybrid + RRF, corpus-adaptive vector path (262144), impact + corroboration, overview.
-3. **Index Storage & Lifecycle** — `src/storage`/`src/indexer`: schema v16, quantized 384-dim vectors, build-aside swap, cooperative cancellation.
+3. **Index Storage & Lifecycle** — `src/storage`/`src/indexer`: schema v19, content-addressed embedding pool, build-aside swap, cooperative cancellation, exclusive scope-cone scanning.
+3a. **Monorepo Scoping & Policy** — `src/mcp/ops.rs` + `src/daemon/{lifecycle,worker}.rs` + `src/shared/project.rs`: gate logic, facts envelope, scope persistence/carry, launch_subdir, marker-validated resolution.
 4. **Daemon & Concurrency** — `src/daemon`: single-writer lock, version-handshake, idle self-exit, inode-swap detection, serve-stale.
 5. **Supply-Chain Trust & Self-Update** — `src/shared/{update,constants,errors}`: manifest, checksum floor, three-state attestation, anti-rollback/expiry, yanked/minimum-safe, InstallChannel.
 

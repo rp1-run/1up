@@ -8,7 +8,7 @@ strictness: strict
 ---
 # Implementation Patterns
 
-Conventions and idioms for 1up (`oneup`). New patterns from the supply-chain, daemon-handshake, and non-destructive-rebuild work are folded in.
+Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon-handshake, non-destructive-rebuild, and monorepo-scoped-indexing (v0.1.13) work are folded in.
 
 ## Naming & Organization
 
@@ -34,8 +34,9 @@ Conventions and idioms for 1up (`oneup`). New patterns from the supply-chain, da
 ## Validation
 
 - Concentrated at clap parsing, MCP input schemas, filesystem gates, and schema-readiness seams.
-- **Decision gates are pure**, taking inputs as parameters (`ensure_manifest_acceptable(manifest, installed, now)`, `should_idle_shutdown(is_empty, empty_for, timeout)`) — deterministic + unit-testable.
-- Repo paths canonicalized + clamped to `source_root`; out-of-root/parent-escape → `Rejected`; 1-based lines enforced.
+- **Decision gates are pure**, taking inputs as parameters (`ensure_manifest_acceptable(manifest, installed, now)`, `should_idle_shutdown(is_empty, empty_for, timeout)`, `gate_allows_first_index(is_first_index, file_count, threshold, scope_recorded)`) — deterministic + unit-testable.
+- Repo paths canonicalized + clamped to `source_root`; out-of-root/parent-escape → `Rejected`; 1-based lines enforced. Scope roots validated on construction (repo-relative, no `../`).
+- **Filter precedence is a documented contract** (`ScanFilter`): secrets > scope_globs (exclusive cone — the REQ-001/REQ-002 cost boundary, which includes/overrides cannot punch through) > include_globs/override dirs > excludes > dotfile hiding. `include_globs` guarantee inclusion and never exclude non-matches.
 
 ## Output Contracts
 
@@ -53,8 +54,9 @@ Conventions and idioms for 1up (`oneup`). New patterns from the supply-chain, da
 
 - Async over Tokio/libSQL everywhere; MCP via rmcp `serve(stdio())`.
 - Indexing parses in parallel (`JoinSet::spawn_blocking`) then reorders deterministically. The daemon worker multiplexes signals/requests/reload/debounce with `tokio::select!` + a `Semaphore` cap.
-- **One shared `CancellationToken`** threads every pass; SIGTERM cancels it and indexing stops at the next safe yield point, resumed not restarted.
-- **RAII `flock` guards** (`DaemonLock`, single-writer `RebuildLock`) enforce single-owner rebuilds, auto-released on drop/`?` unwind.
+- **One shared `CancellationToken`** threads every pass; SIGTERM cancels it and indexing stops at the next safe yield point, resumed not restarted. Long synchronous walks run on `spawn_blocking` with periodic token checks so the signal-observing task is never starved.
+- **RAII `flock` guards** (`DaemonLock`, single-writer `RebuildLock`) enforce single-owner rebuilds, auto-released on drop/`?` unwind. Stale locks (age > `STALENESS_THRESHOLD_SECS` + dead holder) auto-clear before acquisition; a gated project must consume its pending run (`start_run`/`finish_run`) or the dirty flag re-queues it forever.
+- **Non-blocking bounded-wait spawn** (`oneup_start`): spawn the work, `tokio::time::timeout(budget, handle)`; completion within budget returns the final payload, timeout detaches and returns pollable progress; background failures surface as blocked readiness, never just a log line.
 
 ## Dependency Injection / Config
 
@@ -73,3 +75,5 @@ Conventions and idioms for 1up (`oneup`). New patterns from the supply-chain, da
 - **TDD red-first**; behavioral guards over snapshots. Pure injected gates tested with crafted `now`/version/empty-state values.
 - **RAII test guards** isolate/clean up: `EnvGuard` (under a static `Mutex`), `ChildGuard`/`DaemonCleanupGuard` reap spawned daemons, real `flock` guards prove exclusion.
 - Drift guards source expected values from `CARGO_PKG_VERSION` (`documentation_tool_names_match_retained_public_tools`, `committed_update_manifest_version_not_ahead_of_binary`); swap tests assert all-or-nothing reads under concurrent readers.
+- **Eventual-state polling in E2E** — `oneup_start` is non-blocking and the daemon indexes concurrently, so E2E tests assert eventual stable states via `wait_for_status(client, what, predicate)` (deadline + last-payload panic), never single-shot status reads; "degraded" is both a mid-index transient and the FTS-only terminal, so predicates require the full stable shape.
+- **CI-faithful FTS-only regime** — canonical fake HOME (`$(cd "$(mktemp -d)" && pwd -P)` — secure-fs rejects `/var` symlinks), `.download_failed` markers in Library + XDG model dirs, AND `ONEUP_DISABLE_MODEL_DOWNLOADS=1` (explicit index/start clears the marker by design). Test daemons are killed only by path-scoped pattern (`target/debug/1up __worker`); tests never parent the process they SIGTERM-probe (zombies read as alive), discovering daemons via `pgrep -P <server>`. Assert unit-test cache behavior via cache state, not wall-clock timing.

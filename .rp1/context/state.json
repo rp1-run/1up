@@ -2,33 +2,18 @@
   "strategy": "parallel-map-reduce",
   "repo_type": "single-project",
   "monorepo_projects": [],
-  "generated_at": "2026-06-20T09:44:31Z",
-  "git_commit": "d7ac940dada21d21db4b6586cbbb6a744d393726",
-  "files_analyzed": 44,
-  "languages": [
-    "Rust",
-    "TypeScript",
-    "Shell",
-    "Markdown",
-    "YAML",
-    "JSON",
-    "TOML"
-  ],
+  "generated_at": "2026-07-09T02:20:00Z",
+  "git_commit": "4411845591b9e493b55d1ccfdc1354d9143c5983",
+  "files_analyzed": 70,
+  "languages": ["Rust", "TypeScript", "Markdown", "Shell"],
   "metrics": {
-    "mode": "INCREMENTAL",
-    "previous_git_commit": "fa549d5bca05b1ebba8a21b05d5f8e7eaf0f86a8",
-    "changed_files": 44,
-    "total_files_scanned": 42,
-    "section_lines": {
-      "concept_map": 73,
-      "architecture": 101,
-      "interaction_model": 70,
-      "modules": 80,
-      "patterns": 75,
-      "index": 90
-    },
-    "schema_version": 16,
-    "mcp_surface": true,
-    "strategy_detail": "incremental reconcile of the 44-file changed frontier (PRs #61-#68) against the prior KB with novelty scan; corrected the vector exhaustive-scan threshold (16384 -> 262144) and added supply-chain trust, daemon version-handshake, non-destructive rebuild, and idle self-exit"
+    "mode": "FULL",
+    "prior_commit": "d7ac940dada21d21db4b6586cbbb6a744d393726",
+    "changed_files": 70,
+    "analyzers": 5,
+    "analyzer_failures": 0,
+    "kb_files_written": 6,
+    "schema_version_documented": 19,
+    "release_documented": "v0.1.13"
   }
 }
