@@ -155,14 +155,13 @@ async fn scope_carry_branch_switch_database_sharing() {
     println!("If yes, we need to verify WHEN it's cleared and under what circumstances.");
 }
 
+/// A freshly-created staging database does NOT inherit scope from the active
+/// index.db — which is exactly why every rebuild path must write scope to the
+/// staging connection explicitly (ops.rs staged write, daemon re-persist)
+/// before `finalize_and_swap` can be trusted to preserve it. This pins the
+/// empirical conclusion of the T7 scope-carry investigation as assertions.
 #[tokio::test]
 async fn scope_carry_with_fresh_staging_database() {
-    // SCENARIO: Staging database gets scope, but branch switch creates a fresh
-    // staging database for the new context. Does the carried scope reach it?
-    //
-    // This tests whether the repair code (364aaf7) is necessary for the case
-    // where a staging database is created fresh but doesn't inherit the scope.
-
     let repo_dir = TempDir::new().unwrap();
     let repo_path = repo_dir.path().canonicalize().unwrap();
 
@@ -174,9 +173,7 @@ async fn scope_carry_with_fresh_staging_database() {
     let state_root = repo_path.clone();
     oneup::shared::fs::ensure_secure_project_root(&state_root).unwrap();
 
-    // Initial scoped index: writes scope to active index.db
-    println!("\n=== SCENARIO: Staging database scope inheritance ===");
-
+    // Scoped active index.db.
     let db_path = config::project_db_path(&state_root);
     let db = Db::open_rw(&db_path).await.unwrap();
     let conn = db.connect_tuned().await.unwrap();
@@ -186,79 +183,40 @@ async fn scope_carry_with_fresh_staging_database() {
     schema::write_scope_to_meta(&conn, &scope_roots)
         .await
         .unwrap();
-
-    println!("Active index.db has scope: {:?}", scope_roots);
-    drop(conn);
-
-    // Now simulate a staging database being created for a new context
-    // This is what happens during a rebuild - a fresh staging database is created
-    let staging_path = config::project_staging_db_path(&state_root);
-    println!(
-        "If staging database is created fresh at {:?}",
-        staging_path.display()
+    assert_eq!(
+        schema::read_scope_from_meta(&conn).await.unwrap(),
+        Some(scope_roots.clone()),
+        "active index.db should persist the scoped roots"
     );
 
-    // The question: does the staging database inherit the scope?
-    // According to the code, staging is created fresh and then indexed into.
-    // The scope is written DURING indexing (schema::write_scope_to_meta during pipeline).
-
-    // But what if the NEW context's rebuild hasn't started yet when we check?
-    // Let me check if the staging database would have the scope at the point
-    // where run_project opens the connection.
-
-    // First, let's see what happens if we try to read from a fresh staging database
-    if staging_path.exists() {
-        let staging_db = Db::open_rw(&staging_path).await.unwrap();
-        let conn = staging_db.connect_tuned().await.unwrap();
-        schema::initialize(&conn).await.unwrap();
-
-        // At this point, the staging database was just initialized
-        // Would it have the scope?
-        let staging_scope = schema::read_scope_from_meta(&conn)
-            .await
-            .unwrap_or_default();
-
-        println!("Fresh staging database scope: {:?}", staging_scope);
-        // Expected: empty, because staging is a fresh database
-
-        // Now if we write the scope to the staging database
-        // (this is what the indexer should do)
-        schema::write_scope_to_meta(&conn, &scope_roots)
-            .await
-            .unwrap();
-
-        let staging_scope_after = schema::read_scope_from_meta(&conn)
-            .await
-            .unwrap_or_default();
-        println!(
-            "Staging database AFTER writing scope: {:?}",
-            staging_scope_after
-        );
-    }
-
-    // KEY INSIGHT: When does the scope get written to the staging database?
-    // According to src/indexer/pipeline.rs, the scope is written during the
-    // indexing pipeline AFTER scanning has computed the actual scope.
-    //
-    // So:
-    // 1. Staging database is created fresh
-    // 2. indexer/pipeline starts and writes scope to staging DB during indexing
-    // 3. Scope is available in staging database
-    // 4. finalize_and_swap swaps staging to become the new active index.db
-    //
-    // PROBLEM: If branch switches happen DURING step 2, the new context gets
-    // a fresh staging database but the scope hasn't been written yet!
-    //
-    // That's what the repair code at lines 1860-1894 is trying to fix:
-    // It checks if the progress file has a carried scope (step 1 before swap)
-    // and re-persists it to the staging database being used by the new context.
-
-    println!(
-        "\nKey realization: The repair code (364aaf7) persists carried scope\nto the database connection BEFORE the indexing pipeline runs.\nThis ensures that even if the progress file has a carried scope marker,\nit gets written to the database (staging or active) that will be used."
+    // A fresh staging database (opened the way real rebuilds open it) starts
+    // WITHOUT the active DB's scope.
+    let staged = oneup::storage::swap::StagingRebuild::open(&state_root)
+        .await
+        .unwrap();
+    let staging_conn = staged.connection();
+    assert_eq!(
+        schema::read_scope_from_meta(staging_conn).await.unwrap(),
+        None,
+        "fresh staging database must not inherit scope implicitly"
     );
 
-    println!(
-        "\nHowever, the actual indexer/pipeline ALSO writes the scope based on\nwhat it computes. So the repair code's re-persistence may be redundant\nif the indexer will write it anyway."
+    // The explicit write every rebuild path performs makes the scope survive
+    // the eventual swap.
+    schema::write_scope_to_meta(staging_conn, &scope_roots)
+        .await
+        .unwrap();
+    assert_eq!(
+        schema::read_scope_from_meta(staging_conn).await.unwrap(),
+        Some(scope_roots.clone()),
+        "staging database should persist scope once written explicitly"
+    );
+
+    // Writing to staging leaves the active DB's scope untouched.
+    assert_eq!(
+        schema::read_scope_from_meta(&conn).await.unwrap(),
+        Some(scope_roots),
+        "active index.db scope should be unaffected by staging writes"
     );
 }
 

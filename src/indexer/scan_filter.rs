@@ -12,9 +12,10 @@ const DEFAULT_SECRET_GLOBS: &[&str] = &["*.pem", "*.key", "credentials.json", ".
 /// between the three consumers.
 ///
 /// Precedence (highest to lowest): secret pattern (non-overridable) >
-/// configured include glob or dotfile-directory override > scope_globs (exclusive,
-/// only when scoped) > configured user exclude glob > default dotfile/dot-directory
-/// hiding > include by default.
+/// scope_globs (exclusive cone, only when scoped — the REQ-001/REQ-002 cost
+/// boundary, which configured includes must not punch through) > configured
+/// include glob or dotfile-directory override > configured user exclude glob >
+/// default dotfile/dot-directory hiding > include by default.
 ///
 /// Pure and I/O-free: callers supply the repo-relative path and whether it
 /// names a directory.
@@ -110,20 +111,15 @@ impl ScanFilter {
         if glob_matches(&self.secret_globs, rel_path) {
             return true;
         }
+        // Scope filtering runs BEFORE include/override: the scope cone is the
+        // feature's cost boundary (REQ-001/REQ-002), so a configured include
+        // glob or override dir must not pull out-of-cone files into a scoped
+        // index. Directories always descend so in-cone files stay reachable.
+        if !self.scope_globs.is_empty() && !is_dir && !glob_matches(&self.scope_globs, rel_path) {
+            return true;
+        }
         if glob_matches(&self.include_globs, rel_path) || self.matches_override(rel_path, is_dir) {
             return false;
-        }
-        // Scope filtering: if scope_globs is active (scoped indexing), use exclusive cone.
-        // For directories, allow descent so we can check files within scope roots.
-        // For files, exclude if not matching any scope glob.
-        if !self.scope_globs.is_empty() {
-            if is_dir {
-                return false;
-            } else {
-                if !glob_matches(&self.scope_globs, rel_path) {
-                    return true;
-                }
-            }
         }
         if glob_matches(&self.exclude_globs, rel_path) {
             return true;
@@ -144,6 +140,43 @@ mod tests {
         let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
         let overrides: Vec<String> = overrides.iter().map(|s| s.to_string()).collect();
         ScanFilter::new(&include, &exclude, &overrides).unwrap()
+    }
+
+    fn scoped_filter(include: &[&str], overrides: &[&str], scope: &[&str]) -> ScanFilter {
+        let include: Vec<String> = include.iter().map(|s| s.to_string()).collect();
+        let overrides: Vec<String> = overrides.iter().map(|s| s.to_string()).collect();
+        let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+        ScanFilter::with_scope_globs(&include, &[], &overrides, &scope).unwrap()
+    }
+
+    #[test]
+    fn scope_cone_excludes_out_of_scope_file_despite_include_glob() {
+        // REQ-001/REQ-002: the scope cone is the cost boundary; a configured
+        // include glob must not pull out-of-cone files into a scoped index.
+        let f = scoped_filter(&["**/*.ts"], &[], &["services/**"]);
+        assert!(f.is_excluded(Path::new("web/app.ts"), false));
+        assert!(!f.is_excluded(Path::new("services/auth/api.ts"), false));
+    }
+
+    #[test]
+    fn scope_cone_excludes_out_of_scope_file_despite_override_dir() {
+        let f = scoped_filter(&[], &[".github"], &["services/**"]);
+        assert!(f.is_excluded(Path::new(".github/workflows/ci.yml"), false));
+        // Directories still descend under scope so in-cone files stay reachable.
+        assert!(!f.is_excluded(Path::new(".github"), true));
+    }
+
+    #[test]
+    fn include_glob_still_wins_over_exclude_within_scope() {
+        let f = ScanFilter::with_scope_globs(
+            &["services/auth/keep.gen.ts".to_string()],
+            &["**/*.gen.ts".to_string()],
+            &[],
+            &["services/**".to_string()],
+        )
+        .unwrap();
+        assert!(!f.is_excluded(Path::new("services/auth/keep.gen.ts"), false));
+        assert!(f.is_excluded(Path::new("services/auth/other.gen.ts"), false));
     }
 
     #[test]
