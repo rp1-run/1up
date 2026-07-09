@@ -203,7 +203,13 @@ impl SupportedLanguage {
 
     fn container_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::Rust => &["impl_item", "trait_item", "mod_item"],
+            Self::Rust => &[
+                "impl_item",
+                "trait_item",
+                "mod_item",
+                "struct_item",
+                "enum_item",
+            ],
             Self::Python => &["class_definition"],
             Self::JavaScript | Self::TypeScript => &["class_declaration"],
             Self::Go => &[],
@@ -235,7 +241,12 @@ impl SupportedLanguage {
 
     fn nested_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::Rust => &["function_item", "const_item", "type_item"],
+            Self::Rust => &[
+                "function_item",
+                "const_item",
+                "type_item",
+                "field_declaration",
+            ],
             Self::Python => &["function_definition", "decorated_definition"],
             Self::JavaScript | Self::TypeScript => &[
                 "method_definition",
@@ -707,6 +718,23 @@ fn extract_nested(
     let nested_kinds = lang.nested_kinds();
     let comment_kinds = lang.comment_kinds();
 
+    // For Rust structs/enums, extract fields from field_declaration_list
+    if lang == SupportedLanguage::Rust
+        && (container.kind() == "struct_item" || container.kind() == "enum_item")
+    {
+        if let Some(field_list) = container.child_by_field_name("field_declaration_list") {
+            extract_fields_from_list(
+                &field_list,
+                source,
+                lang,
+                parent_name,
+                comment_kinds,
+                segments,
+            );
+            return;
+        }
+    }
+
     let body = find_body_node(container, lang);
     let search_node = body.as_ref().unwrap_or(container);
 
@@ -729,6 +757,25 @@ fn extract_nested(
 
         if nested_kinds.contains(&kind) {
             let comments = collect_leading_comments(search_node, i, comment_kinds, source);
+            let segment = extract_segment(&child, source, lang, &comments, Some(parent_name));
+            segments.push(segment);
+        }
+    }
+}
+
+fn extract_fields_from_list(
+    field_list: &Node,
+    source: &[u8],
+    lang: SupportedLanguage,
+    parent_name: &str,
+    comment_kinds: &[&str],
+    segments: &mut Vec<ParsedSegment>,
+) {
+    let child_count = field_list.named_child_count();
+    for i in 0..child_count {
+        let child = field_list.named_child(i as u32).unwrap();
+        if child.kind() == "field_declaration" {
+            let comments = collect_leading_comments(field_list, i, comment_kinds, source);
             let segment = extract_segment(&child, source, lang, &comments, Some(parent_name));
             segments.push(segment);
         }
@@ -819,6 +866,7 @@ fn classify_block_type(node: &Node, lang: SupportedLanguage) -> String {
             "mod_item" => "module",
             "use_declaration" => "import",
             "macro_definition" => "macro",
+            "field_declaration" => "field",
             _ => kind,
         },
         SupportedLanguage::Python => match kind {
@@ -986,6 +1034,7 @@ fn classify_role(node: &Node, lang: SupportedLanguage) -> SegmentRole {
             "impl_item" => SegmentRole::Implementation,
             "mod_item" => SegmentRole::Orchestration,
             "macro_definition" => SegmentRole::Definition,
+            "field_declaration" => SegmentRole::Definition,
             _ => SegmentRole::Definition,
         },
         SupportedLanguage::Python => match kind {
@@ -1109,7 +1158,7 @@ fn collect_defined_symbols_inner(
     match lang {
         SupportedLanguage::Rust => match kind {
             "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
-            | "const_item" | "static_item" | "macro_definition" => {
+            | "const_item" | "static_item" | "macro_definition" | "field_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Ok(text) = name.utf8_text(source) {
                         symbols.push(text.to_string());
@@ -3251,5 +3300,102 @@ fn main() {
 
         let impl_seg = segments.iter().find(|s| s.block_type == "impl").unwrap();
         assert_eq!(impl_seg.role, SegmentRole::Implementation);
+    }
+
+    #[test]
+    fn test_rust_field_doc_comment_extraction() {
+        let source = r#"
+/// A filter for scanning files.
+pub struct ScanFilter {
+    /// The scope exclusion cone preventing out-of-scope files from being indexed.
+    scope_globs: GlobSet,
+
+    /// Secrets patterns to exclude from indexing.
+    secrets_filter: SecretFilter,
+
+    /// Whether to include dotfiles.
+    include_dotfiles: bool,
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let struct_seg = segments.iter().find(|s| s.block_type == "struct").unwrap();
+        assert!(struct_seg
+            .defined_symbols
+            .contains(&"ScanFilter".to_string()));
+        assert_eq!(struct_seg.role, SegmentRole::Definition);
+
+        let field_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "field" && s.breadcrumb.as_deref() == Some("ScanFilter"))
+            .collect();
+        assert_eq!(
+            field_segments.len(),
+            3,
+            "Expected 3 field segments, found {}",
+            field_segments.len()
+        );
+
+        let scope_globs_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"scope_globs".to_string()))
+            .expect("scope_globs field not found");
+        assert!(
+            scope_globs_field.content.contains("exclusion cone"),
+            "scope_globs field content should contain doc comment"
+        );
+        assert_eq!(scope_globs_field.role, SegmentRole::Definition);
+
+        let secrets_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"secrets_filter".to_string()))
+            .expect("secrets_filter field not found");
+        assert!(
+            secrets_field.content.contains("Secrets patterns"),
+            "secrets_filter field content should contain doc comment"
+        );
+
+        let dotfiles_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"include_dotfiles".to_string()))
+            .expect("include_dotfiles field not found");
+        assert!(
+            dotfiles_field.content.contains("dotfiles"),
+            "include_dotfiles field content should contain doc comment"
+        );
+
+        // Verify source locations are correct for fields
+        assert!(scope_globs_field.line_start > struct_seg.line_start);
+        assert!(secrets_field.line_start > struct_seg.line_start);
+        assert!(dotfiles_field.line_start > struct_seg.line_start);
+    }
+
+    #[test]
+    fn test_rust_field_without_doc_comment() {
+        let source = r#"
+struct SimpleStruct {
+    name: String,
+    value: i32,
+}
+"#;
+        let segments = parse_file(source, "rust").unwrap();
+
+        let field_segments: Vec<_> = segments
+            .iter()
+            .filter(|s| s.block_type == "field" && s.breadcrumb.as_deref() == Some("SimpleStruct"))
+            .collect();
+        assert_eq!(field_segments.len(), 2);
+
+        let name_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"name".to_string()))
+            .unwrap();
+        assert!(name_field.content.contains("name: String"));
+
+        let value_field = field_segments
+            .iter()
+            .find(|s| s.defined_symbols.contains(&"value".to_string()))
+            .unwrap();
+        assert!(value_field.content.contains("value: i32"));
     }
 }
