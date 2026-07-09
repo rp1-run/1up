@@ -649,6 +649,32 @@ try:
         raise SmokeFailure(
             f"oneup_start readiness status {readiness_status} did not include actionable next steps"
         )
+
+    # REQ-012: oneup_start is non-blocking with a bounded wait — longer
+    # first indexes (fresh runner, cold model download) detach and callers
+    # poll oneup_status. Poll like a real agent instead of expecting the
+    # pre-v0.1.13 blocking-start semantics from a single response.
+    if readiness_status in {"missing", "indexing", "stale"}:
+        poll_deadline = time.time() + 180
+        poll_id = 400
+        while time.time() < poll_deadline:
+            time.sleep(3)
+            poll_result = call_tool(
+                proc,
+                stdout_queue,
+                poll_id,
+                "oneup_status",
+                {},
+                timeout_seconds=30,
+            )
+            poll_id += 1
+            poll_envelope = require_tool_envelope(poll_result, "status-poll", "oneup_status")
+            readiness_status = poll_envelope.get("status")
+            if readiness_status in DISCOVERY_READY_STATUSES or readiness_status == "blocked":
+                structured = poll_envelope
+                break
+        artifact["readiness_status"] = readiness_status
+
     if readiness_status not in DISCOVERY_READY_STATUSES:
         start_data = structured.get("data")
         blocked_reason = start_data.get("reason") if isinstance(start_data, dict) else None

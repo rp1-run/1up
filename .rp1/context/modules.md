@@ -17,8 +17,8 @@ strictness: strict
 | `src/cli` | Command surface, lean/human/json output, doctor hint cleanup, MCP launch/setup; orchestrates one-shot index/reindex (build-aside) and daemon start; runs the search version-handshake |
 | `src/mcp` | rmcp stdio server: nine tools over a pure ops layer with structured envelopes, single-sourced guidance, degraded/stale-rebuild readiness |
 | `src/search` | Hybrid candidate-first retrieval, intent, scope, symbol, context, structural, impact, read-only overview |
-| `src/indexer` | Scan, parse/chunk, markdown doc-sections, embed, metadata-prefiltered pipeline (connection-agnostic: writes live or staging) |
-| `src/storage` | libSQL persistence (schema v16): schema/segments/relations/queries/db + build-aside `swap` primitives |
+| `src/indexer` | Scan (exclusive scope cones via `ScanFilter`), parse/chunk, markdown doc-sections, embed (content-addressed pool), metadata-prefiltered pipeline (connection-agnostic: writes live or staging) |
+| `src/storage` | libSQL persistence (schema v19: scope meta `scope_roots_v1`, embedding pool): schema/segments/relations/queries/db + build-aside `swap` primitives |
 | `src/daemon` | Background index/search service with secure Unix IPC; lifecycle: version-handshake drain/restart, single-writer rebuild lock, cooperative cancellation, idle self-exit (non-Unix stubs) |
 | `src/shared` | Cross-cutting: types, constants, secure fs, project/worktree identity, errors, progress, config, self-update trust pipeline |
 | `tests` / `benches` / `evals` / `scripts` | Black-box CLI/MCP/daemon/release tests; Criterion guards; promptfoo evals; benchmarks + installer + release/security + `justfile` (incl. `reap-daemons`) |
@@ -35,7 +35,11 @@ strictness: strict
 - **`mcp::types`** — `deny_unknown_fields` inputs, `RETAINED_PUBLIC_TOOLS: [&str; 9]` (single source), `ToolEnvelope { status, summary, data, next_actions }`.
 - **`shared::update`** *(new surface)* — `ensure_manifest_acceptable` (anti-rollback + expiry), `verify_archive_checksum` (floor), `verify_artifact_attestation` (three-state), atomic `replace_binary`; advisory `build_update_status`.
 - **`shared::fs`** — the only sanctioned write/rename/unlink path: `atomic_replace`, `atomic_replace_within_project_root`, `atomic_rename_file_within_root` (backs the swap); root-clamped + symlink-rejecting.
-- **`storage::schema`** — `SCHEMA_VERSION=16`; `initialize` (staging), `ensure_current` (readers), version/objects/vector/context validation.
+- **`storage::schema`** — `SCHEMA_VERSION=19`; `initialize` (staging, `VectorIndexBuild::Deferred`), `ensure_current` (readers, fail-closed), `read_scope_from_meta`/`write_scope_to_meta` (scope persistence), version/objects/vector/context validation.
+- **`indexer::scan_filter::ScanFilter`** *(v0.1.13)* — pure `is_excluded(rel_path, is_dir)` predicate shared by scanner, `oneup_context`, and the watcher; precedence secrets > scope_globs (exclusive cone) > include_globs/overrides > excludes > dotfiles; `with_scope_globs` constructor for scoped indexing.
+- **`mcp::ops` scope surface** *(v0.1.13)* — `should_return_facts_envelope`/`generate_facts_envelope` (gate), `compute_new_scope`/`apply_scope_to_indexing_config` (scope ops), `determine_rebuild_mode_for_scope` (narrow=atomic, first-scope=rebuild, widen=incremental), `spawn_rebuild_task` + `start_response_budget` (non-blocking start), `compute_index_scope` (coverage, context-id-aware), persistent + in-process walk/density caches keyed on (repo identity, HEAD, mtime) — cache writes never create `.1up`.
+- **`daemon::worker` gate + scope** *(v0.1.13)* — `gate_allows_first_index` (pure, unit-tested; first-index = segments==0, robust to eagerly-created empty schema DB); gated projects consume the pending run and idle; refresh applies scope from meta with progress-file fallback and re-persists it; gate walk runs on `spawn_blocking` with 100-entry cancellation checks.
+- **`shared::project`** *(v0.1.13)* — `.1up` ancestors anchor resolution only with a valid marker (`index.db`/`project_id`/`rebuild.lock`); `launch_subdir` captured before clamping and threaded to the facts envelope.
 
 ## Dependencies
 
@@ -75,6 +79,6 @@ Largest single files: `search/impact.rs`, `storage/segments.rs`.
 
 - **`src/cli`** — visible: `start/status/list/stop/get/symbol/context/impact/doctor`; hidden but callable: `add-mcp/init/search/structural/mcp/index/reindex/update/__worker`. `doctor` is the only user-instruction-file writer (opt-in, `--apply`, fence-only).
 - **`src/mcp`** — `serve_stdio(state_root, source_root)`; nine tools behind `ToolEnvelope`; `degraded_reason` rides the payload only.
-- **`src/storage`** — schema v16; rebuilds go through `swap` (never in-place drop); switch-over writes clamp to `.1up` under the `RebuildLock`.
+- **`src/storage`** — schema v19; rebuilds go through `swap` (never in-place drop); switch-over writes clamp to `.1up` under the `RebuildLock`; scope meta re-persisted to staging by every rebuild path.
 - **`src/daemon`** — `lifecycle::{acquire_rebuild_lock, try_acquire_rebuild_lock, drain_daemon, drain_and_restart_daemon, ensure_daemon}`; framed-JSON IPC with `daemon_version`; impact/overview run locally, not over IPC.
-- **`src/shared`** — secure fs is the only sanctioned write/rename/unlink; `UpdateError`/`DaemonError`/`IndexingError::Cancelled`; constants (`SCHEMA_VERSION=16`, `ATTESTATION_*`, `DAEMON_IDLE_SHUTDOWN_SECS=60`, `DAEMON_DRAIN_TIMEOUT_MS=3000`, `REBUILD_LOCK_CONTENTION_TIMEOUT_MS=5000`, `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS=262144`, `STALE_REBUILD_REASON`).
+- **`src/shared`** — secure fs is the only sanctioned write/rename/unlink; `UpdateError`/`DaemonError`/`IndexingError::Cancelled`; constants (`SCHEMA_VERSION=19`, `FILE_COUNT_THRESHOLD=3000` + env override, `STALENESS_THRESHOLD_SECS=300`, `ATTESTATION_*`, `DAEMON_IDLE_SHUTDOWN_SECS=60`, `DAEMON_DRAIN_TIMEOUT_MS=3000`, `REBUILD_LOCK_CONTENTION_TIMEOUT_MS=5000`, `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS=262144`, `STALE_REBUILD_REASON`, `DISABLE_MODEL_DOWNLOADS_ENV_VAR`).

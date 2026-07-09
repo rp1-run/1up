@@ -19,6 +19,9 @@ How humans (CLI) and agents (MCP) drive 1up, the states they observe, and the ou
 - **Two output registers** — core discovery commands default human-readable and expose `--plain` (one stable lean grammar), rejecting `--format`; maintenance commands keep `--format human|plain|json`.
 - **Advisory impact boundary** — primary (higher-confidence) vs contextual (lower-confidence) results never collapse; CLI labels it "Likely impact (advisory)".
 - **Refuse unsafe ambiguity** — impact requires exactly one anchor; zero/multiple → refused with narrowing hints.
+- **Scope-first monorepo path** *(v0.1.13)* — over-threshold repos (`ONEUP_FILE_COUNT_THRESHOLD`, default 3000) refuse a first unscoped index and return a facts envelope (gitignore-aware per-directory stats, calibrated vector estimates with bounds, `launch_subdir` as first suggestion); indexing starts only after a scoped or explicitly confirmed start. Scope persists across branch switches and restarts.
+- **Non-blocking start with polling** *(v0.1.13)* — `oneup_start` spawns rebuilds and returns within `ONEUP_START_RESPONSE_BUDGET_MS` (2s default): fast ops return final readiness; longer rebuilds return Indexing + progress and agents poll `oneup_status`. Search during rebuild is bounded at 10s, degrading honestly.
+- **Coverage disclosure over silent gaps** *(v0.1.13)* — `index_scope` (roots, indexed/total files, coverage) rides readiness and search payloads; out-of-cone `oneup_context` reads carry `out_of_scope_disclosure` instead of truncating; empty scoped searches suggest widening. Placeholder text never appears in machine-usable `next_actions` arguments (omitted when no real value exists).
 - **Local-only, user-owned, non-mutating by default** — MCP reads/indexes only the configured repo; only `oneup_start` mutates (every other tool is `read_only_hint=true`); host config stays owned by the host/user.
 - **Never writes to instruction files unless invoked** — no normal op creates/edits `AGENTS.md`/`CLAUDE.md`; cleanup is opt-in, default-OFF, preview-first, fence-only.
 - **Machine-clean stdout, diagnostics on stderr** — warnings, daemon version-handshake/drain notices, schema-drift banners, disambiguation hints all go to stderr; stdout is parseable rows/JSON/MCP stdio.
@@ -33,7 +36,7 @@ How humans (CLI) and agents (MCP) drive 1up, the states they observe, and the ou
 
 ## User-Visible States
 
-- **Readiness** (`oneup_status`): ready / missing / indexing / stale / degraded / blocked (+ `drifted`).
+- **Readiness** (`oneup_status`): ready / missing / indexing / stale / degraded / blocked (+ `drifted`). `refuse_and_propose_scope` *(v0.1.13)*: first contact with an over-threshold unscoped repo returns the facts envelope with scope_add suggestions. Stale schema (e.g. v18 index under a v19 binary) fails closed with an `oneup_start {mode: reindex}` next_action — agents self-serve the migration.
 - **Operation** (search): ok / empty / partial / degraded. **Read** (`get`/`context`): found / not_found / ambiguous / rejected / error. **Impact**: expanded / expanded_scoped / empty / empty_scoped / refused.
 - **Start**: started / already_running / startup_in_progress / indexed_and_started.
 - **Lifecycle** (`status`/`list`): not_started / indexing / active / registered / stopped; **watch**: watching / daemon_stopped / source_missing / unsupported / unknown. A stale Running marker on an unregistered project resolves to stopped.
@@ -46,6 +49,7 @@ How humans (CLI) and agents (MCP) drive 1up, the states they observe, and the ou
 - **Orientation** — `oneup_overview` digest → "inspect top symbol / search densest module" (empty → readiness check).
 - **Readiness** — `oneup_status` → next_actions steer to search / `oneup_start` mode / poll / retry.
 - **Discovery** — `oneup_search` → pre-filled `oneup_get`/`oneup_context`/`oneup_symbol` next_actions.
+- **Scope lifecycle** *(v0.1.13)* — facts envelope → `oneup_start {scope_add}` (cone rebuild, non-blocking) → poll `oneup_status` (index_scope visible during and after) → widen via further `scope_add` (incremental) or `scope_narrow` (atomic rebuild); scope carries across branch switches via shared DB meta.
 - **Impact** — `oneup_impact` → read primary, fall back to contextual; refused/empty → narrower anchor/scope.
 - **Daemon warm-search-or-fallback** — CLI auto-starts the daemon, tries warm search (250ms timeout); a stale-binary response is refused (stderr warning) → drain+restart; any miss → transparent local fallback (never stale, never blocking).
 - **Cross-worktree schema-drift** — a second worktree on a different binary fails closed with a precise error naming the offending schema version + worktree path; remediate via `1up update` (older binary) or `1up reindex` (newer binary).
