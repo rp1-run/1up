@@ -1345,7 +1345,6 @@ fn oneup_get_verbosity_parameter() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
 
-    // Create a simple test repository with some Rust code
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src").join("lib.rs"),
@@ -1372,7 +1371,6 @@ pub fn main_logic() {
     )
     .unwrap();
 
-    // Initialize git repo
     std::process::Command::new("git")
         .arg("init")
         .current_dir(&root)
@@ -1401,13 +1399,11 @@ pub fn main_logic() {
 
     let mut client = McpTestClient::start_with_isolated_state(&root);
 
-    // Index the repository
     let _ = client.call_tool(TOOL_START, serde_json::json!({"mode": "index_if_needed"}));
 
     // Wait for indexing to complete using eventual-state polling
     wait_for_searchable_readiness(&mut client);
 
-    // Search for a term that will match code (e.g., "add" function)
     let search_result = client.call_tool(
         TOOL_SEARCH,
         serde_json::json!({
@@ -1547,7 +1543,6 @@ fn test_field_level_doc_comment_search_and_ranking() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
 
-    // Create a test fixture with scan_filter.rs containing field-level doc comments
     // This reproduces the real structure from src/indexer/scan_filter.rs
     fs::create_dir_all(root.join("src").join("indexer")).unwrap();
     fs::write(
