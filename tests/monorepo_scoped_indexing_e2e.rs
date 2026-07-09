@@ -1022,8 +1022,14 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
     // This is the condition that defeated the old !index.db-exists() gate predicate.
     create_empty_schema_db(&root);
 
-    // MCP server acts as daemon; create client
-    let mut client = McpTestClient::start_with_isolated_state(&root);
+    // The synchronous refusal envelope only comes back when the gate walk
+    // finishes inside the start response budget; on contended CI runners the
+    // default 2s budget can be overrun, detaching to an "indexing" ack instead.
+    // This test asserts envelope content, not the budget race, so wait it out.
+    let mut client = McpTestClient::start_with_isolated_state_and_envs(
+        &root,
+        &[("ONEUP_START_RESPONSE_BUDGET_MS", "600000")],
+    );
 
     // 1. Call oneup_status on over-threshold missing repo
     let status_result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
@@ -1362,22 +1368,34 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         &[("ONEUP_START_RESPONSE_BUDGET_MS", "0")],
     );
 
-    // Get facts and trigger scoped indexing
-    let facts_result = client.call_tool(
-        TOOL_START,
-        serde_json::json!({
-            "mode": "index_if_missing"
-        }),
-    );
+    // Get facts and trigger scoped indexing. The first start can race daemon
+    // DB init on slow runners and come back as a transient stale/missing
+    // envelope whose next_action carries no scope_add; retry until the gate's
+    // refusal envelope arrives.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let suggested_scope: Vec<String> = loop {
+        let facts_result = client.call_tool(
+            TOOL_START,
+            serde_json::json!({
+                "mode": "index_if_missing"
+            }),
+        );
 
-    let facts_envelope = mcp_structured(&facts_result);
-    let actions = facts_envelope["next_actions"].as_array().unwrap();
-    let first_action = &actions[0];
-    let scope_add = first_action["arguments"]["scope_add"].as_array().unwrap();
-    let suggested_scope: Vec<String> = scope_add
-        .iter()
-        .filter_map(|s| s.as_str().map(String::from))
-        .collect();
+        let facts_envelope = mcp_structured(&facts_result);
+        if facts_envelope["status"].as_str() == Some("refuse_and_propose_scope") {
+            let actions = facts_envelope["next_actions"].as_array().unwrap();
+            let scope_add = actions[0]["arguments"]["scope_add"].as_array().unwrap();
+            break scope_add
+                .iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never received refuse_and_propose_scope; last envelope: {facts_envelope}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
 
     let _ = client.call_tool(
         TOOL_START,
