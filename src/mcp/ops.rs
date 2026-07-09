@@ -3020,6 +3020,48 @@ pub async fn should_return_facts_envelope(
     Ok(total_files > threshold)
 }
 
+/// Generates ranked scope suggestions from top-level directories.
+/// T9: Provides multiple ranked suggestions without dangling "Or" wording.
+/// Returns up to 3 suggestions formatted as actionable scope cone names.
+/// Excludes launch_subdir from suggestions if already matched (avoids duplication).
+fn generate_ranked_suggestions(
+    per_directory_stats: &[DirectoryStats],
+    launch_subdir: &Option<String>,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    for (idx, stat) in per_directory_stats.iter().take(3).enumerate() {
+        // Skip suggesting the launch_subdir (redundant with top-level launch_subdir suggestion)
+        if let Some(subdir) = launch_subdir {
+            if &stat.directory == subdir {
+                continue;
+            }
+        }
+
+        let suggestion = if idx == 0 {
+            // First suggestion is primary (no "Or")
+            format!("Index the largest directory: {}", stat.directory)
+        } else {
+            // Subsequent suggestions are ranked alternatives
+            format!("Or index {}: {}", ordinal(idx + 1), stat.directory)
+        };
+
+        suggestions.push(suggestion);
+    }
+
+    suggestions
+}
+
+/// Helper to convert numeric position to ordinal (1st, 2nd, 3rd, etc.)
+fn ordinal(n: usize) -> &'static str {
+    match n {
+        1 => "1st",
+        2 => "2nd",
+        3 => "3rd",
+        _ => "next",
+    }
+}
+
 /// Generates a facts envelope for a large monorepo on first-run.
 /// Uses gitignore-aware file counts and calibrated vector estimates based on measured
 /// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
@@ -3048,6 +3090,11 @@ pub async fn generate_facts_envelope(
     // Sort by file count descending (largest first)
     per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
 
+    // T8: Filter out tool/editor dot-directories from stats
+    // Excludes: .idea, .claude, .vscode, .1up, .agentdocs (noise in suggestions)
+    let excluded_dot_dirs = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
+    per_directory_stats.retain(|stat| !excluded_dot_dirs.contains(&stat.directory.as_str()));
+
     // Calibrate global vector estimate (N2: reuses same computed density)
     let (vector_estimate_total, basis, low_bound, high_bound) =
         estimate_vector_count(file_count_total, source_root)?;
@@ -3061,11 +3108,16 @@ pub async fn generate_facts_envelope(
             .and_then(|rel| rel.to_str().map(|s| s.to_string()))
     });
 
+    // T9: Generate ranked suggestions without dangling "Or" wording
+    // Provide up to 3 top directories as ranked suggestions
+    let suggestions = generate_ranked_suggestions(&per_directory_stats, &launch_subdir_str);
+
     Ok(FactsEnvelope {
         per_directory_stats,
         workspace_manifests,
         sparse_checkout,
         launch_subdir: launch_subdir_str,
+        suggestions,
         file_count_total,
         vector_estimate_total,
         vector_estimate_basis: Some(basis),
