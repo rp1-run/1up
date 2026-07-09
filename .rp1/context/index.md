@@ -11,21 +11,21 @@
 | Type | Single project |
 | Entry point | `src/main.rs` -> `src/cli/mod.rs` |
 | Primary agent surface | `1up mcp --path <repo>` exposing `oneup_status`, `oneup_start`, `oneup_overview`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural` |
-| Key patterns | Layered CLI + MCP + daemon, orientation-before-discovery, search-before-get/context, candidate-first retrieval, build-aside rebuild + atomic swap, single-writer rebuild lock, daemon version-handshake, refuse-and-propose monorepo gate + exclusive scope cones, non-blocking bounded-wait start, content-addressed embedding pool, independent-channel supply-chain trust, single-source-of-truth tool guidance |
+| Key patterns | Layered CLI + MCP + daemon, orientation-before-discovery, search-before-get/context, candidate-first retrieval, build-aside rebuild + atomic swap, single-writer rebuild lock, daemon version-handshake, refuse-and-propose monorepo gate + exclusive scope cones, non-blocking bounded-wait start, verbosity-gated slim hydration, content-addressed embedding pool, independent-channel supply-chain trust, single-source-of-truth tool guidance |
 | Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, rmcp, clap, globset, sigstore-verify, TypeScript evals, shell release scripts |
 | Version | 0.1.13 |
 | Schema version | 19 (v17 embedding pool, v18 256-token window, v19 scope metadata `scope_roots_v1`; `VECTOR_PREFILTER_K=400`) |
-| Last generated | 2026-07-09T02:20:00Z |
+| Last generated | 2026-07-09T11:08:12Z |
 
 ## KB File Manifest
 
 | File | Lines | Load For |
 |---|---:|---|
-| [concept_map.md](concept_map.md) | 84 | Domain terminology, scoping + code-discovery + supply-chain concepts, MCP tool vocabulary, storage/search/impact relationships |
+| [concept_map.md](concept_map.md) | 85 | Domain terminology, scoping + code-discovery + supply-chain concepts, MCP tool vocabulary, storage/search/impact relationships |
 | [architecture.md](architecture.md) | 110 | System topology, data/state layout, MCP/CLI/daemon flows, monorepo gate + scope cones, rebuild/swap, release & update architecture |
-| [interaction-model.md](interaction-model.md) | 74 | Agent and CLI interaction semantics, readiness/scope states, non-blocking start + polling, output contracts, setup flows |
-| [modules.md](modules.md) | 84 | Component ownership, module dependencies, public boundaries, metrics |
-| [patterns.md](patterns.md) | 79 | Conventions, data modeling, errors, validation (filter precedence), output, storage, concurrency, testing idioms |
+| [interaction-model.md](interaction-model.md) | 75 | Agent and CLI interaction semantics, readiness/scope states, non-blocking start + polling, output contracts, setup flows |
+| [modules.md](modules.md) | 86 | Component ownership, module dependencies, public boundaries, metrics |
+| [patterns.md](patterns.md) | 83 | Conventions, data modeling, errors, validation (filter precedence), output, storage, concurrency, testing idioms |
 
 ## Task-Based Loading
 
@@ -42,6 +42,7 @@
 
 ## Recent Learnings
 
+- **Envelope quality round 4 (PR #84, merged `daddb79`)**: `index_scope` carries a single-sourced `eligibility_note` (`unscoped_eligibility_note()`, status/search parity) **only on unscoped indexes**, explaining the indexed-vs-total gap; `oneup_get` hydration is slim by default — the content-duplicating per-segment `summary` is removed, symbol lists are gated behind `verbosity: "full"`, and a never-serialized `#[serde(skip)] symbol_hint` keeps the `oneup_symbol` next_action offered; Rust struct-field and enum-variant doc comments are segmented via the generic body walk (a `field_declaration_list` special case was dead code, removed) so comment-defined jargon is searchable; facts-envelope stats exclude tool dot-dirs and carry ranked, rank-truthful `suggestions` (never a leading "Or"); daemon-alive E2E tests pin `ONEUP_START_RESPONSE_BUDGET_MS` / retry to the refusal envelope against real timing races (the daemon-alive path's missing facts envelope is tracked as #86; SIGTERM-immune gate walk as #85; envelope cost floor as #87).
 - **Monorepo-scoped indexing (v0.1.13)**: over-threshold repos (`ONEUP_FILE_COUNT_THRESHOLD`, default 3000) refuse a first unscoped index — the daemon gate (`gate_allows_first_index`, segments-count predicate robust to the eagerly-created empty schema DB) keeps the daemon idle, and `oneup_start` returns a facts envelope (gitignore-aware per-directory stats, measured-density vector estimates with bounds, `launch_subdir` first). Scope roots persist in DB meta (`scope_roots_v1`), carry across branches/restarts, and are enforced as **exclusive `scope_globs`** in `ScanFilter` (precedence: secrets > scope > include/override > exclude > dotfile — includes cannot punch through the cone). Widening is incremental; narrowing is an atomic staging rebuild. `oneup_start` is non-blocking (2s bounded wait, `ONEUP_START_RESPONSE_BUDGET_MS`); stale schema fails closed with self-serve reindex guidance. Validated end-to-end against a large production monorepo (~186k files): scoped cone 2s response/16s build vs 40-minute accident it replaces.
 - **Supply-chain trust**: self-update (`src/shared/update.rs`) verifies a mandatory-when-published SHA-256 checksum, then a keyless-OIDC GitHub build attestation as a three-state gate (verified -> proceed; disproved -> fail closed; cannot-run/offline -> degrade to the checksum floor). `ensure_manifest_acceptable` hard-refuses rolled-back or past-expiry manifests before download. `release-assets.yml` emits `actions/attest-build-provenance`; `setup.sh` does the checksum mandatorily + attestation opt-in (gh/cosign).
 - **Daemon version-handshake**: a daemon search response stamps `daemon_version`; a stale-binary daemon's results are refused, the daemon is drained + restarted under the current binary, and local in-process search is the fallback (never serve stale results). A single-writer `RebuildLock` (`.1up/rebuild.lock`) ensures exactly one process owns a rebuild; a cooperative `CancellationToken` lets SIGTERM interrupt indexing at a safe boundary.

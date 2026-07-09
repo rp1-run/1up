@@ -8,7 +8,7 @@ strictness: strict
 ---
 # Implementation Patterns
 
-Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon-handshake, non-destructive-rebuild, and monorepo-scoped-indexing (v0.1.13) work are folded in.
+Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon-handshake, non-destructive-rebuild, monorepo-scoped-indexing (v0.1.13), and envelope-quality round-4 (PR #84) work are folded in.
 
 ## Naming & Organization
 
@@ -22,7 +22,8 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 - Owned structs/enums with serde derives; MCP inputs derive `Deserialize + JsonSchema` (`deny_unknown_fields`), `rename_all="snake_case"` wire names.
 - Single source of truth via const arrays (`RETAINED_PUBLIC_TOOLS: [&str; 9]`, `NON_EMBEDDABLE_CHUNK_LANGUAGES`).
 - Domain outcomes are dedicated enums (`UpdateStatus`, `ReadinessStatus`), often a three-state collapsed onto `Result`.
-- Additive fields stay back-compatible: `#[serde(default, skip_serializing_if = "Option::is_none")]` (e.g. manifest `expiry`). RAII guards consumed by value (`finalize_and_swap(self)`); `RebuildLock` is `#[must_use]`.
+- Additive fields stay back-compatible: `#[serde(default, skip_serializing_if = "Option::is_none")]` (e.g. manifest `expiry`, `IndexScope.eligibility_note`). RAII guards consumed by value (`finalize_and_swap(self)`); `RebuildLock` is `#[must_use]`.
+- `#[serde(skip)]` hint fields carry pre-gating data for envelope derivation without ever serializing: `SegmentRecord.symbol_hint` (first defined symbol, captured before verbosity gating) drives the `oneup_symbol` next_action while the gated symbol lists are empty. Optional wire params collapse to internal bools (`verbosity: Option<String>` → `is_verbose`); empty vecs are serde-skipped.
 
 ## Error Handling
 
@@ -41,7 +42,8 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 ## Output Contracts
 
 - `tracing` to stderr; **stdout reserved for protocol/data** so MCP stdio + machine output stay clean — notices/banners go to stderr.
-- Degraded/stale wording is centralized in single-source `*_REASON` constants (`STALE_REBUILD_REASON`, `NO_INDEXED_EMBEDDINGS_REASON`) and merged via `combine_degraded_reasons` (never overwritten).
+- Degraded/stale wording is centralized in single-source `*_REASON` constants (`STALE_REBUILD_REASON`, `NO_INDEXED_EMBEDDINGS_REASON`) and merged via `combine_degraded_reasons` (never overwritten). Same family: `unscoped_eligibility_note()` single-sources the `index_scope` note so status, search, and facts paths cannot drift.
+- Ranked-list wording branches on **emptiness, not index** (`generate_ranked_suggestions`): the first *emitted* entry gets primary phrasing (never a leading "Or") even when higher ranks are skipped, and ordinals stay truthful to actual rank, not emission position.
 - MCP `instructions` fit a ~2KB host-truncation budget with the routing rule front-loaded.
 
 ## Storage / I-O
@@ -66,6 +68,7 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 ## Extension
 
 - Static extension surfaces, not plugin loaders: clap enum variants + rmcp `#[tool_router]` methods.
+- Tree-sitter extraction flows through the generic body walk + `nested_kinds()` — no per-container special cases (a `field_declaration_list` field-name lookup was dead code: struct and enum bodies live under the `body` field). Verify grammar node/field names with a parse probe before extending.
 - `RETAINED_PUBLIC_TOOLS` is the single authority: next-actions `debug_assert!` membership; the doctor classifier treats any `oneup_*` token absent from it as stale; doc/test guards pin to it.
 - The only opt-in user-file mutation (`doctor --clean-hints --apply`) is default-OFF, preview-by-default, and removes only a byte-exact 1up-owned fence via `atomic_replace_within_project_root`.
 
@@ -76,4 +79,5 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 - **RAII test guards** isolate/clean up: `EnvGuard` (under a static `Mutex`), `ChildGuard`/`DaemonCleanupGuard` reap spawned daemons, real `flock` guards prove exclusion.
 - Drift guards source expected values from `CARGO_PKG_VERSION` (`documentation_tool_names_match_retained_public_tools`, `committed_update_manifest_version_not_ahead_of_binary`); swap tests assert all-or-nothing reads under concurrent readers.
 - **Eventual-state polling in E2E** — `oneup_start` is non-blocking and the daemon indexes concurrently, so E2E tests assert eventual stable states via `wait_for_status(client, what, predicate)` (deadline + last-payload panic), never single-shot status reads; "degraded" is both a mid-index transient and the FTS-only terminal, so predicates require the full stable shape.
+- **E2E timing hardening** — a test asserting the *synchronous* refusal envelope must pin `ONEUP_START_RESPONSE_BUDGET_MS` high (contended CI runners overrun the 2s default and get a detached `"indexing"` ack); a test racing daemon DB-init retries until the terminal `refuse_and_propose_scope` envelope arrives. Both races reproduce on real hardware, not just CI.
 - **CI-faithful FTS-only regime** — canonical fake HOME (`$(cd "$(mktemp -d)" && pwd -P)` — secure-fs rejects `/var` symlinks), `.download_failed` markers in Library + XDG model dirs, AND `ONEUP_DISABLE_MODEL_DOWNLOADS=1` (explicit index/start clears the marker by design). Test daemons are killed only by path-scoped pattern (`target/debug/1up __worker`); tests never parent the process they SIGTERM-probe (zombies read as alive), discovering daemons via `pgrep -P <server>`. Assert unit-test cache behavior via cache state, not wall-clock timing.

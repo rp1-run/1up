@@ -15,13 +15,13 @@ strictness: strict
 | Module | Purpose |
 |---|---|
 | `src/cli` | Command surface, lean/human/json output, doctor hint cleanup, MCP launch/setup; orchestrates one-shot index/reindex (build-aside) and daemon start; runs the search version-handshake |
-| `src/mcp` | rmcp stdio server: nine tools over a pure ops layer with structured envelopes, single-sourced guidance, degraded/stale-rebuild readiness |
+| `src/mcp` | rmcp stdio server: nine tools over a pure ops layer with structured envelopes, single-sourced guidance + eligibility notes, verbosity-gated hydration, degraded/stale-rebuild readiness |
 | `src/search` | Hybrid candidate-first retrieval, intent, scope, symbol, context, structural, impact, read-only overview |
-| `src/indexer` | Scan (exclusive scope cones via `ScanFilter`), parse/chunk, markdown doc-sections, embed (content-addressed pool), metadata-prefiltered pipeline (connection-agnostic: writes live or staging) |
+| `src/indexer` | Scan (exclusive scope cones via `ScanFilter`), parse/chunk (incl. Rust field/enum-variant doc comments), markdown doc-sections, embed (content-addressed pool), metadata-prefiltered pipeline (connection-agnostic: writes live or staging) |
 | `src/storage` | libSQL persistence (schema v19: scope meta `scope_roots_v1`, embedding pool): schema/segments/relations/queries/db + build-aside `swap` primitives |
 | `src/daemon` | Background index/search service with secure Unix IPC; lifecycle: version-handshake drain/restart, single-writer rebuild lock, cooperative cancellation, idle self-exit (non-Unix stubs) |
 | `src/shared` | Cross-cutting: types, constants, secure fs, project/worktree identity, errors, progress, config, self-update trust pipeline |
-| `tests` / `benches` / `evals` / `scripts` | Black-box CLI/MCP/daemon/release tests; Criterion guards; promptfoo evals; benchmarks + installer + release/security + `justfile` (incl. `reap-daemons`) |
+| `tests` / `benches` / `evals` / `scripts` | Black-box CLI/MCP/daemon/release tests (16-scenario monorepo E2E incl. field-doc ranking, verbosity gating, eligibility-note pins, timing-hardened daemon-alive gates); Criterion guards; promptfoo evals; benchmarks + installer + release/security + `justfile` (incl. `reap-daemons`) |
 
 ## Key Components
 
@@ -40,6 +40,8 @@ strictness: strict
 - **`mcp::ops` scope surface** *(v0.1.13)* — `should_return_facts_envelope`/`generate_facts_envelope` (gate), `compute_new_scope`/`apply_scope_to_indexing_config` (scope ops), `determine_rebuild_mode_for_scope` (narrow=atomic, first-scope=rebuild, widen=incremental), `spawn_rebuild_task` + `start_response_budget` (non-blocking start), `compute_index_scope` (coverage, context-id-aware), persistent + in-process walk/density caches keyed on (repo identity, HEAD, mtime) — cache writes never create `.1up`.
 - **`daemon::worker` gate + scope** *(v0.1.13)* — `gate_allows_first_index` (pure, unit-tested; first-index = segments==0, robust to eagerly-created empty schema DB); gated projects consume the pending run and idle; refresh applies scope from meta with progress-file fallback and re-persists it; gate walk runs on `spawn_blocking` with 100-entry cancellation checks.
 - **`shared::project`** *(v0.1.13)* — `.1up` ancestors anchor resolution only with a valid marker (`index.db`/`project_id`/`rebuild.lock`); `launch_subdir` captured before clamping and threaded to the facts envelope.
+- **`mcp::ops` envelope quality** *(PR #84, daddb79)* — `unscoped_eligibility_note()` single source for the `index_scope` note (status/readiness + search + facts paths); `segment_record()` verbosity gating (`is_verbose`: symbol lists only at `"full"`, `summary` always omitted; `#[serde(skip)] symbol_hint` captured pre-gating drives the `oneup_symbol` next_action in `tools.rs::read_next_actions`); `generate_ranked_suggestions()` (≤3, rank-truthful ordinals, primary phrasing on emptiness — never a leading "Or"); tool dot-dirs excluded from `generate_facts_envelope()` stats.
+- **`indexer::parser` field/variant extraction** *(PR #84)* — Rust `field_declaration` + `enum_variant` in `nested_kinds()` flow through the generic body walk (`body` field; a `field_declaration_list` lookup was dead code and is removed); variants → block_type `variant`, role Definition, name in `defined_symbols`, breadcrumb = parent type.
 
 ## Dependencies
 
