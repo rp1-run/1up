@@ -3051,9 +3051,20 @@ fn generate_ranked_suggestions(
             }
         }
 
-        let suggestion = if idx == 0 {
-            // First suggestion is primary (no "Or")
-            format!("Index the largest directory: {}", stat.directory)
+        let suggestion = if suggestions.is_empty() {
+            // First emitted suggestion is primary (no "Or"), even when the
+            // top-ranked directory was skipped as the launch_subdir.
+            if idx == 0 {
+                format!("Index the largest directory: {}", stat.directory)
+            } else {
+                // Keep the ordinal truthful to the actual rank, not the
+                // emitted position.
+                format!(
+                    "Index the {} largest directory: {}",
+                    ordinal(idx + 1),
+                    stat.directory
+                )
+            }
         } else {
             // Subsequent suggestions are ranked alternatives
             format!("Or index {}: {}", ordinal(idx + 1), stat.directory)
@@ -4929,6 +4940,90 @@ mod tests {
         assert_eq!(
             envelope.per_directory_stats[1].file_count, 1,
             "libs should have 1 file"
+        );
+    }
+
+    fn ranked_stats(directories: &[&str]) -> Vec<DirectoryStats> {
+        directories
+            .iter()
+            .enumerate()
+            .map(|(idx, directory)| DirectoryStats {
+                directory: directory.to_string(),
+                file_count: 100 - idx * 10,
+                estimated_vectors: (100 - idx * 10) * 10,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ranked_suggestions_no_leading_or_when_top_dir_is_launch_subdir() {
+        // T9: when the launch_subdir is the top-ranked directory, the first
+        // emitted suggestion must not start with "Or" and must keep the
+        // truthful rank ordinal.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+        let launch_subdir = Some("services".to_string());
+
+        let suggestions = generate_ranked_suggestions(&stats, &launch_subdir);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the 2nd largest directory: libs".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
+        );
+        assert!(
+            !suggestions[0].starts_with("Or"),
+            "first suggestion must never start with 'Or'; got {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_without_launch_subdir_keep_existing_shape() {
+        // Regression: no launch_subdir leaves the original output unchanged.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+
+        let suggestions = generate_ranked_suggestions(&stats, &None);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the largest directory: services".to_string(),
+                "Or index 2nd: libs".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_single_directory() {
+        let stats = ranked_stats(&["services"]);
+
+        let suggestions = generate_ranked_suggestions(&stats, &None);
+
+        assert_eq!(
+            suggestions,
+            vec!["Index the largest directory: services".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ranked_suggestions_skip_second_ranked_launch_subdir() {
+        // When the launch_subdir is a non-top-ranked directory, the primary
+        // suggestion is unchanged and the "Or" alternatives skip the subdir
+        // while keeping truthful ordinals.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+        let launch_subdir = Some("libs".to_string());
+
+        let suggestions = generate_ranked_suggestions(&stats, &launch_subdir);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                "Index the largest directory: services".to_string(),
+                "Or index 3rd: tools".to_string(),
+            ]
         );
     }
 }
