@@ -15,6 +15,30 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.13](https://github.com/rp1-run/1up/compare/v0.1.12...v0.1.13) (2026-07-09)
+
+
+### Features
+
+* **audit:** P2 measured + verified v18 re-embed (recall gate, INT8 pinning, 256-token window) ([#78](https://github.com/rp1-run/1up/issues/78)) ([790f53f](https://github.com/rp1-run/1up/commit/790f53ff79c49e7c9e157111524a7eabd2ceaf67))
+* **audit:** P4 monorepo scoping + secret-file exclusion (path-prefix search, include/exclude globs, oneup_context enforcement) ([#80](https://github.com/rp1-run/1up/issues/80)) ([309036c](https://github.com/rp1-run/1up/commit/309036cfe73a49f38fdcde4228eb693368c7446d))
+* **cli:** add 1up gc to prune stale worktree contexts and reclaim index disk ([#70](https://github.com/rp1-run/1up/issues/70)) ([88be273](https://github.com/rp1-run/1up/commit/88be2737ff48b7eba29441d18adb21ff417ab417))
+* content-addressed embedding pool — dedup embeddings across worktree/branch contexts (schema v17) ([#73](https://github.com/rp1-run/1up/issues/73)) ([95488d7](https://github.com/rp1-run/1up/commit/95488d72118580f28801b35a776b96bec2d82023))
+* **daemon:** auto-prune source-missing worktree contexts on startup ([#72](https://github.com/rp1-run/1up/issues/72)) ([fc9e6d3](https://github.com/rp1-run/1up/commit/fc9e6d3da99b599fb4b55305af9b865e9673b36f))
+* monorepo-scoped indexing ([#82](https://github.com/rp1-run/1up/issues/82)) ([4411845](https://github.com/rp1-run/1up/commit/4411845591b9e493b55d1ccfdc1354d9143c5983))
+
+
+### Bug Fixes
+
+* **audit:** P1 index integrity + hygiene baseline (subdir context clamp, gc reclaim, quick wins) ([#77](https://github.com/rp1-run/1up/issues/77)) ([78eef3d](https://github.com/rp1-run/1up/commit/78eef3d571d3da22a39bd9249f407e82c775bd37))
+* **audit:** P3 supply-chain attack-chain closure (manifest attestation, host allowlist, fail-closed disproof, SHA-pinned actions) ([#79](https://github.com/rp1-run/1up/issues/79)) ([18e5c1d](https://github.com/rp1-run/1up/commit/18e5c1d9b9b4e815b9955282cbf1be1e0776426e))
+
+
+### Performance Improvements
+
+* **audit:** P5 warm paths, recovery, and retention (warm MCP reads, download recovery, context GC, pipeline perf) ([#81](https://github.com/rp1-run/1up/issues/81)) ([34a5aea](https://github.com/rp1-run/1up/commit/34a5aea1877195261421ee7a52a7a0c43dc2687c))
+* **indexing,retrieval:** 14-recommendation performance pass (schema v18) ([#76](https://github.com/rp1-run/1up/issues/76)) ([39c3960](https://github.com/rp1-run/1up/commit/39c39608ce8cc033bd7dce8faebe39839b57e2c1))
+
 ## [0.1.12](https://github.com/rp1-run/1up/compare/v0.1.11...v0.1.12) (2026-06-20)
 
 
