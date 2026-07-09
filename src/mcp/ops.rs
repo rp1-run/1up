@@ -238,6 +238,12 @@ pub struct SegmentRecord {
     pub referenced_symbols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub called_symbols: Vec<String>,
+    /// First symbol defined by the underlying segment, captured before the
+    /// verbosity gating applied to `defined_symbols`. Never serialized into
+    /// the hydration payload; envelope next_actions read it so defining
+    /// segments keep offering oneup_symbol verification at any verbosity.
+    #[serde(skip)]
+    pub symbol_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2160,9 +2166,14 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
     let role = segment.parsed_role();
     let is_verbose = verbosity.map(|v| v == "full").unwrap_or(false);
 
+    // The symbol hint is derived from the underlying segment data before any
+    // verbosity gating so next_actions never lose the oneup_symbol follow-up.
+    let parsed_defined_symbols = segment.parsed_defined_symbols();
+    let symbol_hint = parsed_defined_symbols.first().cloned();
+
     // Only populate symbols if verbosity is "full"; default to empty lists.
     let defined_symbols = if is_verbose {
-        segment.parsed_defined_symbols()
+        parsed_defined_symbols
     } else {
         Vec::new()
     };
@@ -2191,6 +2202,7 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
         defined_symbols,
         referenced_symbols,
         called_symbols,
+        symbol_hint,
     }
 }
 
