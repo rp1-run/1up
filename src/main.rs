@@ -67,7 +67,7 @@ fn should_show_notification(command: &cli::Command) -> bool {
     }
     !matches!(
         command,
-        cli::Command::Mcp(_) | cli::Command::Worker | cli::Command::Update(_)
+        cli::Command::Mcp(_) | cli::Command::Worker { .. } | cli::Command::Update(_)
     )
 }
 

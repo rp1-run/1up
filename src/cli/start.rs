@@ -216,7 +216,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     if index_ready {
         let already_registered = registry_contains_context(&registry, &worktree_context);
         registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
-        let daemon = ensure_daemon_after_registration(daemon_state)?;
+        let daemon = ensure_daemon_after_registration(daemon_state, &source_root)?;
         let msg =
             current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
         let result = StartResultInfo {
@@ -248,7 +248,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     )
     .await?;
     registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
-    let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?)?;
+    let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?, &source_root)?;
     let msg = indexed_start_message(
         &init_prefix,
         stats.files_indexed,
@@ -344,6 +344,7 @@ fn registry_contains_context(
 
 fn ensure_daemon_after_registration(
     initial_state: DaemonProbeState,
+    source_root: &std::path::Path,
 ) -> anyhow::Result<DaemonStartOutcome> {
     match initial_state {
         DaemonProbeState::Running(pid) => {
@@ -356,7 +357,7 @@ fn ensure_daemon_after_registration(
         DaemonProbeState::Starting => observe_existing_daemon_startup(),
         DaemonProbeState::NotRunning => {
             let binary = lifecycle::current_binary_path()?;
-            let spawned_pid = lifecycle::spawn_daemon(&binary)?;
+            let spawned_pid = lifecycle::spawn_daemon(&binary, source_root)?;
             observe_spawned_daemon(spawned_pid)
         }
     }
