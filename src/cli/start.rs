@@ -177,6 +177,11 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             project_id,
             project_root.display()
         );
+        // REQ-004: Create .1up/.gitignore with `*` to prevent index.db git-add
+        if let Err(err) = create_gitignore_at_project_init(&project_root) {
+            tracing::warn!("failed to create .1up/.gitignore: {}", err);
+            // Non-fatal: gitignore is a usability improvement but not a blocker
+        }
     }
     let init_prefix = if initialized_now {
         format!("Initialized project {project_id}. ")
@@ -878,6 +883,31 @@ async fn run_initial_index(
     .await?;
 
     Ok(stats)
+}
+
+/// Create .1up/.gitignore with `*` to prevent index.db from being git-added.
+/// REQ-004: Non-fatal helper; ignores errors if the file already exists or
+/// cannot be written (e.g., permission issues on read-only filesystem).
+fn create_gitignore_at_project_init(project_root: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let dot_dir = project_root.join(".1up");
+    let gitignore_path = dot_dir.join(".gitignore");
+
+    // If .gitignore already exists, skip (idempotent)
+    if gitignore_path.exists() {
+        return Ok(());
+    }
+
+    // Create .1up directory if needed (should already exist after ensure_project_id)
+    std::fs::create_dir_all(&dot_dir)?;
+
+    // Write "*" to .gitignore to exclude everything in .1up (including index.db)
+    let mut file = std::fs::File::create(&gitignore_path)?;
+    file.write_all(b"*")?;
+    file.sync_all()?;
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -561,3 +561,37 @@ pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
 /// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
 /// switch either way.
 pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
+
+/// Default-on secret-file patterns, excluded from indexing regardless of
+/// configuration (REQ-004). Globs are evaluated against repo-relative paths
+/// and filename alone, so `secrets.yaml` matches at any depth, and
+/// `id_rsa*` matches `id_rsa`, `id_rsa.pub`, etc.
+///
+/// Expanded set covers: API credentials (*.pem, *.key, credentials.json,
+/// .env, .env.*), service accounts (service-account.json), configuration
+/// credentials (.netrc, .pgpass, .git-credentials), cloud provider
+/// credentials (.aws/credentials), and SSH/TLS keys (id_rsa*, id_ed25519,
+/// *.p12, *.pfx), secrets YAML (secrets.yaml, secrets.yml).
+pub const DEFAULT_SECRET_GLOBS: &[&str] = &[
+    // Original 4 patterns (T5 builds on these)
+    "*.pem",
+    "*.key",
+    "credentials.json",
+    ".env",
+    // REQ-004: Expanded credential set
+    "*service-account*.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".netrc",
+    ".pgpass",
+    ".git-credentials",
+    ".aws/credentials",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_rsa.*",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "*.p12",
+    "*.pfx",
+    ".env.*",
+];
