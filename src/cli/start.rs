@@ -109,6 +109,10 @@ pub struct StartArgs {
     #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
     pub embed_threads: Option<usize>,
 
+    /// Scope cone to index (required for monorepos over FILE_COUNT_THRESHOLD)
+    #[arg(long, value_name = "PATH")]
+    pub scope: Option<String>,
+
     /// Print stable plain text output for simple scripts
     #[arg(long, conflicts_with = "format")]
     pub plain: bool,
@@ -160,7 +164,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     };
 
     let mut registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let mut indexing_config = config::resolve_indexing_config(
         args.jobs,
         args.embed_threads,
         registry.indexing_config_for_context(&worktree_context),
@@ -237,6 +241,69 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             already_registered && matches!(format, OutputFormat::Human),
         );
         return Ok(());
+    }
+
+    // REQ-003: Before running initial index, check the monorepo file-count gate.
+    // Gate fires (blocks) if: index missing AND over threshold AND no scope provided.
+    let gate_readiness =
+        crate::mcp::ops::classify_readiness(&project_root, &source_root, &worktree_context).await;
+
+    // Compute launch_subdir for facts envelope suggestions (same logic as mcp/ops::resolve_project)
+    let canonical_launch_dir = match std::path::Path::new(&args.path).canonicalize() {
+        Ok(p) => p,
+        Err(_) => std::path::Path::new(&args.path).to_path_buf(),
+    };
+    let launch_subdir =
+        if canonical_launch_dir != source_root && canonical_launch_dir.starts_with(&source_root) {
+            Some(canonical_launch_dir)
+        } else {
+            None
+        };
+
+    let scope_provided = args.scope.is_some();
+    if !scope_provided
+        && crate::mcp::ops::should_return_facts_envelope(
+            &project_root,
+            &source_root,
+            &gate_readiness,
+        )
+        .await
+        .unwrap_or(false)
+    {
+        // Gate fires: return facts envelope instead of indexing
+        match crate::mcp::ops::generate_facts_envelope(&source_root, launch_subdir).await {
+            Ok(facts) => {
+                // Output facts envelope in appropriate format
+                match format {
+                    OutputFormat::Json => {
+                        if let Ok(payload) = serde_json::to_value(&facts) {
+                            println!("{}", payload);
+                        }
+                    }
+                    _ => {
+                        // Human-readable facts envelope output
+                        emit_facts_envelope(&*fmt, &facts);
+                    }
+                }
+                // REQ-003: Exit with error code 1 to signal user must provide --scope
+                return Err(anyhow::anyhow!(
+                    "repository is over file count threshold; use --scope to proceed"
+                ));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to generate facts envelope: {}",
+                    err
+                ));
+            }
+        }
+    }
+
+    // Gate allowed or scope provided: apply scope if given and proceed with indexing
+    if let Some(scope_path) = args.scope {
+        // Convert scope path to vec and apply to indexing config
+        indexing_config.scope_roots = vec![scope_path.clone()];
+        indexing_config.scope_globs = vec![format!("{}/**", scope_path)];
     }
 
     let show_progress_ui = format == OutputFormat::Human;
@@ -529,6 +596,59 @@ fn emit_start_result(
     } else {
         println!("{rendered}");
     }
+}
+
+/// Emit a facts envelope in human-readable format to stdout.
+///
+/// The envelope includes:
+/// - File count statistics
+/// - Vector estimate with bounds
+/// - Ranked scope suggestions
+/// - Workspace manifest detection
+fn emit_facts_envelope(fmt: &dyn Formatter, envelope: &crate::mcp::types::FactsEnvelope) {
+    let mut lines = vec![];
+
+    lines.push(format!(
+        "Repository has {} files (over {} threshold). Indexing requires a scope.",
+        envelope.file_count_total,
+        constants::FILE_COUNT_THRESHOLD
+    ));
+    lines.push(String::new());
+
+    lines.push("Per-directory statistics:".to_string());
+    for stat in &envelope.per_directory_stats {
+        lines.push(format!(
+            "  {}: {} files (~{} vectors)",
+            stat.directory, stat.file_count, stat.estimated_vectors
+        ));
+    }
+    lines.push(String::new());
+
+    lines.push(format!(
+        "Global estimate: {} vectors (range: {}-{})",
+        envelope.vector_estimate_total,
+        envelope
+            .vector_estimate_low
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        envelope
+            .vector_estimate_high
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    lines.push(String::new());
+
+    if !envelope.suggestions.is_empty() {
+        lines.push("To index, choose a scope:".to_string());
+        lines.push("  1up start . --scope <directory>".to_string());
+        lines.push("Examples:".to_string());
+        for suggestion in &envelope.suggestions {
+            lines.push(format!("  1up start . --scope {}", suggestion));
+        }
+    }
+
+    let message = lines.join("\n");
+    println!("{}", fmt.format_message(&message));
 }
 
 /// Classify the state of a project's on-disk index without mutating it.
