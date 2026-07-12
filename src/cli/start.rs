@@ -228,24 +228,21 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         && index_has_content_for_context(&project_root, &worktree_context.context_id).await;
     let scope_provided = args.scope.is_some();
 
-    // Evaluate the monorepo file-count gate ONLY when there is no servable content —
-    // the populated fast path must not pay for a file-count scan. A schema-current
-    // but empty index on a small repo (gate does not fire) is still treated as ready
-    // so the daemon indexes it in the background, preserving the existing-index skip
-    // contract; only an over-threshold, unscoped, empty (or absent) index falls
-    // through to the facts envelope below, closing the H1 gate bypass.
-    let gate_fires = if has_content {
+    // Evaluate the monorepo file-count gate ONLY when there is no servable content
+    // AND no scope was given — the populated fast path must not pay for a file-count
+    // scan, and an explicit `--scope` bypasses the gate by design. A schema-current
+    // but empty index on a small unscoped repo (gate does not fire) is still treated
+    // as ready so the daemon indexes it in the background, preserving the
+    // existing-index skip contract; only an over-threshold, unscoped, empty (or
+    // absent) index falls through to the facts envelope below, closing the H1 gate
+    // bypass.
+    let gate_fires = if has_content || scope_provided {
         false
     } else {
         let gate_readiness =
             crate::mcp::ops::classify_readiness(&project_root, &source_root, &worktree_context)
                 .await;
-        !scope_provided
-            && crate::mcp::ops::should_return_facts_envelope(
-                &project_root,
-                &source_root,
-                &gate_readiness,
-            )
+        crate::mcp::ops::should_return_facts_envelope(&project_root, &source_root, &gate_readiness)
             .await
             .unwrap_or(false)
     };
@@ -253,7 +250,13 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     // Ready-to-serve (skip the foreground initial index) when the index holds content
     // for this context, OR it is schema-current but small enough that the gate does
     // not fire (the daemon will index it in the background after registration).
-    let index_ready = has_content || (schema_current && !gate_fires);
+    //
+    // REQ-002: a `--scope` on an EMPTY (or absent) index must NOT be treated as ready
+    // — the ready branch returns before scope application/indexing (line ~315), so the
+    // daemon would then index the FULL repo, silently discarding the scope (the exact
+    // full-repo accident the scope is meant to prevent). Force the scoped foreground
+    // index whenever a scope is provided and there is no servable content yet.
+    let index_ready = has_content || (schema_current && !gate_fires && !scope_provided);
 
     let daemon_state = lifecycle::probe_daemon()?;
 
