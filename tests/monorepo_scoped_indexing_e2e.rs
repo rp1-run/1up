@@ -461,8 +461,19 @@ fn monorepo_scope_narrowing_atomic_rebuild() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Check current scope
-    let result1 = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // Both cones' scope publishes asynchronously — the rebuild publishes its scope when
+    // it lands, not when oneup_start returns — so poll for both to appear rather than
+    // reading status once (a single read races the second cone's publish and flakes,
+    // exactly as the widening test above already guards against).
+    let result1 = wait_for_status(
+        &mut client,
+        "both cones in index_scope before narrowing",
+        |env| {
+            env["data"]["index_scope"]["roots"]
+                .as_array()
+                .is_some_and(|roots| roots.len() == 2)
+        },
+    );
     let envelope1 = mcp_structured(&result1);
     let roots1 = envelope1["data"]["index_scope"]["roots"]
         .as_array()
@@ -480,8 +491,17 @@ fn monorepo_scope_narrowing_atomic_rebuild() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Check narrowed scope
-    let result2 = client.call_tool(TOOL_STATUS, serde_json::json!({}));
+    // The narrowing rebuild swaps atomically and republishes scope asynchronously, so
+    // poll for the single remaining cone rather than reading status once.
+    let result2 = wait_for_status(
+        &mut client,
+        "single cone in index_scope after narrowing",
+        |env| {
+            env["data"]["index_scope"]["roots"]
+                .as_array()
+                .is_some_and(|roots| roots.len() == 1)
+        },
+    );
     let envelope2 = mcp_structured(&result2);
     let roots2 = envelope2["data"]["index_scope"]["roots"]
         .as_array()

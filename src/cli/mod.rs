@@ -188,7 +188,11 @@ is ever removed.")]
 
     /// Internal: daemon worker process (not for direct use)
     #[command(name = "__worker", hide = true)]
-    Worker,
+    Worker {
+        /// Project path (for diagnosability in ps/lsof output, ignored at runtime)
+        #[arg(value_name = "PROJECT_PATH")]
+        _project_path: Option<String>,
+    },
 }
 
 impl Command {
@@ -210,7 +214,7 @@ impl Command {
             | Command::Impact(_)
             | Command::Structural(_)
             | Command::Mcp(_)
-            | Command::Worker => None,
+            | Command::Worker { .. } => None,
         }
     }
 }
@@ -269,7 +273,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let format = resolve_maintenance_format(args.format, maintenance_format);
             update::exec(args, format).await
         }
-        Command::Worker => crate::daemon::worker::run().await.map_err(|e| e.into()),
+        Command::Worker { .. } => crate::daemon::worker::run().await.map_err(|e| e.into()),
     }
 }
 

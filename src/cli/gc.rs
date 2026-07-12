@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use serde_json::json;
+use tracing;
 
 use crate::cli::project_status_files::prune_daemon_context_status;
 use crate::daemon::lifecycle::acquire_rebuild_lock;
@@ -16,6 +17,7 @@ use crate::shared::project::resolve_project_root;
 use crate::shared::types::{OutputFormat, WorktreeContext};
 use crate::storage::db::Db;
 use crate::storage::segments::{self, ContextDeletionCounts, IndexedContextRow};
+use std::io;
 
 /// Arguments for the `gc` command. The authoritative long-form help (preview-first
 /// safety model, what is and is not prunable) is the `long_about` on the `Gc` arm in
@@ -247,6 +249,25 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = config::project_db_path(&state_root);
 
     if !db_path.exists() {
+        // A failed first-index (e.g. SIGKILL mid-rebuild) can leave orphan staging
+        // DBs (index.db.rebuild-<uuid>) even though the main index.db was never
+        // created. Under --apply, reclaim them — but only if `.1up` already exists
+        // (so we never create it just to sweep) and while holding the rebuild lock
+        // (so we never delete an in-progress first rebuild's staging DB) (M1).
+        if args.apply && config::project_dot_dir(&state_root).exists() {
+            match acquire_rebuild_lock(&state_root) {
+                Ok(_lock) => {
+                    if let Err(err) = sweep_staging_databases(&state_root) {
+                        eprintln!("warning: could not sweep staging databases: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipped staging sweep (a rebuild may be in progress): {err}"
+                    );
+                }
+            }
+        }
         println!(
             "No 1up index found at {}. Nothing to prune.",
             state_root.display()
@@ -314,8 +335,8 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    // Preview (default), or nothing to prune: write nothing, report what would happen.
-    if !args.apply || candidates.is_empty() {
+    // Preview (default): write nothing, report what would happen.
+    if !args.apply {
         render(
             format,
             &GcReport {
@@ -334,12 +355,15 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Apply: hold the single-writer rebuild lock while we delete rows and compact, so
-    // no concurrent rebuild races the prune.
+    // Apply: hold the single-writer rebuild lock while we delete rows, compact, AND
+    // sweep orphan staging DBs, so no concurrent rebuild races the prune. This runs
+    // even when there are no context candidates so orphan staging databases (left by
+    // a hard-killed or failed-first rebuild) are still reclaimed (M1) — previously
+    // the whole apply path was skipped when `candidates` was empty.
     let _rebuild_lock = acquire_rebuild_lock(&state_root)?;
     let mut deleted = ContextDeletionCounts::default();
     let mut vacuum_error: Option<String> = None;
-    {
+    if !candidates.is_empty() {
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect_tuned().await?;
         for candidate in &candidates {
@@ -365,11 +389,19 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
              Stop the daemon (`1up stop`) and re-run `1up gc --apply` to reclaim disk."
         ));
     }
-    if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
-        warnings.push(format!("could not update daemon status file: {err}"));
+    if !pruned_ids.is_empty() {
+        if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
+            warnings.push(format!("could not update daemon status file: {err}"));
+        }
+        if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
+            warnings.push(format!("could not update project registry: {err}"));
+        }
     }
-    if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
-        warnings.push(format!("could not update project registry: {err}"));
+
+    // Sweep orphaned staging databases (index.db.rebuild-<uuid>) left behind by hard
+    // kills — always, even with no context candidates, under the rebuild lock held above.
+    if let Err(err) = sweep_staging_databases(&state_root) {
+        warnings.push(format!("could not sweep staging databases: {err}"));
     }
 
     let size_after = std::fs::metadata(&db_path).map(|m| m.len()).ok();
@@ -382,7 +414,7 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
             total_contexts,
             candidates: &candidates,
             deleted,
-            vacuumed: !args.no_vacuum && vacuum_error.is_none(),
+            vacuumed: !args.no_vacuum && vacuum_error.is_none() && !candidates.is_empty(),
             size_before,
             size_after,
             warnings: &warnings,
@@ -519,6 +551,37 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Sweep orphaned staging databases (index.db.rebuild-<uuid>) from the .1up directory.
+/// These are left behind when a rebuild is hard-killed (e.g., SIGKILL) before finalization.
+/// Returns Ok(()) on success (whether or not any files were found and deleted).
+fn sweep_staging_databases(state_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dot_1up = config::project_dot_dir(state_root);
+    if !dot_1up.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&dot_1up)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        if file_name_str.starts_with(config::STAGING_INDEX_DB_PREFIX) {
+            if let Err(err) = std::fs::remove_file(&path) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "failed to remove staging database {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1113,6 +1176,52 @@ mod tests {
             segments::freelist_reclaimable_bytes(&conn).await.unwrap(),
             0,
             "gc --apply must VACUUM after pruning, leaving no freed-but-unreturned pages"
+        );
+    }
+
+    #[test]
+    fn sweep_staging_databases_removes_orphaned_rebuild_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dot_1up = temp_dir.path().join(".1up");
+        std::fs::create_dir(&dot_1up).unwrap();
+
+        // Create some staging database files
+        let staging_file_1 = dot_1up.join("index.db.rebuild-12345678-abcd-1234-abcd-123456789abc");
+        let staging_file_2 = dot_1up.join("index.db.rebuild-87654321-dcba-4321-dcba-987654321def");
+        let regular_file = dot_1up.join("index.db");
+
+        std::fs::write(&staging_file_1, "staging data 1").unwrap();
+        std::fs::write(&staging_file_2, "staging data 2").unwrap();
+        std::fs::write(&regular_file, "regular db").unwrap();
+
+        // Verify files exist before sweep
+        assert!(staging_file_1.exists());
+        assert!(staging_file_2.exists());
+        assert!(regular_file.exists());
+
+        // Run sweep
+        sweep_staging_databases(temp_dir.path()).expect("sweep should succeed");
+
+        // Verify staging files are gone but regular file remains
+        assert!(
+            !staging_file_1.exists(),
+            "staging database should be removed"
+        );
+        assert!(
+            !staging_file_2.exists(),
+            "staging database should be removed"
+        );
+        assert!(regular_file.exists(), "regular index.db should remain");
+    }
+
+    #[test]
+    fn sweep_staging_databases_handles_missing_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Don't create .1up directory
+        let result = sweep_staging_databases(temp_dir.path());
+        assert!(
+            result.is_ok(),
+            "sweep should succeed on missing .1up directory"
         );
     }
 }

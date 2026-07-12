@@ -2173,6 +2173,29 @@ fn create_current_index(dir: &Path) {
     });
 }
 
+/// Count segments stored for `file_path` (repo-relative) in the first worktree
+/// context of the project's index. Returns 0 if the DB/context/file is absent.
+fn segment_count_for_file(dir: &Path, file_path: &str) -> usize {
+    block_on(async {
+        let Ok(db) = Db::open_ro(&project_db_path(dir)).await else {
+            return 0;
+        };
+        let Ok(conn) = db.connect() else {
+            return 0;
+        };
+        let Ok(contexts) = segments::list_worktree_contexts(&conn).await else {
+            return 0;
+        };
+        let Some(ctx) = contexts.first() else {
+            return 0;
+        };
+        segments::get_segments_by_file_for_context(&conn, &ctx.context_id, file_path)
+            .await
+            .map(|segs| segs.len())
+            .unwrap_or(0)
+    })
+}
+
 fn seed_current_index_for_context(dir: &Path, context_id: &str) {
     fs::create_dir_all(dir.join(".1up")).unwrap();
     fs::write(dir.join(".1up").join("project_id"), "context-count-project").unwrap();
@@ -2899,6 +2922,206 @@ fn start_contention_preserves_existing_daemon() {
 
     let second_status = wait_for_daemon_running(&canonical_home, &canonical_dir);
     assert_eq!(second_status["pid"].as_u64(), Some(first_pid));
+}
+
+/// REQ-003/H1: an EMPTY schema-current index (schema initialized, zero segments —
+/// e.g. an interrupted initial index, or an index created before the repo grew past
+/// the threshold) must NOT be treated as ready and must NOT bypass the monorepo
+/// file-count gate. Before the fix, a schema-current index short-circuited to
+/// "started" regardless of content, so a grown repo never got gated. Now an
+/// over-threshold repo whose index holds no content still emits the facts envelope
+/// (exit 1). A populated over-threshold index is served (see
+/// `gate_keyed_on_completed_run_not_partial_index` in start_monorepo_gate.rs); this
+/// guards the empty/interrupted half of that contract.
+#[cfg(unix)]
+#[test]
+fn start_over_threshold_with_empty_index_still_gates() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    // Real git repo with 150 files, over the 100 threshold set on the command below.
+    let git_init = StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&canonical_dir)
+        .output()
+        .expect("git init failed");
+    assert!(git_init.status.success(), "git init should succeed");
+    for i in 0..150 {
+        let sub = canonical_dir.join(format!("dir_{}", i / 50));
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            sub.join(format!("file_{i}.rs")),
+            format!("fn func_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    // Empty schema-current index: schema initialized, zero segments for any context.
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let output = std_cmd_with_home(&canonical_home)
+        .env("ONEUP_FILE_COUNT_THRESHOLD", "100")
+        .args(["start", canonical_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "start on an over-threshold repo with an EMPTY index must gate (fail), not report ready; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("threshold") || stdout.contains("scope"),
+        "empty-index gate should emit the facts envelope (threshold/scope); stdout={stdout}",
+    );
+}
+
+/// REQ-002: `1up start --scope <dir>` on an EMPTY schema-current index must run a
+/// SCOPED foreground index, not short-circuit to "ready". `--scope` bypasses the
+/// monorepo gate by design, so an empty-but-current index must not fall into the
+/// ready branch (which returns before scope application) — otherwise the daemon
+/// indexes the FULL repo, silently discarding the scope. Regression: assert only the
+/// in-scope file is recorded and the out-of-scope files are not.
+#[cfg(unix)]
+#[test]
+fn start_scope_on_empty_index_indexes_only_in_scope_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    let git_init = StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&canonical_dir)
+        .output()
+        .expect("git init failed");
+    assert!(git_init.status.success(), "git init should succeed");
+
+    // One in-scope file under `scope/`, four out-of-scope files at the repo root.
+    fs::create_dir_all(canonical_dir.join("scope")).unwrap();
+    fs::write(
+        canonical_dir.join("scope").join("keep.rs"),
+        "pub fn kept() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    for i in 0..4 {
+        fs::write(
+            canonical_dir.join(format!("out_{i}.rs")),
+            format!("pub fn out_{i}() -> i32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+
+    // Empty schema-current index: without the fix, --scope + empty index is treated
+    // as ready and returns before scope application.
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let output = std_cmd_with_home(&canonical_home)
+        .args([
+            "start",
+            canonical_dir.to_str().unwrap(),
+            "--scope",
+            "scope",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scoped start should succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON; err={err} stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+
+    // Must have taken the indexing path (progress present), NOT the ready bypass
+    // (which returns status "started"/"already_running" with progress: null).
+    assert!(
+        !payload["progress"].is_null(),
+        "scoped start on an empty index must run a foreground index, not short-circuit to ready; payload={payload}"
+    );
+    assert_eq!(
+        payload["progress"]["files_indexed"].as_u64(),
+        Some(1),
+        "scoped start must index exactly the one in-scope file; payload={payload}"
+    );
+
+    // The recorded index must contain the in-scope file and none of the out-of-scope
+    // files — the scope was actually applied, not discarded.
+    assert!(
+        segment_count_for_file(&canonical_dir, "scope/keep.rs") > 0,
+        "in-scope file scope/keep.rs should be indexed"
+    );
+    for i in 0..4 {
+        assert_eq!(
+            segment_count_for_file(&canonical_dir, &format!("out_{i}.rs")),
+            0,
+            "out-of-scope file out_{i}.rs must not be indexed"
+        );
+    }
+
+    // Scope metadata must also be PERSISTED to the registry's indexing config: the
+    // daemon rebuilds in the background using this config, so if the scope were not
+    // recorded the next rebuild would re-index the whole repo and reintroduce the
+    // full-repo accident asynchronously.
+    let registry_path = test_data_dir(&canonical_home).join("projects.json");
+    let registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    let entry = registry["projects"]
+        .as_array()
+        .and_then(|p| p.first())
+        .expect("the scoped project should be registered");
+    let indexing = entry
+        .get("indexing")
+        .expect("registry entry must carry an indexing config");
+    let scope_roots = indexing
+        .get("scope_roots")
+        .and_then(|s| s.as_array())
+        .expect("registry entry must record scope_roots metadata");
+    assert_eq!(
+        scope_roots
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["scope"],
+        "the validated `--scope scope` must be recorded as the sole scope root; entry={entry}"
+    );
+    // scope_globs is what actually constrains the (foreground AND daemon) scan.
+    let scope_globs = indexing
+        .get("scope_globs")
+        .and_then(|s| s.as_array())
+        .expect("registry entry must record scope_globs metadata");
+    assert_eq!(
+        scope_globs
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["scope/**"],
+        "scope_globs must exclusively admit the scoped subtree; entry={entry}"
+    );
 }
 
 #[cfg(unix)]

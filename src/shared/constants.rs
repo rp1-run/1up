@@ -561,3 +561,55 @@ pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
 /// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
 /// switch either way.
 pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
+
+/// Per-file size cap to prevent unbounded memory use (REQ-005, T6).
+///
+/// Files larger than this are skipped with a warning during indexing.
+/// 2MB (~2_097_152 bytes) is conservative: it prevents the OOM observed with
+/// a 9.4MB minified file (1.49GB RSS), while most source files stay well
+/// below this threshold. Skipped files produce zero segments and do not
+/// contribute to search indices.
+pub const MAX_FILE_SIZE_BYTES: u64 = 2_097_152; // 2 MB
+
+/// Per-file segment cap to prevent unbounded segment generation (REQ-005, T6).
+///
+/// A single file generating more than this many segments is capped gracefully:
+/// excess segments are skipped and a warning is logged. Conservative limit of
+/// 1000 segments: a typical file generates 10-50 segments, and dense/minified
+/// files would generate hundreds. The 9.4MB pathological case produced 400k
+/// segments; this cap prevents such pathological unbounded growth.
+pub const MAX_SEGMENTS_PER_FILE: usize = 1_000;
+
+/// Default-on secret-file patterns, excluded from indexing regardless of
+/// configuration (REQ-004). Globs are evaluated against repo-relative paths
+/// and filename alone, so `secrets.yaml` matches at any depth, and
+/// `id_rsa*` matches `id_rsa`, `id_rsa.pub`, etc.
+///
+/// Expanded set covers: API credentials (*.pem, *.key, credentials.json,
+/// .env, .env.*), service accounts (service-account.json), configuration
+/// credentials (.netrc, .pgpass, .git-credentials), cloud provider
+/// credentials (.aws/credentials), and SSH/TLS keys (id_rsa*, id_ed25519,
+/// *.p12, *.pfx), secrets YAML (secrets.yaml, secrets.yml).
+pub const DEFAULT_SECRET_GLOBS: &[&str] = &[
+    // Original 4 patterns (T5 builds on these)
+    "*.pem",
+    "*.key",
+    "credentials.json",
+    ".env",
+    // REQ-004: Expanded credential set
+    "*service-account*.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".netrc",
+    ".pgpass",
+    ".git-credentials",
+    ".aws/credentials",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_rsa.*",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "*.p12",
+    "*.pfx",
+    ".env.*",
+];

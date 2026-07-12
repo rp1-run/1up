@@ -2,10 +2,8 @@ use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+use crate::shared::constants::DEFAULT_SECRET_GLOBS;
 use crate::shared::errors::{IndexingError, OneupError};
-
-/// Default-on secret-file patterns, excluded regardless of configuration.
-const DEFAULT_SECRET_GLOBS: &[&str] = &["*.pem", "*.key", "credentials.json", ".env"];
 
 /// Shared inclusion/exclusion predicate reused by the indexer scanner,
 /// `oneup_context`, and the daemon watcher so exclusion rules cannot drift
@@ -181,12 +179,32 @@ mod tests {
 
     #[test]
     fn secret_pattern_excluded_regardless_of_include_glob() {
+        // REQ-004: Secret exclusion glob expansion. Verify all patterns from
+        // DEFAULT_SECRET_GLOBS are excluded even when include glob is "*".
         let f = filter(&["*"], &[], &[]);
+        // Original 4 patterns
         assert!(f.is_excluded(Path::new("secrets/credentials.json"), false));
         assert!(f.is_excluded(Path::new("id_rsa.pem"), false));
         assert!(f.is_excluded(Path::new("service.key"), false));
         assert!(f.is_excluded(Path::new(".env"), false));
         assert!(f.is_excluded(Path::new("config/.env"), false));
+        // Expanded patterns (REQ-004)
+        assert!(f.is_excluded(Path::new("gcp-service-account.json"), false));
+        assert!(f.is_excluded(Path::new("service-account-key.json"), false));
+        assert!(f.is_excluded(Path::new("secrets.yaml"), false));
+        assert!(f.is_excluded(Path::new("secrets.yml"), false));
+        assert!(f.is_excluded(Path::new(".netrc"), false));
+        assert!(f.is_excluded(Path::new(".pgpass"), false));
+        assert!(f.is_excluded(Path::new(".git-credentials"), false));
+        assert!(f.is_excluded(Path::new(".aws/credentials"), false));
+        assert!(f.is_excluded(Path::new("id_rsa"), false));
+        assert!(f.is_excluded(Path::new("id_rsa.pub"), false));
+        assert!(f.is_excluded(Path::new("id_ed25519"), false));
+        assert!(f.is_excluded(Path::new("id_ed25519.pub"), false));
+        assert!(f.is_excluded(Path::new("cert.p12"), false));
+        assert!(f.is_excluded(Path::new("cert.pfx"), false));
+        assert!(f.is_excluded(Path::new(".env.local"), false));
+        assert!(f.is_excluded(Path::new(".env.prod"), false));
     }
 
     #[test]

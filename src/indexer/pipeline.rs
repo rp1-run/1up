@@ -174,8 +174,8 @@ use crate::shared::config;
 use crate::shared::constants::{
     DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS, HF_MODEL_REPO,
-    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE,
+    MAX_FILE_SIZE_BYTES, MAX_SEGMENTS_PER_FILE, NON_EMBEDDABLE_CHUNK_LANGUAGES,
+    PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -715,6 +715,35 @@ async fn prepare_scoped_run_inputs(
 }
 
 fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
+    // REQ-005: Check per-file size cap before reading into memory to prevent OOM
+    // on large minified/generated files. Skip and warn if over cap; zero segments.
+    if scanned_file.file_size > MAX_FILE_SIZE_BYTES {
+        warn!(
+            "skipping file exceeding {}MB size cap ({}B): {}",
+            MAX_FILE_SIZE_BYTES / (1024 * 1024),
+            scanned_file.file_size,
+            scanned_file.relative_path
+        );
+        return ParseResultKind::Skipped(ParseSkipReason::Unreadable);
+    }
+
+    // REQ-005: Check unsupported extension before hash/read to avoid re-reading
+    // large unsupported files (e.g., .sql, .bin) on every scan.
+    if !matches!(
+        parser::SupportedLanguage::from_extension(&scanned_file.extension),
+        Some(parser::SupportedLanguage::Markdown)
+    ) && !parser::use_structural_parser(&scanned_file.extension)
+        && !parser::is_language_supported(&scanned_file.extension)
+    {
+        debug!(
+            "skipping unsupported extension .{}: {}",
+            scanned_file.extension, scanned_file.relative_path
+        );
+        return ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
+            scanned_file.extension,
+        ));
+    }
+
     let content = match std::fs::read_to_string(&scanned_file.path) {
         Ok(content) => content,
         Err(err) => {
@@ -732,7 +761,7 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
         return ParseResultKind::Skipped(ParseSkipReason::Unchanged);
     }
 
-    let segments = if matches!(
+    let mut segments = if matches!(
         parser::SupportedLanguage::from_extension(&scanned_file.extension),
         Some(parser::SupportedLanguage::Markdown)
     ) {
@@ -763,6 +792,22 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
             scanned_file.extension,
         ));
     };
+
+    // REQ-005: enforce the per-file segment cap uniformly across ALL parser
+    // outputs — markdown, tree-sitter, and the fallback chunker — not just the
+    // chunker (which caps internally). A pathologically dense file (e.g. thousands
+    // of tiny top-level definitions) would otherwise blow past the cap and bloat
+    // the index. The 2 MiB size cap above bounds worst-case content, but this is
+    // the documented global segment guard.
+    if segments.len() > MAX_SEGMENTS_PER_FILE {
+        warn!(
+            "capping segments for {} at {} (parser produced {})",
+            scanned_file.relative_path,
+            MAX_SEGMENTS_PER_FILE,
+            segments.len()
+        );
+        segments.truncate(MAX_SEGMENTS_PER_FILE);
+    }
 
     if segments.is_empty() {
         debug!(
@@ -3133,6 +3178,41 @@ mod tests {
         assert!(
             breadcrumbs.contains(&Some("README > Title > Install")),
             "expected file-stem-rooted heading breadcrumb; found {breadcrumbs:?}"
+        );
+    }
+
+    #[test]
+    fn parse_scanned_file_caps_dense_structural_output_at_the_segment_limit() {
+        // H3: the per-file segment cap must apply to tree-sitter output too, not
+        // only the fallback chunker. A source with far more top-level definitions
+        // than the cap must be truncated to MAX_SEGMENTS_PER_FILE.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dense.rs");
+        let function_count = MAX_SEGMENTS_PER_FILE + 500;
+        let mut source = String::with_capacity(function_count * 32);
+        for i in 0..function_count {
+            source.push_str(&format!("pub fn func_{i}() {{ let _ = {i}; }}\n"));
+        }
+        fs::write(&path, &source).unwrap();
+
+        let outcome = parse_scanned_file(ScannedWorkItem {
+            sequence_id: 0,
+            relative_path: "dense.rs".to_string(),
+            path,
+            extension: "rs".to_string(),
+            stored_hash: None,
+            file_size: source.len() as u64,
+            modified_ns: 0,
+        });
+
+        let parsed = match outcome {
+            ParseResultKind::Ready(parsed) => parsed,
+            other => panic!("expected ready parse outcome, got {other:?}"),
+        };
+        assert_eq!(
+            parsed.segments.len(),
+            MAX_SEGMENTS_PER_FILE,
+            "structural parser output must be capped at {MAX_SEGMENTS_PER_FILE} segments"
         );
     }
 

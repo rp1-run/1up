@@ -61,20 +61,68 @@ pub fn write_project_id(project_root: &Path) -> Result<String, OneupError> {
 
 #[allow(dead_code)]
 pub fn ensure_project_id(project_root: &Path) -> Result<(String, bool), OneupError> {
-    match read_project_id(project_root) {
-        Ok(project_id) => return Ok((project_id, false)),
+    let outcome = match read_project_id(project_root) {
+        Ok(project_id) => (project_id, false),
         Err(err) if !is_not_initialized(&err) => return Err(err),
-        Err(_) => {}
+        Err(_) => {
+            let dot_dir = ensure_secure_project_root(project_root)
+                .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+
+            match create_project_id_if_absent(&dot_dir) {
+                Ok(project_id) => (project_id, true),
+                Err(err) if is_already_initialized(&err) => (read_project_id(project_root)?, false),
+                Err(err) => return Err(err),
+            }
+        }
+    };
+
+    // Guarantee `.1up` is git-ignored whenever a project id is resolved — not only
+    // on first creation — so the `init`, `start`, already-initialized, and MCP
+    // auto-init flows (which all funnel through here) protect local index state. The
+    // direct index-db creators `index`/`reindex` do not funnel through here, so they
+    // call `ensure_project_gitignore` themselves. Best-effort: a gitignore failure
+    // must never block project resolution.
+    if let Err(err) = ensure_project_gitignore(project_root) {
+        tracing::warn!(
+            "failed to ensure .1up/.gitignore at {}: {err}",
+            project_root.display()
+        );
     }
 
+    Ok(outcome)
+}
+
+/// Ensure `.1up/.gitignore` exists containing `*`, so local index state
+/// (`index.db`, staging DBs, status files) is never accidentally committed.
+///
+/// Idempotent and symlink-safe: the leaf is probed with `symlink_metadata` (which
+/// does not follow symlinks), returning early only for an existing *regular* file,
+/// then written through the root-clamped atomic writer, which rejects a symlink
+/// leaf and clamps the parent to the approved `.1up` root. A pre-existing regular
+/// `.gitignore` is left untouched (never clobbered); a dangling symlink at the
+/// path is refused rather than followed.
+pub fn ensure_project_gitignore(project_root: &Path) -> Result<(), OneupError> {
     let dot_dir = ensure_secure_project_root(project_root)
         .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+    let gitignore_path = dot_dir.join(".gitignore");
 
-    match create_project_id_if_absent(&dot_dir) {
-        Ok(project_id) => Ok((project_id, true)),
-        Err(err) if is_already_initialized(&err) => Ok((read_project_id(project_root)?, false)),
-        Err(err) => Err(err),
+    if std::fs::symlink_metadata(&gitignore_path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
+
+    atomic_replace(
+        &gitignore_path,
+        b"*",
+        &dot_dir,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    )
+    .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
+
+    Ok(())
 }
 
 /// Checks whether a project has been initialized at the given root.

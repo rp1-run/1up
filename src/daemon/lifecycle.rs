@@ -309,13 +309,15 @@ pub fn send_sigterm(pid: u32) -> Result<(), OneupError> {
     Ok(())
 }
 
-pub fn spawn_daemon(binary_path: &Path) -> Result<u32, OneupError> {
+pub fn spawn_daemon(binary_path: &Path, source_root: &Path) -> Result<u32, OneupError> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    let source_root_display = source_root.display().to_string();
     let child = unsafe {
         Command::new(binary_path)
             .arg("__worker")
+            .arg(&source_root_display)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -328,7 +330,10 @@ pub fn spawn_daemon(binary_path: &Path) -> Result<u32, OneupError> {
     };
 
     let pid = child.id();
-    debug!("spawned daemon worker (pid={pid})");
+    debug!(
+        "spawned daemon worker (pid={pid}) for source_root: {}",
+        source_root.display()
+    );
     Ok(pid)
 }
 
@@ -367,7 +372,7 @@ pub fn ensure_daemon(
     registry.register_with_context(project_id, &context, None)?;
 
     let binary = current_binary_path()?;
-    let pid = spawn_daemon(&binary)?;
+    let pid = spawn_daemon(&binary, source_root)?;
     debug!(
         "auto-started daemon (pid={pid}) for project at {}",
         project_root.display()

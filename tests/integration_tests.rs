@@ -5760,7 +5760,17 @@ fn cli_symbol_empty_results_emits_nothing_on_stdout() {
 
 #[test]
 fn cli_worktree_resolves_to_main_repo_index() {
-    let _guard = HideModelGuard::new();
+    // Isolated fake HOME so this test gets its OWN daemon instead of sharing the
+    // process-wide real-HOME daemon with every other bare-`cmd()` test. Under the
+    // `security-check` job those tests hammer a single shared daemon at once, and
+    // this test's post-`reindex` search would race that daemon's background
+    // atomic-swap schema-init window — exceeding the CLI read path's ~450ms
+    // tolerating-init budget — and flake with "index schema is missing or
+    // unreadable". A private HOME removes the cross-test contention; the seed marker
+    // keeps indexing FTS-only. Mirrors `branch_context_search_excludes_other_worktree_only_content`.
+    let home = TempDir::new().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
 
     let tmp = TempDir::new().unwrap();
     let tmp_root = tmp.path().canonicalize().unwrap();
@@ -5790,12 +5800,12 @@ fn cli_worktree_resolves_to_main_repo_index() {
         .output()
         .expect("git commit failed");
 
-    cmd()
+    cmd_with_home(&canonical_home)
         .args(["init", main_repo.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
 
-    cmd()
+    cmd_with_home(&canonical_home)
         .args(["index", main_repo.to_str().unwrap(), "--format", "json"])
         .assert()
         .success();
@@ -5815,7 +5825,7 @@ fn cli_worktree_resolves_to_main_repo_index() {
 
     assert!(worktree_path.join(".git").is_file());
 
-    let status_output = cmd()
+    let status_output = cmd_with_home(&canonical_home)
         .args([
             "status",
             worktree_path.to_str().unwrap(),
@@ -5836,7 +5846,7 @@ fn cli_worktree_resolves_to_main_repo_index() {
 
     // Core command from a worktree renders lean rows and should succeed against
     // the main repo's index.
-    cmd()
+    cmd_with_home(&canonical_home)
         .args(["search", "greet", "--path", worktree_path.to_str().unwrap()])
         .assert()
         .success();
@@ -5849,7 +5859,7 @@ fn cli_worktree_resolves_to_main_repo_index() {
     )
     .unwrap();
 
-    cmd()
+    cmd_with_home(&canonical_home)
         .args([
             "reindex",
             worktree_path.to_str().unwrap(),
@@ -5859,7 +5869,7 @@ fn cli_worktree_resolves_to_main_repo_index() {
         .assert()
         .success();
 
-    let rows = search_rows(&worktree_path, "worktree_exclusive");
+    let rows = search_rows_with_home(&canonical_home, &worktree_path, "worktree_exclusive");
     assert!(
         !rows.is_empty(),
         "worktree-only symbol should appear after reindex from worktree"

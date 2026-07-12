@@ -50,7 +50,7 @@ pub fn send_sigterm(_pid: u32) -> Result<(), OneupError> {
     Err(unsupported_daemon_error())
 }
 
-pub fn spawn_daemon(_binary_path: &Path) -> Result<u32, OneupError> {
+pub fn spawn_daemon(_binary_path: &Path, _source_root: &Path) -> Result<u32, OneupError> {
     Err(unsupported_daemon_error())
 }
 

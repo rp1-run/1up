@@ -31,6 +31,7 @@ use crate::shared::project;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings, WorktreeContext};
 use crate::storage::db::Db;
 use crate::storage::schema;
+use crate::storage::segments;
 
 const STARTUP_GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -109,6 +110,10 @@ pub struct StartArgs {
     #[arg(long, value_name = "N", value_parser = crate::cli::parse_positive_usize)]
     pub embed_threads: Option<usize>,
 
+    /// Scope cone to index (required for monorepos over FILE_COUNT_THRESHOLD)
+    #[arg(long, value_name = "PATH")]
+    pub scope: Option<String>,
+
     /// Print stable plain text output for simple scripts
     #[arg(long, conflicts_with = "format")]
     pub plain: bool,
@@ -160,7 +165,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     };
 
     let mut registry = Registry::load()?;
-    let indexing_config = config::resolve_indexing_config(
+    let mut indexing_config = config::resolve_indexing_config(
         args.jobs,
         args.embed_threads,
         registry.indexing_config_for_context(&worktree_context),
@@ -174,6 +179,9 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             project_root.display()
         );
     }
+    // REQ-004: `.1up/.gitignore` (with `*`) is ensured inside `ensure_project_id`
+    // above on every resolve, so `init`-first and already-initialized projects are
+    // covered too — no separate gitignore step is needed here.
     let init_prefix = if initialized_now {
         format!("Initialized project {project_id}. ")
     } else {
@@ -209,14 +217,53 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         }
         ProjectIndexState::Current | ProjectIndexState::NotCreated => {}
     }
-    let index_ready = matches!(index_state, ProjectIndexState::Current);
+    // REQ-003/H1: a schema-`Current` index only counts as ready-to-serve when it
+    // actually holds indexed content for this context. An index created while the
+    // repo (or this worktree) had no indexable files is schema-current but empty.
+    // Treating such an empty index as ready would let the early return below
+    // permanently bypass the monorepo file-count gate once the repo grows past the
+    // threshold — the H1 bypass.
+    let schema_current = matches!(index_state, ProjectIndexState::Current);
+    let has_content = schema_current
+        && index_has_content_for_context(&project_root, &worktree_context.context_id).await;
+    let scope_provided = args.scope.is_some();
+
+    // Evaluate the monorepo file-count gate ONLY when there is no servable content
+    // AND no scope was given — the populated fast path must not pay for a file-count
+    // scan, and an explicit `--scope` bypasses the gate by design. A schema-current
+    // but empty index on a small unscoped repo (gate does not fire) is still treated
+    // as ready so the daemon indexes it in the background, preserving the
+    // existing-index skip contract; only an over-threshold, unscoped, empty (or
+    // absent) index falls through to the facts envelope below, closing the H1 gate
+    // bypass.
+    let gate_fires = if has_content || scope_provided {
+        false
+    } else {
+        let gate_readiness =
+            crate::mcp::ops::classify_readiness(&project_root, &source_root, &worktree_context)
+                .await;
+        crate::mcp::ops::should_return_facts_envelope(&project_root, &source_root, &gate_readiness)
+            .await
+            .unwrap_or(false)
+    };
+
+    // Ready-to-serve (skip the foreground initial index) when the index holds content
+    // for this context, OR it is schema-current but small enough that the gate does
+    // not fire (the daemon will index it in the background after registration).
+    //
+    // REQ-002: a `--scope` on an EMPTY (or absent) index must NOT be treated as ready
+    // — the ready branch returns before scope application/indexing (line ~315), so the
+    // daemon would then index the FULL repo, silently discarding the scope (the exact
+    // full-repo accident the scope is meant to prevent). Force the scoped foreground
+    // index whenever a scope is provided and there is no servable content yet.
+    let index_ready = has_content || (schema_current && !gate_fires && !scope_provided);
 
     let daemon_state = lifecycle::probe_daemon()?;
 
     if index_ready {
         let already_registered = registry_contains_context(&registry, &worktree_context);
         registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
-        let daemon = ensure_daemon_after_registration(daemon_state)?;
+        let daemon = ensure_daemon_after_registration(daemon_state, &source_root)?;
         let msg =
             current_index_start_message(&init_prefix, &project_root, already_registered, &daemon);
         let result = StartResultInfo {
@@ -239,6 +286,70 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Not ready-to-serve. If the gate fired (over threshold, unscoped, no content),
+    // emit the facts envelope instead of indexing (REQ-003). Only reachable when the
+    // index is absent or empty AND the gate fired.
+    if gate_fires {
+        // Compute launch_subdir for facts envelope suggestions (same logic as
+        // mcp/ops::resolve_project).
+        let canonical_launch_dir = match std::path::Path::new(&args.path).canonicalize() {
+            Ok(p) => p,
+            Err(_) => std::path::Path::new(&args.path).to_path_buf(),
+        };
+        let launch_subdir = if canonical_launch_dir != source_root
+            && canonical_launch_dir.starts_with(&source_root)
+        {
+            Some(canonical_launch_dir)
+        } else {
+            None
+        };
+
+        // Gate fires: return facts envelope instead of indexing
+        match crate::mcp::ops::generate_facts_envelope(&source_root, launch_subdir).await {
+            Ok(facts) => {
+                // Output facts envelope in appropriate format
+                match format {
+                    OutputFormat::Json => {
+                        if let Ok(payload) = serde_json::to_value(&facts) {
+                            println!("{}", payload);
+                        }
+                    }
+                    _ => {
+                        // Human-readable facts envelope output
+                        emit_facts_envelope(&*fmt, &facts);
+                    }
+                }
+                // REQ-003: Exit with error code 1 to signal user must provide --scope
+                return Err(anyhow::anyhow!(
+                    "repository is over file count threshold; use --scope to proceed"
+                ));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to generate facts envelope: {}",
+                    err
+                ));
+            }
+        }
+    }
+
+    // Gate allowed or scope provided: apply scope if given and proceed with indexing
+    if let Some(scope_path) = args.scope {
+        // REQ-002: validate the requested scope through the shared validator so an
+        // absolute path, a `../` escape, or an empty scope is refused with a clear
+        // error instead of silently producing a zero-file, misleadingly "ready"
+        // index. Use the canonicalized root (trailing slash trimmed) it returns.
+        let scope_roots = crate::shared::types::ScopeRoots::new(vec![scope_path.clone()])
+            .map_err(|err| anyhow::anyhow!("invalid --scope `{scope_path}`: {err}"))?;
+        let canonical_scope = scope_roots
+            .roots()
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("--scope must not be empty"))?;
+        indexing_config.scope_roots = vec![canonical_scope.clone()];
+        indexing_config.scope_globs = vec![format!("{}/**", canonical_scope)];
+    }
+
     let show_progress_ui = format == OutputFormat::Human;
     let stats = run_initial_index(
         &project_root,
@@ -248,7 +359,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     )
     .await?;
     registry.register_with_context(&project_id, &worktree_context, Some(indexing_config))?;
-    let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?)?;
+    let daemon = ensure_daemon_after_registration(lifecycle::probe_daemon()?, &source_root)?;
     let msg = indexed_start_message(
         &init_prefix,
         stats.files_indexed,
@@ -344,6 +455,7 @@ fn registry_contains_context(
 
 fn ensure_daemon_after_registration(
     initial_state: DaemonProbeState,
+    source_root: &std::path::Path,
 ) -> anyhow::Result<DaemonStartOutcome> {
     match initial_state {
         DaemonProbeState::Running(pid) => {
@@ -356,7 +468,7 @@ fn ensure_daemon_after_registration(
         DaemonProbeState::Starting => observe_existing_daemon_startup(),
         DaemonProbeState::NotRunning => {
             let binary = lifecycle::current_binary_path()?;
-            let spawned_pid = lifecycle::spawn_daemon(&binary)?;
+            let spawned_pid = lifecycle::spawn_daemon(&binary, source_root)?;
             observe_spawned_daemon(spawned_pid)
         }
     }
@@ -528,6 +640,59 @@ fn emit_start_result(
     } else {
         println!("{rendered}");
     }
+}
+
+/// Emit a facts envelope in human-readable format to stdout.
+///
+/// The envelope includes:
+/// - File count statistics
+/// - Vector estimate with bounds
+/// - Ranked scope suggestions
+/// - Workspace manifest detection
+fn emit_facts_envelope(fmt: &dyn Formatter, envelope: &crate::mcp::types::FactsEnvelope) {
+    let mut lines = vec![];
+
+    lines.push(format!(
+        "Repository has {} files (over {} threshold). Indexing requires a scope.",
+        envelope.file_count_total,
+        constants::FILE_COUNT_THRESHOLD
+    ));
+    lines.push(String::new());
+
+    lines.push("Per-directory statistics:".to_string());
+    for stat in &envelope.per_directory_stats {
+        lines.push(format!(
+            "  {}: {} files (~{} vectors)",
+            stat.directory, stat.file_count, stat.estimated_vectors
+        ));
+    }
+    lines.push(String::new());
+
+    lines.push(format!(
+        "Global estimate: {} vectors (range: {}-{})",
+        envelope.vector_estimate_total,
+        envelope
+            .vector_estimate_low
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        envelope
+            .vector_estimate_high
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    lines.push(String::new());
+
+    if !envelope.suggestions.is_empty() {
+        lines.push("To index, choose a scope:".to_string());
+        lines.push("  1up start . --scope <directory>".to_string());
+        lines.push("Examples:".to_string());
+        for suggestion in &envelope.suggestions {
+            lines.push(format!("  1up start . --scope {}", suggestion));
+        }
+    }
+
+    let message = lines.join("\n");
+    println!("{}", fmt.format_message(&message));
 }
 
 /// Classify the state of a project's on-disk index without mutating it.
@@ -757,6 +922,29 @@ async fn run_initial_index(
     .await?;
 
     Ok(stats)
+}
+
+/// Whether the current index actually holds indexed content for `context_id`.
+///
+/// A schema-`Current` index can still be empty — e.g. it was created by an earlier
+/// `start`/`init` while the repo (or this worktree) had no indexable files. Such an
+/// index must NOT be treated as a completed build, or the monorepo file-count gate
+/// (REQ-003) is permanently bypassed once the repo grows. Mirrors the zero-segment
+/// => not-built classification used by `1up list` and the MCP readiness path.
+/// Best-effort: any DB open/query error is treated as "no content" so the safe
+/// path (gate + initial index) is taken.
+async fn index_has_content_for_context(project_root: &Path, context_id: &str) -> bool {
+    let db_path = config::project_db_path(project_root);
+    let Ok(db) = Db::open_ro(&db_path).await else {
+        return false;
+    };
+    let Ok(conn) = db.connect() else {
+        return false;
+    };
+    segments::count_segments_for_context(&conn, context_id)
+        .await
+        .map(|count| count > 0)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

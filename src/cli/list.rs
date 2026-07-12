@@ -150,9 +150,12 @@ async fn read_index_health(
     let Ok(conn) = db.connect() else {
         return (ProjectListIndexStatus::Unavailable, None, None);
     };
-    if schema::ensure_current(&conn, &schema::SchemaContext::new(&db_path, project_root))
-        .await
-        .is_err()
+    if schema::ensure_current_tolerating_init(
+        &conn,
+        &schema::SchemaContext::new(&db_path, project_root),
+    )
+    .await
+    .is_err()
     {
         return (ProjectListIndexStatus::Unavailable, None, None);
     }
