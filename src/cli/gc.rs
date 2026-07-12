@@ -249,6 +249,25 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
     let db_path = config::project_db_path(&state_root);
 
     if !db_path.exists() {
+        // A failed first-index (e.g. SIGKILL mid-rebuild) can leave orphan staging
+        // DBs (index.db.rebuild-<uuid>) even though the main index.db was never
+        // created. Under --apply, reclaim them — but only if `.1up` already exists
+        // (so we never create it just to sweep) and while holding the rebuild lock
+        // (so we never delete an in-progress first rebuild's staging DB) (M1).
+        if args.apply && config::project_dot_dir(&state_root).exists() {
+            match acquire_rebuild_lock(&state_root) {
+                Ok(_lock) => {
+                    if let Err(err) = sweep_staging_databases(&state_root) {
+                        eprintln!("warning: could not sweep staging databases: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipped staging sweep (a rebuild may be in progress): {err}"
+                    );
+                }
+            }
+        }
         println!(
             "No 1up index found at {}. Nothing to prune.",
             state_root.display()
@@ -316,8 +335,8 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    // Preview (default), or nothing to prune: write nothing, report what would happen.
-    if !args.apply || candidates.is_empty() {
+    // Preview (default): write nothing, report what would happen.
+    if !args.apply {
         render(
             format,
             &GcReport {
@@ -336,12 +355,15 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Apply: hold the single-writer rebuild lock while we delete rows and compact, so
-    // no concurrent rebuild races the prune.
+    // Apply: hold the single-writer rebuild lock while we delete rows, compact, AND
+    // sweep orphan staging DBs, so no concurrent rebuild races the prune. This runs
+    // even when there are no context candidates so orphan staging databases (left by
+    // a hard-killed or failed-first rebuild) are still reclaimed (M1) — previously
+    // the whole apply path was skipped when `candidates` was empty.
     let _rebuild_lock = acquire_rebuild_lock(&state_root)?;
     let mut deleted = ContextDeletionCounts::default();
     let mut vacuum_error: Option<String> = None;
-    {
+    if !candidates.is_empty() {
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect_tuned().await?;
         for candidate in &candidates {
@@ -367,14 +389,17 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
              Stop the daemon (`1up stop`) and re-run `1up gc --apply` to reclaim disk."
         ));
     }
-    if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
-        warnings.push(format!("could not update daemon status file: {err}"));
-    }
-    if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
-        warnings.push(format!("could not update project registry: {err}"));
+    if !pruned_ids.is_empty() {
+        if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
+            warnings.push(format!("could not update daemon status file: {err}"));
+        }
+        if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
+            warnings.push(format!("could not update project registry: {err}"));
+        }
     }
 
-    // Sweep orphaned staging databases (index.db.rebuild-<uuid>) left behind by hard kills
+    // Sweep orphaned staging databases (index.db.rebuild-<uuid>) left behind by hard
+    // kills — always, even with no context candidates, under the rebuild lock held above.
     if let Err(err) = sweep_staging_databases(&state_root) {
         warnings.push(format!("could not sweep staging databases: {err}"));
     }
@@ -389,7 +414,7 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
             total_contexts,
             candidates: &candidates,
             deleted,
-            vacuumed: !args.no_vacuum && vacuum_error.is_none(),
+            vacuumed: !args.no_vacuum && vacuum_error.is_none() && !candidates.is_empty(),
             size_before,
             size_after,
             warnings: &warnings,

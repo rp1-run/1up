@@ -1654,6 +1654,51 @@ fn count_files_gitignore_aware(
     Ok(count)
 }
 
+/// Deregister and stop watching a project whose source root has been deleted, so
+/// the daemon stops trying to re-index a gone worktree. Handles both the main-repo
+/// case (`state_root == source_root`) and a deleted *linked* worktree (`state_root`
+/// survives, `source_root` gone). Best-effort registry + watch cleanup; returns
+/// default stats so the daemon loop keeps serving other projects.
+fn deregister_deleted_project(
+    context_id: &str,
+    projects: &mut ProjectStates,
+    watcher: &mut FileWatcher,
+    lock_root: &Path,
+) -> Result<pipeline::PipelineStats, OneupError> {
+    if let Some(removed_state) = projects.remove(context_id) {
+        warn!(
+            "project source root deleted or inaccessible: {}; deregistering",
+            removed_state.source_root.display()
+        );
+        let context = WorktreeContext {
+            context_id: removed_state.context.context_id.clone(),
+            state_root: removed_state.project_root.clone(),
+            source_root: removed_state.source_root.clone(),
+            main_worktree_root: removed_state.context.main_worktree_root.clone(),
+            worktree_role: removed_state.context.worktree_role,
+            git_dir: removed_state.context.git_dir.clone(),
+            common_git_dir: removed_state.context.common_git_dir.clone(),
+            branch_name: removed_state.context.branch_name.clone(),
+            branch_ref: removed_state.context.branch_ref.clone(),
+            head_oid: removed_state.context.head_oid.clone(),
+            branch_status: removed_state.context.branch_status,
+        };
+        if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context(&context)) {
+            warn!(
+                "failed to deregister deleted project {}: {err}",
+                lock_root.display()
+            );
+        }
+        if let Err(err) = watcher.unwatch(&removed_state.source_root) {
+            warn!(
+                "failed to unwatch deleted source root {}: {err}",
+                removed_state.source_root.display()
+            );
+        }
+    }
+    Ok(pipeline::PipelineStats::default())
+}
+
 async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
@@ -1668,11 +1713,22 @@ async fn run_project(
     // its event loop while a one-shot rebuild holds the lock. The guard releases
     // on drop — including when an in-flight pass is cancelled and this frame
     // unwinds — freeing the lock for the restarted binary.
-    let lock_root = projects
-        .get(context_id)
-        .expect("dirty project must exist while running")
-        .project_root
-        .clone();
+    let (lock_root, source_missing) = {
+        let state = projects
+            .get(context_id)
+            .expect("dirty project must exist while running");
+        (state.project_root.clone(), !state.source_root.exists())
+    };
+    // REQ-001: detect a deleted source root BEFORE attempting the rebuild lock.
+    // For a *linked* worktree the state_root (main repo, owns `.1up/`) can survive
+    // while the source_root (the worktree) is deleted, so the lock — which is keyed
+    // on state_root — would still acquire and the deleted-source cleanup below
+    // would never run, leaving the daemon refreshing a gone worktree. Statting
+    // source_root independently covers both the main-repo case (state_root ==
+    // source_root) and the linked-worktree split.
+    if source_missing {
+        return deregister_deleted_project(context_id, projects, watcher, &lock_root);
+    }
     let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
@@ -1686,57 +1742,13 @@ async fn run_project(
             .into());
         }
         Err(e) => {
-            // REQ-001: Detect missing/deleted project root (lock acquire failure).
-            // Check if the project still exists. If not, deregister and clear dirty
-            // flag so the daemon doesn't spin forever trying to re-index it.
+            // The source root existed at the top of this pass; a lock error here is
+            // a genuine lock/IO fault, or a race where the root vanished mid-pass.
+            // Re-check once for that race and clean up, otherwise propagate.
             let state = projects.get(context_id).expect("dirty project must exist");
             if !state.source_root.exists() {
-                warn!(
-                    "project source root deleted or inaccessible: {}; deregistering",
-                    state.source_root.display()
-                );
-                // Clear dirty flag and mark project for removal so the daemon loop
-                // stops trying to re-index this context. Remove from active projects.
-                let removed_state = projects.remove(context_id);
-
-                // Best-effort deregister: source root is gone but we try to clean up the registry entry
-                if let Some(removed_state) = removed_state {
-                    let context = WorktreeContext {
-                        context_id: removed_state.context.context_id.clone(),
-                        state_root: removed_state.project_root.clone(),
-                        source_root: removed_state.source_root.clone(),
-                        main_worktree_root: removed_state.context.main_worktree_root.clone(),
-                        worktree_role: removed_state.context.worktree_role,
-                        git_dir: removed_state.context.git_dir.clone(),
-                        common_git_dir: removed_state.context.common_git_dir.clone(),
-                        branch_name: removed_state.context.branch_name.clone(),
-                        branch_ref: removed_state.context.branch_ref.clone(),
-                        head_oid: removed_state.context.head_oid.clone(),
-                        branch_status: removed_state.context.branch_status,
-                    };
-                    if let Err(err) =
-                        Registry::load().and_then(|mut r| r.deregister_context(&context))
-                    {
-                        warn!(
-                            "failed to deregister deleted project {}: {err}",
-                            lock_root.display()
-                        );
-                    }
-
-                    // Stop watching the deleted source root
-                    if let Err(err) = watcher.unwatch(&removed_state.source_root) {
-                        warn!(
-                            "failed to unwatch deleted source root {}: {err}",
-                            removed_state.source_root.display()
-                        );
-                    }
-                }
-
-                // Return ok with default stats to continue processing other projects
-                return Ok(pipeline::PipelineStats::default());
+                return deregister_deleted_project(context_id, projects, watcher, &lock_root);
             }
-
-            // Lock acquire failed for some other reason; propagate the error
             return Err(e);
         }
     };
@@ -2946,6 +2958,83 @@ mod tests {
         assert!(
             !projects.contains_key(&key),
             "deleted project must be removed from projects map so daemon stops re-selecting it"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_project_deregisters_deleted_linked_worktree_when_state_root_survives() {
+        // H4: for a *linked* worktree the state_root (main repo, owns `.1up/`) can
+        // survive while the source_root (the worktree) is deleted. The rebuild lock
+        // is keyed on state_root, so it still acquires — the daemon must detect the
+        // gone source_root BEFORE the lock and deregister, instead of spinning on a
+        // missing worktree. Distinct from the main-repo case (state == source).
+        let main_tmp = tempfile::tempdir().unwrap();
+        let main_root = main_tmp.path().canonicalize().unwrap();
+        let worktree_tmp = tempfile::tempdir().unwrap();
+        let worktree_root = worktree_tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                worktree_root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        // The index/state DB lives under the *main* (state) root, not the worktree.
+        let db_path = config::project_db_path(&main_root);
+        ensure_secure_project_root(&main_root).unwrap();
+        let db = Db::open_rw(&db_path).await.unwrap();
+        schema::initialize(&db.connect_tuned().await.unwrap())
+            .await
+            .unwrap();
+
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(
+                &main_root,
+                &worktree_root,
+                db,
+                ProjectRunState {
+                    running: false,
+                    dirty: true,
+                    pending_scope: Some(RunScope::Full),
+                    pending_fallback_reason: None,
+                },
+            ),
+        );
+
+        let cancel_token = CancellationToken::new();
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+
+        // Delete ONLY the linked worktree (source root); the main/state root survives.
+        drop(worktree_tmp);
+        assert!(
+            !worktree_root.exists(),
+            "worktree source root must be deleted for the test"
+        );
+        assert!(
+            main_root.exists(),
+            "main/state root must survive for the test"
+        );
+
+        let result = run_project(
+            &key,
+            &mut projects,
+            &cancel_token,
+            &mut search_requests_rx,
+            &mut watcher,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_project must succeed and return default stats when the linked worktree is deleted, got: {result:?}"
+        );
+        assert!(
+            !projects.contains_key(&key),
+            "deleted linked worktree must be removed from the projects map so the daemon stops re-selecting it"
         );
     }
 

@@ -1780,22 +1780,36 @@ async fn warm_index_connection(
 ) -> anyhow::Result<Connection> {
     let current_identity = index_file_identity(canonical_db_path);
 
-    let mut cache = warm_index_cache().lock().await;
-    if let Some(warm) = cache.get(canonical_db_path) {
-        if warm.identity == current_identity {
-            debug_assert!(
-                warm.schema_validated,
-                "a cache-resident warm index must have already passed schema validation"
-            );
-            return Ok(warm.conn.clone());
+    // Fast path: serve a validated warm connection under a short-lived lock.
+    {
+        let cache = warm_index_cache().lock().await;
+        if let Some(warm) = cache.get(canonical_db_path) {
+            if warm.identity == current_identity {
+                debug_assert!(
+                    warm.schema_validated,
+                    "a cache-resident warm index must have already passed schema validation"
+                );
+                return Ok(warm.conn.clone());
+            }
         }
     }
 
+    // Miss: open and validate WITHOUT holding the cache lock. Use the tolerant
+    // validator so a direct read (search/get/symbol/impact/structural/overview)
+    // rides out the daemon's first-index window — tables present, version row not
+    // yet committed — instead of failing with "reindex required", mirroring the CLI
+    // read paths and the readiness classifier (M2). Validating off-lock means that
+    // retry never stalls unrelated readers on the global warm cache, and the async
+    // sleep yields the runtime.
     let db = Db::open_ro(db_path).await?;
     let conn = db.connect_tuned().await?;
-    schema::ensure_current(&conn, &schema::SchemaContext::new(db_path, state_root)).await?;
+    schema::ensure_current_tolerating_init(&conn, &schema::SchemaContext::new(db_path, state_root))
+        .await?;
 
+    // Publish under the lock. A concurrent miss may have populated the entry in the
+    // meantime; overwriting with our freshly validated identity is harmless.
     let served = conn.clone();
+    let mut cache = warm_index_cache().lock().await;
     cache.insert(
         canonical_db_path.to_path_buf(),
         WarmIndex {

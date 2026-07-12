@@ -202,6 +202,18 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
         registry.indexing_config_for_context(&worktree_context),
     )?;
     let show_progress_ui = format == OutputFormat::Human;
+
+    // REQ-004/H2: `1up reindex` rebuilds `.1up/index.db` directly (it does not funnel
+    // through `ensure_project_id`), so ensure `.1up/.gitignore` here too — otherwise
+    // a reindex-first user on a fresh repo could commit their local index.db.
+    // Best-effort: a gitignore failure must never block the rebuild.
+    if let Err(err) = crate::shared::project::ensure_project_gitignore(&project_root) {
+        tracing::warn!(
+            "failed to ensure .1up/.gitignore at {}: {err}",
+            project_root.display()
+        );
+    }
+
     let stats = run_reindex_once(
         &worktree_context,
         &project_root,

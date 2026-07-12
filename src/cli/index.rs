@@ -216,6 +216,17 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     ensure_secure_project_root(&project_root)?;
 
+    // REQ-004/H2: `1up index` creates `.1up/index.db` directly (it does not funnel
+    // through `ensure_project_id`), so ensure `.1up/.gitignore` here too — otherwise
+    // an index-first user on a fresh repo could commit their local index.db.
+    // Best-effort: a gitignore failure must never block indexing.
+    if let Err(err) = crate::shared::project::ensure_project_gitignore(&project_root) {
+        tracing::warn!(
+            "failed to ensure .1up/.gitignore at {}: {err}",
+            project_root.display()
+        );
+    }
+
     let stats = run_index_once(
         &db_path,
         &worktree_context,

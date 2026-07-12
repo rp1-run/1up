@@ -241,3 +241,64 @@ fn secret_files_are_excluded_from_indexing() {
 
     println!("REQ-004 test passed: secret files excluded, .1up/.gitignore created");
 }
+
+/// REQ-004/H2 regression: `1up index` creates `.1up/index.db` directly without
+/// funneling through `ensure_project_id`, so it must ensure `.1up/.gitignore` on its
+/// own. Before the fix, an index-first user on a fresh repo got a committable
+/// `index.db` with no `.gitignore`. This guards against a refactor dropping that
+/// call. `1up index` is a synchronous one-shot, so no daemon-readiness poll is
+/// needed.
+#[test]
+fn index_first_run_creates_gitignore_without_prior_start() {
+    let _hide_model = HideModelGuard::new();
+
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&home_path);
+
+    let temp_base = TempDir::new().unwrap();
+    let project_path = temp_base.path().join("index_first");
+    fs::create_dir_all(&project_path).unwrap();
+
+    let git_init = StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&project_path)
+        .output()
+        .expect("git init failed");
+    assert!(git_init.status.success(), "git init should succeed");
+
+    fs::create_dir_all(project_path.join("src")).unwrap();
+    fs::write(
+        project_path.join("src").join("lib.rs"),
+        "pub fn hello_world() { println!(\"Hello from source code\"); }",
+    )
+    .unwrap();
+
+    let canonical_project_path = project_path.canonicalize().unwrap();
+
+    // `1up index` as the VERY FIRST command — no prior `start`/`init` established a
+    // project id or gitignore.
+    let index_output = run_1up_command(
+        &home_path,
+        &["index", canonical_project_path.to_str().unwrap()],
+    );
+    assert!(
+        index_output.status.success(),
+        "1up index should succeed; stderr={}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+
+    // The index.db must exist AND be git-ignored.
+    let db_path = project_path.join(".1up").join("index.db");
+    assert!(db_path.exists(), "1up index should create .1up/index.db");
+    let gitignore_path = project_path.join(".1up").join(".gitignore");
+    assert!(
+        gitignore_path.exists(),
+        ".1up/.gitignore should be created by `1up index` on a fresh repo (H2)"
+    );
+    let gitignore_content = fs::read_to_string(&gitignore_path).unwrap();
+    assert_eq!(
+        gitignore_content, "*",
+        ".1up/.gitignore should contain exactly `*` to exclude all local index state"
+    );
+}

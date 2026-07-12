@@ -63,6 +63,10 @@ fn daemon_sigterm_terminates_cleanly_after_directory_deletion() {
         .env("XDG_DATA_HOME", home_path.join("data"))
         .env("XDG_CONFIG_HOME", home_path.join("config"))
         .env("ONEUP_DISABLE_MODEL_DOWNLOADS", "1")
+        // Short idle-shutdown so the detached worker self-reaps quickly once the
+        // deleted project empties the registry, making the orphan-worker assertion
+        // below deterministic. Inherited by the spawned `__worker`.
+        .env("ONEUP_DAEMON_IDLE_SHUTDOWN_SECS", "2")
         .spawn()
         .expect("failed to spawn daemon");
 
@@ -118,17 +122,36 @@ fn daemon_sigterm_terminates_cleanly_after_directory_deletion() {
         "daemon should have terminated cleanly within 2 seconds after SIGTERM"
     );
 
-    // Verify no orphaned worker processes remain
-    thread::sleep(Duration::from_millis(500)); // Give processes time to exit
-    let status = std::process::Command::new("pgrep")
-        .args(["-P", &daemon_pid.to_string(), "__worker"])
-        .output()
-        .expect("pgrep command failed");
-
-    let orphaned_workers = String::from_utf8_lossy(&status.stdout);
+    // Verify no orphaned/spinning worker remains. The worker is a DETACHED process
+    // (`1up __worker <source_root>`), reparented away from the MCP frontend, so the
+    // previous `pgrep -P <mcp_pid> __worker` filtered on a parent that never owns it
+    // AND matched `__worker` as a process *name* (the process name is `1up`) — a
+    // double false-green that always passed. Match the worker's full argv scoped to
+    // THIS test's unique project path instead, and poll: after the project deletion
+    // the worker deregisters the gone project, empties, and self-exits within the
+    // short idle-shutdown window set above. Scoped so it can never observe or kill
+    // an unrelated daemon.
+    let worker_pattern = format!("__worker {}", project_path.display());
+    let worker_deadline = Instant::now() + Duration::from_secs(15);
+    let mut worker_gone = false;
+    while Instant::now() < worker_deadline {
+        let found = std::process::Command::new("pgrep")
+            .args(["-f", &worker_pattern])
+            .output()
+            .expect("pgrep command failed");
+        if String::from_utf8_lossy(&found.stdout).trim().is_empty() {
+            worker_gone = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    // Path-scoped cleanup so a still-spinning worker never leaks into the host.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", &worker_pattern])
+        .output();
     assert!(
-        orphaned_workers.trim().is_empty(),
-        "no orphaned __worker processes should remain after SIGTERM; found: {}",
-        orphaned_workers
+        worker_gone,
+        "detached __worker for {} must self-exit after the project is deleted; it was still running",
+        project_path.display()
     );
 }

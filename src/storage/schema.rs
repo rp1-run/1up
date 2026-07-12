@@ -343,7 +343,12 @@ pub async fn ensure_current_tolerating_init(
                 if attempt >= DB_LOCK_RETRY_ATTEMPTS || !is_initializing_schema_error(&err) {
                     return Err(err);
                 }
-                thread::sleep(retry_delay);
+                // Yield rather than block: this is an async fn and a caller (the
+                // MCP warm-index path) may await it while holding a shared lock,
+                // so a blocking `thread::sleep` here would stall unrelated tasks
+                // on the same runtime during the init window. Mirrors the prior
+                // MCP wrapper's `tokio::time::sleep`.
+                tokio::time::sleep(retry_delay).await;
             }
         }
     }

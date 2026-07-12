@@ -108,9 +108,13 @@ fn stop_deleted_directory_succeeds_via_registry_fallback() {
         .expect("project should be registered before deletion")
         .to_string();
 
-    // Kill any __worker processes that might be holding locks on the directory
+    // Kill only THIS test's worker (holding locks on the directory), scoped to its
+    // unique worktree path so it can never terminate an unrelated developer or test
+    // daemon. The worker is spawned as `1up __worker <source_root>` (see
+    // lifecycle::spawn_daemon), and each test uses a distinct TempDir.
+    let worker_pattern = format!("__worker {}", canonical_project_path.display());
     let _ = StdCommand::new("pkill")
-        .args(["-f", "target/debug/1up __worker"])
+        .args(["-f", &worker_pattern])
         .output();
 
     // Give the daemon a moment to release file handles

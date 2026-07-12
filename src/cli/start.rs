@@ -31,6 +31,7 @@ use crate::shared::project;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings, WorktreeContext};
 use crate::storage::db::Db;
 use crate::storage::schema;
+use crate::storage::segments;
 
 const STARTUP_GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_GUARD_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -177,12 +178,10 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             project_id,
             project_root.display()
         );
-        // REQ-004: Create .1up/.gitignore with `*` to prevent index.db git-add
-        if let Err(err) = create_gitignore_at_project_init(&project_root) {
-            tracing::warn!("failed to create .1up/.gitignore: {}", err);
-            // Non-fatal: gitignore is a usability improvement but not a blocker
-        }
     }
+    // REQ-004: `.1up/.gitignore` (with `*`) is ensured inside `ensure_project_id`
+    // above on every resolve, so `init`-first and already-initialized projects are
+    // covered too — no separate gitignore step is needed here.
     let init_prefix = if initialized_now {
         format!("Initialized project {project_id}. ")
     } else {
@@ -218,7 +217,15 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         }
         ProjectIndexState::Current | ProjectIndexState::NotCreated => {}
     }
-    let index_ready = matches!(index_state, ProjectIndexState::Current);
+    // REQ-003: a schema-`Current` index only counts as "ready" if it actually
+    // holds indexed content for this context. An index created while the repo (or
+    // this worktree) had no indexable files is schema-current but empty; treating
+    // it as ready would let the early return below permanently bypass the monorepo
+    // file-count gate once the repo grows. A current-but-empty index falls through
+    // to the gate + initial-index path instead, mirroring the zero-segment =>
+    // not-built classification used by `1up list` and the MCP readiness path.
+    let index_ready = matches!(index_state, ProjectIndexState::Current)
+        && index_has_content_for_context(&project_root, &worktree_context.context_id).await;
 
     let daemon_state = lifecycle::probe_daemon()?;
 
@@ -306,9 +313,19 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     // Gate allowed or scope provided: apply scope if given and proceed with indexing
     if let Some(scope_path) = args.scope {
-        // Convert scope path to vec and apply to indexing config
-        indexing_config.scope_roots = vec![scope_path.clone()];
-        indexing_config.scope_globs = vec![format!("{}/**", scope_path)];
+        // REQ-002: validate the requested scope through the shared validator so an
+        // absolute path, a `../` escape, or an empty scope is refused with a clear
+        // error instead of silently producing a zero-file, misleadingly "ready"
+        // index. Use the canonicalized root (trailing slash trimmed) it returns.
+        let scope_roots = crate::shared::types::ScopeRoots::new(vec![scope_path.clone()])
+            .map_err(|err| anyhow::anyhow!("invalid --scope `{scope_path}`: {err}"))?;
+        let canonical_scope = scope_roots
+            .roots()
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("--scope must not be empty"))?;
+        indexing_config.scope_roots = vec![canonical_scope.clone()];
+        indexing_config.scope_globs = vec![format!("{}/**", canonical_scope)];
     }
 
     let show_progress_ui = format == OutputFormat::Human;
@@ -885,29 +902,27 @@ async fn run_initial_index(
     Ok(stats)
 }
 
-/// Create .1up/.gitignore with `*` to prevent index.db from being git-added.
-/// REQ-004: Non-fatal helper; ignores errors if the file already exists or
-/// cannot be written (e.g., permission issues on read-only filesystem).
-fn create_gitignore_at_project_init(project_root: &Path) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let dot_dir = project_root.join(".1up");
-    let gitignore_path = dot_dir.join(".gitignore");
-
-    // If .gitignore already exists, skip (idempotent)
-    if gitignore_path.exists() {
-        return Ok(());
-    }
-
-    // Create .1up directory if needed (should already exist after ensure_project_id)
-    std::fs::create_dir_all(&dot_dir)?;
-
-    // Write "*" to .gitignore to exclude everything in .1up (including index.db)
-    let mut file = std::fs::File::create(&gitignore_path)?;
-    file.write_all(b"*")?;
-    file.sync_all()?;
-
-    Ok(())
+/// Whether the current index actually holds indexed content for `context_id`.
+///
+/// A schema-`Current` index can still be empty — e.g. it was created by an earlier
+/// `start`/`init` while the repo (or this worktree) had no indexable files. Such an
+/// index must NOT be treated as a completed build, or the monorepo file-count gate
+/// (REQ-003) is permanently bypassed once the repo grows. Mirrors the zero-segment
+/// => not-built classification used by `1up list` and the MCP readiness path.
+/// Best-effort: any DB open/query error is treated as "no content" so the safe
+/// path (gate + initial index) is taken.
+async fn index_has_content_for_context(project_root: &Path, context_id: &str) -> bool {
+    let db_path = config::project_db_path(project_root);
+    let Ok(db) = Db::open_ro(&db_path).await else {
+        return false;
+    };
+    let Ok(conn) = db.connect() else {
+        return false;
+    };
+    segments::count_segments_for_context(&conn, context_id)
+        .await
+        .map(|count| count > 0)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
