@@ -51,7 +51,9 @@ fn cmd_with_home(home: &Path) -> Command {
 
 /// Wait for the indexing to complete by checking status
 fn wait_for_indexing_complete(home: &Path, project_path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Generous under parallel CI load: the security-check job runs the whole suite
+    // concurrently, so a fresh FTS-only index can take well over 10s to reach ready.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = cmd_with_home(home)
             .args(["status", project_path.to_str().unwrap(), "--format", "json"])
@@ -113,6 +115,25 @@ fn get_segment_count_for_file_blocking(project_path: &Path, file_path: &str) -> 
     })
 }
 
+/// Poll the on-disk segment count for `file_path` until it reaches at least
+/// `min_expected`, or a generous deadline elapses; returns the last observed count.
+/// Indexing is asynchronous — `start` runs a foreground initial index AND the daemon
+/// then refreshes by rebuilding into a staging DB and atomically swapping it in — so
+/// a single read taken right after `wait_for_indexing_complete` (which silently
+/// returns on timeout) can race the swap window and observe 0 under parallel CI
+/// load. Polling for the expected content removes that flake without weakening the
+/// assertion.
+fn wait_for_file_segments(project_path: &Path, file_path: &str, min_expected: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let count = get_segment_count_for_file_blocking(project_path, file_path);
+        if count >= min_expected || Instant::now() >= deadline {
+            return count;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn test_file_above_size_cap_is_skipped() {
     let _hide_model = HideModelGuard::new();
@@ -156,9 +177,10 @@ fn test_file_above_size_cap_is_skipped() {
     // Wait for indexing to complete
     wait_for_indexing_complete(&home_path, &project_path);
 
-    // Get segment counts by querying the database directly
+    // Poll the normal file until it has segments (ensures indexing reached it), then
+    // read the oversized file — which must have produced none.
+    let normal_segments = wait_for_file_segments(&project_path, "normal.txt", 1);
     let oversized_segments = get_segment_count_for_file_blocking(&project_path, "oversized.txt");
-    let normal_segments = get_segment_count_for_file_blocking(&project_path, "normal.txt");
 
     // Cleanup
     let _ = cmd_with_home(&home_path)
@@ -220,8 +242,8 @@ fn test_segment_cap_bounds_dense_file() {
     // Wait for indexing to complete
     wait_for_indexing_complete(&home_path, &project_path);
 
-    // Get segment count for the dense file
-    let segment_count = get_segment_count_for_file_blocking(&project_path, "dense.txt");
+    // Poll the dense file until it has segments, then assert the cap bound.
+    let segment_count = wait_for_file_segments(&project_path, "dense.txt", 1);
 
     // Cleanup
     let _ = cmd_with_home(&home_path)
@@ -279,8 +301,8 @@ fn test_normal_file_indexes_successfully() {
     // Wait for indexing to complete
     wait_for_indexing_complete(&home_path, &project_path);
 
-    // Get segment count
-    let segment_count = get_segment_count_for_file_blocking(&project_path, "example.rs");
+    // Poll until the file has segments — indexing is async and can lag under load.
+    let segment_count = wait_for_file_segments(&project_path, "example.rs", 1);
 
     // Cleanup
     let _ = cmd_with_home(&home_path)
