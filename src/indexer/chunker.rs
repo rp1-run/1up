@@ -1,5 +1,6 @@
-use crate::shared::constants::{CHUNK_OVERLAP, CHUNK_WINDOW_SIZE};
+use crate::shared::constants::{CHUNK_OVERLAP, CHUNK_WINDOW_SIZE, MAX_SEGMENTS_PER_FILE};
 use crate::shared::types::{ParsedSegment, SegmentRole};
+use tracing::warn;
 
 /// Detects a language name from a file extension for unsupported tree-sitter languages.
 fn language_from_extension(ext: &str) -> String {
@@ -42,6 +43,10 @@ fn language_from_extension(ext: &str) -> String {
 ///
 /// Returns `Vec<ParsedSegment>` with `block_type` set to `"chunk"` and line numbers tracking
 /// each window position. The window advances by `window_size - overlap` lines on each step.
+///
+/// REQ-005: Respects per-file segment cap (`MAX_SEGMENTS_PER_FILE`) to prevent unbounded
+/// segment generation from pathological files. If segment count would exceed the cap,
+/// truncates at the cap and logs a warning; the excess content is not segmented.
 pub fn chunk_file(
     content: &str,
     file_extension: &str,
@@ -66,6 +71,16 @@ pub fn chunk_file(
     let mut start = 0;
 
     while start < lines.len() {
+        // REQ-005: Stop generating segments if cap is reached.
+        if segments.len() >= MAX_SEGMENTS_PER_FILE {
+            warn!(
+                "chunker capping segment generation at {} for file with extension .{}; \
+                 excess content not indexed",
+                MAX_SEGMENTS_PER_FILE, file_extension
+            );
+            break;
+        }
+
         let end = (start + effective_window).min(lines.len());
         let chunk_lines = &lines[start..end];
         let chunk_content = chunk_lines.join("\n");

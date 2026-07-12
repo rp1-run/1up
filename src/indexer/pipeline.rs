@@ -174,8 +174,8 @@ use crate::shared::config;
 use crate::shared::constants::{
     DEFAULT_INDEX_CONTEXT_ID, EMBEDDING_DIM, EMBEDDING_MAX_TOKENS,
     GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS, HF_MODEL_REPO,
-    NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE,
+    MAX_FILE_SIZE_BYTES, NON_EMBEDDABLE_CHUNK_LANGUAGES, PROGRESS_PERSIST_THROTTLE_MS,
+    PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{IndexingError, OneupError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -715,6 +715,35 @@ async fn prepare_scoped_run_inputs(
 }
 
 fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
+    // REQ-005: Check per-file size cap before reading into memory to prevent OOM
+    // on large minified/generated files. Skip and warn if over cap; zero segments.
+    if scanned_file.file_size > MAX_FILE_SIZE_BYTES {
+        warn!(
+            "skipping file exceeding {}MB size cap ({}B): {}",
+            MAX_FILE_SIZE_BYTES / (1024 * 1024),
+            scanned_file.file_size,
+            scanned_file.relative_path
+        );
+        return ParseResultKind::Skipped(ParseSkipReason::Unreadable);
+    }
+
+    // REQ-005: Check unsupported extension before hash/read to avoid re-reading
+    // large unsupported files (e.g., .sql, .bin) on every scan.
+    if !matches!(
+        parser::SupportedLanguage::from_extension(&scanned_file.extension),
+        Some(parser::SupportedLanguage::Markdown)
+    ) && !parser::use_structural_parser(&scanned_file.extension)
+        && !parser::is_language_supported(&scanned_file.extension)
+    {
+        debug!(
+            "skipping unsupported extension .{}: {}",
+            scanned_file.extension, scanned_file.relative_path
+        );
+        return ParseResultKind::Skipped(ParseSkipReason::UnsupportedExtension(
+            scanned_file.extension,
+        ));
+    }
+
     let content = match std::fs::read_to_string(&scanned_file.path) {
         Ok(content) => content,
         Err(err) => {
