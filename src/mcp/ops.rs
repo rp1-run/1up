@@ -826,7 +826,7 @@ pub async fn classify_readiness(
 
     payload.schema_version = schema::get_schema_version(&conn).await.ok().flatten();
 
-    if let Err(err) = ensure_schema_current_tolerating_init(
+    if let Err(err) = schema::ensure_current_tolerating_init(
         &conn,
         &schema::SchemaContext::new(&db_path, source_root),
     )
@@ -979,40 +979,6 @@ pub async fn classify_readiness(
     payload.summary = "The repository is ready for 1up MCP search.".to_string();
 
     payload
-}
-
-/// Run [`schema::ensure_current`], riding out a freshly-initializing index.
-///
-/// `schema::initialize` (invoked by the auto-started daemon when it first opens a
-/// brand-new project DB) creates every table first and writes the `schema_version`
-/// row last, and is not a single transaction. A readiness check that lands inside
-/// that window on a separate read-only connection sees "tables exist, version
-/// absent" and `ensure_current` returns the transient
-/// [`schema::is_initializing_schema_error`] shape. The daemon commits the version
-/// row microseconds later, so we retry on exactly that shape (reusing the shared
-/// DB-lock retry budget) to let initialization settle before classifying. This
-/// mirrors the lock-retry hardening of `schema::table_has_column` and never retries
-/// a genuine version mismatch (`out of date` / `newer than this binary supports`),
-/// which fails fast on the first attempt.
-async fn ensure_schema_current_tolerating_init(
-    conn: &Connection,
-    ctx: &schema::SchemaContext<'_>,
-) -> Result<(), OneupError> {
-    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
-    let mut attempt = 0;
-    loop {
-        match schema::ensure_current(conn, ctx).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                attempt += 1;
-                if attempt >= DB_LOCK_RETRY_ATTEMPTS || !schema::is_initializing_schema_error(&err)
-                {
-                    return Err(err);
-                }
-                tokio::time::sleep(retry_delay).await;
-            }
-        }
-    }
 }
 
 /// Populate the advisory head-drift fields from the head OID recorded at the

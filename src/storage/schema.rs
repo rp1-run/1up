@@ -312,6 +312,43 @@ pub async fn ensure_current(conn: &Connection, ctx: &SchemaContext<'_>) -> Resul
     }
 }
 
+/// [`ensure_current`], but tolerant of the brief window in which a freshly
+/// created index has its tables but not yet its `schema_version` row.
+///
+/// [`initialize`] creates every table first and writes the `schema_version`
+/// row last, and is not a single transaction. A reader that races the daemon's
+/// first index — or the atomic swap at the end of a rebuild — can momentarily
+/// see "tables exist, version absent", which [`ensure_current`] reports as the
+/// transient [`is_initializing_schema_error`] shape. The writer commits the
+/// version row microseconds later, so we retry on exactly that shape (reusing
+/// the shared DB-lock retry budget) to let initialization settle. A genuine
+/// version mismatch (`out of date` / `newer than this binary supports`) is a
+/// distinct shape and still fails fast on the first attempt.
+///
+/// Read commands should call this instead of [`ensure_current`] so that
+/// `search`/`status` right after a `reindex` (or during a daemon rebuild) ride
+/// out the window rather than surfacing a spurious "reindex required" — the
+/// same hardening the MCP readiness path already applies.
+pub async fn ensure_current_tolerating_init(
+    conn: &Connection,
+    ctx: &SchemaContext<'_>,
+) -> Result<(), OneupError> {
+    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    let mut attempt = 0;
+    loop {
+        match ensure_current(conn, ctx).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= DB_LOCK_RETRY_ATTEMPTS || !is_initializing_schema_error(&err) {
+                    return Err(err);
+                }
+                thread::sleep(retry_delay);
+            }
+        }
+    }
+}
+
 /// Whether an [`ensure_current`] error is the transient "tables present but no
 /// readable schema version" shape (see [`SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT`]).
 ///
@@ -1190,6 +1227,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!is_initializing_schema_error(&newer_err));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_tolerating_init_passes_on_a_current_schema() {
+        // The happy path: a fully-initialized index validates on the first
+        // attempt, so read commands pay no retry cost once initialization has
+        // settled. (The retry-until-settled behavior itself is exercised by the
+        // integration suite, where reads race the daemon's first index.)
+        let (_db, conn) = setup().await;
+        initialize(&conn).await.unwrap();
+
+        ensure_current_tolerating_init(&conn, &SchemaContext::unspecified())
+            .await
+            .expect("a current schema must validate without retrying");
+    }
+
+    #[tokio::test]
+    async fn ensure_current_tolerating_init_still_fails_fast_on_version_mismatch() {
+        // Tolerating the initialization window must NOT mask a genuine
+        // incompatible schema: an out-of-date index is a distinct shape from the
+        // transient "tables present, version absent" window, so it is surfaced
+        // immediately with its reindex guidance rather than being retried away.
+        let (_db, conn) = setup().await;
+        seed_schema_version(&conn, SCHEMA_VERSION - 1).await;
+
+        let err = ensure_current_tolerating_init(&conn, &SchemaContext::unspecified())
+            .await
+            .unwrap_err();
+        assert!(!is_initializing_schema_error(&err));
+        let msg = err.to_string();
+        assert!(msg.contains("out of date"));
+        assert!(msg.contains("run `1up reindex`"));
     }
 
     #[tokio::test]

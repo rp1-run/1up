@@ -75,7 +75,7 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
             match Db::open_ro(&db_path).await {
                 Ok(db) => match db.connect() {
                     Ok(conn) => {
-                        match schema::ensure_current(
+                        match schema::ensure_current_tolerating_init(
                             &conn,
                             &schema::SchemaContext::new(&db_path, &source_root),
                         )
