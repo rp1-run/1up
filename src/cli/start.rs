@@ -217,15 +217,43 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         }
         ProjectIndexState::Current | ProjectIndexState::NotCreated => {}
     }
-    // REQ-003: a schema-`Current` index only counts as "ready" if it actually
-    // holds indexed content for this context. An index created while the repo (or
-    // this worktree) had no indexable files is schema-current but empty; treating
-    // it as ready would let the early return below permanently bypass the monorepo
-    // file-count gate once the repo grows. A current-but-empty index falls through
-    // to the gate + initial-index path instead, mirroring the zero-segment =>
-    // not-built classification used by `1up list` and the MCP readiness path.
-    let index_ready = matches!(index_state, ProjectIndexState::Current)
+    // REQ-003/H1: a schema-`Current` index only counts as ready-to-serve when it
+    // actually holds indexed content for this context. An index created while the
+    // repo (or this worktree) had no indexable files is schema-current but empty.
+    // Treating such an empty index as ready would let the early return below
+    // permanently bypass the monorepo file-count gate once the repo grows past the
+    // threshold — the H1 bypass.
+    let schema_current = matches!(index_state, ProjectIndexState::Current);
+    let has_content = schema_current
         && index_has_content_for_context(&project_root, &worktree_context.context_id).await;
+    let scope_provided = args.scope.is_some();
+
+    // Evaluate the monorepo file-count gate ONLY when there is no servable content —
+    // the populated fast path must not pay for a file-count scan. A schema-current
+    // but empty index on a small repo (gate does not fire) is still treated as ready
+    // so the daemon indexes it in the background, preserving the existing-index skip
+    // contract; only an over-threshold, unscoped, empty (or absent) index falls
+    // through to the facts envelope below, closing the H1 gate bypass.
+    let gate_fires = if has_content {
+        false
+    } else {
+        let gate_readiness =
+            crate::mcp::ops::classify_readiness(&project_root, &source_root, &worktree_context)
+                .await;
+        !scope_provided
+            && crate::mcp::ops::should_return_facts_envelope(
+                &project_root,
+                &source_root,
+                &gate_readiness,
+            )
+            .await
+            .unwrap_or(false)
+    };
+
+    // Ready-to-serve (skip the foreground initial index) when the index holds content
+    // for this context, OR it is schema-current but small enough that the gate does
+    // not fire (the daemon will index it in the background after registration).
+    let index_ready = has_content || (schema_current && !gate_fires);
 
     let daemon_state = lifecycle::probe_daemon()?;
 
@@ -255,33 +283,24 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // REQ-003: Before running initial index, check the monorepo file-count gate.
-    // Gate fires (blocks) if: index missing AND over threshold AND no scope provided.
-    let gate_readiness =
-        crate::mcp::ops::classify_readiness(&project_root, &source_root, &worktree_context).await;
-
-    // Compute launch_subdir for facts envelope suggestions (same logic as mcp/ops::resolve_project)
-    let canonical_launch_dir = match std::path::Path::new(&args.path).canonicalize() {
-        Ok(p) => p,
-        Err(_) => std::path::Path::new(&args.path).to_path_buf(),
-    };
-    let launch_subdir =
-        if canonical_launch_dir != source_root && canonical_launch_dir.starts_with(&source_root) {
+    // Not ready-to-serve. If the gate fired (over threshold, unscoped, no content),
+    // emit the facts envelope instead of indexing (REQ-003). Only reachable when the
+    // index is absent or empty AND the gate fired.
+    if gate_fires {
+        // Compute launch_subdir for facts envelope suggestions (same logic as
+        // mcp/ops::resolve_project).
+        let canonical_launch_dir = match std::path::Path::new(&args.path).canonicalize() {
+            Ok(p) => p,
+            Err(_) => std::path::Path::new(&args.path).to_path_buf(),
+        };
+        let launch_subdir = if canonical_launch_dir != source_root
+            && canonical_launch_dir.starts_with(&source_root)
+        {
             Some(canonical_launch_dir)
         } else {
             None
         };
 
-    let scope_provided = args.scope.is_some();
-    if !scope_provided
-        && crate::mcp::ops::should_return_facts_envelope(
-            &project_root,
-            &source_root,
-            &gate_readiness,
-        )
-        .await
-        .unwrap_or(false)
-    {
         // Gate fires: return facts envelope instead of indexing
         match crate::mcp::ops::generate_facts_envelope(&source_root, launch_subdir).await {
             Ok(facts) => {

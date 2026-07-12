@@ -2901,6 +2901,69 @@ fn start_contention_preserves_existing_daemon() {
     assert_eq!(second_status["pid"].as_u64(), Some(first_pid));
 }
 
+/// REQ-003/H1: an EMPTY schema-current index (schema initialized, zero segments —
+/// e.g. an interrupted initial index, or an index created before the repo grew past
+/// the threshold) must NOT be treated as ready and must NOT bypass the monorepo
+/// file-count gate. Before the fix, a schema-current index short-circuited to
+/// "started" regardless of content, so a grown repo never got gated. Now an
+/// over-threshold repo whose index holds no content still emits the facts envelope
+/// (exit 1). A populated over-threshold index is served (see
+/// `gate_keyed_on_completed_run_not_partial_index` in start_monorepo_gate.rs); this
+/// guards the empty/interrupted half of that contract.
+#[cfg(unix)]
+#[test]
+fn start_over_threshold_with_empty_index_still_gates() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    seed_model_download_failure(&canonical_home);
+    let _cleanup = DaemonCleanupGuard::new(&canonical_home, &canonical_dir);
+
+    // Real git repo with 150 files, over the 100 threshold set on the command below.
+    let git_init = StdCommand::new("git")
+        .args(["init"])
+        .current_dir(&canonical_dir)
+        .output()
+        .expect("git init failed");
+    assert!(git_init.status.success(), "git init should succeed");
+    for i in 0..150 {
+        let sub = canonical_dir.join(format!("dir_{}", i / 50));
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            sub.join(format!("file_{i}.rs")),
+            format!("fn func_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    // Empty schema-current index: schema initialized, zero segments for any context.
+    create_current_index(&canonical_dir);
+    fs::write(
+        canonical_dir.join(".1up").join("project_id"),
+        "fixture-project-id",
+    )
+    .unwrap();
+
+    let output = std_cmd_with_home(&canonical_home)
+        .env("ONEUP_FILE_COUNT_THRESHOLD", "100")
+        .args(["start", canonical_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "start on an over-threshold repo with an EMPTY index must gate (fail), not report ready; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("threshold") || stdout.contains("scope"),
+        "empty-index gate should emit the facts envelope (threshold/scope); stdout={stdout}",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn concurrent_first_start_reuses_project_id() {
