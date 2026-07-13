@@ -52,10 +52,16 @@ npm run eval:summary:luna
 
 `eval:parallel:luna` runs all seven search and impact cases, exits non-zero if
 any child Promptfoo process fails, and retains per-case logs plus `runs.tsv`
-under `results/latest-luna/`. The summary reports process duration and, when
-the provider exposes them, per-agent duration, cost, turns, and token usage.
-Use `npm run eval:luna` or `npm run eval:luna:impact` only when intentionally
-running one suite serially.
+under `results/latest-luna/`. Each child gets a unique, disposable
+`PROMPTFOO_CONFIG_DIR`, isolating Promptfoo's database, logs, and cache working
+state from both other children and the user's global Promptfoo state. The
+runner removes that temporary state on success, failure, or interruption; it
+does not remove the durable per-case results. `PROMPTFOO_CACHE_ENABLED=false`
+separately disables cached response reuse and does not provide this state
+isolation. The summary reports process duration and, when the provider exposes
+them, per-agent duration, cost, turns, and token usage. Use `npm run eval:luna`
+or `npm run eval:luna:impact` only when intentionally running one suite
+serially.
 
 The equivalent preserved Claude commands are:
 
@@ -72,6 +78,18 @@ npx promptfoo validate -c suites/1up-impact/evals.yaml
 npx promptfoo validate -c suites/1up-search/evals-luna.yaml
 npx promptfoo validate -c suites/1up-impact/evals-luna.yaml
 ```
+
+The parallel-runner regression also stays entirely local: it injects a fake
+Promptfoo executable and verifies seven-way state isolation, cleanup, durable
+logs and `runs.tsv`, and aggregate failure propagation.
+
+```sh
+npm run test:parallel
+```
+
+Neither this regression nor configuration validation replaces the manual-only
+credentialed/model runs above. Do not run Claude, Luna, MCP-adoption, or recall
+evals as automated agent validation.
 
 ## Recall gate
 

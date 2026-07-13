@@ -17,7 +17,8 @@
     "eval:view": "promptfoo view",
     "format": "npx @biomejs/biome format --write biome.json package.json tsconfig.json suites",
     "lint": "npx @biomejs/biome lint biome.json package.json tsconfig.json suites",
-    "test": "npm run typecheck && bun test suites/shared/assertions/index.test.ts",
+    "test": "npm run typecheck && bun test suites/shared/assertions/index.test.ts && npm run test:parallel",
+    "test:parallel": "./run-parallel.test.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

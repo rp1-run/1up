@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-PROMPTFOO="node_modules/.bin/promptfoo"
+PROMPTFOO_BIN="${PROMPTFOO_BIN:-node_modules/.bin/promptfoo}"
 PROVIDER="${1:-claude}"
 
 case "$PROVIDER" in
@@ -35,6 +35,44 @@ RESULT_DIR="results/latest-${PROVIDER}"
 mkdir -p "$RESULT_DIR"
 rm -f "$RESULT_DIR"/*.log "$RESULT_DIR"/runs.tsv
 
+STATE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/1up-promptfoo-${PROVIDER}.XXXXXX") || {
+  echo "Failed to create temporary Promptfoo state directory." >&2
+  exit 1
+}
+STATE_ROOT=$(cd "$STATE_ROOT" && pwd -P)
+RESULT_DIR_ABS=$(cd "$RESULT_DIR" && pwd -P)
+case "$STATE_ROOT" in
+  "$RESULT_DIR_ABS"|"$RESULT_DIR_ABS"/*)
+    rm -rf -- "$STATE_ROOT"
+    echo "Temporary Promptfoo state directory must be outside durable results." >&2
+    exit 1
+    ;;
+esac
+
+cleanup() {
+  EXIT_STATUS=$?
+  trap - EXIT HUP INT TERM
+
+  for PID in "${PIDS[@]}"; do
+    if [ -n "$PID" ]; then
+      kill "$PID" 2>/dev/null || true
+    fi
+  done
+  for PID in "${PIDS[@]}"; do
+    if [ -n "$PID" ]; then
+      wait "$PID" 2>/dev/null || true
+    fi
+  done
+
+  rm -rf -- "$STATE_ROOT"
+  exit "$EXIT_STATUS"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 TOTAL=$(( ${#SEARCH_TESTS[@]} + ${#IMPACT_TESTS[@]} ))
 echo "Running $TOTAL ${PROVIDER} tests in parallel (${#SEARCH_TESTS[@]} search + ${#IMPACT_TESTS[@]} impact)..."
 echo "Logs: $RESULT_DIR"
@@ -42,7 +80,9 @@ echo
 
 for i in "${!SEARCH_TESTS[@]}"; do
   LOG="$RESULT_DIR/search-$i.log"
-  $PROMPTFOO eval -c "$SEARCH_CONFIG" --filter-pattern "^${SEARCH_TESTS[$i]}$" > "$LOG" 2>&1 &
+  CONFIG_DIR="$STATE_ROOT/search-$i"
+  mkdir -p "$CONFIG_DIR"
+  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$SEARCH_CONFIG" --filter-pattern "^${SEARCH_TESTS[$i]}$" > "$LOG" 2>&1 &
   PIDS+=($!)
   LABELS+=("${SEARCH_TESTS[$i]}")
   LOGS+=("$LOG")
@@ -52,7 +92,9 @@ done
 
 for i in "${!IMPACT_TESTS[@]}"; do
   LOG="$RESULT_DIR/impact-$i.log"
-  $PROMPTFOO eval -c "$IMPACT_CONFIG" --filter-pattern "^${IMPACT_TESTS[$i]}$" > "$LOG" 2>&1 &
+  CONFIG_DIR="$STATE_ROOT/impact-$i"
+  mkdir -p "$CONFIG_DIR"
+  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$IMPACT_CONFIG" --filter-pattern "^${IMPACT_TESTS[$i]}$" > "$LOG" 2>&1 &
   PIDS+=($!)
   LABELS+=("${IMPACT_TESTS[$i]}")
   LOGS+=("$LOG")
@@ -73,6 +115,7 @@ for i in "${!PIDS[@]}"; do
     FAILED=$((FAILED + 1))
     STATUS="fail"
   fi
+  PIDS[$i]=""
   DURATION=$(( $(date +%s) - STARTED_AT[$i] ))
   printf '%s\t%s\t%s\t%s\n' "${LABELS[$i]}" "$DURATION" "$STATUS" "${LOGS[$i]}" >> "$RESULT_DIR/runs.tsv"
 done
