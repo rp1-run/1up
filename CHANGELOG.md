@@ -15,6 +15,19 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.14](https://github.com/rp1-run/1up/compare/v0.1.13...v0.1.14) (2026-07-13)
+
+
+### Features
+
+* **mcp:** envelope quality round 4 — scope disclosure, slimmer hydration, field doc-comment search ([#84](https://github.com/rp1-run/1up/issues/84)) ([daddb79](https://github.com/rp1-run/1up/commit/daddb794be2927d7db2476bc26a607c0c7bb8571))
+* release-gating fixes — daemon-spin blocker, CLI monorepo gate, secret globs, per-file caps ([#91](https://github.com/rp1-run/1up/issues/91)) ([8bfa534](https://github.com/rp1-run/1up/commit/8bfa534214b3d732fa91a403ca033fbb25b29364))
+
+
+### Documentation
+
+* **kb:** correct remaining PR [#94](https://github.com/rp1-run/1up/issues/94) accuracy findings ([#95](https://github.com/rp1-run/1up/issues/95)) ([aea7499](https://github.com/rp1-run/1up/commit/aea7499276d89f3a6b50f4073492d67507ab428f))
+
 ## [0.1.13](https://github.com/rp1-run/1up/compare/v0.1.12...v0.1.13) (2026-07-09)
 
 
