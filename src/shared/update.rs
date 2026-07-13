@@ -1641,6 +1641,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_channel_from_path_returns_manual_for_local_bin_install() {
+        let path = std::path::Path::new("/home/user/.local/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Manual);
+    }
+
+    #[test]
+    fn detect_channel_from_path_returns_manual_for_legacy_user_install() {
+        let path = std::path::Path::new("/home/user/.1up/bin/1up");
+        assert_eq!(detect_channel_from_path(path), InstallChannel::Manual);
+    }
+
+    #[test]
     fn detect_install_channel_returns_known_channel() {
         let channel = detect_install_channel();
         assert!(
