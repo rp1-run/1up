@@ -8,6 +8,12 @@
     "coverage": "npm run typecheck && bun test suites/shared/assertions/index.test.ts --coverage",
     "eval": "promptfoo eval -c suites/1up-search/evals.yaml",
     "eval:impact": "promptfoo eval -c suites/1up-impact/evals.yaml",
+    "eval:luna": "promptfoo eval -c suites/1up-search/evals-luna.yaml",
+    "eval:luna:impact": "promptfoo eval -c suites/1up-impact/evals-luna.yaml",
+    "eval:parallel": "./run-parallel.sh claude",
+    "eval:parallel:luna": "./run-parallel.sh luna",
+    "eval:summary": "./summary.sh",
+    "eval:summary:luna": "./summary.sh luna",
     "eval:view": "promptfoo view",
     "format": "npx @biomejs/biome format --write biome.json package.json tsconfig.json suites",
     "lint": "npx @biomejs/biome lint biome.json package.json tsconfig.json suites",
@@ -15,8 +21,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "promptfoo": "^0.121.0",
-    "@anthropic-ai/claude-agent-sdk": "^0.2.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.0",
+    "@openai/codex-sdk": "0.144.1",
+    "promptfoo": "0.121.18"
   },
   "overrides": {
     "jsdom": "~24.1.0"

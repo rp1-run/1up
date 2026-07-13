@@ -37,6 +37,14 @@ function makeContext(toolCalls: TestToolCall[] = []) {
   };
 }
 
+function makeCodexContext(items: readonly object[]) {
+  return {
+    providerResponse: {
+      raw: JSON.stringify({ items }),
+    },
+  };
+}
+
 describe("assert1upUsed", () => {
   test("passes when canonical MCP search is present", () => {
     const result = assert1upUsed(
@@ -86,6 +94,32 @@ describe("assert1upImpactUsed", () => {
 });
 
 describe("assertReadinessWorkflowUsed", () => {
+  test("preserves ordered Codex MCP calls from raw trajectory items", () => {
+    const result = assertReadinessWorkflowUsed(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_status",
+          arguments: {},
+          status: "completed",
+        },
+        {
+          id: "mcp-2",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_search",
+          arguments: { query: "daemon" },
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
   test("passes when status happens before retained discovery", () => {
     const result = assertReadinessWorkflowUsed(
       "",
@@ -165,6 +199,25 @@ describe("assertReadinessWorkflowUsed", () => {
 });
 
 describe("assertNoFallbackTools", () => {
+  test("detects fallback discovery in Codex command execution items", () => {
+    const result = assertNoFallbackTools(
+      "",
+      makeCodexContext([
+        {
+          id: "command-1",
+          type: "command_execution",
+          command: "rg daemon src",
+          aggregated_output: "",
+          exit_code: 0,
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("rg before oneup_search");
+  });
+
   test("passes when fallback search tools are absent", () => {
     const result = assertNoFallbackTools(
       "",
@@ -273,6 +326,97 @@ describe("assertNoFallbackTools", () => {
 });
 
 describe("assertStructuredOneupMcpResponses", () => {
+  test("validates structured Codex MCP results from raw trajectory items", () => {
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_status",
+          arguments: {},
+          result: {
+            content: [],
+            structured_content: {
+              status: "ready",
+              summary: "Ready for search.",
+              data: { readiness: "ready" },
+              next_actions: [],
+            },
+          },
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("ToolEnvelope");
+  });
+
+  test("fails when a captured Codex MCP result has null structured content", () => {
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_status",
+          arguments: {},
+          result: {
+            content: [],
+            structured_content: null,
+          },
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("missing structured_content object");
+  });
+
+  test("fails when a captured Codex MCP result omits structured content", () => {
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_search",
+          arguments: { query: "daemon" },
+          result: { content: [] },
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("missing structured_content object");
+  });
+
+  test("reports failed Codex MCP items as errored calls", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_get",
+          arguments: { handles: [":bad"] },
+          error: { message: "invalid handle" },
+          status: "failed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("errored MCP call oneup_get");
+  });
+
   test("passes when provider metadata omits MCP outputs", () => {
     const result = assertStructuredOneupMcpResponses(
       "",
@@ -330,7 +474,9 @@ describe("assertStructuredOneupMcpResponses", () => {
     );
 
     expect(result.pass).toBe(true);
-    expect(result.reason).toContain("did not include captured structured MCP outputs");
+    expect(result.reason).toContain(
+      "did not include captured structured MCP outputs",
+    );
   });
 
   test("fails for captured outputs without structured envelope fields", () => {
@@ -528,6 +674,30 @@ describe("assertValidOneupMcpCalls", () => {
 });
 
 describe("reportEfficiency", () => {
+  test("reports Codex usage when Claude turn metadata is absent", () => {
+    const result = reportEfficiency("", {
+      providerResponse: {
+        raw: JSON.stringify({
+          items: [{ type: "agent_message", id: "message-1", text: "done" }],
+          usage: {
+            input_tokens: 900,
+            cached_input_tokens: 600,
+            output_tokens: 120,
+            reasoning_output_tokens: 80,
+          },
+        }),
+      },
+    });
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("duration n/a");
+    expect(result.reason).toContain("1 turn");
+    expect(result.reason).toContain("cached:600");
+    expect(result.reason).toContain("reasoning:80");
+    expect(result.score).toBe(0);
+    expect(result.namedScores).toBeUndefined();
+  });
+
   test("prefers token counts from raw provider usage", () => {
     const result = reportEfficiency("", {
       providerResponse: {

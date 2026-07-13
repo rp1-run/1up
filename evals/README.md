@@ -23,6 +23,56 @@ npm run eval
 npm run eval:impact
 ```
 
+### Codex SDK / Luna manual run
+
+The Luna path is separate from the Claude path. It uses
+`suites/1up-search/evals-luna.yaml` and
+`suites/1up-impact/evals-luna.yaml`, pins `gpt-5.6-luna`, and starts the
+`oneup` MCP server from each disposable test workspace through Codex
+`cli_config`. The baseline Codex provider has no `oneup` MCP server. The
+existing Claude configs and `npm run eval` / `npm run eval:impact` commands
+remain unchanged.
+
+Run Luna only from an authenticated secure shell. The Codex SDK can reuse an
+existing ChatGPT login when `OPENAI_API_KEY` and `CODEX_API_KEY` are unset;
+verify that state with `codex login status`. Keep the installed `1up` binary
+first on `PATH`, because both fixture setup and the MCP server resolve the
+literal `1up` command.
+
+```sh
+cd /path/to/1up/evals
+bun install --frozen-lockfile
+test "$(1up --version | awk '{print $3}')" = "0.1.15"
+codex login status
+
+# Credentialed/model execution: run manually, never as an agent validation.
+PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna
+npm run eval:summary:luna
+```
+
+`eval:parallel:luna` runs all seven search and impact cases, exits non-zero if
+any child Promptfoo process fails, and retains per-case logs plus `runs.tsv`
+under `results/latest-luna/`. The summary reports process duration and, when
+the provider exposes them, per-agent duration, cost, turns, and token usage.
+Use `npm run eval:luna` or `npm run eval:luna:impact` only when intentionally
+running one suite serially.
+
+The equivalent preserved Claude commands are:
+
+```sh
+npm run eval:parallel
+npm run eval:summary
+```
+
+Configuration-only validation does not authenticate or invoke a model:
+
+```sh
+npx promptfoo validate -c suites/1up-search/evals.yaml
+npx promptfoo validate -c suites/1up-impact/evals.yaml
+npx promptfoo validate -c suites/1up-search/evals-luna.yaml
+npx promptfoo validate -c suites/1up-impact/evals-luna.yaml
+```
+
 ## Recall gate
 
 The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from P5 MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.

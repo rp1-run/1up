@@ -25,6 +25,7 @@ interface ToolCall {
   readonly output?: unknown;
   readonly is_error?: boolean;
   readonly parentToolUseId?: string | null;
+  readonly structuredOutputRequired?: boolean;
 }
 
 interface ProviderMetadata {
@@ -47,12 +48,69 @@ interface EvalContext {
     metadata?: ProviderMetadata;
     tokenUsage?: TokenUsage;
     cost?: number;
-    raw?: string;
+    raw?: unknown;
   };
 }
 
 function getToolCalls(context: EvalContext): readonly ToolCall[] {
-  return context.providerResponse?.metadata?.toolCalls ?? [];
+  const metadataCalls = context.providerResponse?.metadata?.toolCalls;
+  if (metadataCalls !== undefined) {
+    return metadataCalls;
+  }
+
+  const raw = context.providerResponse?.raw;
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return [];
+    }
+  }
+
+  if (!isRecord(parsed) || !Array.isArray(parsed.items)) {
+    return [];
+  }
+
+  return parsed.items.flatMap((item): ToolCall[] => {
+    if (!isRecord(item) || typeof item.type !== "string") {
+      return [];
+    }
+
+    const id = typeof item.id === "string" ? item.id : undefined;
+    if (
+      item.type === "mcp_tool_call" &&
+      typeof item.server === "string" &&
+      typeof item.tool === "string"
+    ) {
+      return [
+        {
+          id,
+          name: `mcp__${item.server}__${item.tool}`,
+          input: item.arguments ?? item.args ?? item.input ?? {},
+          output: item.result,
+          is_error: item.status === "failed" || item.error !== undefined,
+          structuredOutputRequired: item.result !== undefined,
+        },
+      ];
+    }
+
+    if (item.type === "command_execution" && typeof item.command === "string") {
+      return [
+        {
+          id,
+          name: "Bash",
+          input: { command: item.command },
+          output: item.aggregated_output,
+          is_error:
+            item.status === "failed" ||
+            (typeof item.exit_code === "number" && item.exit_code !== 0),
+        },
+      ];
+    }
+
+    return [];
+  });
 }
 
 function getOneupCalls(
@@ -651,13 +709,19 @@ export function assertStructuredOneupMcpResponses(
     };
   }
 
+  const missingEnvelopeProblems: string[] = [];
   const envelopes = callsWithOutput.flatMap((tc) => {
     const tool = toOneupMcpTool(tc.name) ?? tc.name;
     const envelope = extractStructuredEnvelope(tc.output);
+    if (!envelope && tc.structuredOutputRequired) {
+      missingEnvelopeProblems.push(
+        `${tool}: missing structured_content object`,
+      );
+    }
     return envelope ? [{ tool, envelope }] : [];
   });
 
-  if (envelopes.length === 0) {
+  if (envelopes.length === 0 && missingEnvelopeProblems.length === 0) {
     return {
       pass: true,
       score: 1,
@@ -666,9 +730,12 @@ export function assertStructuredOneupMcpResponses(
     };
   }
 
-  const problems = envelopes.flatMap(({ tool, envelope }) => {
-    return validateEnvelope(envelope).map((problem) => `${tool}: ${problem}`);
-  });
+  const problems = [
+    ...missingEnvelopeProblems,
+    ...envelopes.flatMap(({ tool, envelope }) => {
+      return validateEnvelope(envelope).map((problem) => `${tool}: ${problem}`);
+    }),
+  ];
 
   const pass = problems.length === 0;
 
@@ -785,7 +852,15 @@ export function reportEfficiency(
   const meta = context.providerResponse?.metadata;
   const cost = context.providerResponse?.cost;
 
-  const turns = meta?.numTurns ?? 0;
+  let rawRecord: Record<string, unknown> | undefined;
+  const rawValue = context.providerResponse?.raw;
+  if (isRecord(rawValue)) {
+    rawRecord = rawValue;
+  } else if (typeof rawValue === "string") {
+    rawRecord = parseJsonRecord(rawValue);
+  }
+
+  const turns = meta?.numTurns ?? (Array.isArray(rawRecord?.items) ? 1 : 0);
   const durationMs = meta?.durationMs ?? 0;
 
   // Parse the raw SDK response to get full token counts including cache.
@@ -794,19 +869,30 @@ export function reportEfficiency(
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheCreation = 0;
+  let cachedInput = 0;
+  let reasoningOutput = 0;
   let debugInfo = "";
 
-  const rawStr = context.providerResponse?.raw;
-  if (rawStr) {
-    try {
-      const raw = typeof rawStr === "string" ? JSON.parse(rawStr) : rawStr;
-      const usage = raw.usage ?? {};
-      inputTokens = usage.input_tokens ?? 0;
-      outputTokens = usage.output_tokens ?? 0;
-      cacheCreation = usage.cache_creation_input_tokens ?? 0;
-    } catch {
-      debugInfo = " [raw parse failed]";
-    }
+  if (rawRecord) {
+    const usage = isRecord(rawRecord.usage) ? rawRecord.usage : {};
+    inputTokens =
+      typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+    outputTokens =
+      typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+    cacheCreation =
+      typeof usage.cache_creation_input_tokens === "number"
+        ? usage.cache_creation_input_tokens
+        : 0;
+    cachedInput =
+      typeof usage.cached_input_tokens === "number"
+        ? usage.cached_input_tokens
+        : 0;
+    reasoningOutput =
+      typeof usage.reasoning_output_tokens === "number"
+        ? usage.reasoning_output_tokens
+        : 0;
+  } else if (rawValue !== undefined) {
+    debugInfo = " [raw parse failed]";
   } else {
     // No raw — try tokenUsage as fallback
     const tu = context.providerResponse?.tokenUsage;
@@ -825,19 +911,34 @@ export function reportEfficiency(
     Math.min(100, Math.round((1 - durationS / 200) * 100)),
   );
   // Cost: $0.50 baseline → 0, $0 → 100. e.g. $0.25 → 50, $0.10 → 80
-  const costScore = Math.max(
-    0,
-    Math.min(100, Math.round((1 - costVal / 0.5) * 100)),
-  );
+  const costScore =
+    cost === undefined
+      ? 0
+      : Math.max(0, Math.min(100, Math.round((1 - costVal / 0.5) * 100)));
+
+  const namedScores: Record<string, number> = {};
+  if (durationMs > 0) {
+    namedScores.Speed = speedScore;
+  }
+  if (cost !== undefined) {
+    namedScores["Cost Efficiency"] = costScore;
+  }
+
+  const usageDetails = [
+    `in:${inputTokens.toLocaleString()}`,
+    `out:${outputTokens.toLocaleString()}`,
+    `cache_create:${cacheCreation.toLocaleString()}`,
+    ...(cachedInput > 0 ? [`cached:${cachedInput.toLocaleString()}`] : []),
+    ...(reasoningOutput > 0
+      ? [`reasoning:${reasoningOutput.toLocaleString()}`]
+      : []),
+  ].join(" ");
 
   return {
     pass: true,
     score: costScore / 100,
-    namedScores: {
-      Speed: speedScore,
-      "Cost Efficiency": costScore,
-    },
-    reason: `${durationS}s | $${costVal.toFixed(2)} | ${turns} turns | tokens in:${inputTokens.toLocaleString()} out:${outputTokens.toLocaleString()} cache_create:${cacheCreation.toLocaleString()}${debugInfo}`,
+    ...(Object.keys(namedScores).length > 0 ? { namedScores } : {}),
+    reason: `${durationMs > 0 ? `${durationS}s` : "duration n/a"} | ${cost === undefined ? "cost n/a" : `$${costVal.toFixed(2)}`} | ${turns} ${turns === 1 ? "turn" : "turns"} | tokens ${usageDetails}${debugInfo}`,
   };
 }
 
