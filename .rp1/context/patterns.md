@@ -8,7 +8,7 @@ strictness: strict
 ---
 # Implementation Patterns
 
-Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon-handshake, non-destructive-rebuild, and monorepo-scoped-indexing (v0.1.13) work are folded in.
+Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon-handshake, non-destructive-rebuild, monorepo-scoped-indexing, and release-gating / MCP-envelope (v0.1.14) work are folded in.
 
 ## Naming & Organization
 
@@ -30,13 +30,16 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 - **Actionable wording:** `DrainTimeout` → "run `1up stop` then retry"; schema errors name found-vs-expected versions + the worktree path.
 - **Three outcome shapes:** verified → `Ok`; disproved → hard fail leaving state untouched (`ensure_manifest_acceptable`, `AttestationFailed`); cannot-run → degrade to a safe floor.
 - **Cooperative cancellation** is its own typed outcome (`IndexingError::Cancelled`), leaving the context dirty for a later pass.
+- **Stat before you lock:** the daemon stats `source_root` *before* acquiring the rebuild lock; if it is gone, `deregister_deleted_project` unwatches + deregisters and returns `Ok(PipelineStats::default())` — never fatal, so it can't spin on a deleted worktree. An independent stat is required because a linked worktree's `state_root` (which keys the lock) can outlive its `source_root`; a mid-pass lock error re-checks the same race before propagating.
+- **Best-effort side work never blocks the primary op:** `.1up/.gitignore` creation (`ensure_project_gitignore`) and deleted-source cleanup `warn!` and continue on failure rather than failing project resolution or the indexing pass.
 
 ## Validation
 
 - Concentrated at clap parsing, MCP input schemas, filesystem gates, and schema-readiness seams.
 - **Decision gates are pure**, taking inputs as parameters (`ensure_manifest_acceptable(manifest, installed, now)`, `should_idle_shutdown(is_empty, empty_for, timeout)`, `gate_allows_first_index(is_first_index, file_count, threshold, scope_recorded)`) — deterministic + unit-testable.
 - Repo paths canonicalized + clamped to `source_root`; out-of-root/parent-escape → `Rejected`; 1-based lines enforced. Scope roots validated on construction (repo-relative, no `../`).
-- **Filter precedence is a documented contract** (`ScanFilter`): secrets > scope_globs (exclusive cone — the REQ-001/REQ-002 cost boundary, which includes/overrides cannot punch through) > include_globs/override dirs > excludes > dotfile hiding. `include_globs` guarantee inclusion and never exclude non-matches.
+- **Gate before index:** readiness/threshold decisions are pure boolean helpers (`classify_readiness`, `should_return_facts_envelope`, the gitignore-aware file-count gate) evaluated *before* any indexing work; `1up start` refuses an over-threshold, unscoped first index and emits a facts envelope (exit 1) instead of silently indexing the whole monorepo (closes the H1 bypass).
+- **Filter precedence is a documented contract** (`ScanFilter`): secrets > scope_globs (exclusive cone — the REQ-001/REQ-002 cost boundary, which includes/overrides cannot punch through) > include_globs/override dirs > excludes > dotfile hiding. `include_globs` guarantee inclusion and never exclude non-matches. The secret tier is `DEFAULT_SECRET_GLOBS` (19 default-on patterns: keys, `.env*`, cloud/SSH/service-account creds) enforced on BOTH the scan path and the MCP read path (`oneup_context`'s `is_excluded`); configured includes/overrides can never punch through it.
 
 ## Output Contracts
 
@@ -47,6 +50,8 @@ Conventions and idioms for 1up (`oneup`). Patterns from the supply-chain, daemon
 ## Storage / I-O
 
 - libSQL via a `Db` wrapper; tuned PRAGMAs applied with lock-retry; reads context-scoped (`*_for_context`).
+- **Ride out the schema-init window:** read paths call `ensure_current_tolerating_init`, which retries *only* the transient "tables present, `schema_version` absent" shape (a reader racing the daemon's first index / atomic swap) — reuses the retry constants `DB_LOCK_RETRY_ATTEMPTS`(10) × `DB_LOCK_RETRY_DELAY_MS`(50 ms), allowing 10 attempts with 9 sleeps ≈ 450 ms total of non-blocking `tokio::time::sleep`; a genuine version mismatch still fails fast on the first attempt. Shared across CLI reads, the MCP warm-connection, and DB-lock loops. `SCHEMA_VERSION` stays 19.
+- **Pre-read resource guards:** the pipeline checks `file_size` vs `MAX_FILE_SIZE_BYTES`(2 MB) and unsupported extension *before* hashing/reading (skips minified/generated OOM offenders without re-reading them each scan), then caps every parser's output — markdown, tree-sitter, and fallback chunker — at `MAX_SEGMENTS_PER_FILE`(1000).
 - **Atomic temp-then-rename** for state files (`atomic_replace`) and the index: a rebuild is **build-aside** (uuid-suffixed staging DB), finalized to one self-contained file (`wal_checkpoint(TRUNCATE)`), then atomically renamed over `index.db`; prior sidecars retired first.
 - Downloaded artifacts verified against a pinned SHA-256 floor, then keyless-OIDC attestation. Secure-fs enforces canonical paths, clamps writes to an approved root, rejects symlink components.
 

@@ -25,9 +25,17 @@ strictness: strict
 - **RepositoryOverview** — deterministic, size-bounded orientation digest (stats, top symbols, module map, dependency edges, entry points); recommended first call (`oneup_overview`).
 - **Scope Roots / scope_globs** *(new v0.1.13)* — validated repo-relative directory cones (no absolute/`../` paths) persisted in DB meta (`scope_roots_v1`); converted to exclusive `dir/**` scope_globs. Survive branch switches and daemon restarts (scope carry). Distinct from additive `include_globs`.
 - **First-Index Gate + Facts Envelope** *(new)* — REQ-001 refuse-and-propose: a first index (segments == 0, robust to the empty schema DB created at startup) of an over-threshold repo (`ONEUP_FILE_COUNT_THRESHOLD`, default 3000) without a recorded scope stays idle and returns a `FactsEnvelope` — gitignore-aware per-directory stats, workspace manifests, sparse-checkout, `launch_subdir` first-suggestion, calibrated vector estimates (measured density, low/high bounds + basis). Gated daemon consumes the pending run and idles (no walk loop).
-- **IndexScope** *(new)* — coverage disclosure on readiness/search payloads: roots, indexed_files, total_files, `coverage_description()`; agents must never infer absence from empty scoped results.
+- **IndexScope** *(new)* — coverage disclosure on readiness/search payloads: roots, indexed_files, total_files, `coverage_description()`, and `eligibility_note` *(new v0.1.14)* — a plain-text explanation of the unscoped index coverage gap (why indexed_files < total_files: lockfiles, vendored code, gitignored paths), populated only when scope roots are empty. Agents must never infer absence from empty scoped results.
 - **Embedding Pool** *(v17+)* — content-addressed dedup: `content_key` (hash of content + token window) → shared vector + `ref_count`; DiskANN built deferred (`VectorIndexBuild::Deferred`) after pool load, before swap. Replaces per-segment 1:1 vectors.
 - **Non-Blocking Start** *(new)* — REQ-012: `oneup_start` spawns the rebuild (`spawn_rebuild_task`) and waits a bounded budget (`ONEUP_START_RESPONSE_BUDGET_MS`, default 2s); fast ops return final readiness (drift cleared, blocked surfaced), long rebuilds detach and callers poll `oneup_status`.
+- **Verbosity Parameter** *(new)* — `GetInput.verbosity` (`default`|`full`, default `default`) gates symbol-list detail in `oneup_get` hydration: `default` omits `defined/referenced/called_symbols`; `full` populates them. Segment `summary` remains `None` unconditionally. Trims routine payloads while keeping opt-in symbol depth.
+- **symbol_hint** *(new)* — first defined symbol per segment, captured before verbosity gating and `#[serde(skip)]` (never serialized into the payload); the envelope's `next_actions` read it so defining segments keep offering an `oneup_symbol` follow-up even at `default` verbosity.
+- **Struct/Enum Field Introspection** *(new)* — the Rust parser now treats `struct_item`/`enum_item` as containers and emits `field_declaration`→`field` and `enum_variant`→`variant` nested segments (role Definition) carrying their doc comments and defined-symbol names, so field/variant docs become searchable.
+- **Schema Init Tolerance Window** *(new v0.1.14)* — `ensure_current_tolerating_init` (moved out of `mcp/ops` into `storage/schema` for reuse) rides out the transient "tables exist, `schema_version` row absent" window when a reader races the daemon's first index or a rebuild's atomic swap; retries only that init shape (budget ≈450 ms = `DB_LOCK_RETRY_ATTEMPTS` 10 × `DB_LOCK_RETRY_DELAY_MS` 50 ms), while a genuine version mismatch is a distinct shape that still fails fast on the first attempt.
+- **File/Segment Size Caps** *(new v0.1.14)* — `MAX_FILE_SIZE_BYTES` (2 MB, skipped before read) + `MAX_SEGMENTS_PER_FILE` (1000, excess dropped with a warning) bound memory on minified/generated files (prevents the 9.4 MB → 1.49 GB RSS OOM).
+- **Expanded Secret Globs** *(new v0.1.14)* — `DEFAULT_SECRET_GLOBS` grows 4 → 19 patterns (API creds, `*service-account*.json`, `.netrc`/`.pgpass`/`.git-credentials`, `.aws/credentials`, SSH/TLS keys `id_rsa*`/`id_ed25519`/`id_ed25519.pub`/`*.p12`/`*.pfx`, `.env.*`), centralized in `shared/constants` and applied non-overridably on both the scan and MCP read paths.
+- **Project Gitignore** *(new v0.1.14)* — `ensure_project_gitignore` writes `.1up/.gitignore` = `*` at init/start/index/reindex/MCP auto-init; idempotent, symlink-safe (never clobbers a regular file, refuses a symlink leaf), best-effort so a failure never blocks project resolution.
+- **Deleted Source Root Deregistration** *(new v0.1.14)* — the daemon worker detects a deleted `source_root` (main repo where `state_root == source_root`, or a linked worktree whose state_root survives) before the rebuild lock and rechecks on lock-acquisition error, then cleanly deregisters (`Registry` + `unwatch`) and returns default stats so the loop keeps serving other projects (fixes the CPU-spin blocker).
 
 ## Terminology
 
@@ -63,15 +71,17 @@ strictness: strict
 - CLI search **validates** `daemon_version` == `VERSION` before trusting daemon results.
 - `SERVER_GUIDANCE` is **constrained by** `RETAINED_PUBLIC_TOOLS` (drift-guard test).
 - First-Index Gate **emits** Facts Envelope; a scoped `oneup_start` **records** scope (progress decision + DB meta) which the daemon refresh **reads** (meta, falling back to the recorded decision) and **re-persists** — every rebuild path writes scope to the staging connection so `finalize_and_swap` preserves it.
-- `ScanFilter` precedence: secrets > scope_globs (exclusive cone) > include_globs/override dirs > exclude_globs > dotfile hiding — configured includes cannot punch through the cone.
+- `ScanFilter` precedence: secrets > scope_globs (exclusive cone) > include_globs/override dirs > exclude_globs > dotfile hiding — configured includes cannot punch through the cone; the secrets tier is the non-overridable `DEFAULT_SECRET_GLOBS` (4 → 19), shared by the scanner and the `oneup_context` read path.
+- `warm_index_connection` and every CLI read command (`search`/`status`/`get`/`symbol`/`impact`/`list`/`structural`) **use** `ensure_current_tolerating_init`, so a read right after `reindex` (or during a daemon rebuild) rides out the init window instead of surfacing a spurious "reindex required".
+- `oneup_get` **gates** symbol lists by `verbosity`; the envelope's `next_actions` still **read** `symbol_hint` so a defining segment keeps proposing `oneup_symbol` at `default` verbosity.
 
 ## Bounded Contexts
 
 1. **Code Discovery (MCP)** — `src/mcp`: nine `oneup_*` tools, `ToolEnvelope`/`next_actions`, status enums, single-sourced guidance.
 2. **Search & Retrieval** — `src/search`: hybrid + RRF, corpus-adaptive vector path (262144), impact + corroboration, overview.
-3. **Index Storage & Lifecycle** — `src/storage`/`src/indexer`: schema v19, content-addressed embedding pool, build-aside swap, cooperative cancellation, exclusive scope-cone scanning.
+3. **Index Storage & Lifecycle** — `src/storage`/`src/indexer`: schema v19, content-addressed embedding pool, build-aside swap, cooperative cancellation, exclusive scope-cone scanning, size/segment caps, field/variant introspection, init-tolerant schema validation.
 3a. **Monorepo Scoping & Policy** — `src/mcp/ops.rs` + `src/daemon/{lifecycle,worker}.rs` + `src/shared/project.rs`: gate logic, facts envelope, scope persistence/carry, launch_subdir, marker-validated resolution.
-4. **Daemon & Concurrency** — `src/daemon`: single-writer lock, version-handshake, idle self-exit, inode-swap detection, serve-stale.
+4. **Daemon & Concurrency** — `src/daemon`: single-writer lock, version-handshake, idle self-exit, inode-swap detection, serve-stale, deleted-source-root deregistration.
 5. **Supply-Chain Trust & Self-Update** — `src/shared/{update,constants,errors}`: manifest, checksum floor, three-state attestation, anti-rollback/expiry, yanked/minimum-safe, InstallChannel.
 
 ## Cross-Cutting Concerns
@@ -81,4 +91,6 @@ strictness: strict
 - **Atomic, torn-read-safe persistence** — temp+fsync+rename / finalize-and-swap with owner-only modes.
 - **Worktree-context isolation** — `context_id` threads every read so linked worktrees share one DB without cross-contamination.
 - **Cross-process coordination** — single-writer lock + version-handshake + non-blocking lock probes coordinate CLI/daemon/MCP without serving wrong-version or torn results.
+- **Bounded resource use** *(new v0.1.14)* — per-file size/segment caps skip pathological minified/generated files before they OOM; a deleted source root deregisters (returning default stats) instead of spinning the daemon loop.
+- **Non-overridable secret exclusion** *(new v0.1.14)* — `DEFAULT_SECRET_GLOBS` (centralized in `shared/constants`) is enforced regardless of config on both scan and MCP read paths, above every include/scope tier.
 - **Hermetic testing** — `ONEUP_DISABLE_MODEL_DOWNLOADS`; attestation verify is pure/offline against an embedded root; gates take `now`/version as params.

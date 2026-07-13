@@ -8,7 +8,7 @@ strictness: strict
 ---
 # System Architecture
 
-1up is a local-first single Rust binary (`oneup` package, `1up` binary) with an optional background daemon and an MCP stdio mode, over a project-local libSQL index (`.1up/index.db`, schema v19). Since v0.1.13, large monorepos are indexed as **scoped directory cones** behind a refuse-and-propose gate.
+1up is a local-first single Rust binary (`oneup` package, `1up` binary) with an optional background daemon and an MCP stdio mode, over a project-local libSQL index (`.1up/index.db`, schema v19). Since v0.1.13 large monorepos are indexed as **scoped directory cones** behind a refuse-and-propose gate; v0.1.14 hardens release-gating (deleted-dir deregistration, per-file resource caps, CLI-enforced gate).
 
 ## Architectural Patterns
 
@@ -20,12 +20,14 @@ strictness: strict
 - **Long-lived handle adopts swapped index by inode** — the daemon records `(dev, ino)` and reopens before any pass/search when a swap installed a fresh inode.
 - **Serve-stale during rebuild** — daemon results carry `STALE_REBUILD_REASON` when a refresh is in flight, combined via `combine_degraded_reasons`.
 - **Daemon idle self-exit** — an empty daemon self-exits past `DAEMON_IDLE_SHUTDOWN_SECS=60`.
+- **Deleted watched-directory deregistration** — daemon `run_project` stats `source_root` BEFORE the rebuild lock; on a missing root `deregister_deleted_project` removes it from `ProjectStates` + `Registry` + unwatches and returns default stats, so the sweep loop empties and the main `tokio::select!` polls SIGTERM instead of re-spinning (fixes the release-blocker 100%-CPU spin on a deleted/renamed watched dir). Covers main-repo and linked-worktree cases, and re-checks after a lock error for the vanish-mid-pass race; worker argv now carries `PROJECT_PATH` for observability.
 - **Independent-channel supply-chain trust** — `verify_archive_checksum` (SHA-256 floor) then `verify_artifact_attestation` (sigstore-verify against the embedded production trusted root, issuer + workflow identity pinned); three-state: verified → proceed, cannot-run → degrade to checksum, disproved → fail closed.
 - **Mandatory-when-published checksum (tri-state fetch)** — `setup.sh` classifies the `SHA256SUMS` fetch published/unpublished/transient (retry then fail closed); attestation is opt-in via gh/cosign.
 - **Anti-rollback / anti-freeze manifest gate** — `ensure_manifest_acceptable` rejects older-than-installed or past-expiry manifests before download (distinct from advisory `build_update_status`).
-- **Schema-gated local state, fail-closed** — `ensure_current` validates `SCHEMA_VERSION=19`, objects, vector column, context columns; no in-place migration (older schema fails closed with reindex guidance on both CLI stderr and MCP `next_actions`).
-- **Refuse-and-propose gate (monorepo)** — a first index (segments == 0, robust to the empty schema DB created at startup) of an over-threshold repo without a recorded scope never starts: the daemon consumes the pending run and idles (no re-walk loop); `oneup_start` returns a `FactsEnvelope` (gitignore-aware per-directory stats, workspace manifests, `launch_subdir` first-suggestion, measured-density vector estimates with bounds). Gate decision is the pure `gate_allows_first_index`.
+- **Schema-gated local state, fail-closed** — `ensure_current` validates `SCHEMA_VERSION=19`, objects, vector column, context columns; no in-place migration (older schema fails closed with reindex guidance on both CLI stderr and MCP `next_actions`). Read paths (`search`/`status`) call `ensure_current_tolerating_init`, which rides out the transient "tables present, version row absent" init window (bounded ~450 ms = `DB_LOCK_RETRY_ATTEMPTS=10` × `DB_LOCK_RETRY_DELAY_MS=50`, non-blocking) shared with the MCP warm-connection path; a genuine version mismatch still fails fast on the first attempt.
+- **Refuse-and-propose gate (monorepo)** — a first index (segments == 0, robust to the empty schema DB created at startup) of an over-threshold repo without a recorded scope never starts: the daemon consumes the pending run and idles (no re-walk loop); `oneup_start` returns a `FactsEnvelope` (gitignore-aware per-directory stats, workspace manifests, `launch_subdir` first-suggestion, measured-density vector estimates with bounds). Gate decision is the pure `gate_allows_first_index`. Enforced on BOTH surfaces now: MCP `oneup_start` and the CLI `1up start` (gate evaluated before indexing; new first-class `--scope <dir>` arg bypasses it; on fire the CLI emits the same facts envelope and exits 1). A schema-current-but-empty index no longer counts as ready, closing the gate-bypass once a repo grows past threshold.
 - **Exclusive scope cones** — `ScanFilter` precedence: secrets > `scope_globs` (exclusive cone) > `include_globs`/override dirs > excludes > dotfile hiding; configured includes cannot punch through the cone. Scope roots persist in DB meta (`scope_roots_v1`); every rebuild path (MCP staged, daemon refresh with progress-file fallback) re-persists scope so `finalize_and_swap` preserves it; widening (`scope_add` on a scoped index) is incremental, narrowing is an atomic staging rebuild.
+- **Indexer resource protection (per-file bounds)** — `MAX_FILE_SIZE_BYTES=2MB` is checked against the scanner's `file_size` BEFORE read (over-cap files skipped), the unsupported-extension skip moved ahead of hash/read, and `MAX_SEGMENTS_PER_FILE=1000` is enforced across all parser outputs (markdown/tree-sitter/chunker). Bounds worst-case memory on minified/generated files (prevents the ~1.49GB-RSS OOM seen on a 9.4MB minified file).
 - **Non-blocking bounded-wait start** — `oneup_start` spawns the rebuild and waits up to `ONEUP_START_RESPONSE_BUDGET_MS` (2s default): fast ops return final readiness (drift cleared, blocked surfaced with reason); long rebuilds detach and callers poll `oneup_status`. Searches during rebuild are bounded (10s) and degrade honestly.
 - **Content-addressed embedding pool + deferred vector index** — `embedding_pool` (v17+) dedups vectors by `content_key` with `ref_count` lifecycle; staging rebuilds create schema with `VectorIndexBuild::Deferred` and build DiskANN once after pool load, before the swap.
 - **Liveness-reconciled state** — stale rebuild locks (>5 min, dead holder) auto-clear before acquisition; `Running` progress with a dead `indexer_pid` reads as missing; the gate walk runs on `spawn_blocking` so SIGTERM cancellation actually fires mid-walk.
@@ -35,7 +37,7 @@ strictness: strict
 
 | Layer | Purpose | Key files |
 |---|---|---|
-| CLI | Parse commands, output contracts, dispatch lifecycle/index/search/update/doctor/mcp; run the search version-handshake | `main.rs`, `cli/mod.rs`, `cli/search.rs`, `cli/mcp.rs` |
+| CLI | Parse commands, output contracts, dispatch lifecycle/index/search/update/doctor/mcp; run the search version-handshake; enforce the monorepo gate at `1up start` (`--scope`) | `main.rs`, `cli/mod.rs`, `cli/start.rs`, `cli/search.rs`, `cli/mcp.rs` |
 | MCP | Nine `oneup_*` tools over stdio with `ToolEnvelope`; auto-init + auto-start daemon; facts-envelope gate, scope ops, non-blocking start, IndexScope disclosure | `mcp/{server,tools,ops,types}.rs` |
 | Daemon | Watched-index refresh (cancellable, lock-guarded, scope-aware + gated), warm search with handshake + serve-stale, idle self-exit, liveness reconciliation | `daemon/{worker,lifecycle,search_service,watcher,registry,ipc}.rs` |
 | Indexer | Scan (exclusive scope cones via `ScanFilter`), parse, chunk, embed (pool dedup), prefilter, persist; honors a `CancellationToken` | `indexer/{pipeline,scanner,scan_filter,parser,embedder,markdown}.rs` |
@@ -69,6 +71,7 @@ strictness: strict
 - **Index build/refresh** — source files → segments/vectors/symbols/relations rows (built aside + atomically swapped on a required rebuild); progress → `index_status.json`.
 - **Update check** — remote `update-manifest.json` → version-keyed cache → passive notification or anti-rollback/expiry refusal.
 - **Self-update activation** — archive + SHA-256 + attestation bundles → atomically replaced binary (checksum + attestation verified; daemon stopped first).
+- **GC reclamation** — `1up gc --apply` prunes source-missing context registrations (`PruneReason::SourceMissing`, alongside stale-branch/nested/superseded reasons) under the rebuild lock, and sweeps orphaned `index.db.rebuild-<uuid>` staging DBs left by hard-killed rebuilds (even with no context candidates).
 
 ## Deployment
 
@@ -89,9 +92,13 @@ graph TB
     CLI -->|drain + restart on stale daemon| Daemon
     MCP -->|auto start| Daemon
     Daemon -->|notify refresh, cancellable| Indexer[Indexer pipeline]
+    Daemon -->|source root deleted| Deregister[Deregister and unwatch]
     CLI -->|index / reindex| Indexer
     MCP -->|over-threshold, no scope| Gate[refuse-and-propose gate]
+    CLI -->|over-threshold, no scope| Gate
     Gate -->|facts envelope| Host
+    Gate -->|facts envelope to stdout| CLI
+    Indexer -->|per-file 2MB and 1000-seg caps| Bounds[Resource bounds]
     Indexer -->|ScanFilter exclusive scope cone| Source
     Indexer -->|build aside| Staging[Staging DB uuid]
     Staging -->|finalize + atomic rename| Storage[(index.db v19)]
