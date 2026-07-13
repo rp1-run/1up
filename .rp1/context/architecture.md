@@ -97,6 +97,7 @@ graph TB
     MCP -->|over-threshold, no scope| Gate[refuse-and-propose gate]
     CLI -->|over-threshold, no scope| Gate
     Gate -->|facts envelope| Host
+    Gate -->|facts envelope to stdout| CLI
     Indexer -->|per-file 2MB and 1000-seg caps| Bounds[Resource bounds]
     Indexer -->|ScanFilter exclusive scope cone| Source
     Indexer -->|build aside| Staging[Staging DB uuid]

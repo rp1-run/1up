@@ -54,7 +54,8 @@ strictness: strict
 - `cli/reindex` + `mcp/ops` → `storage::swap` + `daemon::lifecycle` (rebuild via staging under the lock).
 - `cli/search` + `daemon/worker` → `daemon::lifecycle` (handshake drain/restart; lock probe).
 - `cli` read cmds + `mcp/ops` warm path → `storage::schema::ensure_current_tolerating_init` (relocated from `mcp/ops`).
-- `indexer/scan_filter` + `daemon/worker` + `oneup_context` → `shared::constants::DEFAULT_SECRET_GLOBS` (single-sourced 19-pattern secret set) + `MAX_FILE_SIZE_BYTES`/`MAX_SEGMENTS_PER_FILE`.
+- `indexer/scan_filter` + MCP `context` reads → `shared::constants::DEFAULT_SECRET_GLOBS` (single-sourced 19-pattern secret set, non-overridable on both scan and read paths).
+- `indexer/pipeline` + `indexer/chunker` → `shared::constants::MAX_FILE_SIZE_BYTES`/`MAX_SEGMENTS_PER_FILE` (resource caps, enforced per file).
 - `cli/start` gate → `mcp::ops::{classify_readiness, should_return_facts_envelope, generate_facts_envelope}` (shared monorepo gate).
 - `storage/swap` → `shared::fs` (atomic rename/cleanup) and debug-asserts the caller holds the `RebuildLock`.
 - `shared/update` → `shared::fs`, `sigstore_verify`, `sigstore_trust_root`, `reqwest`, `sha2`.

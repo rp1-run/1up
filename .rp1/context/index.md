@@ -13,7 +13,7 @@
 | Primary agent surface | `1up mcp --path <repo>` exposing `oneup_status`, `oneup_start`, `oneup_overview`, `oneup_search`, `oneup_get`, `oneup_symbol`, `oneup_context`, `oneup_impact`, `oneup_structural` |
 | Key patterns | Layered CLI + MCP + daemon, orientation-before-discovery, search-before-get/context, candidate-first retrieval, build-aside rebuild + atomic swap, single-writer rebuild lock, daemon version-handshake, deleted-dir deregistration, refuse-and-propose monorepo gate + exclusive scope cones, non-blocking bounded-wait start, per-file size/segment caps, schema-init tolerance, content-addressed embedding pool, independent-channel supply-chain trust, single-source-of-truth tool guidance |
 | Tech stack | Rust, Tokio, libSQL, ONNX Runtime, tree-sitter, rmcp, clap, globset, sigstore-verify, TypeScript evals, shell release scripts |
-| Version | 0.1.14 |
+| Version | 0.1.13 (0.1.14 pending) |
 | Schema version | 19 (v17 embedding pool, v18 256-token window, v19 scope metadata `scope_roots_v1`; `VECTOR_PREFILTER_K=400`) |
 | Last generated | 2026-07-12T00:00:00Z |
 
@@ -22,9 +22,9 @@
 | File | Lines | Load For |
 |---|---:|---|
 | [concept_map.md](concept_map.md) | 96 | Domain terminology, scoping + code-discovery + supply-chain concepts, MCP tool vocabulary, storage/search/impact relationships |
-| [architecture.md](architecture.md) | 116 | System topology, data/state layout, MCP/CLI/daemon flows, deleted-dir deregistration, monorepo gate + scope cones, rebuild/swap, release & update architecture |
+| [architecture.md](architecture.md) | 117 | System topology, data/state layout, MCP/CLI/daemon flows, deleted-dir deregistration, monorepo gate + scope cones, rebuild/swap, release & update architecture |
 | [interaction-model.md](interaction-model.md) | 79 | Agent and CLI interaction semantics, readiness/scope states, non-blocking start + polling, schema-init tolerance, output contracts, setup flows |
-| [modules.md](modules.md) | 96 | Component ownership, module dependencies, public boundaries, metrics |
+| [modules.md](modules.md) | 97 | Component ownership, module dependencies, public boundaries, metrics |
 | [patterns.md](patterns.md) | 84 | Conventions, data modeling, errors, validation (filter precedence + secret globs), output, storage (schema-init tolerance), concurrency, testing idioms |
 
 ## Task-Based Loading
