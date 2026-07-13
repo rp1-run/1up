@@ -45,7 +45,34 @@ function makeCodexContext(items: readonly object[]) {
   };
 }
 
+function makeVariantContext(
+  label: "1up" | "baseline",
+  items: readonly object[] = [],
+) {
+  return {
+    prompt: { label },
+    provider: { label: `${label}-agent` },
+    providerResponse: {
+      raw: JSON.stringify({ items }),
+    },
+  };
+}
+
 describe("assert1upUsed", () => {
+  test("does not require 1up workflow calls from the baseline variant", () => {
+    const result = assert1upUsed("", makeVariantContext("baseline"));
+
+    expect(result.pass).toBe(true);
+    expect(result.reason).toContain("baseline variant");
+  });
+
+  test("still fails closed when the 1up variant omits search", () => {
+    const result = assert1upUsed("", makeVariantContext("1up"));
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_search");
+  });
+
   test("passes when canonical MCP search is present", () => {
     const result = assert1upUsed(
       "",
@@ -417,6 +444,33 @@ describe("assertStructuredOneupMcpResponses", () => {
     expect(result.reason).toContain("errored MCP call oneup_get");
   });
 
+  test("does not treat a completed Codex MCP item with null error as failed", () => {
+    const result = assertValidOneupMcpCalls(
+      "",
+      makeCodexContext([
+        {
+          id: "mcp-1",
+          type: "mcp_tool_call",
+          server: "oneup",
+          tool: "oneup_status",
+          arguments: {},
+          error: null,
+          result: {
+            structured_content: {
+              status: "ready",
+              summary: "Ready.",
+              data: {},
+              next_actions: [],
+            },
+          },
+          status: "completed",
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
   test("passes when provider metadata omits MCP outputs", () => {
     const result = assertStructuredOneupMcpResponses(
       "",
@@ -454,6 +508,33 @@ describe("assertStructuredOneupMcpResponses", () => {
 
     expect(result.pass).toBe(true);
     expect(result.reason).toContain("ToolEnvelope");
+  });
+
+  test("allows next actions that do not require arguments", () => {
+    const call = toolCall("mcp__oneup__oneup_status", {});
+    const result = assertStructuredOneupMcpResponses(
+      "",
+      makeContext([
+        {
+          ...call,
+          output: {
+            structuredContent: {
+              status: "degraded",
+              summary: "Search remains available.",
+              data: { readiness: "degraded" },
+              next_actions: [
+                {
+                  tool: "oneup_search",
+                  reason: "Search the readable index.",
+                },
+              ],
+            },
+          },
+        },
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
   });
 
   test("passes when captured provider output is text-only tool_result content", () => {
@@ -525,7 +606,6 @@ describe("assertStructuredOneupMcpResponses", () => {
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("data must be an object");
     expect(result.reason).toContain("without string reason");
-    expect(result.reason).toContain("without object arguments");
   });
 });
 

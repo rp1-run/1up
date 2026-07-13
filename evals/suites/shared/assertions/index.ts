@@ -43,6 +43,8 @@ interface TokenUsage {
 }
 
 interface EvalContext {
+  prompt?: string | { label?: string };
+  provider?: { label?: string };
   vars?: Record<string, string | number | boolean | object>;
   providerResponse?: {
     metadata?: ProviderMetadata;
@@ -89,8 +91,9 @@ function getToolCalls(context: EvalContext): readonly ToolCall[] {
           name: `mcp__${item.server}__${item.tool}`,
           input: item.arguments ?? item.args ?? item.input ?? {},
           output: item.result,
-          is_error: item.status === "failed" || item.error !== undefined,
-          structuredOutputRequired: item.result !== undefined,
+          is_error: item.status === "failed" || item.error != null,
+          structuredOutputRequired:
+            item.status === "completed" && item.result != null,
         },
       ];
     }
@@ -123,6 +126,27 @@ function getOneupCalls(
       oneupTool !== undefined && (tool === undefined || oneupTool === tool)
     );
   });
+}
+
+function baselineSkip(context: EvalContext): GradingResult | undefined {
+  const promptLabel =
+    typeof context.prompt === "object" ? context.prompt.label : undefined;
+  const providerLabel = context.provider?.label;
+  const baseline =
+    promptLabel === "baseline" || providerLabel === "baseline-agent";
+  if (!baseline) {
+    return undefined;
+  }
+
+  const calls = getOneupCalls(context);
+  const pass = calls.length === 0;
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? "1up workflow assertion is not applicable to the isolated baseline variant"
+      : `Baseline variant unexpectedly invoked 1up MCP calls: ${formatToolNames(calls)}`,
+  };
 }
 
 const FALLBACK_TOOLS = ["rg", "grep", "find"] as const;
@@ -587,8 +611,8 @@ function validateEnvelope(envelope: Record<string, unknown>): string[] {
         problems.push("next_actions contains action without string reason");
       }
 
-      if (!isRecord(action.arguments)) {
-        problems.push("next_actions contains action without object arguments");
+      if (action.arguments !== undefined && !isRecord(action.arguments)) {
+        problems.push("next_actions contains non-object arguments");
       }
     }
   }
@@ -600,6 +624,9 @@ export function assert1upUsed(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getOneupCalls(context);
   const found = calls.some((tc) => toOneupMcpTool(tc.name) === "oneup_search");
 
@@ -616,6 +643,9 @@ export function assertReadinessWorkflowUsed(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getToolCalls(context);
   const statusIndex = toolCallIndex(calls, "oneup_status");
   const startIndex = toolCallIndex(calls, "oneup_start");
@@ -664,6 +694,9 @@ export function assert1upImpactUsed(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getOneupCalls(context, "oneup_impact");
   const found = calls.length > 0;
 
@@ -680,6 +713,9 @@ export function assertNoFallbackTools(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const violations = fallbackViolations(context);
 
   const pass = violations.length === 0;
@@ -696,8 +732,11 @@ export function assertStructuredOneupMcpResponses(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const callsWithOutput = getOneupCalls(context).filter(
-    (tc) => tc.output !== undefined,
+    (tc) => tc.output != null,
   );
 
   if (callsWithOutput.length === 0) {
@@ -752,6 +791,9 @@ export function assertReadAfterSearch(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getToolCalls(context);
   const searchIndex = toolCallIndex(calls, "oneup_search");
   const hydrationIndex = calls.findIndex((tc, index) => {
@@ -780,6 +822,9 @@ export function assertSymbolVerificationUsed(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getOneupCalls(context, "oneup_symbol");
   const pass = calls.length > 0;
 
@@ -796,6 +841,9 @@ export function assertImpactTrustInterpreted(
   output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const impactCalls = getOneupCalls(context, "oneup_impact");
   const interpretedTrust =
     /\b(primary|contextual|lower-confidence|confidence|advisory|likely-impact)\b/i.test(
@@ -818,6 +866,9 @@ export function assertValidOneupMcpCalls(
   _output: string,
   context: EvalContext,
 ): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
   const calls = getToolCalls(context);
   const badAliases = calls
     .filter((tc) => usesDigitLeadingOneupAlias(tc.name))

@@ -51,17 +51,22 @@ npm run eval:summary:luna
 ```
 
 `eval:parallel:luna` runs all seven search and impact cases, exits non-zero if
-any child Promptfoo process fails, and retains per-case logs plus `runs.tsv`
-under `results/latest-luna/`. Each child gets a unique, disposable
+any child Promptfoo process fails, and retains per-case logs, JSON diagnostics,
+and `runs.tsv` under `results/latest-luna/`. Before a rerun, it moves the prior
+latest directory under `results/archive-luna/` so failed evidence is not
+overwritten. Each child gets a unique, disposable
 `PROMPTFOO_CONFIG_DIR`, isolating Promptfoo's database, logs, and cache working
 state from both other children and the user's global Promptfoo state. The
 runner removes that temporary state on success, failure, or interruption; it
 does not remove the durable per-case results. `PROMPTFOO_CACHE_ENABLED=false`
 separately disables cached response reuse and does not provide this state
-isolation. The summary reports process duration and, when the provider exposes
-them, per-agent duration, cost, turns, and token usage. Use `npm run eval:luna`
-or `npm run eval:luna:impact` only when intentionally running one suite
-serially.
+isolation. Every Codex target also gets an isolated `HOME` and `CODEX_HOME`
+containing only a copied `auth.json`; host Codex config and MCP servers are not
+inherited. `PATH` and `NODE_EXTRA_CA_CERTS` are forwarded explicitly so the
+installed `1up` binary and corporate trust root remain available. The summary
+reports process duration and falls back to the JSON diagnostics for per-agent
+duration, cost, turns, and token usage. Use `npm run eval:luna` or
+`npm run eval:luna:impact` only when intentionally running one suite serially.
 
 The equivalent preserved Claude commands are:
 
@@ -83,8 +88,14 @@ The parallel-runner regression also stays entirely local: it injects a fake
 Promptfoo executable and verifies seven-way state isolation, cleanup, durable
 logs and `runs.tsv`, and aggregate failure propagation.
 
+`codex-config.test.sh` performs a second no-model integration check using a
+fake `codex_path_override`. It records the final Codex argv and proves the
+workspace-bound `mcp_servers.oneup` overrides appear only on the 1up target,
+never on the baseline or distinct grader.
+
 ```sh
 npm run test:parallel
+npm run test:codex-config
 ```
 
 Neither this regression nor configuration validation replaces the manual-only

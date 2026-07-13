@@ -65,7 +65,9 @@ tests:
       TASK_PROMPT: >
         Trace how emdash content search is enabled and queried, from a field
         becoming searchable through to admin search results. Identify the key
-        files involved in each step.
+        files involved in each step. Follow the admin global/full-text search
+        results surface, not the collection content list's local client-side
+        filter.
       EXPECTED_FILES: fts-manager.ts,query.ts,AdminCommandPalette.tsx
     assert:
       - type: javascript

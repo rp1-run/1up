@@ -30,10 +30,17 @@ IMPACT_TESTS=("FTSManager Impact" "Schema Registry Impact" "Plugin Runner Impact
 PIDS=()
 LABELS=()
 LOGS=()
+DIAGNOSTICS=()
 STARTED_AT=()
 RESULT_DIR="results/latest-${PROVIDER}"
+ARCHIVE_ROOT="results/archive-${PROVIDER}"
+if [ -d "$RESULT_DIR" ] && [ -n "$(find "$RESULT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  ARCHIVE_DIR="$ARCHIVE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$ARCHIVE_ROOT"
+  mv "$RESULT_DIR" "$ARCHIVE_DIR"
+  echo "Archived previous results: $ARCHIVE_DIR"
+fi
 mkdir -p "$RESULT_DIR"
-rm -f "$RESULT_DIR"/*.log "$RESULT_DIR"/runs.tsv
 
 STATE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/1up-promptfoo-${PROVIDER}.XXXXXX") || {
   echo "Failed to create temporary Promptfoo state directory." >&2
@@ -80,24 +87,28 @@ echo
 
 for i in "${!SEARCH_TESTS[@]}"; do
   LOG="$RESULT_DIR/search-$i.log"
+  DIAGNOSTIC="$RESULT_DIR/search-$i.json"
   CONFIG_DIR="$STATE_ROOT/search-$i"
   mkdir -p "$CONFIG_DIR"
-  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$SEARCH_CONFIG" --filter-pattern "^${SEARCH_TESTS[$i]}$" > "$LOG" 2>&1 &
+  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$SEARCH_CONFIG" --filter-pattern "^${SEARCH_TESTS[$i]}$" --output "$DIAGNOSTIC" > "$LOG" 2>&1 &
   PIDS+=($!)
   LABELS+=("${SEARCH_TESTS[$i]}")
   LOGS+=("$LOG")
+  DIAGNOSTICS+=("$DIAGNOSTIC")
   STARTED_AT+=("$(date +%s)")
   echo "  Started: ${SEARCH_TESTS[$i]} (pid $!)"
 done
 
 for i in "${!IMPACT_TESTS[@]}"; do
   LOG="$RESULT_DIR/impact-$i.log"
+  DIAGNOSTIC="$RESULT_DIR/impact-$i.json"
   CONFIG_DIR="$STATE_ROOT/impact-$i"
   mkdir -p "$CONFIG_DIR"
-  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$IMPACT_CONFIG" --filter-pattern "^${IMPACT_TESTS[$i]}$" > "$LOG" 2>&1 &
+  PROMPTFOO_CONFIG_DIR="$CONFIG_DIR" "$PROMPTFOO_BIN" eval -c "$IMPACT_CONFIG" --filter-pattern "^${IMPACT_TESTS[$i]}$" --output "$DIAGNOSTIC" > "$LOG" 2>&1 &
   PIDS+=($!)
   LABELS+=("${IMPACT_TESTS[$i]}")
   LOGS+=("$LOG")
+  DIAGNOSTICS+=("$DIAGNOSTIC")
   STARTED_AT+=("$(date +%s)")
   echo "  Started: ${IMPACT_TESTS[$i]} (pid $!)"
 done
@@ -117,7 +128,7 @@ for i in "${!PIDS[@]}"; do
   fi
   PIDS[$i]=""
   DURATION=$(( $(date +%s) - STARTED_AT[$i] ))
-  printf '%s\t%s\t%s\t%s\n' "${LABELS[$i]}" "$DURATION" "$STATUS" "${LOGS[$i]}" >> "$RESULT_DIR/runs.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\n' "${LABELS[$i]}" "$DURATION" "$STATUS" "${LOGS[$i]}" "${DIAGNOSTICS[$i]}" >> "$RESULT_DIR/runs.tsv"
 done
 
 echo

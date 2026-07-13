@@ -21,11 +21,22 @@ providers:
       network_access_enabled: false
       web_search_mode: disabled
       enable_streaming: true
+      cli_env:
+        HOME: "{{_HOME}}"
+        CODEX_HOME: "{{_CODEX_HOME}}"
+        PATH: "{{_PATH}}"
+        NODE_EXTRA_CA_CERTS: "{{_NODE_EXTRA_CA_CERTS}}"
       cli_config:
+        features:
+          apps: false
+          non_prefixed_mcp_tool_names: true
+          plugins: false
         mcp_servers:
           oneup:
             command: 1up
             args: ["mcp", "--path", "{{WORKSPACE_DIR}}"]
+            required: true
+            startup_timeout_sec: 30
 
   - id: openai:codex-sdk
     label: baseline-agent
@@ -38,18 +49,26 @@ providers:
       network_access_enabled: false
       web_search_mode: disabled
       enable_streaming: true
+      cli_env:
+        HOME: "{{_HOME}}"
+        CODEX_HOME: "{{_CODEX_HOME}}"
+        PATH: "{{_PATH}}"
+        NODE_EXTRA_CA_CERTS: "{{_NODE_EXTRA_CA_CERTS}}"
 
 defaultTest:
   options:
     provider:
-      id: openai:codex-sdk
+      id: openai:codex-sdk:gpt-5.6-luna
       config:
-        model: gpt-5.6-luna
-        working_dir: "{{WORKSPACE_DIR}}"
         sandbox_mode: read-only
         approval_policy: never
         network_access_enabled: false
         web_search_mode: disabled
+        cli_env:
+          HOME: "{{_HOME}}"
+          CODEX_HOME: "{{_CODEX_HOME}}"
+          PATH: "{{_PATH}}"
+          NODE_EXTRA_CA_CERTS: "{{_NODE_EXTRA_CA_CERTS}}"
 
 extensions:
   - file://../shared/extension.ts:default
