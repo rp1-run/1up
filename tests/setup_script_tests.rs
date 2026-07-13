@@ -531,6 +531,10 @@ struct RunInput<'a> {
 }
 
 fn run_setup(input: RunInput) -> std::process::Output {
+    run_setup_with_extra_path(input, None)
+}
+
+fn run_setup_with_extra_path(input: RunInput, extra_path: Option<&Path>) -> std::process::Output {
     // Keep attestation verification hermetic by default: unless a test has
     // already placed its own `gh`/`cosign` stub, shadow both with an
     // always-unavailable stub so setup.sh never invokes a real verifier (which
@@ -544,7 +548,15 @@ fn run_setup(input: RunInput) -> std::process::Output {
     }
 
     let real_path = std::env::var("PATH").unwrap_or_default();
-    let path = format!("{}:{}", input.wrapper_dir.display(), real_path);
+    let path = match extra_path {
+        Some(extra_path) => format!(
+            "{}:{}:{}",
+            input.wrapper_dir.display(),
+            extra_path.display(),
+            real_path
+        ),
+        None => format!("{}:{}", input.wrapper_dir.display(), real_path),
+    };
 
     let mut cmd = Command::new("bash");
     cmd.arg(setup_script())
@@ -609,7 +621,7 @@ fn setup_installs_binary_and_updates_path_on_happy_path() {
     let final_line = stdout.lines().last().unwrap_or("");
     assert_eq!(final_line, "Run: 1up start", "final stdout line: {stdout}");
 
-    let installed = host_home.path().join(".1up/bin/1up");
+    let installed = host_home.path().join(".local/bin/1up");
     assert!(installed.is_file(), "binary should be installed");
     let mode = fs::metadata(&installed).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o755, "installed binary must be 0755");
@@ -674,7 +686,7 @@ fn setup_is_idempotent_on_second_run() {
     );
 
     // No staging leftovers in the install dir.
-    let install_dir = host_home.path().join(".1up/bin");
+    let install_dir = host_home.path().join(".local/bin");
     for entry in fs::read_dir(&install_dir).unwrap() {
         let name = entry.unwrap().file_name();
         let name_s = name.to_string_lossy();
@@ -713,7 +725,7 @@ fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
 
     let rc_path = host_home.path().join(".zshrc");
     let rc_after_first = fs::read_to_string(&rc_path).unwrap();
-    let default_install_dir = host_home.path().join(".1up/bin");
+    let default_install_dir = host_home.path().join(".local/bin");
     assert!(
         rc_after_first.contains(default_install_dir.to_str().unwrap()),
         "first run rc should reference default install dir: {rc_after_first}"
@@ -763,6 +775,92 @@ fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
 }
 
 #[test]
+fn setup_migrates_legacy_managed_path_block_to_local_bin() {
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let rc_path = host_home.path().join(".zshrc");
+    let legacy_dir = host_home.path().join(".1up/bin");
+    fs::write(
+        &rc_path,
+        format!(
+            "keep-me\n\n# >>> 1up install (managed) >>>\nexport PATH=\"{}:$PATH\"\n# <<< 1up install (managed) <<<\n",
+            legacy_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/zsh",
+    });
+
+    assert!(
+        output.status.success(),
+        "setup.sh should migrate the managed block: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let rc = fs::read_to_string(&rc_path).unwrap();
+    assert!(
+        rc.contains("keep-me"),
+        "unmanaged rc content must survive: {rc}"
+    );
+    assert!(
+        rc.contains(&format!(
+            "export PATH=\"{}:$PATH\"",
+            host_home.path().join(".local/bin").display()
+        )),
+        "managed block should point at the new default: {rc}"
+    );
+    assert!(
+        !rc.contains(&format!("export PATH=\"{}:$PATH\"", legacy_dir.display())),
+        "legacy managed path should be removed: {rc}"
+    );
+}
+
+#[test]
+fn setup_does_not_edit_rc_when_local_bin_is_already_on_path() {
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), true);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let rc_path = host_home.path().join(".zshrc");
+    fs::write(&rc_path, "keep-me\n").unwrap();
+    let local_bin = host_home.path().join(".local/bin");
+    let output = run_setup_with_extra_path(
+        RunInput {
+            home: host_home.path(),
+            wrapper_dir: wrapper_dir.path(),
+            install_dir: None,
+            version_pin: Some(FIXTURE_TAG),
+            shell_override: "/bin/zsh",
+        },
+        Some(&local_bin),
+    );
+
+    assert!(
+        output.status.success(),
+        "setup.sh should succeed without an rc edit: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        fs::read_to_string(&rc_path).unwrap(),
+        "keep-me\n",
+        "an existing PATH entry should leave the rc file byte-for-byte unchanged"
+    );
+}
+
+#[test]
 fn setup_fails_on_checksum_mismatch() {
     // Published SHA256SUMS that disagrees with the served archive must be
     // fatal. Binary must NOT land in the install dir.
@@ -794,7 +892,7 @@ fn setup_fails_on_checksum_mismatch() {
         "stderr should name the failure: {stderr}"
     );
 
-    let installed = host_home.path().join(".1up/bin/1up");
+    let installed = host_home.path().join(".local/bin/1up");
     assert!(
         !installed.exists(),
         "binary must not be installed on checksum failure"
@@ -828,7 +926,7 @@ fn setup_warns_and_installs_without_sha256sums() {
         "stderr should carry the integrity warning: {stderr}"
     );
     assert!(
-        host_home.path().join(".1up/bin/1up").is_file(),
+        host_home.path().join(".local/bin/1up").is_file(),
         "binary must still be installed"
     );
 }
@@ -871,7 +969,7 @@ fn setup_treats_transient_sums_fetch_as_fatal() {
         "a transient failure must NOT be reported as genuinely unpublished: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin/1up").exists(),
+        !host_home.path().join(".local/bin/1up").exists(),
         "binary must not be installed when the checksum cannot be obtained"
     );
 }
@@ -921,7 +1019,7 @@ fn setup_fails_when_sums_published_but_entry_missing() {
         "stderr should name the missing checksum entry: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin/1up").exists(),
+        !host_home.path().join(".local/bin/1up").exists(),
         "binary must not be installed when the published checksum has no matching entry"
     );
 }
@@ -960,7 +1058,7 @@ fn setup_fails_when_attestation_is_disproved() {
         "stderr should name the attestation failure: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin/1up").exists(),
+        !host_home.path().join(".local/bin/1up").exists(),
         "binary must not be installed when attestation is disproved"
     );
 }
@@ -996,7 +1094,7 @@ fn setup_degrades_when_no_attestation_verifier_present() {
         "stderr should carry the degrade notice naming the missing verifier: {stderr}"
     );
     assert!(
-        host_home.path().join(".1up/bin/1up").is_file(),
+        host_home.path().join(".local/bin/1up").is_file(),
         "binary must still install on the checksum floor when no verifier is present"
     );
 }
@@ -1041,7 +1139,7 @@ fn setup_degrades_when_attestation_cannot_be_verified() {
         "a cannot-run outcome must NOT be treated as a disproof: {stderr}"
     );
     assert!(
-        host_home.path().join(".1up/bin/1up").is_file(),
+        host_home.path().join(".local/bin/1up").is_file(),
         "binary must still install on the checksum floor when attestation cannot run"
     );
 }
@@ -1073,7 +1171,7 @@ fn setup_rejects_unsupported_platform() {
         "stderr should name platform: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin").exists(),
+        !host_home.path().join(".local/bin").exists(),
         "install dir must not be created on unsupported-platform failure"
     );
 }
@@ -1109,7 +1207,7 @@ fn setup_honors_pinned_version() {
     );
 
     // Sanity: the stub binary prints the tag it was built for.
-    let installed = host_home.path().join(".1up/bin/1up");
+    let installed = host_home.path().join(".local/bin/1up");
     let version_out = Command::new(&installed).arg("--version").output().unwrap();
     let version_stdout = String::from_utf8_lossy(&version_out.stdout);
     assert!(
@@ -1148,7 +1246,7 @@ fn setup_rejects_intel_macos_with_specific_message() {
         "stderr should name the unsupported flavour: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin").exists(),
+        !host_home.path().join(".local/bin").exists(),
         "install dir must not be created on Intel macOS"
     );
 }
@@ -1185,7 +1283,7 @@ fn setup_resolves_latest_release_when_unpinned() {
         "final message should name the resolved tag: {stdout}"
     );
 
-    let installed = host_home.path().join(".1up/bin/1up");
+    let installed = host_home.path().join(".local/bin/1up");
     assert!(installed.is_file(), "binary should be installed");
     let version_out = Command::new(&installed).arg("--version").output().unwrap();
     let version_stdout = String::from_utf8_lossy(&version_out.stdout);
@@ -1274,7 +1372,7 @@ fn setup_fails_cleanly_on_missing_pinned_version() {
         "stderr should name the missing tag and asset: {stderr}"
     );
     assert!(
-        !host_home.path().join(".1up/bin/1up").exists(),
+        !host_home.path().join(".local/bin/1up").exists(),
         "binary must not be installed when the pinned release is missing"
     );
     assert!(

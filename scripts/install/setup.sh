@@ -2,13 +2,13 @@
 # 1up install script. Safe under `curl | bash`.
 #
 # Detects platform, downloads the matching release archive from GitHub,
-# verifies SHA256 when published, installs into $HOME/.1up/bin (or
+# verifies SHA256 when published, installs into $HOME/.local/bin (or
 # $1UP_INSTALL_DIR), and updates the user's shell rc with a PATH block.
 #
 # Env vars (names start with a digit, so set them via `env NAME=VALUE ...`
 # or from a shell that accepts digit-leading identifiers):
 #   1UP_VERSION       pin to a specific release tag (default: latest)
-#   1UP_INSTALL_DIR   override install directory (default: $HOME/.1up/bin)
+#   1UP_INSTALL_DIR   override install directory (default: $HOME/.local/bin)
 #   1UP_REPO          override GitHub repo slug (default: rp1-run/1up)
 #
 # bash 3.2 compatible. No $0-relative paths. All expansions quoted.
@@ -516,7 +516,7 @@ install_binary() {
     if [ -n "$INSTALL_DIR_OVERRIDE" ]; then
         INSTALL_DIR="$INSTALL_DIR_OVERRIDE"
     else
-        INSTALL_DIR="$HOME/.1up/bin"
+        INSTALL_DIR="$HOME/.local/bin"
     fi
 
     # Reject install-dir values that would corrupt the rc file when

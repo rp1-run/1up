@@ -68,7 +68,9 @@ x86_64:
 curl -fsSL https://github.com/rp1-run/1up/releases/latest/download/setup.sh | bash
 ```
 
-Follow any printed `PATH` instruction or open a new shell, then verify the binary:
+The installer places `1up` in `~/.local/bin`. If that directory is already on `PATH`, the command
+is ready immediately and the installer leaves your shell files alone. Otherwise, follow the
+printed instruction or open a new shell, then verify the binary:
 
 ```sh
 1up --version
@@ -233,7 +235,8 @@ The full data, network, and security boundary is:
 ## <img src="assets/readme/icons/heroicons-solid/arrow-path.svg" alt="" width="20" height="20"> Stay Current, Recover Cleanly
 
 Keep the binary and its shared worktree index aligned. For the recommended script install, apply
-the version advertised on the stable update channel:
+the version advertised on the stable update channel in place, whether the binary lives in the new
+`~/.local/bin` default or the legacy `~/.1up/bin` location:
 
 ```sh
 1up update
@@ -260,8 +263,12 @@ command -v 1up
 1up --version
 ```
 
-Open a new shell after installation. If those commands work in a terminal but not in a GUI host,
-use the absolute binary path in MCP config or launch the host with the same `PATH`.
+The recommended installer writes `~/.local/bin/1up`. Most shells already include `~/.local/bin`;
+when yours does not, the installer prints the rc-file reload step it added. Rerunning the installer
+migrates its legacy managed `~/.1up/bin` PATH block to the new default without disturbing the rest
+of your rc file. If the commands work in a terminal but not in a GUI host, use
+`~/.local/bin/1up` as the absolute binary path in MCP config or launch the host with the same
+`PATH`.
 
 **The tools do not appear**
 
