@@ -27,7 +27,7 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 3. Call `oneup_search` with the task intent and a small limit.
 4. Copy a full handle from the most recent structured search response and hydrate it with `oneup_get`; do not guess or truncate handles.
 5. Use `oneup_context` for precise file-line context when needed.
-6. Before answering, call `oneup_symbol` once for the central symbol you found (for this task, prefer `FTSManager` or `searchWithDb`) to verify definitions or references.
+6. Before answering, call `oneup_symbol` once for the central symbol you found to verify definitions or references.
 7. Once `oneup_symbol` succeeds, do not call any more tools. Answer immediately from the inspected code and name the key files and their roles.
 
 {{TASK_PROMPT}}

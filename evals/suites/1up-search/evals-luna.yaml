@@ -175,11 +175,13 @@ tests:
   - description: Plugin Architecture
     vars:
       TASK_PROMPT: >
-        Trace how a sandboxed emdash plugin is registered, capability-gated,
-        loaded into Cloudflare Worker isolation, and given controlled access
-        to content, storage, and network. Identify the key files involved in
-        each step.
-      EXPECTED_FILES: manager.ts,hooks.ts,runner.ts,wrapper.ts,bridge.ts
+        Compare emdash's trusted in-process plugin registration and hook
+        execution with its separate sandboxed-plugin path. Trace how sandbox
+        descriptors become runtime manifests, how plugin code is loaded into
+        Cloudflare Worker isolation, and how controlled content, storage, and
+        network access is enforced. Identify the key files involved and do not
+        treat trusted hook registration as sandbox registration.
+      EXPECTED_FILES: manager.ts,hooks.ts,emdash-runtime.ts,runner.ts,wrapper.ts,bridge.ts
     assert:
       - type: javascript
         value: |
@@ -206,26 +208,36 @@ tests:
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
         value: >
-          Accuracy: The correct plugin architecture is: (1) manager.ts handles
-          plugin registration, (2) hooks.ts provides capability hooks, (3)
-          runner.ts loads plugins into Cloudflare Worker isolation, (4) wrapper.ts
-          provides sandboxed wrapping, (5) bridge.ts controls access to content,
-          storage, and network. Score 1.0 if the key files and their roles are
-          correct, 0.5 if partially correct, 0.0 if fundamentally wrong. Judge
-          only factual correctness, not format or length.
+          Accuracy: EmDash has two distinct paths. For trusted in-process
+          plugins, manager.ts registers PluginDefinition objects and hooks.ts
+          builds and executes the hook pipeline with PluginContext capability
+          checks. Sandboxed descriptors are handled separately: emdash-runtime.ts
+          creates PluginManifest values and asks SandboxRunner to load them;
+          Cloudflare runner.ts creates Worker Loader isolates, wrapper.ts exposes
+          hook and route RPC inside the isolate, and bridge.ts enforces declared
+          capabilities, storage scope, and allowed network hosts. Score 1.0 if
+          the answer preserves this distinction and correctly describes the
+          sandbox boundary and controls, 0.5 if partially correct, 0.0 if it
+          conflates trusted registration with sandbox loading or is fundamentally
+          wrong. Judge only factual correctness, not format or length.
       - type: llm-rubric
         value: >
-          Completeness: The answer should cover: (a) plugin registration,
-          (b) capability gating, (c) Worker isolation, (d) controlled resource
-          access. Score 1.0 if all four, 0.75 if three, 0.5 if two, 0.25 if
-          one. Judge only coverage, not format or length.
+          Completeness: The answer should cover: (a) trusted in-process
+          registration and hook execution, (b) separate sandbox descriptor and
+          runtime loading, (c) Worker isolation and wrapper RPC, (d) controlled
+          content, storage, and network access. Score 1.0 if all four, 0.75 if
+          three, 0.5 if two, 0.25 if one. Judge only coverage, not format or
+          length.
 
   - description: Live Content Query
     vars:
       TASK_PROMPT: >
-        Explain how emdash stores schema in the database and exposes typed
-        live content queries through Astro. Identify the key files involved
-        in each step.
+        Trace emdash's public Astro live-collection path: from database-backed
+        schema persistence, through the site's live collection configuration
+        and the emdash live loader, to the typed public collection and entry
+        query helpers used by Astro pages. Identify the key files involved in
+        each step. Distinguish this public path from internal admin/runtime
+        queries made directly through the content repository.
       EXPECTED_FILES: registry.ts,loader.ts,query.ts,live.config.ts
     assert:
       - type: javascript
@@ -253,16 +265,22 @@ tests:
         value: file://../shared/assertions/index.ts:reportEfficiency
       - type: llm-rubric
         value: >
-          Accuracy: The correct live content query flow is: (1) registry.ts
-          stores schema definitions in the database, (2) loader.ts loads schema
-          at runtime, (3) query.ts executes typed content queries, (4)
-          live.config.ts integrates with Astro for live queries. Score 1.0 if
-          all four are correctly described, 0.5 if partially correct, 0.0 if
-          fundamentally wrong. Judge only factual correctness, not format or
-          length.
+          Accuracy: SchemaRegistry in registry.ts persists collection and field
+          metadata and maintains the dynamic content tables. A site's
+          live.config.ts registers the generic _emdash Astro live collection
+          with emdashLoader(). The LiveLoader in loader.ts translates collection
+          and entry requests into queries against the appropriate dynamic table.
+          The public getEmDashCollection() and getEmDashEntry() helpers in
+          query.ts call Astro's live-content APIs and preserve generated
+          collection types. ContentRepository.findMany is an internal
+          repository query, not this public Astro live-collection path. Score
+          1.0 if all roles and the distinction are correct, 0.5 if partially
+          correct, 0.0 if fundamentally wrong. Judge only factual correctness,
+          not format or length.
       - type: llm-rubric
         value: >
-          Completeness: The answer should cover: (a) schema storage,
-          (b) schema loading, (c) query execution, (d) Astro integration.
-          Score 1.0 if all four, 0.75 if three, 0.5 if two, 0.25 if one.
-          Judge only coverage, not format or length.
+          Completeness: The answer should cover: (a) database-backed schema and
+          dynamic tables, (b) live.config.ts registration with emdashLoader(),
+          (c) loader.ts query translation, (d) typed public helpers in query.ts.
+          Score 1.0 if all four, 0.75 if three, 0.5 if two, 0.25 if one. Judge
+          only coverage, not format or length.

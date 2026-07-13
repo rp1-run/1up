@@ -845,19 +845,24 @@ export function assertImpactTrustInterpreted(
   if (skipped) return skipped;
 
   const impactCalls = getOneupCalls(context, "oneup_impact");
-  const interpretedTrust =
-    /\b(primary|contextual|lower-confidence|confidence|advisory|likely-impact)\b/i.test(
+  const hasPrimaryBoundary =
+    /\b(?:primary|direct)\b(?:\s|[/:(—-]){1,8}\b(?:high|higher)[ -]confidence\b/i.test(
       output,
     );
+  const hasContextualBoundary =
+    /\b(?:contextual|indirect)\b(?:\s|[/:(—-]){1,8}\b(?:low|lower)[ -]confidence\b/i.test(
+      output,
+    );
+  const interpretedTrust = hasPrimaryBoundary && hasContextualBoundary;
   const pass = impactCalls.length > 0 && interpretedTrust;
 
   return {
     pass,
     score: pass ? 1 : impactCalls.length > 0 ? 0.5 : 0,
     reason: pass
-      ? "Agent interpreted impact output with explicit trust-boundary language"
+      ? "Agent separated primary/direct higher-confidence impact from contextual/indirect lower-confidence guidance"
       : impactCalls.length > 0
-        ? "Agent called oneup_impact but did not distinguish primary/contextual or confidence boundaries in the answer"
+        ? "Agent called oneup_impact but did not explicitly separate primary/direct higher-confidence findings from contextual/indirect lower-confidence guidance"
         : "Agent did not call oneup_impact",
   };
 }

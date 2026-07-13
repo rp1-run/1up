@@ -669,13 +669,30 @@ describe("assertSymbolVerificationUsed", () => {
 describe("assertImpactTrustInterpreted", () => {
   test("passes when impact output trust buckets are interpreted", () => {
     const result = assertImpactTrustInterpreted(
-      "Primary likely-impact files are query.ts and registry.ts. Contextual lower-confidence callers should be verified.",
+      "Primary higher-confidence likely-impact files are query.ts and registry.ts. Contextual lower-confidence callers should be verified.",
       makeContext([
         toolCall("mcp__oneup__oneup_impact", { symbol: "FTSManager" }),
       ]),
     );
 
     expect(result.pass).toBe(true);
+  });
+
+  test.each([
+    "The primary runtime consumers are query.ts and registry.ts.",
+    "Contextual callers include query.ts and registry.ts.",
+    "Confidence is high that query.ts and registry.ts are affected.",
+    "Primary lower-confidence callers and contextual higher-confidence callers are affected.",
+  ])("rejects incomplete trust-boundary wording: %s", (output) => {
+    const result = assertImpactTrustInterpreted(
+      output,
+      makeContext([
+        toolCall("mcp__oneup__oneup_impact", { symbol: "FTSManager" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.score).toBe(0.5);
   });
 
   test("gives partial credit when impact is called without trust language", () => {
