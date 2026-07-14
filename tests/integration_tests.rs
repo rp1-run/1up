@@ -5348,6 +5348,42 @@ fn mcp_impact_preserves_trust_buckets_and_followups() {
     assert_mcp_next_actions_are_canonical(empty_envelope);
 }
 
+/// T4 amendment: the measured impact failures passed only {path, line} and got
+/// "provide exactly one impact anchor" back — a dead turn. A relative file path
+/// in the project-root `path` slot with no other anchor now resolves to a File
+/// anchor, and roots resolve from the ambient project (not the file path), so
+/// the call yields advisory impact output instead of an error.
+#[test]
+fn mcp_impact_promotes_relative_path_slot_to_file_anchor() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "path": "src/auth/runtime.rs", "line": 1 }),
+    );
+
+    assert_ne!(
+        result["isError"], true,
+        "a relative path-slot file anchor must not error: {result}"
+    );
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert!(
+        matches!(
+            envelope["status"].as_str().unwrap(),
+            "expanded" | "expanded_scoped"
+        ),
+        "relative path-slot anchor should resolve to advisory impact output: {envelope:?}"
+    );
+    assert!(
+        !envelope["data"]["results"].as_array().unwrap().is_empty(),
+        "path-slot file anchor should surface primary likely-impact results: {envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
 #[test]
 fn mcp_impact_refusal_sets_is_error() {
     let tmp = create_impact_acceptance_fixture();

@@ -424,7 +424,14 @@ impl OneupMcpServer {
             }
         };
 
-        let roots = match self.roots(input.path.as_deref()) {
+        // When `path` was consumed as a relative file anchor, it does not name
+        // the project root, so resolve roots from the ambient project instead.
+        let root_selector = if impact_path_as_file_anchor(&input).is_some() {
+            None
+        } else {
+            input.path.as_deref()
+        };
+        let roots = match self.roots(root_selector) {
             Ok(roots) => roots,
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
@@ -548,6 +555,40 @@ fn looks_like_file_path(value: &str) -> bool {
     trimmed.contains('/') && !trimmed.ends_with('/')
 }
 
+/// Whether a value looks like a repo-relative file path suitable for promotion
+/// to a File impact anchor from the project-root `path` slot: it is relative
+/// (no leading `/`), carries a path separator, and does not end with one.
+/// Absolute paths retain their project-root selector meaning and are never
+/// promoted.
+fn looks_like_relative_file_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.starts_with('/') && looks_like_file_path(trimmed)
+}
+
+/// The repo-relative file path an impact call supplied in the project-root
+/// `path` slot as its only anchor, or `None` when `path` is absent, absolute,
+/// not file-looking, or another anchor (handle/symbol/file) is present. When
+/// this returns `Some`, `path` names a file anchor rather than the project
+/// root, so the handler must resolve roots without it.
+fn impact_path_as_file_anchor(input: &ImpactInput) -> Option<String> {
+    let has_other_anchor = [&input.handle, &input.symbol, &input.file]
+        .into_iter()
+        .any(|value| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    if has_other_anchor {
+        return None;
+    }
+    input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| looks_like_relative_file_path(value))
+        .map(str::to_string)
+}
+
 fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
     let handle = input
         .handle
@@ -563,14 +604,25 @@ fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
         .iter()
         .filter(|present| **present)
         .count();
-    if count != 1 {
+    if count > 1 {
         return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
     }
 
-    // A file path supplied in the `symbol` slot is promoted to a File anchor,
-    // so `line` pins it just like an explicit `file` anchor.
+    // A repo-relative file path supplied in the project-root `path` slot with no
+    // other anchor is promoted to a File anchor: the measured impact failures
+    // passed only {path, line}. Absolute paths keep their project-root meaning.
+    let path_as_file = impact_path_as_file_anchor(input);
+    if count == 0 && path_as_file.is_none() {
+        return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
+    }
+
+    // A file path supplied in the `symbol` slot is likewise promoted, so `line`
+    // pins it just like an explicit `file` anchor.
     let symbol_as_file = symbol.filter(|value| looks_like_file_path(value));
-    let file_anchor = file.or(symbol_as_file);
+    let file_anchor: Option<String> = file
+        .cloned()
+        .or_else(|| symbol_as_file.cloned())
+        .or(path_as_file);
     if input.line.is_some() && file_anchor.is_none() {
         return Err("line can only be used with a file impact anchor".to_string());
     }
@@ -581,7 +633,7 @@ fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
         }
     } else if let Some(path) = file_anchor {
         ImpactAnchor::File {
-            path: path.clone(),
+            path,
             line: input.line,
         }
     } else {
@@ -619,8 +671,11 @@ fn corrected_impact_call(input: &ImpactInput) -> Option<Value> {
         return Some(json!({ "handle": format!(":{}", normalize_handle(&handle)) }));
     }
 
-    // A file path (explicit, or one supplied in the symbol slot) keeps its line.
-    let file_path = file.or_else(|| symbol.clone().filter(|value| looks_like_file_path(value)));
+    // A file path (explicit, in the symbol slot, or a relative path in the
+    // project-root `path` slot) keeps its line.
+    let file_path = file
+        .or_else(|| symbol.clone().filter(|value| looks_like_file_path(value)))
+        .or_else(|| impact_path_as_file_anchor(input));
     if let Some(path) = file_path {
         let mut arguments = serde_json::Map::new();
         arguments.insert("file".to_string(), Value::from(path));
@@ -1947,6 +2002,109 @@ mod tests {
     #[test]
     fn corrected_impact_call_is_none_without_any_anchor() {
         assert_eq!(corrected_impact_call(&impact_input()), None);
+    }
+
+    #[test]
+    fn impact_request_promotes_relative_path_slot_to_file_anchor() {
+        // A relative file path supplied in the project-root `path` slot with no
+        // other anchor now resolves to a File anchor instead of erroring.
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "packages/cloudflare/src/sandbox/runner.ts".to_string(),
+                line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_promoted_path_slot_anchor_accepts_line() {
+        // The measured failure shape: {"path": "...runner.ts", "line": 111} with
+        // no other anchor resolves to a file anchor pinned at the line.
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+        input.line = Some(111);
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "packages/cloudflare/src/sandbox/runner.ts".to_string(),
+                line: Some(111),
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_does_not_promote_absolute_path_slot() {
+        // An absolute path keeps its project-root selector meaning and is never
+        // promoted, so a call with no real anchor still errors -- with or
+        // without a line, since the absent-anchor check precedes the line check.
+        let mut input = impact_input();
+        input.path = Some("/Users/dev/project".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap_err(),
+            "provide exactly one impact anchor: handle, symbol, or file"
+        );
+
+        input.line = Some(9);
+        assert_eq!(
+            impact_request(&input).unwrap_err(),
+            "provide exactly one impact anchor: handle, symbol, or file"
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_promotes_relative_path_slot_with_line() {
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+        input.line = Some(111);
+
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({
+                "file": "packages/cloudflare/src/sandbox/runner.ts",
+                "line": 111
+            }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_ignores_absolute_path_slot() {
+        // An absolute path is a project-root selector, not a file anchor, so the
+        // corrected-call builder synthesizes nothing from it -- the error
+        // envelope falls back to the generic search/symbol next actions.
+        let mut input = impact_input();
+        input.path = Some("/Users/dev/project".to_string());
+        input.line = Some(9);
+
+        assert_eq!(corrected_impact_call(&input), None);
+    }
+
+    #[test]
+    fn impact_path_slot_stays_repo_root_when_an_explicit_anchor_is_present() {
+        // With a real anchor present, a file-looking `path` retains its
+        // project-root selector meaning: it is never consumed as a file anchor,
+        // so the handler passes it through to root resolution unchanged.
+        let mut input = impact_input();
+        input.handle = Some(":abcdef012345".to_string());
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+
+        assert_eq!(impact_path_as_file_anchor(&input), None);
+
+        let request = impact_request(&input).unwrap();
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::Segment {
+                id: "abcdef012345".to_string()
+            }
+        );
     }
 
     #[test]
