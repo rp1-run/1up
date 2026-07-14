@@ -89,7 +89,7 @@ tests:
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
       - type: llm-rubric
         value: >
           Accuracy: The correct search flow in emdash is: (1) FTSManager in

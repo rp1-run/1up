@@ -18,6 +18,16 @@ interface GradingResult {
   namedScores?: Record<string, number>;
 }
 
+/**
+ * Prefix stamped on the reason of any component that does not apply to the
+ * variant under test (e.g. 1up-specific assertions scored against the isolated
+ * baseline). The per-axis report (axes-report.ts) excludes marked components
+ * from axis means and renders them `n/a` instead of granting automatic credit,
+ * so the baseline no longer inherits the score of assertions it never exercises
+ * (REQ-002).
+ */
+export const NOT_APPLICABLE_REASON = "not-applicable:";
+
 interface ToolCall {
   readonly id?: string;
   readonly name: string;
@@ -144,7 +154,7 @@ function baselineSkip(context: EvalContext): GradingResult | undefined {
     pass,
     score: pass ? 1 : 0,
     reason: pass
-      ? "1up workflow assertion is not applicable to the isolated baseline variant"
+      ? `${NOT_APPLICABLE_REASON} 1up workflow assertion is not applicable to the isolated baseline variant`
       : `Baseline variant unexpectedly invoked 1up MCP calls: ${formatToolNames(calls)}`,
   };
 }
@@ -690,6 +700,122 @@ export function assertReadinessWorkflowUsed(
   };
 }
 
+const ONEUP_INDEXING_SUBCOMMANDS = new Set(["index", "reindex", "start"]);
+
+function oneupIndexingCommands(command: string): string[] {
+  const found: string[] = [];
+  let segment: ShellToken[] = [];
+
+  const flush = () => {
+    const toolIndex = segment.findIndex(
+      (token) => fallbackToolName(token.value) === undefined && isOneup(token),
+    );
+    if (toolIndex !== -1) {
+      const subcommand = segment
+        .slice(toolIndex + 1)
+        .find((token) => !token.value.startsWith("-"));
+      if (subcommand && ONEUP_INDEXING_SUBCOMMANDS.has(subcommand.value)) {
+        found.push(
+          segment
+            .slice(toolIndex)
+            .map((token) => token.value)
+            .join(" "),
+        );
+      }
+    }
+    segment = [];
+  };
+
+  for (const token of tokenizeShell(command)) {
+    if (SHELL_SEGMENT_BOUNDARIES.has(token.value)) {
+      flush();
+    } else {
+      segment.push(token);
+    }
+  }
+  flush();
+
+  return found;
+}
+
+function isOneup(token: ShellToken): boolean {
+  const name = token.value.split(/[\\/]/).at(-1) ?? token.value;
+  return name === "1up";
+}
+
+/**
+ * Warm-suite readiness contract (REQ-001): the fixture hook pre-warms the
+ * index before the agent starts, so the measured trajectory must contain
+ * exactly one initial `oneup_status` before any discovery call and must never
+ * trigger indexing from the measurement loop — no `oneup_start`, no Bash
+ * `1up index/reindex/start`. Any of those contaminates the token/latency/cost
+ * axes with cold-start work. Cold-start readiness waiting lives in the separate
+ * cold suite, which keeps using `assertReadinessWorkflowUsed`.
+ */
+export function assertWarmReadiness(
+  _output: string,
+  context: EvalContext,
+): GradingResult {
+  const skipped = baselineSkip(context);
+  if (skipped) return skipped;
+
+  const calls = getToolCalls(context);
+  const statusCalls = calls.filter(
+    (tc) => toOneupMcpTool(tc.name) === "oneup_status",
+  );
+  const statusIndex = toolCallIndex(calls, "oneup_status");
+  const startIndex = toolCallIndex(calls, "oneup_start");
+  const firstDiscoveryIndex = firstToolCallIndex(calls, ONEUP_DISCOVERY_TOOLS);
+
+  const indexingCommands = calls.flatMap((tc) => {
+    if (toCanonical(tc.name) !== "shell") {
+      return [];
+    }
+    const command = (tc.input as { command?: string })?.command ?? "";
+    return oneupIndexingCommands(command);
+  });
+
+  const problems: string[] = [];
+
+  if (statusCalls.length === 0) {
+    problems.push("missing initial oneup_status readiness check");
+  } else if (statusCalls.length > 1) {
+    problems.push(
+      `expected exactly one oneup_status, saw ${statusCalls.length}`,
+    );
+  }
+
+  if (
+    statusIndex !== -1 &&
+    firstDiscoveryIndex !== -1 &&
+    statusIndex > firstDiscoveryIndex
+  ) {
+    problems.push("oneup_status happened after discovery");
+  }
+
+  if (startIndex !== -1) {
+    problems.push("oneup_start triggered indexing in a warm case");
+  }
+
+  if (indexingCommands.length > 0) {
+    problems.push(
+      `Bash indexing in a warm case: ${indexingCommands
+        .map((command) => command.slice(0, 60))
+        .join(", ")}`,
+    );
+  }
+
+  const pass = problems.length === 0;
+
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? "Agent performed exactly one initial oneup_status on the pre-warmed index and triggered no indexing"
+      : `Agent violated the warm readiness contract: ${problems.join(", ")}`,
+  };
+}
+
 export function assert1upImpactUsed(
   _output: string,
   context: EvalContext,
@@ -901,7 +1027,15 @@ export function assertValidOneupMcpCalls(
   };
 }
 
-export function reportEfficiency(
+/**
+ * Neutral run-metrics reporter (REQ-002): always passes with a fixed neutral
+ * score so it can never advantage either provider in Promptfoo's
+ * (non-authoritative) composite, and emits the raw latency/tokens/cost/calls
+ * measures as namedScores. The per-axis report (axes-report.ts) splits these
+ * into the independent latency, tokens, and cost axes; graded scoring lives
+ * there, not here.
+ */
+export function reportRunMetrics(
   _output: string,
   context: EvalContext,
 ): GradingResult {
@@ -957,28 +1091,18 @@ export function reportEfficiency(
     debugInfo = ` [no raw, keys: ${Object.keys(context.providerResponse ?? {}).join(",")}]`;
   }
 
+  const tokens =
+    inputTokens + outputTokens + cacheCreation + cachedInput + reasoningOutput;
+  const costUsd = cost ?? 0;
+  const calls = getToolCalls(context).length;
   const durationS = Math.round(durationMs / 1000);
-  const costVal = cost ?? 0;
 
-  // Efficiency scores: higher = better, 0-100 scale for readability.
-  // Speed: 200s baseline → 0, 0s → 100. e.g. 50s → 75, 100s → 50
-  const speedScore = Math.max(
-    0,
-    Math.min(100, Math.round((1 - durationS / 200) * 100)),
-  );
-  // Cost: $0.50 baseline → 0, $0 → 100. e.g. $0.25 → 50, $0.10 → 80
-  const costScore =
-    cost === undefined
-      ? 0
-      : Math.max(0, Math.min(100, Math.round((1 - costVal / 0.5) * 100)));
-
-  const namedScores: Record<string, number> = {};
-  if (durationMs > 0) {
-    namedScores.Speed = speedScore;
-  }
-  if (cost !== undefined) {
-    namedScores["Cost Efficiency"] = costScore;
-  }
+  const namedScores: Record<string, number> = {
+    latency_ms: durationMs,
+    tokens,
+    cost_usd: costUsd,
+    calls,
+  };
 
   const usageDetails = [
     `in:${inputTokens.toLocaleString()}`,
@@ -992,11 +1116,18 @@ export function reportEfficiency(
 
   return {
     pass: true,
-    score: costScore / 100,
-    ...(Object.keys(namedScores).length > 0 ? { namedScores } : {}),
-    reason: `${durationMs > 0 ? `${durationS}s` : "duration n/a"} | ${cost === undefined ? "cost n/a" : `$${costVal.toFixed(2)}`} | ${turns} ${turns === 1 ? "turn" : "turns"} | tokens ${usageDetails}${debugInfo}`,
+    score: 1,
+    namedScores,
+    reason: `${durationMs > 0 ? `${durationS}s` : "duration n/a"} | ${cost === undefined ? "cost n/a" : `$${costUsd.toFixed(2)}`} | ${calls} ${calls === 1 ? "call" : "calls"} | ${turns} ${turns === 1 ? "turn" : "turns"} | tokens ${usageDetails}${debugInfo}`,
   };
 }
+
+/**
+ * Back-compat alias for the untouched Claude-path suites (`evals.yaml`), which
+ * still reference `reportEfficiency`. The Luna warm and cold suites reference
+ * `reportRunMetrics` directly.
+ */
+export const reportEfficiency = reportRunMetrics;
 
 export function assertExpectedFiles(
   expectedFiles: string[],
