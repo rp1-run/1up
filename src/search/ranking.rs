@@ -554,12 +554,84 @@ pub(crate) fn tokenize_text(value: &str) -> Vec<String> {
     tokens
 }
 
+/// Longest all-uppercase run treated as a prose acronym (e.g. `API`, `CPU`,
+/// `HTTP`); longer all-caps tokens read as identifier-like constants
+/// (e.g. `MAX_RESULTS`, `DEFAULT`).
+const MAX_PROSE_ACRONYM_CHARS: usize = 6;
+
+/// Token intent classes for natural-language detection. Neutral tokens carry
+/// no intent signal; identifier-like tokens carry symbol/code structure; prose
+/// tokens read as ordinary words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryTokenClass {
+    Neutral,
+    Identifier,
+    Prose,
+}
+
+/// Classifies one case-preserved query word. Neutral tokens are too short or
+/// purely numeric. Identifier-like tokens carry code structure: a `_`
+/// separator, a letter+digit mix, an interior CamelCase transition (a
+/// letters-only word that `tokenize_text` splits into more than one token), or
+/// a long all-caps constant. Everything else — all-lowercase words,
+/// Capitalized words, and short all-caps acronyms — reads as prose.
+fn classify_query_token(word: &str) -> QueryTokenClass {
+    let char_count = word.chars().count();
+    if char_count < 2 || word.chars().all(|c| c.is_ascii_digit()) {
+        return QueryTokenClass::Neutral;
+    }
+
+    // Past the neutral check any remaining digit means a letter+digit mix,
+    // since `query_words` only keeps alphanumerics and `_`.
+    if word.contains('_') || word.chars().any(|c| c.is_ascii_digit()) {
+        return QueryTokenClass::Identifier;
+    }
+
+    if tokenize_text(word).len() > 1 {
+        return QueryTokenClass::Identifier;
+    }
+
+    if word.chars().all(|c| c.is_uppercase()) && char_count > MAX_PROSE_ACRONYM_CHARS {
+        return QueryTokenClass::Identifier;
+    }
+
+    QueryTokenClass::Prose
+}
+
+/// Decides natural-language intent at the token level: a query reads as prose
+/// when it has at least two significant terms, at least two prose-like words,
+/// and prose-like words strictly outnumber identifier-like words. This keeps
+/// the ranking safeguards for proper-noun and acronym prose (e.g. "how does
+/// EmDash flush the API buffer") while leaving identifier queries
+/// (snake_case/CamelCase pairs, single symbols) classified as non-prose.
 fn is_natural_language_query(query: &str) -> bool {
-    let terms = query_terms(query);
-    terms.len() >= 2
-        && !query.contains('_')
-        && !query.chars().any(|c| c.is_uppercase())
-        && !query.chars().any(|c| c.is_numeric())
+    if query_terms(query).len() < 2 {
+        return false;
+    }
+
+    let mut prose = 0usize;
+    let mut identifier = 0usize;
+    for word in query_words(query) {
+        match classify_query_token(&word) {
+            QueryTokenClass::Prose => prose += 1,
+            QueryTokenClass::Identifier => identifier += 1,
+            QueryTokenClass::Neutral => {}
+        }
+    }
+
+    prose >= 2 && prose > identifier
+}
+
+/// Splits a query into case-preserving words on non-alphanumeric boundaries
+/// (keeping `_` so snake_case identifiers stay whole). Unlike `query_terms`
+/// this applies no stop-word or length filtering and preserves case, so token
+/// classifiers can inspect the raw shape of each word.
+pub(crate) fn query_words(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_string())
+        .collect()
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -1067,5 +1139,68 @@ mod tests {
 
         assert!(docs_penalty < config_penalty);
         assert!(docs_boost <= config_boost);
+    }
+
+    #[test]
+    fn prose_queries_classify_as_natural_language() {
+        assert!(
+            is_natural_language_query("how does the daemon shut down"),
+            "all-lowercase prose is natural language"
+        );
+        assert!(
+            is_natural_language_query("when does EmDash flush the buffer"),
+            "prose with a CamelCase proper noun stays natural language"
+        );
+        assert!(
+            is_natural_language_query("how does the API handle retries"),
+            "prose with a short acronym stays natural language"
+        );
+        assert!(
+            is_natural_language_query("What triggers a rebuild"),
+            "a capitalized sentence start is still prose"
+        );
+    }
+
+    #[test]
+    fn identifier_queries_are_not_natural_language() {
+        assert!(
+            !is_natural_language_query("PolicyRuleValidator"),
+            "a single CamelCase symbol is not prose"
+        );
+        assert!(
+            !is_natural_language_query("warm_index_cache resolve_handle"),
+            "a pair of snake_case identifiers is not prose"
+        );
+        assert!(
+            !is_natural_language_query("daemon"),
+            "a single term is never prose"
+        );
+        assert!(
+            !is_natural_language_query("HybridSearchEngine SearchScope"),
+            "a pair of CamelCase identifiers is not prose"
+        );
+    }
+
+    #[test]
+    fn query_token_classification_covers_each_class() {
+        assert_eq!(classify_query_token("daemon"), QueryTokenClass::Prose);
+        assert_eq!(classify_query_token("Windows"), QueryTokenClass::Prose);
+        assert_eq!(classify_query_token("API"), QueryTokenClass::Prose);
+        assert_eq!(classify_query_token("HTTP"), QueryTokenClass::Prose);
+
+        assert_eq!(
+            classify_query_token("warm_index"),
+            QueryTokenClass::Identifier
+        );
+        assert_eq!(classify_query_token("EmDash"), QueryTokenClass::Identifier);
+        assert_eq!(classify_query_token("utf8"), QueryTokenClass::Identifier);
+        assert_eq!(
+            classify_query_token("MAXRESULTS"),
+            QueryTokenClass::Identifier,
+            "a long all-caps constant reads as an identifier, not an acronym"
+        );
+
+        assert_eq!(classify_query_token("a"), QueryTokenClass::Neutral);
+        assert_eq!(classify_query_token("123"), QueryTokenClass::Neutral);
     }
 }
