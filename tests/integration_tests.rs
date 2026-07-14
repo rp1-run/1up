@@ -4236,6 +4236,101 @@ fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
 }
 
 #[test]
+fn mcp_get_rejects_an_identical_failed_handle_retry_within_a_session() {
+    // REQ-003: a handle that failed to resolve is remembered against the index
+    // identity, so an identical retry against the unchanged index is rejected
+    // without re-querying and steered to fresh guidance rather than a repeat.
+    let tmp = create_ambiguous_handle_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "ambiguous_collision_token", "limit": 32 }),
+    );
+    assert_ne!(search["isError"], true);
+    let handles = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["handle"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let ambiguous_prefix = ambiguous_handle_prefix(&handles);
+
+    // First call: the ambiguous prefix fails with disambiguation candidates.
+    let first = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [ambiguous_prefix.clone()] }),
+    );
+    assert_eq!(first["isError"], true);
+    let first_envelope = mcp_structured(&first);
+    let first_records = first_envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(first_records[0]["status"], "ambiguous");
+    let candidates = first_records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(candidates.len() > 1);
+
+    // Second identical call: rejected without re-query, carrying the cached
+    // candidates and next-actions that differ from repeating the call.
+    let second = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [ambiguous_prefix.clone()] }),
+    );
+    assert_eq!(second["isError"], true);
+    assert_mcp_response_is_presentation_free(&second);
+    let second_envelope = mcp_structured(&second);
+    let second_records = second_envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(
+        second_records[0]["status"], "rejected",
+        "an identical failed retry is rejected, not resolved again: {second_records:?}"
+    );
+    assert_eq!(second_records[0]["source"]["kind"], "handle");
+    let rejected_candidates = second_records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_candidates, candidates,
+        "the rejection reuses the candidates cached from the original failure"
+    );
+
+    let next_actions = second_envelope["next_actions"].as_array().unwrap();
+    assert_eq!(
+        next_actions[0]["tool"], TOOL_GET,
+        "a rejected retry with cached candidates prefills a disambiguating oneup_get: {next_actions:?}"
+    );
+    let prefilled = next_actions[0]["arguments"]["handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(prefilled, candidates);
+    assert!(
+        !prefilled.contains(&ambiguous_prefix),
+        "the follow-up must differ from repeating the failed call: {next_actions:?}"
+    );
+    let search_action = next_actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SEARCH)
+        .expect("a search fallback must trail the rejection");
+    assert!(
+        search_action["reason"]
+            .as_str()
+            .unwrap()
+            .contains("refined query"),
+        "the rejection steers toward a refined query, not a repeat: {search_action:?}"
+    );
+    assert_mcp_next_actions_are_canonical(second_envelope);
+}
+
+#[test]
 fn mcp_structural_returns_matches_and_explicit_diagnostics() {
     let tmp = create_search_acceptance_fixture();
     let _guard = init_and_index_fts_only(&tmp);

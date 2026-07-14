@@ -61,6 +61,11 @@ const MIN_HANDLE_RECOVERY_PREFIX_CHARS: usize = 8;
 /// broad to discriminate, so recovery declines rather than guess.
 const HANDLE_RECOVERY_CANDIDATE_LIMIT: usize = 32;
 
+/// Upper bound on the bounded process-global failed-handle retry memory (T3).
+/// Once exceeded, the oldest-recorded entry is evicted first so the memory can
+/// never grow without bound across a long-lived MCP session.
+const FAILED_HANDLE_MEMORY_CAP: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct McpProjectRoots {
     pub state_root: PathBuf,
@@ -1338,13 +1343,104 @@ async fn get_handles_once(
     verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
-    let records = resolve_handle_records(
-        &current.conn,
-        &worktree_context.context_id,
-        handles,
-        verbosity,
-    )
-    .await?;
+    let context_id = &worktree_context.context_id;
+    // The failed-handle memory is keyed and identity-stamped against the same
+    // canonical db path the warm cache uses, so a rejection reflects the exact
+    // index generation the retry would otherwise re-query (T3).
+    let current_identity = index_file_identity(&current.db_path);
+    let normalized: Vec<String> = handles
+        .iter()
+        .map(|handle| normalize_handle(handle))
+        .collect();
+
+    // Pre-pass: reject a handle that already failed this session against this
+    // same index identity without re-querying (T3). An identity mismatch drops
+    // the stale entry so the handle resolves fresh below; an empty handle is
+    // never a memory key (it resolves to the empty-handle rejection instead).
+    let mut prejudged: Vec<Option<ReadRecord>> = Vec::with_capacity(handles.len());
+    {
+        let mut memory = failed_handle_memory()
+            .lock()
+            .expect("failed-handle memory mutex poisoned");
+        for (raw_handle, normalized) in handles.iter().zip(&normalized) {
+            if normalized.is_empty() {
+                prejudged.push(None);
+                continue;
+            }
+            let key = (
+                current.db_path.clone(),
+                context_id.clone(),
+                normalized.clone(),
+            );
+            match memory.lookup(&key, current_identity) {
+                Some(record) => {
+                    let source = ReadSource::Handle {
+                        raw: raw_handle.clone(),
+                        normalized: normalized.clone(),
+                    };
+                    prejudged.push(Some(read_rejected_handle(
+                        source,
+                        record.outcome,
+                        record.matching_handles,
+                    )));
+                }
+                None => prejudged.push(None),
+            }
+        }
+    }
+
+    // Resolve only the handles not already rejected, preserving the batched
+    // exact-then-prefix path (and its within-call independence) untouched.
+    let to_resolve: Vec<String> = handles
+        .iter()
+        .zip(&prejudged)
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(handle, _)| handle.clone())
+        .collect();
+    let resolved =
+        resolve_handle_records(&current.conn, context_id, &to_resolve, verbosity).await?;
+
+    // Merge the pre-rejected and freshly-resolved records back into input order.
+    let mut resolved = resolved.into_iter();
+    let records: Vec<ReadRecord> = prejudged
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                resolved
+                    .next()
+                    .expect("resolved records cover every non-rejected handle")
+            })
+        })
+        .collect();
+
+    // Post-pass: remember fresh failures and forget entries a success cleared
+    // (T3). Pre-rejected records keep their existing entry (they were never
+    // re-queried); a transient `Error` is not remembered so it can be retried.
+    {
+        let mut memory = failed_handle_memory()
+            .lock()
+            .expect("failed-handle memory mutex poisoned");
+        for (normalized, record) in normalized.iter().zip(&records) {
+            if normalized.is_empty() {
+                continue;
+            }
+            let key = (
+                current.db_path.clone(),
+                context_id.clone(),
+                normalized.clone(),
+            );
+            match record.status {
+                ReadStatus::NotFound | ReadStatus::Ambiguous => memory.record_failure(
+                    key,
+                    current_identity,
+                    record.status,
+                    record.matching_handles.clone(),
+                ),
+                ReadStatus::Found => memory.clear(&key),
+                ReadStatus::Rejected | ReadStatus::Error => {}
+            }
+        }
+    }
 
     Ok(ReadPayload {
         status: aggregate_read_status(&records),
@@ -1940,6 +2036,108 @@ async fn record_vector_count_for_context(canonical_db_path: &Path, context_id: &
     }
 }
 
+/// Identity-stamped record of a handle lookup that already failed this session
+/// (T3). `outcome` is the terminal failure status (`NotFound` or `Ambiguous`)
+/// and `matching_handles` carries the candidate ids from an ambiguous failure
+/// so a later rejection can still offer disambiguation without re-querying.
+/// `seq` records insertion order for oldest-first eviction.
+#[derive(Debug, Clone)]
+struct FailedHandleRecord {
+    identity: Option<IndexFileIdentity>,
+    outcome: ReadStatus,
+    matching_handles: Vec<String>,
+    seq: u64,
+}
+
+/// Memory key: canonical `index.db` path, worktree `context_id`, and the
+/// normalized handle. Scoping by the canonical db path and context mirrors the
+/// warm cache key and the context-scoped storage reads, so a rejection can
+/// never leak across indexes or contexts.
+type FailedHandleKey = (PathBuf, String, String);
+
+/// Bounded, insertion-ordered memory of handle lookups that already failed
+/// (T3). Distinct from [`warm_index_cache`] because it is keyed per (index,
+/// context, handle) rather than per index file and holds no live connection.
+/// Every method is synchronous, so the guarding mutex is only ever held for a
+/// pure in-memory operation (never across an `await`).
+#[derive(Default)]
+struct FailedHandleMemory {
+    entries: HashMap<FailedHandleKey, FailedHandleRecord>,
+    next_seq: u64,
+}
+
+impl FailedHandleMemory {
+    /// Decide a handle's fate against recorded history (T3). A recorded failure
+    /// whose stamped identity still matches the current on-disk index is
+    /// returned so the caller can reject the identical retry without
+    /// re-querying; an identity mismatch (a build-aside swap installed a fresh
+    /// index) drops the now-stale entry and returns `None` so the handle
+    /// resolves fresh; an absent entry also returns `None`.
+    fn lookup(
+        &mut self,
+        key: &FailedHandleKey,
+        current_identity: Option<IndexFileIdentity>,
+    ) -> Option<FailedHandleRecord> {
+        match self.entries.get(key) {
+            Some(record) if record.identity == current_identity => Some(record.clone()),
+            Some(_) => {
+                self.entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Record a terminal failure outcome, stamping it with the current index
+    /// identity and the next insertion sequence, then evict the oldest entry
+    /// while over the cap.
+    fn record_failure(
+        &mut self,
+        key: FailedHandleKey,
+        identity: Option<IndexFileIdentity>,
+        outcome: ReadStatus,
+        matching_handles: Vec<String>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(
+            key,
+            FailedHandleRecord {
+                identity,
+                outcome,
+                matching_handles,
+                seq,
+            },
+        );
+        while self.entries.len() > FAILED_HANDLE_MEMORY_CAP {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, record)| record.seq)
+                .map(|(oldest_key, _)| oldest_key.clone())
+            {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Forget any recorded failure for a handle (T3): a fresh success supersedes
+    /// a prior failure, so a later identical call is no longer rejected.
+    fn clear(&mut self, key: &FailedHandleKey) {
+        self.entries.remove(key);
+    }
+}
+
+/// Process-global failed-handle retry memory (T3), mirroring the process-global
+/// shape of [`warm_index_cache`]. Guards a purely in-memory map, so a plain
+/// `std::sync::Mutex` suffices: the lock is never held across an `await`.
+fn failed_handle_memory() -> &'static Mutex<FailedHandleMemory> {
+    static MEMORY: OnceLock<Mutex<FailedHandleMemory>> = OnceLock::new();
+    MEMORY.get_or_init(|| Mutex::new(FailedHandleMemory::default()))
+}
+
 async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     let db_path = project_db_path(state_root);
     if !db_path.exists() {
@@ -2433,6 +2631,35 @@ fn language_for_path(file_path: &Path) -> String {
         Some(lang) => lang.name().to_string(),
         None if ext.is_empty() => "unknown".to_string(),
         None => ext.to_string(),
+    }
+}
+
+/// `Rejected` record for an identical failed handle retry (T3). The message is
+/// built from the remembered `outcome` so it names the original cause
+/// truthfully (an ambiguous prefix vs a plain not-found) rather than
+/// re-querying to rediscover it. Carries the candidate ids cached from an
+/// ambiguous failure (empty when the original failure was a plain not-found) so
+/// the follow-up next_actions can still offer disambiguation.
+fn read_rejected_handle(
+    source: ReadSource,
+    outcome: ReadStatus,
+    matching_handles: Vec<String>,
+) -> ReadRecord {
+    let cause = match outcome {
+        ReadStatus::Ambiguous => "matched multiple indexed segments",
+        _ => "was not found",
+    };
+    let message = format!(
+        "this segment handle already {cause} in the active context this session; repeating the identical call was rejected without re-querying"
+    );
+    ReadRecord {
+        status: ReadStatus::Rejected,
+        source,
+        segment: None,
+        context: None,
+        matching_handles,
+        recovered_from: None,
+        message: Some(message),
     }
 }
 
@@ -4866,6 +5093,122 @@ mod tests {
         let record = resolve_one(&conn, ctx, "ffffffffa316205a1afe69ccd1137e2").await;
         assert_eq!(record.status, ReadStatus::NotFound);
         assert!(record.recovered_from.is_none());
+    }
+
+    // Failed-handle retry memory gate (T3). Exercised on a fresh local
+    // `FailedHandleMemory` rather than the process-global one so the matrix is
+    // deterministic and parallel-safe.
+
+    /// Fabricate a distinct, comparable index identity in a platform-agnostic
+    /// way (real ids come from `index_file_identity`; the gate only compares
+    /// them for equality).
+    #[cfg(unix)]
+    fn fake_identity(seed: u64) -> Option<IndexFileIdentity> {
+        Some((1, seed))
+    }
+    #[cfg(not(unix))]
+    fn fake_identity(seed: u64) -> Option<IndexFileIdentity> {
+        Some((seed, std::time::SystemTime::UNIX_EPOCH))
+    }
+
+    fn memory_key(handle: &str) -> FailedHandleKey {
+        (
+            PathBuf::from("/tmp/index.db"),
+            "ctx".to_string(),
+            handle.to_string(),
+        )
+    }
+
+    #[test]
+    fn failed_handle_memory_rejects_identical_failure_under_same_identity() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        let candidates = vec!["deadbeefdeadbeef1111".to_string()];
+        memory.record_failure(
+            key.clone(),
+            fake_identity(7),
+            ReadStatus::Ambiguous,
+            candidates.clone(),
+        );
+
+        let hit = memory
+            .lookup(&key, fake_identity(7))
+            .expect("an identical failure under the same identity is a memory hit");
+        assert_eq!(hit.outcome, ReadStatus::Ambiguous);
+        assert_eq!(
+            hit.matching_handles, candidates,
+            "the rejection carries the cached candidate ids for disambiguation"
+        );
+        // The entry survives the reject (a retry is rejected without re-query,
+        // not consumed), so a second identical retry is still rejected.
+        assert!(memory.lookup(&key, fake_identity(7)).is_some());
+    }
+
+    #[test]
+    fn failed_handle_memory_drops_stale_entry_on_identity_change() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        memory.record_failure(
+            key.clone(),
+            fake_identity(1),
+            ReadStatus::NotFound,
+            Vec::new(),
+        );
+
+        // A build-aside swap installed a fresh index: the mismatched identity
+        // drops the stale entry and declines to reject, so the handle resolves
+        // fresh.
+        assert!(memory.lookup(&key, fake_identity(2)).is_none());
+        // And the now-dropped entry no longer rejects even at the original
+        // identity.
+        assert!(memory.lookup(&key, fake_identity(1)).is_none());
+    }
+
+    #[test]
+    fn failed_handle_memory_clear_forgets_a_prior_failure() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        memory.record_failure(
+            key.clone(),
+            fake_identity(1),
+            ReadStatus::NotFound,
+            Vec::new(),
+        );
+        memory.clear(&key);
+        assert!(
+            memory.lookup(&key, fake_identity(1)).is_none(),
+            "a success clears the entry, so the next identical call resolves fresh"
+        );
+    }
+
+    #[test]
+    fn failed_handle_memory_evicts_oldest_over_cap() {
+        let mut memory = FailedHandleMemory::default();
+        // Insert one past the cap; the very first (oldest) entry is evicted.
+        for i in 0..=FAILED_HANDLE_MEMORY_CAP {
+            memory.record_failure(
+                memory_key(&format!("handle-{i:04}")),
+                fake_identity(1),
+                ReadStatus::NotFound,
+                Vec::new(),
+            );
+        }
+        assert_eq!(memory.entries.len(), FAILED_HANDLE_MEMORY_CAP);
+        assert!(
+            memory
+                .lookup(&memory_key("handle-0000"), fake_identity(1))
+                .is_none(),
+            "the oldest entry is evicted first once over the cap"
+        );
+        assert!(
+            memory
+                .lookup(
+                    &memory_key(&format!("handle-{:04}", FAILED_HANDLE_MEMORY_CAP)),
+                    fake_identity(1)
+                )
+                .is_some(),
+            "the newest entry survives eviction"
+        );
     }
 
     /// Per-item baseline (relocated from the pre-R-013 `resolve_handle_record`):
