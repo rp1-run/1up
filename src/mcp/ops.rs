@@ -6,7 +6,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context};
 use libsql::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
@@ -218,6 +219,61 @@ pub enum ReadSource {
     Location { path: String, line: usize },
 }
 
+/// Structured, ready-to-issue recovery call carried by a [`TruncationNote`].
+///
+/// `tool` MUST be a member of `RETAINED_PUBLIC_TOOLS` (enforced by the
+/// `action()` debug-assert when the call is copied into a next_action).
+/// `arguments` share [`serde_json::Value`] with `NextAction::arguments`
+/// (`{path, line, expansion}` for scope clips, `{name}` for symbol clips) so
+/// the note's recovery call can be prepended into `next_actions` verbatim and
+/// re-issued by an agent without reshaping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecoveryCall {
+    pub tool: String,
+    pub arguments: Value,
+}
+
+/// Load-bearing truncation metadata attached to a record whenever content was
+/// bounded (REQ-004). Never best-effort: its presence means an omission
+/// occurred and `recovery` states exactly how to fetch the omitted content.
+///
+/// Scope clips populate the scope fields (`scope_name`, `scope_type`,
+/// `full_line_start`/`full_line_end`, `omitted_above`/`omitted_below`);
+/// symbol-list clips populate `omitted_symbols`; `recovery` is always present.
+/// Absent (`None`) on a record means nothing was bounded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TruncationNote {
+    /// Single-source reason constant (`SCOPE_TRUNCATION_REASON` /
+    /// `SYMBOL_LIST_TRUNCATION_REASON`), also rendered in the summary marker.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_line_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_line_end: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_above: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_below: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_symbols: Option<usize>,
+    pub recovery: RecoveryCall,
+}
+
+/// Constant-size symbol counts emitted at default verbosity when the symbol
+/// lists are omitted but non-empty, making the omission explicit without
+/// re-inflating the payload (REQ-003). Present only when a list was omitted
+/// non-empty; the `oneup_symbol` recovery path retrieves the full lists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymbolCounts {
+    pub defined: usize,
+    pub referenced: usize,
+    pub called: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentRecord {
     pub handle: String,
@@ -238,6 +294,15 @@ pub struct SegmentRecord {
     pub referenced_symbols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub called_symbols: Vec<String>,
+    /// Constant-size symbol counts, emitted at default verbosity when the
+    /// symbol lists are omitted but non-empty (REQ-003). `None` when the lists
+    /// are present (full verbosity) or all counts are zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_counts: Option<SymbolCounts>,
+    /// Load-bearing truncation note set when a symbol list was capped at
+    /// [`MAX_SYMBOLS_PER_LIST`] (REQ-004). `None` when nothing was bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationNote>,
     /// First symbol defined by the underlying segment, captured before the
     /// verbosity gating applied to `defined_symbols`. Never serialized into
     /// the hydration payload; envelope next_actions read it so defining
@@ -256,6 +321,12 @@ pub struct ContextRecord {
     pub line_end: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub out_of_scope_disclosure: Option<String>,
+    /// Load-bearing truncation note set when a large enclosing scope was
+    /// windowed (REQ-004): scope name/type, full scope range, omitted line
+    /// counts, and a ready-to-issue `oneup_context` recovery call. `None` when
+    /// the whole scope was returned (nothing bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationNote>,
 }
 
 /// Orientation digest payload for `oneup_overview`. Section sizes are bounded
@@ -2126,6 +2197,7 @@ fn read_context(
             line_start: context.line_start,
             line_end: context.line_end,
             out_of_scope_disclosure,
+            truncation: None,
         }),
         matching_handles: Vec::new(),
         message: None,
@@ -2183,6 +2255,8 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
         defined_symbols,
         referenced_symbols,
         called_symbols,
+        symbol_counts: None,
+        truncation: None,
         symbol_hint,
     }
 }
@@ -3203,6 +3277,69 @@ mod tests {
 
     fn readiness_fixture() -> ReadinessPayload {
         blocked_readiness_for_path("repo", "fixture")
+    }
+
+    #[test]
+    fn truncation_note_round_trips_with_scope_recovery() {
+        let note = TruncationNote {
+            reason: crate::shared::constants::SCOPE_TRUNCATION_REASON.to_string(),
+            scope_name: Some("load_plugins".to_string()),
+            scope_type: Some("function".to_string()),
+            full_line_start: Some(71),
+            full_line_end: Some(588),
+            omitted_above: Some(13),
+            omitted_below: Some(498),
+            omitted_symbols: None,
+            recovery: RecoveryCall {
+                tool: "oneup_context".to_string(),
+                arguments: serde_json::json!({"path": "manager.ts", "line": 87, "expansion": 500}),
+            },
+        };
+
+        let value = serde_json::to_value(&note).unwrap();
+        // Absent-when-None: symbol-clip-only field is not serialized for a scope clip.
+        assert!(value.get("omitted_symbols").is_none());
+        let restored: TruncationNote = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, note);
+        assert_eq!(restored.recovery.tool, "oneup_context");
+        assert_eq!(restored.recovery.arguments["line"], serde_json::json!(87));
+    }
+
+    #[test]
+    fn truncation_note_round_trips_with_symbol_recovery() {
+        let note = TruncationNote {
+            reason: crate::shared::constants::SYMBOL_LIST_TRUNCATION_REASON.to_string(),
+            scope_name: None,
+            scope_type: None,
+            full_line_start: None,
+            full_line_end: None,
+            omitted_above: None,
+            omitted_below: None,
+            omitted_symbols: Some(42),
+            recovery: RecoveryCall {
+                tool: "oneup_symbol".to_string(),
+                arguments: serde_json::json!({"name": "Db"}),
+            },
+        };
+
+        let value = serde_json::to_value(&note).unwrap();
+        // Absent-when-None: scope-only fields are omitted for a symbol clip.
+        assert!(value.get("scope_name").is_none());
+        assert!(value.get("full_line_start").is_none());
+        let restored: TruncationNote = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, note);
+    }
+
+    #[test]
+    fn symbol_counts_round_trips() {
+        let counts = SymbolCounts {
+            defined: 1,
+            referenced: 12,
+            called: 0,
+        };
+        let restored: SymbolCounts =
+            serde_json::from_value(serde_json::to_value(counts).unwrap()).unwrap();
+        assert_eq!(restored, counts);
     }
 
     #[test]
