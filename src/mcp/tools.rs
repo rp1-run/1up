@@ -873,12 +873,49 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
         )];
     }
 
-    // REQ-008: Placeholder-free output. Omit arguments when we cannot synthesize a real query.
-    vec![action(
-        TOOL_SEARCH,
-        "Search again to obtain a valid handle or precise file location.",
-        None,
-    )]
+    // No content hydrated: give status-aware guidance for the failed handle
+    // records so an agent can disambiguate or refine instead of blindly
+    // repeating the call (REQ-002).
+    handle_failure_next_actions(payload)
+}
+
+/// Next_actions for a get call that hydrated no content (REQ-002). An ambiguous
+/// handle prepends a ready-to-issue `oneup_get` prefilled with the real
+/// candidate ids from `matching_handles` (never placeholders) so the agent can
+/// pick one unambiguous handle ahead of the generic search fallback; when a
+/// handle was simply absent the search reason notes it is not in the active
+/// context. The placeholder-free search fallback always trails (REQ-008) so
+/// there is always a forward action.
+fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
+    let mut actions = Vec::new();
+
+    if let Some(candidates) = payload
+        .records
+        .iter()
+        .find(|record| {
+            record.status == ops::ReadStatus::Ambiguous && !record.matching_handles.is_empty()
+        })
+        .map(|record| record.matching_handles.clone())
+    {
+        actions.push(action(
+            TOOL_GET,
+            "Hydrate the listed candidate handles to choose the one you meant.",
+            Some(json!({ "handles": candidates })),
+        ));
+    }
+
+    let absent_from_context = payload
+        .records
+        .iter()
+        .any(|record| record.status == ops::ReadStatus::NotFound);
+    let search_reason = if absent_from_context {
+        "The handle is not present in the active context; search to obtain a valid handle."
+    } else {
+        "Search again to obtain a valid handle or precise file location."
+    };
+    actions.push(action(TOOL_SEARCH, search_reason, None));
+
+    actions
 }
 
 fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
@@ -1782,6 +1819,68 @@ mod tests {
             paths.len(),
             MAX_RECOVERY_ACTIONS,
             "recovery actions must be deduped per path"
+        );
+    }
+
+    fn handle_record(status: ops::ReadStatus, matching_handles: Vec<String>) -> ops::ReadRecord {
+        ops::ReadRecord {
+            status,
+            source: ops::ReadSource::Handle {
+                raw: ":abc".to_string(),
+                normalized: "abc".to_string(),
+            },
+            segment: None,
+            context: None,
+            matching_handles,
+            recovered_from: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn ambiguous_record_prefills_oneup_get_with_real_candidates_before_search() {
+        let candidates = vec![
+            "0b25cc46a316205a1afe69ccd11337e2".to_string(),
+            "0b25cc46a316205a1afe69ccd1144abc".to_string(),
+        ];
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(
+                ops::ReadStatus::Ambiguous,
+                candidates.clone(),
+            )],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions[0].tool, TOOL_GET);
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "handles": candidates })),
+            "disambiguation action must prefill the real candidate ids"
+        );
+        assert!(
+            actions.iter().any(|action| action.tool == TOOL_SEARCH),
+            "generic search fallback must trail the disambiguation action"
+        );
+    }
+
+    #[test]
+    fn not_found_record_notes_absence_from_active_context() {
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::NotFound, Vec::new())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_SEARCH);
+        assert!(actions[0].arguments.is_none());
+        assert!(
+            actions[0].reason.contains("active context"),
+            "not_found guidance must note the handle is absent from the active context: {}",
+            actions[0].reason
         );
     }
 }
