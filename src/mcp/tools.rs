@@ -208,12 +208,15 @@ impl OneupMcpServer {
             }
         }
 
+        // A whole-repo sentinel in `path_prefix` means "no cone", so it is
+        // normalized away rather than validated as a literal subtree prefix.
+        let path_prefix = normalize_repo_scope(input.path_prefix.as_deref());
         match ops::run_search(
             &roots.state_root,
             &roots.worktree_context,
             &queries,
             limit,
-            input.path_prefix.as_deref(),
+            path_prefix.as_deref(),
         )
         .await
         {
@@ -438,7 +441,29 @@ impl OneupMcpServer {
         match ops::explore_impact(&roots.state_root, &roots.worktree_context, request).await {
             Ok(payload) => {
                 let summary = impact_summary(&payload);
-                let next_actions = impact_next_actions(&payload);
+                let mut next_actions = impact_next_actions(&payload);
+                // A remaining scope-exclusion refusal means a real requested
+                // cone blocked the anchor: either it resolved outside the scope
+                // (file/handle) or a scoped symbol lookup found nothing inside
+                // the cone. Prepend the same anchor with no scope as a
+                // ready-to-issue retry that searches the whole repo (mirrors T4).
+                let scope_requested = normalize_repo_scope(input.scope.as_deref()).is_some();
+                let scope_excluded_anchor = payload.refusal.as_ref().is_some_and(|refusal| {
+                    refusal.reason == "anchor_out_of_scope"
+                        || (scope_requested && refusal.reason == "anchor_not_found")
+                });
+                if scope_excluded_anchor {
+                    if let Some(anchor) = corrected_impact_call(&input) {
+                        next_actions.insert(
+                            0,
+                            action(
+                                TOOL_IMPACT,
+                                "Retry impact without a scope to search the whole repository.",
+                                Some(anchor),
+                            ),
+                        );
+                    }
+                }
                 call_result(
                     envelope(
                         status_string(&payload.status),
@@ -554,6 +579,25 @@ fn looks_like_file_path(value: &str) -> bool {
     trimmed.contains('/') && !trimmed.ends_with('/')
 }
 
+/// Whole-repo scope sentinels an agent may pass to mean "no cone" (case-
+/// insensitive, trimmed). The empty string is handled separately by the trim.
+const WHOLE_REPO_SCOPE_SENTINELS: [&str; 5] = ["all", ".", "/", "*", "**"];
+
+/// Normalizes a scope / path-prefix argument before it is validated as a real
+/// directory cone: a blank value or a whole-repo sentinel becomes `None` (no
+/// cone), so a whole-repo request is never misread as a literal path prefix.
+/// Any other value is trimmed and preserved.
+fn normalize_repo_scope(value: Option<&str>) -> Option<String> {
+    let trimmed = value.map(str::trim).filter(|value| !value.is_empty())?;
+    if WHOLE_REPO_SCOPE_SENTINELS
+        .iter()
+        .any(|sentinel| trimmed.eq_ignore_ascii_case(sentinel))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Whether a value looks like a repo-relative file path suitable for promotion
 /// to a File impact anchor from the project-root `path` slot: it is relative
 /// (no leading `/`), carries a path separator, and does not end with one.
@@ -643,7 +687,7 @@ fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
 
     Ok(ImpactRequest {
         anchor,
-        scope: input.scope.clone(),
+        scope: normalize_repo_scope(input.scope.as_deref()),
         depth: input.depth.unwrap_or_default(),
         limit: input.limit.unwrap_or_default(),
     })
@@ -2103,6 +2147,59 @@ mod tests {
             ImpactAnchor::Segment {
                 id: "abcdef012345".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn normalize_repo_scope_maps_whole_repo_sentinels_to_none() {
+        for sentinel in ["all", "ALL", " . ", "/", "*", "**", "", "   "] {
+            assert_eq!(
+                normalize_repo_scope(Some(sentinel)),
+                None,
+                "whole-repo sentinel {sentinel:?} must normalize to no scope"
+            );
+        }
+        assert_eq!(normalize_repo_scope(None), None);
+        // A real directory cone is preserved (and trimmed).
+        assert_eq!(
+            normalize_repo_scope(Some("  packages/core  ")),
+            Some("packages/core".to_string())
+        );
+    }
+
+    #[test]
+    fn impact_request_drops_whole_repo_scope_sentinel_but_keeps_real_cone() {
+        let mut input = impact_input();
+        input.symbol = Some("load_auth_config".to_string());
+
+        input.scope = Some("all".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap().scope,
+            None,
+            "scope:'all' must be normalized to no cone"
+        );
+
+        input.scope = Some("packages/core".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap().scope,
+            Some("packages/core".to_string()),
+            "a real directory cone must still scope the request"
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_drops_scope_for_no_scope_retry() {
+        // The retry offered for an outside-scope error keeps the anchor but
+        // never carries the scope that excluded it.
+        let mut input = impact_input();
+        input.symbol = Some("load_auth_config".to_string());
+        input.scope = Some("packages/core".to_string());
+
+        let corrected = corrected_impact_call(&input).unwrap();
+        assert_eq!(corrected["symbol"], "load_auth_config");
+        assert!(
+            corrected.get("scope").is_none(),
+            "corrected retry must not carry a scope: {corrected:?}"
         );
     }
 

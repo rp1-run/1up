@@ -5505,6 +5505,68 @@ fn mcp_impact_promotes_relative_path_slot_to_file_anchor() {
     assert_mcp_next_actions_are_canonical(envelope);
 }
 
+/// T7: the measured dead turn was scope:"all" (meaning whole-repo) validated as
+/// a literal cone, erroring "outside requested scope `all`". The sentinel is now
+/// normalized to no scope, so the anchor resolves against the whole repository.
+#[test]
+fn mcp_impact_treats_whole_repo_scope_sentinel_as_no_scope() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "symbol": "load_auth_config", "scope": "all" }),
+    );
+
+    assert_ne!(
+        result["isError"], true,
+        "scope:'all' must be treated as whole-repo, not a literal cone: {result}"
+    );
+    let envelope = mcp_structured(&result);
+    assert!(
+        matches!(
+            envelope["status"].as_str().unwrap(),
+            "expanded" | "expanded_scoped" | "empty" | "empty_scoped"
+        ),
+        "whole-repo impact should resolve to advisory output: {envelope:?}"
+    );
+}
+
+/// T7: a REMAINING anchor-outside-scope error (a real cone that excludes the
+/// anchor) carries a ready-to-issue oneup_impact retry with the same anchor and
+/// no scope, so recovery is one call away.
+#[test]
+fn mcp_impact_outside_real_scope_offers_no_scope_retry() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    // load_auth_config lives under src/auth; scoping to src/cache excludes it.
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "symbol": "load_auth_config", "scope": "src/cache" }),
+    );
+
+    assert_eq!(
+        result["isError"], true,
+        "an anchor outside a real scope must error: {result}"
+    );
+    let envelope = mcp_structured(&result);
+    let retry = envelope["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["tool"] == "oneup_impact")
+        .expect("outside-scope error must offer an oneup_impact retry");
+    assert_eq!(retry["arguments"]["symbol"], "load_auth_config");
+    assert!(
+        retry["arguments"].get("scope").is_none(),
+        "the corrected retry must drop the excluding scope: {retry:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
 #[test]
 fn mcp_impact_refusal_sets_is_error() {
     let tmp = create_impact_acceptance_fixture();
