@@ -83,6 +83,7 @@ tests:
       EXPECTED_FILES: query.ts,registry.ts,emdash-runtime.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -91,19 +92,27 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upImpactUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertImpactTrustInterpreted
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: FTSManager in fts-manager.ts creates FTS5 virtual tables
           and triggers for content search. Key downstream dependencies
@@ -116,6 +125,7 @@ tests:
           fundamentally wrong. Judge the quality of impact analysis,
           not format.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: A thorough impact analysis should identify: (a) direct
           consumers that instantiate or call FTSManager methods, (b) API
@@ -133,6 +143,7 @@ tests:
       EXPECTED_FILES: emdash-runtime.ts,schema.ts,typegen.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -141,19 +152,27 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upImpactUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertImpactTrustInterpreted
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: registry.ts stores schema definitions in the database.
           Key dependents include: (1) emdash-runtime.ts creates a
@@ -165,6 +184,7 @@ tests:
           Score 0.0 if fundamentally wrong. Judge the quality of impact
           reasoning.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should trace impact through: (a) schema
           storage layer, (b) schema loading/runtime layer, (c) query
@@ -182,6 +202,7 @@ tests:
       EXPECTED_FILES: emdash-runtime.ts,types.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -190,19 +211,27 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upImpactUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertImpactTrustInterpreted
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: runner.ts loads plugins into Cloudflare Worker isolation.
           Key dependencies include: (1) emdash-runtime.ts calls
@@ -214,6 +243,7 @@ tests:
           identified with reasoning. Score 0.5 if one is found. Score 0.0
           if fundamentally wrong.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should cover: (a) sandbox runtime and
           plugin loading, (b) type definitions and interface contracts,
