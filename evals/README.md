@@ -65,7 +65,14 @@ separately disables cached response reuse and does not provide this state
 isolation. Every Codex target also gets an isolated `HOME` and `CODEX_HOME`
 containing only a copied `auth.json`; host Codex config and MCP servers are not
 inherited. `PATH` and `NODE_EXTRA_CA_CERTS` are forwarded explicitly so the
-installed `1up` binary and corporate trust root remain available. The summary
+installed `1up` binary and corporate trust root remain available. Because the
+1up target enables the `non_prefixed_mcp_tool_names` unstable feature (so agents
+call the canonical `oneup_*` tool names), its `cli_config` also sets
+`suppress_unstable_features_warning: true`; without it, Codex prints an
+unstable-feature warning that pollutes the 1up trajectory and skews the graded
+output. The knob is scoped to that single known warning — it does not hide
+unrelated advisories — and is set only on the 1up target, never on the baseline
+or grader Codex invocations. `codex-config.test.sh` asserts this placement. The summary
 reports process duration and falls back to the JSON diagnostics for per-agent
 duration, cost, turns, and token usage. Use `npm run eval:luna` or
 `npm run eval:luna:impact` only when intentionally running one suite serially.
