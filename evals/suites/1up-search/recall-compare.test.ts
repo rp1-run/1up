@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_RECALL_TOLERANCE,
@@ -290,5 +293,72 @@ describe("detectDegradedStderr", () => {
     expect(
       detectDegradedStderr("indexed 1200 segments\nsearch complete"),
     ).toEqual([]);
+  });
+});
+
+// Drift guard over the committed recall fixtures (T6 / REQ-005). The pinned
+// baseline and the pinned results must always describe the SAME recall epoch:
+// the same schema version, the same audited corpus (size + sha256), and the same
+// model. If they diverge — e.g. one is recaptured on schema 19 while the other
+// is left on schema 18 — the runtime gate would raise a config-mismatch
+// RecallCompareError instead of a meaningful verdict (the "incompatible-schema
+// recall comparison" failure mode). This guard proves that parity structurally,
+// using the production comparator, without pinning a literal schema epoch (the
+// value moves 18 -> 19 at the manual, credentialed `RECALL_CAPTURE_BASELINE=1`
+// recapture; see recall-audit.md). The corpus size is pinned to the live
+// `recall-corpus.jsonl` so a row added/removed without a recapture is caught.
+describe("committed recall fixtures (schema parity + corpus identity)", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const readJson = (name: string): Record<string, unknown> =>
+    JSON.parse(readFileSync(join(here, name), "utf8"));
+
+  const baseline = readJson(
+    "recall-baseline.json",
+  ) as unknown as RecallBaseline;
+  const results = readJson("recall-results.json");
+  const liveCorpusRaw = readFileSync(join(here, "recall-corpus.jsonl"), "utf8");
+  const liveCorpusRows = liveCorpusRaw
+    .split("\n")
+    .filter((line) => line.trim().length > 0 && !line.trim().startsWith("//"));
+
+  const resultsCorpus = results.corpus as { size: number; sha256: string };
+
+  test("baseline and results share one schema version (parity)", () => {
+    expect(typeof baseline.schema_version).toBe("number");
+    expect(baseline.schema_version).toBe(results.schema_version as number);
+  });
+
+  test("baseline and results share corpus identity (size + sha256)", () => {
+    expect(baseline.corpus.size).toBe(resultsCorpus.size);
+    expect(baseline.corpus.sha256).toBe(resultsCorpus.sha256);
+  });
+
+  test("baseline and results name the same model", () => {
+    expect(baseline.model_id).toBe(results.model_id as string);
+  });
+
+  test("baseline corpus size matches the live audited corpus row count", () => {
+    expect(baseline.corpus.size).toBe(liveCorpusRows.length);
+  });
+
+  test("baseline and results are comparable (no config mismatch)", () => {
+    // A candidate built from the committed results must compare cleanly against
+    // the committed baseline: same schema, corpus, and model => a real verdict,
+    // never a RecallCompareError. This is the schema-parity + corpus-identity
+    // contract exercised through the exact code path the gate uses.
+    const candidate: RecallCandidate = {
+      schema_version: results.schema_version as number,
+      model_id: results.model_id as string,
+      max_tokens: (results.max_tokens as number | null) ?? null,
+      corpus: { size: resultsCorpus.size, sha256: resultsCorpus.sha256 },
+      recall_at_10: results.recall_at_10 as number,
+      recall_at_20: results.recall_at_20 as number,
+    };
+    const comparison = compareRecall(
+      baseline,
+      candidate,
+      DEFAULT_RECALL_TOLERANCE,
+    );
+    expect(["pass", "fail"]).toContain(comparison.verdict);
   });
 });
