@@ -446,7 +446,7 @@ impl OneupMcpServer {
                 // cone blocked the anchor: either it resolved outside the scope
                 // (file/handle) or a scoped symbol lookup found nothing inside
                 // the cone. Prepend the same anchor with no scope as a
-                // ready-to-issue retry that searches the whole repo (mirrors T4).
+                // ready-to-issue retry that searches the whole repo.
                 let scope_requested = normalize_repo_scope(input.scope.as_deref()).is_some();
                 let scope_excluded_anchor = payload.refusal.as_ref().is_some_and(|refusal| {
                     refusal.reason == "anchor_out_of_scope"

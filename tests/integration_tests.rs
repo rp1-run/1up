@@ -1692,9 +1692,9 @@ fn mutate_parallel_regression_fixture(dir: &std::path::Path) {
 }
 
 /// A repo where markdown doc sections and code both match an implementation
-/// query, mirroring the warm-run failure where site-features.md / emdash-api.md
-/// doc_sections crowded out the actual page component. Used to prove the
-/// implementation-intent doc demotion surfaces code above docs.
+/// query, with the doc_sections saturated so they crowd out the actual page
+/// component. Used to prove the implementation-intent doc demotion surfaces
+/// code above docs.
 fn create_doc_crowding_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4108,7 +4108,7 @@ fn mcp_search_fuses_multi_query_aspects_into_one_ranked_list() {
     );
 }
 
-/// T6: an implementation-intent search (marker tokens like "page"/"component")
+/// An implementation-intent search (marker tokens like "page"/"component")
 /// sinks doc_section results below code results while keeping every doc result
 /// present, so the actual page component leads instead of being crowded out by
 /// documentation prose.
@@ -5505,9 +5505,9 @@ fn mcp_impact_promotes_relative_path_slot_to_file_anchor() {
     assert_mcp_next_actions_are_canonical(envelope);
 }
 
-/// T7: the measured dead turn was scope:"all" (meaning whole-repo) validated as
-/// a literal cone, erroring "outside requested scope `all`". The sentinel is now
-/// normalized to no scope, so the anchor resolves against the whole repository.
+/// A whole-repo scope sentinel (scope:"all") is normalized to no scope rather
+/// than validated as a literal cone, so the anchor resolves against the whole
+/// repository instead of erroring "outside requested scope `all`".
 #[test]
 fn mcp_impact_treats_whole_repo_scope_sentinel_as_no_scope() {
     let tmp = create_impact_acceptance_fixture();
@@ -5533,9 +5533,9 @@ fn mcp_impact_treats_whole_repo_scope_sentinel_as_no_scope() {
     );
 }
 
-/// T7: a REMAINING anchor-outside-scope error (a real cone that excludes the
-/// anchor) carries a ready-to-issue oneup_impact retry with the same anchor and
-/// no scope, so recovery is one call away.
+/// An anchor-outside-scope error (a real cone that excludes the anchor) carries
+/// a ready-to-issue oneup_impact retry with the same anchor and no scope, so
+/// recovery is one call away.
 #[test]
 fn mcp_impact_outside_real_scope_offers_no_scope_retry() {
     let tmp = create_impact_acceptance_fixture();
