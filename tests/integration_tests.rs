@@ -6,7 +6,7 @@ use oneup::mcp::types::{
     RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
     TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
-use oneup::shared::constants::SCHEMA_VERSION;
+use oneup::shared::constants::{SCHEMA_VERSION, SCOPE_TRUNCATION_REASON};
 use oneup::storage::{
     db::Db,
     queries, schema,
@@ -1976,6 +1976,62 @@ Accent color guidance: tint palette swatches for the `render_widget_panel` chrom
     tmp
 }
 
+/// Writes a Rust source file at `repo/src/{name}.rs` whose single top-level
+/// function's `function_item` spans exactly `span` lines (1-based inclusive:
+/// signature + `span - 2` body statements + closing brace). This gives
+/// scope-window tests a deterministic enclosing-scope size so the
+/// whole-scope threshold (`MAX_WHOLE_SCOPE_LINES = 101`) can be exercised at
+/// its boundary. Returns the repo-relative path for `oneup_context` calls.
+fn write_scope_file(repo: &Path, name: &str, span: usize) -> String {
+    assert!(
+        span >= 3,
+        "a scope needs a signature, a body line, and a brace"
+    );
+    let mut lines = Vec::with_capacity(span);
+    lines.push(format!("pub fn {name}() {{"));
+    for i in 0..(span - 2) {
+        lines.push(format!("    let v{i} = {i};"));
+    }
+    lines.push("}".to_string());
+    let rel = format!("src/{name}.rs");
+    let path = repo.join(&rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    rel
+}
+
+/// Like [`write_scope_file`] but plants `sentinel` as a unique string literal
+/// on the second-to-last body line (near the scope tail). A near-top windowed
+/// read omits the tail, so only the truncation note's recovery call retrieves
+/// the sentinel — the HYP-002 regression surface. Returns the repo-relative path.
+fn write_scope_file_with_tail_sentinel(
+    repo: &Path,
+    name: &str,
+    span: usize,
+    sentinel: &str,
+) -> String {
+    assert!(
+        span >= 5,
+        "need room for a near-top target and a tail sentinel"
+    );
+    let body = span - 2;
+    let mut lines = Vec::with_capacity(span);
+    lines.push(format!("pub fn {name}() {{"));
+    for i in 0..body {
+        if i == body - 1 {
+            lines.push(format!("    let sentinel = \"{sentinel}\";"));
+        } else {
+            lines.push(format!("    let v{i} = {i};"));
+        }
+    }
+    lines.push("}".to_string());
+    let rel = format!("src/{name}.rs");
+    let path = repo.join(&rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    rel
+}
+
 fn create_ambiguous_handle_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("src");
@@ -3597,8 +3653,8 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
         "oneup_get text should include hydrated segment records, not only a status summary: {read_handle_text}"
     );
     assert!(
-        read_handle_text.contains("PolicyRuleValidator"),
-        "oneup_get text should include hydrated source content: {read_handle_text}"
+        !read_handle_text.contains("PolicyRuleValidator"),
+        "oneup_get text must be content-free (REQ-001): source appears only in structured data, never mirrored into the summary: {read_handle_text}"
     );
     let read_handle_envelope = mcp_structured(&read_handle);
     assert_eq!(read_handle_envelope["status"], "ok");
@@ -3643,12 +3699,12 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert_mcp_response_is_presentation_free(&read_location);
     let read_location_text = read_location["content"][0]["text"].as_str().unwrap();
     assert!(
-        read_location_text.contains("context src/policy.rs:"),
-        "oneup_context text should include hydrated context records: {read_location_text}"
+        read_location_text.contains("src/policy.rs:"),
+        "oneup_context text should include the content-free location line: {read_location_text}"
     );
     assert!(
-        read_location_text.contains("validate(&self"),
-        "oneup_context text should include source context: {read_location_text}"
+        !read_location_text.contains("validate(&self"),
+        "oneup_context text must be content-free (REQ-001): source context appears only in structured data, never mirrored into the summary: {read_location_text}"
     );
     let read_location_envelope = mcp_structured(&read_location);
     assert_eq!(read_location_envelope["status"], "ok");
@@ -3661,6 +3717,13 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
             .as_u64()
             .unwrap()
             <= 4
+    );
+    assert!(
+        read_location_envelope["data"]["records"][0]["context"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("validate(&self"),
+        "context source content must remain in structured data exactly once: {read_location_envelope:?}"
     );
 
     let symbol = client.call_tool(
@@ -3703,6 +3766,236 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
             .iter()
             .all(|action| action["tool"] != "oneup_impact"),
         "impact should not be a primary symbol next action: {symbol_actions:?}"
+    );
+}
+
+/// REQ-001 (exactly-once serialization): the authoritative source of a
+/// hydrated segment lives only in `structuredContent.data.records[].segment.content`;
+/// it is never mirrored into the text summary. Serializing the whole
+/// `CallToolResult` and counting a content-only sentinel proves the mirror is
+/// gone — the token occurs exactly once. Currently red before the summary flip.
+#[test]
+fn mcp_get_serializes_segment_source_exactly_once() {
+    let tmp = TempDir::new().unwrap();
+    let sentinel = "ZZ_ONCE_SENTINEL_5e91";
+    write_scope_file_with_tail_sentinel(tmp.path(), "once_marker", 6, sentinel);
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "once_marker", "limit": 3 }),
+    );
+    let handle = mcp_structured(&search)["data"]["results"][0]["handle"]
+        .as_str()
+        .expect("search should return a hydratable handle")
+        .to_string();
+
+    let get = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [format!(":{handle}")] }),
+    );
+    assert_ne!(get["isError"], true);
+
+    // The source lives in structured content...
+    let content = mcp_structured(&get)["data"]["records"][0]["segment"]["content"]
+        .as_str()
+        .expect("hydrated segment carries source content");
+    assert!(
+        content.contains(sentinel),
+        "structured content should carry the source: {content}"
+    );
+    // ...and not in the text summary.
+    let text = get["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains(sentinel),
+        "text summary must stay content-free (REQ-001): {text}"
+    );
+
+    // Across the entire serialized CallToolResult the source appears exactly once.
+    let serialized = serde_json::to_string(&get).unwrap();
+    assert_eq!(
+        serialized.matches(sentinel).count(),
+        1,
+        "source must be serialized exactly once, not mirrored into text: {serialized}"
+    );
+}
+
+/// REQ-002 (bounded, invariant summary): the text summary is a constant
+/// per-record grammar independent of record size. A tiny scope and an unclipped
+/// ~120-line scope must yield summaries of near-identical length (differing only
+/// by line-number digits), both well within budget, while the large record's
+/// structured content dwarfs its summary — proving the bulk moved out of text.
+/// Modeled on `mcp_overview_data_payload_stays_within_documented_budget`.
+#[test]
+fn mcp_read_summary_size_is_bounded_and_invariant_across_record_sizes() {
+    let tmp = TempDir::new().unwrap();
+    write_scope_file(tmp.path(), "tiny_scope", 6);
+    write_scope_file(tmp.path(), "big_scope", 120);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let small = client.call_tool(
+        TOOL_CONTEXT,
+        serde_json::json!({
+            "locations": [{ "path": "src/tiny_scope.rs", "line": 3, "expansion": 2 }]
+        }),
+    );
+    // A large explicit expansion returns the whole 120-line scope unclipped, so
+    // this is a genuinely large-content record.
+    let large = client.call_tool(
+        TOOL_CONTEXT,
+        serde_json::json!({
+            "locations": [{ "path": "src/big_scope.rs", "line": 60, "expansion": 500 }]
+        }),
+    );
+    assert_ne!(small["isError"], true);
+    assert_ne!(large["isError"], true);
+
+    let small_summary = small["content"][0]["text"].as_str().unwrap();
+    let large_summary = large["content"][0]["text"].as_str().unwrap();
+
+    const SUMMARY_BUDGET: usize = 256;
+    assert!(
+        large_summary.len() <= SUMMARY_BUDGET,
+        "large-record summary must stay within budget; got {} bytes:\n{large_summary}",
+        large_summary.len()
+    );
+    assert!(
+        large_summary.len().abs_diff(small_summary.len()) <= 16,
+        "summary length must be invariant to record size (small={}, large={})",
+        small_summary.len(),
+        large_summary.len()
+    );
+
+    // The large record's structured source content dwarfs its summary: the
+    // compaction moved the bulk out of the text block (REQ-001/REQ-002).
+    let large_content = mcp_structured(&large)["data"]["records"][0]["context"]["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        large_content.len() > large_summary.len() * 4,
+        "structured content ({}) should dwarf the summary ({})",
+        large_content.len(),
+        large_summary.len()
+    );
+    assert!(
+        mcp_structured(&large)["data"]["records"][0]["context"]["truncation"].is_null(),
+        "the whole scope returned unclipped, so no truncation note: {large}"
+    );
+}
+
+/// REQ-003/REQ-004 (whole-scope threshold, end-to-end): a scope of exactly
+/// `MAX_WHOLE_SCOPE_LINES` (101) lines returns whole with no truncation note,
+/// while a 102-line scope windowed near its middle carries a load-bearing note
+/// stating the full scope range. Asserts the ==101 whole / ==102 clipped
+/// boundary end-to-end through `oneup_context`.
+#[test]
+fn mcp_context_truncation_note_tracks_whole_scope_threshold() {
+    let tmp = TempDir::new().unwrap();
+    write_scope_file(tmp.path(), "at_threshold", 101);
+    write_scope_file(tmp.path(), "over_threshold", 102);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let whole = client.call_tool(
+        TOOL_CONTEXT,
+        serde_json::json!({
+            "locations": [{ "path": "src/at_threshold.rs", "line": 50, "expansion": 2 }]
+        }),
+    );
+    assert_ne!(whole["isError"], true);
+    assert!(
+        mcp_structured(&whole)["data"]["records"][0]["context"]["truncation"].is_null(),
+        "a scope of exactly MAX_WHOLE_SCOPE_LINES must return whole (no truncation): {whole}"
+    );
+
+    let clipped = client.call_tool(
+        TOOL_CONTEXT,
+        serde_json::json!({
+            "locations": [{ "path": "src/over_threshold.rs", "line": 50, "expansion": 2 }]
+        }),
+    );
+    assert_ne!(clipped["isError"], true);
+    let note = &mcp_structured(&clipped)["data"]["records"][0]["context"]["truncation"];
+    assert_eq!(
+        note["reason"].as_str(),
+        Some(SCOPE_TRUNCATION_REASON),
+        "a scope one line over threshold must window with a load-bearing note: {clipped}"
+    );
+    assert_eq!(note["full_line_start"].as_u64(), Some(1));
+    assert_eq!(note["full_line_end"].as_u64(), Some(102));
+}
+
+/// REQ-004 recovery round-trip (REQUIRED, HYP-002 regression): a near-top
+/// windowed read of a large scope omits the tail sentinel; deserializing the
+/// truncation note's recovery call and re-issuing it verbatim retrieves the
+/// omitted remainder, so the union of both responses covers the full enclosing
+/// scope and surfaces the sentinel. Guards against the fixed-window miss
+/// observed at manager.ts:546-561.
+#[test]
+fn mcp_context_truncation_recovery_round_trips_to_full_scope() {
+    let tmp = TempDir::new().unwrap();
+    let sentinel = "ZZ_TAIL_SENTINEL_7b2c";
+    let rel = write_scope_file_with_tail_sentinel(tmp.path(), "recovery_scope", 120, sentinel);
+    let mut client = McpTestClient::start(tmp.path());
+
+    // Near the scope top, with a tiny expansion: the tail (and its sentinel) is
+    // omitted from the first window.
+    let first = client.call_tool(
+        TOOL_CONTEXT,
+        serde_json::json!({ "locations": [{ "path": rel, "line": 2, "expansion": 3 }] }),
+    );
+    assert_ne!(first["isError"], true);
+    let first_ctx = mcp_structured(&first)["data"]["records"][0]["context"].clone();
+    let first_content = first_ctx["content"].as_str().unwrap();
+    assert!(
+        !first_content.contains(sentinel),
+        "the near-top window must omit the tail sentinel: {first_content}"
+    );
+
+    let note = first_ctx["truncation"].clone();
+    assert_eq!(note["reason"].as_str(), Some(SCOPE_TRUNCATION_REASON));
+    let scope_start = note["full_line_start"].as_u64().unwrap();
+    let scope_end = note["full_line_end"].as_u64().unwrap();
+    assert_eq!((scope_start, scope_end), (1, 120));
+
+    // The recovery call is prepended as the first envelope next_action, naming
+    // the clipped scope and omitted counts, and carries the note's arguments
+    // verbatim (REQ-004).
+    let first_actions = mcp_structured(&first)["next_actions"].as_array().unwrap();
+    assert_eq!(first_actions[0]["tool"].as_str(), Some(TOOL_CONTEXT));
+    assert_eq!(first_actions[0]["arguments"], note["recovery"]["arguments"]);
+    let reason = first_actions[0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("recovery_scope") && reason.contains("115"),
+        "recovery next_action must name the clipped scope and omitted line counts: {reason}"
+    );
+
+    // Re-issue the note's exact recovery call verbatim.
+    let recovery = note["recovery"].clone();
+    assert_eq!(recovery["tool"].as_str(), Some(TOOL_CONTEXT));
+    let recovered = client.call_tool(TOOL_CONTEXT, recovery["arguments"].clone());
+    assert_ne!(recovered["isError"], true);
+    let recovered_ctx = mcp_structured(&recovered)["data"]["records"][0]["context"].clone();
+    let recovered_content = recovered_ctx["content"].as_str().unwrap();
+
+    // The recovered content surfaces the omitted sentinel...
+    assert!(
+        recovered_content.contains(sentinel),
+        "recovery call must retrieve the omitted tail sentinel: {recovered_content}"
+    );
+    // ...and the union of both windows covers the full enclosing scope.
+    let union_start = first_ctx["line_start"]
+        .as_u64()
+        .unwrap()
+        .min(recovered_ctx["line_start"].as_u64().unwrap());
+    let union_end = first_ctx["line_end"]
+        .as_u64()
+        .unwrap()
+        .max(recovered_ctx["line_end"].as_u64().unwrap());
+    assert!(
+        union_start <= scope_start && union_end >= scope_end,
+        "union [{union_start},{union_end}] must cover the full enclosing scope [{scope_start},{scope_end}]"
     );
 }
 
