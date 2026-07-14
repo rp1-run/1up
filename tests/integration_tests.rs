@@ -1691,6 +1691,66 @@ fn mutate_parallel_regression_fixture(dir: &std::path::Path) {
     .unwrap();
 }
 
+/// A repo where markdown doc sections and code both match an implementation
+/// query, mirroring the warm-run failure where site-features.md / emdash-api.md
+/// doc_sections crowded out the actual page component. Used to prove the
+/// implementation-intent doc demotion surfaces code above docs.
+fn create_doc_crowding_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+
+    // Several doc sections saturated with the query terms so they rank highly.
+    fs::write(
+        tmp.path().join("docs").join("site-features.md"),
+        r#"# Admin global search
+
+## Search results page component
+
+The admin global search page component renders the search results page. The
+search results page component lists every matching record for the admin search
+page and paginates the global search results.
+
+## Search page rendering
+
+Rendering of the admin search results page component is documented here: the
+global search page component paints the admin search results page on screen.
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("emdash-api.md"),
+        r#"# Emdash API
+
+## Admin search page component overview
+
+The admin search page component and the global search results page component
+are described for the admin search page consumer of the global search results.
+"#,
+    )
+    .unwrap();
+
+    // The actual implementation of the admin search page component.
+    fs::write(
+        tmp.path().join("src").join("admin_search_page.rs"),
+        r#"/// Renders the admin global search results page.
+pub struct AdminSearchPageComponent {
+    pub query: String,
+}
+
+impl AdminSearchPageComponent {
+    pub fn render_search_results_page(&self) -> String {
+        format!("admin global search results page for {}", self.query)
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    tmp
+}
+
 fn create_search_acceptance_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4045,6 +4105,68 @@ fn mcp_search_fuses_multi_query_aspects_into_one_ranked_list() {
         mcp_structured(&single)["data"]["results"],
         mcp_structured(&empty_extra)["data"]["results"],
         "an empty queries array must leave the single-query result list unchanged"
+    );
+}
+
+/// T6: an implementation-intent search (marker tokens like "page"/"component")
+/// sinks doc_section results below code results while keeping every doc result
+/// present, so the actual page component leads instead of being crowded out by
+/// documentation prose.
+#[test]
+fn mcp_search_demotes_doc_sections_for_implementation_intent() {
+    let tmp = create_doc_crowding_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": "admin global search page component search results page",
+            "limit": 10
+        }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_response_is_presentation_free(&search);
+
+    let results = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap();
+    let kinds: Vec<&str> = results
+        .iter()
+        .map(|hit| hit["kind"].as_str().unwrap_or_default())
+        .collect();
+
+    let has_doc = kinds.contains(&"doc_section");
+    let has_code = kinds.iter().any(|kind| *kind != "doc_section");
+    assert!(
+        has_doc && has_code,
+        "fixture must return both code and doc_section results: {kinds:?}"
+    );
+
+    // Every code result precedes every doc_section: once the first doc appears,
+    // the remainder of the list is docs only.
+    let first_doc = kinds
+        .iter()
+        .position(|kind| *kind == "doc_section")
+        .unwrap();
+    assert!(
+        kinds[first_doc..].iter().all(|kind| *kind == "doc_section"),
+        "implementation-intent search must rank code above doc_sections: {kinds:?}"
+    );
+
+    // The doc results are demoted, not dropped -- they remain in the list.
+    let doc_count = kinds.iter().filter(|kind| **kind == "doc_section").count();
+    assert!(
+        doc_count > 0,
+        "doc results must stay present after demotion: {kinds:?}"
+    );
+
+    // The implementation file leads the ranked list for an implementation query.
+    assert_eq!(
+        results[0]["path"].as_str().unwrap(),
+        "src/admin_search_page.rs",
+        "the page component implementation should lead an implementation search: {kinds:?}"
     );
 }
 

@@ -1201,13 +1201,21 @@ pub async fn run_search(
 
 /// Reduce the per-query ranked lists into the final result list. A single query
 /// is returned untouched; two or more queries are fused with RRF, deduped by
-/// handle, and truncated to `limit`.
-fn finalize_search_lists(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
-    if lists.len() <= 1 {
+/// handle, and truncated to `limit`. On the assembled list, an implementation-
+/// intent query then sinks doc-section results below code results (a stable
+/// reorder, no scoring or filtering) so implementation searches surface code
+/// first.
+fn finalize_search_lists(
+    lists: Vec<Vec<SearchResult>>,
+    limit: usize,
+    queries: &[String],
+) -> Vec<SearchResult> {
+    let merged = if lists.len() <= 1 {
         lists.into_iter().next().unwrap_or_default()
     } else {
         crate::search::hybrid::merge_multi_query_results(lists, limit)
-    }
+    };
+    crate::search::hybrid::demote_doc_sections_for_implementation_intent(merged, queries)
 }
 
 /// Process-global warm embedding runtime for the in-process MCP fallback search
@@ -1295,14 +1303,14 @@ async fn run_search_once(
             for query in queries {
                 lists.push(engine.search(query, limit).await?);
             }
-            finalize_search_lists(lists, limit)
+            finalize_search_lists(lists, limit, queries)
         } else {
             let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
             let mut lists = Vec::with_capacity(queries.len());
             for query in queries {
                 lists.push(engine.fts_only_search(query, limit).await?);
             }
-            finalize_search_lists(lists, limit)
+            finalize_search_lists(lists, limit, queries)
         };
         (results, embedding_reason)
     } else {
@@ -1312,7 +1320,7 @@ async fn run_search_once(
             lists.push(engine.fts_only_search(query, limit).await?);
         }
         (
-            finalize_search_lists(lists, limit),
+            finalize_search_lists(lists, limit, queries),
             Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()),
         )
     };
