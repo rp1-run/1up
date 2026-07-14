@@ -2202,10 +2202,6 @@ async fn resolve_handle_records(
         } else if let Some(segment) = segments_by_id.get(&normalized) {
             records.push(read_segment(source, segment.clone(), verbosity));
         } else {
-            // Isolate the residual per-handle path (REQ-002): a non-lock error
-            // resolving one handle becomes that handle's Error record instead of
-            // aborting the whole batch, so one bad handle never poisons the rest.
-            // Lock errors still propagate so `retry_on_db_lock` retries the call.
             let record = match resolve_handle_via_prefix(
                 conn,
                 context_id,
@@ -2225,12 +2221,12 @@ async fn resolve_handle_records(
     Ok(records)
 }
 
-/// Pure classification gate for a residual per-handle resolution error
-/// (REQ-002). A lock error is returned as `Err` so it `?`-propagates and
-/// `retry_on_db_lock` retries the whole call; any other error is isolated to a
-/// single `ReadStatus::Error` record carrying the error text, so one handle's
-/// failure never aborts the batch. Index-level failures (the batched exact-id
-/// fetch, `open_current_index`) stay whole-call failures and never reach here.
+/// Pure classification gate for a residual per-handle resolution error. A lock
+/// error is returned as `Err` so it `?`-propagates and `retry_on_db_lock`
+/// retries the whole call; any other error is isolated to a single
+/// `ReadStatus::Error` record carrying the error text, so one handle's failure
+/// never aborts the batch. Index-level failures (the batched exact-id fetch,
+/// `open_current_index`) stay whole-call failures and never reach here.
 fn isolate_residual_resolution_error(
     source: ReadSource,
     err: anyhow::Error,
@@ -4957,10 +4953,6 @@ mod tests {
 
     #[test]
     fn residual_resolution_error_isolates_non_lock_and_propagates_lock() {
-        // REQ-002: a non-lock residual resolution error must not abort the
-        // batch — it becomes an isolated Error record for that one handle. A
-        // lock error must still propagate so retry_on_db_lock retries the whole
-        // call rather than burning the handle as a failure.
         let source = || ReadSource::Handle {
             raw: ":deadbeefcafe".to_string(),
             normalized: "deadbeefcafe".to_string(),
@@ -4991,9 +4983,6 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_handle_records_aggregate_reflects_found_mix() {
-        // REQ-002: the payload status aggregates per-handle outcomes in request
-        // order — all Found is Ok, a mix is Partial with the valid content
-        // intact and the miss isolated, and no Found is Empty.
         let db = Db::open_memory().await.unwrap();
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();

@@ -713,14 +713,13 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
 }
 
 /// Selects the bounded, relevance-ordered batch of result handles the default
-/// post-search `oneup_get` next action recommends hydrating (REQ-001).
+/// post-search `oneup_get` next action recommends hydrating.
 ///
 /// `results` are already RRF-ranked, so taking the leading
 /// `min(len, HYDRATION_BATCH_MAX_HANDLES)` yields the most relevant handles in
 /// ranked order (not an arbitrary subset). Each handle is emitted as a
-/// `:`-prefixed full handle. Empty input yields empty output; the caller
-/// handles the empty-results branch before reaching this gate. Pure and
-/// deterministic so the bound and ordering are unit-testable in isolation.
+/// `:`-prefixed full handle; the caller handles the empty-results branch before
+/// reaching this gate.
 fn select_hydration_handles(results: &[ops::SearchHit]) -> Vec<String> {
     results
         .iter()

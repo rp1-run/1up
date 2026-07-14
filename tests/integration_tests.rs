@@ -4332,10 +4332,10 @@ fn mcp_get_rejects_an_identical_failed_handle_retry_within_a_session() {
     assert_mcp_next_actions_are_canonical(second_envelope);
 }
 
-/// REQ-001 + REQ-002 (integration): a many-result search recommends a bounded
-/// batched `oneup_get` (capped at `HYDRATION_BATCH_MAX_HANDLES`, never the whole
-/// result set, in ranked order), and issuing that exact recommended batch
-/// hydrates one record per handle in request order with an `ok` envelope.
+/// A many-result search recommends a bounded batched `oneup_get` (capped at
+/// `HYDRATION_BATCH_MAX_HANDLES`, never the whole result set, in ranked order),
+/// and issuing that exact recommended batch hydrates one record per handle in
+/// request order with an `ok` envelope.
 #[test]
 fn mcp_search_recommends_bounded_batch_and_get_hydrates_in_order() {
     let tmp = create_ambiguous_handle_fixture();
@@ -4425,9 +4425,9 @@ fn mcp_search_recommends_bounded_batch_and_get_hydrates_in_order() {
     }
 }
 
-/// REQ-002 (integration): a mixed batch (one mistyped handle among valid ones)
-/// returns `partial` with `is_error` unset, the valid handles hydrated, and the
-/// bad handle an explicit distinguishable failure record, all in request order.
+/// A mixed batch (one mistyped handle among valid ones) returns `partial` with
+/// `is_error` unset, the valid handles hydrated, and the bad handle an explicit
+/// distinguishable failure record, all in request order.
 #[test]
 fn mcp_batched_get_isolates_one_bad_handle_as_partial() {
     let tmp = create_ambiguous_handle_fixture();
@@ -4497,8 +4497,8 @@ fn mcp_batched_get_isolates_one_bad_handle_as_partial() {
         .is_empty());
 }
 
-/// REQ-002 (integration): a batch where every handle is invalid returns `empty`
-/// with `is_error` true and failure-guidance steering the agent back to search.
+/// A batch where every handle is invalid returns `empty` with `is_error` true
+/// and failure-guidance steering the agent back to search.
 #[test]
 fn mcp_batched_get_all_invalid_handles_returns_empty_error() {
     let tmp = create_ambiguous_handle_fixture();
