@@ -6,7 +6,9 @@ use oneup::mcp::types::{
     RETAINED_PUBLIC_TOOLS, TOOL_CONTEXT, TOOL_GET, TOOL_IMPACT, TOOL_OVERVIEW, TOOL_SEARCH,
     TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
-use oneup::shared::constants::{SCHEMA_VERSION, SCOPE_TRUNCATION_REASON};
+use oneup::shared::constants::{
+    HYDRATION_BATCH_MAX_HANDLES, SCHEMA_VERSION, SCOPE_TRUNCATION_REASON,
+};
 use oneup::storage::{
     db::Db,
     queries, schema,
@@ -4328,6 +4330,211 @@ fn mcp_get_rejects_an_identical_failed_handle_retry_within_a_session() {
         "the rejection steers toward a refined query, not a repeat: {search_action:?}"
     );
     assert_mcp_next_actions_are_canonical(second_envelope);
+}
+
+/// REQ-001 + REQ-002 (integration): a many-result search recommends a bounded
+/// batched `oneup_get` (capped at `HYDRATION_BATCH_MAX_HANDLES`, never the whole
+/// result set, in ranked order), and issuing that exact recommended batch
+/// hydrates one record per handle in request order with an `ok` envelope.
+#[test]
+fn mcp_search_recommends_bounded_batch_and_get_hydrates_in_order() {
+    let tmp = create_ambiguous_handle_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "ambiguous_collision_token", "limit": 32 }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_response_is_presentation_free(&search);
+    let search_envelope = mcp_structured(&search);
+    let results = search_envelope["data"]["results"].as_array().unwrap();
+    assert!(
+        results.len() > HYDRATION_BATCH_MAX_HANDLES,
+        "fixture must return more than {HYDRATION_BATCH_MAX_HANDLES} results to prove the cap, got {}",
+        results.len()
+    );
+
+    let get_action = search_envelope["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["tool"] == TOOL_GET)
+        .expect("a multi-result search must recommend a batched oneup_get");
+    let recommended = get_action["arguments"]["handles"]
+        .as_array()
+        .expect("the batched get action must carry a handles array")
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        recommended.len(),
+        HYDRATION_BATCH_MAX_HANDLES,
+        "a many-result search must recommend exactly the {HYDRATION_BATCH_MAX_HANDLES}-handle cap: {recommended:?}"
+    );
+    assert!(
+        recommended.len() < results.len(),
+        "the recommendation must never be the whole result set: {recommended:?}"
+    );
+    assert!(
+        recommended.len() >= 2,
+        "a multi-result search must recommend a batch of at least two handles: {recommended:?}"
+    );
+    assert!(
+        recommended.iter().all(|handle| handle.starts_with(':')),
+        "recommended handles must be `:`-prefixed full handles: {recommended:?}"
+    );
+    let ranked = results
+        .iter()
+        .take(HYDRATION_BATCH_MAX_HANDLES)
+        .map(|hit| format!(":{}", hit["handle"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recommended, ranked,
+        "recommended handles must be the top-ranked results in order, not an arbitrary subset"
+    );
+
+    let get = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": recommended.clone() }),
+    );
+    assert_ne!(get["isError"], true);
+    assert_mcp_response_is_presentation_free(&get);
+    let get_envelope = mcp_structured(&get);
+    assert_eq!(get_envelope["status"], "ok");
+    let records = get_envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(
+        records.len(),
+        recommended.len(),
+        "a batched get must return exactly one record per requested handle"
+    );
+    for (record, requested) in records.iter().zip(&recommended) {
+        assert_eq!(record["status"], "found");
+        assert_eq!(
+            record["source"]["raw"].as_str().unwrap(),
+            requested,
+            "records must preserve the requested handle order"
+        );
+        assert!(
+            !record["segment"]["content"].as_str().unwrap().is_empty(),
+            "each found record must hydrate segment content: {record:?}"
+        );
+    }
+}
+
+/// REQ-002 (integration): a mixed batch (one mistyped handle among valid ones)
+/// returns `partial` with `is_error` unset, the valid handles hydrated, and the
+/// bad handle an explicit distinguishable failure record, all in request order.
+#[test]
+fn mcp_batched_get_isolates_one_bad_handle_as_partial() {
+    let tmp = create_ambiguous_handle_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "ambiguous_collision_token", "limit": 32 }),
+    );
+    assert_ne!(search["isError"], true);
+    let valid = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(2)
+        .map(|hit| format!(":{}", hit["handle"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        valid.len(),
+        2,
+        "need two valid handles to bracket the bad one"
+    );
+
+    let bad = ":does-not-exist".to_string();
+    let batch = vec![valid[0].clone(), bad.clone(), valid[1].clone()];
+
+    let get = client.call_tool(TOOL_GET, serde_json::json!({ "handles": batch }));
+    assert_ne!(
+        get["isError"], true,
+        "one bad handle must not fail an otherwise valid batch: {get}"
+    );
+    assert_mcp_response_is_presentation_free(&get);
+    let envelope = mcp_structured(&get);
+    assert_eq!(envelope["status"], "partial");
+
+    let records = envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(
+        records.len(),
+        3,
+        "one record per requested handle, in order"
+    );
+
+    assert_eq!(records[0]["status"], "found");
+    assert_eq!(records[0]["source"]["raw"].as_str().unwrap(), valid[0]);
+    assert!(!records[0]["segment"]["content"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+
+    assert_eq!(
+        records[1]["status"], "not_found",
+        "the mistyped handle is an isolated, distinguishable failure: {records:?}"
+    );
+    assert_eq!(records[1]["source"]["raw"].as_str().unwrap(), bad);
+    assert!(
+        records[1]["segment"].is_null(),
+        "the failed handle must not hydrate any segment: {records:?}"
+    );
+
+    assert_eq!(records[2]["status"], "found");
+    assert_eq!(records[2]["source"]["raw"].as_str().unwrap(), valid[1]);
+    assert!(!records[2]["segment"]["content"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+/// REQ-002 (integration): a batch where every handle is invalid returns `empty`
+/// with `is_error` true and failure-guidance steering the agent back to search.
+#[test]
+fn mcp_batched_get_all_invalid_handles_returns_empty_error() {
+    let tmp = create_ambiguous_handle_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let batch = vec![
+        ":does-not-exist-a".to_string(),
+        ":does-not-exist-b".to_string(),
+    ];
+    let get = client.call_tool(TOOL_GET, serde_json::json!({ "handles": batch.clone() }));
+
+    assert_eq!(
+        get["isError"], true,
+        "a batch where every handle fails must set is_error: {get}"
+    );
+    assert_mcp_response_is_presentation_free(&get);
+    let envelope = mcp_structured(&get);
+    assert_eq!(envelope["status"], "empty");
+
+    let records = envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(
+        records.len(),
+        batch.len(),
+        "one record per requested handle"
+    );
+    for (record, requested) in records.iter().zip(&batch) {
+        assert_eq!(record["status"], "not_found");
+        assert_eq!(record["source"]["raw"].as_str().unwrap(), requested);
+    }
+
+    assert_eq!(
+        envelope["next_actions"][0]["tool"], TOOL_SEARCH,
+        "an all-invalid batch must steer the agent back to search: {envelope:?}"
+    );
 }
 
 #[test]
