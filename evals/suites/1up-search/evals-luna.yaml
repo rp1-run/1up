@@ -4,7 +4,7 @@ evaluateOptions:
   maxConcurrency: 1
 
 prompts:
-  - id: file://prompt-1up.txt
+  - id: file://prompt-1up-warm.txt
     label: 1up
   - id: file://prompt-baseline.txt
     label: baseline
