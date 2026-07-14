@@ -3299,6 +3299,61 @@ fn git_head_oid(dir: &Path) -> String {
 }
 
 #[test]
+fn mcp_readiness_reports_pinned_detached_commit_as_ready() {
+    let _model_guard = RestoreHiddenModelGuard::new();
+
+    let repo = create_multi_lang_fixture();
+    git(repo.path(), &["init"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git(repo.path(), &["config", "user.name", "1up Test"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    let indexed_head = git_head_oid(repo.path());
+
+    // Detach HEAD at the exact commit before indexing so the segments are stored
+    // under the detached-commit context and readiness reflects a pinned checkout
+    // whose working tree matches the indexed state.
+    git(
+        repo.path(),
+        &["checkout", "--detach", indexed_head.as_str()],
+    );
+
+    init_and_index(&repo);
+
+    // Address the repo per call via `path` from a neutral isolated-state server
+    // so no daemon registers or reconciles the repo and the readiness
+    // observation cannot race a refresh.
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let repo_path = repo.path().to_str().unwrap();
+
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let envelope = mcp_structured(&result);
+    assert_mcp_response_is_presentation_free(&result);
+
+    // The pinned-detached readiness contract (REQ-005): an exact detached commit
+    // matching the indexed state is never downgraded for branch ambiguity. The
+    // CI-faithful test HOME carries a model-download-failed marker, so the read
+    // path reports `degraded` for unavailable embeddings (as the existing ready
+    // fixture also does); that is orthogonal to the branch caveat. The behavior
+    // under test is that no branch-ambiguity reason is attached, which is what
+    // `apply_branch_readiness` now exempts. The pure `Ready` outcome is covered
+    // by the direct `apply_branch_readiness` unit matrix.
+    assert_eq!(envelope["data"]["branch_status"], "detached");
+    assert_eq!(envelope["data"]["drifted"], false);
+    let reason = envelope["data"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("branch context") && !reason.contains("not branch-filtered"),
+        "a pinned detached commit must not carry a branch-ambiguity reason: {envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
+#[test]
 fn mcp_status_reports_head_drift_and_start_clears_it() {
     let repo = create_multi_lang_fixture();
     git(repo.path(), &["init"]);
