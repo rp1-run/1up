@@ -2202,13 +2202,43 @@ async fn resolve_handle_records(
         } else if let Some(segment) = segments_by_id.get(&normalized) {
             records.push(read_segment(source, segment.clone(), verbosity));
         } else {
-            records.push(
-                resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await?,
-            );
+            // Isolate the residual per-handle path (REQ-002): a non-lock error
+            // resolving one handle becomes that handle's Error record instead of
+            // aborting the whole batch, so one bad handle never poisons the rest.
+            // Lock errors still propagate so `retry_on_db_lock` retries the call.
+            let record = match resolve_handle_via_prefix(
+                conn,
+                context_id,
+                source.clone(),
+                &normalized,
+                verbosity,
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(err) => isolate_residual_resolution_error(source, err)?,
+            };
+            records.push(record);
         }
     }
 
     Ok(records)
+}
+
+/// Pure classification gate for a residual per-handle resolution error
+/// (REQ-002). A lock error is returned as `Err` so it `?`-propagates and
+/// `retry_on_db_lock` retries the whole call; any other error is isolated to a
+/// single `ReadStatus::Error` record carrying the error text, so one handle's
+/// failure never aborts the batch. Index-level failures (the batched exact-id
+/// fetch, `open_current_index`) stay whole-call failures and never reach here.
+fn isolate_residual_resolution_error(
+    source: ReadSource,
+    err: anyhow::Error,
+) -> anyhow::Result<ReadRecord> {
+    if is_lock_error(&err.to_string()) {
+        return Err(err);
+    }
+    Ok(read_message(ReadStatus::Error, source, err.to_string()))
 }
 
 /// Residual prefix resolution for a handle that did not match an exact id:
@@ -4923,6 +4953,117 @@ mod tests {
             "dddd4444eeee5555",
             "a duplicate handle resolves independently and preserves order"
         );
+    }
+
+    #[test]
+    fn residual_resolution_error_isolates_non_lock_and_propagates_lock() {
+        // REQ-002: a non-lock residual resolution error must not abort the
+        // batch — it becomes an isolated Error record for that one handle. A
+        // lock error must still propagate so retry_on_db_lock retries the whole
+        // call rather than burning the handle as a failure.
+        let source = || ReadSource::Handle {
+            raw: ":deadbeefcafe".to_string(),
+            normalized: "deadbeefcafe".to_string(),
+        };
+
+        let isolated =
+            isolate_residual_resolution_error(source(), anyhow::anyhow!("segment decode failed"))
+                .expect("a non-lock error is isolated to a record, not propagated");
+        assert_eq!(isolated.status, ReadStatus::Error);
+        assert_eq!(
+            isolated.message.as_deref(),
+            Some("segment decode failed"),
+            "the error text is surfaced on the isolated record"
+        );
+        assert!(isolated.segment.is_none());
+        match &isolated.source {
+            ReadSource::Handle { raw, .. } => assert_eq!(raw, ":deadbeefcafe"),
+            other => panic!("the requested handle must be preserved, got {other:?}"),
+        }
+
+        let propagated =
+            isolate_residual_resolution_error(source(), anyhow::anyhow!("database is locked"));
+        assert!(
+            propagated.is_err(),
+            "a lock error must propagate for whole-call retry, not become a record"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_records_aggregate_reflects_found_mix() {
+        // REQ-002: the payload status aggregates per-handle outcomes in request
+        // order — all Found is Ok, a mix is Partial with the valid content
+        // intact and the miss isolated, and no Found is Empty.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-aggregate";
+        for (id, file) in [
+            ("aaaa1111bbbb2222", "src/a.rs"),
+            ("cccc3333dddd4444", "src/b.rs"),
+        ] {
+            segments::upsert_segment_for_context(&conn, ctx, &test_segment(id, file))
+                .await
+                .unwrap();
+        }
+
+        let all_valid = resolve_handle_records(
+            &conn,
+            ctx,
+            &[
+                "aaaa1111bbbb2222".to_string(),
+                "cccc3333dddd4444".to_string(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aggregate_read_status(&all_valid), OperationStatus::Ok);
+        assert_eq!(
+            all_valid
+                .iter()
+                .map(|record| record.status)
+                .collect::<Vec<_>>(),
+            vec![ReadStatus::Found, ReadStatus::Found]
+        );
+
+        let mixed = resolve_handle_records(
+            &conn,
+            ctx,
+            &[
+                "aaaa1111bbbb2222".to_string(),   // valid
+                "zzzznotarealhandle".to_string(), // mistyped miss
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aggregate_read_status(&mixed), OperationStatus::Partial);
+        assert_eq!(mixed[0].status, ReadStatus::Found);
+        assert_eq!(
+            mixed[0].segment.as_ref().unwrap().handle,
+            "aaaa1111bbbb2222",
+            "the valid handle's content survives the sibling miss"
+        );
+        assert_ne!(
+            mixed[1].status,
+            ReadStatus::Found,
+            "the mistyped handle is an isolated non-found record, not a batch abort"
+        );
+
+        let all_invalid = resolve_handle_records(
+            &conn,
+            ctx,
+            &[
+                "zzzznotarealhandle".to_string(),
+                "yyyyalsomissing0000".to_string(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aggregate_read_status(&all_invalid), OperationStatus::Empty);
     }
 
     // Observed warm-suite failure fixture (design.md): a single dropped
