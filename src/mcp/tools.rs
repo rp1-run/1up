@@ -1457,10 +1457,31 @@ fn indexed_tool_error(message: String) -> CallToolResult {
     )
 }
 
+/// Once the index phase has reached a terminal ready/complete state, drop
+/// build-time telemetry that no longer informs a readiness decision: the
+/// index_progress prefilter/parallelism/message internals plus the
+/// index_progress source_root that only duplicates the envelope's top-level
+/// source_root. Running or not-yet-ready phases keep their full progress so
+/// live indexing stays observable.
+fn lean_ready_status(payload: &mut ReadinessPayload) {
+    let ready = payload.status == ReadinessStatus::Ready;
+    let Some(progress) = payload.index_progress.as_mut() else {
+        return;
+    };
+    if !(ready || matches!(progress.state, IndexState::Complete)) {
+        return;
+    }
+    progress.prefilter = None;
+    progress.parallelism = None;
+    progress.message = None;
+    progress.source_root = None;
+}
+
 fn readiness_result(
-    payload: ReadinessPayload,
+    mut payload: ReadinessPayload,
     metadata: Option<ReadinessContextMetadata>,
 ) -> ToolEnvelope {
+    lean_ready_status(&mut payload);
     let status = status_string(&payload.status);
     let summary = payload.summary.clone();
     let mut data = payload_value(&payload);
@@ -1654,6 +1675,78 @@ mod tests {
             panic!("expected arguments to be Some");
         }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    #[test]
+    fn lean_ready_status_strips_build_telemetry_from_terminal_index_progress() {
+        use crate::shared::types::{
+            IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexState,
+        };
+        use std::path::PathBuf;
+
+        let mut progress = IndexProgress::pending();
+        progress.state = IndexState::Complete;
+        progress.phase = IndexPhase::Complete;
+        progress.source_root = Some(PathBuf::from("/repo"));
+        progress.message = Some("indexing complete".to_string());
+        progress.parallelism = Some(IndexParallelism {
+            jobs_configured: 8,
+            jobs_effective: 8,
+            embed_threads: 4,
+        });
+        progress.prefilter = Some(IndexPrefilterInfo {
+            discovered: 100,
+            metadata_skipped: 10,
+            content_read: 90,
+            deleted: 0,
+        });
+
+        let mut payload = ready_payload(Some(false));
+        payload.source_root = "/repo".to_string();
+        payload.index_progress = Some(progress);
+
+        lean_ready_status(&mut payload);
+
+        let leaned = payload.index_progress.as_ref().unwrap();
+        assert!(leaned.prefilter.is_none(), "prefilter must be stripped");
+        assert!(leaned.parallelism.is_none(), "parallelism must be stripped");
+        assert!(leaned.message.is_none(), "message must be stripped");
+        assert!(
+            leaned.source_root.is_none(),
+            "duplicate index_progress source_root must be stripped"
+        );
+        // Readiness essentials survive: the terminal state itself is retained.
+        assert!(matches!(leaned.state, IndexState::Complete));
+    }
+
+    #[test]
+    fn lean_ready_status_preserves_running_index_progress() {
+        use crate::shared::types::{IndexParallelism, IndexPhase, IndexProgress, IndexState};
+
+        let mut progress = IndexProgress::pending();
+        progress.state = IndexState::Running;
+        progress.phase = IndexPhase::Storing;
+        progress.message = Some("storing segments".to_string());
+        progress.parallelism = Some(IndexParallelism {
+            jobs_configured: 8,
+            jobs_effective: 8,
+            embed_threads: 4,
+        });
+
+        // A not-yet-ready payload with a running index keeps its live progress
+        // telemetry so indexing stays observable.
+        let mut payload = ops::blocked_readiness_for_path("repo", "indexing");
+        assert_ne!(payload.status, ReadinessStatus::Ready);
+        payload.index_progress = Some(progress);
+
+        lean_ready_status(&mut payload);
+
+        let kept = payload.index_progress.as_ref().unwrap();
+        assert!(
+            kept.parallelism.is_some(),
+            "running parallelism must be kept"
+        );
+        assert!(kept.message.is_some(), "running message must be kept");
     }
 
     fn detached_context(branch_status: BranchStatus) -> WorktreeContext {

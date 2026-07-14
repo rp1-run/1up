@@ -409,6 +409,46 @@ fn write_running_progress_for_context(project: &Path, context_id: &str) {
     .unwrap();
 }
 
+/// Persists a terminal (complete) index-progress record for the active context
+/// carrying the full build-time telemetry an indexer emits — the parallelism,
+/// prefilter, and message internals plus a source_root that duplicates the
+/// envelope's top-level source_root. No `context_id` is written so the record
+/// matches whichever context the reader resolves for the repo.
+fn write_complete_progress_with_telemetry(project: &Path) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("index_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "complete",
+            "phase": "complete",
+            "source_root": project,
+            "files_total": 3,
+            "files_scanned": 3,
+            "files_processed": 3,
+            "files_indexed": 3,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "segments_stored": 12,
+            "embeddings_enabled": true,
+            "message": "indexing complete",
+            "parallelism": {
+                "jobs_configured": 8,
+                "jobs_effective": 8,
+                "embed_threads": 4
+            },
+            "prefilter": {
+                "discovered": 100,
+                "metadata_skipped": 10,
+                "content_read": 90,
+                "deleted": 0
+            },
+            "updated_at": "2026-04-26T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
@@ -3475,6 +3515,68 @@ fn mcp_status_ignores_index_progress_from_other_context() {
     } else {
         assert_eq!(envelope["next_actions"][0]["tool"], TOOL_STATUS);
     }
+}
+
+/// T5: once the index phase is terminal, the readiness envelope keeps only the
+/// readiness essentials of index_progress and drops the build-time telemetry
+/// (prefilter/parallelism/message internals) and the duplicate source_root. The
+/// repo is addressed per call via `path` from a neutral isolated-state server
+/// so no daemon registers or reconciles it and rewrites the progress file.
+#[test]
+fn mcp_status_leans_terminal_index_progress_to_readiness_essentials() {
+    let target = TempDir::new().unwrap();
+    let target_root = target.path().canonicalize().unwrap();
+    fs::create_dir_all(target_root.join(".git")).unwrap();
+    write_complete_progress_with_telemetry(&target_root);
+
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let target_path = target_root.to_str().unwrap();
+
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": target_path }));
+    let envelope = mcp_structured(&result);
+
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+
+    let progress = &envelope["data"]["index_progress"];
+    assert!(
+        progress.is_object(),
+        "the active context's terminal progress should be exposed: {envelope:?}"
+    );
+    // Readiness essential: the terminal state itself is retained.
+    assert_eq!(progress["state"], "complete");
+    // Build-time telemetry is stripped from a terminal envelope.
+    assert!(
+        progress.get("prefilter").is_none(),
+        "terminal index_progress must omit the prefilter internals: {progress}"
+    );
+    assert!(
+        progress.get("parallelism").is_none(),
+        "terminal index_progress must omit the parallelism internals: {progress}"
+    );
+    assert!(
+        progress.get("message").is_none(),
+        "terminal index_progress must omit the build message: {progress}"
+    );
+    // The duplicate root is dropped from progress but kept at the top level.
+    assert!(
+        progress.get("source_root").is_none(),
+        "terminal index_progress must omit the duplicate source_root: {progress}"
+    );
+    assert!(
+        envelope["data"]["source_root"].is_string(),
+        "the envelope must still carry the top-level source_root: {envelope:?}"
+    );
+
+    // Byte budget: the leaned terminal envelope stays compact.
+    let data_bytes = serde_json::to_vec(&envelope["data"]).unwrap().len();
+    assert!(
+        data_bytes <= 1536,
+        "leaned terminal status data should stay compact; got {data_bytes} bytes: {}",
+        envelope["data"]
+    );
 }
 
 #[test]
