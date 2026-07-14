@@ -111,6 +111,43 @@ Neither this regression nor configuration validation replaces the manual-only
 credentialed/model runs above. Do not run Claude, Luna, MCP-adoption, or recall
 evals as automated agent validation.
 
+### P4 acceptance: bounded batch hydration warm-suite verification
+
+Closing the bounded 2-4 handle batch-hydration initiative (phase P4) requires a
+manual, credentialed warm-suite run compared against the P1-recorded 1up warm
+Luna baseline. This is a development-gate measurement performed by the
+initiative owner, not an automated CI gate and not a statistical release claim.
+
+Run it from the same authenticated secure shell used for the Luna manual run
+above, inside `evals/`:
+
+```sh
+cd /path/to/1up/evals
+PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna
+npm run eval:summary:luna
+```
+
+Record the following five axes from the summary and compare them against the
+P1-recorded 1up warm Luna baseline (reference: **5.09M input tokens**):
+
+| Axis | Target |
+|------|--------|
+| Average MCP calls per case | at or below **12** |
+| Aggregate input tokens | at least **40% better** than the P1 baseline |
+| Aggregate latency | at least **40% better** than the P1 baseline |
+| Aggregate dollar cost | at least **40% better** than the P1 baseline |
+| Factual accuracy + expected-file scores | **non-inferior** to the baseline |
+
+Input tokens, latency, and dollar cost must each clear the 40% bound
+independently; the quality axes (factual accuracy and expected-file) must not
+regress. Attribute any shortfall per axis (calls vs tokens vs latency) so the
+result is actionable.
+
+Evidence is recorded locally under `evals/results/` (gitignored). It is **never
+committed** and is **not a CI gate** — running this credentialed acceptance
+check is a manual Definition-of-Done step for the initiative owner and is out of
+agent scope.
+
 ## Recall gate
 
 The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from P5 MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.
