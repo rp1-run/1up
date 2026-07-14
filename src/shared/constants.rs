@@ -103,6 +103,20 @@ pub const SYMBOL_WEIGHT: f64 = 4.0;
 /// Maximum search results returned per query.
 pub const MAX_SEARCH_RESULTS: usize = 20;
 
+/// Upper bound on the number of result handles the default post-search
+/// `oneup_get` next action recommends hydrating in a single batched call
+/// (REQ-001).
+///
+/// Single source of truth for the batch cap — never re-hardcoded. The
+/// selection gate (`select_hydration_handles` in `src/mcp/tools.rs`) takes the
+/// top `min(result_count, HYDRATION_BATCH_MAX_HANDLES)` handles in RRF-ranked
+/// order, so "most relevant" is guaranteed by the existing ranking rather than
+/// a heuristic. Bounded to 4 to cut sequential single-handle round trips
+/// without flooding the agent's context (unbounded/blind hydration is
+/// prohibited); each hydrated record is already compaction-bounded (P2), so a
+/// batch of four cannot re-inflate the envelope.
+pub const HYDRATION_BATCH_MAX_HANDLES: usize = 4;
+
 /// Maximum size of a framed daemon request payload in bytes.
 pub const MAX_DAEMON_REQUEST_BYTES: usize = 16 * 1024;
 

@@ -21,7 +21,9 @@ use crate::mcp::types::{
     TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
-use crate::shared::constants::{MAX_RECOVERY_ACTIONS, MAX_SEARCH_RESULTS};
+use crate::shared::constants::{
+    HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_RESULTS,
+};
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, StructuralResult,
     StructuralSearchReport, StructuralSearchStatus, WorktreeContext,
@@ -710,6 +712,23 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
     actions
 }
 
+/// Selects the bounded, relevance-ordered batch of result handles the default
+/// post-search `oneup_get` next action recommends hydrating (REQ-001).
+///
+/// `results` are already RRF-ranked, so taking the leading
+/// `min(len, HYDRATION_BATCH_MAX_HANDLES)` yields the most relevant handles in
+/// ranked order (not an arbitrary subset). Each handle is emitted as a
+/// `:`-prefixed full handle. Empty input yields empty output; the caller
+/// handles the empty-results branch before reaching this gate. Pure and
+/// deterministic so the bound and ordering are unit-testable in isolation.
+fn select_hydration_handles(results: &[ops::SearchHit]) -> Vec<String> {
+    results
+        .iter()
+        .take(HYDRATION_BATCH_MAX_HANDLES)
+        .map(|hit| format!(":{}", hit.handle))
+        .collect()
+}
+
 fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
     let Some(first) = payload.results.first() else {
         // If empty search results with scope, suggest widening scope
@@ -741,11 +760,16 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
         )];
     };
 
+    let handles = select_hydration_handles(&payload.results);
     let mut actions = vec![
         action(
             TOOL_GET,
-            "Hydrate the top search result before editing or concluding.",
-            Some(json!({ "handles": [format!(":{}", first.handle)] })),
+            format!(
+                "Hydrate the top {} result{} in one batched oneup_get call before editing or concluding; each handle reports independently, so one bad handle never fails the rest.",
+                handles.len(),
+                if handles.len() == 1 { "" } else { "s" },
+            ),
+            Some(json!({ "handles": handles })),
         ),
         action(
             TOOL_CONTEXT,
@@ -2026,5 +2050,129 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].tool, TOOL_SEARCH);
         assert!(actions[0].reason.contains("refined query"));
+    }
+
+    fn search_hit(handle: &str) -> ops::SearchHit {
+        ops::SearchHit {
+            handle: handle.to_string(),
+            path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            kind: "function".to_string(),
+            score: 100,
+            line_start: 1,
+            line_end: 10,
+            breadcrumb: None,
+            symbol: None,
+            defined_symbols: Vec::new(),
+        }
+    }
+
+    fn search_payload(hits: Vec<ops::SearchHit>) -> SearchPayload {
+        SearchPayload {
+            status: OperationStatus::Ok,
+            results: hits,
+            degraded_reason: None,
+            index_scope: None,
+        }
+    }
+
+    #[test]
+    fn select_hydration_handles_empty_input_yields_empty_output() {
+        assert!(select_hydration_handles(&[]).is_empty());
+    }
+
+    #[test]
+    fn select_hydration_handles_single_result_returns_that_one_handle() {
+        let handles = select_hydration_handles(&[search_hit("aaa")]);
+        assert_eq!(handles, vec![":aaa".to_string()]);
+    }
+
+    #[test]
+    fn select_hydration_handles_two_to_four_results_returns_all_of_them() {
+        for count in 2..=HYDRATION_BATCH_MAX_HANDLES {
+            let hits: Vec<_> = (0..count).map(|i| search_hit(&format!("h{i}"))).collect();
+            let handles = select_hydration_handles(&hits);
+            assert_eq!(
+                handles.len(),
+                count,
+                "{count} results must all be recommended"
+            );
+            let expected: Vec<String> = (0..count).map(|i| format!(":h{i}")).collect();
+            assert_eq!(handles, expected);
+        }
+    }
+
+    #[test]
+    fn select_hydration_handles_bounds_many_results_to_top_four_in_ranked_order() {
+        let hits: Vec<_> = (0..8).map(|i| search_hit(&format!("h{i}"))).collect();
+
+        let handles = select_hydration_handles(&hits);
+
+        assert_eq!(
+            handles.len(),
+            HYDRATION_BATCH_MAX_HANDLES,
+            "a many-result set must never recommend more than the cap"
+        );
+        assert_eq!(
+            handles,
+            vec![
+                ":h0".to_string(),
+                ":h1".to_string(),
+                ":h2".to_string(),
+                ":h3".to_string(),
+            ],
+            "handles must be the top HYDRATION_BATCH_MAX_HANDLES in ranked order"
+        );
+    }
+
+    #[test]
+    fn select_hydration_handles_carry_the_colon_prefix() {
+        let handles = select_hydration_handles(&[search_hit("deadbeef")]);
+        assert!(
+            handles.iter().all(|handle| handle.starts_with(':')),
+            "every recommended handle must carry the ':' prefix: {handles:?}"
+        );
+    }
+
+    #[test]
+    fn search_next_actions_default_get_recommends_the_selected_batch() {
+        let payload = search_payload(vec![
+            search_hit("h0"),
+            search_hit("h1"),
+            search_hit("h2"),
+            search_hit("h3"),
+            search_hit("h4"),
+        ]);
+
+        let actions = search_next_actions(&payload);
+
+        let get = actions
+            .iter()
+            .find(|action| action.tool == TOOL_GET)
+            .expect("a multi-result search must recommend a batched oneup_get");
+        assert_eq!(
+            get.arguments,
+            Some(json!({
+                "handles": [":h0", ":h1", ":h2", ":h3"]
+            })),
+            "the default get action must prefill the bounded selected batch"
+        );
+    }
+
+    #[test]
+    fn search_next_actions_single_result_recommends_exactly_one_handle() {
+        let payload = search_payload(vec![search_hit("only")]);
+
+        let actions = search_next_actions(&payload);
+
+        let get = actions
+            .iter()
+            .find(|action| action.tool == TOOL_GET)
+            .expect("a single-result search must still recommend oneup_get");
+        assert_eq!(
+            get.arguments,
+            Some(json!({ "handles": [":only"] })),
+            "a single result recommends exactly that one handle"
+        );
     }
 }
