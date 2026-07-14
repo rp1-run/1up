@@ -1159,7 +1159,7 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
 pub async fn run_search(
     state_root: &Path,
     worktree_context: &WorktreeContext,
-    query: &str,
+    queries: &[String],
     limit: usize,
     path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
@@ -1169,7 +1169,7 @@ pub async fn run_search(
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             retry_on_db_lock(|| async {
-                run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+                run_search_once(state_root, worktree_context, queries, limit, path_prefix).await
             }),
         )
         .await
@@ -1193,9 +1193,21 @@ pub async fn run_search(
         }
     } else {
         retry_on_db_lock(|| async {
-            run_search_once(state_root, worktree_context, query, limit, path_prefix).await
+            run_search_once(state_root, worktree_context, queries, limit, path_prefix).await
         })
         .await
+    }
+}
+
+/// Reduce the per-query ranked lists into the final result list. A single query
+/// is returned untouched (byte-for-byte identical to the pre-multi-query path);
+/// two or more queries are fused with RRF, deduped by handle, and truncated to
+/// `limit`.
+fn finalize_search_lists(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
+    if lists.len() <= 1 {
+        lists.into_iter().next().unwrap_or_default()
+    } else {
+        crate::search::hybrid::merge_multi_query_results(lists, limit)
     }
 }
 
@@ -1219,7 +1231,7 @@ fn fallback_embedding_runtime() -> &'static tokio::sync::Mutex<EmbeddingRuntime>
 async fn run_search_once(
     state_root: &Path,
     worktree_context: &WorktreeContext,
-    query: &str,
+    queries: &[String],
     limit: usize,
     path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
@@ -1269,6 +1281,10 @@ async fn run_search_once(
                         count
                     }
                 };
+            // Reuse one warm engine across every query in the multi-query set:
+            // `search` takes `&mut self`, so each query runs against the same
+            // loaded embedder and cached vector count, then the per-query ranked
+            // lists are fused (a single query returns unchanged).
             let mut engine = HybridSearchEngine::new_scoped(
                 &current.conn,
                 runtime.current_embedder(),
@@ -1276,16 +1292,30 @@ async fn run_search_once(
             )
             .with_has_vectors(has_vectors)
             .with_vector_count(vector_count);
-            engine.search(query, limit).await?
+            let mut lists = Vec::with_capacity(queries.len());
+            for query in queries {
+                lists.push(engine.search(query, limit).await?);
+            }
+            finalize_search_lists(lists, limit)
         } else {
             let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
-            engine.fts_only_search(query, limit).await?
+            let mut lists = Vec::with_capacity(queries.len());
+            for query in queries {
+                lists.push(engine.fts_only_search(query, limit).await?);
+            }
+            finalize_search_lists(lists, limit)
         };
         (results, embedding_reason)
     } else {
         let engine = HybridSearchEngine::new_scoped(&current.conn, None, search_scope.clone());
-        let results = engine.fts_only_search(query, limit).await?;
-        (results, Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()))
+        let mut lists = Vec::with_capacity(queries.len());
+        for query in queries {
+            lists.push(engine.fts_only_search(query, limit).await?);
+        }
+        (
+            finalize_search_lists(lists, limit),
+            Some(NO_INDEXED_EMBEDDINGS_REASON.to_string()),
+        )
     };
 
     // Stale-but-available: when a rebuild/refresh is in progress for this
@@ -4578,7 +4608,7 @@ mod tests {
             branch_status: BranchStatus::Named,
         };
 
-        let payload = run_search(&root, &context, "vectorless_needle", 5, None)
+        let payload = run_search(&root, &context, &["vectorless_needle".to_string()], 5, None)
             .await
             .unwrap();
 
@@ -4642,9 +4672,15 @@ mod tests {
             branch_status: BranchStatus::Named,
         };
 
-        let scoped = run_search(&root, &context, "probetokenonly", 10, Some("included"))
-            .await
-            .unwrap();
+        let scoped = run_search(
+            &root,
+            &context,
+            &["probetokenonly".to_string()],
+            10,
+            Some("included"),
+        )
+        .await
+        .unwrap();
         let scoped_paths: Vec<_> = scoped.results.iter().map(|r| r.path.clone()).collect();
         assert_eq!(
             scoped_paths,
@@ -4652,7 +4688,7 @@ mod tests {
             "path_prefix must constrain oneup_search results to the prefix"
         );
 
-        let unscoped = run_search(&root, &context, "probetokenonly", 10, None)
+        let unscoped = run_search(&root, &context, &["probetokenonly".to_string()], 10, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4781,7 +4817,7 @@ mod tests {
         };
 
         // Warm the process-global cache against the pre-swap generation.
-        let before = run_search(&root, &context, "old_needle", 5, None)
+        let before = run_search(&root, &context, &["old_needle".to_string()], 5, None)
             .await
             .unwrap();
         assert_eq!(before.results.len(), 1);
@@ -4792,7 +4828,7 @@ mod tests {
             swap::swap_index_into_place(&root, &staging).await.unwrap();
         }
 
-        let after = run_search(&root, &context, "new_needle", 5, None)
+        let after = run_search(&root, &context, &["new_needle".to_string()], 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4807,7 +4843,7 @@ mod tests {
             "the post-swap read must carry the correct degraded reason, not a stale/silent one"
         );
 
-        let stale = run_search(&root, &context, "old_needle", 5, None)
+        let stale = run_search(&root, &context, &["old_needle".to_string()], 5, None)
             .await
             .unwrap();
         assert!(

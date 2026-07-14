@@ -22,7 +22,7 @@ use crate::mcp::types::{
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::{
-    HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_RESULTS,
+    HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_QUERIES, MAX_SEARCH_RESULTS,
 };
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, StructuralResult,
@@ -165,7 +165,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_search",
-        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads, then hydrate a small selected batch of handles in one oneup_get call, inspect file-line context, or verify symbols from the returned actions.",
+        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads, then hydrate a small selected batch of handles in one oneup_get call, inspect file-line context, or verify symbols from the returned actions. For a multi-part question, pass every distinct aspect in one call via the queries array instead of issuing separate searches; 1up fuses the per-aspect results into one ranked list.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Search Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -191,10 +191,28 @@ impl OneupMcpServer {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_RESULTS);
 
+        // Effective query set for a (possibly multi-part) search: the primary
+        // `query` first (unchanged), then each distinct non-empty extra aspect,
+        // deduped and capped at MAX_SEARCH_QUERIES. A single query leaves the
+        // downstream path byte-for-byte identical to the pre-multi-query flow.
+        let mut queries = vec![input.query.clone()];
+        if let Some(extra) = input.queries.as_ref() {
+            for candidate in extra {
+                let trimmed = candidate.trim();
+                if trimmed.is_empty() || queries.iter().any(|existing| existing == trimmed) {
+                    continue;
+                }
+                queries.push(trimmed.to_string());
+                if queries.len() >= MAX_SEARCH_QUERIES {
+                    break;
+                }
+            }
+        }
+
         match ops::run_search(
             &roots.state_root,
             &roots.worktree_context,
-            &input.query,
+            &queries,
             limit,
             input.path_prefix.as_deref(),
         )

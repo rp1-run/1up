@@ -3846,6 +3846,101 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     );
 }
 
+/// A multi-part question is answered in one call: the opt-in `queries` array
+/// runs the hybrid search per aspect and fuses the ranked lists, so a single
+/// call surfaces handles for every aspect. An empty `queries` array leaves the
+/// single-query envelope byte-for-byte unchanged, proving the fusion path only
+/// engages when there is more than one aspect to merge.
+#[test]
+fn mcp_search_fuses_multi_query_aspects_into_one_ranked_list() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let paths_of = |result: &serde_json::Value| -> Vec<String> {
+        mcp_structured(result)["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Each aspect surfaces its own file on its own.
+    let policy = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    assert_ne!(policy["isError"], true);
+    assert!(
+        paths_of(&policy).contains(&"src/policy.rs".to_string()),
+        "single-aspect search should surface the policy file: {:?}",
+        paths_of(&policy)
+    );
+
+    let signatures = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "validate_incoming_request_signatures", "limit": 5 }),
+    );
+    assert_ne!(signatures["isError"], true);
+    assert!(
+        paths_of(&signatures).contains(&"src/signatures.rs".to_string()),
+        "single-aspect search should surface the signatures file: {:?}",
+        paths_of(&signatures)
+    );
+
+    // One multi-query call covers both aspects in a single fused ranked list.
+    let fused = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": "PolicyRuleValidator",
+            "queries": ["validate_incoming_request_signatures"],
+            "limit": 10
+        }),
+    );
+    assert_ne!(fused["isError"], true);
+    assert_mcp_response_is_presentation_free(&fused);
+    let fused_paths = paths_of(&fused);
+    assert!(
+        fused_paths.contains(&"src/policy.rs".to_string())
+            && fused_paths.contains(&"src/signatures.rs".to_string()),
+        "a multi-query call should fuse handles for every aspect into one ranked list: {fused_paths:?}"
+    );
+    // Handles stay unique after de-duplication by handle.
+    let handles: Vec<&str> = mcp_structured(&fused)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["handle"].as_str().unwrap())
+        .collect();
+    let mut deduped = handles.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        handles.len(),
+        "fused results must be deduplicated by handle: {handles:?}"
+    );
+
+    // An empty `queries` array is identical to a plain single-query call: the
+    // fusion path never engages, so the ranked envelope is byte-for-byte the
+    // same.
+    let single = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    let empty_extra = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "queries": [], "limit": 5 }),
+    );
+    assert_eq!(
+        mcp_structured(&single)["data"]["results"],
+        mcp_structured(&empty_extra)["data"]["results"],
+        "an empty queries array must leave the single-query result list unchanged"
+    );
+}
+
 /// REQ-001 (exactly-once serialization): the authoritative source of a
 /// hydrated segment lives only in `structuredContent.data.records[].segment.content`;
 /// it is never mirrored into the text summary. Serializing the whole

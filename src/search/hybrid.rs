@@ -7,6 +7,7 @@ use crate::search::ranking::{query_words, rank_candidates, tokenize_text, Ranked
 use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
+use crate::shared::constants::RRF_K;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{normalize_score, SearchResult};
 
@@ -377,6 +378,63 @@ fn candidate_key(candidate: &CandidateRow) -> String {
     candidate.segment_id.clone()
 }
 
+/// Fuse several per-query ranked result lists into one deduped-by-handle ranked
+/// list using Reciprocal Rank Fusion (the multi-query `oneup_search` path).
+///
+/// Each input list is independently ranked with rank 0 at the top. A segment's
+/// fused score is `Σ 1/(RRF_K + rank)` over every list it appears in, so a
+/// segment several aspects of a multi-part question all surface outranks one
+/// that only matched a single aspect. The list is deduplicated by `segment_id`
+/// (the durable handle), keeping the representative row from the list where the
+/// segment ranked best (lowest rank) and re-deriving its displayed `score` from
+/// the fused RRF total. Ordering is fully deterministic: fused score descending,
+/// then best rank ascending, then `segment_id` ascending. The fused list is
+/// truncated to `limit`.
+///
+/// A single-element `lists` is returned untouched (aside from the `limit`
+/// truncation the single-query path already applies), so the caller only reaches
+/// this merge when there is more than one query to fuse.
+pub fn merge_multi_query_results(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+
+    // Per handle: (fused RRF score, best rank seen, representative row).
+    let mut fused: HashMap<String, (f64, usize, SearchResult)> = HashMap::new();
+    for list in lists {
+        for (rank, result) in list.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + rank as f64);
+            match fused.get_mut(&result.segment_id) {
+                Some(entry) => {
+                    entry.0 += contribution;
+                    if rank < entry.1 {
+                        entry.1 = rank;
+                        entry.2 = result;
+                    }
+                }
+                None => {
+                    fused.insert(result.segment_id.clone(), (contribution, rank, result));
+                }
+            }
+        }
+    }
+
+    let mut merged: Vec<(f64, usize, SearchResult)> = fused.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+            .then_with(|| a.2.segment_id.cmp(&b.2.segment_id))
+    });
+
+    merged
+        .into_iter()
+        .take(limit)
+        .map(|(fused_score, _, mut result)| {
+            result.score = normalize_score(fused_score);
+            result
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +443,67 @@ mod tests {
     use crate::search::symbol::SymbolSearchEngine;
     use crate::shared::types::{BranchStatus, SegmentRole};
     use crate::storage::segments::StoredSegment;
+
+    fn result_with_id(segment_id: &str) -> SearchResult {
+        SearchResult {
+            segment_id: segment_id.to_string(),
+            file_path: format!("src/{segment_id}.rs"),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: String::new(),
+            score: 0,
+            line_number: 1,
+            line_end: 2,
+            breadcrumb: None,
+            defined_symbols: None,
+        }
+    }
+
+    #[test]
+    fn merge_multi_query_dedups_by_handle_and_keeps_best_rank() {
+        // Query A ranks [a, b, c]; query B ranks [b, d, a]. Every handle is
+        // deduped once; `b` (ranks 1 and 0) and `a` (ranks 0 and 2) appear in
+        // both lists, so they outrank the single-list `c` and `d`.
+        let list_a = vec![
+            result_with_id("a"),
+            result_with_id("b"),
+            result_with_id("c"),
+        ];
+        let list_b = vec![
+            result_with_id("b"),
+            result_with_id("d"),
+            result_with_id("a"),
+        ];
+
+        let merged = merge_multi_query_results(vec![list_a, list_b], 10);
+
+        // Fused RRF: b = 1/61 + 1/60, a = 1/60 + 1/62 (both matched twice, so
+        // they lead), then the single-list handles by their own rank — d (rank 1)
+        // ahead of c (rank 2).
+        let ids: Vec<&str> = merged.iter().map(|r| r.segment_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "d", "c"], "fused ranking: {ids:?}");
+        assert_eq!(
+            merged.len(),
+            4,
+            "each handle must appear exactly once after de-duplication"
+        );
+        // A fused handle scores higher than a single-list handle.
+        assert!(
+            merged[0].score >= merged[2].score,
+            "a handle matched by both queries should not rank below a single-query handle"
+        );
+    }
+
+    #[test]
+    fn merge_multi_query_truncates_to_limit() {
+        let list = vec![
+            result_with_id("a"),
+            result_with_id("b"),
+            result_with_id("c"),
+        ];
+        let merged = merge_multi_query_results(vec![list], 2);
+        assert_eq!(merged.len(), 2);
+    }
 
     /// Test-only reference implementation of the pre-change `get_segment_by_id`
     /// hydration path. The equivalence test pins `search_result_from_candidate`
