@@ -23,6 +23,7 @@ use crate::mcp::types::{
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::{
     HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_QUERIES, MAX_SEARCH_RESULTS,
+    SUMMARY_MAX_BYTES,
 };
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, StructuralResult,
@@ -30,7 +31,6 @@ use crate::shared::types::{
 };
 
 const DEFAULT_SEARCH_LIMIT: usize = 5;
-const MCP_HANDLE_DISPLAY_LEN: usize = 12;
 const MCP_FIELD_SEP: &str = "  ";
 const MCP_PLACEHOLDER: &str = "-";
 
@@ -219,7 +219,7 @@ impl OneupMcpServer {
         .await
         {
             Ok(payload) => {
-                let summary = search_summary(&payload, &input.query);
+                let summary = search_summary(&payload);
                 let next_actions = search_next_actions(&payload);
                 result(envelope(
                     status_string(&payload.status),
@@ -1150,84 +1150,53 @@ fn all_read_records_failed(payload: &ReadPayload) -> bool {
         })
 }
 
-fn search_summary(payload: &SearchPayload, query: &str) -> String {
-    let header = match payload.status {
-        OperationStatus::Ok => format!(
-            "Found {} ranked 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
-        OperationStatus::Degraded => format!(
-            "Found {} degraded 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
-        OperationStatus::Empty => {
-            // If empty search with scope, provide scope-aware message
-            if let Some(scope) = &payload.index_scope {
-                if !scope.roots.is_empty() {
-                    let scope_list = scope.roots.join(", ");
-                    return format!(
-                        "No results found in indexed scope [{}] for \"{}\". {}",
-                        scope_list,
-                        query,
-                        scope.coverage_description()
-                    );
-                }
-            }
-            format!("No indexed code matched \"{}\".", query)
+/// Content-free search summary (mirrors the `read_summary`/`oneup_context`
+/// grammar): a constant-shaped orientation line whose length is independent of
+/// the query text and the result set. The ranked results are the single source
+/// of truth in `structuredContent`, so the text echoes neither the query, the
+/// per-result rows, nor any (truncated) handle — that mirror is what re-inflated
+/// the search envelope. Bounded at [`SUMMARY_MAX_BYTES`] so even a many-root
+/// empty-scope notice cannot grow the text block.
+fn search_summary(payload: &SearchPayload) -> String {
+    let count = payload.results.len();
+    let summary = match payload.status {
+        OperationStatus::Ok => {
+            format!("Found {count} ranked 1up search result(s); details in structuredContent.")
         }
-        OperationStatus::Partial => format!(
-            "Found {} partial 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
+        OperationStatus::Degraded => {
+            format!("Found {count} degraded 1up search result(s); details in structuredContent.")
+        }
+        OperationStatus::Partial => {
+            format!("Found {count} partial 1up search result(s); details in structuredContent.")
+        }
+        OperationStatus::Empty => match payload
+            .index_scope
+            .as_ref()
+            .filter(|scope| !scope.roots.is_empty())
+        {
+            Some(scope) => format!(
+                "No indexed code matched in the configured scope. {}",
+                scope.coverage_description()
+            ),
+            None => "No indexed code matched the search.".to_string(),
+        },
     };
 
-    if payload.results.is_empty() {
-        return header;
+    clamp_summary_bytes(summary)
+}
+
+/// Clamp a model-facing summary to [`SUMMARY_MAX_BYTES`], truncating on a UTF-8
+/// character boundary so the text block can never exceed the byte budget.
+fn clamp_summary_bytes(mut summary: String) -> String {
+    if summary.len() <= SUMMARY_MAX_BYTES {
+        return summary;
     }
-
-    let rows = payload
-        .results
-        .iter()
-        .map(format_search_hit_row)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!("{header}\n\n{rows}")
-}
-
-fn format_search_hit_row(hit: &ops::SearchHit) -> String {
-    let symbol = hit
-        .symbol
-        .as_deref()
-        .or_else(|| hit.defined_symbols.first().map(String::as_str));
-    let breadcrumb_symbol = format_breadcrumb_symbol(hit.breadcrumb.as_deref(), symbol);
-    format!(
-        "{}{MCP_FIELD_SEP}{}:{}-{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}:{}",
-        hit.score,
-        hit.path,
-        hit.line_start,
-        hit.line_end,
-        hit.kind,
-        breadcrumb_symbol,
-        short_handle(&hit.handle)
-    )
-}
-
-fn format_breadcrumb_symbol(breadcrumb: Option<&str>, symbol: Option<&str>) -> String {
-    let breadcrumb = breadcrumb
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MCP_PLACEHOLDER);
-    let symbol = symbol
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MCP_PLACEHOLDER);
-    format!("{breadcrumb}::{symbol}")
-}
-
-fn short_handle(handle: &str) -> String {
-    handle.chars().take(MCP_HANDLE_DISPLAY_LEN).collect()
+    let mut end = SUMMARY_MAX_BYTES;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    summary.truncate(end);
+    summary
 }
 
 fn read_summary(payload: &ReadPayload) -> String {
@@ -1537,6 +1506,64 @@ fn status_string<T: Serialize>(status: &T) -> String {
 mod tests {
     use super::*;
     use crate::search::impact::{ImpactAnchor, ImpactHint};
+
+    #[test]
+    fn search_summary_is_content_free_and_within_budget() {
+        let payload = SearchPayload {
+            status: OperationStatus::Ok,
+            results: vec![ops::SearchHit {
+                handle: "abcdef0123456789".to_string(),
+                path: "src/very/deep/module/path.rs".to_string(),
+                language: "rust".to_string(),
+                kind: "function".to_string(),
+                score: 42,
+                line_start: 10,
+                line_end: 20,
+                breadcrumb: Some("Module::Type".to_string()),
+                symbol: Some("SecretSymbolName".to_string()),
+                defined_symbols: vec!["SecretSymbolName".to_string()],
+            }],
+            degraded_reason: None,
+            index_scope: None,
+        };
+
+        let summary = search_summary(&payload);
+
+        assert!(
+            summary.contains("1 ranked"),
+            "summary should report the ranked count: {summary}"
+        );
+        assert!(
+            !summary.contains("abcdef0123456789"),
+            "summary must not leak a result handle: {summary}"
+        );
+        assert!(
+            !summary.contains("src/very/deep"),
+            "summary must not enumerate result paths: {summary}"
+        );
+        assert!(
+            !summary.contains("SecretSymbolName"),
+            "summary must not enumerate per-result symbols: {summary}"
+        );
+        assert!(
+            summary.len() <= SUMMARY_MAX_BYTES,
+            "summary must stay within budget; got {} bytes",
+            summary.len()
+        );
+    }
+
+    #[test]
+    fn clamp_summary_bytes_truncates_on_char_boundary() {
+        let long = "x".repeat(SUMMARY_MAX_BYTES + 50);
+        assert_eq!(clamp_summary_bytes(long).len(), SUMMARY_MAX_BYTES);
+
+        // A run of multi-byte characters is truncated on a boundary, never mid
+        // codepoint, so the clamped string stays valid UTF-8 within budget.
+        let multibyte = "é".repeat(SUMMARY_MAX_BYTES);
+        let clamped = clamp_summary_bytes(multibyte);
+        assert!(clamped.len() <= SUMMARY_MAX_BYTES);
+        assert!(clamped.chars().all(|c| c == 'é'));
+    }
 
     fn impact_input() -> ImpactInput {
         ImpactInput {

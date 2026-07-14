@@ -3666,16 +3666,21 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert_mcp_text_matches_summary(&search);
     let search_text = search["content"][0]["text"].as_str().unwrap();
     assert!(
-        search_text.contains("src/policy.rs:"),
-        "oneup_search text should include ranked rows, not only a count summary: {search_text}"
+        search_text.contains("result"),
+        "oneup_search text should report a result count: {search_text}"
     );
     assert!(
-        search_text
-            .lines()
-            .any(|line| line.contains("PolicyRuleValidator")
-                && line.contains(":")
-                && line.contains("  ")),
-        "oneup_search text should include a CLI-like row with symbol and handle: {search_text}"
+        !search_text.contains("src/policy.rs"),
+        "oneup_search text must be content-free: ranked rows live only in structured data, never mirrored into the summary: {search_text}"
+    );
+    assert!(
+        !search_text.contains("PolicyRuleValidator"),
+        "oneup_search text must not echo the query or enumerate per-result symbols/handles: {search_text}"
+    );
+    assert!(
+        search_text.len() <= 256,
+        "oneup_search text must stay within the summary byte budget; got {} bytes: {search_text}",
+        search_text.len()
     );
     let search_envelope = mcp_structured(&search);
     assert!(
@@ -3939,6 +3944,54 @@ fn mcp_search_fuses_multi_query_aspects_into_one_ranked_list() {
         mcp_structured(&empty_extra)["data"]["results"],
         "an empty queries array must leave the single-query result list unchanged"
     );
+}
+
+/// The `oneup_search` text summary is content-free and byte-bounded: it reports
+/// only a count, never echoing the (possibly long) query, enumerating result
+/// rows, or leaking a handle. The ranked results stay the single source of
+/// truth in structured content.
+#[test]
+fn mcp_search_summary_is_content_free_and_within_byte_budget() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let sentinel = "ZZ_QUERY_ECHO_SENTINEL_2f7c";
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": format!("PolicyRuleValidator {sentinel}"),
+            "limit": 5
+        }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_response_is_presentation_free(&search);
+
+    let text = search["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.len() <= 256,
+        "search summary must stay within the 256-byte budget; got {} bytes: {text}",
+        text.len()
+    );
+    assert!(
+        !text.contains(sentinel),
+        "search summary must not echo the query: {text}"
+    );
+    assert!(
+        !text.contains("src/policy.rs"),
+        "search summary must not enumerate result rows: {text}"
+    );
+
+    // Every returned handle stays out of the text; it lives only in structured data.
+    let structured = mcp_structured(&search);
+    for hit in structured["data"]["results"].as_array().unwrap() {
+        let handle = hit["handle"].as_str().unwrap();
+        assert!(
+            !text.contains(handle),
+            "search summary must not leak result handle {handle}: {text}"
+        );
+    }
 }
 
 /// REQ-001 (exactly-once serialization): the authoritative source of a

@@ -103,6 +103,16 @@ pub const SYMBOL_WEIGHT: f64 = 4.0;
 /// Maximum search results returned per query.
 pub const MAX_SEARCH_RESULTS: usize = 20;
 
+/// Byte budget for a model-facing MCP tool text summary.
+///
+/// The authoritative payload for every tool is `structuredContent`; the text
+/// summary is only a constant-shaped orientation line. Search, read, and
+/// context summaries stay content-free (no query echo, no per-result rows, no
+/// source body), so this bound is a backstop that keeps a variable-length tail
+/// — an empty-scope coverage notice with many roots, say — from re-inflating
+/// the text block the compaction is meant to shrink.
+pub const SUMMARY_MAX_BYTES: usize = 256;
+
 /// Upper bound on the number of queries fused in a single multi-query
 /// `oneup_search` call (the opt-in `queries` array).
 ///
