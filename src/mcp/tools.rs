@@ -889,13 +889,16 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
     handle_failure_next_actions(payload)
 }
 
-/// Next_actions for a get call that hydrated no content (REQ-002). An ambiguous
-/// handle prepends a ready-to-issue `oneup_get` prefilled with the real
-/// candidate ids from `matching_handles` (never placeholders) so the agent can
-/// pick one unambiguous handle ahead of the generic search fallback; when a
-/// handle was simply absent the search reason notes it is not in the active
+/// Next_actions for a get call that hydrated no content (REQ-002, REQ-003). A
+/// failure carrying candidate ids — an ambiguous prefix or a rejected identical
+/// retry whose original failure was ambiguous — prepends a ready-to-issue
+/// `oneup_get` prefilled with the real candidate ids from `matching_handles`
+/// (never placeholders) so the agent can pick one unambiguous handle ahead of
+/// the generic search fallback. The trailing search reason is the most specific
+/// applicable: a rejected identical retry is steered to a refined query instead
+/// of repeating the call; an absent handle notes it is not in the active
 /// context. The placeholder-free search fallback always trails (REQ-008) so
-/// there is always a forward action.
+/// there is always a forward action that differs from repeating the call.
 fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
     let mut actions = Vec::new();
 
@@ -903,7 +906,10 @@ fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
         .records
         .iter()
         .find(|record| {
-            record.status == ops::ReadStatus::Ambiguous && !record.matching_handles.is_empty()
+            matches!(
+                record.status,
+                ops::ReadStatus::Ambiguous | ops::ReadStatus::Rejected
+            ) && !record.matching_handles.is_empty()
         })
         .map(|record| record.matching_handles.clone())
     {
@@ -914,11 +920,17 @@ fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
         ));
     }
 
+    let rejected_identical_retry = payload
+        .records
+        .iter()
+        .any(|record| record.status == ops::ReadStatus::Rejected);
     let absent_from_context = payload
         .records
         .iter()
         .any(|record| record.status == ops::ReadStatus::NotFound);
-    let search_reason = if absent_from_context {
+    let search_reason = if rejected_identical_retry {
+        "This identical handle already failed in the active context this session; search with a refined query instead of repeating the call."
+    } else if absent_from_context {
         "The handle is not present in the active context; search to obtain a valid handle."
     } else {
         "Search again to obtain a valid handle or precise file location."
@@ -1963,5 +1975,56 @@ mod tests {
             "not_found guidance must note the handle is absent from the active context: {}",
             actions[0].reason
         );
+    }
+
+    #[test]
+    fn rejected_record_offers_candidates_and_a_refined_search_not_a_repeat() {
+        // A rejected identical retry whose original failure was ambiguous keeps
+        // the cached candidate ids, so the follow-up prefills a disambiguating
+        // oneup_get and steers the trailing search away from repeating the call
+        // (REQ-003).
+        let candidates = vec![
+            "0b25cc46a316205a1afe69ccd11337e2".to_string(),
+            "0b25cc46a316205a1afe69ccd1144abc".to_string(),
+        ];
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::Rejected, candidates.clone())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions[0].tool, TOOL_GET);
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "handles": candidates })),
+            "a rejected retry with cached candidates prefills oneup_get with the real ids"
+        );
+        let search = actions
+            .iter()
+            .find(|action| action.tool == TOOL_SEARCH)
+            .expect("a rejected retry must still trail a search fallback");
+        assert!(
+            search.reason.contains("refined query"),
+            "the rejection must steer toward a refined query, not a repeat: {}",
+            search.reason
+        );
+    }
+
+    #[test]
+    fn rejected_record_without_candidates_only_offers_a_refined_search() {
+        // A rejected retry whose original failure was a plain not-found carries
+        // no candidates, so only the refined-query search fallback is offered
+        // (REQ-003).
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::Rejected, Vec::new())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_SEARCH);
+        assert!(actions[0].reason.contains("refined query"));
     }
 }
