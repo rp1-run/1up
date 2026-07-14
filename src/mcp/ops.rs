@@ -14,10 +14,11 @@ use crate::daemon::registry::Registry;
 use crate::indexer::embedder::{
     self, clear_download_failure, EmbeddingLoadStatus, EmbeddingRuntime, EmbeddingUnavailableReason,
 };
+use crate::indexer::parser::SupportedLanguage;
 use crate::indexer::pipeline;
 use crate::indexer::scan_filter::ScanFilter;
-use crate::mcp::types::{DirectoryStats, FactsEnvelope, StartMode};
-use crate::search::context::ContextEngine;
+use crate::mcp::types::{DirectoryStats, FactsEnvelope, StartMode, TOOL_CONTEXT, TOOL_SYMBOL};
+use crate::search::context::{ContextEngine, ScopeWindow};
 use crate::search::impact::{ImpactHorizonEngine, ImpactRequest, ImpactResultEnvelope};
 use crate::search::overview;
 use crate::search::retrieval;
@@ -25,14 +26,16 @@ use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, Sym
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
-    FILE_COUNT_THRESHOLD_ENV_VAR, NO_INDEXED_EMBEDDINGS_REASON, STALE_REBUILD_REASON,
+    FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_SYMBOLS_PER_LIST,
+    NO_INDEXED_EMBEDDINGS_REASON, SCOPE_TRUNCATION_REASON, STALE_REBUILD_REASON,
+    SYMBOL_LIST_TRUNCATION_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::project;
 use crate::shared::types::{
-    combine_degraded_reasons, ContextAccessScope, ContextResult, DaemonProjectStatus,
-    IndexProgress, IndexScope, IndexState, IndexingConfig, ReferenceKind, RunScope, SearchResult,
-    SegmentRole, SetupTimings, StructuralSearchReport, SymbolResult, WorktreeContext,
+    combine_degraded_reasons, DaemonProjectStatus, IndexProgress, IndexScope, IndexState,
+    IndexingConfig, ReferenceKind, RunScope, SearchResult, SegmentRole, SetupTimings,
+    StructuralSearchReport, SymbolResult, WorktreeContext,
 };
 use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
@@ -2081,13 +2084,15 @@ fn read_location_record(
         None
     };
 
-    match ContextEngine::retrieve_with_scope(
-        &file_path,
-        location.line,
-        location.expansion,
-        ContextAccessScope::ProjectRoot,
-    ) {
-        Ok(context) => read_context(source, source_root, context, out_of_scope_disclosure),
+    match ContextEngine::retrieve_scope_window(&file_path, location.line, location.expansion) {
+        Ok(window) => read_context(
+            source,
+            source_root,
+            &file_path,
+            location.line,
+            window,
+            out_of_scope_disclosure,
+        ),
         Err(err) => read_message(ReadStatus::Error, source, err.to_string()),
     }
 }
@@ -2177,13 +2182,53 @@ fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&s
 fn read_context(
     source: ReadSource,
     source_root: &Path,
-    context: ContextResult,
+    file_path: &Path,
+    target_line: usize,
+    window: ScopeWindow,
     out_of_scope_disclosure: Option<String>,
 ) -> ReadRecord {
-    let path = Path::new(&context.file_path)
+    let path = file_path
         .strip_prefix(source_root)
         .map(relative_path_string)
-        .unwrap_or_else(|_| context.file_path.clone());
+        .unwrap_or_else(|_| file_path.display().to_string());
+
+    // The `ScopeWindow` contract omits language, so derive it from the file
+    // extension here (mirrors the context engine's own extension mapping).
+    let language = language_for_path(file_path);
+
+    // Load-bearing truncation note (REQ-004): only when the returned window is a
+    // strict subset of the enclosing scope. The recovery re-issues oneup_context
+    // at the ORIGINAL target line so the same smallest enclosing scope re-resolves
+    // (a midpoint retarget could land in a nested scope), with an expansion large
+    // enough to reach the farthest scope edge, clamped to the ceiling.
+    let truncation = window.clipped.then(|| {
+        let omitted_above = window.line_start.saturating_sub(window.scope_line_start);
+        let omitted_below = window.scope_line_end.saturating_sub(window.line_end);
+        let reach = target_line
+            .saturating_sub(window.scope_line_start)
+            .max(window.scope_line_end.saturating_sub(target_line));
+        let expansion = reach.min(MAX_CONTEXT_EXPANSION_LINES);
+        TruncationNote {
+            reason: SCOPE_TRUNCATION_REASON.to_string(),
+            scope_name: window.scope_name.clone(),
+            scope_type: Some(window.scope_type.clone()),
+            full_line_start: Some(window.scope_line_start),
+            full_line_end: Some(window.scope_line_end),
+            omitted_above: Some(omitted_above),
+            omitted_below: Some(omitted_below),
+            omitted_symbols: None,
+            recovery: RecoveryCall {
+                tool: TOOL_CONTEXT.to_string(),
+                arguments: serde_json::json!({
+                    "locations": [{
+                        "path": path.clone(),
+                        "line": target_line,
+                        "expansion": expansion,
+                    }]
+                }),
+            },
+        }
+    });
 
     ReadRecord {
         status: ReadStatus::Found,
@@ -2191,16 +2236,28 @@ fn read_context(
         segment: None,
         context: Some(ContextRecord {
             path,
-            language: context.language,
-            scope_type: context.scope_type,
-            content: context.content,
-            line_start: context.line_start,
-            line_end: context.line_end,
+            language,
+            scope_type: window.scope_type,
+            content: window.content,
+            line_start: window.line_start,
+            line_end: window.line_end,
             out_of_scope_disclosure,
-            truncation: None,
+            truncation,
         }),
         matching_handles: Vec::new(),
         message: None,
+    }
+}
+
+/// Best-effort display language for a context record, derived from the file
+/// extension: the supported-language name, else the raw extension, else
+/// `unknown` for extensionless files.
+fn language_for_path(file_path: &Path) -> String {
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match SupportedLanguage::from_extension(ext) {
+        Some(lang) => lang.name().to_string(),
+        None if ext.is_empty() => "unknown".to_string(),
+        None => ext.to_string(),
     }
 }
 
@@ -2219,27 +2276,71 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
     let role = segment.parsed_role();
     let is_verbose = verbosity.map(|v| v == "full").unwrap_or(false);
 
-    // The symbol hint is derived from the underlying segment data before any
-    // verbosity gating so next_actions never lose the oneup_symbol follow-up.
-    let parsed_defined_symbols = segment.parsed_defined_symbols();
-    let symbol_hint = parsed_defined_symbols.first().cloned();
+    // Resolve the full symbol lists once. Counts and the recovery name are taken
+    // from these before any verbosity gating so next_actions and symbol_counts
+    // never lose the oneup_symbol follow-up.
+    let all_defined = segment.parsed_defined_symbols();
+    let all_referenced = segment.parsed_referenced_symbols();
+    let all_called = segment.parsed_called_symbols();
+    let symbol_hint = all_defined.first().cloned();
 
-    // Only populate symbols if verbosity is "full"; default to empty lists.
-    let defined_symbols = if is_verbose {
-        parsed_defined_symbols
-    } else {
-        Vec::new()
+    let counts = SymbolCounts {
+        defined: all_defined.len(),
+        referenced: all_referenced.len(),
+        called: all_called.len(),
     };
-    let referenced_symbols = if is_verbose {
-        segment.parsed_referenced_symbols()
-    } else {
-        Vec::new()
-    };
-    let called_symbols = if is_verbose {
-        segment.parsed_called_symbols()
-    } else {
-        Vec::new()
-    };
+
+    let (defined_symbols, referenced_symbols, called_symbols, symbol_counts, truncation) =
+        if is_verbose {
+            // Full verbosity (REQ-003): emit the lists but cap each at
+            // MAX_SYMBOLS_PER_LIST. When any list overflows, attach a
+            // load-bearing truncation note (REQ-004) with the total omitted
+            // count and a ready-to-issue oneup_symbol recovery targeting a
+            // symbol this segment actually carries (prefer the defining symbol).
+            let omitted = counts.defined.saturating_sub(MAX_SYMBOLS_PER_LIST)
+                + counts.referenced.saturating_sub(MAX_SYMBOLS_PER_LIST)
+                + counts.called.saturating_sub(MAX_SYMBOLS_PER_LIST);
+            let recovery_name = all_defined
+                .first()
+                .or_else(|| all_referenced.first())
+                .or_else(|| all_called.first())
+                .cloned();
+            let truncation = (omitted > 0)
+                .then_some(recovery_name)
+                .flatten()
+                .map(|name| TruncationNote {
+                    reason: SYMBOL_LIST_TRUNCATION_REASON.to_string(),
+                    scope_name: None,
+                    scope_type: None,
+                    full_line_start: None,
+                    full_line_end: None,
+                    omitted_above: None,
+                    omitted_below: None,
+                    omitted_symbols: Some(omitted),
+                    recovery: RecoveryCall {
+                        tool: TOOL_SYMBOL.to_string(),
+                        arguments: serde_json::json!({
+                            "name": name,
+                            "include": "both",
+                            "fuzzy": true,
+                        }),
+                    },
+                });
+            (
+                cap_symbols(all_defined),
+                cap_symbols(all_referenced),
+                cap_symbols(all_called),
+                None,
+                truncation,
+            )
+        } else {
+            // Default verbosity (REQ-003): omit the lists but make the omission
+            // explicit with constant-size counts when any list is non-empty; the
+            // symbol_hint / oneup_symbol next_action remains the recovery path.
+            let symbol_counts =
+                (counts.defined + counts.referenced + counts.called > 0).then_some(counts);
+            (Vec::new(), Vec::new(), Vec::new(), symbol_counts, None)
+        };
 
     SegmentRecord {
         handle: segment.id,
@@ -2255,10 +2356,16 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
         defined_symbols,
         referenced_symbols,
         called_symbols,
-        symbol_counts: None,
-        truncation: None,
+        symbol_counts,
+        truncation,
         symbol_hint,
     }
+}
+
+/// Cap a symbol list at [`MAX_SYMBOLS_PER_LIST`], preserving order.
+fn cap_symbols(mut symbols: Vec<String>) -> Vec<String> {
+    symbols.truncate(MAX_SYMBOLS_PER_LIST);
+    symbols
 }
 
 fn search_hit(result: SearchResult) -> SearchHit {
@@ -3340,6 +3447,168 @@ mod tests {
         let restored: SymbolCounts =
             serde_json::from_value(serde_json::to_value(counts).unwrap()).unwrap();
         assert_eq!(restored, counts);
+    }
+
+    fn segment_with_symbols(defined: usize, referenced: usize, called: usize) -> StoredSegment {
+        let names = |prefix: &str, n: usize| -> String {
+            let v: Vec<String> = (0..n).map(|i| format!("{prefix}{i}")).collect();
+            serde_json::to_string(&v).unwrap()
+        };
+        StoredSegment {
+            id: "seg-1".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: "fn f() {}".to_string(),
+            line_start: 1,
+            line_end: 3,
+            breadcrumb: None,
+            complexity: 0,
+            role: "DEFINITION".to_string(),
+            defined_symbols: names("def", defined),
+            referenced_symbols: names("ref", referenced),
+            called_symbols: names("call", called),
+            file_hash: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn segment_record_full_verbosity_caps_lists_and_notes_symbol_truncation() {
+        let record = segment_record(segment_with_symbols(25, 3, 0), Some("full"));
+
+        // Each list is capped at MAX_SYMBOLS_PER_LIST; content is untouched.
+        assert_eq!(record.defined_symbols.len(), MAX_SYMBOLS_PER_LIST);
+        assert_eq!(record.referenced_symbols.len(), 3);
+        assert_eq!(record.content, "fn f() {}");
+        // Counts belong to default verbosity only.
+        assert!(record.symbol_counts.is_none());
+
+        let note = record
+            .truncation
+            .expect("overflowing list must produce a note");
+        assert_eq!(note.reason, SYMBOL_LIST_TRUNCATION_REASON);
+        assert_eq!(note.omitted_symbols, Some(5));
+        assert_eq!(note.recovery.tool, TOOL_SYMBOL);
+        assert_eq!(note.recovery.arguments["name"], serde_json::json!("def0"));
+    }
+
+    #[test]
+    fn segment_record_full_verbosity_without_overflow_has_no_truncation() {
+        let record = segment_record(segment_with_symbols(2, 1, 0), Some("full"));
+        assert_eq!(record.defined_symbols.len(), 2);
+        assert!(record.truncation.is_none());
+        assert!(record.symbol_counts.is_none());
+    }
+
+    #[test]
+    fn segment_record_default_verbosity_emits_counts_and_omits_lists() {
+        let record = segment_record(segment_with_symbols(25, 3, 0), None);
+
+        assert!(record.defined_symbols.is_empty());
+        assert!(record.referenced_symbols.is_empty());
+        assert!(record.called_symbols.is_empty());
+        // Symbol capping is a full-verbosity concern; default verbosity discloses
+        // the omission through counts, not a truncation note.
+        assert!(record.truncation.is_none());
+        assert_eq!(
+            record.symbol_counts,
+            Some(SymbolCounts {
+                defined: 25,
+                referenced: 3,
+                called: 0,
+            })
+        );
+        assert_eq!(record.symbol_hint.as_deref(), Some("def0"));
+    }
+
+    #[test]
+    fn segment_record_default_verbosity_omits_counts_when_all_empty() {
+        let record = segment_record(segment_with_symbols(0, 0, 0), None);
+        assert!(record.symbol_counts.is_none());
+        assert!(record.truncation.is_none());
+        assert!(record.symbol_hint.is_none());
+    }
+
+    fn scope_window(clipped: bool) -> ScopeWindow {
+        ScopeWindow {
+            content: "windowed body".to_string(),
+            line_start: 84,
+            line_end: 90,
+            scope_line_start: 71,
+            scope_line_end: 588,
+            scope_type: "function".to_string(),
+            scope_name: Some("load_plugins".to_string()),
+            clipped,
+        }
+    }
+
+    #[test]
+    fn read_context_maps_clipped_window_to_recoverable_truncation() {
+        let source_root = Path::new("/repo");
+        let file_path = Path::new("/repo/src/manager.ts");
+        let record = read_context(
+            ReadSource::Location {
+                path: "src/manager.ts".to_string(),
+                line: 87,
+            },
+            source_root,
+            file_path,
+            87,
+            scope_window(true),
+            None,
+        );
+
+        let context = record.context.expect("context record present");
+        // Window range and language surface; content appears once.
+        assert_eq!((context.line_start, context.line_end), (84, 90));
+        assert_eq!(context.language, "typescript");
+        assert_eq!(context.content, "windowed body");
+
+        let note = context.truncation.expect("clipped window carries a note");
+        assert_eq!(note.reason, SCOPE_TRUNCATION_REASON);
+        assert_eq!(note.scope_name.as_deref(), Some("load_plugins"));
+        assert_eq!(note.scope_type.as_deref(), Some("function"));
+        assert_eq!(
+            (note.full_line_start, note.full_line_end),
+            (Some(71), Some(588))
+        );
+        assert_eq!(note.omitted_above, Some(13));
+        assert_eq!(note.omitted_below, Some(498));
+        assert!(note.omitted_symbols.is_none());
+
+        // Recovery re-issues oneup_context at the ORIGINAL target line, expansion
+        // reaching the farthest scope edge (max(87-71, 588-87)=501) clamped to 500,
+        // shaped as a directly re-issuable ContextInput.
+        assert_eq!(note.recovery.tool, TOOL_CONTEXT);
+        let location = &note.recovery.arguments["locations"][0];
+        assert_eq!(location["path"], serde_json::json!("src/manager.ts"));
+        assert_eq!(location["line"], serde_json::json!(87));
+        assert_eq!(
+            location["expansion"],
+            serde_json::json!(MAX_CONTEXT_EXPANSION_LINES)
+        );
+    }
+
+    #[test]
+    fn read_context_whole_scope_has_no_truncation() {
+        let source_root = Path::new("/repo");
+        let file_path = Path::new("/repo/src/manager.ts");
+        let record = read_context(
+            ReadSource::Location {
+                path: "src/manager.ts".to_string(),
+                line: 87,
+            },
+            source_root,
+            file_path,
+            87,
+            scope_window(false),
+            None,
+        );
+
+        let context = record.context.expect("context record present");
+        assert!(context.truncation.is_none());
     }
 
     #[test]
