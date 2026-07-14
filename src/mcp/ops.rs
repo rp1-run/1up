@@ -1200,9 +1200,8 @@ pub async fn run_search(
 }
 
 /// Reduce the per-query ranked lists into the final result list. A single query
-/// is returned untouched (byte-for-byte identical to the pre-multi-query path);
-/// two or more queries are fused with RRF, deduped by handle, and truncated to
-/// `limit`.
+/// is returned untouched; two or more queries are fused with RRF, deduped by
+/// handle, and truncated to `limit`.
 fn finalize_search_lists(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
     if lists.len() <= 1 {
         lists.into_iter().next().unwrap_or_default()

@@ -5348,11 +5348,10 @@ fn mcp_impact_preserves_trust_buckets_and_followups() {
     assert_mcp_next_actions_are_canonical(empty_envelope);
 }
 
-/// T4 amendment: the measured impact failures passed only {path, line} and got
-/// "provide exactly one impact anchor" back — a dead turn. A relative file path
-/// in the project-root `path` slot with no other anchor now resolves to a File
-/// anchor, and roots resolve from the ambient project (not the file path), so
-/// the call yields advisory impact output instead of an error.
+/// A relative file path in the project-root `path` slot with no other anchor
+/// resolves to a File anchor, and roots resolve from the ambient project (not
+/// the file path), so the call yields advisory impact output instead of an
+/// error.
 #[test]
 fn mcp_impact_promotes_relative_path_slot_to_file_anchor() {
     let tmp = create_impact_acceptance_fixture();

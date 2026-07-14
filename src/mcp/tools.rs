@@ -192,9 +192,8 @@ impl OneupMcpServer {
             .clamp(1, MAX_SEARCH_RESULTS);
 
         // Effective query set for a (possibly multi-part) search: the primary
-        // `query` first (unchanged), then each distinct non-empty extra aspect,
-        // deduped and capped at MAX_SEARCH_QUERIES. A single query leaves the
-        // downstream path byte-for-byte identical to the pre-multi-query flow.
+        // `query` first, then each distinct non-empty extra aspect, deduped and
+        // capped at MAX_SEARCH_QUERIES.
         let mut queries = vec![input.query.clone()];
         if let Some(extra) = input.queries.as_ref() {
             for candidate in extra {
@@ -609,8 +608,8 @@ fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
     }
 
     // A repo-relative file path supplied in the project-root `path` slot with no
-    // other anchor is promoted to a File anchor: the measured impact failures
-    // passed only {path, line}. Absolute paths keep their project-root meaning.
+    // other anchor is promoted to a File anchor. Absolute paths keep their
+    // project-root meaning.
     let path_as_file = impact_path_as_file_anchor(input);
     if count == 0 && path_as_file.is_none() {
         return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
@@ -2007,7 +2006,7 @@ mod tests {
     #[test]
     fn impact_request_promotes_relative_path_slot_to_file_anchor() {
         // A relative file path supplied in the project-root `path` slot with no
-        // other anchor now resolves to a File anchor instead of erroring.
+        // other anchor resolves to a File anchor.
         let mut input = impact_input();
         input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
 
@@ -2024,8 +2023,8 @@ mod tests {
 
     #[test]
     fn impact_request_promoted_path_slot_anchor_accepts_line() {
-        // The measured failure shape: {"path": "...runner.ts", "line": 111} with
-        // no other anchor resolves to a file anchor pinned at the line.
+        // {"path": "...runner.ts", "line": 111} with no other anchor resolves to
+        // a file anchor pinned at the line.
         let mut input = impact_input();
         input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
         input.line = Some(111);
