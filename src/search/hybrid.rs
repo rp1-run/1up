@@ -3,7 +3,7 @@ use libsql::Connection;
 use crate::indexer::embedder::Embedder;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
-use crate::search::ranking::{rank_candidates, tokenize_text, RankedCandidate};
+use crate::search::ranking::{query_words, rank_candidates, tokenize_text, RankedCandidate};
 use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
@@ -336,14 +336,6 @@ fn identifier_like_words(words: &[String]) -> Vec<String> {
     }
 
     variants
-}
-
-fn query_words(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|word| !word.is_empty())
-        .map(|word| word.to_string())
-        .collect()
 }
 
 /// Builds the ranked results directly from the `CandidateRow`s already carried
