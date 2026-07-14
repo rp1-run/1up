@@ -1678,6 +1678,7 @@ mod tests {
                     segment: None,
                     context: Some(context),
                     matching_handles: Vec::new(),
+                    recovered_from: None,
                     message: None,
                 })
                 .collect(),

@@ -41,13 +41,25 @@ use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
-    count_vector_rows_for_context, get_all_file_paths_for_context,
-    get_segment_by_prefix_for_context, get_segments_by_ids_for_context,
-    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
+    count_vector_rows_for_context, get_all_file_paths_for_context, get_segment_by_id_for_context,
+    get_segment_by_prefix_for_context, get_segment_ids_by_prefix_for_context,
+    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
+    StoredSegment,
 };
 use crate::storage::swap;
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
+
+/// Floor length (in characters) for unique-prefix handle recovery (T1). A
+/// supplied handle must share at least this many leading characters with a
+/// single indexed segment id before recovery may resolve it, giving 32 bits of
+/// hex discrimination and forbidding short-prefix guesses.
+const MIN_HANDLE_RECOVERY_PREFIX_CHARS: usize = 8;
+
+/// Upper bound on candidate ids fetched at the floor prefix during handle
+/// recovery. A fetch that saturates this limit means the floor prefix is too
+/// broad to discriminate, so recovery declines rather than guess.
+const HANDLE_RECOVERY_CANDIDATE_LIMIT: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct McpProjectRoots {
@@ -211,6 +223,12 @@ pub struct ReadRecord {
     pub context: Option<ContextRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matching_handles: Vec<String>,
+    /// Set only on a record recovered via the unique-prefix gate (T1): the
+    /// original supplied handle that did not resolve exactly or by prefix but
+    /// whose unique canonical prefix mapped to this segment. Additive and
+    /// omitted on every non-recovered record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -2009,7 +2027,7 @@ async fn resolve_handle_via_prefix(
         match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
             SegmentPrefixLookup::Found(segment) => read_segment(source, *segment, verbosity),
             SegmentPrefixLookup::NotFound => {
-                read_message(ReadStatus::NotFound, source, "segment handle was not found")
+                attempt_handle_recovery(conn, context_id, source, normalized, verbosity).await?
             }
             SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
                 status: ReadStatus::Ambiguous,
@@ -2017,10 +2035,144 @@ async fn resolve_handle_via_prefix(
                 segment: None,
                 context: None,
                 matching_handles: ids,
+                recovered_from: None,
                 message: Some("segment handle matched multiple indexed segments".to_string()),
             },
         },
     )
+}
+
+/// Outcome of the pure unique-prefix recovery gate (T1). `candidates` are the
+/// ids sharing the floor prefix; the gate itself never issues a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandleRecovery {
+    /// Exactly one candidate is uniquely closest at the longest matching prefix
+    /// (>= floor); recovery resolves to this id.
+    Found(String),
+    /// Two or more candidates tie at the longest matching prefix; recovery
+    /// declines to guess and surfaces the tied ids for disambiguation.
+    Ambiguous(Vec<String>),
+    /// No candidate reaches the floor prefix; there is nothing to recover.
+    None,
+}
+
+/// Recovery path taken when a handle matched no segment exactly or by prefix
+/// (REQ-001). Fetches the context-scoped candidate ids sharing the floor prefix
+/// (`supplied[..MIN_HANDLE_RECOVERY_PREFIX_CHARS]`, bounded by
+/// [`HANDLE_RECOVERY_CANDIDATE_LIMIT`]) and runs the pure recovery gate. A
+/// unique longest-prefix candidate is re-fetched by its exact id and returned
+/// as a `Found` record disclosing `recovered_from`; a tie yields an explicit
+/// `Ambiguous` record; anything else stays `NotFound`. Context scoping is
+/// inherited from the storage query, so a foreign-context handle can never be
+/// recovered (REQ-001 AC3). A candidate fetch that saturates the limit means
+/// the floor prefix is too broad to discriminate, so recovery declines.
+async fn attempt_handle_recovery(
+    conn: &Connection,
+    context_id: &str,
+    source: ReadSource,
+    normalized: &str,
+    verbosity: Option<&str>,
+) -> anyhow::Result<ReadRecord> {
+    const NOT_FOUND_MESSAGE: &str = "segment handle was not found";
+
+    // Below the floor there are not enough characters to discriminate, so a
+    // floor prefix cannot even be formed; decline without querying.
+    let floor_prefix: String = normalized
+        .chars()
+        .take(MIN_HANDLE_RECOVERY_PREFIX_CHARS)
+        .collect();
+    if floor_prefix.chars().count() < MIN_HANDLE_RECOVERY_PREFIX_CHARS {
+        return Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        ));
+    }
+
+    let candidates = get_segment_ids_by_prefix_for_context(
+        conn,
+        context_id,
+        &floor_prefix,
+        HANDLE_RECOVERY_CANDIDATE_LIMIT,
+    )
+    .await?;
+
+    // A saturated fetch means the floor prefix matches too many segments to
+    // treat any single one as a unique recovery target.
+    if candidates.len() >= HANDLE_RECOVERY_CANDIDATE_LIMIT {
+        return Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        ));
+    }
+
+    match recover_handle_by_unique_prefix(normalized, &candidates) {
+        HandleRecovery::Found(id) => {
+            match get_segment_by_id_for_context(conn, context_id, &id).await? {
+                Some(segment) => Ok(read_recovered_segment(
+                    source,
+                    segment,
+                    verbosity,
+                    normalized.to_string(),
+                )),
+                // The candidate id vanished between the id fetch and the
+                // re-fetch (e.g. a concurrent rebuild); stay truthful.
+                None => Ok(read_message(
+                    ReadStatus::NotFound,
+                    source,
+                    NOT_FOUND_MESSAGE,
+                )),
+            }
+        }
+        HandleRecovery::Ambiguous(ids) => Ok(ReadRecord {
+            status: ReadStatus::Ambiguous,
+            source,
+            segment: None,
+            context: None,
+            matching_handles: ids,
+            recovered_from: None,
+            message: Some(
+                "segment handle prefix matched multiple indexed segments in the active context"
+                    .to_string(),
+            ),
+        }),
+        HandleRecovery::None => Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        )),
+    }
+}
+
+/// Pure longest-common-prefix recovery gate (REQ-001). Walks prefix lengths
+/// from the full supplied handle down to [`MIN_HANDLE_RECOVERY_PREFIX_CHARS`];
+/// the first (longest) length at which any candidate matches decides the
+/// outcome, so a lone match recovers (`Found`) and a tie declines with the tied
+/// ids (`Ambiguous`). Candidates are assumed to already share the floor prefix,
+/// so the walk terminates at the floor unless the set is empty. Never
+/// fuzzy-matches: only shared leading characters count.
+fn recover_handle_by_unique_prefix(supplied: &str, candidates: &[String]) -> HandleRecovery {
+    let supplied_chars: Vec<char> = supplied.chars().collect();
+    if supplied_chars.len() < MIN_HANDLE_RECOVERY_PREFIX_CHARS || candidates.is_empty() {
+        return HandleRecovery::None;
+    }
+
+    for len in (MIN_HANDLE_RECOVERY_PREFIX_CHARS..=supplied_chars.len()).rev() {
+        let prefix: String = supplied_chars[..len].iter().collect();
+        let matches: Vec<String> = candidates
+            .iter()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => continue,
+            1 => return HandleRecovery::Found(matches.into_iter().next().unwrap()),
+            _ => return HandleRecovery::Ambiguous(matches),
+        }
+    }
+
+    HandleRecovery::None
 }
 
 fn read_location_record(
@@ -2175,7 +2327,29 @@ fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&s
         segment: Some(segment_record(segment, verbosity)),
         context: None,
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: None,
+    }
+}
+
+/// Single-source disclosure attached to a record recovered via the unique-prefix
+/// gate (T1), stating plainly that the supplied handle did not resolve directly.
+const HANDLE_RECOVERY_MESSAGE: &str =
+    "segment handle did not resolve exactly or by prefix; recovered via its unique canonical prefix within the active context";
+
+/// `Found` record for a segment resolved through unique-prefix recovery: a
+/// normal segment read with the additive `recovered_from` disclosure and a
+/// message naming the recovery (REQ-001).
+fn read_recovered_segment(
+    source: ReadSource,
+    segment: StoredSegment,
+    verbosity: Option<&str>,
+    recovered_from: String,
+) -> ReadRecord {
+    ReadRecord {
+        recovered_from: Some(recovered_from),
+        message: Some(HANDLE_RECOVERY_MESSAGE.to_string()),
+        ..read_segment(source, segment, verbosity)
     }
 }
 
@@ -2245,6 +2419,7 @@ fn read_context(
             truncation,
         }),
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: None,
     }
 }
@@ -2268,6 +2443,7 @@ fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<Strin
         segment: None,
         context: None,
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: Some(message.into()),
     }
 }
@@ -4520,6 +4696,176 @@ mod tests {
             "dddd4444eeee5555",
             "a duplicate handle resolves independently and preserves order"
         );
+    }
+
+    // Observed warm-suite failure fixture (design.md): a single dropped
+    // character late in the handle leaves a 28-char unique shared prefix.
+    const RECOVERY_SUPPLIED: &str = "0b25cc46a316205a1afe69ccd1137e2";
+    const RECOVERY_TRUE_ID: &str = "0b25cc46a316205a1afe69ccd11337e2";
+
+    #[test]
+    fn recover_handle_gate_resolves_unique_longest_prefix() {
+        // A lone candidate uniquely closest at a >= floor prefix recovers.
+        let candidates = vec![RECOVERY_TRUE_ID.to_string()];
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &candidates),
+            HandleRecovery::Found(RECOVERY_TRUE_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn recover_handle_gate_prefers_the_strictly_closer_candidate() {
+        // One candidate shares a 28-char prefix, the other diverges from the
+        // supplied handle right at the floor: the strictly closer id wins
+        // uniquely rather than tying. (`0` differs from the supplied char at
+        // index 8, so `far` shares exactly the 8-char floor.)
+        let far = format!("{}000000000000000000000000", &RECOVERY_SUPPLIED[..8]);
+        let candidates = vec![RECOVERY_TRUE_ID.to_string(), far];
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &candidates),
+            HandleRecovery::Found(RECOVERY_TRUE_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn recover_handle_gate_declines_on_a_tie() {
+        // Two candidates both diverge from the supplied handle at the floor
+        // (char index 8 is `f`, not the supplied `a`) and differ only from each
+        // other afterward, so they tie at the 8-char prefix; the gate declines
+        // to guess and returns both.
+        let a = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "a".repeat(23));
+        let b = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "b".repeat(23));
+        match recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &[a.clone(), b.clone()]) {
+            HandleRecovery::Ambiguous(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&a) && ids.contains(&b));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_handle_gate_declines_below_the_floor_or_without_candidates() {
+        // A supplied handle shorter than the floor can never discriminate.
+        assert_eq!(
+            recover_handle_by_unique_prefix("0b25cc", &[RECOVERY_TRUE_ID.to_string()]),
+            HandleRecovery::None
+        );
+        // No candidate to recover to.
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &[]),
+            HandleRecovery::None
+        );
+    }
+
+    /// Seed a memory index with one segment per (context, id) pair and resolve a
+    /// single handle through the full residual + recovery path.
+    async fn resolve_one(conn: &Connection, context_id: &str, handle: &str) -> ReadRecord {
+        let records = resolve_handle_records(conn, context_id, &[handle.to_string()], None)
+            .await
+            .unwrap();
+        records.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovers_unique_prefix_and_discloses_source() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-recovery";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        let record = resolve_one(&conn, ctx, RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::Found);
+        assert_eq!(
+            record.segment.as_ref().unwrap().handle,
+            RECOVERY_TRUE_ID,
+            "recovery hydrates the intended segment"
+        );
+        assert_eq!(
+            record.recovered_from.as_deref(),
+            Some(RECOVERY_SUPPLIED),
+            "a recovered record discloses the supplied handle"
+        );
+        assert!(
+            record.message.is_some(),
+            "recovery is explained in the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovery_never_guesses_a_tie() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-recovery-tie";
+        let a = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "a".repeat(23));
+        let b = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "b".repeat(23));
+        segments::upsert_segment_for_context(&conn, ctx, &test_segment(&a, "src/a.rs"))
+            .await
+            .unwrap();
+        segments::upsert_segment_for_context(&conn, ctx, &test_segment(&b, "src/b.rs"))
+            .await
+            .unwrap();
+
+        let record = resolve_one(&conn, ctx, RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::Ambiguous);
+        assert!(
+            record.segment.is_none(),
+            "an ambiguous handle is never hydrated"
+        );
+        assert_eq!(record.matching_handles.len(), 2);
+        assert!(record.recovered_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovery_is_context_scoped() {
+        // The intended segment lives only in a foreign context, so the supplied
+        // handle must never recover in the active context (REQ-001 AC3).
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        segments::upsert_segment_for_context(
+            &conn,
+            "ctx-foreign",
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        let record = resolve_one(&conn, "ctx-active", RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::NotFound);
+        assert!(record.recovered_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_without_a_floor_prefix_candidate_stays_not_found() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-miss";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        // Shares no floor prefix with any indexed id.
+        let record = resolve_one(&conn, ctx, "ffffffffa316205a1afe69ccd1137e2").await;
+        assert_eq!(record.status, ReadStatus::NotFound);
+        assert!(record.recovered_from.is_none());
     }
 
     /// Per-item baseline (relocated from the pre-R-013 `resolve_handle_record`):

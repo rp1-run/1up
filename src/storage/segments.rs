@@ -564,6 +564,47 @@ pub async fn get_segment_by_prefix_for_context(
     }
 }
 
+/// Fetch up to `limit` candidate segment ids sharing `prefix` within one
+/// context, id-only, for the unique-prefix handle recovery gate (T1). The
+/// caller runs a pure recovery gate over the returned candidate set, so this
+/// query deliberately returns bare ids (never full segment bodies) ordered
+/// deterministically. An empty prefix returns no candidates rather than
+/// matching every row.
+pub async fn get_segment_ids_by_prefix_for_context(
+    conn: &Connection,
+    context_id: &str,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>, OneupError> {
+    if prefix.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_context_id(context_id)?;
+
+    let escaped_prefix = escape_like_prefix(prefix);
+    let mut rows = conn
+        .query(
+            queries::SELECT_SEGMENT_IDS_BY_PREFIX_FOR_CONTEXT,
+            libsql::params![context_id, escaped_prefix.as_str(), limit as i64],
+        )
+        .await
+        .map_err(|e| StorageError::Query(format!("query segment ids by prefix failed: {e}")))?;
+
+    let mut ids = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
+    {
+        let id: String = row
+            .get(0)
+            .map_err(|e| StorageError::Query(format!("decode segment id failed: {e}")))?;
+        ids.push(id);
+    }
+
+    Ok(ids)
+}
+
 /// Get the stored file hash for every indexed file path.
 #[allow(dead_code)]
 pub async fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>, OneupError> {
@@ -2927,6 +2968,48 @@ mod tests {
             SegmentPrefixLookup::Found(seg) => assert_eq!(seg.id, "a0f1e2c3d4b5f6a7"),
             other => panic!("expected Found for literal prefix, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ids_by_prefix_for_context_returns_bounded_ordered_candidates() {
+        let (_db, conn) = setup().await;
+
+        for id in ["0b25aaaa11112222", "0b25bbbb33334444", "0b25cccc55556666"] {
+            upsert_segment(&conn, &test_segment(id, "src/x.rs", "hx"))
+                .await
+                .unwrap();
+        }
+        // A distinct-prefix row must not surface for the "0b25" floor prefix.
+        upsert_segment(&conn, &test_segment("ffff000011112222", "src/y.rs", "hy"))
+            .await
+            .unwrap();
+
+        // All three "0b25"-prefixed ids come back, ordered ascending by id.
+        let ids =
+            get_segment_ids_by_prefix_for_context(&conn, DEFAULT_INDEX_CONTEXT_ID, "0b25", 32)
+                .await
+                .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "0b25aaaa11112222".to_string(),
+                "0b25bbbb33334444".to_string(),
+                "0b25cccc55556666".to_string(),
+            ]
+        );
+
+        // The row limit caps the candidate set (saturation signal for the caller).
+        let capped =
+            get_segment_ids_by_prefix_for_context(&conn, DEFAULT_INDEX_CONTEXT_ID, "0b25", 2)
+                .await
+                .unwrap();
+        assert_eq!(capped.len(), 2);
+
+        // An empty prefix never matches every row.
+        let empty = get_segment_ids_by_prefix_for_context(&conn, DEFAULT_INDEX_CONTEXT_ID, "", 32)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

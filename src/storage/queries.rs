@@ -951,6 +951,20 @@ WHERE context_id = ?1
 ORDER BY id
 LIMIT 5";
 
+/// Id-only candidate fetch for the unique-prefix handle recovery gate (T1):
+/// every segment id sharing a floor prefix within one context, ordered
+/// deterministically and bounded by a caller-supplied limit. Selecting only the
+/// id keeps the recovery candidate scan cheap; the caller re-fetches the full
+/// segment for the single recovered id via the exact-id path.
+/// Params: `?1` context id, `?2` escaped prefix, `?3` row limit.
+pub const SELECT_SEGMENT_IDS_BY_PREFIX_FOR_CONTEXT: &str = "
+SELECT id
+FROM segments
+WHERE context_id = ?1
+  AND id LIKE ?2 || '%' ESCAPE '\\'
+ORDER BY id
+LIMIT ?3";
+
 /// Build the exact-id batch-fetch statement for `id_count` segment ids within
 /// one context. Selects the same columns in the same order as
 /// [`SELECT_SEGMENT_BY_ID_FOR_CONTEXT`], so a batched fetch returns rows
