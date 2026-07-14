@@ -3479,6 +3479,26 @@ fn mcp_get_ignores_handles_from_other_context() {
         "foreign-context segment should not be hydrated: {envelope:?}"
     );
     assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
+
+    // REQ-001 AC3: a mistyped handle whose only unique-prefix match lives in a
+    // foreign context must never be recovered into the active context. The
+    // seeded id is "other-context-segment"; a one-character typo shares a long
+    // prefix but must still resolve to not_found with no recovery disclosure.
+    let recovery = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [":other-context-segmenX"] }),
+    );
+    assert_eq!(recovery["isError"], true);
+    let recovery_envelope = mcp_structured(&recovery);
+    assert_eq!(
+        recovery_envelope["data"]["records"][0]["status"],
+        "not_found"
+    );
+    assert!(
+        recovery_envelope["data"]["records"][0]["recovered_from"].is_null(),
+        "a foreign-context handle must never be recovered: {recovery_envelope:?}"
+    );
+    assert!(recovery_envelope["data"]["records"][0]["segment"].is_null());
 }
 
 #[test]
