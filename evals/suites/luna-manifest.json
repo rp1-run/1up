@@ -1,0 +1,51 @@
+{
+  "manifest_version": "1",
+  "contract_hash": "334b9795cbf7c5b278b9f4e817fbbb001032c4d75c81ede93a4207b22328cccd",
+  "contract": {
+    "fixture": {
+      "repo": "https://github.com/emdash-cms/emdash.git",
+      "commit": "5beb0dd"
+    },
+    "prompts": [
+      {
+        "path": "suites/1up-impact/prompt-1up-warm.txt",
+        "sha256": "c7f7a01c0d0b18c02228d6d30298b52a7520afcd680f38a4d21cb26485ef704e"
+      },
+      {
+        "path": "suites/1up-impact/prompt-baseline.txt",
+        "sha256": "b367190828b77151e7a0fdc8f541f3b81181e474da8d0b6a586a8e00312d1f7d"
+      },
+      {
+        "path": "suites/1up-search/prompt-1up-warm.txt",
+        "sha256": "adab764a0ee159bf08dc0d428127197977b8132d45cf3f440febd526d980c900"
+      },
+      {
+        "path": "suites/1up-search/prompt-baseline.txt",
+        "sha256": "7aa82653228a50302d3584e539659a740a661c09d0644626e90b26de9f6a7854"
+      }
+    ],
+    "suites": [
+      {
+        "path": "suites/1up-impact/evals-luna.yaml",
+        "sha256": "ac43a67b5c901c955098304392dd9fca612b3364bb8fe96100155f480ea7b223"
+      },
+      {
+        "path": "suites/1up-search/evals-luna.yaml",
+        "sha256": "5a38bd297c85d99af124b2128020f547ff383f8c5320d575bbd1e689f42ffd25"
+      }
+    ],
+    "grader": {
+      "provider": "openai:codex-sdk",
+      "model": "gpt-5.6-luna"
+    },
+    "axes": {
+      "graded": ["factual", "retrieval", "adoption", "reliability"],
+      "efficiency": ["latency_ms", "tokens", "cost_usd", "calls"]
+    },
+    "cost_transform": {
+      "speed_baseline_s": 200,
+      "cost_baseline_usd": 0.5
+    },
+    "trial_count": 1
+  }
+}
