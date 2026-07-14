@@ -143,6 +143,75 @@ pub const STALE_REBUILD_REASON: &str = "index is rebuilding; results may be stal
 /// Default context expansion window (lines) when tree-sitter is unavailable.
 pub const CONTEXT_FALLBACK_LINES: usize = 50;
 
+/// Maximum number of symbols emitted per list (`defined`/`referenced`/`called`)
+/// in a hydrated `oneup_get` record at `verbosity: "full"` (REQ-003).
+///
+/// Bounds the per-record symbol payload so a segment referencing hundreds of
+/// symbols cannot re-inflate the envelope the compaction is meant to shrink.
+/// When a list is clipped the record carries a `TruncationNote` with the
+/// omitted count and an `oneup_symbol` recovery call, so the full set stays
+/// reachable.
+///
+/// Consumed by the `src/mcp` record-construction and envelope layers (T3/T4);
+/// provisioned here per the shared-literals + pre-provisioned-API convention.
+#[allow(dead_code)]
+pub const MAX_SYMBOLS_PER_LIST: usize = 20;
+
+/// Hard ceiling (lines each side of the target) on `oneup_context` enclosing-scope
+/// expansion (REQ-003).
+///
+/// The window branch clamps `target_line ± expansion` to this bound per side so a
+/// single context request can never return an unbounded slice of a very large
+/// scope (the ~99 KB unbounded-scope response this feature retires). A recovery
+/// call whose far edge exceeds the ceiling re-issues at the original target line
+/// and the follow-up response carries its own truncation note, so content stays
+/// reachable in bounded iterations.
+///
+/// Consumed by `src/search/context.rs` windowing (T2) and `src/mcp` (T3).
+#[allow(dead_code)]
+pub const MAX_CONTEXT_EXPANSION_LINES: usize = 500;
+
+/// Maximum number of truncation-recovery actions prepended to a read envelope's
+/// `next_actions` (REQ-004).
+///
+/// Deduped per path and capped here so a multi-record response with many clipped
+/// scopes cannot turn `next_actions` into the new unbounded payload. Every
+/// truncated record independently carries its own structured
+/// `TruncationNote.recovery`, so recovery never depends on winning a next_action
+/// slot.
+///
+/// Consumed by `read_next_actions` in `src/mcp/tools.rs` (T4).
+#[allow(dead_code)]
+pub const MAX_RECOVERY_ACTIONS: usize = 3;
+
+/// Line span at or under which an `oneup_context` enclosing scope is returned
+/// whole with no truncation, regardless of the requested `expansion` (REQ-003).
+///
+/// Derived as `2 * CONTEXT_FALLBACK_LINES + 1` (101) — the default window's own
+/// line budget — so the whole-scope branch can never cost more than a default
+/// window while preserving legacy whole-scope fidelity for the common small-scope
+/// case (the HYP-002 mitigation). Only scopes larger than this are windowed.
+///
+/// Consumed by `src/search/context.rs` windowing (T2).
+#[allow(dead_code)]
+pub const MAX_WHOLE_SCOPE_LINES: usize = 2 * CONTEXT_FALLBACK_LINES + 1;
+
+/// Single-source reason string stamped on a `TruncationNote` when an
+/// `oneup_context` enclosing scope was windowed (larger than
+/// [`MAX_WHOLE_SCOPE_LINES`]). Keeps the model-facing summary marker and the
+/// structured note in sync from one definition (Output Contracts pattern).
+///
+/// Consumed by `src/mcp` record construction and summary rendering (T3/T4).
+#[allow(dead_code)]
+pub const SCOPE_TRUNCATION_REASON: &str = "enclosing scope windowed";
+
+/// Single-source reason string stamped on a `TruncationNote` when a hydrated
+/// record's symbol list was capped at [`MAX_SYMBOLS_PER_LIST`].
+///
+/// Consumed by `src/mcp` record construction and summary rendering (T3/T4).
+#[allow(dead_code)]
+pub const SYMBOL_LIST_TRUNCATION_REASON: &str = "symbol list capped";
+
 /// Sliding window size (lines) for text chunker.
 pub const CHUNK_WINDOW_SIZE: usize = 60;
 
