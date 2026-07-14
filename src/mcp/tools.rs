@@ -399,22 +399,28 @@ impl OneupMcpServer {
         let request = match impact_request(&input) {
             Ok(request) => request,
             Err(message) => {
-                return error_result(
-                    "error",
-                    message,
-                    vec![
-                        action(
-                            TOOL_SEARCH,
-                            "Search to obtain a precise result handle for impact exploration.",
-                            None,
-                        ),
-                        action(
-                            TOOL_SYMBOL,
-                            "Verify a known symbol before using it as an impact anchor.",
-                            None,
-                        ),
-                    ],
-                );
+                // Prepend a ready-to-issue corrected impact call when the caller
+                // supplied a usable anchor in the wrong shape, so a bad call is
+                // one retry away instead of a fresh search/symbol round trip.
+                let mut actions = Vec::new();
+                if let Some(corrected) = corrected_impact_call(&input) {
+                    actions.push(action(
+                        TOOL_IMPACT,
+                        "Retry impact with a single corrected anchor.",
+                        Some(corrected),
+                    ));
+                }
+                actions.push(action(
+                    TOOL_SEARCH,
+                    "Search to obtain a precise result handle for impact exploration.",
+                    None,
+                ));
+                actions.push(action(
+                    TOOL_SYMBOL,
+                    "Verify a known symbol before using it as an impact anchor.",
+                    None,
+                ));
+                return error_result("error", message, actions);
             }
         };
 
@@ -531,43 +537,56 @@ impl OneupMcpServer {
     }
 }
 
+/// Whether an impact anchor value looks like a repo-relative file path rather
+/// than a symbol name: it carries a path separator and does not end with one
+/// (a trailing separator is a directory, not a file). Symbol names never
+/// contain a path separator, so this promotes a file path an agent mistakenly
+/// supplied in the `symbol` slot to a File anchor without misreading a dotted
+/// symbol name.
+fn looks_like_file_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains('/') && !trimmed.ends_with('/')
+}
+
 fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
-    let anchors = [
-        input
-            .handle
-            .as_ref()
-            .filter(|value| !value.trim().is_empty()),
-        input
-            .symbol
-            .as_ref()
-            .filter(|value| !value.trim().is_empty()),
-        input.file.as_ref().filter(|value| !value.trim().is_empty()),
-    ];
-    let count = anchors.iter().filter(|anchor| anchor.is_some()).count();
+    let handle = input
+        .handle
+        .as_ref()
+        .filter(|value| !value.trim().is_empty());
+    let symbol = input
+        .symbol
+        .as_ref()
+        .filter(|value| !value.trim().is_empty());
+    let file = input.file.as_ref().filter(|value| !value.trim().is_empty());
+
+    let count = [handle.is_some(), symbol.is_some(), file.is_some()]
+        .iter()
+        .filter(|present| **present)
+        .count();
     if count != 1 {
         return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
     }
-    if input.line.is_some()
-        && input
-            .file
-            .as_ref()
-            .is_none_or(|file| file.trim().is_empty())
-    {
+
+    // A file path supplied in the `symbol` slot is promoted to a File anchor,
+    // so `line` pins it just like an explicit `file` anchor.
+    let symbol_as_file = symbol.filter(|value| looks_like_file_path(value));
+    let file_anchor = file.or(symbol_as_file);
+    if input.line.is_some() && file_anchor.is_none() {
         return Err("line can only be used with a file impact anchor".to_string());
     }
 
-    let anchor = if let Some(handle) = input.handle.as_ref() {
+    let anchor = if let Some(handle) = handle {
         ImpactAnchor::Segment {
             id: normalize_handle(handle),
         }
-    } else if let Some(symbol) = input.symbol.as_ref() {
-        ImpactAnchor::Symbol {
-            name: symbol.clone(),
+    } else if let Some(path) = file_anchor {
+        ImpactAnchor::File {
+            path: path.clone(),
+            line: input.line,
         }
     } else {
-        ImpactAnchor::File {
-            path: input.file.clone().unwrap_or_default(),
-            line: input.line,
+        ImpactAnchor::Symbol {
+            name: symbol.cloned().unwrap_or_default(),
         }
     };
 
@@ -577,6 +596,41 @@ fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
         depth: input.depth.unwrap_or_default(),
         limit: input.limit.unwrap_or_default(),
     })
+}
+
+/// Best-effort corrected single-anchor `oneup_impact` call for an
+/// anchor-validation error: it keeps the most precise anchor the caller already
+/// supplied (handle, then a file / file-looking symbol, then a plain symbol) so
+/// a malformed call is one ready-to-issue retry away rather than a fresh
+/// discovery round trip. Returns `None` when no usable anchor was supplied.
+fn corrected_impact_call(input: &ImpactInput) -> Option<Value> {
+    let trimmed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let handle = trimmed(&input.handle);
+    let symbol = trimmed(&input.symbol);
+    let file = trimmed(&input.file);
+
+    if let Some(handle) = handle {
+        return Some(json!({ "handle": format!(":{}", normalize_handle(&handle)) }));
+    }
+
+    // A file path (explicit, or one supplied in the symbol slot) keeps its line.
+    let file_path = file.or_else(|| symbol.clone().filter(|value| looks_like_file_path(value)));
+    if let Some(path) = file_path {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("file".to_string(), Value::from(path));
+        if let Some(line) = input.line {
+            arguments.insert("line".to_string(), Value::from(line));
+        }
+        return Some(Value::Object(arguments));
+    }
+
+    symbol.map(|symbol| json!({ "symbol": symbol }))
 }
 
 fn symbol_include(include: SymbolIncludeInput) -> SymbolInclude {
@@ -1716,6 +1770,90 @@ mod tests {
         let message = impact_request(&input).unwrap_err();
 
         assert_eq!(message, "line can only be used with a file impact anchor");
+    }
+
+    #[test]
+    fn impact_request_promotes_file_looking_symbol_to_file_anchor() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "src/mcp/tools.rs".to_string(),
+                line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_promoted_symbol_file_anchor_accepts_line() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+        input.line = Some(42);
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "src/mcp/tools.rs".to_string(),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_keeps_plain_symbol_anchor() {
+        let mut input = impact_input();
+        input.symbol = Some("PolicyRuleValidator".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::Symbol {
+                name: "PolicyRuleValidator".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_prefers_handle_over_other_anchors() {
+        // Two anchors fail validation; the corrected retry keeps the most
+        // precise one (the handle) as a single ready-to-issue call.
+        let mut input = impact_input();
+        input.handle = Some("abcdef012345".to_string());
+        input.symbol = Some("PolicyRuleValidator".to_string());
+
+        assert!(impact_request(&input).is_err());
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({ "handle": ":abcdef012345" }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_promotes_file_looking_symbol_with_line() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+        input.file = Some("src/other.rs".to_string());
+        input.line = Some(7);
+
+        // Two file-ish anchors fail validation; the explicit file wins and
+        // keeps the line.
+        assert!(impact_request(&input).is_err());
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({ "file": "src/other.rs", "line": 7 }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_is_none_without_any_anchor() {
+        assert_eq!(corrected_impact_call(&impact_input()), None);
     }
 
     #[test]
