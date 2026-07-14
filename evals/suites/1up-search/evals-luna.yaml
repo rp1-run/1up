@@ -27,6 +27,7 @@ providers:
         PATH: "{{_PATH}}"
         NODE_EXTRA_CA_CERTS: "{{_NODE_EXTRA_CA_CERTS}}"
       cli_config:
+        suppress_unstable_features_warning: true
         features:
           apps: false
           non_prefixed_mcp_tool_names: true
