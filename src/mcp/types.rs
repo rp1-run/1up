@@ -93,7 +93,7 @@ pub struct GetInput {
     pub path: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Optional verbosity level: \"default\" omits symbol lists and redundant summaries; \"full\" includes detailed symbol metadata. Defaults to \"default\"."
+        description = "Optional. Reading code needs no verbosity argument: the default returns the complete source segment with constant-size symbol counts. Higher-detail symbol-metadata levels are accepted for backward compatibility but are not required."
     )]
     pub verbosity: Option<String>,
 }

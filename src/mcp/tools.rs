@@ -234,7 +234,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_get",
-        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Use before answering, citing, or editing discovered code. The full source is returned once in structured data, not mirrored in the text summary. At verbosity \"full\" symbol lists are capped; when a list is clipped the record carries a truncation note whose ready-to-issue oneup_symbol recovery call fetches the rest, prepended first in next_actions to follow before answering.",
+        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Use before answering, citing, or editing discovered code. Reading code needs no verbosity argument: the default returns the complete source once in structured data, not mirrored in the text summary, alongside constant-size symbol counts and a ready-to-issue oneup_symbol call when you need the full symbol lists.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Get Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]

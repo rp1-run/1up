@@ -3994,6 +3994,81 @@ fn mcp_search_summary_is_content_free_and_within_byte_budget() {
     }
 }
 
+/// `oneup_get` no longer advertises the `full` verbosity level (the default is
+/// presented as the way to read complete code), but the level is still ACCEPTED
+/// and HONORED for backward compatibility: a `full` request materializes the
+/// symbol lists the default omits.
+#[test]
+fn mcp_get_still_honors_full_verbosity() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    let handles: Vec<String> = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| format!(":{}", hit["handle"].as_str().unwrap()))
+        .collect();
+    assert!(
+        !handles.is_empty(),
+        "search should return hydratable handles"
+    );
+
+    // Default verbosity omits the symbol lists, surfacing constant-size counts.
+    let default_get = client.call_tool(TOOL_GET, serde_json::json!({ "handles": handles.clone() }));
+    assert_ne!(default_get["isError"], true);
+    let default_records = mcp_structured(&default_get)["data"]["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let has_symbol_bearing_segment = default_records.iter().any(|record| {
+        record["segment"]["symbol_counts"]["defined"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    });
+
+    // `full` is still accepted even though it is no longer advertised.
+    let full_get = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": handles, "verbosity": "full" }),
+    );
+    assert_ne!(
+        full_get["isError"], true,
+        "verbosity full must still be accepted: {full_get:?}"
+    );
+    let full_records = mcp_structured(&full_get)["data"]["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    if has_symbol_bearing_segment {
+        // Full verbosity materializes the symbol lists the default omits and
+        // drops the constant-size counts in their favor.
+        assert!(
+            full_records
+                .iter()
+                .any(|record| record["segment"]["defined_symbols"]
+                    .as_array()
+                    .map(|list| !list.is_empty())
+                    .unwrap_or(false)),
+            "full verbosity must materialize the symbol lists default omits: {full_records:?}"
+        );
+        assert!(
+            full_records
+                .iter()
+                .all(|record| record["segment"]["symbol_counts"].is_null()),
+            "full verbosity replaces the constant-size counts with the real lists: {full_records:?}"
+        );
+    }
+}
+
 /// REQ-001 (exactly-once serialization): the authoritative source of a
 /// hydrated segment lives only in `structuredContent.data.records[].segment.content`;
 /// it is never mirrored into the text summary. Serializing the whole
