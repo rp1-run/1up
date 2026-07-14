@@ -579,6 +579,16 @@ fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeCont
         return;
     }
 
+    // An exact detached commit that matches the indexed state is pinned, not
+    // ambiguous, so it must not be downgraded. This aligns the readiness path
+    // with the search path, which already treats `Detached` as non-degraded
+    // (`SearchScope::degraded_reason`, src/search/scope.rs). Exempt it only when
+    // HEAD is proven un-drifted (`Some(false)`); `Some(true)` (drifted) and
+    // `None` (unprovable) keep the degraded caveat. (REQ-005)
+    if context.branch_status == BranchStatus::Detached && payload.drifted == Some(false) {
+        return;
+    }
+
     let branch_reason = context.branch_status.branch_scope_caveat();
 
     if payload.status == ReadinessStatus::Ready {
@@ -1510,6 +1520,77 @@ mod tests {
             panic!("expected arguments to be Some");
         }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    fn detached_context(branch_status: BranchStatus) -> WorktreeContext {
+        use std::path::PathBuf;
+        WorktreeContext {
+            context_id: "ctx".to_string(),
+            state_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: crate::shared::types::WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status,
+        }
+    }
+
+    fn ready_payload(drifted: Option<bool>) -> ReadinessPayload {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Ready;
+        payload.summary = "The index is ready.".to_string();
+        payload.reason = None;
+        payload.drifted = drifted;
+        payload
+    }
+
+    #[test]
+    fn apply_branch_readiness_pins_exact_detached_commit() {
+        let mut named = ready_payload(Some(false));
+        apply_branch_readiness(&mut named, &detached_context(BranchStatus::Named));
+        assert_eq!(named.status, ReadinessStatus::Ready);
+        assert!(named.reason.is_none());
+
+        let mut pinned = ready_payload(Some(false));
+        apply_branch_readiness(&mut pinned, &detached_context(BranchStatus::Detached));
+        assert_eq!(pinned.status, ReadinessStatus::Ready);
+        assert!(
+            pinned.reason.is_none(),
+            "pinned detached commit must not carry a branch-ambiguity reason"
+        );
+    }
+
+    #[test]
+    fn apply_branch_readiness_degrades_unprovable_or_ambiguous_branches() {
+        let detached_caveat = BranchStatus::Detached.branch_scope_caveat();
+        for drifted in [Some(true), None] {
+            let mut payload = ready_payload(drifted);
+            apply_branch_readiness(&mut payload, &detached_context(BranchStatus::Detached));
+            assert_eq!(
+                payload.status,
+                ReadinessStatus::Degraded,
+                "detached with drifted={drifted:?} must degrade"
+            );
+            assert_eq!(payload.reason.as_deref(), Some(detached_caveat.as_str()));
+        }
+
+        for status in [BranchStatus::Unreadable, BranchStatus::Unknown] {
+            let mut payload = ready_payload(Some(false));
+            apply_branch_readiness(&mut payload, &detached_context(status));
+            assert_eq!(
+                payload.status,
+                ReadinessStatus::Degraded,
+                "{status:?} must degrade even when un-drifted"
+            );
+            assert_eq!(
+                payload.reason.as_deref(),
+                Some(status.branch_scope_caveat().as_str())
+            );
+        }
     }
 
     #[test]
