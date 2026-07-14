@@ -4145,7 +4145,39 @@ fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
     );
     assert_eq!(records[1]["status"], "not_found");
     assert_eq!(records[1]["source"]["normalized"], "does-not-exist");
-    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
+
+    // REQ-002: the ambiguous record's disambiguation next-action prefills
+    // oneup_get with the real candidate ids (never placeholders) ahead of the
+    // generic search fallback, so an agent can pick one unambiguous handle.
+    let next_actions = envelope["next_actions"].as_array().unwrap();
+    assert_eq!(next_actions[0]["tool"], TOOL_GET);
+    let prefilled = next_actions[0]["arguments"]["handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let candidates = records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prefilled, candidates,
+        "disambiguation action must prefill the exact ambiguous candidates"
+    );
+    assert!(
+        prefilled.iter().all(|handle| !handle.is_empty()),
+        "disambiguation handles must be real values, never placeholders: {prefilled:?}"
+    );
+    assert!(
+        next_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_SEARCH),
+        "the generic search fallback must remain available: {next_actions:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
 }
 
 #[test]
