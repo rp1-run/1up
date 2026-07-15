@@ -35,7 +35,7 @@ The Luna path is separate from the Claude path. It uses
 existing Claude configs and `npm run eval` / `npm run eval:impact` commands
 remain unchanged.
 
-Run Luna only from an authenticated secure shell. The Codex SDK can reuse an
+Run Luna only from an interactive shell where `codex login status` succeeds. The Codex SDK can reuse an
 existing ChatGPT login when `OPENAI_API_KEY` and `CODEX_API_KEY` are unset;
 verify that state with `codex login status`. Keep the installed `1up` binary
 first on `PATH`, because both fixture setup and the MCP server resolve the
@@ -44,7 +44,7 @@ literal `1up` command.
 ```sh
 cd /path/to/1up/evals
 bun install --frozen-lockfile
-test "$(1up --version | awk '{print $3}')" = "0.1.15"
+1up --version   # confirm this matches the build under test
 codex login status
 
 # Credentialed/model execution: run manually, never as an agent validation.
@@ -65,7 +65,7 @@ separately disables cached response reuse and does not provide this state
 isolation. Every Codex target also gets an isolated `HOME` and `CODEX_HOME`
 containing only a copied `auth.json`; host Codex config and MCP servers are not
 inherited. `PATH` and `NODE_EXTRA_CA_CERTS` are forwarded explicitly so the
-installed `1up` binary and corporate trust root remain available. Because the
+installed `1up` binary and custom CA trust root remain available. Because the
 1up target enables the `non_prefixed_mcp_tool_names` unstable feature (so agents
 call the canonical `oneup_*` tool names), its `cli_config` also sets
 `suppress_unstable_features_warning: true`; without it, Codex prints an
@@ -111,15 +111,16 @@ Neither this regression nor configuration validation replaces the manual-only
 credentialed/model runs above. Do not run Claude, Luna, MCP-adoption, or recall
 evals as automated agent validation.
 
-### P4 acceptance: bounded batch hydration warm-suite verification
+### Warm-suite acceptance measurement procedure
 
-Closing the bounded 2-4 handle batch-hydration initiative (phase P4) requires a
-manual, credentialed warm-suite run compared against the P1-recorded 1up warm
-Luna baseline. This is a development-gate measurement performed by the
-initiative owner, not an automated CI gate and not a statistical release claim.
+Use this manual, credentialed warm-suite run to confirm the 1up warm Luna
+figures still clear the acceptance bounds relative to the recorded
+pre-optimization baseline in `suites/luna-baseline.json`. It is a
+development-gate measurement, not an automated CI gate and not a statistical
+release claim.
 
-Run it from the same authenticated secure shell used for the Luna manual run
-above, inside `evals/`:
+Run it from the same interactive shell where `codex login status` succeeds —
+the one used for the Luna manual run above — inside `evals/`:
 
 ```sh
 cd /path/to/1up/evals
@@ -128,14 +129,14 @@ npm run eval:summary:luna
 ```
 
 Record the following five axes from the summary and compare them against the
-P1-recorded 1up warm Luna baseline (reference: **5.09M input tokens**):
+recorded pre-optimization 1up warm Luna baseline in `suites/luna-baseline.json`:
 
 | Axis | Target |
 |------|--------|
 | Average MCP calls per case | at or below **12** |
-| Aggregate input tokens | at least **40% better** than the P1 baseline |
-| Aggregate latency | at least **40% better** than the P1 baseline |
-| Aggregate dollar cost | at least **40% better** than the P1 baseline |
+| Aggregate input tokens | at least **40% better** than the recorded baseline |
+| Aggregate latency | at least **40% better** than the recorded baseline |
+| Aggregate dollar cost | at least **40% better** than the recorded baseline |
 | Factual accuracy + expected-file scores | **non-inferior** to the baseline |
 
 Input tokens, latency, and dollar cost must each clear the 40% bound
@@ -145,14 +146,13 @@ result is actionable.
 
 Evidence is recorded locally under `evals/results/` (gitignored). It is **never
 committed** and is **not a CI gate** — running this credentialed acceptance
-check is a manual Definition-of-Done step for the initiative owner and is out of
-agent scope.
+check is a manual step and is out of agent scope.
 
 ## Recall gate
 
-The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from P5 MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.
+The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.
 
-**MODEL-ENABLED — never run in-agent.** `just eval-recall`, `just eval-recall-ab`, and `just eval-recall-baseline` reindex with the embedding model enabled and hang inside agent sessions. Run them only as a manual pre-merge DoD step or on the scheduled `.github/workflows/embedding-quality.yml` workflow.
+**MODEL-ENABLED — never run in-agent.** `just eval-recall`, `just eval-recall-ab`, and `just eval-recall-baseline` reindex with the embedding model enabled and hang inside agent sessions. Run them only as a manual pre-merge step or on the scheduled `.github/workflows/embedding-quality.yml` workflow.
 
 **Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts) (impure driver)
 **Gate logic**: [`suites/1up-search/recall-compare.ts`](suites/1up-search/recall-compare.ts) (pure, unit-tested with `bun test`, no model or index)
@@ -214,7 +214,7 @@ All recall recipes reindex with `--exclude-glob 'evals/suites/1up-search/recall-
 just eval-recall-ab
 ```
 
-Confirms INT8-vs-FP32 recall parity within tolerance — the required pre-merge DoD for a variant/model change (REQ-004). It runs `1up stop` then reindexes and scores the `fp32` leg (captured to a temporary baseline), then `1up stop` + reindexes + scores the `int8` leg gated against that temp baseline within `ONEUP_RECALL_TOLERANCE`, exiting non-zero beyond it. `1up stop` per leg prevents a live daemon holding the other variant from serving query embeddings for the wrong leg; the pinned `recall-baseline.json` is never touched. Record the resulting numbers in the baseline-update commit.
+Confirms INT8-vs-FP32 recall parity within tolerance — the required pre-merge check for a variant/model change. It runs `1up stop` then reindexes and scores the `fp32` leg (captured to a temporary baseline), then `1up stop` + reindexes + scores the `int8` leg gated against that temp baseline within `ONEUP_RECALL_TOLERANCE`, exiting non-zero beyond it. `1up stop` per leg prevents a live daemon holding the other variant from serving query embeddings for the wrong leg; the pinned `recall-baseline.json` is never touched. Record the resulting numbers in the baseline-update commit.
 
 ### Baseline-update policy
 
@@ -238,11 +238,11 @@ The baseline changes **only** via the sanctioned capture recipe:
 just eval-recall-baseline
 ```
 
-This reindexes and writes a fresh structured baseline (with metadata) from the current run. **Never** regenerate the baseline to make the gate pass — that defeats the gate. Move it only for a legitimate reason (an intended recall improvement you are locking in, a corpus expansion, or a repo-layout change that makes anchors stale), and record the new recall numbers and the rationale in the baseline-update commit message (and, when relevant, in the KB `Recent Learnings` entry). A structurally invalid or absent baseline (e.g. the legacy schema-v11 prose form) is treated as missing, so the gate errors with a clear "capture a baseline" message rather than passing.
+This reindexes and writes a fresh structured baseline (with metadata) from the current run. **Never** regenerate the baseline to make the gate pass — that defeats the gate. Move it only for a legitimate reason (an intended recall improvement you are locking in, a corpus expansion, or a repo-layout change that makes anchors stale), and record the new recall numbers and the rationale in the baseline-update commit message (and, when relevant, in engineering notes). A structurally invalid or absent baseline (e.g. the legacy schema-v11 prose form) is treated as missing, so the gate errors with a clear "capture a baseline" message rather than passing.
 
-Recall is not P5 MCP release evidence; P5 readiness uses the MCP adoption suites above. The gate is most relevant when a change intentionally touches vector storage, the ANN index, the embedder, the tokenizer window, or retrieval ranking.
+Recall is not MCP release-readiness evidence; that readiness uses the MCP adoption suites above. The gate is most relevant when a change intentionally touches vector storage, the ANN index, the embedder, the tokenizer window, or retrieval ranking.
 
 ## Related scripts
 
-- `scripts/benchmark_vector_index_size.sh` - REQ-001/REQ-003/REQ-005 gate. Fresh-reindexes the 1up repo and reports `db_size_bytes`, `indexing_ms`, and `schema_version`; pinned baseline at `scripts/baselines/vector_index_size_baseline.json`. Invoked via `just bench-vector-index-size`.
-- `evals/suites/1up-search/search-bench.ts` - latency-oriented search harness; not part of P5 MCP eval readiness evidence.
+- `scripts/benchmark_vector_index_size.sh` - Fresh-reindexes the 1up repo and reports `db_size_bytes`, `indexing_ms`, and `schema_version`; pinned baseline at `scripts/baselines/vector_index_size_baseline.json`. Invoked via `just bench-vector-index-size`.
+- `evals/suites/1up-search/search-bench.ts` - latency-oriented search harness; not part of MCP release-readiness evidence.

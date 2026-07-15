@@ -40,8 +40,8 @@ drift from renames/schema evolution/symbol relocation, corrected to the current 
 
 ## Schema-19 recapture (MANUAL, credentialed — never in-agent)
 
-The pinned `recall-baseline.json` and `recall-results.json` remain on **schema 18** with
-the pre-audit corpus sha (`46800759…`). They are intentionally left stale in-agent: the
+The pinned `recall-baseline.json` remains on **schema 18** with
+the pre-audit corpus sha (`46800759…`). It is intentionally left stale in-agent: the
 model-credentialed recapture is a Definition-of-Done step and must not run inside the
 build agent. After this audit lands, the nightly `embedding-quality` recall gate
 (`just eval-recall`) will fail-closed with a baseline/candidate config mismatch (schema
@@ -55,10 +55,11 @@ To recapture on schema 19 (operator, on a model-enabled machine):
    `{size: 15, sha256: ae668c77…}`.
 2. Recapture the fp32 A/B comparison leg (`ONEUP_MODEL_VARIANT=fp32`, compared with
    `allowModelIdMismatch`) so both legs sit on schema 19 against the audited corpus.
-3. Commit the regenerated `recall-baseline.json` and `recall-results.json`.
+3. Commit the regenerated `recall-baseline.json`. (`recall-results.json` is a
+   gitignored per-run artifact and is not committed.)
 
 `recall-compare.ts` is schema-agnostic (it compares baseline and candidate schema
 versions by equality, not against a hardcoded epoch), so no code change is required for
 schema 19 — parity is enforced generically and the drift guard in
-`recall-compare.test.ts` confirms the committed baseline and results stay on a single
+`recall-compare.test.ts` confirms the baseline and results stay on a single
 schema with a shared corpus identity.
