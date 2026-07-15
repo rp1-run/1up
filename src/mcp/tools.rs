@@ -22,7 +22,8 @@ use crate::mcp::types::{
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
 use crate::shared::constants::{
-    HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_RESULTS,
+    HYDRATION_BATCH_MAX_HANDLES, MAX_RECOVERY_ACTIONS, MAX_SEARCH_QUERIES, MAX_SEARCH_RESULTS,
+    SUMMARY_MAX_BYTES,
 };
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, StructuralResult,
@@ -30,7 +31,6 @@ use crate::shared::types::{
 };
 
 const DEFAULT_SEARCH_LIMIT: usize = 5;
-const MCP_HANDLE_DISPLAY_LEN: usize = 12;
 const MCP_FIELD_SEP: &str = "  ";
 const MCP_PLACEHOLDER: &str = "-";
 
@@ -165,7 +165,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_search",
-        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads, then hydrate a small selected batch of handles in one oneup_get call, inspect file-line context, or verify symbols from the returned actions.",
+        description = "Search source code by meaning as the primary discovery path for code questions. Call before raw grep, rg, find, or broad file reads, then hydrate a small selected batch of handles in one oneup_get call, inspect file-line context, or verify symbols from the returned actions. For a multi-part question, pass every distinct aspect in one call via the queries array instead of issuing separate searches; 1up fuses the per-aspect results into one ranked list.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Search Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -191,17 +191,37 @@ impl OneupMcpServer {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_RESULTS);
 
+        // Effective query set for a (possibly multi-part) search: the primary
+        // `query` first, then each distinct non-empty extra aspect, deduped and
+        // capped at MAX_SEARCH_QUERIES.
+        let mut queries = vec![input.query.clone()];
+        if let Some(extra) = input.queries.as_ref() {
+            for candidate in extra {
+                let trimmed = candidate.trim();
+                if trimmed.is_empty() || queries.iter().any(|existing| existing == trimmed) {
+                    continue;
+                }
+                queries.push(trimmed.to_string());
+                if queries.len() >= MAX_SEARCH_QUERIES {
+                    break;
+                }
+            }
+        }
+
+        // A whole-repo sentinel in `path_prefix` means "no cone", so it is
+        // normalized away rather than validated as a literal subtree prefix.
+        let path_prefix = normalize_repo_scope(input.path_prefix.as_deref());
         match ops::run_search(
             &roots.state_root,
             &roots.worktree_context,
-            &input.query,
+            &queries,
             limit,
-            input.path_prefix.as_deref(),
+            path_prefix.as_deref(),
         )
         .await
         {
             Ok(payload) => {
-                let summary = search_summary(&payload, &input.query);
+                let summary = search_summary(&payload);
                 let next_actions = search_next_actions(&payload);
                 result(envelope(
                     status_string(&payload.status),
@@ -216,7 +236,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_get",
-        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Use before answering, citing, or editing discovered code. The full source is returned once in structured data, not mirrored in the text summary. At verbosity \"full\" symbol lists are capped; when a list is clipped the record carries a truncation note whose ready-to-issue oneup_symbol recovery call fetches the rest, prepended first in next_actions to follow before answering.",
+        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Use before answering, citing, or editing discovered code. Reading code needs no verbosity argument: the default returns the complete source once in structured data, not mirrored in the text summary, alongside constant-size symbol counts and a ready-to-issue oneup_symbol call when you need the full symbol lists.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Get Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -381,26 +401,39 @@ impl OneupMcpServer {
         let request = match impact_request(&input) {
             Ok(request) => request,
             Err(message) => {
-                return error_result(
-                    "error",
-                    message,
-                    vec![
-                        action(
-                            TOOL_SEARCH,
-                            "Search to obtain a precise result handle for impact exploration.",
-                            None,
-                        ),
-                        action(
-                            TOOL_SYMBOL,
-                            "Verify a known symbol before using it as an impact anchor.",
-                            None,
-                        ),
-                    ],
-                );
+                // Prepend a ready-to-issue corrected impact call when the caller
+                // supplied a usable anchor in the wrong shape, so a bad call is
+                // one retry away instead of a fresh search/symbol round trip.
+                let mut actions = Vec::new();
+                if let Some(corrected) = corrected_impact_call(&input) {
+                    actions.push(action(
+                        TOOL_IMPACT,
+                        "Retry impact with a single corrected anchor.",
+                        Some(corrected),
+                    ));
+                }
+                actions.push(action(
+                    TOOL_SEARCH,
+                    "Search to obtain a precise result handle for impact exploration.",
+                    None,
+                ));
+                actions.push(action(
+                    TOOL_SYMBOL,
+                    "Verify a known symbol before using it as an impact anchor.",
+                    None,
+                ));
+                return error_result("error", message, actions);
             }
         };
 
-        let roots = match self.roots(input.path.as_deref()) {
+        // When `path` was consumed as a relative file anchor, it does not name
+        // the project root, so resolve roots from the ambient project instead.
+        let root_selector = if impact_path_as_file_anchor(&input).is_some() {
+            None
+        } else {
+            input.path.as_deref()
+        };
+        let roots = match self.roots(root_selector) {
             Ok(roots) => roots,
             Err(err) => return error_result("error", err.to_string(), vec![]),
         };
@@ -408,7 +441,29 @@ impl OneupMcpServer {
         match ops::explore_impact(&roots.state_root, &roots.worktree_context, request).await {
             Ok(payload) => {
                 let summary = impact_summary(&payload);
-                let next_actions = impact_next_actions(&payload);
+                let mut next_actions = impact_next_actions(&payload);
+                // A remaining scope-exclusion refusal means a real requested
+                // cone blocked the anchor: either it resolved outside the scope
+                // (file/handle) or a scoped symbol lookup found nothing inside
+                // the cone. Prepend the same anchor with no scope as a
+                // ready-to-issue retry that searches the whole repo.
+                let scope_requested = normalize_repo_scope(input.scope.as_deref()).is_some();
+                let scope_excluded_anchor = payload.refusal.as_ref().is_some_and(|refusal| {
+                    refusal.reason == "anchor_out_of_scope"
+                        || (scope_requested && refusal.reason == "anchor_not_found")
+                });
+                if scope_excluded_anchor {
+                    if let Some(anchor) = corrected_impact_call(&input) {
+                        next_actions.insert(
+                            0,
+                            action(
+                                TOOL_IMPACT,
+                                "Retry impact without a scope to search the whole repository.",
+                                Some(anchor),
+                            ),
+                        );
+                    }
+                }
                 call_result(
                     envelope(
                         status_string(&payload.status),
@@ -513,52 +568,167 @@ impl OneupMcpServer {
     }
 }
 
+/// Whether an impact anchor value looks like a repo-relative file path rather
+/// than a symbol name: it carries a path separator and does not end with one
+/// (a trailing separator is a directory, not a file). Symbol names never
+/// contain a path separator, so this promotes a file path an agent mistakenly
+/// supplied in the `symbol` slot to a File anchor without misreading a dotted
+/// symbol name.
+fn looks_like_file_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains('/') && !trimmed.ends_with('/')
+}
+
+/// Whole-repo scope sentinels an agent may pass to mean "no cone" (case-
+/// insensitive, trimmed). The empty string is handled separately by the trim.
+const WHOLE_REPO_SCOPE_SENTINELS: [&str; 5] = ["all", ".", "/", "*", "**"];
+
+/// Normalizes a scope / path-prefix argument before it is validated as a real
+/// directory cone: a blank value or a whole-repo sentinel becomes `None` (no
+/// cone), so a whole-repo request is never misread as a literal path prefix.
+/// Any other value is trimmed and preserved.
+fn normalize_repo_scope(value: Option<&str>) -> Option<String> {
+    let trimmed = value.map(str::trim).filter(|value| !value.is_empty())?;
+    if WHOLE_REPO_SCOPE_SENTINELS
+        .iter()
+        .any(|sentinel| trimmed.eq_ignore_ascii_case(sentinel))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Whether a value looks like a repo-relative file path suitable for promotion
+/// to a File impact anchor from the project-root `path` slot: it is relative
+/// (no leading `/`), carries a path separator, and does not end with one.
+/// Absolute paths retain their project-root selector meaning and are never
+/// promoted.
+fn looks_like_relative_file_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.starts_with('/') && looks_like_file_path(trimmed)
+}
+
+/// The repo-relative file path an impact call supplied in the project-root
+/// `path` slot as its only anchor, or `None` when `path` is absent, absolute,
+/// not file-looking, or another anchor (handle/symbol/file) is present. When
+/// this returns `Some`, `path` names a file anchor rather than the project
+/// root, so the handler must resolve roots without it.
+fn impact_path_as_file_anchor(input: &ImpactInput) -> Option<String> {
+    let has_other_anchor = [&input.handle, &input.symbol, &input.file]
+        .into_iter()
+        .any(|value| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    if has_other_anchor {
+        return None;
+    }
+    input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| looks_like_relative_file_path(value))
+        .map(str::to_string)
+}
+
 fn impact_request(input: &ImpactInput) -> Result<ImpactRequest, String> {
-    let anchors = [
-        input
-            .handle
-            .as_ref()
-            .filter(|value| !value.trim().is_empty()),
-        input
-            .symbol
-            .as_ref()
-            .filter(|value| !value.trim().is_empty()),
-        input.file.as_ref().filter(|value| !value.trim().is_empty()),
-    ];
-    let count = anchors.iter().filter(|anchor| anchor.is_some()).count();
-    if count != 1 {
+    let handle = input
+        .handle
+        .as_ref()
+        .filter(|value| !value.trim().is_empty());
+    let symbol = input
+        .symbol
+        .as_ref()
+        .filter(|value| !value.trim().is_empty());
+    let file = input.file.as_ref().filter(|value| !value.trim().is_empty());
+
+    let count = [handle.is_some(), symbol.is_some(), file.is_some()]
+        .iter()
+        .filter(|present| **present)
+        .count();
+    if count > 1 {
         return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
     }
-    if input.line.is_some()
-        && input
-            .file
-            .as_ref()
-            .is_none_or(|file| file.trim().is_empty())
-    {
+
+    // A repo-relative file path supplied in the project-root `path` slot with no
+    // other anchor is promoted to a File anchor. Absolute paths keep their
+    // project-root meaning.
+    let path_as_file = impact_path_as_file_anchor(input);
+    if count == 0 && path_as_file.is_none() {
+        return Err("provide exactly one impact anchor: handle, symbol, or file".to_string());
+    }
+
+    // A file path supplied in the `symbol` slot is likewise promoted, so `line`
+    // pins it just like an explicit `file` anchor.
+    let symbol_as_file = symbol.filter(|value| looks_like_file_path(value));
+    let file_anchor: Option<String> = file
+        .cloned()
+        .or_else(|| symbol_as_file.cloned())
+        .or(path_as_file);
+    if input.line.is_some() && file_anchor.is_none() {
         return Err("line can only be used with a file impact anchor".to_string());
     }
 
-    let anchor = if let Some(handle) = input.handle.as_ref() {
+    let anchor = if let Some(handle) = handle {
         ImpactAnchor::Segment {
             id: normalize_handle(handle),
         }
-    } else if let Some(symbol) = input.symbol.as_ref() {
-        ImpactAnchor::Symbol {
-            name: symbol.clone(),
+    } else if let Some(path) = file_anchor {
+        ImpactAnchor::File {
+            path,
+            line: input.line,
         }
     } else {
-        ImpactAnchor::File {
-            path: input.file.clone().unwrap_or_default(),
-            line: input.line,
+        ImpactAnchor::Symbol {
+            name: symbol.cloned().unwrap_or_default(),
         }
     };
 
     Ok(ImpactRequest {
         anchor,
-        scope: input.scope.clone(),
+        scope: normalize_repo_scope(input.scope.as_deref()),
         depth: input.depth.unwrap_or_default(),
         limit: input.limit.unwrap_or_default(),
     })
+}
+
+/// Best-effort corrected single-anchor `oneup_impact` call for an
+/// anchor-validation error: it keeps the most precise anchor the caller already
+/// supplied (handle, then a file / file-looking symbol, then a plain symbol) so
+/// a malformed call is one ready-to-issue retry away rather than a fresh
+/// discovery round trip. Returns `None` when no usable anchor was supplied.
+fn corrected_impact_call(input: &ImpactInput) -> Option<Value> {
+    let trimmed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let handle = trimmed(&input.handle);
+    let symbol = trimmed(&input.symbol);
+    let file = trimmed(&input.file);
+
+    if let Some(handle) = handle {
+        return Some(json!({ "handle": format!(":{}", normalize_handle(&handle)) }));
+    }
+
+    // A file path (explicit, in the symbol slot, or a relative path in the
+    // project-root `path` slot) keeps its line.
+    let file_path = file
+        .or_else(|| symbol.clone().filter(|value| looks_like_file_path(value)))
+        .or_else(|| impact_path_as_file_anchor(input));
+    if let Some(path) = file_path {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("file".to_string(), Value::from(path));
+        if let Some(line) = input.line {
+            arguments.insert("line".to_string(), Value::from(line));
+        }
+        return Some(Value::Object(arguments));
+    }
+
+    symbol.map(|symbol| json!({ "symbol": symbol }))
 }
 
 fn symbol_include(include: SymbolIncludeInput) -> SymbolInclude {
@@ -1132,84 +1302,53 @@ fn all_read_records_failed(payload: &ReadPayload) -> bool {
         })
 }
 
-fn search_summary(payload: &SearchPayload, query: &str) -> String {
-    let header = match payload.status {
-        OperationStatus::Ok => format!(
-            "Found {} ranked 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
-        OperationStatus::Degraded => format!(
-            "Found {} degraded 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
-        OperationStatus::Empty => {
-            // If empty search with scope, provide scope-aware message
-            if let Some(scope) = &payload.index_scope {
-                if !scope.roots.is_empty() {
-                    let scope_list = scope.roots.join(", ");
-                    return format!(
-                        "No results found in indexed scope [{}] for \"{}\". {}",
-                        scope_list,
-                        query,
-                        scope.coverage_description()
-                    );
-                }
-            }
-            format!("No indexed code matched \"{}\".", query)
+/// Content-free search summary (mirrors the `read_summary`/`oneup_context`
+/// grammar): a constant-shaped orientation line whose length is independent of
+/// the query text and the result set. The ranked results are the single source
+/// of truth in `structuredContent`, so the text echoes neither the query, the
+/// per-result rows, nor any (truncated) handle — that mirror is what re-inflated
+/// the search envelope. Bounded at [`SUMMARY_MAX_BYTES`] so even a many-root
+/// empty-scope notice cannot grow the text block.
+fn search_summary(payload: &SearchPayload) -> String {
+    let count = payload.results.len();
+    let summary = match payload.status {
+        OperationStatus::Ok => {
+            format!("Found {count} ranked 1up search result(s); details in structuredContent.")
         }
-        OperationStatus::Partial => format!(
-            "Found {} partial 1up search result(s) for \"{}\".",
-            payload.results.len(),
-            query
-        ),
+        OperationStatus::Degraded => {
+            format!("Found {count} degraded 1up search result(s); details in structuredContent.")
+        }
+        OperationStatus::Partial => {
+            format!("Found {count} partial 1up search result(s); details in structuredContent.")
+        }
+        OperationStatus::Empty => match payload
+            .index_scope
+            .as_ref()
+            .filter(|scope| !scope.roots.is_empty())
+        {
+            Some(scope) => format!(
+                "No indexed code matched in the configured scope. {}",
+                scope.coverage_description()
+            ),
+            None => "No indexed code matched the search.".to_string(),
+        },
     };
 
-    if payload.results.is_empty() {
-        return header;
+    clamp_summary_bytes(summary)
+}
+
+/// Clamp a model-facing summary to [`SUMMARY_MAX_BYTES`], truncating on a UTF-8
+/// character boundary so the text block can never exceed the byte budget.
+fn clamp_summary_bytes(mut summary: String) -> String {
+    if summary.len() <= SUMMARY_MAX_BYTES {
+        return summary;
     }
-
-    let rows = payload
-        .results
-        .iter()
-        .map(format_search_hit_row)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!("{header}\n\n{rows}")
-}
-
-fn format_search_hit_row(hit: &ops::SearchHit) -> String {
-    let symbol = hit
-        .symbol
-        .as_deref()
-        .or_else(|| hit.defined_symbols.first().map(String::as_str));
-    let breadcrumb_symbol = format_breadcrumb_symbol(hit.breadcrumb.as_deref(), symbol);
-    format!(
-        "{}{MCP_FIELD_SEP}{}:{}-{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}{}{MCP_FIELD_SEP}:{}",
-        hit.score,
-        hit.path,
-        hit.line_start,
-        hit.line_end,
-        hit.kind,
-        breadcrumb_symbol,
-        short_handle(&hit.handle)
-    )
-}
-
-fn format_breadcrumb_symbol(breadcrumb: Option<&str>, symbol: Option<&str>) -> String {
-    let breadcrumb = breadcrumb
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MCP_PLACEHOLDER);
-    let symbol = symbol
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MCP_PLACEHOLDER);
-    format!("{breadcrumb}::{symbol}")
-}
-
-fn short_handle(handle: &str) -> String {
-    handle.chars().take(MCP_HANDLE_DISPLAY_LEN).collect()
+    let mut end = SUMMARY_MAX_BYTES;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    summary.truncate(end);
+    summary
 }
 
 fn read_summary(payload: &ReadPayload) -> String {
@@ -1416,10 +1555,31 @@ fn indexed_tool_error(message: String) -> CallToolResult {
     )
 }
 
+/// Once the index phase has reached a terminal ready/complete state, drop
+/// build-time telemetry that no longer informs a readiness decision: the
+/// index_progress prefilter/parallelism/message internals plus the
+/// index_progress source_root that only duplicates the envelope's top-level
+/// source_root. Running or not-yet-ready phases keep their full progress so
+/// live indexing stays observable.
+fn lean_ready_status(payload: &mut ReadinessPayload) {
+    let ready = payload.status == ReadinessStatus::Ready;
+    let Some(progress) = payload.index_progress.as_mut() else {
+        return;
+    };
+    if !(ready || matches!(progress.state, IndexState::Complete)) {
+        return;
+    }
+    progress.prefilter = None;
+    progress.parallelism = None;
+    progress.message = None;
+    progress.source_root = None;
+}
+
 fn readiness_result(
-    payload: ReadinessPayload,
+    mut payload: ReadinessPayload,
     metadata: Option<ReadinessContextMetadata>,
 ) -> ToolEnvelope {
+    lean_ready_status(&mut payload);
     let status = status_string(&payload.status);
     let summary = payload.summary.clone();
     let mut data = payload_value(&payload);
@@ -1520,6 +1680,64 @@ mod tests {
     use super::*;
     use crate::search::impact::{ImpactAnchor, ImpactHint};
 
+    #[test]
+    fn search_summary_is_content_free_and_within_budget() {
+        let payload = SearchPayload {
+            status: OperationStatus::Ok,
+            results: vec![ops::SearchHit {
+                handle: "abcdef0123456789".to_string(),
+                path: "src/very/deep/module/path.rs".to_string(),
+                language: "rust".to_string(),
+                kind: "function".to_string(),
+                score: 42,
+                line_start: 10,
+                line_end: 20,
+                breadcrumb: Some("Module::Type".to_string()),
+                symbol: Some("SecretSymbolName".to_string()),
+                defined_symbols: vec!["SecretSymbolName".to_string()],
+            }],
+            degraded_reason: None,
+            index_scope: None,
+        };
+
+        let summary = search_summary(&payload);
+
+        assert!(
+            summary.contains("1 ranked"),
+            "summary should report the ranked count: {summary}"
+        );
+        assert!(
+            !summary.contains("abcdef0123456789"),
+            "summary must not leak a result handle: {summary}"
+        );
+        assert!(
+            !summary.contains("src/very/deep"),
+            "summary must not enumerate result paths: {summary}"
+        );
+        assert!(
+            !summary.contains("SecretSymbolName"),
+            "summary must not enumerate per-result symbols: {summary}"
+        );
+        assert!(
+            summary.len() <= SUMMARY_MAX_BYTES,
+            "summary must stay within budget; got {} bytes",
+            summary.len()
+        );
+    }
+
+    #[test]
+    fn clamp_summary_bytes_truncates_on_char_boundary() {
+        let long = "x".repeat(SUMMARY_MAX_BYTES + 50);
+        assert_eq!(clamp_summary_bytes(long).len(), SUMMARY_MAX_BYTES);
+
+        // A run of multi-byte characters is truncated on a boundary, never mid
+        // codepoint, so the clamped string stays valid UTF-8 within budget.
+        let multibyte = "é".repeat(SUMMARY_MAX_BYTES);
+        let clamped = clamp_summary_bytes(multibyte);
+        assert!(clamped.len() <= SUMMARY_MAX_BYTES);
+        assert!(clamped.chars().all(|c| c == 'é'));
+    }
+
     fn impact_input() -> ImpactInput {
         ImpactInput {
             handle: None,
@@ -1555,6 +1773,78 @@ mod tests {
             panic!("expected arguments to be Some");
         }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    #[test]
+    fn lean_ready_status_strips_build_telemetry_from_terminal_index_progress() {
+        use crate::shared::types::{
+            IndexParallelism, IndexPhase, IndexPrefilterInfo, IndexProgress, IndexState,
+        };
+        use std::path::PathBuf;
+
+        let mut progress = IndexProgress::pending();
+        progress.state = IndexState::Complete;
+        progress.phase = IndexPhase::Complete;
+        progress.source_root = Some(PathBuf::from("/repo"));
+        progress.message = Some("indexing complete".to_string());
+        progress.parallelism = Some(IndexParallelism {
+            jobs_configured: 8,
+            jobs_effective: 8,
+            embed_threads: 4,
+        });
+        progress.prefilter = Some(IndexPrefilterInfo {
+            discovered: 100,
+            metadata_skipped: 10,
+            content_read: 90,
+            deleted: 0,
+        });
+
+        let mut payload = ready_payload(Some(false));
+        payload.source_root = "/repo".to_string();
+        payload.index_progress = Some(progress);
+
+        lean_ready_status(&mut payload);
+
+        let leaned = payload.index_progress.as_ref().unwrap();
+        assert!(leaned.prefilter.is_none(), "prefilter must be stripped");
+        assert!(leaned.parallelism.is_none(), "parallelism must be stripped");
+        assert!(leaned.message.is_none(), "message must be stripped");
+        assert!(
+            leaned.source_root.is_none(),
+            "duplicate index_progress source_root must be stripped"
+        );
+        // Readiness essentials survive: the terminal state itself is retained.
+        assert!(matches!(leaned.state, IndexState::Complete));
+    }
+
+    #[test]
+    fn lean_ready_status_preserves_running_index_progress() {
+        use crate::shared::types::{IndexParallelism, IndexPhase, IndexProgress, IndexState};
+
+        let mut progress = IndexProgress::pending();
+        progress.state = IndexState::Running;
+        progress.phase = IndexPhase::Storing;
+        progress.message = Some("storing segments".to_string());
+        progress.parallelism = Some(IndexParallelism {
+            jobs_configured: 8,
+            jobs_effective: 8,
+            embed_threads: 4,
+        });
+
+        // A not-yet-ready payload with a running index keeps its live progress
+        // telemetry so indexing stays observable.
+        let mut payload = ops::blocked_readiness_for_path("repo", "indexing");
+        assert_ne!(payload.status, ReadinessStatus::Ready);
+        payload.index_progress = Some(progress);
+
+        lean_ready_status(&mut payload);
+
+        let kept = payload.index_progress.as_ref().unwrap();
+        assert!(
+            kept.parallelism.is_some(),
+            "running parallelism must be kept"
+        );
+        assert!(kept.message.is_some(), "running message must be kept");
     }
 
     fn detached_context(branch_status: BranchStatus) -> WorktreeContext {
@@ -1671,6 +1961,246 @@ mod tests {
         let message = impact_request(&input).unwrap_err();
 
         assert_eq!(message, "line can only be used with a file impact anchor");
+    }
+
+    #[test]
+    fn impact_request_promotes_file_looking_symbol_to_file_anchor() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "src/mcp/tools.rs".to_string(),
+                line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_promoted_symbol_file_anchor_accepts_line() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+        input.line = Some(42);
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "src/mcp/tools.rs".to_string(),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_keeps_plain_symbol_anchor() {
+        let mut input = impact_input();
+        input.symbol = Some("PolicyRuleValidator".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::Symbol {
+                name: "PolicyRuleValidator".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_prefers_handle_over_other_anchors() {
+        // Two anchors fail validation; the corrected retry keeps the most
+        // precise one (the handle) as a single ready-to-issue call.
+        let mut input = impact_input();
+        input.handle = Some("abcdef012345".to_string());
+        input.symbol = Some("PolicyRuleValidator".to_string());
+
+        assert!(impact_request(&input).is_err());
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({ "handle": ":abcdef012345" }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_promotes_file_looking_symbol_with_line() {
+        let mut input = impact_input();
+        input.symbol = Some("src/mcp/tools.rs".to_string());
+        input.file = Some("src/other.rs".to_string());
+        input.line = Some(7);
+
+        // Two file-ish anchors fail validation; the explicit file wins and
+        // keeps the line.
+        assert!(impact_request(&input).is_err());
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({ "file": "src/other.rs", "line": 7 }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_is_none_without_any_anchor() {
+        assert_eq!(corrected_impact_call(&impact_input()), None);
+    }
+
+    #[test]
+    fn impact_request_promotes_relative_path_slot_to_file_anchor() {
+        // A relative file path supplied in the project-root `path` slot with no
+        // other anchor resolves to a File anchor.
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "packages/cloudflare/src/sandbox/runner.ts".to_string(),
+                line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_promoted_path_slot_anchor_accepts_line() {
+        // {"path": "...runner.ts", "line": 111} with no other anchor resolves to
+        // a file anchor pinned at the line.
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+        input.line = Some(111);
+
+        let request = impact_request(&input).unwrap();
+
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::File {
+                path: "packages/cloudflare/src/sandbox/runner.ts".to_string(),
+                line: Some(111),
+            }
+        );
+    }
+
+    #[test]
+    fn impact_request_does_not_promote_absolute_path_slot() {
+        // An absolute path keeps its project-root selector meaning and is never
+        // promoted, so a call with no real anchor still errors -- with or
+        // without a line, since the absent-anchor check precedes the line check.
+        let mut input = impact_input();
+        input.path = Some("/Users/dev/project".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap_err(),
+            "provide exactly one impact anchor: handle, symbol, or file"
+        );
+
+        input.line = Some(9);
+        assert_eq!(
+            impact_request(&input).unwrap_err(),
+            "provide exactly one impact anchor: handle, symbol, or file"
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_promotes_relative_path_slot_with_line() {
+        let mut input = impact_input();
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+        input.line = Some(111);
+
+        assert_eq!(
+            corrected_impact_call(&input),
+            Some(json!({
+                "file": "packages/cloudflare/src/sandbox/runner.ts",
+                "line": 111
+            }))
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_ignores_absolute_path_slot() {
+        // An absolute path is a project-root selector, not a file anchor, so the
+        // corrected-call builder synthesizes nothing from it -- the error
+        // envelope falls back to the generic search/symbol next actions.
+        let mut input = impact_input();
+        input.path = Some("/Users/dev/project".to_string());
+        input.line = Some(9);
+
+        assert_eq!(corrected_impact_call(&input), None);
+    }
+
+    #[test]
+    fn impact_path_slot_stays_repo_root_when_an_explicit_anchor_is_present() {
+        // With a real anchor present, a file-looking `path` retains its
+        // project-root selector meaning: it is never consumed as a file anchor,
+        // so the handler passes it through to root resolution unchanged.
+        let mut input = impact_input();
+        input.handle = Some(":abcdef012345".to_string());
+        input.path = Some("packages/cloudflare/src/sandbox/runner.ts".to_string());
+
+        assert_eq!(impact_path_as_file_anchor(&input), None);
+
+        let request = impact_request(&input).unwrap();
+        assert_eq!(
+            request.anchor,
+            ImpactAnchor::Segment {
+                id: "abcdef012345".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_repo_scope_maps_whole_repo_sentinels_to_none() {
+        for sentinel in ["all", "ALL", " . ", "/", "*", "**", "", "   "] {
+            assert_eq!(
+                normalize_repo_scope(Some(sentinel)),
+                None,
+                "whole-repo sentinel {sentinel:?} must normalize to no scope"
+            );
+        }
+        assert_eq!(normalize_repo_scope(None), None);
+        // A real directory cone is preserved (and trimmed).
+        assert_eq!(
+            normalize_repo_scope(Some("  packages/core  ")),
+            Some("packages/core".to_string())
+        );
+    }
+
+    #[test]
+    fn impact_request_drops_whole_repo_scope_sentinel_but_keeps_real_cone() {
+        let mut input = impact_input();
+        input.symbol = Some("load_auth_config".to_string());
+
+        input.scope = Some("all".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap().scope,
+            None,
+            "scope:'all' must be normalized to no cone"
+        );
+
+        input.scope = Some("packages/core".to_string());
+        assert_eq!(
+            impact_request(&input).unwrap().scope,
+            Some("packages/core".to_string()),
+            "a real directory cone must still scope the request"
+        );
+    }
+
+    #[test]
+    fn corrected_impact_call_drops_scope_for_no_scope_retry() {
+        // The retry offered for an outside-scope error keeps the anchor but
+        // never carries the scope that excluded it.
+        let mut input = impact_input();
+        input.symbol = Some("load_auth_config".to_string());
+        input.scope = Some("packages/core".to_string());
+
+        let corrected = corrected_impact_call(&input).unwrap();
+        assert_eq!(corrected["symbol"], "load_auth_config");
+        assert!(
+            corrected.get("scope").is_none(),
+            "corrected retry must not carry a scope: {corrected:?}"
+        );
     }
 
     #[test]

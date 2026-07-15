@@ -71,6 +71,11 @@ pub struct StartInput {
 #[serde(deny_unknown_fields)]
 pub struct SearchInput {
     pub query: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional additional queries for a multi-part question. Pass every distinct aspect of the question in one call (up to four total, including `query`); 1up runs the hybrid search per aspect and merges the ranked results, so one call replaces several sequential searches. Omit for a single-aspect question."
+    )]
+    pub queries: Option<Vec<String>>,
     pub limit: Option<usize>,
     pub path: Option<String>,
     #[schemars(
@@ -88,7 +93,7 @@ pub struct GetInput {
     pub path: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Optional verbosity level: \"default\" omits symbol lists and redundant summaries; \"full\" includes detailed symbol metadata. Defaults to \"default\"."
+        description = "Optional. Reading code needs no verbosity argument: the default returns the complete source segment with constant-size symbol counts. Higher-detail symbol-metadata levels are accepted for backward compatibility but are not required."
     )]
     pub verbosity: Option<String>,
 }

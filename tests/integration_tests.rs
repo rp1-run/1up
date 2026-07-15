@@ -409,6 +409,46 @@ fn write_running_progress_for_context(project: &Path, context_id: &str) {
     .unwrap();
 }
 
+/// Persists a terminal (complete) index-progress record for the active context
+/// carrying the full build-time telemetry an indexer emits — the parallelism,
+/// prefilter, and message internals plus a source_root that duplicates the
+/// envelope's top-level source_root. No `context_id` is written so the record
+/// matches whichever context the reader resolves for the repo.
+fn write_complete_progress_with_telemetry(project: &Path) {
+    fs::create_dir_all(project.join(".1up")).unwrap();
+    fs::write(
+        project.join(".1up").join("index_status.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "complete",
+            "phase": "complete",
+            "source_root": project,
+            "files_total": 3,
+            "files_scanned": 3,
+            "files_processed": 3,
+            "files_indexed": 3,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "segments_stored": 12,
+            "embeddings_enabled": true,
+            "message": "indexing complete",
+            "parallelism": {
+                "jobs_configured": 8,
+                "jobs_effective": 8,
+                "embed_threads": 4
+            },
+            "prefilter": {
+                "discovered": 100,
+                "metadata_skipped": 10,
+                "content_read": 90,
+                "deleted": 0
+            },
+            "updated_at": "2026-04-26T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
@@ -1649,6 +1689,66 @@ fn mutate_parallel_regression_fixture(dir: &std::path::Path) {
         "pub fn fresh_symbol() -> &'static str {\n    \"fresh\"\n}\n",
     )
     .unwrap();
+}
+
+/// A repo where markdown doc sections and code both match an implementation
+/// query, with the doc_sections saturated so they crowd out the actual page
+/// component. Used to prove the implementation-intent doc demotion surfaces
+/// code above docs.
+fn create_doc_crowding_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+
+    // Several doc sections saturated with the query terms so they rank highly.
+    fs::write(
+        tmp.path().join("docs").join("site-features.md"),
+        r#"# Admin global search
+
+## Search results page component
+
+The admin global search page component renders the search results page. The
+search results page component lists every matching record for the admin search
+page and paginates the global search results.
+
+## Search page rendering
+
+Rendering of the admin search results page component is documented here: the
+global search page component paints the admin search results page on screen.
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("docs").join("emdash-api.md"),
+        r#"# Emdash API
+
+## Admin search page component overview
+
+The admin search page component and the global search results page component
+are described for the admin search page consumer of the global search results.
+"#,
+    )
+    .unwrap();
+
+    // The actual implementation of the admin search page component.
+    fs::write(
+        tmp.path().join("src").join("admin_search_page.rs"),
+        r#"/// Renders the admin global search results page.
+pub struct AdminSearchPageComponent {
+    pub query: String,
+}
+
+impl AdminSearchPageComponent {
+    pub fn render_search_results_page(&self) -> String {
+        format!("admin global search results page for {}", self.query)
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    tmp
 }
 
 fn create_search_acceptance_fixture() -> TempDir {
@@ -3477,6 +3577,68 @@ fn mcp_status_ignores_index_progress_from_other_context() {
     }
 }
 
+/// T5: once the index phase is terminal, the readiness envelope keeps only the
+/// readiness essentials of index_progress and drops the build-time telemetry
+/// (prefilter/parallelism/message internals) and the duplicate source_root. The
+/// repo is addressed per call via `path` from a neutral isolated-state server
+/// so no daemon registers or reconciles it and rewrites the progress file.
+#[test]
+fn mcp_status_leans_terminal_index_progress_to_readiness_essentials() {
+    let target = TempDir::new().unwrap();
+    let target_root = target.path().canonicalize().unwrap();
+    fs::create_dir_all(target_root.join(".git")).unwrap();
+    write_complete_progress_with_telemetry(&target_root);
+
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let target_path = target_root.to_str().unwrap();
+
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": target_path }));
+    let envelope = mcp_structured(&result);
+
+    assert_ne!(result["isError"], true);
+    assert_mcp_response_is_presentation_free(&result);
+
+    let progress = &envelope["data"]["index_progress"];
+    assert!(
+        progress.is_object(),
+        "the active context's terminal progress should be exposed: {envelope:?}"
+    );
+    // Readiness essential: the terminal state itself is retained.
+    assert_eq!(progress["state"], "complete");
+    // Build-time telemetry is stripped from a terminal envelope.
+    assert!(
+        progress.get("prefilter").is_none(),
+        "terminal index_progress must omit the prefilter internals: {progress}"
+    );
+    assert!(
+        progress.get("parallelism").is_none(),
+        "terminal index_progress must omit the parallelism internals: {progress}"
+    );
+    assert!(
+        progress.get("message").is_none(),
+        "terminal index_progress must omit the build message: {progress}"
+    );
+    // The duplicate root is dropped from progress but kept at the top level.
+    assert!(
+        progress.get("source_root").is_none(),
+        "terminal index_progress must omit the duplicate source_root: {progress}"
+    );
+    assert!(
+        envelope["data"]["source_root"].is_string(),
+        "the envelope must still carry the top-level source_root: {envelope:?}"
+    );
+
+    // Byte budget: the leaned terminal envelope stays compact.
+    let data_bytes = serde_json::to_vec(&envelope["data"]).unwrap().len();
+    assert!(
+        data_bytes <= 1536,
+        "leaned terminal status data should stay compact; got {data_bytes} bytes: {}",
+        envelope["data"]
+    );
+}
+
 #[test]
 fn mcp_status_ignores_index_rows_from_other_context() {
     let project = TempDir::new().unwrap();
@@ -3666,16 +3828,21 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     assert_mcp_text_matches_summary(&search);
     let search_text = search["content"][0]["text"].as_str().unwrap();
     assert!(
-        search_text.contains("src/policy.rs:"),
-        "oneup_search text should include ranked rows, not only a count summary: {search_text}"
+        search_text.contains("result"),
+        "oneup_search text should report a result count: {search_text}"
     );
     assert!(
-        search_text
-            .lines()
-            .any(|line| line.contains("PolicyRuleValidator")
-                && line.contains(":")
-                && line.contains("  ")),
-        "oneup_search text should include a CLI-like row with symbol and handle: {search_text}"
+        !search_text.contains("src/policy.rs"),
+        "oneup_search text must be content-free: ranked rows live only in structured data, never mirrored into the summary: {search_text}"
+    );
+    assert!(
+        !search_text.contains("PolicyRuleValidator"),
+        "oneup_search text must not echo the query or enumerate per-result symbols/handles: {search_text}"
+    );
+    assert!(
+        search_text.len() <= 256,
+        "oneup_search text must stay within the summary byte budget; got {} bytes: {search_text}",
+        search_text.len()
     );
     let search_envelope = mcp_structured(&search);
     assert!(
@@ -3844,6 +4011,286 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
             .all(|action| action["tool"] != "oneup_impact"),
         "impact should not be a primary symbol next action: {symbol_actions:?}"
     );
+}
+
+/// A multi-part question is answered in one call: the opt-in `queries` array
+/// runs the hybrid search per aspect and fuses the ranked lists, so a single
+/// call surfaces handles for every aspect. An empty `queries` array leaves the
+/// single-query envelope byte-for-byte unchanged, proving the fusion path only
+/// engages when there is more than one aspect to merge.
+#[test]
+fn mcp_search_fuses_multi_query_aspects_into_one_ranked_list() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let paths_of = |result: &serde_json::Value| -> Vec<String> {
+        mcp_structured(result)["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Each aspect surfaces its own file on its own.
+    let policy = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    assert_ne!(policy["isError"], true);
+    assert!(
+        paths_of(&policy).contains(&"src/policy.rs".to_string()),
+        "single-aspect search should surface the policy file: {:?}",
+        paths_of(&policy)
+    );
+
+    let signatures = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "validate_incoming_request_signatures", "limit": 5 }),
+    );
+    assert_ne!(signatures["isError"], true);
+    assert!(
+        paths_of(&signatures).contains(&"src/signatures.rs".to_string()),
+        "single-aspect search should surface the signatures file: {:?}",
+        paths_of(&signatures)
+    );
+
+    // One multi-query call covers both aspects in a single fused ranked list.
+    let fused = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": "PolicyRuleValidator",
+            "queries": ["validate_incoming_request_signatures"],
+            "limit": 10
+        }),
+    );
+    assert_ne!(fused["isError"], true);
+    assert_mcp_response_is_presentation_free(&fused);
+    let fused_paths = paths_of(&fused);
+    assert!(
+        fused_paths.contains(&"src/policy.rs".to_string())
+            && fused_paths.contains(&"src/signatures.rs".to_string()),
+        "a multi-query call should fuse handles for every aspect into one ranked list: {fused_paths:?}"
+    );
+    // Handles stay unique after de-duplication by handle.
+    let handles: Vec<&str> = mcp_structured(&fused)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["handle"].as_str().unwrap())
+        .collect();
+    let mut deduped = handles.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        handles.len(),
+        "fused results must be deduplicated by handle: {handles:?}"
+    );
+
+    // An empty `queries` array is identical to a plain single-query call: the
+    // fusion path never engages, so the ranked envelope is byte-for-byte the
+    // same.
+    let single = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    let empty_extra = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "queries": [], "limit": 5 }),
+    );
+    assert_eq!(
+        mcp_structured(&single)["data"]["results"],
+        mcp_structured(&empty_extra)["data"]["results"],
+        "an empty queries array must leave the single-query result list unchanged"
+    );
+}
+
+/// An implementation-intent search (marker tokens like "page"/"component")
+/// sinks doc_section results below code results while keeping every doc result
+/// present, so the actual page component leads instead of being crowded out by
+/// documentation prose.
+#[test]
+fn mcp_search_demotes_doc_sections_for_implementation_intent() {
+    let tmp = create_doc_crowding_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": "admin global search page component search results page",
+            "limit": 10
+        }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_response_is_presentation_free(&search);
+
+    let results = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap();
+    let kinds: Vec<&str> = results
+        .iter()
+        .map(|hit| hit["kind"].as_str().unwrap_or_default())
+        .collect();
+
+    let has_doc = kinds.contains(&"doc_section");
+    let has_code = kinds.iter().any(|kind| *kind != "doc_section");
+    assert!(
+        has_doc && has_code,
+        "fixture must return both code and doc_section results: {kinds:?}"
+    );
+
+    // Every code result precedes every doc_section: once the first doc appears,
+    // the remainder of the list is docs only.
+    let first_doc = kinds
+        .iter()
+        .position(|kind| *kind == "doc_section")
+        .unwrap();
+    assert!(
+        kinds[first_doc..].iter().all(|kind| *kind == "doc_section"),
+        "implementation-intent search must rank code above doc_sections: {kinds:?}"
+    );
+
+    // The doc results are demoted, not dropped -- they remain in the list.
+    let doc_count = kinds.iter().filter(|kind| **kind == "doc_section").count();
+    assert!(
+        doc_count > 0,
+        "doc results must stay present after demotion: {kinds:?}"
+    );
+
+    // The implementation file leads the ranked list for an implementation query.
+    assert_eq!(
+        results[0]["path"].as_str().unwrap(),
+        "src/admin_search_page.rs",
+        "the page component implementation should lead an implementation search: {kinds:?}"
+    );
+}
+
+/// The `oneup_search` text summary is content-free and byte-bounded: it reports
+/// only a count, never echoing the (possibly long) query, enumerating result
+/// rows, or leaking a handle. The ranked results stay the single source of
+/// truth in structured content.
+#[test]
+fn mcp_search_summary_is_content_free_and_within_byte_budget() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let sentinel = "ZZ_QUERY_ECHO_SENTINEL_2f7c";
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({
+            "query": format!("PolicyRuleValidator {sentinel}"),
+            "limit": 5
+        }),
+    );
+    assert_ne!(search["isError"], true);
+    assert_mcp_response_is_presentation_free(&search);
+
+    let text = search["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.len() <= 256,
+        "search summary must stay within the 256-byte budget; got {} bytes: {text}",
+        text.len()
+    );
+    assert!(
+        !text.contains(sentinel),
+        "search summary must not echo the query: {text}"
+    );
+    assert!(
+        !text.contains("src/policy.rs"),
+        "search summary must not enumerate result rows: {text}"
+    );
+
+    // Every returned handle stays out of the text; it lives only in structured data.
+    let structured = mcp_structured(&search);
+    for hit in structured["data"]["results"].as_array().unwrap() {
+        let handle = hit["handle"].as_str().unwrap();
+        assert!(
+            !text.contains(handle),
+            "search summary must not leak result handle {handle}: {text}"
+        );
+    }
+}
+
+/// `oneup_get` no longer advertises the `full` verbosity level (the default is
+/// presented as the way to read complete code), but the level is still ACCEPTED
+/// and HONORED for backward compatibility: a `full` request materializes the
+/// symbol lists the default omits.
+#[test]
+fn mcp_get_still_honors_full_verbosity() {
+    let tmp = create_search_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+    wait_for_mcp_searchable_readiness(&mut client);
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "PolicyRuleValidator", "limit": 5 }),
+    );
+    let handles: Vec<String> = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| format!(":{}", hit["handle"].as_str().unwrap()))
+        .collect();
+    assert!(
+        !handles.is_empty(),
+        "search should return hydratable handles"
+    );
+
+    // Default verbosity omits the symbol lists, surfacing constant-size counts.
+    let default_get = client.call_tool(TOOL_GET, serde_json::json!({ "handles": handles.clone() }));
+    assert_ne!(default_get["isError"], true);
+    let default_records = mcp_structured(&default_get)["data"]["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let has_symbol_bearing_segment = default_records.iter().any(|record| {
+        record["segment"]["symbol_counts"]["defined"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    });
+
+    // `full` is still accepted even though it is no longer advertised.
+    let full_get = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": handles, "verbosity": "full" }),
+    );
+    assert_ne!(
+        full_get["isError"], true,
+        "verbosity full must still be accepted: {full_get:?}"
+    );
+    let full_records = mcp_structured(&full_get)["data"]["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    if has_symbol_bearing_segment {
+        // Full verbosity materializes the symbol lists the default omits and
+        // drops the constant-size counts in their favor.
+        assert!(
+            full_records
+                .iter()
+                .any(|record| record["segment"]["defined_symbols"]
+                    .as_array()
+                    .map(|list| !list.is_empty())
+                    .unwrap_or(false)),
+            "full verbosity must materialize the symbol lists default omits: {full_records:?}"
+        );
+        assert!(
+            full_records
+                .iter()
+                .all(|record| record["segment"]["symbol_counts"].is_null()),
+            "full verbosity replaces the constant-size counts with the real lists: {full_records:?}"
+        );
+    }
 }
 
 /// REQ-001 (exactly-once serialization): the authoritative source of a
@@ -5021,6 +5468,103 @@ fn mcp_impact_preserves_trust_buckets_and_followups() {
         "expected explicit empty impact status, got {empty_envelope:?}"
     );
     assert_mcp_next_actions_are_canonical(empty_envelope);
+}
+
+/// A relative file path in the project-root `path` slot with no other anchor
+/// resolves to a File anchor, and roots resolve from the ambient project (not
+/// the file path), so the call yields advisory impact output instead of an
+/// error.
+#[test]
+fn mcp_impact_promotes_relative_path_slot_to_file_anchor() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "path": "src/auth/runtime.rs", "line": 1 }),
+    );
+
+    assert_ne!(
+        result["isError"], true,
+        "a relative path-slot file anchor must not error: {result}"
+    );
+    assert_mcp_response_is_presentation_free(&result);
+    let envelope = mcp_structured(&result);
+    assert!(
+        matches!(
+            envelope["status"].as_str().unwrap(),
+            "expanded" | "expanded_scoped"
+        ),
+        "relative path-slot anchor should resolve to advisory impact output: {envelope:?}"
+    );
+    assert!(
+        !envelope["data"]["results"].as_array().unwrap().is_empty(),
+        "path-slot file anchor should surface primary likely-impact results: {envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
+/// A whole-repo scope sentinel (scope:"all") is normalized to no scope rather
+/// than validated as a literal cone, so the anchor resolves against the whole
+/// repository instead of erroring "outside requested scope `all`".
+#[test]
+fn mcp_impact_treats_whole_repo_scope_sentinel_as_no_scope() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "symbol": "load_auth_config", "scope": "all" }),
+    );
+
+    assert_ne!(
+        result["isError"], true,
+        "scope:'all' must be treated as whole-repo, not a literal cone: {result}"
+    );
+    let envelope = mcp_structured(&result);
+    assert!(
+        matches!(
+            envelope["status"].as_str().unwrap(),
+            "expanded" | "expanded_scoped" | "empty" | "empty_scoped"
+        ),
+        "whole-repo impact should resolve to advisory output: {envelope:?}"
+    );
+}
+
+/// An anchor-outside-scope error (a real cone that excludes the anchor) carries
+/// a ready-to-issue oneup_impact retry with the same anchor and no scope, so
+/// recovery is one call away.
+#[test]
+fn mcp_impact_outside_real_scope_offers_no_scope_retry() {
+    let tmp = create_impact_acceptance_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    // load_auth_config lives under src/auth; scoping to src/cache excludes it.
+    let result = client.call_tool(
+        TOOL_IMPACT,
+        serde_json::json!({ "symbol": "load_auth_config", "scope": "src/cache" }),
+    );
+
+    assert_eq!(
+        result["isError"], true,
+        "an anchor outside a real scope must error: {result}"
+    );
+    let envelope = mcp_structured(&result);
+    let retry = envelope["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["tool"] == "oneup_impact")
+        .expect("outside-scope error must offer an oneup_impact retry");
+    assert_eq!(retry["arguments"]["symbol"], "load_auth_config");
+    assert!(
+        retry["arguments"].get("scope").is_none(),
+        "the corrected retry must drop the excluding scope: {retry:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
 }
 
 #[test]

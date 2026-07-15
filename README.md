@@ -155,6 +155,23 @@ Start with `oneup_status`, follow the returned `oneup_start` action only when ne
 `oneup_overview` to get the shape of an unfamiliar repository. Keep raw file reads, `rg`, or `find`
 for exact literal verification after `1up` has narrowed the scope.
 
+## <img src="assets/readme/icons/heroicons-solid/chart-bar-square.svg" alt="" width="20" height="20"> Measured Against Going Without
+
+The warm-suite eval runs the same coding agent on the same seven code-comprehension and
+impact-analysis questions twice — once with the `oneup` MCP tools, once with only raw file reads
+and text search — and both must pass the same factual-accuracy and expected-file assertions.
+Latest paired run (2026-07-14):
+
+| Axis (7-case total) | Without 1up | With 1up | Delta |
+|---|---|---|---|
+| Input tokens | 3,838,805 | 2,142,698 | −44% |
+| Latency | 861s | 498s | −42% |
+| Cost | $1.32 | $0.63 | −52% |
+
+Both variants answered all seven cases correctly; the with-1up agent averaged 8 tool calls per
+case. These are single paired runs, not confidence intervals — the harness, cases, and
+reproduction steps live in [evals/README.md](evals/README.md).
+
 ## <img src="assets/readme/icons/heroicons-solid/command-line.svg" alt="" width="20" height="20"> Move Fast From The Terminal
 
 Prefer the shell? The same local index powers a compact terminal lifecycle on macOS and Linux:

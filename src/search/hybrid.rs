@@ -1,12 +1,14 @@
 use libsql::Connection;
 
 use crate::indexer::embedder::Embedder;
+use crate::indexer::markdown::DOC_SECTION_BLOCK_TYPE;
 use crate::search::intent::detect_intent;
 use crate::search::intent::QueryIntent;
 use crate::search::ranking::{query_words, rank_candidates, tokenize_text, RankedCandidate};
 use crate::search::retrieval::{self, CandidateRow};
 use crate::search::scope::SearchScope;
 use crate::search::symbol::SymbolSearchEngine;
+use crate::shared::constants::RRF_K;
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::{normalize_score, SearchResult};
 
@@ -377,6 +379,144 @@ fn candidate_key(candidate: &CandidateRow) -> String {
     candidate.segment_id.clone()
 }
 
+/// Fuse several per-query ranked result lists into one deduped-by-handle ranked
+/// list using Reciprocal Rank Fusion (the multi-query `oneup_search` path).
+///
+/// Each input list is independently ranked with rank 0 at the top. A segment's
+/// fused score is `Σ 1/(RRF_K + rank)` over every list it appears in, so a
+/// segment several aspects of a multi-part question all surface outranks one
+/// that only matched a single aspect. The list is deduplicated by `segment_id`
+/// (the durable handle), keeping the representative row from the list where the
+/// segment ranked best (lowest rank) and re-deriving its displayed `score` from
+/// the fused RRF total. Ordering is fully deterministic: fused score descending,
+/// then best rank ascending, then `segment_id` ascending. The fused list is
+/// truncated to `limit`.
+///
+/// A single-element `lists` is returned untouched (aside from the `limit`
+/// truncation the single-query path already applies), so the caller only reaches
+/// this merge when there is more than one query to fuse.
+pub fn merge_multi_query_results(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+
+    // Per handle: (fused RRF score, best rank seen, representative row).
+    let mut fused: HashMap<String, (f64, usize, SearchResult)> = HashMap::new();
+    for list in lists {
+        for (rank, result) in list.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + rank as f64);
+            match fused.get_mut(&result.segment_id) {
+                Some(entry) => {
+                    entry.0 += contribution;
+                    if rank < entry.1 {
+                        entry.1 = rank;
+                        entry.2 = result;
+                    }
+                }
+                None => {
+                    fused.insert(result.segment_id.clone(), (contribution, rank, result));
+                }
+            }
+        }
+    }
+
+    let mut merged: Vec<(f64, usize, SearchResult)> = fused.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+            .then_with(|| a.2.segment_id.cmp(&b.2.segment_id))
+    });
+
+    merged
+        .into_iter()
+        .take(limit)
+        .map(|(fused_score, _, mut result)| {
+            result.score = normalize_score(fused_score);
+            result
+        })
+        .collect()
+}
+
+/// High-precision query tokens that signal the searcher is after implementation
+/// code (a component, handler, route, ...) rather than prose. Kept deliberately
+/// narrow so [`demote_doc_sections_for_implementation_intent`] fires only on an
+/// unambiguous implementation query. Matched whole-token and case-insensitively.
+const IMPLEMENTATION_INTENT_MARKERS: [&str; 23] = [
+    "component",
+    "components",
+    "handler",
+    "handlers",
+    "endpoint",
+    "endpoints",
+    "implementation",
+    "implemented",
+    "function",
+    "functions",
+    "class",
+    "classes",
+    "hook",
+    "hooks",
+    "route",
+    "routes",
+    "renderer",
+    "rendering",
+    "ui",
+    "page",
+    "pages",
+    "wizard",
+    "pipeline",
+];
+
+/// Whether any query in the set carries a high-precision implementation-intent
+/// marker (whole-token, case-insensitive). For a multi-query call this is the
+/// union of every query's tokens, so one implementation-flavored aspect is
+/// enough to signal intent.
+pub fn query_signals_implementation_intent(queries: &[String]) -> bool {
+    queries.iter().any(|query| {
+        query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .any(|token| {
+                IMPLEMENTATION_INTENT_MARKERS
+                    .iter()
+                    .any(|marker| token.eq_ignore_ascii_case(marker))
+            })
+    })
+}
+
+/// When the query set signals implementation intent and the ranked list holds
+/// at least one non-doc result, stable-partition the list so `doc_section`
+/// results fall below every code result, preserving relative order within each
+/// group. Scores are untouched and nothing is dropped — every result stays
+/// present. Without implementation intent (or when every result is a doc
+/// section) the list is returned unchanged, so non-implementation searches are
+/// byte-identical to before.
+pub fn demote_doc_sections_for_implementation_intent(
+    results: Vec<SearchResult>,
+    queries: &[String],
+) -> Vec<SearchResult> {
+    if !query_signals_implementation_intent(queries) {
+        return results;
+    }
+    let has_non_doc = results
+        .iter()
+        .any(|result| result.block_type != DOC_SECTION_BLOCK_TYPE);
+    if !has_non_doc {
+        return results;
+    }
+
+    let mut code = Vec::with_capacity(results.len());
+    let mut docs = Vec::new();
+    for result in results {
+        if result.block_type == DOC_SECTION_BLOCK_TYPE {
+            docs.push(result);
+        } else {
+            code.push(result);
+        }
+    }
+    code.extend(docs);
+    code
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +525,147 @@ mod tests {
     use crate::search::symbol::SymbolSearchEngine;
     use crate::shared::types::{BranchStatus, SegmentRole};
     use crate::storage::segments::StoredSegment;
+
+    fn result_with_id(segment_id: &str) -> SearchResult {
+        SearchResult {
+            segment_id: segment_id.to_string(),
+            file_path: format!("src/{segment_id}.rs"),
+            language: "rust".to_string(),
+            block_type: "function".to_string(),
+            content: String::new(),
+            score: 0,
+            line_number: 1,
+            line_end: 2,
+            breadcrumb: None,
+            defined_symbols: None,
+        }
+    }
+
+    #[test]
+    fn merge_multi_query_dedups_by_handle_and_keeps_best_rank() {
+        // Query A ranks [a, b, c]; query B ranks [b, d, a]. Every handle is
+        // deduped once; `b` (ranks 1 and 0) and `a` (ranks 0 and 2) appear in
+        // both lists, so they outrank the single-list `c` and `d`.
+        let list_a = vec![
+            result_with_id("a"),
+            result_with_id("b"),
+            result_with_id("c"),
+        ];
+        let list_b = vec![
+            result_with_id("b"),
+            result_with_id("d"),
+            result_with_id("a"),
+        ];
+
+        let merged = merge_multi_query_results(vec![list_a, list_b], 10);
+
+        // Fused RRF: b = 1/61 + 1/60, a = 1/60 + 1/62 (both matched twice, so
+        // they lead), then the single-list handles by their own rank — d (rank 1)
+        // ahead of c (rank 2).
+        let ids: Vec<&str> = merged.iter().map(|r| r.segment_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "d", "c"], "fused ranking: {ids:?}");
+        assert_eq!(
+            merged.len(),
+            4,
+            "each handle must appear exactly once after de-duplication"
+        );
+        // A fused handle scores higher than a single-list handle.
+        assert!(
+            merged[0].score >= merged[2].score,
+            "a handle matched by both queries should not rank below a single-query handle"
+        );
+    }
+
+    #[test]
+    fn merge_multi_query_truncates_to_limit() {
+        let list = vec![
+            result_with_id("a"),
+            result_with_id("b"),
+            result_with_id("c"),
+        ];
+        let merged = merge_multi_query_results(vec![list], 2);
+        assert_eq!(merged.len(), 2);
+    }
+
+    fn doc_result(segment_id: &str) -> SearchResult {
+        SearchResult {
+            file_path: format!("docs/{segment_id}.md"),
+            language: "markdown".to_string(),
+            block_type: DOC_SECTION_BLOCK_TYPE.to_string(),
+            ..result_with_id(segment_id)
+        }
+    }
+
+    #[test]
+    fn implementation_intent_detects_whole_token_markers_case_insensitively() {
+        // A marker token anywhere in any query fires, case-insensitively.
+        assert!(query_signals_implementation_intent(&[
+            "admin search Page COMPONENT".to_string()
+        ]));
+        // Union across a multi-query set: one implementation aspect is enough.
+        assert!(query_signals_implementation_intent(&[
+            "where does auth live".to_string(),
+            "login route".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn implementation_intent_ignores_non_marker_and_substring_matches() {
+        // No marker token present.
+        assert!(!query_signals_implementation_intent(&[
+            "search configuration schema".to_string()
+        ]));
+        // Whole-token only: "configuration" must not match "function", nor
+        // "components" spelled inside a larger word be a false positive here.
+        assert!(!query_signals_implementation_intent(&[
+            "reusable subcomponents catalogue".to_string()
+        ]));
+        // Empty set never signals intent.
+        assert!(!query_signals_implementation_intent(&[]));
+    }
+
+    #[test]
+    fn demotion_sinks_docs_below_code_preserving_relative_order() {
+        let results = vec![
+            doc_result("d1"),
+            result_with_id("c1"),
+            doc_result("d2"),
+            result_with_id("c2"),
+        ];
+        let queries = vec!["admin search page component".to_string()];
+
+        let demoted = demote_doc_sections_for_implementation_intent(results, &queries);
+        let ids: Vec<&str> = demoted.iter().map(|r| r.segment_id.as_str()).collect();
+
+        // Code keeps its relative order, then docs keep theirs, all below code.
+        assert_eq!(ids, vec!["c1", "c2", "d1", "d2"]);
+    }
+
+    #[test]
+    fn demotion_is_a_noop_without_implementation_intent() {
+        let results = vec![doc_result("d1"), result_with_id("c1"), doc_result("d2")];
+        let queries = vec!["request signing secret configuration".to_string()];
+
+        let demoted = demote_doc_sections_for_implementation_intent(results.clone(), &queries);
+        let before: Vec<&str> = results.iter().map(|r| r.segment_id.as_str()).collect();
+        let after: Vec<&str> = demoted.iter().map(|r| r.segment_id.as_str()).collect();
+
+        // Order is byte-identical to the input when intent does not fire.
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn demotion_is_a_noop_when_every_result_is_a_doc_section() {
+        let results = vec![doc_result("d1"), doc_result("d2"), doc_result("d3")];
+        let queries = vec!["admin search page component".to_string()];
+
+        let demoted = demote_doc_sections_for_implementation_intent(results.clone(), &queries);
+        let before: Vec<&str> = results.iter().map(|r| r.segment_id.as_str()).collect();
+        let after: Vec<&str> = demoted.iter().map(|r| r.segment_id.as_str()).collect();
+
+        // No non-doc result to lift, so the list is returned unchanged.
+        assert_eq!(after, before);
+    }
 
     /// Test-only reference implementation of the pre-change `get_segment_by_id`
     /// hydration path. The equivalence test pins `search_result_from_candidate`
