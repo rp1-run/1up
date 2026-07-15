@@ -1,2 +1,5 @@
 # Local eval run artifacts (large JSON trajectories) — keep summaries (*.md) tracked
 results/*/
+
+# Per-run recall harness output: rewritten each run and leaks absolute paths — never tracked
+suites/1up-search/recall-results.json

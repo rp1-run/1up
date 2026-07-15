@@ -136,7 +136,7 @@ MCP stdio expects protocol messages on stdout. If a host reports parse errors:
 
 ## Cleaning Legacy Pasted 1up Hints
 
-Older 1up onboarding once asked users to paste a code-discovery hint block into their own project instruction files. Some of those pasted blocks reference legacy 1up tool names (the `oneup_*` tokens that 1up no longer provides), so an agent reading them is pointed at tools that do not exist. `1up doctor --clean-hints` is an opt-in helper for finding and cleaning that stale guidance.
+Older 1up onboarding once asked users to paste a code-discovery hint block into their own project instruction files. Some of those pasted blocks reference legacy 1up tool names (stale `oneup_*` tokens that are not part of the current tool set), so an agent reading them is pointed at tools that do not exist. `1up doctor --clean-hints` is an opt-in helper for finding and cleaning that stale guidance.
 
 This command is **opt-in and default-OFF**: 1up writes nothing to your instruction files unless you run it explicitly. Normal 1up operation (`1up start`, indexing, search) never creates or edits these files.
 

@@ -4,7 +4,7 @@
   "captured_at": null,
   "capture_command": "PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna && npm run axes-report:luna:record",
   "reference_anchor": {
-    "source": "requirements REQ-006 / phase-plan research report",
+    "source": "recorded pre-optimization warm-run measurement (2026-07-13)",
     "input_tokens_approx": 5090000,
     "slower_than_codex_pct": 23.9,
     "more_expensive_than_codex_pct": 2.5,

@@ -3080,14 +3080,14 @@ mod tests {
                 project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
                 state: LifecycleState::Active,
                 project_root: PathBuf::from(
-                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments",
+                    "/Users/some-developer/Development/some-very-long-project-name-with-extra-segments",
                 ),
                 source_root: PathBuf::from(
-                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments/worktree-feature-branch",
+                    "/Users/some-developer/Development/some-very-long-project-name-with-extra-segments/worktree-feature-branch",
                 ),
                 context_id: "ctx-linked".to_string(),
                 main_worktree_root: PathBuf::from(
-                    "/Users/prem/Development/some-very-long-project-name-with-extra-segments",
+                    "/Users/some-developer/Development/some-very-long-project-name-with-extra-segments",
                 ),
                 worktree_role: WorktreeRole::Linked,
                 branch_name: Some("feature/very-long-branch-name".to_string()),
