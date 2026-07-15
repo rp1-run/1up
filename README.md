@@ -98,7 +98,7 @@ agent you use for this repository and let it configure the project-scoped server
    the best result with `oneup_get`.
 ````
 
-### Option 2: Install It Yourself
+### Option 2: Install 1up Yourself
 
 Prefer to run each step? The script installer supports Apple Silicon macOS and Linux on arm64 or
 x86_64:
@@ -131,11 +131,24 @@ Add this project/workspace MCP entry:
 Reload the host, approve or trust `oneup` if prompted, then call `oneup_status` and follow its
 next action.
 
-For host-specific config shapes — Codex, Claude Code, Cursor, VS Code, Copilot, generic JSON
-clients, and explicit-path setups — see the focused
+### Option 3: Manual MCP Config
+
+Need host-specific syntax or a config review first? For Codex, Claude Code, Cursor, VS Code,
+Copilot, generic JSON clients, explicit-path config, and host approval details, use the focused
 [docs/mcp-installation.md](docs/mcp-installation.md) reference. Prefer project/workspace
-configuration with `args = ["mcp"]`; use an absolute repository or worktree path only for
-user-global or static hosts.
+configuration with `args = ["mcp"]`. For user-global or static hosts, use an absolute repository
+or worktree path:
+
+```json
+{
+  "mcpServers": {
+    "oneup": {
+      "command": "/absolute/path/to/1up",
+      "args": ["mcp", "--path", "/absolute/path/to/repo"]
+    }
+  }
+}
+```
 
 ## <img src="assets/readme/icons/heroicons-solid/book-open.svg" alt="" width="20" height="20"> Going Deep
 
@@ -205,8 +218,7 @@ The full data, network, and security boundary is:
 ### <img src="assets/readme/icons/heroicons-solid/arrow-path.svg" alt="" width="18" height="18"> Stay Current, Recover Cleanly
 
 Keep the binary and its shared worktree index aligned. For the recommended script install, apply
-the version advertised on the stable update channel in place, whether the binary lives in the new
-`~/.local/bin` default or the legacy `~/.1up/bin` location:
+the version advertised on the stable update channel in place:
 
 ```sh
 1up update
@@ -235,10 +247,9 @@ command -v 1up
 ```
 
 The recommended installer writes `~/.local/bin/1up`. Most shells already include `~/.local/bin`;
-when yours does not, the installer prints the rc-file reload step it added. Rerunning the installer
-migrates its legacy managed `~/.1up/bin` PATH block to the new default without disturbing the rest
-of your rc file. If the commands work in a terminal but not in a GUI host, use `~/.local/bin/1up`
-as the absolute binary path in MCP config or launch the host with the same `PATH`.
+when yours does not, the installer prints the rc-file reload step it added. If the commands work in
+a terminal but not in a GUI host, use `~/.local/bin/1up` as the absolute binary path in MCP config
+or launch the host with the same `PATH`.
 </details>
 
 <details>
@@ -306,8 +317,8 @@ Discovery loop:
 
 `1up impact` returns likely follow-up areas, not an exhaustive dependency graph. The lifecycle
 commands and `get`, `symbol`, `context`, and `impact` accept `--plain`; search already emits a
-stable lean result grammar. `--plain` is only for shell scripts and terminal automation — agents
-should use the `oneup_*` MCP tools through the configured server.
+stable lean result grammar. `--plain` is only for shell scripts and terminal automation.
+Agents should use the `oneup_*` MCP tools through the configured server.
 
 Disk cleanup is preview-first:
 

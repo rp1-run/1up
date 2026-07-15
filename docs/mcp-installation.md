@@ -134,37 +134,6 @@ MCP stdio expects protocol messages on stdout. If a host reports parse errors:
 - Try the absolute binary path from `command -v 1up`.
 - Capture the host log, `1up --version`, OS, host version, and exact MCP config.
 
-## Cleaning Legacy Pasted 1up Hints
-
-Older 1up onboarding once asked users to paste a code-discovery hint block into their own project instruction files. Some of those pasted blocks reference legacy 1up tool names (stale `oneup_*` tokens that are not part of the current tool set), so an agent reading them is pointed at tools that do not exist. `1up doctor --clean-hints` is an opt-in helper for finding and cleaning that stale guidance.
-
-This command is **opt-in and default-OFF**: 1up writes nothing to your instruction files unless you run it explicitly. Normal 1up operation (`1up start`, indexing, search) never creates or edits these files.
-
-When you run it with `--clean-hints`, it inspects three files in the project root:
-
-- `AGENTS.md`
-- `CLAUDE.md`
-- `.github/copilot-instructions.md`
-
-It detects legacy stale 1up tool tokens, defined precisely as any `oneup_*` token that is not one of 1up's current real tools. Currently retained tools are never flagged.
-
-There are two behaviors, and they are deliberately conservative:
-
-- **Fence-only auto-remove**: the command removes only a span 1up can prove it owns — a fenced block delimited by `<!-- 1up:hint:begin -->` and `<!-- 1up:hint:end -->`. Everything outside that exact pair is preserved byte-for-byte. Because earlier guidance was pasted unfenced and 1up has never written such a fence, this path rarely matches existing files in practice.
-- **Detect-and-advise**: for any stale token that is not inside a 1up-owned fence, the command reports what it found and recommends manual removal. It never edits unfenced content.
-
-The safety model is preview-first:
-
-```sh
-# Read-only preview (writes nothing):
-1up doctor --clean-hints
-
-# Apply the fence-only removal (the only path that edits a file):
-1up doctor --clean-hints --apply
-```
-
-Without `--apply` the command only reports. With `--apply` it removes a 1up-owned fenced span if one is present; unfenced stale tokens are always advised, never edited.
-
 ## Safety
 
 `1up mcp` is a local code-discovery server for the detected or configured repository. It does not edit files, refactor code, run tests, execute arbitrary shell commands, mutate host config, or index remote repositories directly.
