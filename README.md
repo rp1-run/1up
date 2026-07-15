@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/rp1-run/1up/releases/latest"><img src="https://img.shields.io/github/v/release/rp1-run/1up?color=blue" alt="Latest release" /></a>
   &nbsp;
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License: Apache 2.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License: Apache-2.0" /></a>
   &nbsp;
   <a href="https://github.com/rp1-run/1up/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rp1-run/1up/ci.yml?branch=main&label=CI" alt="CI status" /></a>
 </p>
