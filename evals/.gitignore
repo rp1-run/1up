@@ -1,0 +1,2 @@
+# Local eval run artifacts (large JSON trajectories) — keep summaries (*.md) tracked
+results/*/

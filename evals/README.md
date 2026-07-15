@@ -23,6 +23,85 @@ npm run eval
 npm run eval:impact
 ```
 
+### Codex SDK / Luna manual run
+
+The Luna path is separate from the Claude path. It uses
+`suites/1up-search/evals-luna.yaml` and
+`suites/1up-impact/evals-luna.yaml`, pins `gpt-5.6-luna`, and starts the
+`oneup` MCP server from each disposable test workspace through Codex
+`cli_config`. The baseline Codex provider has no `oneup` MCP server. The
+existing Claude configs and `npm run eval` / `npm run eval:impact` commands
+remain unchanged.
+
+Run Luna only from an authenticated secure shell. The Codex SDK can reuse an
+existing ChatGPT login when `OPENAI_API_KEY` and `CODEX_API_KEY` are unset;
+verify that state with `codex login status`. Keep the installed `1up` binary
+first on `PATH`, because both fixture setup and the MCP server resolve the
+literal `1up` command.
+
+```sh
+cd /path/to/1up/evals
+bun install --frozen-lockfile
+test "$(1up --version | awk '{print $3}')" = "0.1.15"
+codex login status
+
+# Credentialed/model execution: run manually, never as an agent validation.
+PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna
+npm run eval:summary:luna
+```
+
+`eval:parallel:luna` runs all seven search and impact cases, exits non-zero if
+any child Promptfoo process fails, and retains per-case logs, JSON diagnostics,
+and `runs.tsv` under `results/latest-luna/`. Before a rerun, it moves the prior
+latest directory under `results/archive-luna/` so failed evidence is not
+overwritten. Each child gets a unique, disposable
+`PROMPTFOO_CONFIG_DIR`, isolating Promptfoo's database, logs, and cache working
+state from both other children and the user's global Promptfoo state. The
+runner removes that temporary state on success, failure, or interruption; it
+does not remove the durable per-case results. `PROMPTFOO_CACHE_ENABLED=false`
+separately disables cached response reuse and does not provide this state
+isolation. Every Codex target also gets an isolated `HOME` and `CODEX_HOME`
+containing only a copied `auth.json`; host Codex config and MCP servers are not
+inherited. `PATH` and `NODE_EXTRA_CA_CERTS` are forwarded explicitly so the
+installed `1up` binary and corporate trust root remain available. The summary
+reports process duration and falls back to the JSON diagnostics for per-agent
+duration, cost, turns, and token usage. Use `npm run eval:luna` or
+`npm run eval:luna:impact` only when intentionally running one suite serially.
+
+The equivalent preserved Claude commands are:
+
+```sh
+npm run eval:parallel
+npm run eval:summary
+```
+
+Configuration-only validation does not authenticate or invoke a model:
+
+```sh
+npx promptfoo validate -c suites/1up-search/evals.yaml
+npx promptfoo validate -c suites/1up-impact/evals.yaml
+npx promptfoo validate -c suites/1up-search/evals-luna.yaml
+npx promptfoo validate -c suites/1up-impact/evals-luna.yaml
+```
+
+The parallel-runner regression also stays entirely local: it injects a fake
+Promptfoo executable and verifies seven-way state isolation, cleanup, durable
+logs and `runs.tsv`, and aggregate failure propagation.
+
+`codex-config.test.sh` performs a second no-model integration check using a
+fake `codex_path_override`. It records the final Codex argv and proves the
+workspace-bound `mcp_servers.oneup` overrides appear only on the 1up target,
+never on the baseline or distinct grader.
+
+```sh
+npm run test:parallel
+npm run test:codex-config
+```
+
+Neither this regression nor configuration validation replaces the manual-only
+credentialed/model runs above. Do not run Claude, Luna, MCP-adoption, or recall
+evals as automated agent validation.
+
 ## Recall gate
 
 The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from P5 MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.

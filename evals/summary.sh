@@ -1,74 +1,93 @@
 #!/usr/bin/env bash
-# Usage: ./summary.sh
-# Shows a clean comparison table from the latest eval run(s).
-# Handles both single-process and parallel runs by reading all recent logs.
+# Usage: ./summary.sh [claude|luna]
+# Summarizes the durable logs written by run-parallel.sh.
 
-# Find logs from the last 15 minutes
-RECENT_LOGS=$(find ~/.promptfoo/logs -name 'promptfoo-debug-*.log' -type f -mmin -15 | sort)
+set -uo pipefail
 
-if [ -z "$RECENT_LOGS" ]; then
-  echo "No recent eval logs found (last 15 minutes)."
+PROVIDER="${1:-claude}"
+case "$PROVIDER" in
+  claude|luna) ;;
+  *)
+    echo "Usage: $0 [claude|luna]" >&2
+    exit 2
+    ;;
+esac
+
+RESULT_DIR="results/latest-${PROVIDER}"
+RUNS_FILE="$RESULT_DIR/runs.tsv"
+
+if [ ! -f "$RUNS_FILE" ]; then
+  echo "No ${PROVIDER} parallel eval results found at $RUNS_FILE."
   exit 1
 fi
 
-python3 - $RECENT_LOGS << 'PYEOF'
-import json, re, sys
+python3 - "$PROVIDER" "$RUNS_FILE" << 'PYEOF'
+import json
+import pathlib
+import re
+import sys
 
-kw_map = [("search is enabled", "Search Stack"), ("WordPress import", "WordPress Import"),
-          ("sandboxed emdash plugin", "Plugin Arch"), ("schema in the database", "Live Content"),
-          ("FTSManager class interface", "FTS Impact"), ("schema definitions are stored", "Registry Impact"),
-          ("sandbox runner API", "Runner Impact")]
-tasks_order = ["Search Stack", "WordPress Import", "Plugin Arch", "Live Content",
-               "FTS Impact", "Registry Impact", "Runner Impact"]
+provider, runs_file = sys.argv[1:]
+ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+metric = re.compile(
+    r"(?P<duration>\d+s|duration n/a)\s*\|\s*"
+    r"(?P<cost>\$\d+(?:\.\d+)?|cost n/a)\s*\|\s*"
+    r"(?P<turns>\d+) turns?\s*\|\s*tokens (?P<tokens>[^\n│]+)"
+)
 
-from collections import defaultdict
-by_task = defaultdict(dict)
+rows = []
+for line in pathlib.Path(runs_file).read_text().splitlines():
+    task, process_seconds, status, log_path, diagnostic_path = line.split("\t", 4)
+    if not pathlib.Path(diagnostic_path).is_file():
+        raise SystemExit(f"Missing diagnostic output: {diagnostic_path}")
+    content = ansi.sub("", pathlib.Path(log_path).read_text(errors="replace"))
+    matches = list(metric.finditer(content))
+    agents = []
+    for match in matches[:2]:
+        agents.append(
+            f"{match['duration']}, {match['cost']}, {match['turns']}t, {match['tokens'].strip()}"
+        )
+    while len(agents) < 2:
+        agents.append(None)
 
-for logfile in sys.argv[1:]:
-    with open(logfile) as f:
-        content = f.read()
-    prompts = list(re.finditer(r'Calling Claude Agent SDK: ({.*?})\n', content))
-    responses = list(re.finditer(r'Claude Agent SDK response: ({.*?})\n', content))
-    for p, r in zip(prompts, responses):
-        pd = json.loads(p.group(1))
-        rd = json.loads(r.group(1))
-        pt = pd.get("prompt", "")
-        agent = "1up" if "1up search" in pt else "baseline"
-        task = "?"
-        for kw, label in kw_map:
-            if kw in pt:
-                task = label
-                break
-        by_task[task][agent] = (rd.get("num_turns",0), rd.get("duration_ms",0)/1000, rd.get("total_cost_usd",0))
+    diagnostic = json.loads(pathlib.Path(diagnostic_path).read_text())
+    diagnostic_results = diagnostic.get("results", {}).get("results", [])
+    by_label = {
+        result.get("provider", {}).get("label"): result
+        for result in diagnostic_results
+    }
+    for index, label in enumerate(("1up-agent", "baseline-agent")):
+        if agents[index] is not None:
+            continue
+        result = by_label.get(label)
+        if not result:
+            agents[index] = "metrics unavailable"
+            continue
+        try:
+            raw = json.loads(result.get("response", {}).get("raw", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        usage = raw.get("usage", {})
+        latency = result.get("latencyMs")
+        cost = result.get("cost")
+        turns = 1 if isinstance(raw.get("items"), list) else 0
+        duration = f"{round(latency / 1000)}s" if isinstance(latency, (int, float)) else "duration n/a"
+        cost_text = f"${cost:.2f}" if isinstance(cost, (int, float)) else "cost n/a"
+        tokens = (
+            f"in:{usage.get('input_tokens', 0):,} "
+            f"out:{usage.get('output_tokens', 0):,} "
+            f"cached:{usage.get('cached_input_tokens', 0):,} "
+            f"reasoning:{usage.get('reasoning_output_tokens', 0):,}"
+        )
+        agents[index] = f"{duration}, {cost_text}, {turns}t, {tokens}"
+    rows.append((task, status, int(process_seconds), *agents))
 
-def fmt(t, d, c):
-    return f"{d:>3.0f}s  ${c:.2f}  {t:>2}t"
-
-W = 18
-A = 16
-
-print()
-print(f"  {'Task':<{W}}  {'1up-agent':^{A}}  {'baseline':^{A}}  Winner")
-print(f"  {'─'*W}  {'─'*A}  {'─'*A}  ──────")
-for task in tasks_order:
-    d = by_task.get(task, {})
-    one = d.get("1up", (0,0,0))
-    bas = d.get("baseline", (0,0,0))
-    winner = "← 1up" if one[1] < bas[1] else "baseline →"
-    print(f"  {task:<{W}}  {fmt(*one):>{A}}  {fmt(*bas):>{A}}  {winner}")
-
-one_dur = sum(by_task[t].get("1up",(0,0,0))[1] for t in tasks_order)
-one_cost = sum(by_task[t].get("1up",(0,0,0))[2] for t in tasks_order)
-bas_dur = sum(by_task[t].get("baseline",(0,0,0))[1] for t in tasks_order)
-bas_cost = sum(by_task[t].get("baseline",(0,0,0))[2] for t in tasks_order)
-
-print(f"  {'─'*W}  {'─'*A}  {'─'*A}  ──────")
-print(f"  {'TOTAL':<{W}}  {f'{one_dur:.0f}s  ${one_cost:.2f}':>{A}}  {f'{bas_dur:.0f}s  ${bas_cost:.2f}':>{A}}")
-
-if bas_dur > 0 and bas_cost > 0:
-    td = (one_dur - bas_dur) / bas_dur * 100
-    tc = (one_cost - bas_cost) / bas_cost * 100
-    print()
-    print(f"  1up vs baseline: {td:+.0f}% time, {tc:+.0f}% cost")
-print()
+width = max(len(row[0]) for row in rows)
+print(f"\n{provider.upper()} parallel eval summary")
+for task, status, seconds, oneup, baseline in rows:
+    print(f"  {task:<{width}}  {status.upper():4}  process {seconds:>4}s")
+    print(f"    1up-agent: {oneup}")
+    print(f"    baseline:  {baseline}")
+print(f"\n  Total process-seconds: {sum(row[2] for row in rows)}")
+print(f"  Result directory: {pathlib.Path(runs_file).parent}")
 PYEOF

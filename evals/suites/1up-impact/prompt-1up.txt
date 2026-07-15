@@ -23,13 +23,14 @@ Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
 ## Impact Workflow
 
 1. Call `oneup_status` before impact or discovery.
-2. Call `oneup_start` only if status says indexing or rebuilding is needed.
+2. If status is `indexing`, do not call `oneup_start`; poll `oneup_status` until the index is readable. Otherwise call `oneup_start` only when a status next action explicitly requests it, and copy that next action's arguments exactly. Valid start modes are only `auto`, `index_if_needed`, `index_if_missing`, and `reindex`.
 3. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
 4. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
-5. Read primary result handles with `oneup_get` when you need implementation details.
+5. Copy full handles from the most recent structured response and read primary results with `oneup_get`; do not guess or truncate handles.
 6. Use `oneup_context` for precise file-line context when needed.
-7. Use `oneup_symbol` to verify direct references for important symbols.
-8. In the final answer, separate primary likely-impact findings from contextual or lower-confidence findings.
+7. Before answering, use `oneup_symbol` to verify direct references for an important symbol.
+8. In the final answer, use separate `Primary / higher-confidence` and `Contextual / lower-confidence` sections. If no contextual findings remain after verification, say so explicitly in the contextual section.
+9. Once `oneup_symbol` succeeds, do not call any more tools; answer immediately.
 
 {{TASK_PROMPT}}
 

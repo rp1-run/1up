@@ -1,12 +1,14 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
   mkdirSync,
+  realpathSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,7 +19,7 @@ const CACHE_DIR = join(__dirname, "../../.cache/emdash");
 const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
 const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
 const CACHE_LOCK_PATH = join(__dirname, "../../.cache/.lock");
-const TEMP_BASE = "/tmp/1up-evals";
+const TEMP_BASE = join(realpathSync(tmpdir()), "1up-evals");
 
 interface CacheStatus {
   indexed_files?: number | null;
@@ -28,6 +30,7 @@ export interface FixtureWorkspace {
   workspaceDir: string;
   repoDir: string;
   homeDir: string;
+  codexHomeDir: string;
 }
 
 interface HookContext {
@@ -132,6 +135,22 @@ export function ensureFixtureCache(): void {
   }
 }
 
+export function createIsolatedCodexHome(
+  homeDir: string,
+  sourceCodexHome = process.env.CODEX_HOME ??
+    join(process.env.HOME ?? homeDir, ".codex"),
+): string {
+  const codexHomeDir = join(homeDir, ".codex");
+  mkdirSync(codexHomeDir, { recursive: true });
+
+  const sourceAuth = join(sourceCodexHome, "auth.json");
+  if (existsSync(sourceAuth)) {
+    cpSync(sourceAuth, join(codexHomeDir, "auth.json"));
+  }
+
+  return codexHomeDir;
+}
+
 export function createWorkspace(): FixtureWorkspace {
   const uuid = crypto.randomUUID();
   const workspaceDir = join(TEMP_BASE, uuid);
@@ -141,14 +160,32 @@ export function createWorkspace(): FixtureWorkspace {
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(join(homeDir, ".local/share"), { recursive: true });
   mkdirSync(join(homeDir, ".config"), { recursive: true });
+  const codexHomeDir = createIsolatedCodexHome(homeDir);
 
   cpSync(CACHE_DIR, repoDir, { recursive: true });
 
-  return { workspaceDir, repoDir, homeDir };
+  return { workspaceDir, repoDir, homeDir, codexHomeDir };
 }
 
 export function cleanupWorkspace(workspaceDir: string): void {
   if (existsSync(workspaceDir)) {
+    const repoDir = join(workspaceDir, "emdash");
+    const homeDir = join(workspaceDir, "home");
+    if (existsSync(repoDir)) {
+      try {
+        execFileSync("1up", ["stop", "--plain", "."], {
+          cwd: repoDir,
+          env: {
+            ...process.env,
+            HOME: homeDir,
+            CODEX_HOME: join(homeDir, ".codex"),
+          },
+          stdio: "pipe",
+        });
+      } catch {
+        // Workspace cleanup must still run when no daemon is registered.
+      }
+    }
     rmSync(workspaceDir, { recursive: true, force: true });
   }
 }
@@ -163,7 +200,7 @@ export default async function (
   }
 
   if (hookName === "beforeEach") {
-    const { workspaceDir, repoDir, homeDir } = createWorkspace();
+    const { workspaceDir, repoDir, homeDir, codexHomeDir } = createWorkspace();
 
     if (!context.test.vars) {
       context.test.vars = {};
@@ -178,6 +215,10 @@ export default async function (
 
     context.test.vars._WORKSPACE_DIR = workspaceDir;
     context.test.vars._HOME = homeDir;
+    context.test.vars._CODEX_HOME = codexHomeDir;
+    context.test.vars._PATH = process.env.PATH ?? "";
+    context.test.vars._NODE_EXTRA_CA_CERTS =
+      process.env.NODE_EXTRA_CA_CERTS ?? "";
 
     return;
   }
