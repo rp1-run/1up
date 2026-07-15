@@ -21,7 +21,7 @@ use crate::mcp::types::{
     TOOL_SEARCH, TOOL_START, TOOL_STATUS, TOOL_STRUCTURAL, TOOL_SYMBOL,
 };
 use crate::search::impact::{ImpactAnchor, ImpactRequest, ImpactResultEnvelope, ImpactStatus};
-use crate::shared::constants::MAX_SEARCH_RESULTS;
+use crate::shared::constants::{MAX_RECOVERY_ACTIONS, MAX_SEARCH_RESULTS};
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexState, StructuralResult,
     StructuralSearchReport, StructuralSearchStatus, WorktreeContext,
@@ -214,7 +214,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_get",
-        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Use before answering, citing, or editing discovered code.",
+        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Use before answering, citing, or editing discovered code. The full source is returned once in structured data, not mirrored in the text summary. At verbosity \"full\" symbol lists are capped; when a list is clipped the record carries a truncation note whose ready-to-issue oneup_symbol recovery call fetches the rest, prepended first in next_actions to follow before answering.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Get Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -262,7 +262,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_context",
-        description = "Retrieve repository-scoped file-line context from precise source locations. Use after search, get, or symbol evidence identifies relevant lines.",
+        description = "Retrieve repository-scoped file-line context from precise source locations. Use after search, get, or symbol evidence identifies relevant lines. A small enclosing scope is returned whole; a large scope is windowed around the requested line. When windowed, the record carries a truncation note whose ready-to-issue oneup_context recovery call fetches the omitted remainder, prepended first in next_actions to follow before answering.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Read Context", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -755,7 +755,87 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
     actions
 }
 
+/// Envelope next_actions for get/context. Recovery actions for any bounded
+/// record are **prepended** (first, ahead of generic follow-ups) so an agent
+/// sees how to fetch the omitted content before anything else (REQ-004,
+/// load-bearing). They are deduped per path and capped at
+/// [`MAX_RECOVERY_ACTIONS`] so next_actions can never become the new unbounded
+/// payload the compaction is meant to remove.
 fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
+    let mut actions = recovery_next_actions(payload);
+    actions.extend(read_follow_up_actions(payload));
+    actions
+}
+
+/// Prepended recovery actions copied verbatim from each bounded record's
+/// `TruncationNote.recovery` (structured, ready-to-issue). The description names
+/// the clipped scope, its full range, and the omitted line counts so the agent
+/// can act without re-deriving them. Deduped per path, capped at
+/// [`MAX_RECOVERY_ACTIONS`].
+fn recovery_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
+    let mut actions = Vec::new();
+    let mut seen_paths: Vec<&str> = Vec::new();
+
+    for record in &payload.records {
+        let (path, truncation) = if let Some(segment) = &record.segment {
+            (segment.path.as_str(), segment.truncation.as_ref())
+        } else if let Some(context) = &record.context {
+            (context.path.as_str(), context.truncation.as_ref())
+        } else {
+            continue;
+        };
+
+        let Some(note) = truncation else { continue };
+        if seen_paths.contains(&path) {
+            continue;
+        }
+        seen_paths.push(path);
+
+        actions.push(action(
+            note.recovery.tool.as_str(),
+            recovery_reason(path, note),
+            Some(note.recovery.arguments.clone()),
+        ));
+
+        if actions.len() >= MAX_RECOVERY_ACTIONS {
+            break;
+        }
+    }
+
+    actions
+}
+
+/// Human-facing reason for a recovery action: names the clipped scope, its full
+/// line range, and the omitted counts (e.g. "Retrieve the omitted remainder of
+/// scope `loadPlugins` (manager.ts:71-588; 13 lines above / 498 below
+/// omitted).") for scope clips, or the omitted symbol count for symbol clips.
+fn recovery_reason(path: &str, note: &ops::TruncationNote) -> String {
+    if let (Some(start), Some(end)) = (note.full_line_start, note.full_line_end) {
+        let scope = note
+            .scope_name
+            .as_deref()
+            .map(|name| format!("scope `{name}`"))
+            .unwrap_or_else(|| {
+                note.scope_type
+                    .as_deref()
+                    .map(|scope_type| format!("{scope_type} scope"))
+                    .unwrap_or_else(|| "the enclosing scope".to_string())
+            });
+        return format!(
+            "Retrieve the omitted remainder of {scope} ({path}:{start}-{end}; {} lines above / {} below omitted).",
+            note.omitted_above.unwrap_or(0),
+            note.omitted_below.unwrap_or(0),
+        );
+    }
+
+    if let Some(omitted) = note.omitted_symbols {
+        return format!("Retrieve the {omitted} omitted symbol(s) for the capped list in {path}.");
+    }
+
+    format!("Retrieve the content omitted from {path}.")
+}
+
+fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
     if let Some(segment) = payload
         .records
         .iter()
@@ -1093,49 +1173,55 @@ fn read_record_label(payload: &ReadPayload) -> &'static str {
 }
 
 fn format_read_record(record: &ops::ReadRecord) -> String {
+    let status = status_string(&record.status);
     if let Some(segment) = &record.segment {
-        return format_segment_record(segment);
+        return format_segment_record(&status, segment);
     }
     if let Some(context) = &record.context {
-        return format_context_record(context);
+        return format_context_record(&status, context);
     }
 
     format!(
-        "{}\t{}\t{}\n---",
-        status_string(&record.status),
+        "{status}\t{}\t{}",
         format_read_source(&record.source),
         record.message.as_deref().unwrap_or("")
     )
 }
 
-fn format_segment_record(segment: &ops::SegmentRecord) -> String {
-    format!(
-        "segment {}\npath\t{}\tlines\t{}-{}\tkind\t{}\tlanguage\t{}\tbreadcrumb\t{}\trole\t{}\tdefines\t{}\treferences\t{}\tcalls\t{}\n\n{}\n\n---",
-        segment.handle,
-        segment.path,
-        segment.line_start,
-        segment.line_end,
-        segment.kind,
-        segment.language,
-        segment.breadcrumb.as_deref().unwrap_or(MCP_PLACEHOLDER),
-        status_string(&segment.role),
-        segment.defined_symbols.join(","),
-        segment.referenced_symbols.join(","),
-        segment.called_symbols.join(","),
-        segment.content
-    )
+/// Content-free segment line (REQ-002): the authoritative source stays only in
+/// `structuredContent`; the text summary carries a constant-sized orientation
+/// line whose length is independent of the segment body. A symbol-list clip
+/// appends a bounded `truncated: {reason}` marker so the omission is visible in
+/// the model-facing text, not just in structured data (REQ-004).
+fn format_segment_record(status: &str, segment: &ops::SegmentRecord) -> String {
+    let mut line = format!(
+        "{status}\t{}:{}-{}\t{}\tsegment {}",
+        segment.path, segment.line_start, segment.line_end, segment.language, segment.handle,
+    );
+    if let Some(note) = &segment.truncation {
+        line.push_str(&format!("\ttruncated: {}", note.reason));
+    }
+    line
 }
 
-fn format_context_record(context: &ops::ContextRecord) -> String {
-    format!(
-        "context {}:{}-{}\nlanguage\t{}\tscope\t{}\n\n{}\n\n---",
-        context.path,
-        context.line_start,
-        context.line_end,
-        context.language,
-        context.scope_type,
-        context.content
-    )
+/// Content-free context line (REQ-002). A windowed scope appends a bounded
+/// `truncated: {reason} +{above}/-{below} lines` marker (constant-sized: a
+/// reason constant plus two bounded numerals) so the omitted line counts are
+/// visible in the text block as well as in the structured `TruncationNote`.
+fn format_context_record(status: &str, context: &ops::ContextRecord) -> String {
+    let mut line = format!(
+        "{status}\t{}:{}-{}\t{}\tscope {}",
+        context.path, context.line_start, context.line_end, context.language, context.scope_type,
+    );
+    if let Some(note) = &context.truncation {
+        line.push_str(&format!(
+            "\ttruncated: {} +{}/-{} lines",
+            note.reason,
+            note.omitted_above.unwrap_or(0),
+            note.omitted_below.unwrap_or(0),
+        ));
+    }
+    line
 }
 
 fn format_read_source(source: &ops::ReadSource) -> String {
@@ -1540,6 +1626,161 @@ mod tests {
         assert_eq!(
             actions[0].arguments,
             Some(json!({ "query": "scripts module responsibilities" }))
+        );
+    }
+
+    fn scope_recovery_note(
+        path: &str,
+        line: usize,
+        above: usize,
+        below: usize,
+    ) -> ops::TruncationNote {
+        ops::TruncationNote {
+            reason: crate::shared::constants::SCOPE_TRUNCATION_REASON.to_string(),
+            scope_name: Some("loadPlugins".to_string()),
+            scope_type: Some("function".to_string()),
+            full_line_start: Some(71),
+            full_line_end: Some(588),
+            omitted_above: Some(above),
+            omitted_below: Some(below),
+            omitted_symbols: None,
+            recovery: ops::RecoveryCall {
+                tool: TOOL_CONTEXT.to_string(),
+                arguments: json!({ "path": path, "line": line, "expansion": 500 }),
+            },
+        }
+    }
+
+    fn context_record(path: &str, truncation: Option<ops::TruncationNote>) -> ops::ContextRecord {
+        ops::ContextRecord {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            scope_type: "function".to_string(),
+            content: "fn load() { /* body */ }".to_string(),
+            line_start: 84,
+            line_end: 90,
+            out_of_scope_disclosure: None,
+            truncation,
+        }
+    }
+
+    fn context_read_payload(records: Vec<ops::ContextRecord>) -> ReadPayload {
+        ReadPayload {
+            status: OperationStatus::Ok,
+            records: records
+                .into_iter()
+                .map(|context| ops::ReadRecord {
+                    status: ops::ReadStatus::Found,
+                    source: ops::ReadSource::Location {
+                        path: context.path.clone(),
+                        line: context.line_start,
+                    },
+                    segment: None,
+                    context: Some(context),
+                    matching_handles: Vec::new(),
+                    message: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn context_summary_line_is_content_free_with_truncation_marker() {
+        let payload = context_read_payload(vec![context_record(
+            "manager.ts",
+            Some(scope_recovery_note("manager.ts", 87, 13, 498)),
+        )]);
+
+        let summary = read_summary(&payload);
+
+        assert!(
+            !summary.contains("fn load()"),
+            "summary must not mirror source content: {summary}"
+        );
+        assert!(
+            summary.contains(&format!(
+                "manager.ts:84-90\trust\tscope function\ttruncated: {} +13/-498 lines",
+                crate::shared::constants::SCOPE_TRUNCATION_REASON
+            )),
+            "summary missing constant-sized context line with truncation marker: {summary}"
+        );
+    }
+
+    #[test]
+    fn context_summary_omits_marker_when_not_truncated() {
+        let payload = context_read_payload(vec![context_record("manager.ts", None)]);
+
+        let summary = read_summary(&payload);
+
+        assert!(
+            !summary.contains("truncated:"),
+            "unbounded record must not carry a truncation marker: {summary}"
+        );
+    }
+
+    #[test]
+    fn recovery_action_is_prepended_first_and_carries_verbatim_arguments() {
+        let payload = context_read_payload(vec![context_record(
+            "manager.ts",
+            Some(scope_recovery_note("manager.ts", 87, 13, 498)),
+        )]);
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions[0].tool, TOOL_CONTEXT);
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "path": "manager.ts", "line": 87, "expansion": 500 })),
+            "recovery arguments must be copied verbatim from the note"
+        );
+        assert!(
+            actions[0].reason.contains("loadPlugins")
+                && actions[0].reason.contains("manager.ts:71-588")
+                && actions[0].reason.contains("13 lines above / 498 below"),
+            "recovery reason must name the scope, full range, and omitted counts: {}",
+            actions[0].reason
+        );
+    }
+
+    #[test]
+    fn recovery_actions_dedupe_per_path_and_cap_at_limit() {
+        let mut records = Vec::new();
+        for index in 0..(MAX_RECOVERY_ACTIONS + 3) {
+            let path = format!("file{index}.ts");
+            // Two truncated records for the same path must yield one action.
+            records.push(context_record(
+                &path,
+                Some(scope_recovery_note(&path, 87, 1, 2)),
+            ));
+            records.push(context_record(
+                &path,
+                Some(scope_recovery_note(&path, 87, 1, 2)),
+            ));
+        }
+        let payload = context_read_payload(records);
+
+        let recovery = recovery_next_actions(&payload);
+
+        assert_eq!(
+            recovery.len(),
+            MAX_RECOVERY_ACTIONS,
+            "recovery actions must be capped at MAX_RECOVERY_ACTIONS"
+        );
+        let mut paths: Vec<String> = recovery
+            .iter()
+            .map(|action| {
+                action.arguments.as_ref().unwrap()["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(
+            paths.len(),
+            MAX_RECOVERY_ACTIONS,
+            "recovery actions must be deduped per path"
         );
     }
 }

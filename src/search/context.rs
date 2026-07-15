@@ -3,7 +3,9 @@ use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::indexer::parser::SupportedLanguage;
-use crate::shared::constants::CONTEXT_FALLBACK_LINES;
+use crate::shared::constants::{
+    CONTEXT_FALLBACK_LINES, MAX_CONTEXT_EXPANSION_LINES, MAX_WHOLE_SCOPE_LINES,
+};
 use crate::shared::types::{ContextAccessScope, ContextResult};
 
 pub struct ContextEngine;
@@ -74,6 +76,166 @@ impl ContextEngine {
             }
         }
     }
+
+    /// Retrieve file-line context as a scope-size-aware [`ScopeWindow`].
+    ///
+    /// When the smallest enclosing scope spans `<= MAX_WHOLE_SCOPE_LINES` it is
+    /// returned whole (`clipped = false`) regardless of `expansion`, preserving
+    /// legacy whole-scope fidelity for the common small-scope case. Larger scopes
+    /// are windowed to `target_line ± expansion.unwrap_or(CONTEXT_FALLBACK_LINES)`
+    /// (clamped to `MAX_CONTEXT_EXPANSION_LINES` each side) intersected with the
+    /// scope, with `clipped = true` and the full scope range surfaced so callers
+    /// can build a recoverable truncation note. Files with no enclosing scope fall
+    /// back to a bounded line window (`clipped = false`).
+    #[allow(dead_code)]
+    pub fn retrieve_scope_window(
+        file_path: &Path,
+        target_line: usize,
+        expansion: Option<usize>,
+    ) -> anyhow::Result<ScopeWindow> {
+        let source = std::fs::read_to_string(file_path)?;
+        let total_lines = source.lines().count();
+
+        if target_line == 0 || target_line > total_lines {
+            anyhow::bail!("line {target_line} is out of range (file has {total_lines} lines)");
+        }
+
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let language = SupportedLanguage::from_extension(ext);
+
+        match language.and_then(|lang| find_enclosing_scope(&source, lang, target_line)) {
+            Some(scope) => {
+                let bounds = bound_scope_window(
+                    (scope.line_start, scope.line_end),
+                    target_line,
+                    expansion,
+                    MAX_WHOLE_SCOPE_LINES,
+                    MAX_CONTEXT_EXPANSION_LINES,
+                );
+
+                let lines: Vec<&str> = source.lines().collect();
+                let content = lines[bounds.line_start - 1..bounds.line_end].join("\n");
+
+                if bounds.clipped {
+                    tracing::debug!(
+                        scope_name = scope.scope_name.as_deref().unwrap_or("<anonymous>"),
+                        scope_type = scope.scope_type.as_str(),
+                        scope_line_start = scope.line_start,
+                        scope_line_end = scope.line_end,
+                        window_line_start = bounds.line_start,
+                        window_line_end = bounds.line_end,
+                        omitted_above = bounds.line_start - scope.line_start,
+                        omitted_below = scope.line_end - bounds.line_end,
+                        "oneup_context windowed enclosing scope"
+                    );
+                }
+
+                Ok(ScopeWindow {
+                    content,
+                    line_start: bounds.line_start,
+                    line_end: bounds.line_end,
+                    scope_line_start: scope.line_start,
+                    scope_line_end: scope.line_end,
+                    scope_type: scope.scope_type,
+                    scope_name: scope.scope_name,
+                    clipped: bounds.clipped,
+                })
+            }
+            None => {
+                let lang_name: String = match language {
+                    Some(lang) => lang.name().to_string(),
+                    None if ext.is_empty() => "unknown".to_string(),
+                    None => ext.to_string(),
+                };
+                let fallback = line_range_fallback(
+                    &source,
+                    file_path,
+                    target_line,
+                    total_lines,
+                    expansion.unwrap_or(CONTEXT_FALLBACK_LINES),
+                    &lang_name,
+                    ContextAccessScope::ProjectRoot,
+                );
+                Ok(ScopeWindow {
+                    content: fallback.content,
+                    line_start: fallback.line_start,
+                    line_end: fallback.line_end,
+                    scope_line_start: fallback.line_start,
+                    scope_line_end: fallback.line_end,
+                    scope_type: fallback.scope_type,
+                    scope_name: None,
+                    clipped: false,
+                })
+            }
+        }
+    }
+}
+
+/// Scope-size-aware context window returned by
+/// [`ContextEngine::retrieve_scope_window`].
+///
+/// Carries the (possibly clipped) window content and range, the full enclosing
+/// scope range, and enough metadata for the MCP layer to render a load-bearing
+/// truncation note with a recovery call. `clipped` is `true` only when the
+/// returned window is a strict subset of the enclosing scope.
+#[allow(dead_code)]
+pub struct ScopeWindow {
+    pub content: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub scope_line_start: usize,
+    pub scope_line_end: usize,
+    pub scope_type: String,
+    pub scope_name: Option<String>,
+    pub clipped: bool,
+}
+
+/// Pure line-geometry result of [`bound_scope_window`].
+#[allow(dead_code)]
+struct WindowBounds {
+    line_start: usize,
+    line_end: usize,
+    clipped: bool,
+}
+
+/// Compute the bounded line window for an enclosing scope (pure, 1-based inclusive).
+///
+/// Scopes spanning `<= whole_scope_threshold` lines are returned whole with
+/// `clipped = false`, regardless of `expansion` — so a small explicit expansion
+/// never shrinks a small scope. Larger scopes are windowed to
+/// `target_line ± expansion.unwrap_or(CONTEXT_FALLBACK_LINES)` (each side clamped
+/// to `ceiling`) intersected with the scope; `clipped` is `true` iff the window
+/// is a strict subset of the scope. `target_line` is assumed to lie within
+/// `scope_range`.
+#[allow(dead_code)]
+fn bound_scope_window(
+    scope_range: (usize, usize),
+    target_line: usize,
+    expansion: Option<usize>,
+    whole_scope_threshold: usize,
+    ceiling: usize,
+) -> WindowBounds {
+    let (scope_start, scope_end) = scope_range;
+    let scope_span = scope_end.saturating_sub(scope_start) + 1;
+
+    if scope_span <= whole_scope_threshold {
+        return WindowBounds {
+            line_start: scope_start,
+            line_end: scope_end,
+            clipped: false,
+        };
+    }
+
+    let reach = expansion.unwrap_or(CONTEXT_FALLBACK_LINES).min(ceiling);
+    let line_start = target_line.saturating_sub(reach).max(scope_start);
+    let line_end = target_line.saturating_add(reach).min(scope_end);
+    let clipped = line_start > scope_start || line_end < scope_end;
+
+    WindowBounds {
+        line_start,
+        line_end,
+        clipped,
+    }
 }
 
 struct ScopeHit {
@@ -81,6 +243,7 @@ struct ScopeHit {
     line_start: usize,
     line_end: usize,
     scope_type: String,
+    scope_name: Option<String>,
 }
 
 const SCOPE_NODE_KINDS: &[&[&str]] = &[
@@ -204,12 +367,17 @@ fn find_enclosing_scope(
         let line_start = node.start_position().row + 1;
         let line_end = node.end_position().row + 1;
         let scope_type = classify_scope_type(node.kind(), lang);
+        let scope_name = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source_bytes).ok())
+            .map(|name| name.to_string());
 
         ScopeHit {
             content,
             line_start,
             line_end,
             scope_type,
+            scope_name,
         }
     })
 }
@@ -348,6 +516,7 @@ fn line_range_fallback(
     language: &str,
     access_scope: ContextAccessScope,
 ) -> ContextResult {
+    let window = window.min(MAX_CONTEXT_EXPANSION_LINES);
     let start = if target_line > window {
         target_line - window
     } else {
@@ -591,5 +760,146 @@ func helper() int {
         let result = ContextEngine::retrieve(&path, 4, None).unwrap();
         assert_eq!(result.scope_type, "function");
         assert!(result.content.contains("func main()"));
+    }
+
+    fn huge_rust_source(body_lines: usize) -> String {
+        let mut s = String::from("fn huge_function() -> i32 {\n");
+        for i in 0..body_lines {
+            s.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        s.push_str("    0\n}\n");
+        s
+    }
+
+    #[test]
+    fn test_bound_scope_window_whole_scope_at_threshold() {
+        // A scope spanning exactly MAX_WHOLE_SCOPE_LINES (101) is returned whole,
+        // even for a small explicit expansion.
+        let bounds = bound_scope_window((1, 101), 50, Some(3), MAX_WHOLE_SCOPE_LINES, 500);
+        assert_eq!(bounds.line_start, 1);
+        assert_eq!(bounds.line_end, 101);
+        assert!(!bounds.clipped);
+    }
+
+    #[test]
+    fn test_bound_scope_window_clipped_just_over_threshold() {
+        // One line larger than the whole-scope threshold flips to the window branch
+        // and clips regardless of the target's position.
+        let bounds = bound_scope_window((1, 102), 50, Some(3), MAX_WHOLE_SCOPE_LINES, 500);
+        assert!(bounds.clipped);
+        assert!(bounds.line_start > 1 || bounds.line_end < 102);
+    }
+
+    #[test]
+    fn test_bound_scope_window_default_expansion() {
+        // Default expansion (CONTEXT_FALLBACK_LINES = 50) yields target +/- 50.
+        let bounds = bound_scope_window((1, 600), 300, None, MAX_WHOLE_SCOPE_LINES, 500);
+        assert_eq!(bounds.line_start, 250);
+        assert_eq!(bounds.line_end, 350);
+        assert!(bounds.clipped);
+    }
+
+    #[test]
+    fn test_bound_scope_window_explicit_expansion() {
+        let bounds = bound_scope_window((1, 600), 300, Some(10), MAX_WHOLE_SCOPE_LINES, 500);
+        assert_eq!(bounds.line_start, 290);
+        assert_eq!(bounds.line_end, 310);
+        assert!(bounds.clipped);
+    }
+
+    #[test]
+    fn test_bound_scope_window_ceiling_clamp() {
+        // A huge requested expansion is clamped to the ceiling each side.
+        let bounds = bound_scope_window(
+            (1, 2000),
+            1000,
+            Some(999),
+            MAX_WHOLE_SCOPE_LINES,
+            MAX_CONTEXT_EXPANSION_LINES,
+        );
+        assert_eq!(bounds.line_start, 1000 - MAX_CONTEXT_EXPANSION_LINES);
+        assert_eq!(bounds.line_end, 1000 + MAX_CONTEXT_EXPANSION_LINES);
+        assert!(bounds.clipped);
+    }
+
+    #[test]
+    fn test_bound_scope_window_intersects_scope_edges() {
+        // The window is intersected with the scope: it never extends past the scope
+        // start, and clipping is reported on whichever side is a strict subset.
+        let bounds = bound_scope_window((100, 300), 105, Some(50), MAX_WHOLE_SCOPE_LINES, 500);
+        assert_eq!(bounds.line_start, 100);
+        assert_eq!(bounds.line_end, 155);
+        assert!(bounds.clipped);
+    }
+
+    #[test]
+    fn test_retrieve_scope_window_clips_huge_function_default() {
+        let source = huge_rust_source(150);
+        let (_f, path) = write_temp_file(&source, "rs");
+        let window = ContextEngine::retrieve_scope_window(&path, 75, None).unwrap();
+
+        assert!(window.clipped);
+        assert_eq!(window.scope_type, "function");
+        assert_eq!(window.scope_name.as_deref(), Some("huge_function"));
+        assert_eq!(window.scope_line_start, 1);
+        assert_eq!(window.scope_line_end, 153);
+        // Default window is target +/- CONTEXT_FALLBACK_LINES (101 lines wide).
+        assert_eq!(window.line_start, 25);
+        assert_eq!(window.line_end, 125);
+        assert_eq!(window.content.lines().count(), 101);
+        assert!(window.content.contains("let v73"));
+    }
+
+    #[test]
+    fn test_retrieve_scope_window_explicit_expansion() {
+        let source = huge_rust_source(150);
+        let (_f, path) = write_temp_file(&source, "rs");
+        let window = ContextEngine::retrieve_scope_window(&path, 75, Some(10)).unwrap();
+
+        assert!(window.clipped);
+        assert_eq!(window.line_start, 65);
+        assert_eq!(window.line_end, 85);
+        assert_eq!(window.content.lines().count(), 21);
+    }
+
+    #[test]
+    fn test_retrieve_scope_window_ceiling_clamp() {
+        let source = huge_rust_source(1200);
+        let (_f, path) = write_temp_file(&source, "rs");
+        let window = ContextEngine::retrieve_scope_window(&path, 600, Some(999)).unwrap();
+
+        assert!(window.clipped);
+        assert_eq!(window.line_start, 600 - MAX_CONTEXT_EXPANSION_LINES);
+        assert_eq!(window.line_end, 600 + MAX_CONTEXT_EXPANSION_LINES);
+    }
+
+    #[test]
+    fn test_retrieve_scope_window_small_scope_returned_whole() {
+        // A function well under the whole-scope threshold is returned whole even
+        // with a tiny explicit expansion, with no clipping.
+        let source = huge_rust_source(5);
+        let (_f, path) = write_temp_file(&source, "rs");
+        let window = ContextEngine::retrieve_scope_window(&path, 4, Some(2)).unwrap();
+
+        assert!(!window.clipped);
+        assert_eq!(window.scope_name.as_deref(), Some("huge_function"));
+        assert_eq!(window.line_start, window.scope_line_start);
+        assert_eq!(window.line_end, window.scope_line_end);
+        assert!(window.content.contains("fn huge_function"));
+        assert!(window.content.contains("let v0"));
+        assert!(window.content.contains("let v4"));
+    }
+
+    #[test]
+    fn test_retrieve_scope_window_fallback_no_scope() {
+        let source = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        let (_f, path) = write_temp_file(source, "txt");
+        let window = ContextEngine::retrieve_scope_window(&path, 5, Some(2)).unwrap();
+
+        assert!(!window.clipped);
+        assert_eq!(window.scope_type, "lines");
+        assert_eq!(window.scope_name, None);
+        assert_eq!(window.line_start, 3);
+        assert_eq!(window.line_end, 7);
     }
 }
