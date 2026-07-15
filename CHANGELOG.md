@@ -15,6 +15,25 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.16](https://github.com/rp1-run/1up/compare/v0.1.15...v0.1.16) (2026-07-15)
+
+
+### Features
+
+* **mcp:** bounded batch hydration as the default next action (P4) ([#102](https://github.com/rp1-run/1up/issues/102)) ([10f28b1](https://github.com/rp1-run/1up/commit/10f28b19db57a4c1ce8ba431cf42f94f7602c524))
+* **mcp:** handle recovery, token-level query classification, truthful readiness (P3) ([#106](https://github.com/rp1-run/1up/issues/106)) ([0401cbe](https://github.com/rp1-run/1up/commit/0401cbe881dcedb2a1174f7b0efb52578614e37e))
+* **mcp:** warm-agent turn efficiency — multi-query search, lean envelopes, anchor/scope recovery ([#103](https://github.com/rp1-run/1up/issues/103)) ([73d41f3](https://github.com/rp1-run/1up/commit/73d41f32293760e971cc58355f64cef9e52817c3))
+
+
+### Performance Improvements
+
+* **mcp:** compact oneup_get/oneup_context envelopes (P2) ([#100](https://github.com/rp1-run/1up/issues/100)) ([73e1870](https://github.com/rp1-run/1up/commit/73e187011b4fcdd69aebabec0a124bfdfd5464df))
+
+
+### Documentation
+
+* overhaul repository documentation and scrub tracked leaks ([#104](https://github.com/rp1-run/1up/issues/104)) ([8d8d292](https://github.com/rp1-run/1up/commit/8d8d2927fdfc28e3e077a50aee0fe5c9733d8916))
+
 ## [0.1.15](https://github.com/rp1-run/1up/compare/v0.1.14...v0.1.15) (2026-07-13)
 
 
