@@ -41,13 +41,30 @@ use crate::storage::db::{is_lock_error, Db};
 use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
-    count_vector_rows_for_context, get_all_file_paths_for_context,
-    get_segment_by_prefix_for_context, get_segments_by_ids_for_context,
-    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
+    count_vector_rows_for_context, get_all_file_paths_for_context, get_segment_by_id_for_context,
+    get_segment_by_prefix_for_context, get_segment_ids_by_prefix_for_context,
+    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
+    StoredSegment,
 };
 use crate::storage::swap;
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
+
+/// Floor length (in characters) for unique-prefix handle recovery (T1). A
+/// supplied handle must share at least this many leading characters with a
+/// single indexed segment id before recovery may resolve it, giving 32 bits of
+/// hex discrimination and forbidding short-prefix guesses.
+const MIN_HANDLE_RECOVERY_PREFIX_CHARS: usize = 8;
+
+/// Upper bound on candidate ids fetched at the floor prefix during handle
+/// recovery. A fetch that saturates this limit means the floor prefix is too
+/// broad to discriminate, so recovery declines rather than guess.
+const HANDLE_RECOVERY_CANDIDATE_LIMIT: usize = 32;
+
+/// Upper bound on the bounded process-global failed-handle retry memory (T3).
+/// Once exceeded, the oldest-recorded entry is evicted first so the memory can
+/// never grow without bound across a long-lived MCP session.
+const FAILED_HANDLE_MEMORY_CAP: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct McpProjectRoots {
@@ -211,6 +228,12 @@ pub struct ReadRecord {
     pub context: Option<ContextRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matching_handles: Vec<String>,
+    /// Set only on a record recovered via the unique-prefix gate (T1): the
+    /// original supplied handle that did not resolve exactly or by prefix but
+    /// whose unique canonical prefix mapped to this segment. Additive and
+    /// omitted on every non-recovered record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -1320,13 +1343,104 @@ async fn get_handles_once(
     verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
     let current = open_current_index(state_root).await?;
-    let records = resolve_handle_records(
-        &current.conn,
-        &worktree_context.context_id,
-        handles,
-        verbosity,
-    )
-    .await?;
+    let context_id = &worktree_context.context_id;
+    // The failed-handle memory is keyed and identity-stamped against the same
+    // canonical db path the warm cache uses, so a rejection reflects the exact
+    // index generation the retry would otherwise re-query (T3).
+    let current_identity = index_file_identity(&current.db_path);
+    let normalized: Vec<String> = handles
+        .iter()
+        .map(|handle| normalize_handle(handle))
+        .collect();
+
+    // Pre-pass: reject a handle that already failed this session against this
+    // same index identity without re-querying (T3). An identity mismatch drops
+    // the stale entry so the handle resolves fresh below; an empty handle is
+    // never a memory key (it resolves to the empty-handle rejection instead).
+    let mut prejudged: Vec<Option<ReadRecord>> = Vec::with_capacity(handles.len());
+    {
+        let mut memory = failed_handle_memory()
+            .lock()
+            .expect("failed-handle memory mutex poisoned");
+        for (raw_handle, normalized) in handles.iter().zip(&normalized) {
+            if normalized.is_empty() {
+                prejudged.push(None);
+                continue;
+            }
+            let key = (
+                current.db_path.clone(),
+                context_id.clone(),
+                normalized.clone(),
+            );
+            match memory.lookup(&key, current_identity) {
+                Some(record) => {
+                    let source = ReadSource::Handle {
+                        raw: raw_handle.clone(),
+                        normalized: normalized.clone(),
+                    };
+                    prejudged.push(Some(read_rejected_handle(
+                        source,
+                        record.outcome,
+                        record.matching_handles,
+                    )));
+                }
+                None => prejudged.push(None),
+            }
+        }
+    }
+
+    // Resolve only the handles not already rejected, preserving the batched
+    // exact-then-prefix path (and its within-call independence) untouched.
+    let to_resolve: Vec<String> = handles
+        .iter()
+        .zip(&prejudged)
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(handle, _)| handle.clone())
+        .collect();
+    let resolved =
+        resolve_handle_records(&current.conn, context_id, &to_resolve, verbosity).await?;
+
+    // Merge the pre-rejected and freshly-resolved records back into input order.
+    let mut resolved = resolved.into_iter();
+    let records: Vec<ReadRecord> = prejudged
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                resolved
+                    .next()
+                    .expect("resolved records cover every non-rejected handle")
+            })
+        })
+        .collect();
+
+    // Post-pass: remember fresh failures and forget entries a success cleared
+    // (T3). Pre-rejected records keep their existing entry (they were never
+    // re-queried); a transient `Error` is not remembered so it can be retried.
+    {
+        let mut memory = failed_handle_memory()
+            .lock()
+            .expect("failed-handle memory mutex poisoned");
+        for (normalized, record) in normalized.iter().zip(&records) {
+            if normalized.is_empty() {
+                continue;
+            }
+            let key = (
+                current.db_path.clone(),
+                context_id.clone(),
+                normalized.clone(),
+            );
+            match record.status {
+                ReadStatus::NotFound | ReadStatus::Ambiguous => memory.record_failure(
+                    key,
+                    current_identity,
+                    record.status,
+                    record.matching_handles.clone(),
+                ),
+                ReadStatus::Found => memory.clear(&key),
+                ReadStatus::Rejected | ReadStatus::Error => {}
+            }
+        }
+    }
 
     Ok(ReadPayload {
         status: aggregate_read_status(&records),
@@ -1922,6 +2036,108 @@ async fn record_vector_count_for_context(canonical_db_path: &Path, context_id: &
     }
 }
 
+/// Identity-stamped record of a handle lookup that already failed this session
+/// (T3). `outcome` is the terminal failure status (`NotFound` or `Ambiguous`)
+/// and `matching_handles` carries the candidate ids from an ambiguous failure
+/// so a later rejection can still offer disambiguation without re-querying.
+/// `seq` records insertion order for oldest-first eviction.
+#[derive(Debug, Clone)]
+struct FailedHandleRecord {
+    identity: Option<IndexFileIdentity>,
+    outcome: ReadStatus,
+    matching_handles: Vec<String>,
+    seq: u64,
+}
+
+/// Memory key: canonical `index.db` path, worktree `context_id`, and the
+/// normalized handle. Scoping by the canonical db path and context mirrors the
+/// warm cache key and the context-scoped storage reads, so a rejection can
+/// never leak across indexes or contexts.
+type FailedHandleKey = (PathBuf, String, String);
+
+/// Bounded, insertion-ordered memory of handle lookups that already failed
+/// (T3). Distinct from [`warm_index_cache`] because it is keyed per (index,
+/// context, handle) rather than per index file and holds no live connection.
+/// Every method is synchronous, so the guarding mutex is only ever held for a
+/// pure in-memory operation (never across an `await`).
+#[derive(Default)]
+struct FailedHandleMemory {
+    entries: HashMap<FailedHandleKey, FailedHandleRecord>,
+    next_seq: u64,
+}
+
+impl FailedHandleMemory {
+    /// Decide a handle's fate against recorded history (T3). A recorded failure
+    /// whose stamped identity still matches the current on-disk index is
+    /// returned so the caller can reject the identical retry without
+    /// re-querying; an identity mismatch (a build-aside swap installed a fresh
+    /// index) drops the now-stale entry and returns `None` so the handle
+    /// resolves fresh; an absent entry also returns `None`.
+    fn lookup(
+        &mut self,
+        key: &FailedHandleKey,
+        current_identity: Option<IndexFileIdentity>,
+    ) -> Option<FailedHandleRecord> {
+        match self.entries.get(key) {
+            Some(record) if record.identity == current_identity => Some(record.clone()),
+            Some(_) => {
+                self.entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Record a terminal failure outcome, stamping it with the current index
+    /// identity and the next insertion sequence, then evict the oldest entry
+    /// while over the cap.
+    fn record_failure(
+        &mut self,
+        key: FailedHandleKey,
+        identity: Option<IndexFileIdentity>,
+        outcome: ReadStatus,
+        matching_handles: Vec<String>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(
+            key,
+            FailedHandleRecord {
+                identity,
+                outcome,
+                matching_handles,
+                seq,
+            },
+        );
+        while self.entries.len() > FAILED_HANDLE_MEMORY_CAP {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, record)| record.seq)
+                .map(|(oldest_key, _)| oldest_key.clone())
+            {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Forget any recorded failure for a handle (T3): a fresh success supersedes
+    /// a prior failure, so a later identical call is no longer rejected.
+    fn clear(&mut self, key: &FailedHandleKey) {
+        self.entries.remove(key);
+    }
+}
+
+/// Process-global failed-handle retry memory (T3), mirroring the process-global
+/// shape of [`warm_index_cache`]. Guards a purely in-memory map, so a plain
+/// `std::sync::Mutex` suffices: the lock is never held across an `await`.
+fn failed_handle_memory() -> &'static Mutex<FailedHandleMemory> {
+    static MEMORY: OnceLock<Mutex<FailedHandleMemory>> = OnceLock::new();
+    MEMORY.get_or_init(|| Mutex::new(FailedHandleMemory::default()))
+}
+
 async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     let db_path = project_db_path(state_root);
     if !db_path.exists() {
@@ -2009,7 +2225,7 @@ async fn resolve_handle_via_prefix(
         match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
             SegmentPrefixLookup::Found(segment) => read_segment(source, *segment, verbosity),
             SegmentPrefixLookup::NotFound => {
-                read_message(ReadStatus::NotFound, source, "segment handle was not found")
+                attempt_handle_recovery(conn, context_id, source, normalized, verbosity).await?
             }
             SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
                 status: ReadStatus::Ambiguous,
@@ -2017,10 +2233,144 @@ async fn resolve_handle_via_prefix(
                 segment: None,
                 context: None,
                 matching_handles: ids,
+                recovered_from: None,
                 message: Some("segment handle matched multiple indexed segments".to_string()),
             },
         },
     )
+}
+
+/// Outcome of the pure unique-prefix recovery gate (T1). `candidates` are the
+/// ids sharing the floor prefix; the gate itself never issues a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandleRecovery {
+    /// Exactly one candidate is uniquely closest at the longest matching prefix
+    /// (>= floor); recovery resolves to this id.
+    Found(String),
+    /// Two or more candidates tie at the longest matching prefix; recovery
+    /// declines to guess and surfaces the tied ids for disambiguation.
+    Ambiguous(Vec<String>),
+    /// No candidate reaches the floor prefix; there is nothing to recover.
+    None,
+}
+
+/// Recovery path taken when a handle matched no segment exactly or by prefix
+/// (REQ-001). Fetches the context-scoped candidate ids sharing the floor prefix
+/// (`supplied[..MIN_HANDLE_RECOVERY_PREFIX_CHARS]`, bounded by
+/// [`HANDLE_RECOVERY_CANDIDATE_LIMIT`]) and runs the pure recovery gate. A
+/// unique longest-prefix candidate is re-fetched by its exact id and returned
+/// as a `Found` record disclosing `recovered_from`; a tie yields an explicit
+/// `Ambiguous` record; anything else stays `NotFound`. Context scoping is
+/// inherited from the storage query, so a foreign-context handle can never be
+/// recovered (REQ-001 AC3). A candidate fetch that saturates the limit means
+/// the floor prefix is too broad to discriminate, so recovery declines.
+async fn attempt_handle_recovery(
+    conn: &Connection,
+    context_id: &str,
+    source: ReadSource,
+    normalized: &str,
+    verbosity: Option<&str>,
+) -> anyhow::Result<ReadRecord> {
+    const NOT_FOUND_MESSAGE: &str = "segment handle was not found";
+
+    // Below the floor there are not enough characters to discriminate, so a
+    // floor prefix cannot even be formed; decline without querying.
+    let floor_prefix: String = normalized
+        .chars()
+        .take(MIN_HANDLE_RECOVERY_PREFIX_CHARS)
+        .collect();
+    if floor_prefix.chars().count() < MIN_HANDLE_RECOVERY_PREFIX_CHARS {
+        return Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        ));
+    }
+
+    let candidates = get_segment_ids_by_prefix_for_context(
+        conn,
+        context_id,
+        &floor_prefix,
+        HANDLE_RECOVERY_CANDIDATE_LIMIT,
+    )
+    .await?;
+
+    // A saturated fetch means the floor prefix matches too many segments to
+    // treat any single one as a unique recovery target.
+    if candidates.len() >= HANDLE_RECOVERY_CANDIDATE_LIMIT {
+        return Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        ));
+    }
+
+    match recover_handle_by_unique_prefix(normalized, &candidates) {
+        HandleRecovery::Found(id) => {
+            match get_segment_by_id_for_context(conn, context_id, &id).await? {
+                Some(segment) => Ok(read_recovered_segment(
+                    source,
+                    segment,
+                    verbosity,
+                    normalized.to_string(),
+                )),
+                // The candidate id vanished between the id fetch and the
+                // re-fetch (e.g. a concurrent rebuild); stay truthful.
+                None => Ok(read_message(
+                    ReadStatus::NotFound,
+                    source,
+                    NOT_FOUND_MESSAGE,
+                )),
+            }
+        }
+        HandleRecovery::Ambiguous(ids) => Ok(ReadRecord {
+            status: ReadStatus::Ambiguous,
+            source,
+            segment: None,
+            context: None,
+            matching_handles: ids,
+            recovered_from: None,
+            message: Some(
+                "segment handle prefix matched multiple indexed segments in the active context"
+                    .to_string(),
+            ),
+        }),
+        HandleRecovery::None => Ok(read_message(
+            ReadStatus::NotFound,
+            source,
+            NOT_FOUND_MESSAGE,
+        )),
+    }
+}
+
+/// Pure longest-common-prefix recovery gate (REQ-001). Walks prefix lengths
+/// from the full supplied handle down to [`MIN_HANDLE_RECOVERY_PREFIX_CHARS`];
+/// the first (longest) length at which any candidate matches decides the
+/// outcome, so a lone match recovers (`Found`) and a tie declines with the tied
+/// ids (`Ambiguous`). Candidates are assumed to already share the floor prefix,
+/// so the walk terminates at the floor unless the set is empty. Never
+/// fuzzy-matches: only shared leading characters count.
+fn recover_handle_by_unique_prefix(supplied: &str, candidates: &[String]) -> HandleRecovery {
+    let supplied_chars: Vec<char> = supplied.chars().collect();
+    if supplied_chars.len() < MIN_HANDLE_RECOVERY_PREFIX_CHARS || candidates.is_empty() {
+        return HandleRecovery::None;
+    }
+
+    for len in (MIN_HANDLE_RECOVERY_PREFIX_CHARS..=supplied_chars.len()).rev() {
+        let prefix: String = supplied_chars[..len].iter().collect();
+        let matches: Vec<String> = candidates
+            .iter()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => continue,
+            1 => return HandleRecovery::Found(matches.into_iter().next().unwrap()),
+            _ => return HandleRecovery::Ambiguous(matches),
+        }
+    }
+
+    HandleRecovery::None
 }
 
 fn read_location_record(
@@ -2175,7 +2525,29 @@ fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&s
         segment: Some(segment_record(segment, verbosity)),
         context: None,
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: None,
+    }
+}
+
+/// Single-source disclosure attached to a record recovered via the unique-prefix
+/// gate (T1), stating plainly that the supplied handle did not resolve directly.
+const HANDLE_RECOVERY_MESSAGE: &str =
+    "segment handle did not resolve exactly or by prefix; recovered via its unique canonical prefix within the active context";
+
+/// `Found` record for a segment resolved through unique-prefix recovery: a
+/// normal segment read with the additive `recovered_from` disclosure and a
+/// message naming the recovery (REQ-001).
+fn read_recovered_segment(
+    source: ReadSource,
+    segment: StoredSegment,
+    verbosity: Option<&str>,
+    recovered_from: String,
+) -> ReadRecord {
+    ReadRecord {
+        recovered_from: Some(recovered_from),
+        message: Some(HANDLE_RECOVERY_MESSAGE.to_string()),
+        ..read_segment(source, segment, verbosity)
     }
 }
 
@@ -2245,6 +2617,7 @@ fn read_context(
             truncation,
         }),
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: None,
     }
 }
@@ -2261,6 +2634,35 @@ fn language_for_path(file_path: &Path) -> String {
     }
 }
 
+/// `Rejected` record for an identical failed handle retry (T3). The message is
+/// built from the remembered `outcome` so it names the original cause
+/// truthfully (an ambiguous prefix vs a plain not-found) rather than
+/// re-querying to rediscover it. Carries the candidate ids cached from an
+/// ambiguous failure (empty when the original failure was a plain not-found) so
+/// the follow-up next_actions can still offer disambiguation.
+fn read_rejected_handle(
+    source: ReadSource,
+    outcome: ReadStatus,
+    matching_handles: Vec<String>,
+) -> ReadRecord {
+    let cause = match outcome {
+        ReadStatus::Ambiguous => "matched multiple indexed segments",
+        _ => "was not found",
+    };
+    let message = format!(
+        "this segment handle already {cause} in the active context this session; repeating the identical call was rejected without re-querying"
+    );
+    ReadRecord {
+        status: ReadStatus::Rejected,
+        source,
+        segment: None,
+        context: None,
+        matching_handles,
+        recovered_from: None,
+        message: Some(message),
+    }
+}
+
 fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<String>) -> ReadRecord {
     ReadRecord {
         status,
@@ -2268,6 +2670,7 @@ fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<Strin
         segment: None,
         context: None,
         matching_handles: Vec::new(),
+        recovered_from: None,
         message: Some(message.into()),
     }
 }
@@ -4519,6 +4922,292 @@ mod tests {
             batched[7].segment.as_ref().unwrap().handle,
             "dddd4444eeee5555",
             "a duplicate handle resolves independently and preserves order"
+        );
+    }
+
+    // Observed warm-suite failure fixture (design.md): a single dropped
+    // character late in the handle leaves a 28-char unique shared prefix.
+    const RECOVERY_SUPPLIED: &str = "0b25cc46a316205a1afe69ccd1137e2";
+    const RECOVERY_TRUE_ID: &str = "0b25cc46a316205a1afe69ccd11337e2";
+
+    #[test]
+    fn recover_handle_gate_resolves_unique_longest_prefix() {
+        // A lone candidate uniquely closest at a >= floor prefix recovers.
+        let candidates = vec![RECOVERY_TRUE_ID.to_string()];
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &candidates),
+            HandleRecovery::Found(RECOVERY_TRUE_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn recover_handle_gate_prefers_the_strictly_closer_candidate() {
+        // One candidate shares a 28-char prefix, the other diverges from the
+        // supplied handle right at the floor: the strictly closer id wins
+        // uniquely rather than tying. (`0` differs from the supplied char at
+        // index 8, so `far` shares exactly the 8-char floor.)
+        let far = format!("{}000000000000000000000000", &RECOVERY_SUPPLIED[..8]);
+        let candidates = vec![RECOVERY_TRUE_ID.to_string(), far];
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &candidates),
+            HandleRecovery::Found(RECOVERY_TRUE_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn recover_handle_gate_declines_on_a_tie() {
+        // Two candidates both diverge from the supplied handle at the floor
+        // (char index 8 is `f`, not the supplied `a`) and differ only from each
+        // other afterward, so they tie at the 8-char prefix; the gate declines
+        // to guess and returns both.
+        let a = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "a".repeat(23));
+        let b = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "b".repeat(23));
+        match recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &[a.clone(), b.clone()]) {
+            HandleRecovery::Ambiguous(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&a) && ids.contains(&b));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_handle_gate_declines_below_the_floor_or_without_candidates() {
+        // A supplied handle shorter than the floor can never discriminate.
+        assert_eq!(
+            recover_handle_by_unique_prefix("0b25cc", &[RECOVERY_TRUE_ID.to_string()]),
+            HandleRecovery::None
+        );
+        // No candidate to recover to.
+        assert_eq!(
+            recover_handle_by_unique_prefix(RECOVERY_SUPPLIED, &[]),
+            HandleRecovery::None
+        );
+    }
+
+    /// Seed a memory index with one segment per (context, id) pair and resolve a
+    /// single handle through the full residual + recovery path.
+    async fn resolve_one(conn: &Connection, context_id: &str, handle: &str) -> ReadRecord {
+        let records = resolve_handle_records(conn, context_id, &[handle.to_string()], None)
+            .await
+            .unwrap();
+        records.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovers_unique_prefix_and_discloses_source() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-recovery";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        let record = resolve_one(&conn, ctx, RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::Found);
+        assert_eq!(
+            record.segment.as_ref().unwrap().handle,
+            RECOVERY_TRUE_ID,
+            "recovery hydrates the intended segment"
+        );
+        assert_eq!(
+            record.recovered_from.as_deref(),
+            Some(RECOVERY_SUPPLIED),
+            "a recovered record discloses the supplied handle"
+        );
+        assert!(
+            record.message.is_some(),
+            "recovery is explained in the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovery_never_guesses_a_tie() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-recovery-tie";
+        let a = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "a".repeat(23));
+        let b = format!("{}f{}", &RECOVERY_SUPPLIED[..8], "b".repeat(23));
+        segments::upsert_segment_for_context(&conn, ctx, &test_segment(&a, "src/a.rs"))
+            .await
+            .unwrap();
+        segments::upsert_segment_for_context(&conn, ctx, &test_segment(&b, "src/b.rs"))
+            .await
+            .unwrap();
+
+        let record = resolve_one(&conn, ctx, RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::Ambiguous);
+        assert!(
+            record.segment.is_none(),
+            "an ambiguous handle is never hydrated"
+        );
+        assert_eq!(record.matching_handles.len(), 2);
+        assert!(record.recovered_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_recovery_is_context_scoped() {
+        // The intended segment lives only in a foreign context, so the supplied
+        // handle must never recover in the active context (REQ-001 AC3).
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        segments::upsert_segment_for_context(
+            &conn,
+            "ctx-foreign",
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        let record = resolve_one(&conn, "ctx-active", RECOVERY_SUPPLIED).await;
+        assert_eq!(record.status, ReadStatus::NotFound);
+        assert!(record.recovered_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_without_a_floor_prefix_candidate_stays_not_found() {
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-miss";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment(RECOVERY_TRUE_ID, "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        // Shares no floor prefix with any indexed id.
+        let record = resolve_one(&conn, ctx, "ffffffffa316205a1afe69ccd1137e2").await;
+        assert_eq!(record.status, ReadStatus::NotFound);
+        assert!(record.recovered_from.is_none());
+    }
+
+    // Failed-handle retry memory gate (T3). Exercised on a fresh local
+    // `FailedHandleMemory` rather than the process-global one so the matrix is
+    // deterministic and parallel-safe.
+
+    /// Fabricate a distinct, comparable index identity in a platform-agnostic
+    /// way (real ids come from `index_file_identity`; the gate only compares
+    /// them for equality).
+    #[cfg(unix)]
+    fn fake_identity(seed: u64) -> Option<IndexFileIdentity> {
+        Some((1, seed))
+    }
+    #[cfg(not(unix))]
+    fn fake_identity(seed: u64) -> Option<IndexFileIdentity> {
+        Some((seed, std::time::SystemTime::UNIX_EPOCH))
+    }
+
+    fn memory_key(handle: &str) -> FailedHandleKey {
+        (
+            PathBuf::from("/tmp/index.db"),
+            "ctx".to_string(),
+            handle.to_string(),
+        )
+    }
+
+    #[test]
+    fn failed_handle_memory_rejects_identical_failure_under_same_identity() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        let candidates = vec!["deadbeefdeadbeef1111".to_string()];
+        memory.record_failure(
+            key.clone(),
+            fake_identity(7),
+            ReadStatus::Ambiguous,
+            candidates.clone(),
+        );
+
+        let hit = memory
+            .lookup(&key, fake_identity(7))
+            .expect("an identical failure under the same identity is a memory hit");
+        assert_eq!(hit.outcome, ReadStatus::Ambiguous);
+        assert_eq!(
+            hit.matching_handles, candidates,
+            "the rejection carries the cached candidate ids for disambiguation"
+        );
+        // The entry survives the reject (a retry is rejected without re-query,
+        // not consumed), so a second identical retry is still rejected.
+        assert!(memory.lookup(&key, fake_identity(7)).is_some());
+    }
+
+    #[test]
+    fn failed_handle_memory_drops_stale_entry_on_identity_change() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        memory.record_failure(
+            key.clone(),
+            fake_identity(1),
+            ReadStatus::NotFound,
+            Vec::new(),
+        );
+
+        // A build-aside swap installed a fresh index: the mismatched identity
+        // drops the stale entry and declines to reject, so the handle resolves
+        // fresh.
+        assert!(memory.lookup(&key, fake_identity(2)).is_none());
+        // And the now-dropped entry no longer rejects even at the original
+        // identity.
+        assert!(memory.lookup(&key, fake_identity(1)).is_none());
+    }
+
+    #[test]
+    fn failed_handle_memory_clear_forgets_a_prior_failure() {
+        let mut memory = FailedHandleMemory::default();
+        let key = memory_key("deadbeefdeadbeef");
+        memory.record_failure(
+            key.clone(),
+            fake_identity(1),
+            ReadStatus::NotFound,
+            Vec::new(),
+        );
+        memory.clear(&key);
+        assert!(
+            memory.lookup(&key, fake_identity(1)).is_none(),
+            "a success clears the entry, so the next identical call resolves fresh"
+        );
+    }
+
+    #[test]
+    fn failed_handle_memory_evicts_oldest_over_cap() {
+        let mut memory = FailedHandleMemory::default();
+        // Insert one past the cap; the very first (oldest) entry is evicted.
+        for i in 0..=FAILED_HANDLE_MEMORY_CAP {
+            memory.record_failure(
+                memory_key(&format!("handle-{i:04}")),
+                fake_identity(1),
+                ReadStatus::NotFound,
+                Vec::new(),
+            );
+        }
+        assert_eq!(memory.entries.len(), FAILED_HANDLE_MEMORY_CAP);
+        assert!(
+            memory
+                .lookup(&memory_key("handle-0000"), fake_identity(1))
+                .is_none(),
+            "the oldest entry is evicted first once over the cap"
+        );
+        assert!(
+            memory
+                .lookup(
+                    &memory_key(&format!("handle-{:04}", FAILED_HANDLE_MEMORY_CAP)),
+                    fake_identity(1)
+                )
+                .is_some(),
+            "the newest entry survives eviction"
         );
     }
 

@@ -3299,6 +3299,61 @@ fn git_head_oid(dir: &Path) -> String {
 }
 
 #[test]
+fn mcp_readiness_reports_pinned_detached_commit_as_ready() {
+    let _model_guard = RestoreHiddenModelGuard::new();
+
+    let repo = create_multi_lang_fixture();
+    git(repo.path(), &["init"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "oneup-test@example.com"],
+    );
+    git(repo.path(), &["config", "user.name", "1up Test"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    let indexed_head = git_head_oid(repo.path());
+
+    // Detach HEAD at the exact commit before indexing so the segments are stored
+    // under the detached-commit context and readiness reflects a pinned checkout
+    // whose working tree matches the indexed state.
+    git(
+        repo.path(),
+        &["checkout", "--detach", indexed_head.as_str()],
+    );
+
+    init_and_index(&repo);
+
+    // Address the repo per call via `path` from a neutral isolated-state server
+    // so no daemon registers or reconciles the repo and the readiness
+    // observation cannot race a refresh.
+    let neutral = TempDir::new().unwrap();
+    fs::create_dir_all(neutral.path().join(".git")).unwrap();
+    let mut client = McpTestClient::start_with_isolated_state(neutral.path());
+    let repo_path = repo.path().to_str().unwrap();
+
+    let result = client.call_tool(TOOL_STATUS, serde_json::json!({ "path": repo_path }));
+    let envelope = mcp_structured(&result);
+    assert_mcp_response_is_presentation_free(&result);
+
+    // The pinned-detached readiness contract (REQ-005): an exact detached commit
+    // matching the indexed state is never downgraded for branch ambiguity. The
+    // CI-faithful test HOME carries a model-download-failed marker, so the read
+    // path reports `degraded` for unavailable embeddings (as the existing ready
+    // fixture also does); that is orthogonal to the branch caveat. The behavior
+    // under test is that no branch-ambiguity reason is attached, which is what
+    // `apply_branch_readiness` now exempts. The pure `Ready` outcome is covered
+    // by the direct `apply_branch_readiness` unit matrix.
+    assert_eq!(envelope["data"]["branch_status"], "detached");
+    assert_eq!(envelope["data"]["drifted"], false);
+    let reason = envelope["data"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("branch context") && !reason.contains("not branch-filtered"),
+        "a pinned detached commit must not carry a branch-ambiguity reason: {envelope:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
+#[test]
 fn mcp_status_reports_head_drift_and_start_clears_it() {
     let repo = create_multi_lang_fixture();
     git(repo.path(), &["init"]);
@@ -3479,6 +3534,26 @@ fn mcp_get_ignores_handles_from_other_context() {
         "foreign-context segment should not be hydrated: {envelope:?}"
     );
     assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
+
+    // REQ-001 AC3: a mistyped handle whose only unique-prefix match lives in a
+    // foreign context must never be recovered into the active context. The
+    // seeded id is "other-context-segment"; a one-character typo shares a long
+    // prefix but must still resolve to not_found with no recovery disclosure.
+    let recovery = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [":other-context-segmenX"] }),
+    );
+    assert_eq!(recovery["isError"], true);
+    let recovery_envelope = mcp_structured(&recovery);
+    assert_eq!(
+        recovery_envelope["data"]["records"][0]["status"],
+        "not_found"
+    );
+    assert!(
+        recovery_envelope["data"]["records"][0]["recovered_from"].is_null(),
+        "a foreign-context handle must never be recovered: {recovery_envelope:?}"
+    );
+    assert!(recovery_envelope["data"]["records"][0]["segment"].is_null());
 }
 
 #[test]
@@ -4125,7 +4200,134 @@ fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
     );
     assert_eq!(records[1]["status"], "not_found");
     assert_eq!(records[1]["source"]["normalized"], "does-not-exist");
-    assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
+
+    // REQ-002: the ambiguous record's disambiguation next-action prefills
+    // oneup_get with the real candidate ids (never placeholders) ahead of the
+    // generic search fallback, so an agent can pick one unambiguous handle.
+    let next_actions = envelope["next_actions"].as_array().unwrap();
+    assert_eq!(next_actions[0]["tool"], TOOL_GET);
+    let prefilled = next_actions[0]["arguments"]["handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let candidates = records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prefilled, candidates,
+        "disambiguation action must prefill the exact ambiguous candidates"
+    );
+    assert!(
+        prefilled.iter().all(|handle| !handle.is_empty()),
+        "disambiguation handles must be real values, never placeholders: {prefilled:?}"
+    );
+    assert!(
+        next_actions
+            .iter()
+            .any(|action| action["tool"] == TOOL_SEARCH),
+        "the generic search fallback must remain available: {next_actions:?}"
+    );
+    assert_mcp_next_actions_are_canonical(envelope);
+}
+
+#[test]
+fn mcp_get_rejects_an_identical_failed_handle_retry_within_a_session() {
+    // REQ-003: a handle that failed to resolve is remembered against the index
+    // identity, so an identical retry against the unchanged index is rejected
+    // without re-querying and steered to fresh guidance rather than a repeat.
+    let tmp = create_ambiguous_handle_fixture();
+    let _guard = init_and_index_fts_only(&tmp);
+    let mut client = McpTestClient::start(tmp.path());
+
+    let search = client.call_tool(
+        TOOL_SEARCH,
+        serde_json::json!({ "query": "ambiguous_collision_token", "limit": 32 }),
+    );
+    assert_ne!(search["isError"], true);
+    let handles = mcp_structured(&search)["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["handle"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let ambiguous_prefix = ambiguous_handle_prefix(&handles);
+
+    // First call: the ambiguous prefix fails with disambiguation candidates.
+    let first = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [ambiguous_prefix.clone()] }),
+    );
+    assert_eq!(first["isError"], true);
+    let first_envelope = mcp_structured(&first);
+    let first_records = first_envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(first_records[0]["status"], "ambiguous");
+    let candidates = first_records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(candidates.len() > 1);
+
+    // Second identical call: rejected without re-query, carrying the cached
+    // candidates and next-actions that differ from repeating the call.
+    let second = client.call_tool(
+        TOOL_GET,
+        serde_json::json!({ "handles": [ambiguous_prefix.clone()] }),
+    );
+    assert_eq!(second["isError"], true);
+    assert_mcp_response_is_presentation_free(&second);
+    let second_envelope = mcp_structured(&second);
+    let second_records = second_envelope["data"]["records"].as_array().unwrap();
+    assert_eq!(
+        second_records[0]["status"], "rejected",
+        "an identical failed retry is rejected, not resolved again: {second_records:?}"
+    );
+    assert_eq!(second_records[0]["source"]["kind"], "handle");
+    let rejected_candidates = second_records[0]["matching_handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_candidates, candidates,
+        "the rejection reuses the candidates cached from the original failure"
+    );
+
+    let next_actions = second_envelope["next_actions"].as_array().unwrap();
+    assert_eq!(
+        next_actions[0]["tool"], TOOL_GET,
+        "a rejected retry with cached candidates prefills a disambiguating oneup_get: {next_actions:?}"
+    );
+    let prefilled = next_actions[0]["arguments"]["handles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handle| handle.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(prefilled, candidates);
+    assert!(
+        !prefilled.contains(&ambiguous_prefix),
+        "the follow-up must differ from repeating the failed call: {next_actions:?}"
+    );
+    let search_action = next_actions
+        .iter()
+        .find(|action| action["tool"] == TOOL_SEARCH)
+        .expect("a search fallback must trail the rejection");
+    assert!(
+        search_action["reason"]
+            .as_str()
+            .unwrap()
+            .contains("refined query"),
+        "the rejection steers toward a refined query, not a repeat: {search_action:?}"
+    );
+    assert_mcp_next_actions_are_canonical(second_envelope);
 }
 
 #[test]

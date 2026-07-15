@@ -579,6 +579,16 @@ fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeCont
         return;
     }
 
+    // An exact detached commit that matches the indexed state is pinned, not
+    // ambiguous, so it must not be downgraded. This aligns the readiness path
+    // with the search path, which already treats `Detached` as non-degraded
+    // (`SearchScope::degraded_reason`, src/search/scope.rs). Exempt it only when
+    // HEAD is proven un-drifted (`Some(false)`); `Some(true)` (drifted) and
+    // `None` (unprovable) keep the degraded caveat. (REQ-005)
+    if context.branch_status == BranchStatus::Detached && payload.drifted == Some(false) {
+        return;
+    }
+
     let branch_reason = context.branch_status.branch_scope_caveat();
 
     if payload.status == ReadinessStatus::Ready {
@@ -873,12 +883,61 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
         )];
     }
 
-    // REQ-008: Placeholder-free output. Omit arguments when we cannot synthesize a real query.
-    vec![action(
-        TOOL_SEARCH,
-        "Search again to obtain a valid handle or precise file location.",
-        None,
-    )]
+    // No content hydrated: give status-aware guidance for the failed handle
+    // records so an agent can disambiguate or refine instead of blindly
+    // repeating the call (REQ-002).
+    handle_failure_next_actions(payload)
+}
+
+/// Next_actions for a get call that hydrated no content (REQ-002, REQ-003). A
+/// failure carrying candidate ids — an ambiguous prefix or a rejected identical
+/// retry whose original failure was ambiguous — prepends a ready-to-issue
+/// `oneup_get` prefilled with the real candidate ids from `matching_handles`
+/// (never placeholders) so the agent can pick one unambiguous handle ahead of
+/// the generic search fallback. The trailing search reason is the most specific
+/// applicable: a rejected identical retry is steered to a refined query instead
+/// of repeating the call; an absent handle notes it is not in the active
+/// context. The placeholder-free search fallback always trails (REQ-008) so
+/// there is always a forward action that differs from repeating the call.
+fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
+    let mut actions = Vec::new();
+
+    if let Some(candidates) = payload
+        .records
+        .iter()
+        .find(|record| {
+            matches!(
+                record.status,
+                ops::ReadStatus::Ambiguous | ops::ReadStatus::Rejected
+            ) && !record.matching_handles.is_empty()
+        })
+        .map(|record| record.matching_handles.clone())
+    {
+        actions.push(action(
+            TOOL_GET,
+            "Hydrate the listed candidate handles to choose the one you meant.",
+            Some(json!({ "handles": candidates })),
+        ));
+    }
+
+    let rejected_identical_retry = payload
+        .records
+        .iter()
+        .any(|record| record.status == ops::ReadStatus::Rejected);
+    let absent_from_context = payload
+        .records
+        .iter()
+        .any(|record| record.status == ops::ReadStatus::NotFound);
+    let search_reason = if rejected_identical_retry {
+        "This identical handle already failed in the active context this session; search with a refined query instead of repeating the call."
+    } else if absent_from_context {
+        "The handle is not present in the active context; search to obtain a valid handle."
+    } else {
+        "Search again to obtain a valid handle or precise file location."
+    };
+    actions.push(action(TOOL_SEARCH, search_reason, None));
+
+    actions
 }
 
 fn symbol_next_actions(payload: &SymbolPayload, name: &str) -> Vec<NextAction> {
@@ -1475,6 +1534,77 @@ mod tests {
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
     }
 
+    fn detached_context(branch_status: BranchStatus) -> WorktreeContext {
+        use std::path::PathBuf;
+        WorktreeContext {
+            context_id: "ctx".to_string(),
+            state_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: crate::shared::types::WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status,
+        }
+    }
+
+    fn ready_payload(drifted: Option<bool>) -> ReadinessPayload {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Ready;
+        payload.summary = "The index is ready.".to_string();
+        payload.reason = None;
+        payload.drifted = drifted;
+        payload
+    }
+
+    #[test]
+    fn apply_branch_readiness_pins_exact_detached_commit() {
+        let mut named = ready_payload(Some(false));
+        apply_branch_readiness(&mut named, &detached_context(BranchStatus::Named));
+        assert_eq!(named.status, ReadinessStatus::Ready);
+        assert!(named.reason.is_none());
+
+        let mut pinned = ready_payload(Some(false));
+        apply_branch_readiness(&mut pinned, &detached_context(BranchStatus::Detached));
+        assert_eq!(pinned.status, ReadinessStatus::Ready);
+        assert!(
+            pinned.reason.is_none(),
+            "pinned detached commit must not carry a branch-ambiguity reason"
+        );
+    }
+
+    #[test]
+    fn apply_branch_readiness_degrades_unprovable_or_ambiguous_branches() {
+        let detached_caveat = BranchStatus::Detached.branch_scope_caveat();
+        for drifted in [Some(true), None] {
+            let mut payload = ready_payload(drifted);
+            apply_branch_readiness(&mut payload, &detached_context(BranchStatus::Detached));
+            assert_eq!(
+                payload.status,
+                ReadinessStatus::Degraded,
+                "detached with drifted={drifted:?} must degrade"
+            );
+            assert_eq!(payload.reason.as_deref(), Some(detached_caveat.as_str()));
+        }
+
+        for status in [BranchStatus::Unreadable, BranchStatus::Unknown] {
+            let mut payload = ready_payload(Some(false));
+            apply_branch_readiness(&mut payload, &detached_context(status));
+            assert_eq!(
+                payload.status,
+                ReadinessStatus::Degraded,
+                "{status:?} must degrade even when un-drifted"
+            );
+            assert_eq!(
+                payload.reason.as_deref(),
+                Some(status.branch_scope_caveat().as_str())
+            );
+        }
+    }
+
     #[test]
     fn impact_request_accepts_public_handle_anchor() {
         let mut input = impact_input();
@@ -1678,6 +1808,7 @@ mod tests {
                     segment: None,
                     context: Some(context),
                     matching_handles: Vec::new(),
+                    recovered_from: None,
                     message: None,
                 })
                 .collect(),
@@ -1782,5 +1913,118 @@ mod tests {
             MAX_RECOVERY_ACTIONS,
             "recovery actions must be deduped per path"
         );
+    }
+
+    fn handle_record(status: ops::ReadStatus, matching_handles: Vec<String>) -> ops::ReadRecord {
+        ops::ReadRecord {
+            status,
+            source: ops::ReadSource::Handle {
+                raw: ":abc".to_string(),
+                normalized: "abc".to_string(),
+            },
+            segment: None,
+            context: None,
+            matching_handles,
+            recovered_from: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn ambiguous_record_prefills_oneup_get_with_real_candidates_before_search() {
+        let candidates = vec![
+            "0b25cc46a316205a1afe69ccd11337e2".to_string(),
+            "0b25cc46a316205a1afe69ccd1144abc".to_string(),
+        ];
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(
+                ops::ReadStatus::Ambiguous,
+                candidates.clone(),
+            )],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions[0].tool, TOOL_GET);
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "handles": candidates })),
+            "disambiguation action must prefill the real candidate ids"
+        );
+        assert!(
+            actions.iter().any(|action| action.tool == TOOL_SEARCH),
+            "generic search fallback must trail the disambiguation action"
+        );
+    }
+
+    #[test]
+    fn not_found_record_notes_absence_from_active_context() {
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::NotFound, Vec::new())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_SEARCH);
+        assert!(actions[0].arguments.is_none());
+        assert!(
+            actions[0].reason.contains("active context"),
+            "not_found guidance must note the handle is absent from the active context: {}",
+            actions[0].reason
+        );
+    }
+
+    #[test]
+    fn rejected_record_offers_candidates_and_a_refined_search_not_a_repeat() {
+        // A rejected identical retry whose original failure was ambiguous keeps
+        // the cached candidate ids, so the follow-up prefills a disambiguating
+        // oneup_get and steers the trailing search away from repeating the call
+        // (REQ-003).
+        let candidates = vec![
+            "0b25cc46a316205a1afe69ccd11337e2".to_string(),
+            "0b25cc46a316205a1afe69ccd1144abc".to_string(),
+        ];
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::Rejected, candidates.clone())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions[0].tool, TOOL_GET);
+        assert_eq!(
+            actions[0].arguments,
+            Some(json!({ "handles": candidates })),
+            "a rejected retry with cached candidates prefills oneup_get with the real ids"
+        );
+        let search = actions
+            .iter()
+            .find(|action| action.tool == TOOL_SEARCH)
+            .expect("a rejected retry must still trail a search fallback");
+        assert!(
+            search.reason.contains("refined query"),
+            "the rejection must steer toward a refined query, not a repeat: {}",
+            search.reason
+        );
+    }
+
+    #[test]
+    fn rejected_record_without_candidates_only_offers_a_refined_search() {
+        // A rejected retry whose original failure was a plain not-found carries
+        // no candidates, so only the refined-query search fallback is offered
+        // (REQ-003).
+        let payload = ReadPayload {
+            status: OperationStatus::Empty,
+            records: vec![handle_record(ops::ReadStatus::Rejected, Vec::new())],
+        };
+
+        let actions = read_next_actions(&payload);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_SEARCH);
+        assert!(actions[0].reason.contains("refined query"));
     }
 }

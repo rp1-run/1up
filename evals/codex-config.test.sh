@@ -58,6 +58,7 @@ providers:
         PATH: "$PATH"
         FAKE_CODEX_CAPTURE: "$CAPTURE"
       cli_config:
+        suppress_unstable_features_warning: true
         features:
           apps: false
           non_prefixed_mcp_tool_names: true
@@ -118,15 +119,21 @@ case "$ONEUP_ARGV" in
   *'features.apps=false'*'features.non_prefixed_mcp_tool_names=true'*'features.plugins=false'*'mcp_servers.oneup.command="1up"'*"mcp_servers.oneup.args=[\"mcp\", \"--path\", \"$WORK_DIR/repo\"]"*'mcp_servers.oneup.required=true'*'mcp_servers.oneup.startup_timeout_sec=30'*) ;;
   *) fail "1up target did not receive the workspace-bound oneup MCP overrides" ;;
 esac
+case "$ONEUP_ARGV" in
+  *'suppress_unstable_features_warning=true'*) ;;
+  *) fail "1up target did not receive the unstable-feature warning suppression" ;;
+esac
 case "$BASELINE_ARGV" in
   *mcp_servers.oneup*) fail "baseline target inherited oneup MCP overrides" ;;
   *non_prefixed_mcp_tool_names*) fail "baseline target inherited oneup tool-name behavior" ;;
   *'features.apps=false'*|*'features.plugins=false'*) fail "baseline target inherited oneup tool-surface isolation" ;;
+  *suppress_unstable_features_warning*) fail "baseline target inherited the unstable-feature warning suppression" ;;
 esac
 case "$GRADER_ARGV" in
   *mcp_servers.oneup*) fail "grader inherited oneup MCP overrides" ;;
   *non_prefixed_mcp_tool_names*) fail "grader inherited oneup tool-name behavior" ;;
   *'features.apps=false'*|*'features.plugins=false'*) fail "grader inherited oneup tool-surface isolation" ;;
+  *suppress_unstable_features_warning*) fail "grader inherited the unstable-feature warning suppression" ;;
 esac
 
 echo "Codex config regression passed"
