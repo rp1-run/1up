@@ -28,8 +28,8 @@
   <img src="assets/readme/icons/lobehub/mcp.svg" alt="MCP" width="28" height="28" />
 </p>
 
-1up turns a repository or Git worktree into a local, on-machine index ranked by meaning and text,
-and serves it to MCP-capable coding agents over MCP. It is for developers whose agents open with
+1up turns a repository or Git worktree into a local index ranked by meaning and text,
+and serves it to coding agents over MCP. It is for developers whose agents open with
 broad repository reads and burn tokens and time doing it: with 1up the agent starts from ranked,
 source-grounded evidence, hydrates only the spans it needs, then verifies symbols and likely
 impact — all from an index that never leaves your machine.
@@ -40,7 +40,7 @@ verify rather than exhaustive proofs.
 
 ## <img src="assets/readme/icons/heroicons-solid/bolt.svg" alt="" width="20" height="20"> Why 1up
 
-- **Measured wins, not vibes.** In one paired run — the same agent answering the same seven
+- **Measured, not promised.** In one paired run — the same agent answering the same seven
   questions, with 1up versus without — 1up cut input tokens 44%, latency 42%, and cost 52%, and all
   seven cases were answered correctly both ways.
 - **Ranked by meaning and text.** Hybrid vector, full-text, and symbol retrieval finds code by
@@ -71,7 +71,7 @@ reproduction steps live in [evals/README.md](evals/README.md).
 
 ## <img src="assets/readme/icons/heroicons-solid/rocket-launch.svg" alt="" width="20" height="20"> Start Here
 
-Two ways to get going. Both end with the `oneup` MCP server configured for this repository.
+Two ways to get going. Both end with the `oneup` MCP server configured for your repository.
 
 ### Option 1: Let Your Agent Configure 1up
 

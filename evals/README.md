@@ -152,7 +152,7 @@ check is a manual step and is out of agent scope.
 
 The recall harness measures 1up semantic-search retrieval quality directly (not agent MCP tool selection), so it invokes the CLI `search`/`get` path rather than the MCP suites above. It is now a **baseline-relative gate**: it fails closed on a semantic-path preflight and exits non-zero when recall regresses beyond tolerance, so a vector-storage, embedder, or ranking change that quietly loses recall stops CI red instead of merging blind. It remains distinct from MCP release-readiness evidence (that lives in the adoption suites above) but is no longer merely historical.
 
-**MODEL-ENABLED — never run in-agent.** `just eval-recall`, `just eval-recall-ab`, and `just eval-recall-baseline` reindex with the embedding model enabled and hang inside agent sessions. Run them only as a manual pre-merge DoD step or on the scheduled `.github/workflows/embedding-quality.yml` workflow.
+**MODEL-ENABLED — never run in-agent.** `just eval-recall`, `just eval-recall-ab`, and `just eval-recall-baseline` reindex with the embedding model enabled and hang inside agent sessions. Run them only as a manual pre-merge step or on the scheduled `.github/workflows/embedding-quality.yml` workflow.
 
 **Script**: [`suites/1up-search/recall.ts`](suites/1up-search/recall.ts) (impure driver)
 **Gate logic**: [`suites/1up-search/recall-compare.ts`](suites/1up-search/recall-compare.ts) (pure, unit-tested with `bun test`, no model or index)
@@ -214,7 +214,7 @@ All recall recipes reindex with `--exclude-glob 'evals/suites/1up-search/recall-
 just eval-recall-ab
 ```
 
-Confirms INT8-vs-FP32 recall parity within tolerance — the required pre-merge DoD for a variant/model change. It runs `1up stop` then reindexes and scores the `fp32` leg (captured to a temporary baseline), then `1up stop` + reindexes + scores the `int8` leg gated against that temp baseline within `ONEUP_RECALL_TOLERANCE`, exiting non-zero beyond it. `1up stop` per leg prevents a live daemon holding the other variant from serving query embeddings for the wrong leg; the pinned `recall-baseline.json` is never touched. Record the resulting numbers in the baseline-update commit.
+Confirms INT8-vs-FP32 recall parity within tolerance — the required pre-merge check for a variant/model change. It runs `1up stop` then reindexes and scores the `fp32` leg (captured to a temporary baseline), then `1up stop` + reindexes + scores the `int8` leg gated against that temp baseline within `ONEUP_RECALL_TOLERANCE`, exiting non-zero beyond it. `1up stop` per leg prevents a live daemon holding the other variant from serving query embeddings for the wrong leg; the pinned `recall-baseline.json` is never touched. Record the resulting numbers in the baseline-update commit.
 
 ### Baseline-update policy
 
