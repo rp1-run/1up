@@ -11,7 +11,9 @@ import {
   assertStructuredOneupMcpResponses,
   assertSymbolVerificationUsed,
   assertValidOneupMcpCalls,
-  reportEfficiency,
+  assertWarmReadiness,
+  NOT_APPLICABLE_REASON,
+  reportRunMetrics,
 } from "./index.ts";
 
 let toolId = 0;
@@ -222,6 +224,109 @@ describe("assertReadinessWorkflowUsed", () => {
 
     expect(result.pass).toBe(false);
     expect(result.reason).toContain("oneup_start happened after discovery");
+  });
+});
+
+describe("assertWarmReadiness", () => {
+  test("passes with exactly one status before discovery on a warm index", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
+  });
+
+  test("fails when the initial status check is missing", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([toolCall("mcp__oneup__oneup_search", { query: "daemon" })]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("missing initial oneup_status");
+  });
+
+  test("fails when status is polled more than once", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("exactly one oneup_status, saw 2");
+  });
+
+  test("fails when discovery happens before the status check", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        toolCall("mcp__oneup__oneup_status", {}),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("after discovery");
+  });
+
+  test("fails when oneup_start triggers indexing in a warm case", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        toolCall("mcp__oneup__oneup_start", { mode: "index_if_needed" }),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(false);
+    expect(result.reason).toContain("oneup_start");
+  });
+
+  test.each(["1up index", "1up reindex", "1up start", "/usr/bin/1up index"])(
+    "rejects Bash indexing in a warm case: %s",
+    (command) => {
+      const result = assertWarmReadiness(
+        "",
+        makeContext([
+          toolCall("mcp__oneup__oneup_status", {}),
+          bash(command),
+          toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+        ]),
+      );
+
+      expect(result.pass).toBe(false);
+      expect(result.reason).toContain("Bash indexing in a warm case");
+    },
+  );
+
+  test("allows a non-indexing Bash 1up call after the warm status", () => {
+    const result = assertWarmReadiness(
+      "",
+      makeContext([
+        toolCall("mcp__oneup__oneup_status", {}),
+        bash("1up search daemon"),
+        toolCall("mcp__oneup__oneup_search", { query: "daemon" }),
+      ]),
+    );
+
+    expect(result.pass).toBe(true);
+  });
+
+  test("marks the isolated baseline variant not-applicable without credit", () => {
+    const result = assertWarmReadiness("", makeVariantContext("baseline"));
+
+    expect(result.pass).toBe(true);
+    expect(result.reason.startsWith(NOT_APPLICABLE_REASON)).toBe(true);
   });
 });
 
@@ -770,9 +875,9 @@ describe("assertValidOneupMcpCalls", () => {
   });
 });
 
-describe("reportEfficiency", () => {
-  test("reports Codex usage when Claude turn metadata is absent", () => {
-    const result = reportEfficiency("", {
+describe("reportRunMetrics", () => {
+  test("is pass-always and score-neutral so it never grades a provider", () => {
+    const result = reportRunMetrics("", {
       providerResponse: {
         raw: JSON.stringify({
           items: [{ type: "agent_message", id: "message-1", text: "done" }],
@@ -787,20 +892,22 @@ describe("reportEfficiency", () => {
     });
 
     expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
     expect(result.reason).toContain("duration n/a");
-    expect(result.reason).toContain("1 turn");
     expect(result.reason).toContain("cached:600");
     expect(result.reason).toContain("reasoning:80");
-    expect(result.score).toBe(0);
-    expect(result.namedScores).toBeUndefined();
   });
 
-  test("prefers token counts from raw provider usage", () => {
-    const result = reportEfficiency("", {
+  test("emits raw latency/tokens/cost/calls namedScores from provider usage", () => {
+    const result = reportRunMetrics("", {
       providerResponse: {
         metadata: {
           numTurns: 3,
           durationMs: 42_000,
+          toolCalls: [
+            { id: "t1", name: "mcp__oneup__oneup_status", input: {} },
+            { id: "t2", name: "mcp__oneup__oneup_search", input: {} },
+          ],
         },
         cost: 0.12,
         raw: JSON.stringify({
@@ -814,14 +921,17 @@ describe("reportEfficiency", () => {
     });
 
     expect(result.pass).toBe(true);
+    expect(result.score).toBe(1);
     expect(result.namedScores).toEqual({
-      Speed: 79,
-      "Cost Efficiency": 76,
+      latency_ms: 42_000,
+      tokens: 2_100,
+      cost_usd: 0.12,
+      calls: 2,
     });
     expect(result.reason).toContain("42s");
     expect(result.reason).toContain("$0.12");
+    expect(result.reason).toContain("2 calls");
     expect(result.reason).toContain("in:1,200");
-    expect(result.reason).toContain("out:340");
     expect(result.reason).toContain("cache_create:560");
   });
 });

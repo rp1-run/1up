@@ -1,0 +1,14 @@
+{
+  "pending_capture": true,
+  "contract_hash": "334b9795cbf7c5b278b9f4e817fbbb001032c4d75c81ede93a4207b22328cccd",
+  "captured_at": null,
+  "capture_command": "PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna && npm run axes-report:luna:record",
+  "reference_anchor": {
+    "source": "requirements REQ-006 / phase-plan research report",
+    "input_tokens_approx": 5090000,
+    "slower_than_codex_pct": 23.9,
+    "more_expensive_than_codex_pct": 2.5,
+    "note": "After the credentialed capture overwrites this file, sanity-check the recorded 1up-agent figures against these anchors; large divergence means the warm run did not reflect the frozen contract."
+  },
+  "providers": {}
+}

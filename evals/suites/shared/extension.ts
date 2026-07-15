@@ -17,7 +17,6 @@ const EMDASH_COMMIT = "5beb0dd";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = join(__dirname, "../../.cache/emdash");
 const INDEX_DB_PATH = join(CACHE_DIR, ".1up/index.db");
-const PROJECT_ID_PATH = join(CACHE_DIR, ".1up/project_id");
 const CACHE_LOCK_PATH = join(__dirname, "../../.cache/.lock");
 const TEMP_BASE = join(realpathSync(tmpdir()), "1up-evals");
 
@@ -91,9 +90,6 @@ export function ensureFixtureCache(): void {
 
   const needsWork = !existsSync(join(CACHE_DIR, ".git")) || cacheNeedsRefresh();
   if (!needsWork) {
-    if (existsSync(PROJECT_ID_PATH)) {
-      rmSync(PROJECT_ID_PATH);
-    }
     return;
   }
 
@@ -120,10 +116,6 @@ export function ensureFixtureCache(): void {
     if (cacheNeedsRefresh()) {
       const command = existsSync(INDEX_DB_PATH) ? "1up reindex" : "1up index";
       execSync(command, { cwd: CACHE_DIR, stdio: "pipe" });
-    }
-
-    if (existsSync(PROJECT_ID_PATH)) {
-      rmSync(PROJECT_ID_PATH);
     }
   } finally {
     // Release lock
@@ -165,6 +157,84 @@ export function createWorkspace(): FixtureWorkspace {
   cpSync(CACHE_DIR, repoDir, { recursive: true });
 
   return { workspaceDir, repoDir, homeDir, codexHomeDir };
+}
+
+function workspaceEnv(homeDir: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HOME: homeDir,
+    CODEX_HOME: join(homeDir, ".codex"),
+  };
+}
+
+export interface WarmReadiness {
+  indexedFiles: number;
+  totalSegments: number;
+}
+
+/**
+ * Establish real warm state for a copied workspace before the measured agent
+ * starts. Runs an unconditional synchronous `1up index` (setup cost lives
+ * outside every measured axis, REQ-001), then verifies readiness fail-closed
+ * from `1up status -f json` counts.
+ *
+ * The gate consults only the current-context `indexed_files`/`total_segments`
+ * counts and never the lifecycle/`index_status` string: a copied index reads
+ * `"ready"` even when the current context has zero rows (HYP-001), so only the
+ * counts prove the setup index produced a readable current-context index on the
+ * current schema. Throws on verification failure.
+ */
+export function establishWarmReadiness(
+  repoDir: string,
+  homeDir: string,
+): WarmReadiness {
+  const env = workspaceEnv(homeDir);
+
+  execFileSync("1up", ["index"], { cwd: repoDir, env, stdio: "pipe" });
+
+  const rawStatus = execFileSync("1up", ["status", "-f", "json", "."], {
+    cwd: repoDir,
+    env,
+    stdio: "pipe",
+  }).toString();
+
+  let status: CacheStatus;
+  try {
+    status = JSON.parse(rawStatus) as CacheStatus;
+  } catch {
+    throw new Error(
+      `Warm readiness gate: could not parse '1up status -f json' output for ${repoDir}`,
+    );
+  }
+
+  const indexedFiles = status.indexed_files;
+  const totalSegments = status.total_segments;
+
+  if (
+    typeof indexedFiles !== "number" ||
+    indexedFiles <= 0 ||
+    typeof totalSegments !== "number" ||
+    totalSegments <= 0
+  ) {
+    throw new Error(
+      `Warm readiness gate failed for ${repoDir}: indexed_files=${
+        indexedFiles ?? "null"
+      } total_segments=${
+        totalSegments ?? "null"
+      } (setup index did not produce a readable current-context index; the index_status string is never trusted)`,
+    );
+  }
+
+  return { indexedFiles, totalSegments };
+}
+
+/**
+ * Strip the copied `.1up/` index cache so the cold-start suite exercises
+ * bounded readiness waiting itself. The warm setup index and readiness gate are
+ * skipped for cold cases.
+ */
+export function stripColdState(repoDir: string): void {
+  rmSync(join(repoDir, ".1up"), { recursive: true, force: true });
 }
 
 export function cleanupWorkspace(workspaceDir: string): void {
@@ -219,6 +289,21 @@ export default async function (
     context.test.vars._PATH = process.env.PATH ?? "";
     context.test.vars._NODE_EXTRA_CA_CERTS =
       process.env.NODE_EXTRA_CA_CERTS ?? "";
+
+    if (context.test.vars.FIXTURE_MODE === "cold") {
+      // Cold-start suite owns bounded readiness waiting itself: drop the copied
+      // index cache and skip the warm setup index + readiness gate.
+      stripColdState(repoDir);
+      return;
+    }
+
+    // Warm suites: establish real ready state here, before the measured agent
+    // starts, so it performs exactly one initial status check and never indexes
+    // inside the measurement loop (REQ-001).
+    const readiness = establishWarmReadiness(repoDir, homeDir);
+    context.test.vars.WARM_READY = true;
+    context.test.vars.WARM_INDEXED_FILES = readiness.indexedFiles;
+    context.test.vars.WARM_TOTAL_SEGMENTS = readiness.totalSegments;
 
     return;
   }

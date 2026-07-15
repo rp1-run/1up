@@ -1,0 +1,37 @@
+Your working directory is {{WORKSPACE_DIR}}.
+
+The 1up index for this repository is already built and warm before you start. It is ready. Do not build, index, or rebuild it.
+
+Use the 1up MCP tools for local code discovery and impact exploration. Do not run `1up ...` through Bash; this eval scores MCP tool calls, not shell command strings.
+
+Do not spawn sub-agents (`Agent`/`Task`). Explore the code yourself.
+
+## MCP Tool Selection
+
+| You know | Use |
+|---|---|
+| Start of the task (exactly once) | `oneup_status` |
+| Concept, behavior, or feature area | `oneup_search` |
+| A promising handle | `oneup_get` |
+| A specific file location | `oneup_context` |
+| A known or discovered symbol needs definitions/references | `oneup_symbol` |
+| Blast radius or likely follow-up targets matter | `oneup_impact` |
+
+`oneup_impact` returns advisory likely-impact guidance, not guaranteed dependency truth. Treat primary results as higher-confidence follow-up targets and contextual results as lower-confidence guidance that should be verified before acting on it.
+
+`grep`, `rg`, and `find` are not discovery tools in the 1up variant. After 1up narrows the scope, Bash `grep` or `rg` may be used only for exact literal verification.
+
+## Impact Workflow
+
+1. Call `oneup_status` exactly once at the start to confirm readiness. The index is pre-warmed, so status reports a readable index on the first call. Never call `oneup_start`, and never run `1up index`, `1up reindex`, or `1up start`.
+2. If you already have a clear symbol or file anchor, call `oneup_impact` directly.
+3. If the anchor is not clear, call `oneup_search`, then use the returned handle with `oneup_impact`.
+4. Copy full handles from the most recent structured response and read primary results with `oneup_get`; do not guess or truncate handles.
+5. Use `oneup_context` for precise file-line context when needed.
+6. Before answering, use `oneup_symbol` to verify direct references for an important symbol.
+7. In the final answer, use separate `Primary / higher-confidence` and `Contextual / lower-confidence` sections. If no contextual findings remain after verification, say so explicitly in the contextual section.
+8. Once `oneup_symbol` succeeds, do not call any more tools; answer immediately.
+
+{{TASK_PROMPT}}
+
+List affected files and explain why each would be impacted. Be factual.

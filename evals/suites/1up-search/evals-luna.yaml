@@ -4,7 +4,7 @@ evaluateOptions:
   maxConcurrency: 1
 
 prompts:
-  - id: file://prompt-1up.txt
+  - id: file://prompt-1up-warm.txt
     label: 1up
   - id: file://prompt-baseline.txt
     label: baseline
@@ -85,6 +85,7 @@ tests:
       EXPECTED_FILES: fts-manager.ts,query.ts,AdminCommandPalette.tsx
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -93,21 +94,30 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: The correct search flow in emdash is: (1) FTSManager in
           fts-manager.ts creates FTS5 virtual tables and triggers, (2) query.ts
@@ -118,6 +128,7 @@ tests:
           fundamentally wrong. Judge only factual correctness, not format
           or length.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should cover these stages: (a) fields
           marked searchable, (b) FTS indexing, (c) query execution, (d)
@@ -134,6 +145,7 @@ tests:
       EXPECTED_FILES: WordPressImport.tsx,prepare.ts,execute.ts,gutenberg-to-portable-text/src/index.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -142,21 +154,30 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: The correct WordPress import flow is: (1) WordPressImport.tsx
           is the admin wizard UI, (2) prepare.ts handles schema preparation
@@ -166,6 +187,7 @@ tests:
           described, 0.5 if partially correct, 0.0 if fundamentally wrong.
           Judge only factual correctness, not format or length.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should cover: (a) admin wizard UI,
           (b) schema preparation, (c) WXR parsing/execution, (d) content
@@ -184,6 +206,7 @@ tests:
       EXPECTED_FILES: manager.ts,hooks.ts,emdash-runtime.ts,runner.ts,wrapper.ts,bridge.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -192,21 +215,30 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: EmDash has two distinct paths. For trusted in-process
           plugins, manager.ts registers PluginDefinition objects and hooks.ts
@@ -221,6 +253,7 @@ tests:
           conflates trusted registration with sandbox loading or is fundamentally
           wrong. Judge only factual correctness, not format or length.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should cover: (a) trusted in-process
           registration and hook execution, (b) separate sandbox descriptor and
@@ -241,6 +274,7 @@ tests:
       EXPECTED_FILES: registry.ts,loader.ts,query.ts,live.config.ts
     assert:
       - type: javascript
+        metric: retrieval
         value: |
           const expected = String(context.vars.EXPECTED_FILES).split(',').map(f => f.trim());
           const missing = expected.filter(f => !output.includes(f.split('/').pop() || f));
@@ -249,21 +283,30 @@ tests:
           return { pass: true, score, reason: missing.length === 0 ? `Referenced all expected files: ${expected.join(', ')}` : `Found ${found}/${expected.length}. Missing: ${missing.join(', ')}` };
       - type: javascript
         value: file://../shared/assertions/index.ts:assert1upUsed
+        metric: adoption
       - type: javascript
-        value: file://../shared/assertions/index.ts:assertReadinessWorkflowUsed
+        value: file://../shared/assertions/index.ts:assertWarmReadiness
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertReadAfterSearch
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertSymbolVerificationUsed
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertNoFallbackTools
+        metric: adoption
       - type: javascript
         value: file://../shared/assertions/index.ts:assertValidOneupMcpCalls
+        metric: reliability
       - type: javascript
         value: file://../shared/assertions/index.ts:assertStructuredOneupMcpResponses
+        metric: reliability
       - type: javascript
-        value: file://../shared/assertions/index.ts:reportEfficiency
+        value: file://../shared/assertions/index.ts:reportRunMetrics
+        metric: efficiency
       - type: llm-rubric
+        metric: factual
         value: >
           Accuracy: SchemaRegistry in registry.ts persists collection and field
           metadata and maintains the dynamic content tables. A site's
@@ -278,6 +321,7 @@ tests:
           correct, 0.0 if fundamentally wrong. Judge only factual correctness,
           not format or length.
       - type: llm-rubric
+        metric: factual
         value: >
           Completeness: The answer should cover: (a) database-backed schema and
           dynamic tables, (b) live.config.ts registration with emdashLoader(),
