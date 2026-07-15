@@ -1,14 +1,44 @@
 {
-  "pending_capture": true,
   "contract_hash": "334b9795cbf7c5b278b9f4e817fbbb001032c4d75c81ede93a4207b22328cccd",
-  "captured_at": null,
-  "capture_command": "PROMPTFOO_CACHE_ENABLED=false npm run eval:parallel:luna && npm run axes-report:luna:record",
-  "reference_anchor": {
-    "source": "recorded pre-optimization warm-run measurement (2026-07-13)",
-    "input_tokens_approx": 5090000,
-    "slower_than_codex_pct": 23.9,
-    "more_expensive_than_codex_pct": 2.5,
-    "note": "After the credentialed capture overwrites this file, sanity-check the recorded 1up-agent figures against these anchors; large divergence means the warm run did not reflect the frozen contract."
-  },
-  "providers": {}
+  "captured_at": "2026-07-15T06:30:45.605Z",
+  "providers": {
+    "1up-agent": {
+      "factual": 0.9642857142857143,
+      "retrieval": 0.9404761904761906,
+      "adoption": 1,
+      "reliability": 1,
+      "latency_ms": 71102.28571428571,
+      "tokens": 568769.8571428572,
+      "cost_usd": 0.09029857142857142,
+      "calls": 8.285714285714286,
+      "source_attempt_ids": [
+        "36868d95-68a8-4e77-a719-21291a5e5328",
+        "74100ccc-02fb-400b-b2e4-234eab8812f3",
+        "c8aab08e-031e-459a-85bb-175df3787f62",
+        "d6bfc359-3c04-4ba5-bb61-d20eb8d77a1d",
+        "e20326ac-8482-4a61-a20d-62cab69d2eac",
+        "e8c1fc9f-6c44-4dfb-bdd8-257591d1b1d5",
+        "f572de7e-5cad-4708-9081-fd98e1094f2e"
+      ]
+    },
+    "baseline-agent": {
+      "factual": 1,
+      "retrieval": 1,
+      "adoption": null,
+      "reliability": null,
+      "latency_ms": 122983.71428571429,
+      "tokens": 991950.5714285715,
+      "cost_usd": 0.18812368571428567,
+      "calls": 17.857142857142858,
+      "source_attempt_ids": [
+        "36868d95-68a8-4e77-a719-21291a5e5328",
+        "74100ccc-02fb-400b-b2e4-234eab8812f3",
+        "c8aab08e-031e-459a-85bb-175df3787f62",
+        "d6bfc359-3c04-4ba5-bb61-d20eb8d77a1d",
+        "e20326ac-8482-4a61-a20d-62cab69d2eac",
+        "e8c1fc9f-6c44-4dfb-bdd8-257591d1b1d5",
+        "f572de7e-5cad-4708-9081-fd98e1094f2e"
+      ]
+    }
+  }
 }
