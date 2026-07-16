@@ -10,12 +10,14 @@ Operator runbook for cutting and publishing a public `1up` release.
 | Tag | `vX.Y.Z` |
 | Release notes | `CHANGELOG.md` |
 | Public record | GitHub Release plus `CHANGELOG.md` |
-| Primary user install channel | `scripts/install/setup.sh`, attached to each GitHub Release and fetched from `https://github.com/rp1-run/1up/releases/latest/download/setup.sh` |
+| Primary user install channel | `scripts/install/setup.sh`, attached to each GitHub Release; fetched via `https://1up.rp1.run/setup.sh` (a redirect to `https://github.com/rp1-run/1up/releases/latest/download/setup.sh`) |
 | Stable update metadata | `update-manifest.json` on `main`, sourced from the GitHub Release manifest |
 
 ## User Install Channel
 
-The `curl -fsSL https://github.com/rp1-run/1up/releases/latest/download/setup.sh | bash` command in `README.md` is the single user-facing install path, and GitHub Releases is the only channel that serves it. The installer consumes the archive and `SHA256SUMS` artifacts attached to each GitHub Release, so the release flow must keep attaching `setup.sh` alongside those assets under stable names (`setup.sh`, `1up-vX.Y.Z-<target>.tar.gz`, and `SHA256SUMS`).
+The `curl -fsSL https://1up.rp1.run/setup.sh | bash` command in `README.md` is the single user-facing install path. `1up.rp1.run/setup.sh` is a Cloudflare 302 redirect to `https://github.com/rp1-run/1up/releases/latest/download/setup.sh`, and GitHub Releases is the only channel that serves the script. The installer consumes the archive and `SHA256SUMS` artifacts attached to each GitHub Release, so the release flow must keep attaching `setup.sh` alongside those assets under stable names (`setup.sh`, `1up-vX.Y.Z-<target>.tar.gz`, and `SHA256SUMS`).
+
+The redirect is load-bearing beyond the README: binaries shipped before v0.1.16 print `https://1up.rp1.run/setup.sh` in their upgrade instructions, and the release/update manifests carry it as the install URL. Do not remove the Cloudflare rule or repoint it away from the latest-release asset without a migration plan for those clients.
 
 The stable update manifest is retained for `1up update` and installer metadata. No downstream package channel is required for release readiness.
 
