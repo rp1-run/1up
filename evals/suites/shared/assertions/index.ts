@@ -23,8 +23,8 @@ interface GradingResult {
  * variant under test (e.g. 1up-specific assertions scored against the isolated
  * baseline). The per-axis report (axes-report.ts) excludes marked components
  * from axis means and renders them `n/a` instead of granting automatic credit,
- * so the baseline no longer inherits the score of assertions it never exercises
- * (REQ-002).
+ * so the baseline no longer inherits the score of assertions it never
+ * exercises.
  */
 export const NOT_APPLICABLE_REASON = "not-applicable:";
 
@@ -744,7 +744,7 @@ function isOneup(token: ShellToken): boolean {
 }
 
 /**
- * Warm-suite readiness contract (REQ-001): the fixture hook pre-warms the
+ * Warm-suite readiness contract: the fixture hook pre-warms the
  * index before the agent starts, so the measured trajectory must contain
  * exactly one initial `oneup_status` before any discovery call and must never
  * trigger indexing from the measurement loop — no `oneup_start`, no Bash
@@ -1028,7 +1028,7 @@ export function assertValidOneupMcpCalls(
 }
 
 /**
- * Neutral run-metrics reporter (REQ-002): always passes with a fixed neutral
+ * Neutral run-metrics reporter: always passes with a fixed neutral
  * score so it can never advantage either provider in Promptfoo's
  * (non-authoritative) composite, and emits the raw latency/tokens/cost/calls
  * measures as namedScores. The per-axis report (axes-report.ts) splits these

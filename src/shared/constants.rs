@@ -4,7 +4,7 @@ pub const EMBEDDING_DIM: usize = 384;
 /// 1up version from Cargo.toml, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default batch size for embedding inference (R-005).
+/// Default batch size for embedding inference.
 ///
 /// Held at 32: a partial best-of-3 reindex benchmark over this repo's own ~1.5k
 /// chunk corpus showed 32 (~47.7s) slightly ahead of 64 (~49.6s), i.e. larger
@@ -23,7 +23,7 @@ pub const EMBEDDING_BATCH_SIZE: usize = 32;
 /// programmatic `with_truncation`/`with_padding` override (raising both to
 /// `EMBEDDING_MAX_TOKENS`) right after `Tokenizer::from_file`, which is what
 /// actually widens the window; the shipped file is left untouched so its
-/// `TOKENIZER_SHA256` is unchanged (see `embedder.rs`, HYP-002). Padding must be
+/// `TOKENIZER_SHA256` is unchanged (see `embedder.rs`). Padding must be
 /// overridden alongside truncation: `run_inference` copies `ids[0..max_len]`
 /// across a mixed-length sub-batch, so leaving padding at `Fixed(128)` while
 /// truncation allows 256-token rows would read past a short row's 128-wide id
@@ -173,7 +173,7 @@ pub const STALE_REBUILD_REASON: &str = "index is rebuilding; results may be stal
 pub const CONTEXT_FALLBACK_LINES: usize = 50;
 
 /// Maximum number of symbols emitted per list (`defined`/`referenced`/`called`)
-/// in a hydrated `oneup_get` record at `verbosity: "full"` (REQ-003).
+/// in a hydrated `oneup_get` record at `verbosity: "full"`.
 ///
 /// Bounds the per-record symbol payload so a segment referencing hundreds of
 /// symbols cannot re-inflate the envelope the compaction is meant to shrink.
@@ -181,13 +181,13 @@ pub const CONTEXT_FALLBACK_LINES: usize = 50;
 /// omitted count and an `oneup_symbol` recovery call, so the full set stays
 /// reachable.
 ///
-/// Consumed by the `src/mcp` record-construction and envelope layers (T3/T4);
+/// Consumed by the `src/mcp` record-construction and envelope layers;
 /// provisioned here per the shared-literals + pre-provisioned-API convention.
 #[allow(dead_code)]
 pub const MAX_SYMBOLS_PER_LIST: usize = 20;
 
 /// Hard ceiling (lines each side of the target) on `oneup_context` enclosing-scope
-/// expansion (REQ-003).
+/// expansion.
 ///
 /// The window branch clamps `target_line ± expansion` to this bound per side so a
 /// single context request can never return an unbounded slice of a very large
@@ -196,12 +196,12 @@ pub const MAX_SYMBOLS_PER_LIST: usize = 20;
 /// and the follow-up response carries its own truncation note, so content stays
 /// reachable in bounded iterations.
 ///
-/// Consumed by `src/search/context.rs` windowing (T2) and `src/mcp` (T3).
+/// Consumed by `src/search/context.rs` windowing and `src/mcp`.
 #[allow(dead_code)]
 pub const MAX_CONTEXT_EXPANSION_LINES: usize = 500;
 
 /// Maximum number of truncation-recovery actions prepended to a read envelope's
-/// `next_actions` (REQ-004).
+/// `next_actions`.
 ///
 /// Deduped per path and capped here so a multi-record response with many clipped
 /// scopes cannot turn `next_actions` into the new unbounded payload. Every
@@ -209,19 +209,19 @@ pub const MAX_CONTEXT_EXPANSION_LINES: usize = 500;
 /// `TruncationNote.recovery`, so recovery never depends on winning a next_action
 /// slot.
 ///
-/// Consumed by `read_next_actions` in `src/mcp/tools.rs` (T4).
+/// Consumed by `read_next_actions` in `src/mcp/tools.rs`.
 #[allow(dead_code)]
 pub const MAX_RECOVERY_ACTIONS: usize = 3;
 
 /// Line span at or under which an `oneup_context` enclosing scope is returned
-/// whole with no truncation, regardless of the requested `expansion` (REQ-003).
+/// whole with no truncation, regardless of the requested `expansion`.
 ///
 /// Derived as `2 * CONTEXT_FALLBACK_LINES + 1` (101) — the default window's own
 /// line budget — so the whole-scope branch can never cost more than a default
 /// window while preserving legacy whole-scope fidelity for the common small-scope
-/// case (the HYP-002 mitigation). Only scopes larger than this are windowed.
+/// case. Only scopes larger than this are windowed.
 ///
-/// Consumed by `src/search/context.rs` windowing (T2).
+/// Consumed by `src/search/context.rs` windowing.
 #[allow(dead_code)]
 pub const MAX_WHOLE_SCOPE_LINES: usize = 2 * CONTEXT_FALLBACK_LINES + 1;
 
@@ -230,14 +230,14 @@ pub const MAX_WHOLE_SCOPE_LINES: usize = 2 * CONTEXT_FALLBACK_LINES + 1;
 /// [`MAX_WHOLE_SCOPE_LINES`]). Keeps the model-facing summary marker and the
 /// structured note in sync from one definition (Output Contracts pattern).
 ///
-/// Consumed by `src/mcp` record construction and summary rendering (T3/T4).
+/// Consumed by `src/mcp` record construction and summary rendering.
 #[allow(dead_code)]
 pub const SCOPE_TRUNCATION_REASON: &str = "enclosing scope windowed";
 
 /// Single-source reason string stamped on a `TruncationNote` when a hydrated
 /// record's symbol list was capped at [`MAX_SYMBOLS_PER_LIST`].
 ///
-/// Consumed by `src/mcp` record construction and summary rendering (T3/T4).
+/// Consumed by `src/mcp` record construction and summary rendering.
 #[allow(dead_code)]
 pub const SYMBOL_LIST_TRUNCATION_REASON: &str = "symbol list capped";
 
@@ -251,7 +251,7 @@ pub const CHUNK_OVERLAP: usize = 10;
 pub const WATCHER_DEBOUNCE_MS: u64 = 500;
 
 /// Maximum interval between persisted `index_status.json` progress writes
-/// during a single indexing pass (`FlushState::refresh`, T7/REQ-004).
+/// during a single indexing pass (`FlushState::refresh`).
 ///
 /// Before this throttle, every skipped file or stored batch triggered its own
 /// `atomic_replace` (temp-write + fsync + rename), which dominated wall time
@@ -293,7 +293,7 @@ pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
 /// Whether the post-upgrade daemon auto-restart is gated on an idle/size
 /// threshold before draining and restarting on a detected version mismatch.
 ///
-/// Decision (REQ-004, OQ-003): `false` — there is **no** idle/size gating by
+/// Decision: `false` — there is **no** idle/size gating by
 /// default. On a detected `daemon_version` mismatch the search path always
 /// drains the stale daemon and restarts under the current binary (trigger
 /// point: `src/cli/search.rs`). Serving silently wrong-version results is the
@@ -302,7 +302,7 @@ pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
 /// ([`DAEMON_DRAIN_TIMEOUT_MS`]) and falls back to local in-process search, so
 /// an unconditional restart can never strand the user.
 ///
-/// The specific idle/size thresholds are an open owner decision (OQ-003): a
+/// The specific idle/size thresholds are an open owner decision: a
 /// future owner can flip this to `true` and add the gating check at the
 /// trigger point without re-deriving the rationale recorded here. Provisioned
 /// (unused until that owner decision) per the codebase's pre-provisioned-API
@@ -320,7 +320,7 @@ pub const REBUILD_LOCK_CONTENTION_TIMEOUT_MS: u64 = 5_000;
 /// Poll interval while waiting for a contended rebuild lock to be released.
 pub const REBUILD_LOCK_RETRY_INTERVAL_MS: u64 = 200;
 
-/// REQ-010/REQ-011: Threshold in seconds to determine if a status file or rebuild lock is stale.
+/// Threshold in seconds to determine if a status file or rebuild lock is stale.
 /// If a file claims Running/Locked state but the owning process is dead and file age exceeds this,
 /// the file is treated as stale and auto-reconciled or cleared.
 pub const STALENESS_THRESHOLD_SECS: u64 = 300; // 5 minutes
@@ -371,7 +371,7 @@ pub const SECURE_SOCKET_MODE: u32 = 0o600;
 ///
 /// Embedding is the dominant indexing cost and the only sustained CPU work
 /// during the serial flush, so the embed phase scales toward physical cores
-/// rather than the legacy fixed cap of 4 (R-004). The bound stays coordinated
+/// rather than the legacy fixed cap of 4. The bound stays coordinated
 /// with parse parallelism by
 /// [`crate::shared::types::IndexingConfig::default_jobs`], which reserves cores
 /// for embedding so `embed_threads + jobs` never exceeds physical cores — ONNX
@@ -403,7 +403,7 @@ pub const INDEX_WRITE_BATCH_FILES_ENV_VAR: &str = "ONEUP_INDEX_WRITE_BATCH_FILES
 pub const DISABLE_MODEL_DOWNLOADS_ENV_VAR: &str = "ONEUP_DISABLE_MODEL_DOWNLOADS";
 
 /// Environment variable that explicitly selects the embedding model variant for
-/// a run (T1). Accepted values are `int8` and `fp32` (case-insensitive);
+/// a run. Accepted values are `int8` and `fp32` (case-insensitive);
 /// unset or empty resolves to the established default (`int8`). Any other value
 /// is a hard error at run start — the selection is deterministic and never
 /// silently falls back to the other variant, so an operator can pin and compare
@@ -466,7 +466,7 @@ pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 /// FP32 ONNX model filename (the always-present baseline / fallback artifact).
 pub const MODEL_FILENAME: &str = "model.onnx";
 
-/// INT8-quantized ONNX model filename (R-003, T10; integrity-pinned in T4).
+/// INT8-quantized ONNX model filename (integrity-pinned).
 ///
 /// This dynamic-INT8 build of all-MiniLM-L6-v2 is the v18 default CPU embedding
 /// path. It is a first-class, integrity-verified artifact: a third entry in the
@@ -481,7 +481,7 @@ pub const MODEL_FILENAME: &str = "model.onnx";
 pub const MODEL_ONNX_INT8_FILENAME: &str = "model.int8.onnx";
 
 /// Model-identity suffix that distinguishes the INT8 variant from the FP32
-/// baseline inside the content-addressed embedding key (R-003, T10).
+/// baseline inside the content-addressed embedding key.
 ///
 /// The embedding `content_key` and the stored `meta.embedding_model` fold the
 /// model identity (`HF_MODEL_REPO`). The INT8 and FP32 builds of the same repo
@@ -520,14 +520,14 @@ pub const MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 pub const MODEL_ONNX_SHA256: &str =
     "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
 
-/// Pinned SHA-256 digest for the INT8-quantized ONNX embedding model (T4).
+/// Pinned SHA-256 digest for the INT8-quantized ONNX embedding model.
 ///
 /// The upstream artifact is `onnx/model_qint8_avx512.onnx` in [`HF_MODEL_REPO`]
 /// (byte-identical to the repo's arm64 and avx512_vnni INT8 variants — same LFS
 /// object). This digest is verified both at download/activation time (like every
 /// other artifact) and again at load time in `load_variant(Int8)`, so a
 /// post-activation corruption or tamper refuses the model with a clear
-/// expected-vs-got error instead of serving embeddings from it (REQ-004).
+/// expected-vs-got error instead of serving embeddings from it.
 pub const MODEL_ONNX_INT8_SHA256: &str =
     "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474";
 
@@ -621,7 +621,7 @@ pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 /// its artifact URL is dereferenced (the archive's own attestation gate runs
 /// only after download), so a tampered manifest — or a malicious redirect —
 /// must not be able to steer the download to an attacker-controlled host.
-/// Membership is frozen post-HYP-002 validation, which confirmed the live
+/// Membership was frozen after a validation experiment confirmed the live
 /// redirect chain for a release asset is exactly `github.com` ->
 /// `release-assets.githubusercontent.com`; `objects.githubusercontent.com` is
 /// kept as a historical GitHub release-asset CDN hedge. Deliberately a
@@ -638,7 +638,7 @@ pub const UPDATE_ARTIFACT_HOST_ALLOWLIST: [&str; 3] = [
 /// same-source contexts `1up gc`'s `SupersededSameSource` retention policy
 /// keeps regardless of age; only contexts beyond this rank (and past
 /// [`GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS`]) are eligible for pruning.
-/// Governance constraint (full-scan-audit-fixes-warm-path-lifecycle REQ-003):
+/// Governance constraint:
 /// numeric GC defaults must not be invented as final; this value is
 /// finalized at the planning gate.
 pub const GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT: usize = 3;
@@ -653,14 +653,13 @@ pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
 /// Env var name for the opt-in (default OFF) switch enabling automatic
 /// `SupersededSameSource` context pruning at migration time
 /// (`indexer::pipeline::record_indexed_head`). Unset, empty, or `"0"` disables
-/// it (default); any other value enables it. Governance constraint
-/// (full-scan-audit-fixes-warm-path-lifecycle REQ-003 Open Risks): automatic
+/// it (default); any other value enables it. Governance constraint: automatic
 /// pruning on every index run is not a default-on behavior until the planning
 /// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
 /// switch either way.
 pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
 
-/// Per-file size cap to prevent unbounded memory use (REQ-005, T6).
+/// Per-file size cap to prevent unbounded memory use.
 ///
 /// Files larger than this are skipped with a warning during indexing.
 /// 2MB (~2_097_152 bytes) is conservative: it prevents the OOM observed with
@@ -669,7 +668,7 @@ pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
 /// contribute to search indices.
 pub const MAX_FILE_SIZE_BYTES: u64 = 2_097_152; // 2 MB
 
-/// Per-file segment cap to prevent unbounded segment generation (REQ-005, T6).
+/// Per-file segment cap to prevent unbounded segment generation.
 ///
 /// A single file generating more than this many segments is capped gracefully:
 /// excess segments are skipped and a warning is logged. Conservative limit of
@@ -679,7 +678,7 @@ pub const MAX_FILE_SIZE_BYTES: u64 = 2_097_152; // 2 MB
 pub const MAX_SEGMENTS_PER_FILE: usize = 1_000;
 
 /// Default-on secret-file patterns, excluded from indexing regardless of
-/// configuration (REQ-004). Globs are evaluated against repo-relative paths
+/// configuration. Globs are evaluated against repo-relative paths
 /// and filename alone, so `secrets.yaml` matches at any depth, and
 /// `id_rsa*` matches `id_rsa`, `id_rsa.pub`, etc.
 ///
@@ -689,12 +688,12 @@ pub const MAX_SEGMENTS_PER_FILE: usize = 1_000;
 /// credentials (.aws/credentials), and SSH/TLS keys (id_rsa*, id_ed25519,
 /// *.p12, *.pfx), secrets YAML (secrets.yaml, secrets.yml).
 pub const DEFAULT_SECRET_GLOBS: &[&str] = &[
-    // Original 4 patterns (T5 builds on these)
+    // Original 4 patterns (the expanded set below builds on these)
     "*.pem",
     "*.key",
     "credentials.json",
     ".env",
-    // REQ-004: Expanded credential set
+    // Expanded credential set
     "*service-account*.json",
     "secrets.yaml",
     "secrets.yml",

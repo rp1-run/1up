@@ -975,10 +975,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Integration test (REQ-003/T4): `1up gc --apply` must enforce the
+    /// Integration test: `1up gc --apply` must enforce the
     /// `SupersededSameSource` policy against its real candidate set — recency
     /// rank computed over every recorded context, not the always-`None`
-    /// retention gate this loop used before T4 — then delete the qualifying
+    /// retention gate this loop previously used — then delete the qualifying
     /// rows via `delete_context` and VACUUM.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]

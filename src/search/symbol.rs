@@ -133,7 +133,7 @@ impl<'a> SymbolSearchEngine<'a> {
         let matching_canonicals = find_matching_symbols(&fallback_canonicals, &canonical_query);
 
         // One batched `canonical_symbol IN (...)` lookup replaces the per-canonical
-        // query loop (R-013). The batch is then regrouped per canonical and
+        // query loop. The batch is then regrouped per canonical and
         // replayed in `matching_canonicals` order with the same dedup, so output
         // is identical to issuing one query per canonical: rows for a given
         // canonical keep the query's `ORDER BY` (the batched query uses the same
@@ -216,7 +216,7 @@ impl<'a> SymbolSearchEngine<'a> {
 
     /// Batched form of [`load_matches`]: resolve every canonical in `canonicals`
     /// with one `canonical_symbol IN (...)` query instead of one query per
-    /// canonical (R-013). Each returned match is tagged with the canonical it
+    /// canonical. Each returned match is tagged with the canonical it
     /// matched so the caller can regroup rows per canonical and preserve the
     /// per-canonical ordering and dedup of the per-item path. Empty input issues
     /// no query. The canonical set is bounded by the fuzzy-fallback limit
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(results[0].segment_id, "s-main");
     }
 
-    // TDD (REQ-001 AC3 / T5): the exact-canonical symbol lookup must apply the
+    // TDD: the exact-canonical symbol lookup must apply the
     // same directory-boundary `path_prefix` filter as FTS/vector, so `src/foo`
     // matches itself and its descendants but not a sibling that merely shares
     // the prefix as a string (`src/foobar`).
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(results[0].file_path, "src/foo/a.rs");
     }
 
-    // TDD (REQ-001 AC3 / T5): the batched fuzzy-fallback symbol lookup
+    // TDD: the batched fuzzy-fallback symbol lookup
     // (`load_matches_for_canonicals`) must apply the same `path_prefix` filter
     // as the exact-canonical path, so a scoped fuzzy search does not leak
     // sibling-directory matches.
@@ -875,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn fuzzy_fallback_batched_matches_per_item_order_and_dedup() {
-        // R-013: batching the fuzzy-fallback canonical loop into one IN(...) query
+        // Batching the fuzzy-fallback canonical loop into one IN(...) query
         // must return the same matches, in the same per-canonical order, with the
         // same dedup, as issuing one load_matches query per canonical.
         let (_db, conn) = setup().await;

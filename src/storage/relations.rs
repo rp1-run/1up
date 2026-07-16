@@ -348,7 +348,7 @@ pub struct ModuleDependencyPair {
 
 /// Rank overview symbol keys by distinct referencing source files inside one
 /// index context, restricted to identity-bearing relation rows joined to
-/// qualifying type definitions (Branch B kind policy, design D19).
+/// qualifying type definitions (Branch B kind policy).
 pub async fn get_top_type_symbol_references_for_context(
     conn: &Connection,
     context_id: &str,
@@ -392,7 +392,7 @@ pub async fn get_top_type_symbol_references_for_context(
 
 /// Aggregate directed depth-2 module dependency pairs inside one index
 /// context, sharing the top-symbol filter stack plus the SQL-side per-key
-/// qualifying-definition-count cap of 1..=3 (design D18).
+/// qualifying-definition-count cap of 1..=3.
 pub async fn get_module_dependency_pairs_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1087,9 +1087,9 @@ mod tests {
             .is_empty());
     }
 
-    /// Latency gate for the overview aggregates (design D16): the symbol and
+    /// Latency gate for the overview aggregates: the symbol and
     /// module-dependency queries must stay within the ~1s budget on an index
-    /// of representative scale (HYP-001 v3 measured 0.186-0.232s on 81k
+    /// of representative scale (measurement showed 0.186-0.232s on 81k
     /// relations; the prohibited correlated form measured 183.8s).
     #[tokio::test]
     async fn overview_aggregates_meet_latency_budget_on_representative_index() {

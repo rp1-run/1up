@@ -17,9 +17,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const EVALS_ROOT = resolve(__dirname, "../..");
 const MANIFEST_PATH = resolve(EVALS_ROOT, MANIFEST_RELATIVE_PATH);
 
-describe("committed manifest drift guard (REQ-003)", () => {
+describe("committed manifest drift guard", () => {
   test("suites/luna-manifest.json exists under the tracked suites path", () => {
-    // REQ-003 AC2: the contract lives under tracked evals/suites/, never a
+    // The contract lives under tracked evals/suites/, never a
     // gitignored run-output directory.
     expect(MANIFEST_RELATIVE_PATH.startsWith("suites/")).toBe(true);
     expect(existsSync(MANIFEST_PATH)).toBe(true);

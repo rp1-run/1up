@@ -421,7 +421,7 @@ fn indexing_subcommands_reject_zero_parallel_values() {
 
 #[test]
 fn format_flag_accepts_all_variants() {
-    // `--format`/`-f` lives on each maintenance Args struct post-T7, so it is
+    // `--format`/`-f` lives on each maintenance Args struct, so it is
     // parsed after the subcommand rather than before it.
     for fmt in &["json", "human", "plain"] {
         cmd()
@@ -1202,12 +1202,12 @@ fn lifecycle_plain_flow_covers_start_status_list_and_stop() {
     );
 }
 
-/// REQ-001/002: a daemon-backed search keeps the machine-readable result stream
+/// A daemon-backed search keeps the machine-readable result stream
 /// on stdout clean — result rows go to stdout while any notice (degraded-search
 /// or drain/restart) is confined to stderr. This guards the stdout/stderr
 /// discipline that the refuse-before-write reordering touches; the genuine
-/// cross-version drain/restart path itself is covered by the worker
-/// CODE_EXPERIMENT (a real version mismatch cannot be induced from a single
+/// cross-version drain/restart path itself was covered by a separate manual
+/// worker experiment (a real version mismatch cannot be induced from a single
 /// compiled binary whose `VERSION` is a compile-time constant).
 #[cfg(unix)]
 #[test]
@@ -1265,11 +1265,11 @@ fn search_keeps_stdout_clean_and_notices_on_stderr() {
     );
 }
 
-/// REQ-001 AC1-4: a `--path-prefix` on a daemon-backed CLI search must
+/// A `--path-prefix` on a daemon-backed CLI search must
 /// constrain results to that prefix end to end (CLI -> daemon `SearchRequest`
 /// -> `SearchScope`), and an unprefixed search must remain full-repo. Before
 /// the request-layer plumbing lands, `--path-prefix` is not a recognized flag
-/// at all, so this establishes the red baseline for T6's daemon-plumbing gap
+/// at all, so this establishes the red baseline for the daemon-plumbing gap
 /// (the prefix would otherwise be silently dropped by the daemon path).
 #[cfg(unix)]
 #[test]
@@ -1329,7 +1329,7 @@ fn search_path_prefix_scopes_daemon_backed_results() {
     let unscoped_stdout = String::from_utf8(unscoped.stdout).unwrap();
     assert!(
         unscoped_stdout.contains("included/a.rs") && unscoped_stdout.contains("other/b.rs"),
-        "no prefix supplied must leave full-repo search behavior unchanged (REQ-001 AC4); stdout={unscoped_stdout}"
+        "no prefix supplied must leave full-repo search behavior unchanged; stdout={unscoped_stdout}"
     );
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1364,7 +1364,7 @@ fn search_path_prefix_scopes_daemon_backed_results() {
 
     assert!(
         !scoped_stdout.contains("other/b.rs"),
-        "--path-prefix included must not leak results outside the prefix across the daemon path (REQ-001 AC1); stdout={scoped_stdout}"
+        "--path-prefix included must not leak results outside the prefix across the daemon path; stdout={scoped_stdout}"
     );
 }
 
@@ -1602,7 +1602,7 @@ fn list_and_status_show_linked_worktree_context_sharing_main_state() {
     assert!(!canonical_worktree.join(".1up").join("project_id").exists());
 }
 
-/// REQ-001: invoking 1up from a nested subdirectory of the main worktree must
+/// Invoking 1up from a nested subdirectory of the main worktree must
 /// reuse the repo-root context rather than minting a duplicate subdir-scoped
 /// context. Before the `source_root` clamp, a subdir invocation resolved
 /// `source_root` to the subdir, producing a different `context_id`, a search
@@ -1816,7 +1816,7 @@ fn verbose_flag_accepted() {
 fn search_without_index_requires_reindex() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Core commands (like `search`) do not accept `--format` post-T7.
+    // Core commands (like `search`) do not accept `--format`.
     cmd()
         .args(["search", "needle", "--path", dir.path().to_str().unwrap()])
         .assert()
@@ -2109,9 +2109,8 @@ fn stop_is_a_safe_noop_on_non_unix_platforms() {
 
 // ---------------------------------------------------------------------------
 // `1up start` UX guarantees introduced by the shell-install feature
-// (REQ-031 silent-pass on valid index, REQ-032 `1up status` hint on fresh
-// index, REQ-033 stale-schema warning + non-zero exit, BR-06 no in-place
-// migration). See features/update-script/design.md §3.2.
+// (silent-pass on valid index, `1up status` hint on fresh index,
+// stale-schema warning + non-zero exit, no in-place migration).
 // ---------------------------------------------------------------------------
 
 fn project_db_path(dir: &Path) -> PathBuf {
@@ -2393,7 +2392,7 @@ fn status_and_list_ignore_daemon_status_from_other_contexts() {
 #[cfg(unix)]
 #[test]
 fn start_warns_on_stale_schema() {
-    // REQ-033 + BR-06: an existing index at a prior schema version must
+    // An existing index at a prior schema version must
     // produce a warning that names `1up reindex`, exit non-zero, and leave
     // the on-disk `.1up/index.db` byte-identical (no delete, no migrate).
     let dir = tempfile::tempdir().unwrap();
@@ -2442,7 +2441,7 @@ fn start_warns_on_stale_schema() {
         "expected warning on stdout to name expected schema version v{SCHEMA_VERSION}; stdout={stdout} stderr={stderr}",
     );
 
-    // BR-06: the on-disk index must be untouched. Content is the primary
+    // The on-disk index must be untouched. Content is the primary
     // gate; mtime is asserted additively to catch silent re-writes.
     let bytes_after = fs::read(&db_path).unwrap();
     assert_eq!(
@@ -2459,8 +2458,8 @@ fn start_warns_on_stale_schema() {
 #[cfg(unix)]
 #[test]
 fn start_warns_on_stale_schema_json_envelope() {
-    // JSON formatter variant of REQ-033: the envelope literal is fixed by
-    // design §3.2 (`schema_out_of_date`, `found`, `expected`, `action`).
+    // JSON formatter variant of the stale-schema warning: the envelope
+    // literal is fixed (`schema_out_of_date`, `found`, `expected`, `action`).
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = dir.path().canonicalize().unwrap();
@@ -2714,7 +2713,7 @@ fn lifecycle_registry_outputs_cover_json_human_progress_and_stop_states() {
 #[cfg(unix)]
 #[test]
 fn start_prints_status_hint_on_fresh_index() {
-    // REQ-032: the post-index success message must point the user at
+    // The post-index success message must point the user at
     // `1up status`. Runs end-to-end against a one-file fixture so the
     // success branch (cold start -> daemon spawn) actually fires.
     let dir = tempfile::tempdir().unwrap();
@@ -2924,7 +2923,7 @@ fn start_contention_preserves_existing_daemon() {
     assert_eq!(second_status["pid"].as_u64(), Some(first_pid));
 }
 
-/// REQ-003/H1: an EMPTY schema-current index (schema initialized, zero segments —
+/// An EMPTY schema-current index (schema initialized, zero segments —
 /// e.g. an interrupted initial index, or an index created before the repo grew past
 /// the threshold) must NOT be treated as ready and must NOT bypass the monorepo
 /// file-count gate. Before the fix, a schema-current index short-circuited to
@@ -2987,7 +2986,7 @@ fn start_over_threshold_with_empty_index_still_gates() {
     );
 }
 
-/// REQ-002: `1up start --scope <dir>` on an EMPTY schema-current index must run a
+/// `1up start --scope <dir>` on an EMPTY schema-current index must run a
 /// SCOPED foreground index, not short-circuit to "ready". `--scope` bypasses the
 /// monorepo gate by design, so an empty-but-current index must not fall into the
 /// ready branch (which returns before scope application) — otherwise the daemon

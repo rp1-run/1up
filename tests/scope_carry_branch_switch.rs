@@ -1,4 +1,4 @@
-// Integration test for T7 REQ-013: scope carry on branch switch
+// Integration test: scope carry on branch switch
 // This test exercises the actual database state to answer the empirical question:
 // does scope carried from a prior context reach the new context's pipeline?
 //
@@ -159,7 +159,7 @@ async fn scope_carry_branch_switch_database_sharing() {
 /// index.db — which is exactly why every rebuild path must write scope to the
 /// staging connection explicitly (ops.rs staged write, daemon re-persist)
 /// before `finalize_and_swap` can be trusted to preserve it. This pins the
-/// empirical conclusion of the T7 scope-carry investigation as assertions.
+/// empirical conclusion of the scope-carry investigation as assertions.
 #[tokio::test]
 async fn scope_carry_with_fresh_staging_database() {
     let repo_dir = TempDir::new().unwrap();

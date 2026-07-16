@@ -362,7 +362,7 @@ pub struct IndexingConfig {
     /// default-hidden dotfile policy (e.g. `.github/workflows`). Defaults empty.
     #[serde(default)]
     pub index_hidden_dirs: Vec<String>,
-    /// REQ-002: Scope roots that were converted to scope_globs for this config.
+    /// Scope roots that were converted to scope_globs for this config.
     /// Used to record scope information in the progress file during indexing.
     /// When non-empty, indicates this is a scoped index (not a full index).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -626,7 +626,7 @@ pub struct IndexStageTimings {
 /// validation: paths must be repo-relative (no absolute paths or `../` escapes).
 /// Paths are canonicalized (trailing slashes trimmed) for consistent comparison.
 ///
-/// REQ-002: Repo-relative paths, no escapes, validation on construction.
+/// Repo-relative paths, no escapes, validation on construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ScopeRoots {
@@ -732,7 +732,7 @@ pub struct IndexScopeInfo {
     pub changed_paths: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
-    /// REQ-002: Actual scope roots (e.g., ["services/auth", "libs/core"]).
+    /// Actual scope roots (e.g., ["services/auth", "libs/core"]).
     /// Present when scope was applied (requested/executed start with "scoped:").
     /// Empty for full scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -814,7 +814,7 @@ pub struct IndexProgress {
     pub scope: Option<IndexScopeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilter: Option<IndexPrefilterInfo>,
-    /// REQ-010: PID of the indexing process, used for liveness checks
+    /// PID of the indexing process, used for liveness checks
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexer_pid: Option<u32>,
     pub updated_at: DateTime<Utc>,
@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn embed_threads_plus_parse_jobs_never_oversubscribe_cores() {
-        // Pure gate (R-004): the default parse/embed split must keep
+        // Pure gate: the default parse/embed split must keep
         // embed_threads + jobs within physical cores at every realistic core
         // count, because the parse pool overlaps the embed-bearing flush and
         // ONNX intra-op throughput regresses ~3.5x once the two over-subscribe.
@@ -1018,7 +1018,8 @@ mod tests {
 
     #[test]
     fn embed_threads_scale_past_legacy_cap_on_higher_core_hosts() {
-        // R-004 raises the embed cap past the legacy fixed value of 4. On hosts
+        // The default embed-thread bound raises the cap past the legacy fixed
+        // value of 4. On hosts
         // with enough cores to fund it within the gate (>= 10, where the even
         // split leaves an embed pool > 4), the embed phase now uses more
         // intra-op threads than the old cap while still honoring the budget. If
@@ -1145,7 +1146,7 @@ mod tests {
 
     #[test]
     fn combine_degraded_reasons_joins_both_without_dropping_either() {
-        // Both present: joined by "; ", neither silently dropped (REQ-003 AC4).
+        // Both present: joined by "; ", neither silently dropped.
         assert_eq!(
             combine_degraded_reasons(Some("stale".to_string()), Some("no embeddings".to_string())),
             Some("stale; no embeddings".to_string())
@@ -1159,11 +1160,11 @@ mod tests {
             combine_degraded_reasons(None, Some("no embeddings".to_string())),
             Some("no embeddings".to_string())
         );
-        // No stale reason (rebuild idle) leaves no stale fragment (REQ-003 AC3).
+        // No stale reason (rebuild idle) leaves no stale fragment.
         assert_eq!(combine_degraded_reasons(None, None), None);
     }
 
-    // ScopeRoots validation and helper tests (REQ-002, T2)
+    // ScopeRoots validation and helper tests
 
     #[test]
     fn scope_roots_accepts_valid_repo_relative_paths() {

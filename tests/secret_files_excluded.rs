@@ -1,4 +1,4 @@
-//! Integration test: Secret file exclusion (REQ-004)
+//! Integration test: Secret file exclusion
 //!
 //! This test validates that:
 //! 1. Secret files matching expanded glob patterns are excluded from indexing
@@ -100,7 +100,7 @@ fn secret_files_are_excluded_from_indexing() {
     )
     .unwrap();
 
-    // Create secret files with sensitive content (REQ-004)
+    // Create secret files with sensitive content
     // These should NOT appear in search results
     fs::write(
         project_path.join("gcp-service-account.json"),
@@ -157,7 +157,7 @@ fn secret_files_are_excluded_from_indexing() {
         "index should become ready within 10 seconds"
     );
 
-    // Verify .1up/.gitignore was created with `*` (REQ-004)
+    // Verify .1up/.gitignore was created with `*`
     let gitignore_path = project_path.join(".1up").join(".gitignore");
     assert!(
         gitignore_path.exists(),
@@ -191,7 +191,7 @@ fn secret_files_are_excluded_from_indexing() {
     );
 
     // Search for content from secret files (should NOT be found)
-    // REQ-004: Secret files are excluded, so searching for their content returns no results
+    // Secret files are excluded, so searching for their content returns no results
 
     let search_gcp_secret = run_1up_command(
         &home_path,
@@ -239,10 +239,10 @@ fn secret_files_are_excluded_from_indexing() {
         "search should NOT return .env.local secret content"
     );
 
-    println!("REQ-004 test passed: secret files excluded, .1up/.gitignore created");
+    println!("Test passed: secret files excluded, .1up/.gitignore created");
 }
 
-/// REQ-004/H2 regression: `1up index` creates `.1up/index.db` directly without
+/// Regression: `1up index` creates `.1up/index.db` directly without
 /// funneling through `ensure_project_id`, so it must ensure `.1up/.gitignore` on its
 /// own. Before the fix, an index-first user on a fresh repo got a committable
 /// `index.db` with no `.gitignore`. This guards against a refactor dropping that
@@ -294,7 +294,7 @@ fn index_first_run_creates_gitignore_without_prior_start() {
     let gitignore_path = project_path.join(".1up").join(".gitignore");
     assert!(
         gitignore_path.exists(),
-        ".1up/.gitignore should be created by `1up index` on a fresh repo (H2)"
+        ".1up/.gitignore should be created by `1up index` on a fresh repo"
     );
     let gitignore_content = fs::read_to_string(&gitignore_path).unwrap();
     assert_eq!(

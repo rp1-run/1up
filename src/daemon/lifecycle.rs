@@ -445,7 +445,7 @@ pub fn drain_and_restart_daemon(
 /// drops — on normal scope exit, on a `?` early return, or when an in-flight
 /// indexing pass is cancelled and the holding frame unwinds — so a daemon
 /// drained mid-rebuild frees the lock for the restarted binary with no
-/// stale-lock reconciliation (HYP-002).
+/// stale-lock reconciliation.
 ///
 /// Unlike [`DaemonLock`], the lockfile is intentionally NOT removed on drop:
 /// unlinking a held `flock` target races a concurrent waiter onto a different
@@ -527,7 +527,7 @@ fn acquire_rebuild_lock_with_bound(
     timeout: Duration,
     retry_interval: Duration,
 ) -> Result<RebuildLock, OneupError> {
-    // REQ-010: Clear stale rebuild lock before attempting acquisition.
+    // Clear stale rebuild lock before attempting acquisition.
     // This ensures that a stale lock from a dead process doesn't block indefinitely.
     // The function checks both age (>5 min) and holder liveness before clearing.
     let _ = clear_stale_rebuild_lock(state_root);
@@ -556,7 +556,7 @@ fn acquire_rebuild_lock_with_bound(
     .into())
 }
 
-/// REQ-010: Check if a rebuild lock file is stale.
+/// Check if a rebuild lock file is stale.
 /// A lock is stale if the file age exceeds STALENESS_THRESHOLD_SECS (5 minutes) AND
 /// no process currently holds the lock (non-blocking lock succeeds).
 /// This allows auto-clearing of locks from dead processes so they don't block forever.
@@ -610,7 +610,7 @@ pub fn is_rebuild_lock_stale(state_root: &Path) -> Result<bool, OneupError> {
     }
 }
 
-/// REQ-010: Clear a stale rebuild lock file.
+/// Clear a stale rebuild lock file.
 /// Only clears if the lock is confirmed stale (old file, no holder).
 /// Called before rebuild lock acquisition to prevent indefinite blocking on stale locks from dead processes.
 pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
@@ -631,7 +631,7 @@ pub fn clear_stale_rebuild_lock(state_root: &Path) -> Result<(), OneupError> {
     Ok(())
 }
 
-/// REQ-001: Check if a first-time index should be started based on file count and scope.
+/// Check if a first-time index should be started based on file count and scope.
 /// Used by the daemon to gate large monorepo indexing until a scope is provided.
 ///
 /// Returns:

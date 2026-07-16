@@ -13,7 +13,7 @@ const BASELINE_RELATIVE_PATH = "suites/luna-baseline.json";
 const BASELINE_PATH = resolve(EVALS_ROOT, BASELINE_RELATIVE_PATH);
 const MANIFEST_PATH = resolve(EVALS_ROOT, MANIFEST_RELATIVE_PATH);
 
-/** The eight per-axis fields every provider record must carry (REQ-006). */
+/** The eight per-axis fields every provider record must carry. */
 const AXIS_KEYS = [...GRADED_AXES, ...EFFICIENCY_MEASURES] as const;
 
 interface BaselineFile {
@@ -28,7 +28,7 @@ function readBaseline(): BaselineFile {
 }
 
 /**
- * Drift guard for the committed warm per-axis baseline (REQ-006). The real
+ * Drift guard for the committed warm per-axis baseline. The real
  * per-axis figures come from a manual credentialed warm run
  * (`npm run eval:parallel:luna` then `axes-report --record-baseline`), which is
  * never run in-agent, so a placeholder is committed first. These invariants hold
@@ -37,9 +37,9 @@ function readBaseline(): BaselineFile {
  * states — the same pattern the recall drift guard uses across the schema
  * recapture.
  */
-describe("committed luna-baseline drift guard (REQ-006)", () => {
+describe("committed luna-baseline drift guard", () => {
   test("baseline lives under the tracked suites path and exists", () => {
-    // REQ-003 constraint: benchmark artifacts live under tracked evals/suites/,
+    // Benchmark artifacts live under tracked evals/suites/,
     // never a gitignored run-output directory.
     expect(BASELINE_RELATIVE_PATH.startsWith("suites/")).toBe(true);
     expect(existsSync(BASELINE_PATH)).toBe(true);
@@ -48,7 +48,7 @@ describe("committed luna-baseline drift guard (REQ-006)", () => {
   test("contract_hash is stamped with the current frozen contract", () => {
     // If the manifest contract changes, this pin fails until the baseline is
     // recaptured — a recorded baseline is only comparable against runs of the
-    // same frozen contract (T5).
+    // same frozen contract.
     const baseline = readBaseline();
     const manifest = JSON.parse(readFileSync(MANIFEST_PATH, "utf8")) as {
       contract_hash?: string;

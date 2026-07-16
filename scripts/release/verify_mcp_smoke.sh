@@ -650,7 +650,7 @@ try:
             f"oneup_start readiness status {readiness_status} did not include actionable next steps"
         )
 
-    # REQ-012: oneup_start is non-blocking with a bounded wait — longer
+    # oneup_start is non-blocking with a bounded wait — longer
     # first indexes (fresh runner, cold model download) detach and callers
     # poll oneup_status. Poll like a real agent instead of expecting the
     # pre-v0.1.13 blocking-start semantics from a single response.

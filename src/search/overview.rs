@@ -3,8 +3,8 @@
 //! Computes a deterministic, size-bounded digest (statistics, most-referenced
 //! types, module map, cross-module dependencies, entry points) from bounded
 //! SQL aggregates over the existing index tables. Pure read path: no schema
-//! changes, no embedding runtime, no persisted artifacts (REQ-014 is
-//! structural; this module never touches `segment_vectors`).
+//! changes, no embedding runtime, no persisted artifacts (the no-vector-access
+//! guarantee is structural; this module never touches `segment_vectors`).
 #![allow(dead_code)] // The MCP surface task wires `oneup_overview` through this engine.
 
 use std::collections::BTreeMap;
@@ -66,8 +66,10 @@ pub const DOMINANT_MODULE_SHARE_PERCENT: u64 = 60;
 /// before any non-type definition kind.
 pub const TYPE_DEFINITION_KINDS: [&str; 5] = ["struct", "enum", "trait", "class", "interface"];
 
-/// Shipped qualifying-definition kind policy: Branch B, types only (HYP-001
-/// v3 verdict, design D19 documented REQ-003 downscope). Must stay aligned
+/// Shipped qualifying-definition kind policy: Branch B, types only (a
+/// validation experiment settled the verdict, and the design deliberately
+/// downscoped qualifying definitions to type definitions only).
+/// Must stay aligned
 /// with `queries::OVERVIEW_QUALIFYING_TYPE_KINDS_SQL`.
 pub const QUALIFYING_DEFINITION_KINDS: [&str; 5] = TYPE_DEFINITION_KINDS;
 
@@ -77,7 +79,7 @@ pub const QUALIFYING_DEFINITION_ROLES: [&str; 3] =
     ["DEFINITION", "IMPLEMENTATION", "ORCHESTRATION"];
 
 /// Relation edge kinds carrying usable target identity for aggregate ranking
-/// (design D13: receiver/member edges resolve identity only through per-pair
+/// (receiver/member edges resolve identity only through per-pair
 /// owner alignment, which a bounded aggregate cannot compute). Must stay
 /// aligned with `queries::OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL`.
 pub const IDENTITY_BEARING_EDGE_KINDS: [&str; 4] = [
@@ -89,7 +91,7 @@ pub const IDENTITY_BEARING_EDGE_KINDS: [&str; 4] = [
 
 /// Full orientation digest for one worktree context. Sections use structs
 /// and `Vec`s only, so serialization order is fixed and repeated computes on
-/// an unchanged index are identical (REQ-008).
+/// an unchanged index are identical.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepositoryOverview {
     pub stats: OverviewStats,

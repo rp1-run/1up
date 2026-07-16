@@ -1,19 +1,19 @@
 /**
- * Per-axis Luna eval report and baseline recorder (REQ-002, REQ-006).
+ * Per-axis Luna eval report and baseline recorder.
  *
  * Promptfoo's blended composite score is non-authoritative: it bundles every
  * assertion into one number and grants the isolated baseline automatic credit
  * for 1up-specific workflow assertions it never exercises. This report unbundles
  * scoring into independently interpretable axes computed directly from the
  * `componentResults` embedded in each per-case diagnostic JSON, tagged with the
- * `metric:` axis names that the suite YAMLs carry (T2). Each axis is an
+ * `metric:` axis names that the suite YAMLs carry. Each axis is an
  * independent mean over only its own tagged components, so a change to one axis'
- * assertions can never move another axis (REQ-002 AC2), and components marked
+ * assertions can never move another axis, and components marked
  * `NOT_APPLICABLE_REASON` are excluded and rendered `n/a` rather than counted as
  * a pass (so the baseline no longer inherits credit it did not earn).
  *
  * `--record-baseline` freezes the current per-axis figures into the committed
- * `suites/luna-baseline.json`, stamped with the manifest `contract_hash` (T5) so
+ * `suites/luna-baseline.json`, stamped with the manifest `contract_hash` so
  * a recorded baseline is only comparable against runs of the same frozen
  * contract.
  *
@@ -48,7 +48,7 @@ export const EFFICIENCY_MEASURES = [
 ] as const;
 export type EfficiencyMeasure = (typeof EFFICIENCY_MEASURES)[number];
 
-/** A row of the append-only v2 `runs.tsv` produced by run-parallel.sh (T4). */
+/** A row of the append-only v2 `runs.tsv` produced by run-parallel.sh. */
 export interface RunRow {
   attemptId: string;
   label: string;
@@ -338,7 +338,7 @@ export function buildBaseline(
 }
 
 /**
- * Load the frozen contract hash from the T5 manifest. Absent until the manifest
+ * Load the frozen contract hash from the manifest. Absent until the manifest
  * lands; a placeholder keeps the report usable in-agent while flagging that the
  * recorded baseline is not yet contract-stamped.
  */

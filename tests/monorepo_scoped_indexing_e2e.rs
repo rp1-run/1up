@@ -150,7 +150,7 @@ fn mcp_structured(result: &serde_json::Value) -> &serde_json::Value {
 
 /// Poll `oneup_status` until `predicate` holds on the structured envelope, or
 /// panic with the last envelope after the deadline. `oneup_start` is
-/// non-blocking (REQ-012) and the daemon indexes concurrently, so tests must
+/// non-blocking and the daemon indexes concurrently, so tests must
 /// assert eventual stable states rather than single-shot status reads.
 fn wait_for_status<F: Fn(&serde_json::Value) -> bool>(
     client: &mut McpTestClient,
@@ -279,7 +279,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 /// Pre-create an empty schema index database at the given project root.
 /// This reproduces the real startup sequence where build_project_state creates
-/// an empty schema db BEFORE the daemon gate check runs (HYP-001).
+/// an empty schema db BEFORE the daemon gate check runs.
 /// The gate logic checks segment count (not file existence) to survive this
 /// pre-creation; this test verifies that the gate decision is robust to an
 /// empty-but-present db.
@@ -540,7 +540,7 @@ fn monorepo_scope_persistence_in_meta_table() {
     wait_for_searchable_readiness(&mut client);
 
     // Verify scope is persisted in meta table. oneup_start is non-blocking
-    // (REQ-012) and a daemon refresh can win the first-searchable race with an
+    // and a daemon refresh can win the first-searchable race with an
     // unscoped build, so poll until the scoped rebuild's meta write lands
     // rather than reading once.
     block_on(async {
@@ -758,8 +758,8 @@ fn monorepo_readiness_includes_scope_coverage() {
 
     wait_for_searchable_readiness(&mut client);
 
-    // Get status and verify index_scope. oneup_start is non-blocking
-    // (REQ-012), so poll until the scoped rebuild publishes index_scope
+    // Get status and verify index_scope. oneup_start is non-blocking,
+    // so poll until the scoped rebuild publishes index_scope
     // rather than asserting on the first readable status.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
@@ -833,7 +833,7 @@ fn oneup_status_unscoped_index_scope_includes_eligibility_note() {
     let _ = client.call_tool(TOOL_START, serde_json::json!({"mode": "index_if_needed"}));
     wait_for_searchable_readiness(&mut client);
 
-    // oneup_start is non-blocking (REQ-012), so poll until the completed
+    // oneup_start is non-blocking, so poll until the completed
     // unscoped index publishes index_scope with the eligibility note.
     let result = wait_for_status(
         &mut client,
@@ -903,7 +903,7 @@ fn monorepo_scope_applies_include_globs_filter() {
 }
 
 // ============================================================================
-// T8: Daemon-Alive E2E Tests with Monorepo-Scale Fixture
+// Daemon-Alive E2E Tests with Monorepo-Scale Fixture
 // ============================================================================
 
 /// Create a monorepo fixture with >3000 tracked files using ONEUP_FILE_COUNT_THRESHOLD
@@ -1009,7 +1009,7 @@ edition = "2021"
     total_files
 }
 
-/// T8.1: Gate fires on over-threshold repository without scope
+/// Gate fires on over-threshold repository without scope
 ///
 /// Acceptance: On an over-threshold Missing repo, launch MCP server with daemon alive,
 /// wait, call oneup_status -> still missing; oneup_start without scope -> facts envelope;
@@ -1133,7 +1133,7 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
     // This satisfies the acceptance criterion: no indexing happens until scope is provided.
 }
 
-/// T8.2: Scoped start applies scope and indexes only cone files
+/// Scoped start applies scope and indexes only cone files
 ///
 /// Acceptance: `oneup_start {scope_add: [...]}` scans ~cone file count (not full repo),
 /// verified in `index_status.json`
@@ -1189,7 +1189,7 @@ fn test_daemon_alive_scoped_start_applies_scope() {
     let start_status = start_envelope["status"].as_str();
 
     // "degraded" is the completed state in FTS-only mode (embeddings
-    // unavailable); the REQ-012 bounded wait means a fast cone build can
+    // unavailable); the bounded wait means a fast cone build can
     // finish inside oneup_start rather than returning mid-flight.
     assert!(
         matches!(
@@ -1256,11 +1256,11 @@ fn test_daemon_alive_scoped_start_applies_scope() {
     });
 }
 
-/// T8.3 (REQ-011/F11): the project daemon is not SIGTERM-immune.
+/// The project daemon is not SIGTERM-immune.
 ///
 /// The daemon intentionally persists after its launching parent exits
 /// (`1up start` returns immediately; the cli_tests daemon lifecycle suite
-/// asserts persistence). The F11 regression was orphaned `__worker` daemons
+/// asserts persistence). A past regression left orphaned `__worker` daemons
 /// that ignored SIGTERM and kept burning CPU, so the meaningful assertion
 /// is that the daemon spawned for this isolated project exits promptly on
 /// SIGTERM. Everything is scoped to that daemon's own pid — a machine-wide
@@ -1340,7 +1340,7 @@ fn test_daemon_alive_worker_not_sigterm_immune() {
         "daemon (pid {daemon_pid}) should persist after its parent exits"
     );
 
-    // F11 regression: SIGTERM must terminate it promptly.
+    // Regression guard: SIGTERM must terminate it promptly.
     unsafe {
         libc::kill(daemon_pid, libc::SIGTERM);
     }
@@ -1360,11 +1360,11 @@ fn test_daemon_alive_worker_not_sigterm_immune() {
     }
     assert!(
         exited,
-        "daemon (pid {daemon_pid}) did not exit within 10s of SIGTERM (F11: SIGTERM-immune worker)"
+        "daemon (pid {daemon_pid}) did not exit within 10s of SIGTERM (SIGTERM-immune worker regression)"
     );
 }
 
-/// T8.4: index_scope is visible during indexing
+/// index_scope is visible during indexing
 ///
 /// Acceptance: `index_scope` present on status during and after indexing
 #[test]
@@ -1381,7 +1381,7 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
     );
 
     // This test observes index_scope DURING indexing, so disable the
-    // REQ-012 bounded wait: with a budget, a fast FTS-only rebuild can
+    // bounded wait: with a budget, a fast FTS-only rebuild can
     // complete inside oneup_start and close the mid-indexing window.
     let mut client = McpTestClient::start_with_isolated_state_and_envs(
         &root,
@@ -1641,7 +1641,7 @@ pub fn main_logic() {
     );
 }
 
-/// T7: Integration test for field-level doc comment discovery and ranking
+/// Integration test for field-level doc comment discovery and ranking
 ///
 /// Acceptance Criteria:
 /// - Search for "exclusive cone" (defined in scope_globs field doc) returns results
@@ -2022,7 +2022,7 @@ edition = "2021"
         struct_results.len()
     );
 
-    eprintln!("�n====== T7 Integration Test Complete ======");
+    eprintln!("====== Integration Test Complete ======");
     eprintln!("✓ Field-level doc comments are discoverable via search");
     eprintln!("✓ 'exclusive cone' term ranks in top results");
     eprintln!("✓ Segmentation correctly separates field docs from struct");

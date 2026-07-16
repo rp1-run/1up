@@ -72,7 +72,7 @@ async fn write_pooled_segment(
 /// from "services/auth/utils.rs"), not the full repository-relative path. This enables
 /// cross-cone embedding reuse — identical content in two different scope cones
 /// (e.g., `services/auth/utils.rs` and `services/web/utils.rs`) produces identical
-/// embedding inputs and shares one pooled embedding row (REQ-012).
+/// embedding inputs and shares one pooled embedding row.
 ///
 /// This test prevents future "fixes" from silently breaking cross-cone dedup by
 /// changing the embed input to use full paths. It runs in the default test suite.

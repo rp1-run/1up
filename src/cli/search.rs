@@ -66,7 +66,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     )
     .await
     {
-        // REQ-001: classify by version BEFORE writing. A daemon still running the
+        // Classify by version BEFORE writing. A daemon still running the
         // previous binary stamps a mismatched `daemon_version`; its results must
         // never be served as authoritative, so the version check now gates the
         // write instead of trailing a soft warning after results were already
@@ -76,13 +76,13 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        // REQ-002: refuse the stale result, then drain the old daemon and restart
+        // Refuse the stale result, then drain the old daemon and restart
         // a fresh one under the current binary. On a detected mismatch this
         // always drains and restarts: per the recorded gating decision
-        // (`DAEMON_AUTO_RESTART_GATING_ENABLED = false`, REQ-004/OQ-003) there is
-        // no idle/size gating. The specific idle/size thresholds are an open
-        // owner decision (OQ-003); a future owner introduces the gate here
-        // without re-deriving the rationale.
+        // (`DAEMON_AUTO_RESTART_GATING_ENABLED = false`) there is no idle/size
+        // gating. The specific idle/size thresholds are a deliberately deferred
+        // owner decision; a future owner introduces the gate here without
+        // re-deriving the rationale.
         let stale_version = daemon_version.as_deref().unwrap_or("unknown");
         eprintln!(
             "warning: daemon is running a stale binary version ({stale_version}); CLI is ({VERSION}). Draining the stale daemon and restarting under the current binary."
@@ -147,7 +147,7 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
             EmbeddingLoadStatus::Unavailable(
                 EmbeddingUnavailableReason::PreviousDownloadFailed,
             ) => {
-                // REQ-002: passive search never clears the marker (no network
+                // Passive search never clears the marker (no network
                 // hammering); it only prints the runtime-resolved recovery path.
                 eprintln!(
                     "warning: embedding model download previously failed; search is degraded to FTS-only mode{}",
@@ -222,14 +222,14 @@ fn serve_daemon_results(
 /// Whether a daemon search response may be served as authoritative.
 ///
 /// A response whose `daemon_version` matches the running binary is authoritative.
-/// A *known* mismatch is refused (REQ-001) so results produced by a daemon still
+/// A *known* mismatch is refused so results produced by a daemon still
 /// running the previous binary are never served; an absent version is treated as
 /// authoritative to preserve the established no-version-info behavior.
 fn daemon_response_is_authoritative(daemon_version: Option<&str>) -> bool {
     daemon_version.is_none_or(|dv| dv == VERSION)
 }
 
-/// Refuses a stale-binary daemon (REQ-002): drains the running daemon then
+/// Refuses a stale-binary daemon: drains the running daemon then
 /// restarts a fresh one under the current binary so the retried search is served
 /// by a matching-version daemon. Returns the actionable error on a drain timeout
 /// or a restart failure so the caller surfaces it and falls back to local search
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(cli.args.limit, 7);
     }
 
-    /// REQ-001: a daemon response whose `daemon_version` differs from the running
+    /// A daemon response whose `daemon_version` differs from the running
     /// binary must be refused (non-authoritative) so the caller takes the
     /// drain/restart path instead of writing stale-binary results. A matching or
     /// absent version stays authoritative. This is the inverted-ordering guard;

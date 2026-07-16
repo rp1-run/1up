@@ -506,7 +506,7 @@ fn seed_current_index_for_context(project: &Path, context_id: &str) {
 }
 
 /// Creates a current-schema index with no rows at all: the ready-but-empty
-/// state REQ-010 distinguishes from a missing/unready index.
+/// state that is distinguished from a missing/unready index.
 fn seed_ready_empty_index(project: &Path) {
     fs::create_dir_all(project.join(".1up")).unwrap();
     fs::write(
@@ -632,7 +632,7 @@ async fn write_pooled_segment(
     .unwrap();
 }
 
-/// Re-index / replace-in-place refcount reconciliation (REQ-002 delta-on-re-embed).
+/// Re-index / replace-in-place refcount reconciliation (delta-on-re-embed).
 /// Re-writing a file whose content_key is UNCHANGED nets zero (the replace path
 /// decrements via the `segments_vector_ad` trigger, then re-increments). Re-writing
 /// with a CHANGED content_key seeds the new key at 1 and decrements the superseded
@@ -732,15 +732,15 @@ fn pooled_reindex_reconciles_ref_counts() {
     });
 }
 
-/// Cross-context dedup (REQ-001) and delta-only embedding (REQ-002) through the
+/// Cross-context dedup and delta-only embedding through the
 /// production per-file write path (`replace_file_segments_for_context_tx_with_meta`).
 ///
 /// Cold-start: a fresh context with all-distinct content stores one pool row per
-/// segment (REQ-002 no-regression — everything is embedded). A second context that
+/// segment (no-regression — everything is embedded). A second context that
 /// reuses one content's `content_key` and adds one new content grows the pool by
 /// exactly one row — the shared content is reused, not re-stored, so only the delta
-/// would reach the embedder (REQ-002). The shared embedding ends with `ref_count == 2`
-/// (REQ-001: stored once, referenced by both contexts); each unique content keeps
+/// would reach the embedder. The shared embedding ends with `ref_count == 2`
+/// (stored once, referenced by both contexts); each unique content keeps
 /// `ref_count == 1`.
 #[test]
 fn pooled_index_dedups_shared_content_and_embeds_only_deltas() {
@@ -836,7 +836,7 @@ fn pooled_index_dedups_shared_content_and_embeds_only_deltas() {
         assert_eq!(
             pool_ref_count(&conn, &shared_key).await,
             Some(2),
-            "the shared embedding is stored once and referenced by both contexts (REQ-001)"
+            "the shared embedding is stored once and referenced by both contexts"
         );
         assert_eq!(pool_ref_count(&conn, "key-only-a").await, Some(1));
         assert_eq!(pool_ref_count(&conn, "key-only-b").await, Some(1));
@@ -866,7 +866,7 @@ fn pooled_index_dedups_shared_content_and_embeds_only_deltas() {
 /// the prune so a live context is never collateral-damaged, and the pruned context
 /// must also disappear from `list_worktree_contexts` (its `worktree_contexts` row).
 ///
-/// Adapted to the shared-store model (REQ-004/005): both contexts share one pooled
+/// Adapted to the shared-store model: both contexts share one pooled
 /// embedding, so pruning one must leave the shared vector intact for the survivor
 /// (reference-counted, not unconditional, deletion) rather than orphaning it.
 #[test]
@@ -998,7 +998,7 @@ fn delete_context_removes_only_the_target_context() {
             1
         );
 
-        // Reference-counted deletion (REQ-004/005): pruning ctx-prune decremented
+        // Reference-counted deletion: pruning ctx-prune decremented
         // the shared embedding to a single reference rather than deleting it, so
         // the survivor's vector is intact and still resolves through the pool.
         assert_eq!(
@@ -1027,7 +1027,7 @@ fn delete_context_removes_only_the_target_context() {
         );
 
         // Removing the last referencer (ctx-keep) drops ref_count to zero, so the
-        // delete-at-zero sweep reclaims the now-orphaned pooled embedding (REQ-004).
+        // delete-at-zero sweep reclaims the now-orphaned pooled embedding.
         segments::delete_context(&conn, "ctx-keep").await.unwrap();
         assert_eq!(
             pool_row_count(&conn).await,
@@ -1045,7 +1045,7 @@ fn delete_context_removes_only_the_target_context() {
 /// its `worktree_contexts` row survive, and no stale-branch snapshot of the live
 /// worktree is ever in scope.
 ///
-/// Adapted to the shared-store model (REQ-005): both contexts share one pooled
+/// Adapted to the shared-store model: both contexts share one pooled
 /// embedding, so the prune must reference-count it down and leave the live
 /// context's vector intact rather than deleting it.
 #[cfg(unix)]
@@ -1193,7 +1193,7 @@ fn startup_prune_removes_only_source_missing_contexts() {
             1
         );
 
-        // The startup prune is reference-aware (REQ-005): removing the
+        // The startup prune is reference-aware: removing the
         // source-missing context decremented the shared embedding to one
         // reference instead of deleting a vector the live context still uses.
         assert_eq!(
@@ -2105,7 +2105,7 @@ fn write_scope_file(repo: &Path, name: &str, span: usize) -> String {
 /// Like [`write_scope_file`] but plants `sentinel` as a unique string literal
 /// on the second-to-last body line (near the scope tail). A near-top windowed
 /// read omits the tail, so only the truncation note's recovery call retrieves
-/// the sentinel — the HYP-002 regression surface. Returns the repo-relative path.
+/// the sentinel — the stale-handle regression surface. Returns the repo-relative path.
 fn write_scope_file_with_tail_sentinel(
     repo: &Path,
     name: &str,
@@ -2852,7 +2852,7 @@ fn count_index_rows(project: &Path, sql: &str) -> i64 {
 
 #[test]
 fn markdown_doc_topic_search_returns_heading_scoped_section_with_breadcrumb() {
-    // REQ-005: a documentation-topic query returns the heading-scoped doc
+    // A documentation-topic query returns the heading-scoped doc
     // section with its document-rooted breadcrumb. Runs FTS-only, which also
     // pins degraded-path discoverability of markdown doc segments.
     let tmp = create_markdown_docs_fixture();
@@ -2877,7 +2877,7 @@ fn markdown_doc_topic_search_returns_heading_scoped_section_with_breadcrumb() {
 
 #[test]
 fn markdown_symbol_references_include_doc_mentions() {
-    // REQ-003: documentation mentions surface through the existing symbol
+    // Documentation mentions surface through the existing symbol
     // reference lookup with doc-section provenance, alongside (not replacing)
     // code usages.
     let tmp = create_markdown_docs_fixture();
@@ -2905,7 +2905,7 @@ fn markdown_symbol_references_include_doc_mentions() {
 
 #[test]
 fn markdown_impact_excludes_doc_mentions_while_code_reference_promotes() {
-    // REQ-004 at the integration level: indexing stores doc_mention relation
+    // At the integration level: indexing stores doc_mention relation
     // rows for the markdown sections, yet anchored impact never surfaces the
     // doc segments in either trust bucket while the real code reference still
     // promotes to primary.
@@ -2938,7 +2938,7 @@ fn markdown_impact_excludes_doc_mentions_while_code_reference_promotes() {
 
 #[test]
 fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
-    // REQ-005: doc sections participate in the embedding path like any other
+    // Doc sections participate in the embedding path like any other
     // structural segment. Vector coverage is asserted only when this run
     // actually embedded (the local model is a machine-level artifact);
     // FTS-only discoverability is covered by the doc-topic search test.
@@ -3022,7 +3022,7 @@ fn fresh_index_stores_vector_rows_for_source_segments_when_embeddings_enabled() 
 
 #[test]
 fn prior_schema_version_index_fails_closed_with_reindex_guidance() {
-    // REQ-006: a fresh index at the current schema version serves reads;
+    // A fresh index at the current schema version serves reads;
     // downgrading the stored version to the immediate prior value (v15 at the
     // v16 bump) fails discovery closed with explicit reindex guidance.
     let tmp = create_markdown_docs_fixture();
@@ -3437,7 +3437,7 @@ fn mcp_readiness_reports_pinned_detached_commit_as_ready() {
     let envelope = mcp_structured(&result);
     assert_mcp_response_is_presentation_free(&result);
 
-    // The pinned-detached readiness contract (REQ-005): an exact detached commit
+    // The pinned-detached readiness contract: an exact detached commit
     // matching the indexed state is never downgraded for branch ambiguity. The
     // CI-faithful test HOME carries a model-download-failed marker, so the read
     // path reports `degraded` for unavailable embeddings (as the existing ready
@@ -3577,7 +3577,7 @@ fn mcp_status_ignores_index_progress_from_other_context() {
     }
 }
 
-/// T5: once the index phase is terminal, the readiness envelope keeps only the
+/// Once the index phase is terminal, the readiness envelope keeps only the
 /// readiness essentials of index_progress and drops the build-time telemetry
 /// (prefilter/parallelism/message internals) and the duplicate source_root. The
 /// repo is addressed per call via `path` from a neutral isolated-state server
@@ -3699,7 +3699,7 @@ fn mcp_get_ignores_handles_from_other_context() {
     );
     assert_eq!(envelope["next_actions"][0]["tool"], TOOL_SEARCH);
 
-    // REQ-001 AC3: a mistyped handle whose only unique-prefix match lives in a
+    // A mistyped handle whose only unique-prefix match lives in a
     // foreign context must never be recovered into the active context. The
     // seeded id is "other-context-segment"; a one-character typo shares a long
     // prefix but must still resolve to not_found with no recovery disclosure.
@@ -3898,7 +3898,7 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     );
     assert!(
         !read_handle_text.contains("PolicyRuleValidator"),
-        "oneup_get text must be content-free (REQ-001): source appears only in structured data, never mirrored into the summary: {read_handle_text}"
+        "oneup_get text must be content-free: source appears only in structured data, never mirrored into the summary: {read_handle_text}"
     );
     let read_handle_envelope = mcp_structured(&read_handle);
     assert_eq!(read_handle_envelope["status"], "ok");
@@ -3948,7 +3948,7 @@ fn mcp_core_discovery_loop_returns_structured_evidence() {
     );
     assert!(
         !read_location_text.contains("validate(&self"),
-        "oneup_context text must be content-free (REQ-001): source context appears only in structured data, never mirrored into the summary: {read_location_text}"
+        "oneup_context text must be content-free: source context appears only in structured data, never mirrored into the summary: {read_location_text}"
     );
     let read_location_envelope = mcp_structured(&read_location);
     assert_eq!(read_location_envelope["status"], "ok");
@@ -4293,7 +4293,7 @@ fn mcp_get_still_honors_full_verbosity() {
     }
 }
 
-/// REQ-001 (exactly-once serialization): the authoritative source of a
+/// Exactly-once serialization: the authoritative source of a
 /// hydrated segment lives only in `structuredContent.data.records[].segment.content`;
 /// it is never mirrored into the text summary. Serializing the whole
 /// `CallToolResult` and counting a content-only sentinel proves the mirror is
@@ -4334,7 +4334,7 @@ fn mcp_get_serializes_segment_source_exactly_once() {
     let text = get["content"][0]["text"].as_str().unwrap();
     assert!(
         !text.contains(sentinel),
-        "text summary must stay content-free (REQ-001): {text}"
+        "text summary must stay content-free: {text}"
     );
 
     // Across the entire serialized CallToolResult the source appears exactly once.
@@ -4346,7 +4346,7 @@ fn mcp_get_serializes_segment_source_exactly_once() {
     );
 }
 
-/// REQ-002 (bounded, invariant summary): the text summary is a constant
+/// Bounded, invariant summary: the text summary is a constant
 /// per-record grammar independent of record size. A tiny scope and an unclipped
 /// ~120-line scope must yield summaries of near-identical length (differing only
 /// by line-number digits), both well within budget, while the large record's
@@ -4393,7 +4393,7 @@ fn mcp_read_summary_size_is_bounded_and_invariant_across_record_sizes() {
     );
 
     // The large record's structured source content dwarfs its summary: the
-    // compaction moved the bulk out of the text block (REQ-001/REQ-002).
+    // compaction moved the bulk out of the text block.
     let large_content = mcp_structured(&large)["data"]["records"][0]["context"]["content"]
         .as_str()
         .unwrap();
@@ -4409,7 +4409,7 @@ fn mcp_read_summary_size_is_bounded_and_invariant_across_record_sizes() {
     );
 }
 
-/// REQ-003/REQ-004 (whole-scope threshold, end-to-end): a scope of exactly
+/// Whole-scope threshold, end-to-end: a scope of exactly
 /// `MAX_WHOLE_SCOPE_LINES` (101) lines returns whole with no truncation note,
 /// while a 102-line scope windowed near its middle carries a load-bearing note
 /// stating the full scope range. Asserts the ==101 whole / ==102 clipped
@@ -4450,7 +4450,7 @@ fn mcp_context_truncation_note_tracks_whole_scope_threshold() {
     assert_eq!(note["full_line_end"].as_u64(), Some(102));
 }
 
-/// REQ-004 recovery round-trip (REQUIRED, HYP-002 regression): a near-top
+/// Recovery round-trip regression: a near-top
 /// windowed read of a large scope omits the tail sentinel; deserializing the
 /// truncation note's recovery call and re-issuing it verbatim retrieves the
 /// omitted remainder, so the union of both responses covers the full enclosing
@@ -4485,7 +4485,7 @@ fn mcp_context_truncation_recovery_round_trips_to_full_scope() {
 
     // The recovery call is prepended as the first envelope next_action, naming
     // the clipped scope and omitted counts, and carries the note's arguments
-    // verbatim (REQ-004).
+    // verbatim.
     let first_actions = mcp_structured(&first)["next_actions"].as_array().unwrap();
     assert_eq!(first_actions[0]["tool"].as_str(), Some(TOOL_CONTEXT));
     assert_eq!(first_actions[0]["arguments"], note["recovery"]["arguments"]);
@@ -4650,7 +4650,7 @@ fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
     assert_eq!(records[1]["status"], "not_found");
     assert_eq!(records[1]["source"]["normalized"], "does-not-exist");
 
-    // REQ-002: the ambiguous record's disambiguation next-action prefills
+    // The ambiguous record's disambiguation next-action prefills
     // oneup_get with the real candidate ids (never placeholders) ahead of the
     // generic search fallback, so an agent can pick one unambiguous handle.
     let next_actions = envelope["next_actions"].as_array().unwrap();
@@ -4686,7 +4686,7 @@ fn mcp_get_handles_return_structured_not_found_and_ambiguous_records() {
 
 #[test]
 fn mcp_get_rejects_an_identical_failed_handle_retry_within_a_session() {
-    // REQ-003: a handle that failed to resolve is remembered against the index
+    // A handle that failed to resolve is remembered against the index
     // identity, so an identical retry against the unchanged index is rejected
     // without re-querying and steered to fresh guidance rather than a repeat.
     let tmp = create_ambiguous_handle_fixture();
@@ -7213,7 +7213,7 @@ fn branch_context_search_excludes_other_worktree_only_content() {
     );
 }
 
-/// REQ-003: the `state_root`-keyed single-writer rebuild lock must serialize
+/// The `state_root`-keyed single-writer rebuild lock must serialize
 /// concurrent rebuilds — exactly one process performs the rebuild while a second
 /// concurrent attempt defers (never starting a competing destructive rebuild) —
 /// and must release on drop so a later rebuild can proceed.
@@ -7280,7 +7280,7 @@ fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
 /// `ensure_current` and reads, and a subsequent uncancelled pass completes the
 /// remainder to the full file count.
 ///
-/// This is the design's headline T7 "resume-don't-drop" guarantee (REQ-002):
+/// This is the design's headline "resume-don't-drop" guarantee:
 /// the prior cancellation tests all cancel *before* the pass (a 0->N from-scratch
 /// resume), so the resume-from-a-committed-prefix path was unguarded. The
 /// mid-pass cancellation here is DETERMINISTIC, not timing-based: a libSQL
@@ -7290,7 +7290,7 @@ fn rebuild_lock_serializes_concurrent_rebuilds_to_a_single_writer() {
 /// already durably committed. No wall-clock sleep or race is involved.
 ///
 /// The timing claim (SIGTERM interrupts a real daemon pass within the ~3s bound)
-/// was validated separately by the HYP-001/HYP-003 daemon CODE_EXPERIMENT.
+/// was validated separately by a manual daemon experiment.
 #[cfg(unix)]
 #[test]
 fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
@@ -7338,7 +7338,7 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
     // scheduling race that a multi-worker config has, where all files can land in
     // the reorder buffer and a single flush commits them all before the next
     // safe-point is reached. (Real-world cancel granularity is fine regardless —
-    // validated separately by HYP-003: files parse over time and flush
+    // validated separately: files parse over time and flush
     // incrementally, giving 17-53ms interruption. This knob is test-only.)
     let config =
         IndexingConfig::with_glob_config(1, 1, 1, Vec::new(), Vec::new(), Vec::new()).unwrap();
@@ -7465,15 +7465,15 @@ fn cancelled_mid_pass_keeps_committed_prefix_reopens_and_resumes() {
 // =============================================================================
 // Non-destructive background index rebuild (build-aside + atomic switch-over)
 //
-// These are the end-to-end guards the design's Validation Plan defers to T7. The
+// These are the end-to-end guards deferred by the design's Validation Plan. The
 // decisive in-process primitive guards already live inline:
-//   - all-or-nothing swap / new-generation / sidecar retirement (HYP-001):
+//   - all-or-nothing swap / new-generation / sidecar retirement:
 //     `src/storage/swap.rs` (`swap_is_all_or_nothing_under_concurrent_readers`,
 //     `swap_replaces_index_with_new_generation_and_leaves_no_sidecars`),
 //   - aborted-rebuild-leaves-prior-index-intact: `src/storage/swap.rs`
 //     (`aborted_staging_rebuild_leaves_prior_index_intact_and_no_orphan`,
 //     `swap_leaves_prior_index_unchanged_when_staging_missing`),
-//   - daemon stale-handle reopen after a swap (HYP-002): `src/daemon/worker.rs`
+//   - daemon stale-handle reopen after a swap: `src/daemon/worker.rs`
 //     (`reopen_adopts_swapped_index_so_writes_land_in_the_new_inode`),
 //   - stale/embeddings reason combination + scoping: `src/shared/types.rs` and
 //     `src/mcp/ops.rs` detector tests.
@@ -7533,14 +7533,14 @@ async fn served_index_has_file(db_path: &Path, repo_relative_path: &str) -> bool
     count > 0
 }
 
-/// REQ-001 AC4 + AC2 (integration): a *real* `1up reindex` builds the refreshed
+/// Integration: a *real* `1up reindex` builds the refreshed
 /// index aside and switches it over in a single atomic rename. A reader
 /// repeatedly inspecting the served index throughout the reindex only ever
 /// observes a full valid index (never absent/empty/partial); the switch installs
 /// a *new inode* (build-aside-then-rename, not edit-in-place, mirroring the binary
 /// replacement discipline); and a fresh read afterwards is the new generation.
 ///
-/// The new inode is also the HYP-002 substrate: any handle opened before the swap
+/// The new inode is also the stale-handle substrate: any handle opened before the swap
 /// is left on the orphaned old inode — the exact reason the daemon must reopen
 /// after a swap. The daemon's reopen response is unit-covered in
 /// `src/daemon/worker.rs`; here we prove the cross-process switch installs the new
@@ -7618,7 +7618,7 @@ fn reindex_switch_over_is_all_or_nothing_with_atomic_inode_replacement() {
     stop.store(true, Ordering::Release);
     let samples = sampler.join().unwrap();
 
-    // REQ-001 AC4: every inspection during the reindex saw a complete, valid index
+    // Every inspection during the reindex saw a complete, valid index
     // — never absent, empty, or partial.
     assert!(!samples.is_empty(), "the sampler must observe the index");
     for sample in &samples {
@@ -7631,7 +7631,7 @@ fn reindex_switch_over_is_all_or_nothing_with_atomic_inode_replacement() {
         );
     }
 
-    // REQ-001 AC2: the switch-over is a build-aside atomic rename, so the served
+    // The switch-over is a build-aside atomic rename, so the served
     // file is a *new inode* (an in-place rebuild would keep the same inode).
     let new_inode = fs::metadata(&db_path).unwrap().ino();
     assert_ne!(
@@ -7639,15 +7639,15 @@ fn reindex_switch_over_is_all_or_nothing_with_atomic_inode_replacement() {
         "the atomic switch-over must replace index.db with a freshly-built inode"
     );
 
-    // The fresh read is unambiguously the new generation (REQ-001 AC4 / HYP-001
-    // post-swap-is-new-generation), proving the rename flipped readers over.
+    // The fresh read is unambiguously the new generation
+    // (post-swap-is-new-generation), proving the rename flipped readers over.
     assert!(
         block_on(served_index_has_file(&db_path, "beta.rs")),
         "the served index after reindex must be the new generation (beta.rs present)"
     );
 }
 
-/// REQ-002 AC1 + REQ-003 AC2/AC4 (integration, MCP surface): while a rebuild is in
+/// Integration, MCP surface: while a rebuild is in
 /// progress and a usable prior index exists, MCP `oneup_search` keeps returning the
 /// prior index's results (stale-but-available) and folds the stale notice into
 /// `degraded_reason` — combined with the pre-existing embeddings-unavailable reason,
@@ -7693,7 +7693,7 @@ fn mcp_search_during_rebuild_serves_prior_results_with_stale_degraded_reason() {
     );
     let envelope = mcp_structured(&result);
 
-    // Stale-but-available: the prior index is still served (REQ-002 AC1).
+    // Stale-but-available: the prior index is still served.
     let hits = envelope["data"]["results"]
         .as_array()
         .expect("search payload carries a results array");
@@ -7703,7 +7703,7 @@ fn mcp_search_during_rebuild_serves_prior_results_with_stale_degraded_reason() {
     );
 
     // The notice rides only in `degraded_reason` and flips status to degraded
-    // (REQ-003 AC2 — reuse the existing reason channel, no parallel field).
+    // (reuse the existing reason channel, no parallel field).
     assert_eq!(
         envelope["status"].as_str(),
         Some("degraded"),
@@ -7716,7 +7716,7 @@ fn mcp_search_during_rebuild_serves_prior_results_with_stale_degraded_reason() {
         reason.contains(STALE_REBUILD_REASON),
         "degraded_reason must carry the stale fragment: {reason}"
     );
-    // REQ-003 AC4: the pre-existing embeddings-unavailable reason coexists with the
+    // The pre-existing embeddings-unavailable reason coexists with the
     // stale fragment (combined via `combine_degraded_reasons`), neither dropped.
     assert!(
         reason.contains(NO_INDEXED_EMBEDDINGS_REASON),
@@ -7735,7 +7735,7 @@ fn mcp_search_during_rebuild_serves_prior_results_with_stale_degraded_reason() {
     drop(lock);
 }
 
-/// REQ-002 AC2 (integration, MCP surface): the stale-but-available plumbing must
+/// Integration, MCP surface: the stale-but-available plumbing must
 /// not fabricate results on the cold-start path. With a rebuild in progress
 /// (rebuild lock held) and *no* prior index, MCP `oneup_search` surfaces a
 /// not-ready state with no result rows, never a synthesized hit. The lock is held
@@ -7775,7 +7775,7 @@ fn mcp_search_cold_start_during_rebuild_does_not_fabricate_results() {
     );
 }
 
-/// REQ-003 AC1 + AC3 (integration, CLI render seam): `1up search` keeps the
+/// Integration, CLI render seam: `1up search` keeps the
 /// machine-readable result stream (stdout) byte-for-byte identical whether or not
 /// a stale-rebuild notice is present, and emits the notice only on the warning
 /// channel (stderr) and only while a rebuild is in progress. A one-shot fake daemon
@@ -7857,7 +7857,7 @@ fn cli_search_keeps_stale_rebuild_notice_off_stdout() {
     let (stdout_stale, stderr_stale) = search_against_fake_daemon(Some(STALE_REBUILD_REASON));
     let (stdout_fresh, stderr_fresh) = search_against_fake_daemon(None);
 
-    // REQ-003 AC1: the stale notice never alters the machine-readable result
+    // The stale notice never alters the machine-readable result
     // stream — stdout is byte-identical with and without it.
     assert_eq!(
         stdout_stale, stdout_fresh,
@@ -7874,7 +7874,7 @@ fn cli_search_keeps_stale_rebuild_notice_off_stdout() {
     );
 
     // The notice appears on stderr only, and only when a rebuild is in progress
-    // (REQ-003 AC1 warning-channel + AC3 scoping).
+    // (warning-channel + scoping).
     assert!(
         stderr_stale.contains(STALE_REBUILD_REASON),
         "the stale notice must appear on stderr during a rebuild: {stderr_stale}"

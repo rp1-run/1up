@@ -203,7 +203,7 @@ pub async fn exec(args: ReindexArgs, format: OutputFormat) -> anyhow::Result<()>
     )?;
     let show_progress_ui = format == OutputFormat::Human;
 
-    // REQ-004/H2: `1up reindex` rebuilds `.1up/index.db` directly (it does not funnel
+    // `1up reindex` rebuilds `.1up/index.db` directly (it does not funnel
     // through `ensure_project_id`), so ensure `.1up/.gitignore` here too — otherwise
     // a reindex-first user on a fresh repo could commit their local index.db.
     // Best-effort: a gitignore failure must never block the rebuild.
@@ -249,7 +249,7 @@ async fn run_reindex_once(
 
     // Single-writer rebuild lock: ALWAYS held across the staged build + the atomic
     // switch-over so exactly one process owns the rebuild (single-writer
-    // guarantee) and the switch runs under the lock (HYP-001/HYP-002). `state_root`
+    // guarantee) and the switch runs under the lock. `state_root`
     // is non-optional precisely so this lock can never be silently bypassed.
     // Released when this function returns (RAII).
     let _rebuild_lock = crate::daemon::lifecycle::acquire_rebuild_lock(state_root)?;
@@ -281,7 +281,7 @@ async fn run_reindex_once(
     let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
     let model_start = Instant::now();
-    // REQ-002: `1up reindex` is an explicit, deliberate retry signal, so clear
+    // `1up reindex` is an explicit, deliberate retry signal, so clear
     // any prior download-failure marker before the model prepare's
     // `is_download_failed()` guard runs. Passive search (cli/search.rs) never
     // does this, so it stays FTS-only until an explicit index/reindex clears

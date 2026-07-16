@@ -129,7 +129,7 @@ fn refresh_progress(
     progress_tx: Option<&ProgressSender>,
     update: ProgressUpdate,
 ) {
-    // REQ-002: Preserve scope once it's recorded in the first progress update.
+    // Preserve scope once it's recorded in the first progress update.
     // Subsequent updates may not include scope, but we don't want to overwrite it with None.
     let scope = update.scope.or_else(|| stats.progress.scope.clone());
 
@@ -351,7 +351,7 @@ fn truncate_chars(mut text: String, max_chars: usize) -> String {
 /// Because the embedding input uses the file stem (e.g., "utils" from
 /// "services/auth/utils.rs"), it is identical for the same file name across
 /// different directories and scope cones, so identical content in different cones
-/// yields an identical key and shares a single embedding pool row (REQ-012).
+/// yields an identical key and shares a single embedding pool row.
 /// Folding the model identity into the key makes embeddings produced by a
 /// different model resolve to a different key, so changing the model
 /// automatically invalidates reuse of older vectors. `max_tokens` is folded in
@@ -715,7 +715,7 @@ async fn prepare_scoped_run_inputs(
 }
 
 fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
-    // REQ-005: Check per-file size cap before reading into memory to prevent OOM
+    // Check the per-file size cap before reading into memory to prevent OOM
     // on large minified/generated files. Skip and warn if over cap; zero segments.
     if scanned_file.file_size > MAX_FILE_SIZE_BYTES {
         warn!(
@@ -727,7 +727,7 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
         return ParseResultKind::Skipped(ParseSkipReason::Unreadable);
     }
 
-    // REQ-005: Check unsupported extension before hash/read to avoid re-reading
+    // Check unsupported extension before hash/read to avoid re-reading
     // large unsupported files (e.g., .sql, .bin) on every scan.
     if !matches!(
         parser::SupportedLanguage::from_extension(&scanned_file.extension),
@@ -793,7 +793,7 @@ fn parse_scanned_file(scanned_file: ScannedWorkItem) -> ParseResultKind {
         ));
     };
 
-    // REQ-005: enforce the per-file segment cap uniformly across ALL parser
+    // Enforce the per-file segment cap uniformly across ALL parser
     // outputs — markdown, tree-sitter, and the fallback chunker — not just the
     // chunker (which caps internally). A pathologically dense file (e.g. thousands
     // of tiny top-level definitions) would otherwise blow past the cap and bloat
@@ -882,7 +882,7 @@ struct EmbeddableSegment {
 /// `embedding_pool` under the current model. The returned `(content_key,
 /// embed_input)` pairs are exactly the misses: pool hits are dropped (their
 /// shared vector is reused) and within-batch duplicates are collapsed, so each
-/// distinct new `(content, model)` pair is embedded at most once (REQ-002).
+/// distinct new `(content, model)` pair is embedded at most once.
 /// Input order is preserved so embedding stays deterministic.
 fn plan_embedding_work<'a>(
     embeddable: &'a [EmbeddableSegment],
@@ -907,8 +907,8 @@ fn plan_embedding_work<'a>(
 /// resolved content key (`embeddable`, deterministic file/segment order) plus
 /// the distinct `(content_key, embed_input)` pairs that still need embedding
 /// (`misses`, pool hits already excluded). Produced by `plan_segment_batches`,
-/// which is the *only* phase of the embed<->store flush that touches `conn`
-/// (T6): the caller must keep this lookup from overlapping the store task's
+/// which is the *only* phase of the embed<->store flush that touches `conn`:
+/// the caller must keep this lookup from overlapping the store task's
 /// write on the same connection (Open Risk mitigation), while the CPU-only
 /// `embed_planned_batch` step that follows is free to run concurrently with
 /// the previous batch's store.
@@ -929,7 +929,7 @@ async fn plan_segment_batches(
         return Ok(None);
     };
 
-    // Fold the loaded model variant (INT8 default vs FP32 fallback, R-003/T10)
+    // Fold the loaded model variant (INT8 default vs FP32 fallback)
     // into the content key so swapping the variant resolves to distinct keys and
     // forces a clean re-embed instead of reusing numerically-different vectors.
     let model_id = embedder.model_id();
@@ -959,7 +959,7 @@ async fn plan_segment_batches(
         .collect();
 
     // Look up which keys already live in the pool, then embed only the misses so
-    // content already embedded under this model is never re-embedded (REQ-002).
+    // content already embedded under this model is never re-embedded.
     let distinct_keys: Vec<&str> = {
         let mut seen = HashSet::new();
         embeddable
@@ -979,7 +979,7 @@ async fn plan_segment_batches(
 
 /// Phase B (pure CPU): embeds the plan's misses. Never touches `conn`, so it
 /// is safe to run while a previous batch's store write is in flight on the
-/// store task (T6 double buffer).
+/// store task (the store double buffer).
 fn embed_planned_batch(
     embedder: &mut Embedder,
     plan: &SegmentBatchPlan,
@@ -1144,7 +1144,7 @@ struct StoreOutcome {
 }
 
 /// Overlaps the pure-CPU `Embedder::embed_batch` call for batch N+1 with the
-/// libSQL write of batch N (T6/REQ-004): a dedicated task owns the write
+/// libSQL write of batch N: a dedicated task owns the write
 /// connection and drains `StoreJob`s from a depth-1 channel while the
 /// producer keeps preparing the next batch. `await_inflight` is the single
 /// synchronization point the producer must pass through before it touches
@@ -1358,7 +1358,7 @@ async fn verify_stored_embedding_outcome(
 ///    for in the recorded index.
 /// 3. If no scope and no coverage: proceed normally (empty index).
 ///
-/// REQ-005: This is the critical safety gate preventing silent whole-repo
+/// This is the critical safety gate preventing silent whole-repo
 /// re-indexing on scope state loss. The clamp to recorded coverage ensures
 /// a failed rebuild always leaves the prior index intact for manual inspection.
 async fn clamp_deletion_on_scope_loss(
@@ -1881,7 +1881,7 @@ pub async fn run_with_context_scope_setup_and_progress_root(
 ///
 /// Also runs the opt-in (default OFF) migration-time `SupersededSameSource`
 /// prune when [`config::migration_gc_prune_enabled`] reports the switch is on
-/// (REQ-003 Open Risks: automatic pruning on every index run is not a
+/// (automatic pruning on every index run is not a
 /// default-on behavior until the planning gate finalizes enablement).
 async fn record_indexed_head(conn: &Connection, context: &WorktreeContext) {
     let project_id =
@@ -1974,7 +1974,7 @@ fn superseded_same_source_context_ids(
 /// source-missing prune (`daemon::worker::prune_source_missing_contexts_on_startup`):
 /// deletes rows only, no inline `VACUUM` (full compaction stays exclusive to
 /// explicit `1up gc --apply` under the rebuild lock, so this never competes with
-/// concurrent searches — REQ-004), and every step is best-effort so a prune
+/// concurrent searches), and every step is best-effort so a prune
 /// failure can never fail the index run that just succeeded.
 ///
 /// Registry/daemon-status bookkeeping (which `1up gc --apply` and the daemon
@@ -2047,7 +2047,7 @@ async fn run_with_index_context_scope_setup_and_progress_root(
                 prepare_full_run_inputs(conn, project_root, &context.context_id, config).await?;
             let changed_count = run_inputs.scanned_files.len();
 
-            // REQ-002: Detect scope applied via include_globs (MCP path with scope_roots)
+            // Detect scope applied via include_globs (MCP path with scope_roots)
             let (requested_scope_str, executed_scope_str) = if !config.scope_roots.is_empty() {
                 // Scoped via include_globs: requested = scope root count, executed = actual scanned
                 (
@@ -2178,7 +2178,7 @@ async fn execute_run_with_inputs(
         stats.embedding_unavailable_reason =
             Some("embedding model unavailable; indexed without embeddings".to_string());
     } else {
-        // Use the loaded variant's identity (INT8 vs FP32, R-003/T10) so an index
+        // Use the loaded variant's identity (INT8 vs FP32) so an index
         // built under one variant fails closed with reindex guidance when reopened
         // under the other while vectors exist — the FP32->INT8 re-embed gate.
         let model_id = embedder
@@ -2193,7 +2193,7 @@ async fn execute_run_with_inputs(
         executed: executed_scope,
         changed_paths: changed_path_count,
         fallback_reason,
-        // REQ-002: Include scope roots from config if this is a scoped run
+        // Include scope roots from config if this is a scoped run
         roots: config.scope_roots.clone(),
     });
 
@@ -2258,7 +2258,7 @@ async fn execute_run_with_inputs(
     }
 
     if !deleted_paths.is_empty() {
-        // REQ-005: Apply fail-closed clamp on scope metadata loss.
+        // Apply fail-closed clamp on scope metadata loss.
         // If scope was configured but metadata is lost, clamp to recorded coverage
         // and emit a warning. Never silently delete all segments and re-index.
         let (clamped_deletes, scope_loss_warning) =
@@ -2554,12 +2554,12 @@ mod tests {
         }
     }
 
-    /// T6: the store task must decouple the producer from the write's actual
+    /// The store task must decouple the producer from the write's actual
     /// completion. `dispatch_pending` (the handoff of a prior batch to the
     /// store task) must return well before that batch's libSQL write
     /// finishes, so the flush stage no longer fully serializes
     /// embed-then-store — the caller is free to spend that window on the
-    /// next batch's pure-CPU embed step. Before T6, `store_ready_files` ran
+    /// next batch's pure-CPU embed step. Previously, `store_ready_files` ran
     /// `build_segment_batches` (embed) and the write fully sequentially, so
     /// dispatch and completion were the same event; this assertion fails
     /// against that prior shape.
@@ -2732,7 +2732,7 @@ mod tests {
         .await;
     }
 
-    /// REQ-003/T4 AC: the opt-in migration-time `SupersededSameSource` prune
+    /// The opt-in migration-time `SupersededSameSource` prune
     /// must never fire while [`GC_MIGRATION_PRUNE_ENV_VAR`] is unset (default
     /// OFF) — a context that would otherwise qualify stays recorded.
     #[tokio::test]
@@ -2787,7 +2787,7 @@ mod tests {
         }
     }
 
-    /// REQ-003/T4 AC: enabling [`GC_MIGRATION_PRUNE_ENV_VAR`] prunes
+    /// Enabling [`GC_MIGRATION_PRUNE_ENV_VAR`] prunes
     /// `SupersededSameSource` contexts at migration time via `delete_context`,
     /// with no inline VACUUM — rows beyond the keep-count/age policy are gone,
     /// contexts within the policy (and the active context) survive.
@@ -3797,7 +3797,7 @@ mod tests {
     async fn persisted_progress_reports_embed_threads_when_embeddings_enabled() {
         // Pin the always-provisioned FP32 baseline so this embedding-path test
         // does not depend on the INT8 default artifact being present locally
-        // (provisioned by T4).
+        // (provisioned separately).
         let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
@@ -4051,7 +4051,7 @@ mod tests {
         // The embed input is a deterministic function of repository-relative
         // path + content, so two different contexts (branches/worktrees) that
         // hold the same chunk produce the byte-identical embed input that any
-        // context would, and therefore the same content key (REQ-006).
+        // context would, and therefore the same content key.
         let embed_input = compose_embedding_text("src/search/impact.rs", &segment);
         let key_ctx_a = embedding_content_key(
             HF_MODEL_REPO,
@@ -4155,7 +4155,7 @@ mod tests {
 
         // k2 already lives in the pool, so it is reused rather than re-embedded;
         // the duplicate k1 is collapsed so identical content is embedded once;
-        // ordering is preserved for deterministic embedding (REQ-002).
+        // ordering is preserved for deterministic embedding.
         let present: HashSet<String> = ["k2".to_string()].into_iter().collect();
         assert_eq!(
             plan_embedding_work(&embeddable, &present),
@@ -4218,7 +4218,7 @@ mod tests {
     async fn low_semantic_chunked_files_are_indexed_without_embeddings() {
         // Pin the always-provisioned FP32 baseline so this embedding-path test
         // does not depend on the INT8 default artifact being present locally
-        // (provisioned by T4).
+        // (provisioned separately).
         let _variant = crate::indexer::embedder::Fp32VariantTestGuard::set();
         if !crate::indexer::embedder::is_model_available() {
             return;
@@ -4311,7 +4311,7 @@ mod tests {
         );
     }
 
-    /// REQ-005: Fail-closed clamp on scope metadata loss.
+    /// Fail-closed clamp on scope metadata loss.
     /// Test scenario: no scope, no coverage -> proceed normally.
     #[tokio::test]
     async fn clamp_deletion_on_scope_loss_no_scope_no_coverage() {
@@ -4333,7 +4333,7 @@ mod tests {
         );
     }
 
-    /// REQ-005: Fail-closed clamp on scope metadata loss.
+    /// Fail-closed clamp on scope metadata loss.
     /// Test scenario: scope present -> allow requested deletes (v1 logic).
     #[tokio::test]
     async fn clamp_deletion_on_scope_loss_with_scope_present() {
@@ -4361,7 +4361,7 @@ mod tests {
         );
     }
 
-    /// REQ-005: Fail-closed clamp on scope metadata loss.
+    /// Fail-closed clamp on scope metadata loss.
     /// Test scenario: scope lost, coverage exists -> clamp to recorded paths.
     #[tokio::test]
     async fn clamp_deletion_on_scope_loss_clamps_to_coverage() {
@@ -4418,7 +4418,7 @@ mod tests {
         );
     }
 
-    /// REQ-005: Regression test for scope metadata re-stamping.
+    /// Regression test for scope metadata re-stamping.
     /// Ensures that scope metadata is persisted correctly to staging DB
     /// before finalize_and_swap, so rebuilds cannot erase coverage truth.
     /// This test verifies the core persistence mechanism, not the full swap.
