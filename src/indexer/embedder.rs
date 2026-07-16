@@ -32,7 +32,7 @@ use crate::shared::progress::{ProgressState, ProgressUi};
 
 const MODEL_DOWNLOAD_URL: &str = "onnx/model.onnx";
 const TOKENIZER_DOWNLOAD_URL: &str = "tokenizer.json";
-/// Upstream relative path for the INT8 artifact (T4, HYP-001 validated). The
+/// Upstream relative path for the INT8 artifact (validated by download-and-compare). The
 /// `avx512` build is byte-identical to the repo's arm64/avx512_vnni INT8
 /// variants (same LFS object), fetched via the shared `resolve/main` scheme.
 const MODEL_ONNX_INT8_DOWNLOAD_URL: &str = "onnx/model_qint8_avx512.onnx";
@@ -53,7 +53,7 @@ impl ExpectedArtifactFile {
     }
 }
 
-// The INT8 artifact (T4) is a first-class third entry: the manifest records all
+// The INT8 artifact is a first-class third entry: the manifest records all
 // three files, and every existing staged-download / per-file digest-verify /
 // pointer-repair / `Unverifiable`-resolution path covers it with no new
 // mechanism. A pre-existing two-file verified manifest therefore stops matching
@@ -204,7 +204,7 @@ impl EmbeddingCompatibilityKey {
     }
 }
 
-/// Which ONNX model variant an [`Embedder`] loaded (R-003, T10).
+/// Which ONNX model variant an [`Embedder`] loaded.
 ///
 /// INT8 is the default CPU path when the quantized artifact is present and
 /// loads; FP32 is the always-available fallback with byte-identical numerics to
@@ -239,7 +239,7 @@ impl ModelVariant {
     }
 }
 
-/// The variant used when no [`MODEL_VARIANT_ENV_VAR`] override is set (T1).
+/// The variant used when no [`MODEL_VARIANT_ENV_VAR`] override is set.
 ///
 /// INT8 is the v18 established default CPU embedding path. Selection is
 /// deterministic: an explicit override wins, otherwise this default is loaded.
@@ -248,7 +248,7 @@ impl ModelVariant {
 /// quietly serving the other variant's (numerically different) embeddings.
 const DEFAULT_MODEL_VARIANT: ModelVariant = ModelVariant::Int8;
 
-/// Resolves the embedding model variant from the process environment (T1).
+/// Resolves the embedding model variant from the process environment.
 ///
 /// Precedence is explicit [`MODEL_VARIANT_ENV_VAR`] override > [`DEFAULT_MODEL_VARIANT`].
 /// An unrecognized override is a hard error propagated at run start — never a
@@ -259,7 +259,7 @@ fn resolve_model_variant() -> Result<ModelVariant, OneupError> {
     ))?)
 }
 
-/// Pure parser for the [`MODEL_VARIANT_ENV_VAR`] override value (T1).
+/// Pure parser for the [`MODEL_VARIANT_ENV_VAR`] override value.
 ///
 /// Follows the [`model_downloads_disabled_value`] shape: unset or empty (after
 /// trimming) resolves to [`DEFAULT_MODEL_VARIANT`]; `int8`/`fp32`
@@ -363,7 +363,7 @@ impl EmbeddingRuntime {
         show_progress_ui: bool,
     ) -> Result<EmbeddingLoadStatus, OneupError> {
         // Resolve the variant first, before touching the filesystem: an invalid
-        // override is a hard error at run start (T1), never a degrade through
+        // override is a hard error at run start, never a degrade through
         // `EmbeddingUnavailableReason` and never a silent cross-variant fallback.
         let variant = resolve_model_variant()?;
 
@@ -418,7 +418,7 @@ impl EmbeddingRuntime {
         &mut self,
         embed_threads: usize,
     ) -> Result<EmbeddingLoadStatus, OneupError> {
-        // Same fail-closed variant resolution as the indexing path (T1): a bad
+        // Same fail-closed variant resolution as the indexing path: a bad
         // override aborts the run rather than degrading query embedding to
         // FTS-only or serving the other variant.
         let variant = resolve_model_variant()?;
@@ -655,7 +655,7 @@ pub fn clear_download_failure() {
 /// literal, which is wrong on macOS/Windows) plus the retry command. An
 /// explicit `1up index`/`reindex` (or MCP `oneup_start` indexing) clears the
 /// marker via [`clear_download_failure`] before re-attempting the download,
-/// so this always points at a working recovery path (REQ-002).
+/// so this always points at a working recovery path.
 pub(crate) fn download_failure_marker_hint() -> String {
     match download_failure_marker() {
         Ok(marker) => format!(
@@ -722,14 +722,14 @@ impl Embedder {
     }
 
     /// Creates an embedder from pre-existing model files at a custom path and
-    /// thread count, resolving the variant from the environment (T1).
+    /// thread count, resolving the variant from the environment.
     #[allow(dead_code)]
     pub fn from_dir_with_threads(dir: &Path, intra_threads: usize) -> Result<Self, OneupError> {
         let variant = resolve_model_variant()?;
         Self::from_dir_with_variant(dir, variant, intra_threads, EMBEDDING_BATCH_SIZE)
     }
 
-    /// Loads the explicitly resolved model variant (T1).
+    /// Loads the explicitly resolved model variant.
     ///
     /// Selection is deterministic and already decided by `resolve_model_variant`
     /// (override > default `Int8`): this loads exactly `variant` and never probes
@@ -778,7 +778,7 @@ impl Embedder {
             .into());
         }
 
-        // INT8 load-time integrity recheck (T4, REQ-004 AC1). The compact model
+        // INT8 load-time integrity recheck. The compact model
         // is re-digested against its pinned SHA-256 *before* the ORT session is
         // created, so a post-activation corruption or tamper refuses the model
         // with a clear expected-vs-got error rather than parsing (and serving
@@ -797,7 +797,7 @@ impl Embedder {
             }
         }
 
-        // Pin GraphOptimizationLevel::Level3 explicitly (R-004). It is ort's
+        // Pin GraphOptimizationLevel::Level3 explicitly. It is ort's
         // default today, so this guards against a future or host default that
         // silently lowers graph optimization rather than enabling anything new.
         // Each batch is one serial inference call, so parallelism comes from
@@ -820,8 +820,8 @@ impl Embedder {
             EmbeddingError::TokenizationFailed(format!("failed to load tokenizer: {e}"))
         })?;
 
-        // Programmatically widen the tokenizer window to `EMBEDDING_MAX_TOKENS`
-        // (HYP-002). The shipped `tokenizer.json` hard-pins truncation and
+        // Programmatically widen the tokenizer window to `EMBEDDING_MAX_TOKENS`.
+        // The shipped `tokenizer.json` hard-pins truncation and
         // Fixed padding to 128, so the constant alone is a no-op; overriding
         // here (rather than editing the file) keeps `TOKENIZER_SHA256`
         // unchanged. Existing params are preserved and only the length fields
@@ -850,7 +850,7 @@ impl Embedder {
     }
 
     /// Model-identity string of the loaded variant, folded into the
-    /// content-addressed embedding key and `meta.embedding_model` (R-003, T10).
+    /// content-addressed embedding key and `meta.embedding_model`.
     pub fn model_id(&self) -> String {
         self.variant.model_id()
     }
@@ -869,7 +869,7 @@ impl Embedder {
 
     /// Embeds a batch of texts, returning one 384-dimensional unit vector per input.
     ///
-    /// Inputs are length-bucketed before inference (R-005): every input is
+    /// Inputs are length-bucketed before inference: every input is
     /// tokenized once, the set is sorted by real (un-padded) token length, and
     /// equal-length-ish inputs are grouped into the configured-size sub-batches.
     /// Because the tokenizer pads to a fixed `EMBEDDING_MAX_TOKENS` width but
@@ -935,7 +935,7 @@ impl Embedder {
         // Trim the tensor to this sub-batch's longest *real* sequence rather than
         // the tokenizer's fixed `EMBEDDING_MAX_TOKENS` padding. Mean-pooling masks pad
         // positions, so a narrower tensor yields byte-identical vectors while
-        // skipping the wasted compute on trailing pads (R-005).
+        // skipping the wasted compute on trailing pads.
         let max_len = encodings.iter().map(real_token_len).max().unwrap_or(0);
 
         let mut input_ids = vec![0i64; batch_size * max_len];
@@ -1710,7 +1710,7 @@ fn set_path_mode(path: &Path, mode: u32) -> Result<(), OneupError> {
 /// pinning it keeps variant-agnostic model-gated tests (embedding mechanics,
 /// warm-cache reuse, query-embedding stability, pipeline embedding) runnable on
 /// any host with the FP32 model present, regardless of whether the INT8 default
-/// variant's artifact — provisioned separately (T4) — has been downloaded.
+/// variant's artifact — provisioned separately — has been downloaded.
 /// Shared across the `embedder`, `pipeline`, and `hybrid` test modules.
 #[cfg(test)]
 pub(crate) struct Fp32VariantTestGuard {
@@ -1756,7 +1756,7 @@ mod tests {
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {
         std::fs::write(dir.join(MODEL_FILENAME), model).unwrap();
         std::fs::write(dir.join(TOKENIZER_FILENAME), tokenizer).unwrap();
-        // The INT8 artifact is a first-class expected file (T4); write a fake one
+        // The INT8 artifact is a first-class expected file; write a fake one
         // too so the three-file verify/resolve machinery sees a complete (if
         // tampered) set rather than treating the fixture as an incomplete cache.
         std::fs::write(dir.join(MODEL_ONNX_INT8_FILENAME), b"fake-int8-model").unwrap();
@@ -1864,7 +1864,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn invalid_variant_override_propagates_from_prepare_for_indexing() {
         // A bad ONEUP_MODEL_VARIANT must abort at run start as a hard error, not
-        // degrade to FTS-only or silently pick a variant (REQ-001 AC3). Resolution
+        // degrade to FTS-only or silently pick a variant. Resolution
         // happens before any filesystem/model access, so this holds with no model.
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         let _env_lock = crate::shared::fs::ENV_MUTEX
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn model_variant_identity_distinguishes_int8_from_fp32() {
-        // R-003 (T10): FP32 keeps the bare repo identity so existing FP32 indexes
+        // FP32 keeps the bare repo identity so existing FP32 indexes
         // stay valid; INT8 appends the suffix so its content keys never collide
         // with FP32 vectors. This is the load-bearing correctness point: a variant
         // swap must change the model identity (and therefore every content key),
@@ -1968,7 +1968,7 @@ mod tests {
 
     #[test]
     fn download_failure_marker_hint_uses_resolved_path_not_hardcoded_literal() {
-        // REQ-002: search.rs and the dead-code path in this file both delegate
+        // search.rs and the dead-code path in this file both delegate
         // to this helper, so proving it here proves neither call site can
         // regress to the hardcoded Linux-only `~/.local/share/...` literal
         // (which is wrong on macOS/Windows).
@@ -1992,7 +1992,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn explicit_index_retry_clears_marker_before_download_failed_guard() {
-        // REQ-002: an explicit `1up index`/`reindex` (and MCP `oneup_start`
+        // An explicit `1up index`/`reindex` (and MCP `oneup_start`
         // indexing) calls `clear_download_failure()` before
         // `prepare_for_indexing_with_progress`'s `is_download_failed()` guard,
         // so a deliberate retry re-attempts the download instead of
@@ -2117,7 +2117,7 @@ mod tests {
     fn compatibility_key_changes_when_variant_changes() {
         // A long-lived daemon must never reuse a warm INT8 embedder for an FP32
         // run (or vice versa): the key folds the resolved variant AND fingerprints
-        // that variant's own artifact, so the two resolve to distinct keys (T1).
+        // that variant's own artifact, so the two resolve to distinct keys.
         let tmp = tempfile::tempdir().unwrap();
         // `write_fake_model_files` now also writes the INT8 artifact, so both
         // variants have a distinct file to fingerprint.
@@ -2531,7 +2531,7 @@ mod tests {
 
     #[test]
     fn corrupted_int8_model_refused_at_load_with_expected_vs_got() {
-        // REQ-004 AC1: a present-but-corrupt INT8 artifact must be refused at
+        // A present-but-corrupt INT8 artifact must be refused at
         // load with a clear expected-vs-got error, *before* the ORT session is
         // built and before any embeddings are served — and never by silently
         // loading FP32 instead. No model is needed: the load-time digest recheck
@@ -2562,7 +2562,7 @@ mod tests {
 
     #[test]
     fn legacy_two_file_manifest_resolves_unverifiable_for_three_file_reprovision() {
-        // T4: a pre-existing verified artifact whose manifest predates the INT8
+        // A pre-existing verified artifact whose manifest predates the INT8
         // artifact (two files) must stop matching the pinned three-file set and
         // resolve `Unverifiable`, so the indexing path re-provisions all three
         // files instead of treating the stale set as intact. Pure: no model.
@@ -2772,14 +2772,13 @@ mod tests {
 
     #[test]
     fn tokenizer_window_widens_past_128_and_mixed_batch_is_safe() {
-        // T5/REQ-005: the programmatic tokenizer override must widen the
+        // The programmatic tokenizer override must widen the
         // effective window past the shipped 128-token pin (a long input yields
         // real_token_len > 128, capped at EMBEDDING_MAX_TOKENS). Before the
         // override this fails — the file-baked truncation caps every encoding
         // at 128. Padding is raised in lockstep with truncation, so a
         // mixed-length sub-batch (a >128-token row next to a short row) must
-        // embed without run_inference indexing past the short row's id buffer
-        // (HYP-002).
+        // embed without run_inference indexing past the short row's id buffer.
         let _lock = MODEL_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
         if !is_model_available() {
             eprintln!("skipping: model not available");

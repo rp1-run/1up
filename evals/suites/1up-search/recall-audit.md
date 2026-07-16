@@ -1,4 +1,4 @@
-# Recall Gold Corpus Audit (T6, REQ-005)
+# Recall Gold Corpus Audit
 
 Human-reviewed audit of all 15 gold labels in `recall-corpus.jsonl`. Each label was
 reviewed by reading the current source for the canonical implementation of the topic
@@ -13,7 +13,7 @@ relabeling or by widening gold to make the gate pass.
 - Corpus rows: 15 (unchanged by this audit — repairs are symbol/file corrections only)
 - Corpus sha256 before audit: `46800759ee4a0c896c17c2d769d414ff6194176c5f363bacef2244253dc3283d`
 - Corpus sha256 after audit: `ae668c77e7edd095795d43c23c86e924266ff0b5f769d00965e31ae16decaaab`
-- Reviewed at commit: see the T6 commit; anchors verified against the working tree.
+- Reviewed at the commit that introduced this audit; anchors verified against the working tree.
 
 ## Per-label verdicts
 

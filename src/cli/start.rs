@@ -77,7 +77,7 @@ fn model_status_message(status: &EmbeddingLoadStatus) -> String {
 ///
 /// Produced by [`classify_project_index`] and consumed by `1up start` to
 /// decide whether to (a) proceed with indexing, (b) warn the user that the
-/// schema is stale and point at `1up reindex` (REQ-033, BR-06), or
+/// schema is stale and point at `1up reindex`, or
 /// (c) warn that the index is unreadable and needs a reindex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectIndexState {
@@ -179,7 +179,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
             project_root.display()
         );
     }
-    // REQ-004: `.1up/.gitignore` (with `*`) is ensured inside `ensure_project_id`
+    // `.1up/.gitignore` (with `*`) is ensured inside `ensure_project_id`
     // above on every resolve, so `init`-first and already-initialized projects are
     // covered too — no separate gitignore step is needed here.
     let init_prefix = if initialized_now {
@@ -189,7 +189,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     };
 
     // Classify the on-disk index before deciding the indexing branch. This
-    // gives stale-schema users a concrete `1up reindex` message (REQ-033)
+    // gives stale-schema users a concrete `1up reindex` message
     // instead of an opaque migration error bubbling up from the indexer.
     let index_state = classify_project_index(&project_root).await?;
     match index_state {
@@ -217,12 +217,12 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         }
         ProjectIndexState::Current | ProjectIndexState::NotCreated => {}
     }
-    // REQ-003/H1: a schema-`Current` index only counts as ready-to-serve when it
+    // A schema-`Current` index only counts as ready-to-serve when it
     // actually holds indexed content for this context. An index created while the
     // repo (or this worktree) had no indexable files is schema-current but empty.
     // Treating such an empty index as ready would let the early return below
     // permanently bypass the monorepo file-count gate once the repo grows past the
-    // threshold — the H1 bypass.
+    // threshold — the empty-index gate bypass.
     let schema_current = matches!(index_state, ProjectIndexState::Current);
     let has_content = schema_current
         && index_has_content_for_context(&project_root, &worktree_context.context_id).await;
@@ -234,8 +234,8 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     // but empty index on a small unscoped repo (gate does not fire) is still treated
     // as ready so the daemon indexes it in the background, preserving the
     // existing-index skip contract; only an over-threshold, unscoped, empty (or
-    // absent) index falls through to the facts envelope below, closing the H1 gate
-    // bypass.
+    // absent) index falls through to the facts envelope below, closing the
+    // empty-index gate bypass.
     let gate_fires = if has_content || scope_provided {
         false
     } else {
@@ -251,7 +251,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     // for this context, OR it is schema-current but small enough that the gate does
     // not fire (the daemon will index it in the background after registration).
     //
-    // REQ-002: a `--scope` on an EMPTY (or absent) index must NOT be treated as ready
+    // A `--scope` on an EMPTY (or absent) index must NOT be treated as ready
     // — the ready branch returns before scope application/indexing (line ~315), so the
     // daemon would then index the FULL repo, silently discarding the scope (the exact
     // full-repo accident the scope is meant to prevent). Force the scoped foreground
@@ -287,7 +287,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
     }
 
     // Not ready-to-serve. If the gate fired (over threshold, unscoped, no content),
-    // emit the facts envelope instead of indexing (REQ-003). Only reachable when the
+    // emit the facts envelope instead of indexing. Only reachable when the
     // index is absent or empty AND the gate fired.
     if gate_fires {
         // Compute launch_subdir for facts envelope suggestions (same logic as
@@ -319,7 +319,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
                         emit_facts_envelope(&*fmt, &facts);
                     }
                 }
-                // REQ-003: Exit with error code 1 to signal user must provide --scope
+                // Exit with error code 1 to signal user must provide --scope
                 return Err(anyhow::anyhow!(
                     "repository is over file count threshold; use --scope to proceed"
                 ));
@@ -335,7 +335,7 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     // Gate allowed or scope provided: apply scope if given and proceed with indexing
     if let Some(scope_path) = args.scope {
-        // REQ-002: validate the requested scope through the shared validator so an
+        // Validate the requested scope through the shared validator so an
         // absolute path, a `../` escape, or an empty scope is refused with a clear
         // error instead of silently producing a zero-file, misleadingly "ready"
         // index. Use the canonicalized root (trailing slash trimmed) it returns.
@@ -781,7 +781,7 @@ fn parse_schema_versions(message: &str) -> Option<(u32, u32)> {
 
 /// Emit the user-facing stale-schema warning to stdout in the current
 /// output format. Non-JSON formatters print the free-form warning through
-/// `format_message` (REQ-033 D3); JSON emits the machine-readable
+/// `format_message`; JSON emits the machine-readable
 /// `schema_out_of_date` object called out in design §3.2.
 fn emit_stale_schema_warning(
     project_root: &Path,
@@ -929,7 +929,7 @@ async fn run_initial_index(
 /// A schema-`Current` index can still be empty — e.g. it was created by an earlier
 /// `start`/`init` while the repo (or this worktree) had no indexable files. Such an
 /// index must NOT be treated as a completed build, or the monorepo file-count gate
-/// (REQ-003) is permanently bypassed once the repo grows. Mirrors the zero-segment
+/// is permanently bypassed once the repo grows. Mirrors the zero-segment
 /// => not-built classification used by `1up list` and the MCP readiness path.
 /// Best-effort: any DB open/query error is treated as "no content" so the safe
 /// path (gate + initial index) is taken.

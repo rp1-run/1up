@@ -296,7 +296,7 @@ describe("detectDegradedStderr", () => {
   });
 });
 
-// Drift guard over the committed recall fixtures (T6 / REQ-005). The pinned
+// Drift guard over the committed recall fixtures. The pinned
 // baseline and the pinned results must always describe the SAME recall epoch:
 // the same schema version, the same audited corpus (size + sha256), and the same
 // model. If they diverge — e.g. one is recaptured on schema 19 while the other

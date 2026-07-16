@@ -1,4 +1,4 @@
-/// REQ-005 (T6): Per-file size and segment caps integration tests.
+/// Per-file size and segment caps integration tests.
 ///
 /// Validates that files exceeding the per-file size cap are skipped without
 /// reading into memory, and that the segment cap bounds unbounded segmentation

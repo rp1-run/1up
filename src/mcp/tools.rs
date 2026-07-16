@@ -79,7 +79,7 @@ impl OneupMcpServer {
         // Only return facts if NO scope has been provided yet (user hasn't decided).
         // If scope_add or scope_narrow is provided, proceed with indexing.
         // CRITICAL: Check this BEFORE calling ops::start() to prevent background
-        // spawning when gate fires (REQ-001).
+        // spawning when gate fires.
         let readiness = ops::check_status(&roots).await;
         if input.mode == StartMode::IndexIfMissing || input.mode == StartMode::IndexIfNeeded {
             // Skip facts envelope if scope has already been provided
@@ -93,7 +93,7 @@ impl OneupMcpServer {
                 {
                     if should_return_facts {
                         // Generate and return facts envelope instead of indexing
-                        // REQ-001: Gate fires before ops::start to prevent background spawning
+                        // Gate fires before ops::start to prevent background spawning
                         let facts = match ops::generate_facts_envelope(
                             &roots.source_root,
                             roots.launch_subdir.clone(),
@@ -756,7 +756,7 @@ fn apply_branch_readiness(payload: &mut ReadinessPayload, context: &WorktreeCont
     // with the search path, which already treats `Detached` as non-degraded
     // (`SearchScope::degraded_reason`, src/search/scope.rs). Exempt it only when
     // HEAD is proven un-drifted (`Some(false)`); `Some(true)` (drifted) and
-    // `None` (unprovable) keep the degraded caveat. (REQ-005)
+    // `None` (unprovable) keep the degraded caveat.
     if context.branch_status == BranchStatus::Detached && payload.drifted == Some(false) {
         return;
     }
@@ -903,7 +903,7 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
         // If empty search results with scope, suggest widening scope
         if let Some(scope) = &payload.index_scope {
             if !scope.roots.is_empty() {
-                // REQ-008: Placeholder-free output. When results are empty and scoped,
+                // Placeholder-free output. When results are empty and scoped,
                 // suggest widening scope but omit arguments for the search action
                 // since we cannot synthesize a real refined query.
                 let actions = vec![
@@ -960,8 +960,8 @@ fn search_next_actions(payload: &SearchPayload) -> Vec<NextAction> {
 
 /// Envelope next_actions for get/context. Recovery actions for any bounded
 /// record are **prepended** (first, ahead of generic follow-ups) so an agent
-/// sees how to fetch the omitted content before anything else (REQ-004,
-/// load-bearing). They are deduped per path and capped at
+/// sees how to fetch the omitted content before anything else
+/// (load-bearing). They are deduped per path and capped at
 /// [`MAX_RECOVERY_ACTIONS`] so next_actions can never become the new unbounded
 /// payload the compaction is meant to remove.
 fn read_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
@@ -1051,7 +1051,7 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
             Some(json!({ "locations": [location_argument(&segment.path, segment.line_start)] })),
         )];
         // Use the pre-gating symbol hint: defined_symbols is emptied at default
-        // verbosity (T5 payload cleanup), but defining segments must still
+        // verbosity (payload cleanup), but defining segments must still
         // offer symbol verification.
         if let Some(symbol) = segment.symbol_hint.as_deref() {
             actions.push(action(
@@ -1078,11 +1078,11 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
 
     // No content hydrated: give status-aware guidance for the failed handle
     // records so an agent can disambiguate or refine instead of blindly
-    // repeating the call (REQ-002).
+    // repeating the call.
     handle_failure_next_actions(payload)
 }
 
-/// Next_actions for a get call that hydrated no content (REQ-002, REQ-003). A
+/// Next_actions for a get call that hydrated no content. A
 /// failure carrying candidate ids — an ambiguous prefix or a rejected identical
 /// retry whose original failure was ambiguous — prepends a ready-to-issue
 /// `oneup_get` prefilled with the real candidate ids from `matching_handles`
@@ -1090,7 +1090,7 @@ fn read_follow_up_actions(payload: &ReadPayload) -> Vec<NextAction> {
 /// the generic search fallback. The trailing search reason is the most specific
 /// applicable: a rejected identical retry is steered to a refined query instead
 /// of repeating the call; an absent handle notes it is not in the active
-/// context. The placeholder-free search fallback always trails (REQ-008) so
+/// context. The placeholder-free search fallback always trails so
 /// there is always a forward action that differs from repeating the call.
 fn handle_failure_next_actions(payload: &ReadPayload) -> Vec<NextAction> {
     let mut actions = Vec::new();
@@ -1195,7 +1195,7 @@ fn structural_next_actions(payload: &StructuralSearchReport, pattern: &str) -> V
         )];
     }
 
-    // REQ-008: Placeholder-free output. When results are empty, suggest alternatives
+    // Placeholder-free output. When results are empty, suggest alternatives
     // without placeholder arguments.
     vec![
         action(
@@ -1249,7 +1249,7 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
         }
     }
 
-    // REQ-008: Placeholder-free output. Omit arguments when we cannot synthesize a real narrower anchor.
+    // Placeholder-free output. Omit arguments when we cannot synthesize a real narrower anchor.
     vec![action(
         TOOL_SEARCH,
         "Search for a narrower segment or symbol before retrying impact.",
@@ -1257,7 +1257,7 @@ fn impact_next_actions(payload: &ImpactResultEnvelope) -> Vec<NextAction> {
     )]
 }
 
-/// Non-empty digests hand the agent its next move (REQ-006): verify the top
+/// Non-empty digests hand the agent its next move: verify the top
 /// most-referenced type, then search the densest module. An empty digest
 /// falls back to a readiness check so the envelope always carries at least
 /// one canonical action.
@@ -1409,11 +1409,11 @@ fn format_read_record(record: &ops::ReadRecord) -> String {
     )
 }
 
-/// Content-free segment line (REQ-002): the authoritative source stays only in
+/// Content-free segment line: the authoritative source stays only in
 /// `structuredContent`; the text summary carries a constant-sized orientation
 /// line whose length is independent of the segment body. A symbol-list clip
 /// appends a bounded `truncated: {reason}` marker so the omission is visible in
-/// the model-facing text, not just in structured data (REQ-004).
+/// the model-facing text, not just in structured data.
 fn format_segment_record(status: &str, segment: &ops::SegmentRecord) -> String {
     let mut line = format!(
         "{status}\t{}:{}-{}\t{}\tsegment {}",
@@ -1425,7 +1425,7 @@ fn format_segment_record(status: &str, segment: &ops::SegmentRecord) -> String {
     line
 }
 
-/// Content-free context line (REQ-002). A windowed scope appends a bounded
+/// Content-free context line. A windowed scope appends a bounded
 /// `truncated: {reason} +{above}/-{below} lines` marker (constant-sized: a
 /// reason constant plus two bounded numerals) so the omitted line counts are
 /// visible in the text block as well as in the structured `TruncationNote`.
@@ -2534,8 +2534,7 @@ mod tests {
     fn rejected_record_offers_candidates_and_a_refined_search_not_a_repeat() {
         // A rejected identical retry whose original failure was ambiguous keeps
         // the cached candidate ids, so the follow-up prefills a disambiguating
-        // oneup_get and steers the trailing search away from repeating the call
-        // (REQ-003).
+        // oneup_get and steers the trailing search away from repeating the call.
         let candidates = vec![
             "0b25cc46a316205a1afe69ccd11337e2".to_string(),
             "0b25cc46a316205a1afe69ccd1144abc".to_string(),
@@ -2567,8 +2566,7 @@ mod tests {
     #[test]
     fn rejected_record_without_candidates_only_offers_a_refined_search() {
         // A rejected retry whose original failure was a plain not-found carries
-        // no candidates, so only the refined-query search fallback is offered
-        // (REQ-003).
+        // no candidates, so only the refined-query search fallback is offered.
         let payload = ReadPayload {
             status: OperationStatus::Empty,
             records: vec![handle_record(ops::ReadStatus::Rejected, Vec::new())],

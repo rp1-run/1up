@@ -123,7 +123,7 @@ describe("aggregateAxes graded means", () => {
   });
 });
 
-describe("cross-axis independence (REQ-002 AC2)", () => {
+describe("cross-axis independence", () => {
   test("removing an adoption assertion leaves factual and retrieval unchanged", () => {
     const before = aggregateAxes(inputs(caseDiagnostic()));
 

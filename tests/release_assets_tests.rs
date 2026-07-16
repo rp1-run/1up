@@ -2276,7 +2276,7 @@ fn release_assets_workflow_emits_build_provenance_attestation() {
     assert!(workflow.contains("gh release upload \"$tag\""));
 }
 
-/// Guards REQ-001's producer side: `update-manifest.json` must be generated
+/// Guards the producer side: `update-manifest.json` must be generated
 /// exactly once (via `write_update_manifest.sh`, out of line in
 /// `release-assets.yml`), attested alongside the archives, uploaded as a
 /// release asset, and then propagated to `main` byte-verbatim -- no inline jq
@@ -2328,7 +2328,7 @@ fn update_manifest_is_generated_once_and_published_verbatim() {
     );
 }
 
-/// Guards REQ-004: every third-party GitHub Action referenced from the four
+/// Guards that every third-party GitHub Action referenced from the four
 /// release-path workflows must be pinned to a full commit SHA (not a
 /// floating tag such as `@v4` or a moving branch such as `@stable`), so a
 /// repointed tag or branch cannot inject malicious action code into a

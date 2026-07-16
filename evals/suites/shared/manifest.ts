@@ -1,9 +1,9 @@
 /**
- * Versioned, hashed Luna benchmark manifest (REQ-003).
+ * Versioned, hashed Luna benchmark manifest.
  *
  * A trustworthy comparison across phases requires proof that two runs were
  * measured against the same benchmark rules. This generator freezes the warm
- * Luna benchmark contract — the prompt files and suite YAMLs finalized by T1/T2,
+ * Luna benchmark contract — the prompt files and suite YAMLs,
  * the fixture repo+commit the suites index, the llm-rubric grader identity, the
  * per-axis mapping, the cost transform, and the trial count — into a single
  * committed `suites/luna-manifest.json`. The `contract_hash` is the sha256 of
@@ -12,9 +12,9 @@
  * old hash is visibly incomparable.
  *
  * The manifest lives under tracked `evals/suites/` and hashes only tracked
- * benchmark-definition inputs; no gitignored run-output directory feeds it
- * (REQ-003 AC2). `manifest.test.ts` drift-guards the committed hash against a
- * live recomputation.
+ * benchmark-definition inputs; no gitignored run-output directory feeds it.
+ * `manifest.test.ts` drift-guards the committed hash against a live
+ * recomputation.
  *
  * Usage:
  *   npm run manifest:luna   # regenerate suites/luna-manifest.json (biome-formatted)

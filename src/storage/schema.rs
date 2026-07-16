@@ -57,7 +57,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
 ///
 /// On a cold full rebuild every `embedding_pool` row is known up front, so building
 /// the DiskANN graph once after all rows are inserted is far cheaper than the
-/// incremental per-insert maintenance the index does when it already exists (R-006).
+/// incremental per-insert maintenance the index does when it already exists.
 /// [`VectorIndexBuild::Deferred`] therefore skips index creation (and its
 /// completeness check) here; the staging rebuild builds it once via
 /// [`build_embedding_pool_vector_index`] after the pool is fully loaded and before
@@ -162,7 +162,7 @@ pub async fn initialize_with_vector_index(
 /// before the atomic swap, completing a schema initialized with
 /// [`VectorIndexBuild::Deferred`]. Building the DiskANN graph once over the full pool
 /// avoids the incremental per-insert maintenance the index performs when it already
-/// exists (R-006). After this returns the staging schema is complete and passes
+/// exists. After this returns the staging schema is complete and passes
 /// [`ensure_current`].
 pub async fn build_embedding_pool_vector_index(conn: &Connection) -> Result<(), OneupError> {
     conn.execute(queries::CREATE_INDEX_EMBEDDING_POOL_EMBEDDING, ())
@@ -523,7 +523,7 @@ async fn validate_required_objects(conn: &Connection) -> Result<(), OneupError> 
 
 /// Like [`validate_required_objects`] but tolerates the DiskANN vector index being
 /// absent — used after a [`VectorIndexBuild::Deferred`] initialize, where that index
-/// is intentionally built later (R-006).
+/// is intentionally built later.
 async fn validate_required_objects_except_vector_index(
     conn: &Connection,
 ) -> Result<(), OneupError> {
@@ -744,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_does_not_create_the_dead_file_hash_index() {
-        // R-009 (T11): `idx_segments_file_hash` had no reader and was dropped. A fresh
+        // `idx_segments_file_hash` had no reader and was dropped. A fresh
         // index build must no longer create it, and it must not be a required object.
         let (_db, conn) = setup().await;
         initialize(&conn).await.unwrap();
@@ -769,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_creates_the_segment_vectors_content_key_index() {
-        // R-010 (T12): `idx_segment_vectors_content_key` backs the ANN fan-out join
+        // `idx_segment_vectors_content_key` backs the ANN fan-out join
         // `sv.content_key = p.content_key`. A fresh build must create it, it must be a
         // required object, and an otherwise-complete schema missing only this index
         // must fail closed (so it is genuinely maintained, not best-effort).
@@ -824,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_initialize_omits_index_until_built_then_completes() {
-        // R-006: the deferred path leaves the schema intentionally incomplete (the
+        // The deferred path leaves the schema intentionally incomplete (the
         // DiskANN index is absent) so a reader fails closed, then
         // `build_embedding_pool_vector_index` completes it.
         let (_db, conn) = setup().await;

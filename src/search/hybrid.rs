@@ -16,14 +16,14 @@ pub struct HybridSearchEngine<'a> {
     conn: &'a Connection,
     embedder: Option<&'a mut Embedder>,
     scope: SearchScope,
-    /// Pre-probed vector-presence flag (R-007). Every live caller already runs
+    /// Pre-probed vector-presence flag. Every live caller already runs
     /// the cheap `has_indexed_embeddings` probe before deciding whether to warm
     /// the embedder, so threading the result in here removes the engine's
     /// duplicate probe. `None` means "not supplied" and the engine falls back to
     /// probing live, preserving the prior behaviour for callers that do not set
     /// it (e.g. unit tests).
     has_vectors: Option<bool>,
-    /// Pre-computed per-context vector `COUNT(*)` (R-007), cached by the daemon
+    /// Pre-computed per-context vector `COUNT(*)`, cached by the daemon
     /// on `ProjectState` and invalidated on index swap. When `Some`, the vector
     /// stage skips its per-query `COUNT(*)` for path selection; it MUST equal the
     /// live count so selection is identical. `None` falls back to the live count.
@@ -51,7 +51,7 @@ impl<'a> HybridSearchEngine<'a> {
     }
 
     /// Supply the already-probed vector-presence flag so the vector stage skips
-    /// its duplicate `has_indexed_embeddings` probe (R-007). The supplied value
+    /// its duplicate `has_indexed_embeddings` probe. The supplied value
     /// MUST match the live probe for the open index.
     pub fn with_has_vectors(mut self, has_vectors: bool) -> Self {
         self.has_vectors = Some(has_vectors);
@@ -59,7 +59,7 @@ impl<'a> HybridSearchEngine<'a> {
     }
 
     /// Supply a cached per-context vector count so the vector stage skips its
-    /// per-query `COUNT(*)` for path selection (R-007). The supplied value MUST
+    /// per-query `COUNT(*)` for path selection. The supplied value MUST
     /// equal the live `COUNT(*)` for the open index.
     pub fn with_vector_count(mut self, vector_count: usize) -> Self {
         self.vector_count = Some(vector_count);
@@ -73,7 +73,7 @@ impl<'a> HybridSearchEngine<'a> {
     ///
     /// The symbol and FTS stages are independent read-only queries over the
     /// same connection, so they run concurrently via `tokio::try_join!`
-    /// (R-002, reviving the dead `SqlVectorV2` concurrency pattern on the live
+    /// (reviving the dead `SqlVectorV2` concurrency pattern on the live
     /// path). The vector stage stays sequenced after them because its
     /// `is_exact_lexical_hit` / `has_indexed_embeddings` gate depends on the
     /// lexical results — embedding it concurrently would break the
@@ -97,7 +97,7 @@ impl<'a> HybridSearchEngine<'a> {
         )?;
 
         // Use the caller-supplied vector-presence flag when present, falling back
-        // to the live probe otherwise (R-007: removes the engine's duplicate
+        // to the live probe otherwise (this removes the engine's duplicate
         // `has_indexed_embeddings` probe on the live daemon/MCP/CLI paths, which
         // already ran it before warming the embedder). The exact-lexical-hit
         // short-circuit and `&mut embedder` discipline are unchanged.
@@ -157,7 +157,7 @@ impl<'a> HybridSearchEngine<'a> {
 
     /// Embeds the query for the vector stage, running the CPU-bound ONNX
     /// inference off the cooperative scheduler so it does not stall other
-    /// async work on the multi-thread runtime (R-002).
+    /// async work on the multi-thread runtime.
     ///
     /// Uses `block_in_place` rather than `spawn_blocking`: the embedder is a
     /// borrowed `&mut Embedder` lent by the caller's (warm) runtime, and
@@ -169,7 +169,7 @@ impl<'a> HybridSearchEngine<'a> {
     /// unchanged), and tells the runtime to relocate this worker's other tasks
     /// while the inference runs. Every live caller runs on the multi-thread
     /// `#[tokio::main]` runtime, which `block_in_place` requires.
-    /// Vector-presence gate: the caller-supplied flag when set (R-007), else a
+    /// Vector-presence gate: the caller-supplied flag when set, else a
     /// live probe. Identical to the live probe by contract — `with_has_vectors`
     /// callers pass the live result they already computed.
     async fn has_indexed_embeddings(&self) -> Result<bool, OneupError> {
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(result.segment_id, "seg-123");
     }
 
-    /// REQ-001: building a `SearchResult` from the in-memory `CandidateRow`
+    /// Building a `SearchResult` from the in-memory `CandidateRow`
     /// (no re-fetch) must be byte-identical to the prior `StoredSegment` path
     /// across every field, including `defined_symbols` parsing and the
     /// `line_start -> line_number` mapping.
@@ -839,7 +839,7 @@ mod tests {
         );
     }
 
-    /// REQ-001: empty `defined_symbols` collapses to `None` on both paths.
+    /// Empty `defined_symbols` collapses to `None` on both paths.
     #[test]
     fn search_result_from_candidate_collapses_empty_defined_symbols() {
         let segment = StoredSegment {
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(actual.defined_symbols, None);
     }
 
-    /// REQ-001 guard: the three retrieval stages MUST populate identical
+    /// Guard: the three retrieval stages MUST populate identical
     /// `content`/`breadcrumb`/`defined_symbols` for the same `segment_id`.
     /// This is the invariant that makes direct (re-fetch-free) hydration
     /// byte-identical; a future stage SELECT dropping a column fails here.
@@ -1109,7 +1109,7 @@ mod tests {
         );
     }
 
-    // TDD (REQ-006 / T6 AC2): the threaded `has_vectors` flag must be the
+    // TDD: the threaded `has_vectors` flag must be the
     // authoritative vector-presence signal — identical to the live
     // `has_indexed_embeddings` probe the caller already ran — and replace the
     // engine's duplicate probe. This pins both halves: `with_has_vectors(true)`
@@ -1235,7 +1235,7 @@ mod tests {
         }
     }
 
-    /// REQ-002 (T2): `search` fuses the concurrently-run (`try_join!`) symbol
+    /// `search` fuses the concurrently-run (`try_join!`) symbol
     /// and FTS stages identically to the prior sequential awaits. The corpus
     /// is split so one segment matches *only* the symbol stage and the other
     /// *only* FTS, and the per-stage RRF weights differ (`SYMBOL_WEIGHT=4.0`
@@ -1302,7 +1302,7 @@ mod tests {
         );
     }
 
-    /// REQ-002 (T2): the query embedding now runs through `block_in_place`
+    /// The query embedding now runs through `block_in_place`
     /// (off the cooperative scheduler) rather than inline. The produced vector
     /// must be bit-for-bit identical to the direct synchronous call — the
     /// numerics acceptance gate. Runs on a multi-thread runtime because
@@ -1317,7 +1317,7 @@ mod tests {
 
         // Pin the always-provisioned FP32 baseline: this test verifies
         // variant-agnostic query-embedding stability and must not depend on the
-        // INT8 default artifact being present locally (provisioned by T4).
+        // INT8 default artifact being present locally (provisioned separately).
         let _variant = Fp32VariantTestGuard::set();
         if !is_model_available() {
             eprintln!("skipping: model not available");

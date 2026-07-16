@@ -50,7 +50,7 @@ use crate::storage::swap;
 
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 
-/// Floor length (in characters) for unique-prefix handle recovery (T1). A
+/// Floor length (in characters) for unique-prefix handle recovery. A
 /// supplied handle must share at least this many leading characters with a
 /// single indexed segment id before recovery may resolve it, giving 32 bits of
 /// hex discrimination and forbidding short-prefix guesses.
@@ -61,7 +61,7 @@ const MIN_HANDLE_RECOVERY_PREFIX_CHARS: usize = 8;
 /// broad to discriminate, so recovery declines rather than guess.
 const HANDLE_RECOVERY_CANDIDATE_LIMIT: usize = 32;
 
-/// Upper bound on the bounded process-global failed-handle retry memory (T3).
+/// Upper bound on the bounded process-global failed-handle retry memory.
 /// Once exceeded, the oldest-recorded entry is evicted first so the memory can
 /// never grow without bound across a long-lived MCP session.
 const FAILED_HANDLE_MEMORY_CAP: usize = 128;
@@ -228,7 +228,7 @@ pub struct ReadRecord {
     pub context: Option<ContextRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matching_handles: Vec<String>,
-    /// Set only on a record recovered via the unique-prefix gate (T1): the
+    /// Set only on a record recovered via the unique-prefix gate: the
     /// original supplied handle that did not resolve exactly or by prefix but
     /// whose unique canonical prefix mapped to this segment. Additive and
     /// omitted on every non-recovered record.
@@ -260,7 +260,7 @@ pub struct RecoveryCall {
 }
 
 /// Load-bearing truncation metadata attached to a record whenever content was
-/// bounded (REQ-004). Never best-effort: its presence means an omission
+/// bounded. Never best-effort: its presence means an omission
 /// occurred and `recovery` states exactly how to fetch the omitted content.
 ///
 /// Scope clips populate the scope fields (`scope_name`, `scope_type`,
@@ -291,7 +291,7 @@ pub struct TruncationNote {
 
 /// Constant-size symbol counts emitted at default verbosity when the symbol
 /// lists are omitted but non-empty, making the omission explicit without
-/// re-inflating the payload (REQ-003). Present only when a list was omitted
+/// re-inflating the payload. Present only when a list was omitted
 /// non-empty; the `oneup_symbol` recovery path retrieves the full lists.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolCounts {
@@ -321,12 +321,12 @@ pub struct SegmentRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub called_symbols: Vec<String>,
     /// Constant-size symbol counts, emitted at default verbosity when the
-    /// symbol lists are omitted but non-empty (REQ-003). `None` when the lists
+    /// symbol lists are omitted but non-empty. `None` when the lists
     /// are present (full verbosity) or all counts are zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_counts: Option<SymbolCounts>,
     /// Load-bearing truncation note set when a symbol list was capped at
-    /// [`MAX_SYMBOLS_PER_LIST`] (REQ-004). `None` when nothing was bounded.
+    /// [`MAX_SYMBOLS_PER_LIST`]. `None` when nothing was bounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationNote>,
     /// First symbol defined by the underlying segment, captured before the
@@ -348,7 +348,7 @@ pub struct ContextRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub out_of_scope_disclosure: Option<String>,
     /// Load-bearing truncation note set when a large enclosing scope was
-    /// windowed (REQ-004): scope name/type, full scope range, omitted line
+    /// windowed: scope name/type, full scope range, omitted line
     /// counts, and a ready-to-issue `oneup_context` recovery call. `None` when
     /// the whole scope was returned (nothing bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,7 +357,7 @@ pub struct ContextRecord {
 
 /// Orientation digest payload for `oneup_overview`. Section sizes are bounded
 /// by the engine caps documented in `crate::search::overview`, which keep the
-/// serialized payload within the documented budget (REQ-008).
+/// serialized payload within the documented budget.
 #[derive(Debug, Clone, Serialize)]
 pub struct OverviewPayload {
     pub status: OperationStatus,
@@ -421,7 +421,7 @@ pub struct OverviewEntryPoint {
 
 struct CurrentIndex {
     conn: Connection,
-    /// Canonical `index.db` path -- the warm cache's key (REQ-001) -- so a
+    /// Canonical `index.db` path -- the warm cache's key -- so a
     /// caller needing the per-context vector-count cache (`run_search_once`)
     /// can look it up without re-resolving/canonicalizing the path itself.
     db_path: PathBuf,
@@ -583,12 +583,12 @@ async fn compute_new_scope(
 /// Applies scope roots to IndexingConfig by converting them to include_globs.
 ///
 /// Scope roots are converted to glob patterns: "dir1/**", "dir2/**", etc.
-/// REQ-002: Also stores the actual scope roots so they can be recorded in progress.
+/// Also stores the actual scope roots so they can be recorded in progress.
 fn apply_scope_to_indexing_config(
     config: &mut IndexingConfig,
     scope_roots: &[String],
 ) -> anyhow::Result<()> {
-    // REQ-002: Always store scope roots in config, even if empty, so they're available
+    // Always store scope roots in config, even if empty, so they're available
     // during progress recording. Empty scope_roots indicates unscoped (full) index.
     config.scope_roots = scope_roots.to_vec();
 
@@ -621,7 +621,7 @@ pub async fn check_status(roots: &McpProjectRoots) -> ReadinessPayload {
     .await
 }
 
-/// REQ-012: Spawn an indexing rebuild in the background task so oneup_start
+/// Spawn an indexing rebuild in the background task so oneup_start
 /// returns promptly. The rebuild runs asynchronously and updates progress via
 /// index_status.json, which agents can poll with oneup_status.
 fn spawn_rebuild_task(
@@ -649,7 +649,7 @@ fn spawn_rebuild_task(
     })
 }
 
-/// REQ-012: how long `oneup_start` waits for a spawned rebuild before
+/// How long `oneup_start` waits for a spawned rebuild before
 /// detaching and returning progress. Fast operations (small repos, drift
 /// refreshes, auto-init failures) complete inside the budget so callers get
 /// the final readiness — drift cleared, blocked surfaced with its reason —
@@ -710,7 +710,7 @@ pub async fn start(
         mode == StartMode::Reindex
     };
 
-    // REQ-012: Make oneup_start non-blocking. Spawn indexing in the background
+    // Make oneup_start non-blocking. Spawn indexing in the background
     // and return immediately with status Indexing + progress metadata.
     let should_spawn = match mode {
         StartMode::IndexIfMissing if readiness.status == ReadinessStatus::Missing => true,
@@ -727,7 +727,7 @@ pub async fn start(
             scope_add
         );
         let rebuild_handle = spawn_rebuild_task(roots, rebuild_mode, scope_add, scope_narrow);
-        // REQ-012: bounded wait — return the final readiness when the rebuild
+        // Bounded wait — return the final readiness when the rebuild
         // completes inside the budget; otherwise detach (the task keeps
         // running) and return current status with progress for polling.
         match tokio::time::timeout(start_response_budget(), rebuild_handle).await {
@@ -852,11 +852,11 @@ pub async fn classify_readiness(
     {
         payload.status = ReadinessStatus::Indexing;
         payload.summary = "Indexing is currently running.".to_string();
-        // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+        // Extract scope from progress file (visible during indexing, independent of swap)
         if let Some(progress) = &payload.index_progress {
             payload.index_scope = extract_scope_from_progress(progress);
         }
-        // REQ-002: If scope not in progress yet, try reading from database meta (rebuild in progress)
+        // If scope not in progress yet, try reading from database meta (rebuild in progress)
         if payload.index_scope.is_none() {
             if let Ok(Some(scope)) =
                 compute_index_scope(state_root, source_root, &worktree_context.context_id).await
@@ -871,7 +871,7 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
-            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            // Extract scope from progress file (visible during indexing, independent of swap)
             if let Some(progress) = &payload.index_progress {
                 payload.index_scope = extract_scope_from_progress(progress);
             }
@@ -889,7 +889,7 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
-                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                // Extract scope from progress file (visible during indexing, independent of swap)
                 if let Some(progress) = &payload.index_progress {
                     payload.index_scope = extract_scope_from_progress(progress);
                 }
@@ -908,7 +908,7 @@ pub async fn classify_readiness(
             if daemon_refresh_active {
                 payload.status = ReadinessStatus::Indexing;
                 payload.summary = "Indexing is currently running.".to_string();
-                // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+                // Extract scope from progress file (visible during indexing, independent of swap)
                 if let Some(progress) = &payload.index_progress {
                     payload.index_scope = extract_scope_from_progress(progress);
                 }
@@ -932,7 +932,7 @@ pub async fn classify_readiness(
         if daemon_refresh_active {
             payload.status = ReadinessStatus::Indexing;
             payload.summary = "Indexing is currently running.".to_string();
-            // REQ-002: Extract scope from progress file (visible during indexing, independent of swap)
+            // Extract scope from progress file (visible during indexing, independent of swap)
             if let Some(progress) = &payload.index_progress {
                 payload.index_scope = extract_scope_from_progress(progress);
             }
@@ -1024,7 +1024,7 @@ pub async fn classify_readiness(
     let embedding_reason = embedder::model_unavailable_reason_for_status()
         .map(|reason| unavailable_reason_text(&reason));
 
-    // Compute and populate index scope for coverage disclosure (REQ-002)
+    // Compute and populate index scope for coverage disclosure
     // Use the existing connection to avoid contention
     if let Ok(scope_roots) = schema::read_scope_from_meta(&conn).await {
         let indexed_file_paths =
@@ -1163,7 +1163,7 @@ pub async fn run_search(
     limit: usize,
     path_prefix: Option<&str>,
 ) -> anyhow::Result<SearchPayload> {
-    // REQ-012: Bound search latency to <10s during rebuild. If rebuild is in progress,
+    // Bound search latency to <10s during rebuild. If rebuild is in progress,
     // apply a timeout; otherwise search without timeout (expected to be fast on idle index).
     if rebuild_in_progress(state_root, &worktree_context.context_id) {
         match tokio::time::timeout(
@@ -1219,7 +1219,7 @@ fn finalize_search_lists(
 }
 
 /// Process-global warm embedding runtime for the in-process MCP fallback search
-/// path (R-008).
+/// path.
 ///
 /// The MCP server process serves many tool calls over its lifetime. When the
 /// daemon is unavailable, `run_search_once` embeds the query in-process; keeping a
@@ -1253,7 +1253,7 @@ async fn run_search_once(
     let has_vectors = retrieval::has_indexed_embeddings(&current.conn, &search_scope).await?;
     let (results, embedding_reason) = if has_vectors {
         // Warm the in-process fallback embedding runtime instead of cold-loading
-        // `EmbeddingRuntime::default()` on every call (R-008). The MCP server is a
+        // `EmbeddingRuntime::default()` on every call. The MCP server is a
         // long-lived process serving many tool calls; this in-process search path
         // runs when the daemon is unavailable, so a per-call cold load would
         // re-read and re-initialize the ONNX session for each query. The runtime
@@ -1264,7 +1264,7 @@ async fn run_search_once(
         let embedding_reason = embedding_unavailable_reason(&embedding_status);
         let results = if embedding_status.is_available() {
             // Reuse the warm cache's per-context vector `COUNT(*)` instead of
-            // recomputing it on every search (REQ-001, mirrors the daemon's
+            // recomputing it on every search (mirrors the daemon's
             // `ProjectState::cached_vector_count`). A cache miss computes it
             // once and records it against the current warm-index generation;
             // `warm_index_connection` clears the whole map entry's counts on
@@ -1326,10 +1326,10 @@ async fn run_search_once(
     };
 
     // Stale-but-available: when a rebuild/refresh is in progress for this
-    // context, readers keep serving the prior index (build-aside, REQ-002), so
+    // context, readers keep serving the prior index (build-aside), so
     // flag the served results as possibly stale. The notice rides only in
     // `degraded_reason` (no parallel field) and the render path keeps it off
-    // stdout (REQ-003).
+    // stdout.
     let stale_reason = rebuild_in_progress(state_root, &worktree_context.context_id)
         .then(|| STALE_REBUILD_REASON.to_string());
     let degraded_reason = combine_degraded_reasons(
@@ -1383,7 +1383,7 @@ async fn get_handles_once(
     let context_id = &worktree_context.context_id;
     // The failed-handle memory is keyed and identity-stamped against the same
     // canonical db path the warm cache uses, so a rejection reflects the exact
-    // index generation the retry would otherwise re-query (T3).
+    // index generation the retry would otherwise re-query.
     let current_identity = index_file_identity(&current.db_path);
     let normalized: Vec<String> = handles
         .iter()
@@ -1391,7 +1391,7 @@ async fn get_handles_once(
         .collect();
 
     // Pre-pass: reject a handle that already failed this session against this
-    // same index identity without re-querying (T3). An identity mismatch drops
+    // same index identity without re-querying. An identity mismatch drops
     // the stale entry so the handle resolves fresh below; an empty handle is
     // never a memory key (it resolves to the empty-handle rejection instead).
     let mut prejudged: Vec<Option<ReadRecord>> = Vec::with_capacity(handles.len());
@@ -1450,8 +1450,8 @@ async fn get_handles_once(
         })
         .collect();
 
-    // Post-pass: remember fresh failures and forget entries a success cleared
-    // (T3). Pre-rejected records keep their existing entry (they were never
+    // Post-pass: remember fresh failures and forget entries a success cleared.
+    // Pre-rejected records keep their existing entry (they were never
     // re-queried); a transient `Error` is not remembered so it can be retried.
     {
         let mut memory = failed_handle_memory()
@@ -1759,7 +1759,7 @@ async fn run_index(
     // Apply scope to include_globs for ScanFilter
     apply_scope_to_indexing_config(&mut indexing_config, &new_scope)?;
 
-    // REQ-002: Write initial progress file with scope info BEFORE rebuild lock acquisition.
+    // Write initial progress file with scope info BEFORE rebuild lock acquisition.
     // This ensures scope is visible during the rebuilding phase, even if the progress file
     // isn't updated again until the pipeline starts running.
     let initial_scope_info = if !new_scope.is_empty() {
@@ -1830,7 +1830,7 @@ async fn run_index(
     let _rebuild_lock =
         tokio::task::spawn_blocking(move || lifecycle::acquire_rebuild_lock(&lock_root)).await??;
 
-    // REQ-002: Write scope to index_status.json BEFORE the pipeline starts,
+    // Write scope to index_status.json BEFORE the pipeline starts,
     // ensuring scope is visible to `oneup_status` during indexing (not dependent
     // on finalize_and_swap completion). This is done by the pipeline's initial
     // progress update via IndexRunContext scope information. The scope is already
@@ -1846,7 +1846,7 @@ async fn run_index(
         let staged = swap::StagingRebuild::open(&roots.state_root).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
 
-        // REQ-002 & REQ-005: Write scope to meta table BEFORE pipeline starts
+        // Write scope to meta table BEFORE pipeline starts
         // so clamp_deletion_on_scope_loss can read it during the pipeline
         schema::write_scope_to_meta(staged.connection(), &new_scope).await?;
 
@@ -1861,7 +1861,7 @@ async fn run_index(
         schema::prepare_for_write(&conn).await?;
         setup.db_prepare_ms = db_start.elapsed().as_millis();
 
-        // REQ-002: Write scope to meta table BEFORE pipeline starts
+        // Write scope to meta table BEFORE pipeline starts
         schema::write_scope_to_meta(&conn, &new_scope).await?;
 
         let stats = run_index_pipeline(&conn, roots, &indexing_config, setup).await?;
@@ -1885,7 +1885,7 @@ async fn run_index_pipeline(
     mut setup: SetupTimings,
 ) -> anyhow::Result<pipeline::PipelineStats> {
     let model_start = Instant::now();
-    // REQ-002: MCP `oneup_start` indexing (index-if-missing/index-if-needed/
+    // MCP `oneup_start` indexing (index-if-missing/index-if-needed/
     // reindex) is an explicit, deliberate retry signal, so clear any prior
     // download-failure marker before the model prepare's `is_download_failed()`
     // guard runs. Passive search (cli/search.rs) never does this, so it stays
@@ -1897,7 +1897,7 @@ async fn run_index_pipeline(
         .await?;
     setup.model_prepare_ms = model_start.elapsed().as_millis();
 
-    // REQ-002: Scope is always Full in the MCP path because scope is applied
+    // Scope is always Full in the MCP path because scope is applied
     // via include_globs in IndexingConfig. The pipeline respects include_globs
     // during the scan, so all code paths (scoped and unscoped) use RunScope::Full
     // with appropriate include_globs set or empty.
@@ -1949,7 +1949,7 @@ fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
 }
 
 /// A warm, schema-validated MCP read-index handle kept alive across calls
-/// until a build-aside swap changes the on-disk inode (REQ-001).
+/// until a build-aside swap changes the on-disk inode.
 struct WarmIndex {
     // Kept alive only so `conn` (an `Arc`-backed clone) remains valid for the
     // lifetime of the cache entry; never read directly.
@@ -1966,7 +1966,7 @@ struct WarmIndex {
     vector_counts: HashMap<String, usize>,
 }
 
-/// Process-global warm MCP read-index cache (REQ-001), keyed by canonical
+/// Process-global warm MCP read-index cache, keyed by canonical
 /// `db_path` and mirroring `fallback_embedding_runtime`'s process-global
 /// shape.
 ///
@@ -1977,7 +1977,7 @@ struct WarmIndex {
 /// single call. `warm_index_connection` stats `db_path` on every call and
 /// drops + reopens the entry when the on-disk `(dev,ino)` no longer matches
 /// the cached one, so a served connection can never continue serving a
-/// superseded generation after a build-aside swap (HYP-001: a held
+/// superseded generation after a build-aside swap (a held
 /// `Connection` is pinned to the inode it opened and keeps serving the
 /// pre-swap generation, with no error, until dropped and reopened).
 fn warm_index_cache() -> &'static tokio::sync::Mutex<HashMap<PathBuf, WarmIndex>> {
@@ -1987,7 +1987,7 @@ fn warm_index_cache() -> &'static tokio::sync::Mutex<HashMap<PathBuf, WarmIndex>
 
 /// Return a tuned RO connection to `db_path`'s currently-served index,
 /// reusing the process-global warm cache entry when the on-disk inode is
-/// unchanged (REQ-001).
+/// unchanged.
 ///
 /// On a cache hit (inode match) this is a cheap clone of the already
 /// schema-validated connection -- `libsql::Connection` is `Arc`-backed, so
@@ -2049,7 +2049,7 @@ async fn warm_index_connection(
 }
 
 /// Return the cached per-context vector count recorded against
-/// `canonical_db_path`'s warm cache entry, if any (REQ-001).
+/// `canonical_db_path`'s warm cache entry, if any.
 async fn cached_vector_count_for_context(
     canonical_db_path: &Path,
     context_id: &str,
@@ -2062,7 +2062,7 @@ async fn cached_vector_count_for_context(
 
 /// Record a freshly-computed per-context vector count against
 /// `canonical_db_path`'s warm cache entry, so the next search for the same
-/// context skips its per-query `COUNT(*)` (REQ-001). A no-op if the entry was
+/// context skips its per-query `COUNT(*)`. A no-op if the entry was
 /// concurrently reopened (a rare inode-swap race): the recomputed count
 /// belongs to the entry that just replaced this one, not the one being
 /// updated here.
@@ -2073,8 +2073,8 @@ async fn record_vector_count_for_context(canonical_db_path: &Path, context_id: &
     }
 }
 
-/// Identity-stamped record of a handle lookup that already failed this session
-/// (T3). `outcome` is the terminal failure status (`NotFound` or `Ambiguous`)
+/// Identity-stamped record of a handle lookup that already failed this session.
+/// `outcome` is the terminal failure status (`NotFound` or `Ambiguous`)
 /// and `matching_handles` carries the candidate ids from an ambiguous failure
 /// so a later rejection can still offer disambiguation without re-querying.
 /// `seq` records insertion order for oldest-first eviction.
@@ -2092,8 +2092,8 @@ struct FailedHandleRecord {
 /// never leak across indexes or contexts.
 type FailedHandleKey = (PathBuf, String, String);
 
-/// Bounded, insertion-ordered memory of handle lookups that already failed
-/// (T3). Distinct from [`warm_index_cache`] because it is keyed per (index,
+/// Bounded, insertion-ordered memory of handle lookups that already failed.
+/// Distinct from [`warm_index_cache`] because it is keyed per (index,
 /// context, handle) rather than per index file and holds no live connection.
 /// Every method is synchronous, so the guarding mutex is only ever held for a
 /// pure in-memory operation (never across an `await`).
@@ -2104,7 +2104,7 @@ struct FailedHandleMemory {
 }
 
 impl FailedHandleMemory {
-    /// Decide a handle's fate against recorded history (T3). A recorded failure
+    /// Decide a handle's fate against recorded history. A recorded failure
     /// whose stamped identity still matches the current on-disk index is
     /// returned so the caller can reject the identical retry without
     /// re-querying; an identity mismatch (a build-aside swap installed a fresh
@@ -2160,14 +2160,14 @@ impl FailedHandleMemory {
         }
     }
 
-    /// Forget any recorded failure for a handle (T3): a fresh success supersedes
+    /// Forget any recorded failure for a handle: a fresh success supersedes
     /// a prior failure, so a later identical call is no longer rejected.
     fn clear(&mut self, key: &FailedHandleKey) {
         self.entries.remove(key);
     }
 }
 
-/// Process-global failed-handle retry memory (T3), mirroring the process-global
+/// Process-global failed-handle retry memory, mirroring the process-global
 /// shape of [`warm_index_cache`]. Guards a purely in-memory map, so a plain
 /// `std::sync::Mutex` suffices: the lock is never held across an `await`.
 fn failed_handle_memory() -> &'static Mutex<FailedHandleMemory> {
@@ -2196,7 +2196,7 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
 
 /// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
 /// order. The exact-id pass is collapsed into a single `id IN (...)` batch
-/// lookup (R-013); only the residual handles that did not exact-match (12-char
+/// lookup; only the residual handles that did not exact-match (12-char
 /// display handles and genuine misses) fall back to the per-handle prefix
 /// lookup. Each handle is resolved independently, so the per-handle
 /// Found/NotFound/Ambiguous outcome and the empty-handle rejection are identical
@@ -2303,7 +2303,7 @@ async fn resolve_handle_via_prefix(
     )
 }
 
-/// Outcome of the pure unique-prefix recovery gate (T1). `candidates` are the
+/// Outcome of the pure unique-prefix recovery gate. `candidates` are the
 /// ids sharing the floor prefix; the gate itself never issues a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandleRecovery {
@@ -2317,15 +2317,15 @@ enum HandleRecovery {
     None,
 }
 
-/// Recovery path taken when a handle matched no segment exactly or by prefix
-/// (REQ-001). Fetches the context-scoped candidate ids sharing the floor prefix
+/// Recovery path taken when a handle matched no segment exactly or by prefix.
+/// Fetches the context-scoped candidate ids sharing the floor prefix
 /// (`supplied[..MIN_HANDLE_RECOVERY_PREFIX_CHARS]`, bounded by
 /// [`HANDLE_RECOVERY_CANDIDATE_LIMIT`]) and runs the pure recovery gate. A
 /// unique longest-prefix candidate is re-fetched by its exact id and returned
 /// as a `Found` record disclosing `recovered_from`; a tie yields an explicit
 /// `Ambiguous` record; anything else stays `NotFound`. Context scoping is
 /// inherited from the storage query, so a foreign-context handle can never be
-/// recovered (REQ-001 AC3). A candidate fetch that saturates the limit means
+/// recovered. A candidate fetch that saturates the limit means
 /// the floor prefix is too broad to discriminate, so recovery declines.
 async fn attempt_handle_recovery(
     conn: &Connection,
@@ -2406,7 +2406,7 @@ async fn attempt_handle_recovery(
     }
 }
 
-/// Pure longest-common-prefix recovery gate (REQ-001). Walks prefix lengths
+/// Pure longest-common-prefix recovery gate. Walks prefix lengths
 /// from the full supplied handle down to [`MIN_HANDLE_RECOVERY_PREFIX_CHARS`];
 /// the first (longest) length at which any candidate matches decides the
 /// outcome, so a lone match recovers (`Found`) and a tie declines with the tied
@@ -2594,13 +2594,13 @@ fn read_segment(source: ReadSource, segment: StoredSegment, verbosity: Option<&s
 }
 
 /// Single-source disclosure attached to a record recovered via the unique-prefix
-/// gate (T1), stating plainly that the supplied handle did not resolve directly.
+/// gate, stating plainly that the supplied handle did not resolve directly.
 const HANDLE_RECOVERY_MESSAGE: &str =
     "segment handle did not resolve exactly or by prefix; recovered via its unique canonical prefix within the active context";
 
 /// `Found` record for a segment resolved through unique-prefix recovery: a
 /// normal segment read with the additive `recovered_from` disclosure and a
-/// message naming the recovery (REQ-001).
+/// message naming the recovery.
 fn read_recovered_segment(
     source: ReadSource,
     segment: StoredSegment,
@@ -2631,7 +2631,7 @@ fn read_context(
     // extension here (mirrors the context engine's own extension mapping).
     let language = language_for_path(file_path);
 
-    // Load-bearing truncation note (REQ-004): only when the returned window is a
+    // Load-bearing truncation note: only when the returned window is a
     // strict subset of the enclosing scope. The recovery re-issues oneup_context
     // at the ORIGINAL target line so the same smallest enclosing scope re-resolves
     // (a midpoint retarget could land in a nested scope), with an expansion large
@@ -2697,7 +2697,7 @@ fn language_for_path(file_path: &Path) -> String {
     }
 }
 
-/// `Rejected` record for an identical failed handle retry (T3). The message is
+/// `Rejected` record for an identical failed handle retry. The message is
 /// built from the remembered `outcome` so it names the original cause
 /// truthfully (an ambiguous prefix vs a plain not-found) rather than
 /// re-querying to rediscover it. Carries the candidate ids cached from an
@@ -2758,9 +2758,9 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
 
     let (defined_symbols, referenced_symbols, called_symbols, symbol_counts, truncation) =
         if is_verbose {
-            // Full verbosity (REQ-003): emit the lists but cap each at
+            // Full verbosity: emit the lists but cap each at
             // MAX_SYMBOLS_PER_LIST. When any list overflows, attach a
-            // load-bearing truncation note (REQ-004) with the total omitted
+            // load-bearing truncation note with the total omitted
             // count and a ready-to-issue oneup_symbol recovery targeting a
             // symbol this segment actually carries (prefer the defining symbol).
             let omitted = counts.defined.saturating_sub(MAX_SYMBOLS_PER_LIST)
@@ -2800,7 +2800,7 @@ fn segment_record(segment: StoredSegment, verbosity: Option<&str>) -> SegmentRec
                 truncation,
             )
         } else {
-            // Default verbosity (REQ-003): omit the lists but make the omission
+            // Default verbosity: omit the lists but make the omission
             // explicit with constant-size counts when any list is non-empty; the
             // symbol_hint / oneup_symbol next_action remains the recovery path.
             let symbol_counts =
@@ -2868,7 +2868,7 @@ fn symbol_record(result: SymbolResult) -> SymbolRecord {
 
 fn overview_payload(digest: overview::RepositoryOverview) -> OverviewPayload {
     // A ready index with zero segments is a valid empty digest, not an
-    // error (REQ-010); missing/unready indexes fail in open_current_index.
+    // error; missing/unready indexes fail in open_current_index.
     let status = if digest.stats.total_segments == 0 {
         OperationStatus::Empty
     } else {
@@ -2995,7 +2995,7 @@ fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let content = std::fs::read_to_string(&path).ok()?;
     let progress = serde_json::from_str(&content).ok()?;
 
-    // REQ-010: Check if the progress file is stale (Running state, dead process, age > 5 min).
+    // Check if the progress file is stale (Running state, dead process, age > 5 min).
     // Treat stale progress as if no index exists, so agents don't poll indefinitely.
     if is_index_progress_stale(&progress, &path) {
         return None;
@@ -3014,15 +3014,15 @@ fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Opt
 }
 
 /// Extract scope info from progress file during indexing.
-/// REQ-002: Scope should be visible during indexing, independent of swap completion.
+/// Scope should be visible during indexing, independent of swap completion.
 fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
-    // REQ-002: Extract scope from progress during indexing.
+    // Extract scope from progress during indexing.
     // The scope roots come from IndexScopeInfo recorded during pipeline startup.
     // Return IndexScope as soon as scope_info is available, even if files_total is 0,
     // so scope is visible from the start of indexing (not just during scanning).
     progress.scope.as_ref().map(|scope_info| {
         IndexScope {
-            // REQ-002: Use roots from scope_info (recorded during pipeline startup)
+            // Use roots from scope_info (recorded during pipeline startup)
             roots: scope_info.roots.clone(),
             indexed_files: progress.files_indexed,
             total_files: progress.files_total,
@@ -3031,7 +3031,7 @@ fn extract_scope_from_progress(progress: &IndexProgress) -> Option<IndexScope> {
     })
 }
 
-/// REQ-010: Check if an index progress file is stale.
+/// Check if an index progress file is stale.
 /// A progress file is stale if it claims Running state but the owning process (indexer_pid)
 /// is dead AND the file is older than STALENESS_THRESHOLD_SECS (5 minutes).
 /// This prevents agents from indefinitely polling a stuck indexing state.
@@ -3126,7 +3126,7 @@ enum LocationError {
     Error(String),
 }
 
-// REQ-005: Cache key for directory walk results, invalidating on repo identity change or HEAD drift.
+// Cache key for directory walk results, invalidating on repo identity change or HEAD drift.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct DirectoryWalkCacheKey {
@@ -3135,8 +3135,8 @@ struct DirectoryWalkCacheKey {
     root_mtime: Option<u64>,     // filesystem mtime in seconds, or None on error
 }
 
-// REQ-005: Static in-process cache for directory walk results.
-// F5/N4b: Also persists to disk for cross-process reuse (cold-walk latency fix).
+// Static in-process cache for directory walk results.
+// Also persists to disk for cross-process reuse (cold-walk latency fix).
 static DIRECTORY_WALK_CACHE: OnceLock<
     Mutex<HashMap<DirectoryWalkCacheKey, BTreeMap<String, usize>>>,
 > = OnceLock::new();
@@ -3188,8 +3188,8 @@ fn save_persistent_directory_walk_cache(
     entries: &HashMap<String, BTreeMap<String, usize>>,
 ) {
     let dot_dir = project_dot_dir(state_root);
-    // FIX A: Only write cache if .1up already exists. Never create .1up during blocked/failed
-    // indexing attempts (REQ-001: blocked path must leave NO .1up side effects).
+    // Only write cache if .1up already exists. Never create .1up during blocked/failed
+    // indexing attempts (blocked path must leave NO .1up side effects).
     if !dot_dir.exists() {
         return;
     }
@@ -3291,7 +3291,7 @@ fn get_file_count_threshold() -> usize {
         .unwrap_or(FILE_COUNT_THRESHOLD)
 }
 
-/// Counts files per top-level directory with result caching (REQ-005).
+/// Counts files per top-level directory with result caching.
 /// Returns a map of directory name to file_count.
 /// Cache invalidates on git HEAD drift or root directory mtime change,
 /// ensuring <1s repeat call latency while maintaining correctness.
@@ -3548,7 +3548,7 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
 /// Calibrates vector estimate based on measured language densities.
 /// Returns (total_estimate, basis_explanation, low_bound, high_bound).
 ///
-/// REQ-006: Vector estimate must be calibrated against real embedding density.
+/// Vector estimate must be calibrated against real embedding density.
 /// Measured densities:
 /// - Rust: 37.02 segments/file (measured on 1up: 148 files → 5479 segments)
 /// - Kotlin/Java: ~28 segments/file (measured on a large production monorepo)
@@ -3661,7 +3661,7 @@ pub async fn should_return_facts_envelope(
 }
 
 /// Generates ranked scope suggestions from top-level directories.
-/// T9: Provides multiple ranked suggestions without dangling "Or" wording.
+/// Provides multiple ranked suggestions without dangling "Or" wording.
 /// Returns up to 3 suggestions formatted as actionable scope cone names.
 /// Excludes launch_subdir from suggestions if already matched (avoids duplication).
 fn generate_ranked_suggestions(
@@ -3715,8 +3715,8 @@ fn ordinal(n: usize) -> &'static str {
 
 /// Generates a facts envelope for a large monorepo on first-run.
 /// Uses gitignore-aware file counts and calibrated vector estimates based on measured
-/// language densities (REQ-004, REQ-005, REQ-006, REQ-007).
-/// N2: Per-directory estimates now use the same calibrated density as the global estimate.
+/// language densities.
+/// Per-directory estimates use the same calibrated density as the global estimate.
 pub async fn generate_facts_envelope(
     source_root: &Path,
     launch_subdir: Option<PathBuf>,
@@ -3741,7 +3741,7 @@ pub async fn generate_facts_envelope(
     // Sort by file count descending (largest first)
     per_directory_stats.sort_by_key(|b| std::cmp::Reverse(b.file_count));
 
-    // T8: Filter out tool/editor dot-directories from stats
+    // Filter out tool/editor dot-directories from stats
     // Excludes: .idea, .claude, .vscode, .1up, .agentdocs (noise in suggestions)
     let excluded_dot_dirs = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
     per_directory_stats.retain(|stat| !excluded_dot_dirs.contains(&stat.directory.as_str()));
@@ -3759,7 +3759,7 @@ pub async fn generate_facts_envelope(
             .and_then(|rel| rel.to_str().map(|s| s.to_string()))
     });
 
-    // T9: Generate ranked suggestions without dangling "Or" wording
+    // Generate ranked suggestions without dangling "Or" wording
     // Provide up to 3 top directories as ranked suggestions
     let suggestions = generate_ranked_suggestions(&per_directory_stats, &launch_subdir_str);
 
@@ -4179,8 +4179,8 @@ mod tests {
 
     #[test]
     fn stale_rebuild_reason_states_rebuilding_and_stale() {
-        // The wording is the single source of truth folded into degraded_reason
-        // by T6; pin its substance so the user-facing notice cannot silently drift.
+        // The wording is the single source of truth folded into degraded_reason;
+        // pin its substance so the user-facing notice cannot silently drift.
         assert_eq!(
             crate::shared::constants::STALE_REBUILD_REASON,
             "index is rebuilding; results may be stale"
@@ -4325,7 +4325,7 @@ mod tests {
         );
     }
 
-    /// REQ-005 AC1 red-first baseline: prior to enforcing `ScanFilter` at the
+    /// Red-first baseline: prior to enforcing `ScanFilter` at the
     /// context read path, `oneup_context` read secret-pattern files off disk
     /// directly, bypassing indexer exclusions entirely. This asserts the
     /// closed behavior — the fix under test refuses the file rather than
@@ -4385,7 +4385,7 @@ mod tests {
         assert!(payload.records[0].context.is_none());
     }
 
-    /// REQ-005 AC2: a non-excluded file continues to be served normally even
+    /// A non-excluded file continues to be served normally even
     /// when the project has a configured (non-matching) `ScanFilter`.
     #[tokio::test]
     async fn read_context_locations_serves_non_excluded_file_with_configured_filter() {
@@ -4631,7 +4631,7 @@ mod tests {
         );
     }
 
-    /// REQ-001 AC1/AC4: the `mcp::ops` construction site must inject
+    /// The `mcp::ops` construction site must inject
     /// `path_prefix` into `SearchScope` so a scoped `oneup_search` never leaks
     /// results outside the prefix, while an unscoped call keeps the full-repo
     /// result set (mirrors the equivalent cli::search and daemon::worker
@@ -4701,7 +4701,7 @@ mod tests {
         assert_eq!(
             unscoped.results.len(),
             2,
-            "no prefix supplied must leave full-repo search behavior unchanged (REQ-001 AC4)"
+            "no prefix supplied must leave full-repo search behavior unchanged"
         );
     }
 
@@ -4739,7 +4739,7 @@ mod tests {
         staging
     }
 
-    /// REQ-001 AC1 / T1: a second `open_current_index` call on an
+    /// A second `open_current_index` call on an
     /// unchanged-inode `db_path` must reuse the cached tuned RO connection and
     /// skip `ensure_current`/schema re-validation, rather than opening a fresh
     /// connection per call.
@@ -4781,7 +4781,7 @@ mod tests {
             );
     }
 
-    /// REQ-001 AC4 / T1 (HYP-001): after a build-aside swap installs a fresh
+    /// After a build-aside swap installs a fresh
     /// index generation on a new inode, the next MCP read must observe the new
     /// generation's data -- never silently continue serving the pre-swap
     /// generation through the warm cache -- and must still surface the
@@ -4859,7 +4859,7 @@ mod tests {
         );
     }
 
-    /// T1: the per-context vector-count cache on a warm index entry must be
+    /// The per-context vector-count cache on a warm index entry must be
     /// populated on demand, keyed independently per context, and cleared in
     /// full when a build-aside swap reopens the entry -- mirroring the
     /// daemon's `reopen_invalidates_cached_vector_count_after_swap` coverage
@@ -4913,7 +4913,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_handles_batched_matches_per_item_outcomes_and_order() {
-        // R-013: the batched exact-id + residual-prefix resolver must return the
+        // The batched exact-id + residual-prefix resolver must return the
         // same per-handle Found/NotFound/Ambiguous outcomes, in input order, as
         // resolving each handle one at a time (exact id, then prefix).
         let db = Db::open_memory().await.unwrap();
@@ -5229,7 +5229,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_handle_recovery_is_context_scoped() {
         // The intended segment lives only in a foreign context, so the supplied
-        // handle must never recover in the active context (REQ-001 AC3).
+        // handle must never recover in the active context.
         let db = Db::open_memory().await.unwrap();
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
@@ -5268,7 +5268,7 @@ mod tests {
         assert!(record.recovered_from.is_none());
     }
 
-    // Failed-handle retry memory gate (T3). Exercised on a fresh local
+    // Failed-handle retry memory gate. Exercised on a fresh local
     // `FailedHandleMemory` rather than the process-global one so the matrix is
     // deterministic and parallel-safe.
 
@@ -5384,7 +5384,7 @@ mod tests {
         );
     }
 
-    /// Per-item baseline (relocated from the pre-R-013 `resolve_handle_record`):
+    /// Per-item baseline (relocated from the pre-batching `resolve_handle_record`):
     /// resolve one handle by exact id, then by prefix. The batched
     /// `resolve_handle_records` must match this field-for-field.
     async fn resolve_handle_record_per_item(
@@ -5736,7 +5736,7 @@ mod tests {
         // Verify scope is extracted correctly
         assert!(scope.is_some());
         let scope = scope.unwrap();
-        // REQ-002: Roots should now be populated from IndexScopeInfo during indexing
+        // Roots should now be populated from IndexScopeInfo during indexing
         assert_eq!(
             scope.roots,
             vec!["services/auth".to_string(), "libs/core".to_string()]
@@ -6088,7 +6088,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_facts_envelope_excludes_dot_directories() {
-        // T8: Verify that tool/editor dot-directories are filtered from
+        // Verify that tool/editor dot-directories are filtered from
         // per_directory_stats in the facts envelope. The envelope is used for
         // scope suggestions; dot-directories are noise and should not appear.
         let tmp = tempfile::tempdir().unwrap();
@@ -6205,7 +6205,7 @@ mod tests {
 
     #[test]
     fn test_ranked_suggestions_no_leading_or_when_top_dir_is_launch_subdir() {
-        // T9: when the launch_subdir is the top-ranked directory, the first
+        // When the launch_subdir is the top-ranked directory, the first
         // emitted suggestion must not start with "Or" and must keep the
         // truthful rank ordinal.
         let stats = ranked_stats(&["services", "libs", "tools"]);

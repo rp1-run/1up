@@ -216,7 +216,7 @@ pub async fn exec(args: IndexArgs, format: OutputFormat) -> anyhow::Result<()> {
 
     ensure_secure_project_root(&project_root)?;
 
-    // REQ-004/H2: `1up index` creates `.1up/index.db` directly (it does not funnel
+    // `1up index` creates `.1up/index.db` directly (it does not funnel
     // through `ensure_project_id`), so ensure `.1up/.gitignore` here too — otherwise
     // an index-first user on a fresh repo could commit their local index.db.
     // Best-effort: a gitignore failure must never block indexing.
@@ -266,7 +266,7 @@ async fn run_index_once(
 
     // Single-writer rebuild lock: ALWAYS held across schema prepare + the
     // pipeline write so a concurrent daemon/CLI/MCP rebuild of the shared index
-    // cannot race this one (REQ-003 single-writer guarantee). `state_root` is
+    // cannot race this one (single-writer guarantee). `state_root` is
     // non-optional precisely so this lock can never be silently bypassed.
     // Released when this function returns (RAII).
     let _rebuild_lock = crate::daemon::lifecycle::acquire_rebuild_lock(state_root)?;
@@ -290,7 +290,7 @@ async fn run_index_once(
     let mut model_spinner = spin("Loading embedding model", show_progress_ui);
 
     let model_start = Instant::now();
-    // REQ-002: `1up index` is an explicit, deliberate retry signal, so clear
+    // `1up index` is an explicit, deliberate retry signal, so clear
     // any prior download-failure marker before the model prepare's
     // `is_download_failed()` guard runs. Passive search (cli/search.rs) never
     // does this, so it stays FTS-only until an explicit index/reindex clears

@@ -244,7 +244,7 @@ fn update_http_failure_is_permanent(status: reqwest::StatusCode) -> bool {
 
 /// Fetches the remote update manifest over HTTPS with bounded timeouts,
 /// verifying the raw response bytes against an attested release build
-/// subject (REQ-001, via [`verify_manifest_attestation`]) before any content
+/// subject (via [`verify_manifest_attestation`]) before any content
 /// is parsed. A disproof or definitive-empty outcome rejects the manifest
 /// before this returns, so `build_update_status` / `ensure_manifest_acceptable`
 /// / a cache write never runs on unattested bytes; a cannot-run outcome
@@ -754,7 +754,7 @@ fn verify_attestation_bundles(
 /// Fully-resolved outcome of fetching attestation bundles for a digest from
 /// the GitHub attestations API, replacing the previous `Option<Vec<String>>`
 /// collapse so a definitive-empty result is distinguishable from cannot-run
-/// (REQ-003, recalibrated by ADD-001 in `hypotheses.md`).
+/// (the attestations-404 disambiguation).
 ///
 /// - `Bundles`: attestation material was returned; verify it normally.
 /// - `DefinitiveEmpty`: the API confirmed no attestation exists for this
@@ -789,8 +789,8 @@ enum ProvisionalAttestationOutcome {
 /// extracted from the HTTP response — so this is exhaustively unit-testable
 /// without a network call. HTTP 200 with at least one bundle is `Bundles`;
 /// HTTP 200 with a parseable empty list is `DefinitiveEmpty` (kept as
-/// defense-in-depth even though the live API signals absence via 404 per
-/// HYP-001); HTTP 404 is left `AmbiguousNotFound` rather than resolved here,
+/// defense-in-depth even though the live API was observed to signal absence
+/// via 404); HTTP 404 is left `AmbiguousNotFound` rather than resolved here,
 /// since disambiguating it requires the repo-existence probe (an IO call) in
 /// [`fetch_attestation_bundles`]; 403/429/5xx/malformed-200 are `CannotRun`;
 /// and any response whose `Sunset` header date has passed is `CannotRun`
@@ -868,7 +868,8 @@ impl RepoProbeCache {
 static ATTESTATION_REPO_PROBE_CACHE: RepoProbeCache = RepoProbeCache::new();
 
 /// Probes whether the attestation repository ([`ATTESTATION_REPO_SLUG`]) is
-/// reachable, used to resolve an ambiguous attestations-API 404 (ADD-001): a
+/// reachable, used to resolve an ambiguous attestations-API 404 (the
+/// attestations-404 disambiguation): a
 /// reachable repo turns the 404 into `DefinitiveEmpty`; an unreachable one
 /// (offline, rate-limited, repo gone) keeps it `CannotRun`.
 async fn probe_attestation_repo_exists(client: &reqwest::Client) -> bool {
@@ -1013,7 +1014,8 @@ fn build_attestation_client() -> Result<reqwest::Client, UpdateError> {
 /// - verified: at least one fetched bundle verified and named the project's
 ///   release workflow -> `Ok(())`, proceed to activation.
 /// - definitive-empty: the attestations API confirmed no attestation exists
-///   for this digest (ADD-001) -> `Err(AttestationMissing)`, a hard fail that
+///   for this digest (per the attestations-404 disambiguation) ->
+///   `Err(AttestationMissing)`, a hard fail that
 ///   leaves the running binary untouched.
 /// - cannot-run: the outcome could not be determined (offline / unconfirmed
 ///   404 / rate-limited / 5xx / past-`Sunset`) -> `Ok(())` with a stderr
@@ -1093,7 +1095,7 @@ fn verify_manifest_attestation_outcome(
 }
 
 /// Verifies that a fetched update-manifest body corresponds to an attested
-/// release build subject (REQ-001) before its bytes are parsed, called from
+/// release build subject before its bytes are parsed, called from
 /// [`fetch_update_manifest`] with the raw response bytes hashed first.
 ///
 /// Reuses [`fetch_attestation_bundles`] (the same function
@@ -2587,7 +2589,7 @@ mod tests {
 
     #[test]
     fn verify_manifest_attestation_outcome_rejects_tampered_bytes() {
-        // REQ-001: a fixture attestation bundle attests a specific subject
+        // A fixture attestation bundle attests a specific subject
         // digest. Tampered manifest bytes never hash to that digest, so
         // verification must fail closed before `fetch_update_manifest` ever
         // reaches `serde_json::from_slice`. Pure/offline: constructs the

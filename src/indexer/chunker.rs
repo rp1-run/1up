@@ -44,7 +44,7 @@ fn language_from_extension(ext: &str) -> String {
 /// Returns `Vec<ParsedSegment>` with `block_type` set to `"chunk"` and line numbers tracking
 /// each window position. The window advances by `window_size - overlap` lines on each step.
 ///
-/// REQ-005: Respects per-file segment cap (`MAX_SEGMENTS_PER_FILE`) to prevent unbounded
+/// Respects the per-file segment cap (`MAX_SEGMENTS_PER_FILE`) to prevent unbounded
 /// segment generation from pathological files. If segment count would exceed the cap,
 /// truncates at the cap and logs a warning; the excess content is not segmented.
 pub fn chunk_file(
@@ -71,7 +71,7 @@ pub fn chunk_file(
     let mut start = 0;
 
     while start < lines.len() {
-        // REQ-005: Stop generating segments if cap is reached.
+        // Stop generating segments if the cap is reached.
         if segments.len() >= MAX_SEGMENTS_PER_FILE {
             warn!(
                 "chunker capping segment generation at {} for file with extension .{}; \

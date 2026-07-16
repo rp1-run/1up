@@ -175,12 +175,12 @@ export interface WarmReadiness {
 /**
  * Establish real warm state for a copied workspace before the measured agent
  * starts. Runs an unconditional synchronous `1up index` (setup cost lives
- * outside every measured axis, REQ-001), then verifies readiness fail-closed
+ * outside every measured axis), then verifies readiness fail-closed
  * from `1up status -f json` counts.
  *
  * The gate consults only the current-context `indexed_files`/`total_segments`
  * counts and never the lifecycle/`index_status` string: a copied index reads
- * `"ready"` even when the current context has zero rows (HYP-001), so only the
+ * `"ready"` even when the current context has zero rows, so only the
  * counts prove the setup index produced a readable current-context index on the
  * current schema. Throws on verification failure.
  */
@@ -299,7 +299,7 @@ export default async function (
 
     // Warm suites: establish real ready state here, before the measured agent
     // starts, so it performs exactly one initial status check and never indexes
-    // inside the measurement loop (REQ-001).
+    // inside the measurement loop.
     const readiness = establishWarmReadiness(repoDir, homeDir);
     context.test.vars.WARM_READY = true;
     context.test.vars.WARM_INDEXED_FILES = readiness.indexedFiles;

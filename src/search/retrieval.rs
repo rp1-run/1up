@@ -229,7 +229,7 @@ pub(crate) async fn fetch_vector_candidates(
 
 /// Like [`fetch_vector_candidates`], but accepts a pre-computed per-context
 /// vector count so a caller that already knows it (the daemon caches it on
-/// `ProjectState`, invalidated on index swap — R-007) can skip the per-query
+/// `ProjectState`, invalidated on index swap) can skip the per-query
 /// `COUNT(*)`. The cached count MUST equal the live `COUNT(*)` for the open
 /// index, so path selection (`vector_search_path_for_corpus`) is identical to
 /// the live-count path; passing `None` falls back to the live count.
@@ -246,7 +246,7 @@ pub(crate) async fn fetch_vector_candidates_with_count(
     // bypassing both the ANN index and the count-based path selection below:
     // `vector_top_k` applies the path filter only after truncating to its
     // top-K budget, which would starve out in-scope results that did not
-    // survive that truncation (design decision, REQ-001).
+    // survive that truncation (design decision).
     let (path, vector_count) = if scope.path_prefix().is_some() {
         (VectorSearchPath::ExhaustiveScan, None)
     } else {
@@ -1066,9 +1066,9 @@ mod tests {
         assert_eq!(candidates.len(), 10);
     }
 
-    // TDD (REQ-006 / T6 AC2): a cached per-context vector count threaded into
+    // TDD: a cached per-context vector count threaded into
     // the vector stage MUST select the same path and return byte-identical
-    // candidates as the live `COUNT(*)`. This pins R-007's "cached count is a
+    // candidates as the live `COUNT(*)`. This pins the "cached count is a
     // pure optimization, never a behavior change" contract: the daemon caches
     // the count on `ProjectState` and the served results must not depend on
     // whether the count came from the cache or a live query.
@@ -1143,15 +1143,16 @@ mod tests {
         assert_eq!(candidates[0].segment_id, "seg-3");
     }
 
-    // TDD (REQ-003 / T5 AC2+AC3): under pooling, the ANN `vector_top_k` returns
+    // TDD: under pooling, the ANN `vector_top_k` returns
     // one row per distinct pool vector, so the query must fan out to every
-    // `segment_vectors` reference sharing that `content_key` (AC2). This is the
+    // `segment_vectors` reference sharing that `content_key`. This is the
     // discriminating assertion — a missing/wrong fan-out join yields the wrong
     // rows (verified: it returns 2 unrelated rows instead of all 5). The expected
     // ascending-id ordering documents the `ORDER BY v.rank, s.id` tiebreak
-    // contract (AC3); it guarantees determinism independent of query plan even
+    // contract; it guarantees determinism independent of query plan even
     // though the current libSQL plan already scans `segment_vectors` by its
-    // segment-id PK. The full pre/post search-identical guard runs in T7.
+    // segment-id PK. The full pre/post search-identical guard is covered
+    // separately.
     #[tokio::test]
     async fn ann_path_fans_out_shared_pool_row_with_deterministic_tiebreak() {
         let conn = setup().await;
@@ -1243,7 +1244,7 @@ mod tests {
         assert_eq!(candidates[0].segment_id, "seg-active");
     }
 
-    // TDD (REQ-001 AC2 / T5): the exhaustive vector path must apply the
+    // TDD: the exhaustive vector path must apply the
     // `path_prefix` directory-boundary filter so `src/foo` matches itself and
     // its descendants but not a sibling directory that merely shares the
     // prefix as a string (`src/foobar`).
@@ -1293,7 +1294,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
     }
 
-    // TDD (REQ-001 AC2 / T5): scoped vector search must force the exhaustive
+    // TDD: scoped vector search must force the exhaustive
     // scan and bypass count-based path selection entirely, even when the
     // (cached or live) vector count is above `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`.
     // Before this fix, a large count routed to `vector_top_k`, which has no
@@ -1338,7 +1339,7 @@ mod tests {
         assert_eq!(candidates[0].segment_id, "seg-in-scope");
     }
 
-    // TDD (REQ-001 AC1 / T5): the FTS candidate query must apply the same
+    // TDD: the FTS candidate query must apply the same
     // directory-boundary `path_prefix` filter as the vector stage.
     #[tokio::test]
     async fn fts_candidates_respect_path_prefix_boundary() {
@@ -1374,7 +1375,7 @@ mod tests {
         );
     }
 
-    // TDD (REQ-001 AC4 / T5): an unset `path_prefix` must leave full-repo
+    // TDD: an unset `path_prefix` must leave full-repo
     // search behavior unchanged.
     #[tokio::test]
     async fn no_path_prefix_leaves_full_repo_behavior_unchanged() {

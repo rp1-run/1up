@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS segment_vectors (
     content_key TEXT NOT NULL
 )";
 
-/// Secondary index on `segment_vectors.content_key` (R-010). The ANN fan-out
+/// Secondary index on `segment_vectors.content_key`. The ANN fan-out
 /// query joins `segment_vectors AS sv ON sv.content_key = p.content_key` to map a
 /// pooled `embedding_pool` row back to every referencing segment; the reverse
 /// `content_key -> segment_id` direction has no covering index otherwise
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS segment_relations (
 )";
 
 pub const CREATE_INDEX_EMBEDDING_POOL_EMBEDDING: &str =
-    "/* KEEP: max_neighbors=32 caps DiskANN fanout for REQ-001 (<=80 MiB); default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_embedding_pool_embedding ON embedding_pool (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
+    "/* KEEP: max_neighbors=32 caps DiskANN fanout to hold the <=80 MiB index-size budget; default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_embedding_pool_embedding ON embedding_pool (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(context_id, canonical_symbol, reference_kind)";
@@ -329,7 +329,7 @@ small-corpus latency fix showed spending seconds in read-heavy graph walks.
 The `segment_vectors -> embedding_pool` join is 1:1 (each reference names exactly
 one pool row), so the candidate row set, the `vector_distance_cos` values, and the
 `ORDER BY ..., s.id` ordering are byte-for-byte identical to the pre-pooling inline
-column (HYP-001 CONFIRMED) — the vector bytes simply moved into the shared pool. */
+column (confirmed by measurement) — the vector bytes simply moved into the shared pool. */
 pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
@@ -341,8 +341,8 @@ WHERE s.context_id = ?2
 ORDER BY vector_distance_cos(p.embedding_vec, vector8(?1)), s.id
 LIMIT ?3";
 
-/// Path-prefix-scoped sibling of [`SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`]
-/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// Path-prefix-scoped sibling of [`SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`]:
+/// `?4` is the bound `LIKE` pattern built by
 /// `SearchScope::path_prefix_like_pattern`. Scoped vector search is always
 /// forced onto this exhaustive path (never `vector_top_k`) so the prefix
 /// filter cannot starve out results the ANN path would otherwise truncate
@@ -381,8 +381,8 @@ WHERE segments_fts MATCH ?1
 ORDER BY f.rank, s.rowid
 LIMIT ?3";
 
-/// Path-prefix-scoped sibling of [`SELECT_FTS_CANDIDATES_FOR_CONTEXT`]
-/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// Path-prefix-scoped sibling of [`SELECT_FTS_CANDIDATES_FOR_CONTEXT`]:
+/// `?4` is the bound `LIKE` pattern built by
 /// `SearchScope::path_prefix_like_pattern`.
 pub const SELECT_FTS_CANDIDATES_FOR_CONTEXT_SCOPED: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
@@ -432,15 +432,15 @@ ON CONFLICT(id) DO UPDATE SET
 /// Prefix for a batched existence check against `embedding_pool`. The caller
 /// appends a comma-separated `?n` placeholder list (one per content key) and a
 /// closing `)`. The lookup-before-embed pipeline uses this to find which keys
-/// are already stored so it can embed only the misses (REQ-002).
+/// are already stored so it can embed only the misses.
 pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
     "SELECT content_key FROM embedding_pool WHERE content_key IN (";
 
 /// Idempotent insert of a shared pool vector. The vector bytes for a given
 /// `content_key` are a deterministic function of (model, content), so a key
 /// already present is left untouched (`DO NOTHING`) rather than rewritten —
-/// avoiding needless churn in the DiskANN index shadow tables. Concurrency-safe
-/// (REQ-001): two writers inserting the same new content collapse to one row.
+/// avoiding needless churn in the DiskANN index shadow tables. Concurrency-safe:
+/// two writers inserting the same new content collapse to one row.
 /// `ref_count` is reconciled separately (incremented on the `segment_vectors`
 /// write, decremented by the `segments_vector_ad` AFTER DELETE trigger).
 pub const UPSERT_EMBEDDING_POOL: &str = "
@@ -454,7 +454,7 @@ ON CONFLICT(content_key) DO NOTHING";
 pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
     "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
 
-/// Bulk form of [`INCREMENT_EMBEDDING_POOL_REF_COUNT`] (R-011): apply every
+/// Bulk form of [`INCREMENT_EMBEDDING_POOL_REF_COUNT`]: apply every
 /// distinct key's increment from one write batch in a single statement instead
 /// of one `UPDATE` per key. `?1` is a JSON object mapping each `content_key` to
 /// the number of new referencing rows (e.g. `{"<key>": 2}`); `json_each` expands
@@ -479,7 +479,7 @@ UPDATE embedding_pool
    SET ref_count = ref_count - 1
  WHERE content_key = (SELECT content_key FROM segment_vectors WHERE segment_id = ?1)";
 
-/// Reference-aware garbage collection of the shared pool (REQ-004). The
+/// Reference-aware garbage collection of the shared pool. The
 /// `segments_vector_ad` trigger decrements `ref_count` as segments are deleted
 /// but never removes a pool row, so a vector whose last referencer is gone
 /// lingers as a zero-ref orphan. `delete_context` runs this sweep after its
@@ -488,7 +488,7 @@ UPDATE embedding_pool
 /// correctly maintained count never goes negative, but any row at or below zero
 /// is unreferenced and safe to delete. Pool rows still referenced by another
 /// context keep `ref_count >= 1`, so this never touches a live vector — the
-/// per-context isolation guarantee (REQ-005).
+/// per-context isolation guarantee.
 pub const DELETE_ORPHANED_EMBEDDING_POOL_ROWS: &str =
     "DELETE FROM embedding_pool WHERE ref_count <= 0";
 
@@ -951,7 +951,7 @@ WHERE context_id = ?1
 ORDER BY id
 LIMIT 5";
 
-/// Id-only candidate fetch for the unique-prefix handle recovery gate (T1):
+/// Id-only candidate fetch for the unique-prefix handle recovery gate:
 /// every segment id sharing a floor prefix within one context, ordered
 /// deterministically and bounded by a caller-supplied limit. Selecting only the
 /// id keeps the recovery candidate scan cheap; the caller re-fetches the full
@@ -968,7 +968,7 @@ LIMIT ?3";
 /// Build the exact-id batch-fetch statement for `id_count` segment ids within
 /// one context. Selects the same columns in the same order as
 /// [`SELECT_SEGMENT_BY_ID_FOR_CONTEXT`], so a batched fetch returns rows
-/// byte-identical to issuing `id_count` individual id lookups (R-013).
+/// byte-identical to issuing `id_count` individual id lookups.
 /// Params: `?1` context id, `?2..?(id_count + 1)` segment ids.
 pub fn select_segments_by_ids_for_context_sql(id_count: usize) -> String {
     let mut id_placeholders = String::new();
@@ -1073,8 +1073,8 @@ ORDER BY
   s.line_start,
   ss.symbol";
 
-/// Path-prefix-scoped sibling of [`SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`]
-/// (REQ-001): `?4` is the bound `LIKE` pattern built by
+/// Path-prefix-scoped sibling of [`SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT`]:
+/// `?4` is the bound `LIKE` pattern built by
 /// `SearchScope::path_prefix_like_pattern`.
 pub const SELECT_SYMBOL_MATCHES_BY_CANONICAL_FOR_CONTEXT_SCOPED: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type, s.content,
@@ -1100,11 +1100,11 @@ ORDER BY
 /// canonical come back in the same relative order a single-canonical lookup
 /// would return; the trailing `ss.canonical_symbol` column lets the caller
 /// regroup rows per canonical and replay the per-canonical iteration order and
-/// dedup of the per-item path (R-013).
+/// dedup of the per-item path.
 /// Params: `?1` context id, `?2` reference kind,
 /// `?3..?(canonical_count + 2)` canonical symbols, and when `path_scoped` is
 /// `true` a trailing `?(canonical_count + 3)` bound `LIKE` pattern built by
-/// `SearchScope::path_prefix_like_pattern` (REQ-001).
+/// `SearchScope::path_prefix_like_pattern`.
 pub fn select_symbol_matches_by_canonicals_for_context_sql(
     canonical_count: usize,
     path_scoped: bool,
@@ -1339,12 +1339,12 @@ pub const POOL_CHUNK_SIZE: usize = SQLITE_MAX_PARAMS / POOL_INSERT_COLS;
 // qualifying roles, edge/block compatibility), so those fragments are defined
 // once below and the full statements are composed from them.
 //
-// HARD CONSTRAINT (design D16): every per-key or per-pair predicate is
+// HARD CONSTRAINT: every per-key or per-pair predicate is
 // pre-aggregated in a CTE grouped by the symbol key and equi-joined to the
 // relation scan. Correlated per-row subqueries or EXISTS probes against
-// `segment_symbols`/`segments` are prohibited: HYP-001 v2 measured identical
-// predicates at 0.19-0.44s in this form versus 183.8s (~400x) correlated on
-// an 81k-relation index.
+// `segment_symbols`/`segments` are prohibited: a measured experiment showed
+// identical predicates at 0.19-0.44s in this form versus 183.8s (~400x)
+// correlated on an 81k-relation index.
 
 /// Module key used for files that live directly in the repository root.
 pub const OVERVIEW_ROOT_MODULE_KEY: &str = "(root)";
@@ -1352,13 +1352,13 @@ pub const OVERVIEW_ROOT_MODULE_KEY: &str = "(root)";
 /// Relation rows that carry usable target identity for aggregate ranking.
 /// `method_receiver`/`member_access` rows are excluded: their identity is only
 /// derivable through per-pair owner alignment, which a bounded aggregate
-/// cannot compute (design D13).
+/// cannot compute.
 pub const OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL: &str =
     "('bare_identifier', 'qualified_path', 'constructor_like', 'macro_like')";
 
 /// Qualifying definition kinds for overview ranking: type definitions only,
-/// the shipped Branch B policy (HYP-001 v3 verdict, design D19 documented
-/// REQ-003 downscope).
+/// the shipped Branch B policy (a measured verdict; the type-definitions-only
+/// downscope is a documented decision).
 pub const OVERVIEW_QUALIFYING_TYPE_KINDS_SQL: &str =
     "('struct', 'enum', 'trait', 'class', 'interface')";
 
@@ -1386,7 +1386,7 @@ CASE r.edge_identity_kind
   END = 1";
 
 /// Pre-aggregated qualifying definition CTE body: one row per symbol key with
-/// its qualifying definition count and edge-compatibility flags (D16 shape).
+/// its qualifying definition count and edge-compatibility flags.
 fn overview_qualifying_definitions_cte_sql() -> String {
     format!(
         "SELECT ss.canonical_symbol AS symbol_key,
@@ -1478,7 +1478,7 @@ LIMIT ?3",
 
 /// Overview symbol ranking: distinct referencing source files per symbol key
 /// over identity-bearing relation rows equi-joined to the pre-aggregated
-/// qualifying definition CTE (D16). The per-key 1..=3 ambiguity rule is
+/// qualifying definition CTE. The per-key 1..=3 ambiguity rule is
 /// applied by the overview engine after Rust-side path exclusions, so this
 /// statement reports `definition_count` instead of capping on it.
 /// Params: `?1` context id, `?2` row limit (oversample).
@@ -1508,7 +1508,7 @@ LIMIT ?2",
 
 /// Directed depth-2 module dependency pairs sharing the symbol-ranking filter
 /// stack plus the SQL-side per-key qualifying-definition-count cap of 1..=3
-/// (design D18; counted pre-exclusion, a documented divergence from the
+/// (counted pre-exclusion, a documented divergence from the
 /// top-symbols rule). Each pair counts distinct (referencing file, symbol
 /// key) combinations; self-edge dropping and test/low-signal target exclusion
 /// happen in the overview engine rollup.

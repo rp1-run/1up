@@ -11,7 +11,7 @@
 //! precondition for the later atomic rename — a staged database that still
 //! carried a live, header-compatible WAL would, once renamed over the served
 //! index, leave an orphan WAL that SQLite replays silently and that even
-//! `PRAGMA integrity_check` reports as "ok" (HYP-001).
+//! `PRAGMA integrity_check` reports as "ok".
 
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -33,8 +33,7 @@ use crate::storage::{queries, schema};
 /// `index.db`. The served index is never torn down before that switch, so a reader
 /// keeps seeing the full prior index throughout the rebuild and a single rename
 /// flips it to the full new index — and a rebuild that fails, is cancelled, or
-/// panics before the switch leaves the prior `index.db` intact and served
-/// (REQ-001 AC3).
+/// panics before the switch leaves the prior `index.db` intact and served.
 ///
 /// On drop the staging file is best-effort removed so an aborted rebuild leaves no
 /// orphan behind; after a successful switch the file was already renamed away, so
@@ -67,8 +66,8 @@ impl StagingRebuild {
         // Defer the `idx_embedding_pool_embedding` DiskANN build: on a cold full
         // rebuild every pool row is known up front, so building the graph once after
         // the pool is loaded (in `finalize_and_swap`) is far cheaper than the
-        // incremental per-insert maintenance the index does when it already exists
-        // (R-006). The staging schema is therefore intentionally incomplete until the
+        // incremental per-insert maintenance the index does when it already exists.
+        // The staging schema is therefore intentionally incomplete until the
         // deferred build runs; the served `index.db` only ever appears via the swap,
         // which happens strictly after that build.
         schema::initialize_with_vector_index(&conn, schema::VectorIndexBuild::Deferred).await?;
@@ -100,7 +99,7 @@ impl StagingRebuild {
     /// swap on a swap failure, otherwise by this guard's `Drop`).
     pub async fn finalize_and_swap(mut self) -> Result<(), OneupError> {
         // Build the deferred DiskANN vector index now that the pool is fully loaded,
-        // before releasing the connection (R-006). This is the after-pool-load,
+        // before releasing the connection. This is the after-pool-load,
         // before-finalize hook: every `embedding_pool` row inserted by the rebuild
         // pipeline is present, so the graph is built once over the full pool instead
         // of being maintained per insert. It completes the deferred schema so the
@@ -188,7 +187,7 @@ pub async fn finalize_staged_db(db: Db, staging_path: &Path) -> Result<(), Oneup
 /// The prior `index.db` may carry a header-compatible `-wal`/`-shm` pair. If such
 /// an orphan WAL were left next to the freshly-renamed `index.db`, SQLite would
 /// silently replay it and serve stale data that even `PRAGMA integrity_check`
-/// reports as "ok" (HYP-001). The prior sidecars are therefore retired *before*
+/// reports as "ok". The prior sidecars are therefore retired *before*
 /// the rename — folding the prior WAL into the prior `index.db` and dropping every
 /// handle so SQLite removes the now-empty sidecars (SQLite's sanctioned
 /// open-then-immediately-close idiom, reusing [`finalize_staged_db`]), never a raw
@@ -201,7 +200,7 @@ pub async fn finalize_staged_db(db: Db, staging_path: &Path) -> Result<(), Oneup
 /// # Preconditions and failure behavior
 ///
 /// MUST be called while the single-writer `RebuildLock` is held (and, for the
-/// daemon, while its long-lived handle is quiesced — HYP-002) so no other writer
+/// daemon, while its long-lived handle is quiesced) so no other writer
 /// races the switch; this is debug-asserted on platforms with a real advisory
 /// lock. On any failure before the rename the prior `index.db` is left intact and
 /// queryable and the staging file is best-effort removed (mirroring
@@ -268,9 +267,9 @@ pub async fn swap_index_into_place(
 /// fail. `PASSIVE` never waits on readers. This stays correct because the only
 /// orphan WAL that replays *silently* against the new inode is a header-compatible
 /// one carrying committed frames, which only a writer produces — and writers are
-/// excluded here by the held `RebuildLock` (and the daemon's quiesced handle,
-/// HYP-002). A reader's WAL carries no committed frames and is not replayed
-/// (HYP-001), so leaving a reader's transient sidecar behind is harmless; what
+/// excluded here by the held `RebuildLock` (and the daemon's quiesced handle).
+/// A reader's WAL carries no committed frames and is not replayed
+/// (verified by experiment), so leaving a reader's transient sidecar behind is harmless; what
 /// matters is that no writer-produced WAL survives, which holds because none can be
 /// produced during the swap.
 async fn retire_prior_index_sidecars(index_path: &Path) -> Result<(), OneupError> {
@@ -379,7 +378,7 @@ async fn checkpoint_truncate_once(conn: &Connection) -> Result<bool, libsql::Err
 ///
 /// A `wal_checkpoint(TRUNCATE)` followed by dropping all handles should leave the
 /// `-wal` sidecar either absent or zero-length. A non-empty `-wal` is the exact
-/// HYP-001 hazard (a header-compatible orphan WAL the rename would carry over and
+/// silent-replay hazard (a header-compatible orphan WAL the rename would carry over and
 /// SQLite would silently replay), so it is rejected here rather than swapped.
 fn ensure_no_live_wal(staging_path: &Path) -> Result<(), OneupError> {
     let wal_path = wal_sidecar_path(staging_path);
@@ -619,7 +618,7 @@ mod tests {
         let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
         swap_index_into_place(&root, &staging).await.unwrap();
 
-        // The switch left no pre-swap sidecars (HYP-001: a header-compatible orphan
+        // The switch left no pre-swap sidecars (a header-compatible orphan
         // WAL would replay silently), checked before any reader opens the new inode.
         assert_no_sidecars(&index_path);
         // Reads observe the full NEW generation, not the old one.
@@ -812,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_staging_rebuild_leaves_prior_index_intact_and_no_orphan() {
-        // REQ-001 AC3: a rebuild interrupted/cancelled before the switch-over must
+        // A rebuild interrupted/cancelled before the switch-over must
         // leave the prior `index.db` intact and served, and leave no orphan staging
         // file. Dropping the guard without `finalize_and_swap` is the build-aside
         // equivalent of a failed/cancelled rebuild before the switch.
@@ -848,7 +847,7 @@ mod tests {
         );
     }
 
-    /// R-006 / HYP-002 acceptance: a cold rebuild that *defers* the DiskANN build
+    /// Deferred-build acceptance: a cold rebuild that *defers* the DiskANN build
     /// (the `StagingRebuild` path) serves byte-identical ranked results to one that
     /// builds the index incrementally/immediately, and the served read path is the
     /// exact `vector_distance_cos` scan at this corpus size (well below

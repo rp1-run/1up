@@ -163,7 +163,7 @@ describe("establishWarmReadiness", () => {
     }
   });
 
-  test("throws fail-closed on zero counts even when the status string reads ready (HYP-001)", () => {
+  test("throws fail-closed on zero counts even when the status string reads ready", () => {
     const root = mkdtempSync(join(tmpdir(), "1up-warm-ready-hyp001-"));
     roots.push(root);
     const repo = join(root, "emdash");

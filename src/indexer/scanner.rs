@@ -96,7 +96,7 @@ pub fn is_scannable_file(path: &Path) -> bool {
 ///
 /// `DEFAULT_IGNORE_DIRS` stays a negations-only `OverrideBuilder` (no
 /// positive whitelist glob), avoiding the `ignore::OverrideBuilder` whitelist
-/// pitfall (HYP-001). Dotfile pruning is disabled at the walker level
+/// pitfall. Dotfile pruning is disabled at the walker level
 /// (`.hidden(false)`) because `ScanFilter` — applied by callers via
 /// `filter_entry` — owns the full dotfile decision so a configured
 /// dotfile-directory override can re-admit specific hidden directories.

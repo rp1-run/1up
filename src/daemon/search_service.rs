@@ -424,7 +424,7 @@ mod tests {
         assert!(results.is_none());
     }
 
-    /// REQ-001: the daemon `SearchRequest` frame must carry `path_prefix` end
+    /// The daemon `SearchRequest` frame must carry `path_prefix` end
     /// to end over the IPC socket — the daemon path silently dropping it would
     /// return unfiltered full-repo results despite the CLI/MCP request asking
     /// for a scoped search.
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(request.path_prefix, None);
     }
 
-    /// REQ-001: an empty-after-trim `path_prefix` sanitizes to `None`, matching
+    /// An empty-after-trim `path_prefix` sanitizes to `None`, matching
     /// `SearchScope::with_path_prefix`'s own empty-clears-scoping semantics so
     /// the two layers never disagree about what "no prefix" means.
     #[test]
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(request.path_prefix, None);
     }
 
-    /// REQ-001: a non-blank `path_prefix` survives sanitization (trimmed but
+    /// A non-blank `path_prefix` survives sanitization (trimmed but
     /// otherwise preserved) so the daemon worker receives it unmangled.
     #[test]
     fn sanitize_request_trims_path_prefix() {

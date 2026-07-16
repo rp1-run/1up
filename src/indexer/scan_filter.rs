@@ -10,7 +10,7 @@ use crate::shared::errors::{IndexingError, OneupError};
 /// between the three consumers.
 ///
 /// Precedence (highest to lowest): secret pattern (non-overridable) >
-/// scope_globs (exclusive cone, only when scoped — the REQ-001/REQ-002 cost
+/// scope_globs (exclusive cone, only when scoped — the scoped-indexing cost
 /// boundary, which configured includes must not punch through) > configured
 /// include glob or dotfile-directory override > configured user exclude glob >
 /// default dotfile/dot-directory hiding > include by default.
@@ -110,7 +110,7 @@ impl ScanFilter {
             return true;
         }
         // Scope filtering runs BEFORE include/override: the scope cone is the
-        // feature's cost boundary (REQ-001/REQ-002), so a configured include
+        // feature's cost boundary, so a configured include
         // glob or override dir must not pull out-of-cone files into a scoped
         // index. Directories always descend so in-cone files stay reachable.
         if !self.scope_globs.is_empty() && !is_dir && !glob_matches(&self.scope_globs, rel_path) {
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn scope_cone_excludes_out_of_scope_file_despite_include_glob() {
-        // REQ-001/REQ-002: the scope cone is the cost boundary; a configured
+        // The scope cone is the cost boundary; a configured
         // include glob must not pull out-of-cone files into a scoped index.
         let f = scoped_filter(&["**/*.ts"], &[], &["services/**"]);
         assert!(f.is_excluded(Path::new("web/app.ts"), false));
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn secret_pattern_excluded_regardless_of_include_glob() {
-        // REQ-004: Secret exclusion glob expansion. Verify all patterns from
+        // Secret exclusion glob expansion. Verify all patterns from
         // DEFAULT_SECRET_GLOBS are excluded even when include glob is "*".
         let f = filter(&["*"], &[], &[]);
         // Original 4 patterns
@@ -188,7 +188,7 @@ mod tests {
         assert!(f.is_excluded(Path::new("service.key"), false));
         assert!(f.is_excluded(Path::new(".env"), false));
         assert!(f.is_excluded(Path::new("config/.env"), false));
-        // Expanded patterns (REQ-004)
+        // Expanded patterns
         assert!(f.is_excluded(Path::new("gcp-service-account.json"), false));
         assert!(f.is_excluded(Path::new("service-account-key.json"), false));
         assert!(f.is_excluded(Path::new("secrets.yaml"), false));

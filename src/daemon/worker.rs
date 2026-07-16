@@ -84,20 +84,20 @@ struct ProjectState {
     db: Db,
     /// Identity (device, inode) of the `index.db` file backing `db` at the time
     /// `db` was opened. A one-shot rebuild swaps the index via an atomic rename
-    /// onto a fresh inode (T2), so a mismatch between this and the current
+    /// onto a fresh inode, so a mismatch between this and the current
     /// on-disk identity means the daemon's long-lived handle now points at the
-    /// orphaned pre-swap inode and must be reopened before any pass touches it
-    /// (HYP-002). `None` when the index was absent when `db` was opened.
+    /// orphaned pre-swap inode and must be reopened before any pass touches it.
+    /// `None` when the index was absent when `db` was opened.
     index_identity: Option<IndexFileIdentity>,
-    /// Cached per-context vector `COUNT(*)` for the open index (R-007), populated
+    /// Cached per-context vector `COUNT(*)` for the open index, populated
     /// lazily on the first search that needs it and reused across requests so the
     /// hot path skips a per-query `COUNT(*)`. MUST be invalidated (`None`) on
     /// `reopen_if_index_swapped` so a build-aside swap never serves a stale count
     /// into `vector_search_path_for_corpus` (exhaustive-vs-ANN) path selection.
     cached_vector_count: Option<usize>,
     /// One reused tuned read [`Connection`] to the open index, serving repeated
-    /// daemon searches without a fresh per-request `connect()` + PRAGMA pass
-    /// (R-008). Created lazily on the first search and dropped (`None`) whenever
+    /// daemon searches without a fresh per-request `connect()` + PRAGMA pass.
+    /// Created lazily on the first search and dropped (`None`) whenever
     /// the backing `db` is reopened on a build-aside swap
     /// (`reopen_if_index_swapped`), so a reused connection can never outlive the
     /// inode it was opened against and serve through an orphaned pre-swap handle.
@@ -116,8 +116,8 @@ struct ProjectState {
 }
 
 /// On-disk identity of an `index.db` file, used to detect a build-aside swap
-/// performed by another process (the one-shot rebuild owners — T4). On Unix the
-/// atomic rename that switches the index over (T2) replaces the directory entry
+/// performed by another process (the one-shot rebuild owners). On Unix the
+/// atomic rename that switches the index over replaces the directory entry
 /// with a different inode, so `(device, inode)` changes exactly when the file the
 /// daemon's open handle refers to has been orphaned. `worker.rs` is compiled only
 /// on Unix (`mod.rs` routes non-Unix to `worker_stub.rs`), so the Unix-specific
@@ -165,7 +165,7 @@ pub async fn run() -> Result<(), OneupError> {
 async fn run_inner() -> Result<(), OneupError> {
     info!("daemon worker starting (pid={})", std::process::id());
 
-    // REQ-011 note: the daemon must NOT die with its launcher — `1up start`
+    // Note: the daemon must NOT die with its launcher — `1up start`
     // exits immediately by design and the daemon lifecycle tests require
     // persistence. Orphan control is handled by SIGTERM responsiveness
     // (handler below), idle shutdown, and stale-state reconciliation.
@@ -532,8 +532,8 @@ async fn load_and_watch_projects(
 
 /// Prewarm every loaded project's embedding runtime immediately after
 /// [`load_and_watch_projects`] so the first real search finds a `Warm` runtime
-/// instead of paying a cold model load past the daemon's search deadline
-/// (REQ-004 D). Mirrors the search path's own `prepare_for_search` call
+/// instead of paying a cold model load past the daemon's search deadline.
+/// Mirrors the search path's own `prepare_for_search` call
 /// (`handle_search_request`) rather than the indexing path's
 /// `prepare_for_indexing`, since prewarming is not itself an indexing pass and
 /// must not trigger a model download — a project with no model available yet
@@ -854,7 +854,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
     }
     // Record the inode the handle now refers to so a later build-aside swap (a
     // one-shot rebuild atomically renaming a fresh index over `index.db`) is
-    // detectable and the handle gets reopened before it writes (HYP-002).
+    // detectable and the handle gets reopened before it writes.
     let index_identity = index_file_identity(&db_path);
 
     Ok(Some(ProjectState {
@@ -880,7 +880,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
 /// On-disk `(device, inode)` identity of an `index.db` file, or `None` when the
 /// file is absent or cannot be stat'd. Two opens of the same path yield the same
 /// identity until an atomic rename swaps a different file over it, which is
-/// exactly how the build-aside switch-over (T2) installs a refreshed index.
+/// exactly how the build-aside switch-over installs a refreshed index.
 fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(index_path)
@@ -892,11 +892,11 @@ fn index_file_identity(index_path: &Path) -> Option<IndexFileIdentity> {
 /// swapped `index.db` onto a fresh inode since the handle was opened.
 ///
 /// The daemon is the sole cross-process holder of a long-lived RW handle to
-/// `index.db`. A one-shot rebuild (CLI `reindex` / MCP `run_index` — T4) builds a
-/// refreshed index aside and atomically renames it over `index.db` (T2), which
+/// `index.db`. A one-shot rebuild (CLI `reindex` / MCP `run_index`) builds a
+/// refreshed index aside and atomically renames it over `index.db`, which
 /// orphans the inode the daemon's handle still refers to. Continuing to use that
 /// stale handle is a data-divergence hazard, not merely a stale read: a write
-/// through it lands in the now-unlinked old inode and is silently lost (HYP-002).
+/// through it lands in the now-unlinked old inode and is silently lost.
 ///
 /// This compares the recorded open-time identity against the current on-disk
 /// identity. On a match (the common case — no swap) it is a cheap no-op that
@@ -938,12 +938,12 @@ async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupEr
     state.index_identity = current_identity;
     // Drop the reused read connection: it (and its cached prepared statements)
     // was bound to the pre-swap `db`/inode, so it must be reopened against the
-    // freshly-adopted index before the next search (R-008). The next search
+    // freshly-adopted index before the next search. The next search
     // lazily re-creates it via `connect_tuned`, which re-runs the read PRAGMA
     // profile on the new handle.
     state.read_conn = None;
     // The swapped-in index has its own vector population; drop the cached count
-    // so the next search recomputes it against the refreshed index (R-007). A
+    // so the next search recomputes it against the refreshed index. A
     // stale count here could flip `vector_search_path_for_corpus` between the
     // exhaustive scan and the ANN path and silently change served candidates.
     state.cached_vector_count = None;
@@ -951,7 +951,7 @@ async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupEr
 }
 
 /// Return the daemon's reused tuned read connection for `state`, creating it on
-/// first use (R-008).
+/// first use.
 ///
 /// Repeated daemon searches share one [`Connection`] (and its libSQL prepared-
 /// statement cache) instead of opening a fresh connection and re-running the read
@@ -1423,7 +1423,7 @@ async fn run_dirty_projects_until_clean(
     }
 }
 
-/// REQ-013: Persist carried scope to the progress file so the new context's
+/// Persist carried scope to the progress file so the new context's
 /// rebuild applies the scope from the prior context. This is an interim guard
 /// rail; v1.1 will implement per-cone drift tracking and full branch-context
 /// retention.
@@ -1521,7 +1521,7 @@ fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut Project
         let new_context_id = current_context.context_id.clone();
         let old_source_root = state.source_root.clone();
 
-        // REQ-013: Scope carry on branch switch. If the old context was scoped,
+        // Scope carry on branch switch. If the old context was scoped,
         // document the scope so the new context can inherit it and avoid rebuild
         // multiplication. This is an interim guard rail; v1.1 will implement
         // per-cone drift tracking and full branch-context retention.
@@ -1548,7 +1548,7 @@ fn mark_branch_context_changes(watcher: &mut FileWatcher, projects: &mut Project
                 RunScope::Full,
                 Some("branch_context_changed".to_string()),
             );
-            // REQ-013: If prior context had scope, carry it to prevent rebuild multiplication
+            // If prior context had scope, carry it to prevent rebuild multiplication
             if let Some(scope_info) = prior_scope {
                 info!(
                     "Carrying scope from prior branch context to {} (interim guard rail for v1.1 per-cone drift)",
@@ -1593,14 +1593,14 @@ fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
 /// Run `unit` to completion, servicing queued daemon search requests as they
 /// arrive in the meantime.
 ///
-/// HYP-002 (CONFIRMED): a refresh sweep's per-project pass can run for
+/// Confirmed hazard: a refresh sweep's per-project pass can run for
 /// seconds — far past `DAEMON_READ_TIMEOUT_MS` — so yielding only at project
 /// boundaries is insufficient; a search queued while `unit` is still pending
 /// must be served without waiting for `unit` to finish. Each iteration polls
 /// `unit` and the search-request channel together: whichever is ready first
 /// wins, and if a request wins, `unit` simply gets re-polled (resuming
 /// exactly where it left off) on the next loop iteration. `handle_search_request`
-/// takes its own brief, per-call slice of `projects` (T8) rather than the
+/// takes its own brief, per-call slice of `projects` rather than the
 /// long-lived borrow `unit` may or may not hold, so a search for any OTHER
 /// project never contends with `unit`'s (potentially long) execution here.
 async fn run_unit_while_servicing_search<F: Future>(
@@ -1719,7 +1719,7 @@ async fn run_project(
             .expect("dirty project must exist while running");
         (state.project_root.clone(), !state.source_root.exists())
     };
-    // REQ-001: detect a deleted source root BEFORE attempting the rebuild lock.
+    // Detect a deleted source root BEFORE attempting the rebuild lock.
     // For a *linked* worktree the state_root (main repo, owns `.1up/`) can survive
     // while the source_root (the worktree) is deleted, so the lock — which is keyed
     // on state_root — would still acquire and the deleted-source cleanup below
@@ -1758,7 +1758,7 @@ async fn run_project(
     // the index onto a fresh inode, the daemon's long-lived handle now points at
     // the orphaned pre-swap inode; reopen it here — before `start_run` consumes
     // the pending scope and before any write — so this pass writes into the
-    // refreshed index, never the lost old one (HYP-002). Doing this before
+    // refreshed index, never the lost old one. Doing this before
     // `start_run` keeps the project dirty for a clean retry if the reopen fails.
     {
         let state = projects
@@ -1774,7 +1774,7 @@ async fn run_project(
         }
     }
 
-    // REQ-001: Gate check for first-time large monorepo indexing.
+    // Gate check for first-time large monorepo indexing.
     // Before starting a first index, check if file count is over threshold without scope.
     // If so, stay idle and let the MCP oneup_start path handle the gate.
     {
@@ -1866,7 +1866,7 @@ async fn run_project(
             let mut indexing_config =
                 config::resolve_indexing_config(None, None, state.indexing.as_ref())?;
 
-            // REQ-002: Daemon path must apply recorded scope identically to MCP path.
+            // Daemon path must apply recorded scope identically to MCP path.
             // Load scope from meta table and apply as scope_globs (the exclusive
             // scope filter) — include_globs only guarantee inclusion and never
             // exclude, so assigning them here would silently full-index a scoped
@@ -1934,7 +1934,7 @@ async fn run_project(
         }
     };
 
-    // REQ-013 EVIDENCE-BASED DECISION: Scope carries to new branch contexts.
+    // EVIDENCE-BASED DECISION: Scope carries to new branch contexts.
     //
     // DISPUTE SUMMARY: Two reviews disagreed about whether scope carried on branch
     // switch reaches the new context's rebuild:
@@ -1993,7 +1993,7 @@ async fn run_project(
 
     // Take the embedding runtime OUT of the map-borrowed state before the
     // (potentially multi-second) prepare+pipeline pass, so `projects` is never
-    // held across it (HYP-002/T8): a queued daemon search for ANY project runs
+    // held across it: a queued daemon search for ANY project runs
     // via `run_unit_while_servicing_search` below without contending with this
     // pass for the whole-map borrow. `EmbeddingRuntime` is cheap to move
     // (`Default`-backed cache), so this is a pointer-swap, not a reload.
@@ -2090,9 +2090,9 @@ async fn handle_search_request(
     }
 
     // Adopt a freshly-swapped index before serving: if a one-shot rebuild
-    // atomically switched `index.db` onto a new inode (T2), reopen the handle so
+    // atomically switched `index.db` onto a new inode, reopen the handle so
     // this search is served by the refreshed index automatically, with no manual
-    // step (REQ-002 AC3). The switch-over is atomic, so the handle always lands
+    // step. The switch-over is atomic, so the handle always lands
     // on a complete index — never a partial one. A reopen failure falls back to
     // the standard unavailable response (the CLI then searches locally) rather
     // than serving through the orphaned pre-swap handle.
@@ -2126,7 +2126,7 @@ async fn handle_search_request(
         }
     };
 
-    // Reuse one tuned read connection across requests (R-008). The schema is NOT
+    // Reuse one tuned read connection across requests. The schema is NOT
     // re-validated here: `ensure_current` is authoritative at index-open
     // (`load_project_state` -> `prepare_for_write`) and on every build-aside swap
     // (`reopen_if_index_swapped` -> `prepare_for_write`, called just above), and
@@ -2156,7 +2156,7 @@ async fn handle_search_request(
     };
 
     // Populate (once) and reuse the per-context vector count so the hot path
-    // skips a per-query `COUNT(*)` (R-007). The cache is invalidated on index
+    // skips a per-query `COUNT(*)`. The cache is invalidated on index
     // swap by `reopen_if_index_swapped`, so a populated value always reflects the
     // currently-open index. Only meaningful when embeddings exist.
     let cached_vector_count = if has_embeddings {
@@ -2182,7 +2182,7 @@ async fn handle_search_request(
 
     // This context's own embedding runtime is temporarily checked out by an
     // in-flight refresh sweep exactly while `last_refresh_state == Running`
-    // (`run_project`'s `std::mem::take`, HYP-002/T8): `Pending` (dirty but not
+    // (`run_project`'s `std::mem::take`): `Pending` (dirty but not
     // yet started) leaves the runtime untouched, so only `Running` must divert
     // away from it.
     let embedder_checked_out_by_sweep = state.last_refresh_state == DaemonRefreshState::Running;
@@ -2202,10 +2202,10 @@ async fn handle_search_request(
         engine.fts_only_search(&request.query, request.limit).await
     } else {
         // Take the embedding runtime OUT of the map-borrowed state so the
-        // heavy hybrid search below runs without holding `&mut projects`
-        // (HYP-002/T8): a concurrent refresh sweep for a DIFFERENT project
+        // heavy hybrid search below runs without holding `&mut projects`:
+        // a concurrent refresh sweep for a DIFFERENT project
         // never contends with this call for the whole-map borrow, and WAL's
-        // concurrent-reader semantics (HYP-001) make the shared connection
+        // concurrent-reader semantics make the shared connection
         // safe to use unlocked. Every exit path below restores it before
         // returning, so a warm model is never dropped.
         let mut embedding_runtime = std::mem::take(&mut state.embedding_runtime);
@@ -2217,7 +2217,7 @@ async fn handle_search_request(
                 }
                 // An invalid ONEUP_MODEL_VARIANT override is a hard config error,
                 // not a degrade: refuse the request rather than silently serving
-                // FTS-only results from the wrong (or no) variant (T1).
+                // FTS-only results from the wrong (or no) variant.
                 warn!(
                     "daemon search embedding preparation failed for {}: {err}",
                     request.project_root.display()
@@ -2436,7 +2436,7 @@ mod tests {
         assert_eq!(state.last_refresh_state, DaemonRefreshState::Pending);
     }
 
-    /// REQ-004 D / T9: `prewarm_project_embedders` runs once, right after
+    /// `prewarm_project_embedders` runs once, right after
     /// `load_and_watch_projects`, so a project's embedding runtime is already
     /// loaded before the first real search arrives. Modeled on
     /// `prepare_for_search_reuses_warm_runtime_when_model_is_unchanged`: proving
@@ -3060,7 +3060,7 @@ mod tests {
         ));
     }
 
-    /// HYP-002 (CONFIRMED) / T8: per-project-boundary yielding alone is
+    /// Confirmed hazard: per-project-boundary yielding alone is
     /// insufficient because a single project's refresh pass can run for
     /// seconds, far past `DAEMON_READ_TIMEOUT_MS` — the search path must be
     /// decoupled from the sweep's `&mut projects` borrow, not merely
@@ -3342,7 +3342,7 @@ mod tests {
         staging
     }
 
-    /// HYP-002 regression: after a one-shot rebuild swaps the index onto a fresh
+    /// Lost-write regression: after a one-shot rebuild swaps the index onto a fresh
     /// inode, the daemon's reopen gate must adopt the new inode so a subsequent
     /// write lands in the refreshed index and is durable — never silently lost
     /// into the orphaned pre-swap inode.
@@ -3383,7 +3383,7 @@ mod tests {
             "the reopened handle must read the swapped-in (new) generation"
         );
 
-        // Decisive HYP-002 guard: a write through the reopened handle is durable
+        // Decisive lost-write guard: a write through the reopened handle is durable
         // on the live inode. A stale handle would write into the orphaned old
         // inode and this independent on-disk read would still see only 3 rows.
         let conn = state.db.connect_tuned().await.unwrap();
@@ -3396,7 +3396,7 @@ mod tests {
         );
     }
 
-    /// REQ-006 / T6 AC3: the per-context vector-count cache on `ProjectState`
+    /// The per-context vector-count cache on `ProjectState`
     /// MUST be invalidated when a build-aside rebuild swaps the index. A stale
     /// count surviving the swap could flip `vector_search_path_for_corpus`
     /// between the exhaustive scan and the ANN path and silently change served
@@ -3426,7 +3426,7 @@ mod tests {
         );
     }
 
-    /// REQ-006 / T6 AC3 (no-swap arm): a no-op reopen (no swap) keeps the cached
+    /// No-swap arm: a no-op reopen (no swap) keeps the cached
     /// count untouched so steady-state searches reuse it and never re-`COUNT(*)`.
     #[cfg(unix)]
     #[tokio::test]
@@ -3497,7 +3497,7 @@ mod tests {
         staging
     }
 
-    /// T7 AC2 / REQ-007: hoisting `ensure_current` out of the per-request path is
+    /// Hoisting `ensure_current` out of the per-request path is
     /// sound only because every index (re)open re-runs it. A build-aside swap to
     /// an index whose schema this binary cannot serve MUST fail closed at the
     /// reopen gate (`reopen_if_index_swapped` -> `prepare_for_write` ->
@@ -3539,7 +3539,7 @@ mod tests {
         let _ = identity_before;
     }
 
-    /// T7 AC3 / REQ-007: repeated queries on the reused tuned read connection must
+    /// Repeated queries on the reused tuned read connection must
     /// return identical results to a fresh per-request connection. Seeds an index,
     /// then asserts that the same query run twice through `ensure_read_conn`'s
     /// reused handle matches the result from an independent fresh `connect_tuned`.
@@ -3677,7 +3677,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_project_continues_serving_other_projects_after_one_deleted() {
-        // REQ-001 acceptance: GIVEN a long-running daemon with multiple projects,
+        // Acceptance: GIVEN a long-running daemon with multiple projects,
         // WHEN one project is deleted, THEN the daemon continues to serve search
         // and watch other projects without degradation
         let tmp1 = tempfile::tempdir().unwrap();
@@ -3786,7 +3786,7 @@ mod tests {
 
     #[test]
     fn spawn_daemon_includes_source_root_in_command_for_diagnosability() {
-        // REQ-001 acceptance: GIVEN the worker process is handling a deleted directory,
+        // Acceptance: GIVEN the worker process is handling a deleted directory,
         // WHEN observing the process via ps/lsof, THEN the argv includes the project
         // path for diagnosability
         //

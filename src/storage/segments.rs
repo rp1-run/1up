@@ -78,9 +78,10 @@ pub struct SegmentInsert {
     /// segments and for runs with no active embedder. When `Some`, the pool-aware
     /// write path writes a `segment_vectors(segment_id, content_key)` reference
     /// and reconciles the pool `ref_count`.
-    // Transient: produced by the lookup-before-embed pipeline (T3) but not read
-    // until the pool-aware write path (T4) consumes it. Remove this attribute
-    // when T4 wires `content_key` into the `segment_vectors` write.
+    // Transient: produced by the lookup-before-embed pipeline but not read
+    // until the pool-aware write path consumes it. Remove this attribute
+    // when the pool-aware write path wires `content_key` into the
+    // `segment_vectors` write.
     #[allow(dead_code)]
     pub content_key: Option<String>,
     /// Serialized embedding vector for this segment, present only when the
@@ -269,7 +270,7 @@ async fn write_segment_vector_reference(
 ///
 /// The lookup-before-embed pipeline uses this to embed only genuinely new
 /// content: any key already present resolves to its shared vector instead of
-/// being re-embedded (REQ-002). The check is batched in `SQLITE_MAX_PARAMS`-sized
+/// being re-embedded. The check is batched in `SQLITE_MAX_PARAMS`-sized
 /// chunks so an arbitrarily large key set stays within the bound-parameter
 /// limit. Read-only: it never mutates the pool or `ref_count`.
 pub async fn existing_embedding_pool_keys(
@@ -415,7 +416,7 @@ pub async fn get_segment_by_id_for_context(
 /// [`get_segment_by_id_for_context`] returning `None` — and duplicate ids are
 /// harmless (each row keys on its own id). Batched in `SQLITE_MAX_PARAMS`-sized
 /// chunks (reserving one bound slot for the leading context id) so an
-/// arbitrarily large handle set stays within the bound-parameter limit (R-013).
+/// arbitrarily large handle set stays within the bound-parameter limit.
 pub async fn get_segments_by_ids_for_context(
     conn: &Connection,
     context_id: &str,
@@ -565,7 +566,7 @@ pub async fn get_segment_by_prefix_for_context(
 }
 
 /// Fetch up to `limit` candidate segment ids sharing `prefix` within one
-/// context, id-only, for the unique-prefix handle recovery gate (T1). The
+/// context, id-only, for the unique-prefix handle recovery gate. The
 /// caller runs a pure recovery gate over the returned candidate set, so this
 /// query deliberately returns bare ids (never full segment bodies) ordered
 /// deterministically. An empty prefix returns no candidates rather than
@@ -1176,7 +1177,7 @@ pub struct ContextDeletionCounts {
 /// only `segment_relations`, `indexed_files`, `segments`, and the `worktree_contexts`
 /// registry row are deleted explicitly.
 ///
-/// Reference-aware (REQ-004/005): embeddings are content-addressed and shared
+/// Reference-aware: embeddings are content-addressed and shared
 /// across contexts via `embedding_pool`. The `segments_vector_ad` trigger
 /// decrements `ref_count` as this context's segments are deleted, then the
 /// delete-at-zero sweep removes only the pool rows whose last referencer is now
@@ -2058,7 +2059,7 @@ async fn batch_upsert_segments_for_context(
     Ok(())
 }
 
-/// Persist the pooled embedding references for one file's segments (REQ-001).
+/// Persist the pooled embedding references for one file's segments.
 ///
 /// Each embeddable segment carries a `content_key`; a pool *miss* additionally
 /// carries the freshly embedded `embedding_vec` to be shared. The write proceeds
@@ -2183,7 +2184,7 @@ async fn batch_insert_segment_vector_refs(
 /// content key, so it equals the live referencing-row count.
 ///
 /// Dedup-heavy write batches reference many keys, so a single bulk `UPDATE`
-/// (R-011) replaces the prior per-key `UPDATE` loop: the per-distinct-key deltas
+/// replaces the prior per-key `UPDATE` loop: the per-distinct-key deltas
 /// are serialized to a JSON `content_key -> delta` object and applied in one
 /// statement via [`queries::BATCH_INCREMENT_EMBEDDING_POOL_REF_COUNTS`]. Counts
 /// are identical to the loop because the keys are distinct (one pool row each)
@@ -3394,9 +3395,10 @@ mod tests {
         out
     }
 
-    /// Byte-for-byte replica of the pre-R-011 per-key `UPDATE` loop, retained as
-    /// the equivalence baseline the bulk statement must match (mirrors the T1
-    /// pattern of keeping the prior implementation in the test module).
+    /// Byte-for-byte replica of the earlier per-key `UPDATE` loop, retained as
+    /// the equivalence baseline the bulk statement must match (mirrors the
+    /// established pattern of keeping the prior implementation in the test
+    /// module).
     async fn loop_increment_pool_ref_counts_baseline(
         conn: &Connection,
         ref_segments: &[&SegmentInsert],
@@ -3418,7 +3420,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_ref_count_bulk_statement_matches_per_key_loop() {
-        // R-011 / REQ-008: the single bulk `UPDATE` must leave `ref_count` rows
+        // The single bulk `UPDATE` must leave `ref_count` rows
         // identical to the prior per-key loop for a multi-key batch with varied
         // per-key reference counts. Run both paths against separately-seeded
         // in-memory pools and assert the full row set matches.
@@ -3515,7 +3517,7 @@ mod tests {
 
     #[tokio::test]
     async fn pooled_write_shares_one_vector_across_contexts_with_matched_ref_count() {
-        // REQ-001 / T4 AC4: byte-identical content indexed in two contexts must
+        // Byte-identical content indexed in two contexts must
         // store its embedding exactly once and count both references. Identical
         // content => identical content_key, so the pool holds one row; the two
         // distinct segment_vectors rows (one per context) both reference it.
@@ -3603,7 +3605,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_context_refcounts_shared_pool_row_and_frees_last_referencer() {
-        // REQ-004 / T6 AC4: a vector shared by two contexts is reference-counted
+        // A vector shared by two contexts is reference-counted
         // on deletion. Removing one context must leave the shared pool row with
         // ref_count == 1 (still resolvable by the survivor); removing the last
         // referencer must drop it to zero and physically delete the pool row.

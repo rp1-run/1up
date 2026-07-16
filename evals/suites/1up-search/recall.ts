@@ -45,12 +45,12 @@
  * identity, so several results pointing at the same anchor count once -- this matches the
  * intent "how much of the gold did we surface".)
  *
- * Resilience requirements (from feature task T3):
+ * Resilience requirements:
  * - Rows with empty gold (no anchors and no segment IDs) are skipped for recall but still
  *   recorded with status="skipped_no_gold" so the harness never produces NaN.
  * - An empty corpus produces recall = 0 (not NaN) with empty per_query.
  *
- * Quality gate (feature task T2):
+ * Quality gate:
  * - Before scoring, a semantic-path preflight asserts (via `1up status <repo> -f json`)
  *   that the index has embeddings (`vector_rows > 0`), reports a current `schema_version`,
  *   and serves the expected `embedding_model` variant (`ONEUP_MODEL_VARIANT`, default int8).
