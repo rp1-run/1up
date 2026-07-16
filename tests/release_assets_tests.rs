@@ -897,7 +897,8 @@ fn mcp_installation_docs_keep_script_installer_and_manual_mcp_guidance() {
     }
 
     for required in [
-        "curl -fsSL https://github.com/rp1-run/1up/releases/latest/download/setup.sh | bash",
+        "curl -fsSL https://1up.rp1.run/setup.sh | bash",
+        "https://github.com/rp1-run/1up/releases/latest/download/setup.sh",
         "Configure 1up MCP for this repository.",
         "Configure the `oneup` MCP server in project/workspace scope.",
         "Use explicit `--path` config only when project/workspace config is not available.",

@@ -82,7 +82,7 @@ agent you use for this repository and let it configure the project-scoped server
 # Configure 1up MCP for this repository.
 
 1. If `1up` is not installed, run:
-   `curl -fsSL https://github.com/rp1-run/1up/releases/latest/download/setup.sh | bash`
+   `curl -fsSL https://1up.rp1.run/setup.sh | bash`
    Otherwise, run `1up update`.
 2. Verify the install with `1up --version`.
 3. Configure the `oneup` MCP server in project/workspace scope.
@@ -104,10 +104,12 @@ Prefer to run each step? The script installer supports Apple Silicon macOS and L
 x86_64:
 
 ```sh
-curl -fsSL https://github.com/rp1-run/1up/releases/latest/download/setup.sh | bash
+curl -fsSL https://1up.rp1.run/setup.sh | bash
 ```
 
-The installer places `1up` in `~/.local/bin`. If that directory is already on `PATH`, the command
+The URL is a redirect to the latest GitHub Release asset — fetch
+`https://github.com/rp1-run/1up/releases/latest/download/setup.sh` directly if you prefer to see
+the source. The installer places `1up` in `~/.local/bin`. If that directory is already on `PATH`, the command
 is ready immediately; otherwise follow the printed instruction or open a new shell. Verify the
 binary:
 
