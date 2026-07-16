@@ -15,6 +15,13 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.1.17](https://github.com/rp1-run/1up/compare/v0.1.16...v0.1.17) (2026-07-16)
+
+
+### Documentation
+
+* adopt 1up.rp1.run/setup.sh as the canonical install one-liner ([#111](https://github.com/rp1-run/1up/issues/111)) ([cd87bd7](https://github.com/rp1-run/1up/commit/cd87bd7f0158d9f8b13a04259db5a211f5bad18f))
+
 ## [0.1.16](https://github.com/rp1-run/1up/compare/v0.1.15...v0.1.16) (2026-07-15)
 
 
