@@ -42,6 +42,14 @@ use crate::storage::{db::Db, schema};
 const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
 const STARTUP_RECONCILIATION_REASON: &str = "startup_reconciliation";
 
+/// Test-only seam gate for [`test_rebuild_hold`]; never set in production.
+const REBUILD_HOLD_ENV_VAR: &str = "ONEUP_TEST_REBUILD_HOLD";
+/// While this file exists under a project's `.1up/`, a pass with the seam
+/// enabled parks inside its pipeline window (rebuild lock held).
+const REBUILD_HOLD_FILE_NAME: &str = "test-rebuild.hold";
+/// Written by a parked pass so tests can detect it deterministically.
+const REBUILD_HOLD_ENTERED_FILE_NAME: &str = "test-rebuild.hold-entered";
+
 #[derive(Debug, Default)]
 struct ProjectRunState {
     running: bool,
@@ -122,17 +130,14 @@ struct ProjectState {
     /// set (a SIGHUP reload de-register or worker shutdown) so a de-registered
     /// project's rebuild stops promptly instead of running on against a gone
     /// registry (issue #109).
+    ///
+    /// Cancellation is a REQUEST, not proof the pass has stopped: the in-flight
+    /// pass owns its single-writer [`lifecycle::RebuildLock`] guard on the
+    /// `run_project` stack frame and keeps being polled after a mid-pass
+    /// de-registration, so the `rebuild.lock` FD releases only when the pipeline
+    /// has exited at a committed boundary and the frame returns — never while the
+    /// old pass could still write (cancel → drain → unlock).
     cancel_token: CancellationToken,
-    /// The single-writer [`lifecycle::RebuildLock`] guard for THIS project's
-    /// in-flight rebuild, owned by the active-set entry rather than living as a
-    /// `run_project` stack local. Because the guard lives in the entry, dropping
-    /// the entry when the project is de-registered (SIGHUP reload) or on worker
-    /// shutdown deterministically releases the `rebuild.lock` FD — closing the
-    /// leak that orphaned the lock and wedged every later `1up reindex` with a
-    /// contention error that never cleared (issue #109). `Some` only while a pass
-    /// holds the lock; reclaimed and dropped when the pass ends so an idle
-    /// project never blocks a competing one-shot rebuild.
-    rebuild_lock: Option<lifecycle::RebuildLock>,
 }
 
 /// On-disk identity of an `index.db` file, used to detect a build-aside swap
@@ -246,8 +251,10 @@ async fn run_inner() -> Result<(), OneupError> {
     run_dirty_projects_until_clean_or_cancelled(
         &mut file_watcher,
         &mut projects,
+        &mut deferred,
         &cancel_token,
         &mut sigterm,
+        &mut sighup,
         &mut search_requests_rx,
     )
     .await;
@@ -315,8 +322,10 @@ async fn run_inner() -> Result<(), OneupError> {
                     run_dirty_projects_until_clean_or_cancelled(
                         &mut file_watcher,
                         &mut projects,
+                        &mut deferred,
                         &cancel_token,
                         &mut sigterm,
+                        &mut sighup,
                         &mut search_requests_rx,
                     )
                     .await;
@@ -357,8 +366,10 @@ async fn run_inner() -> Result<(), OneupError> {
                     run_dirty_projects_until_clean_or_cancelled(
                         &mut file_watcher,
                         &mut projects,
+                        &mut deferred,
                         &cancel_token,
                         &mut sigterm,
+                        &mut sighup,
                         &mut search_requests_rx,
                     )
                     .await;
@@ -374,8 +385,10 @@ async fn run_inner() -> Result<(), OneupError> {
                 run_dirty_projects_until_clean_or_cancelled(
                     &mut file_watcher,
                     &mut projects,
+                    &mut deferred,
                     &cancel_token,
                     &mut sigterm,
+                    &mut sighup,
                     &mut search_requests_rx,
                 )
                 .await;
@@ -384,9 +397,12 @@ async fn run_inner() -> Result<(), OneupError> {
     }
 
     mark_all_contexts_daemon_stopped(&mut projects);
-    // Shutdown drop-path: cancel every project's in-flight rebuild and release its
-    // rebuild-lock FD before exit, so a worker that shuts down mid-rebuild never
-    // leaves an orphaned `rebuild.lock` behind for the next process (issue #109).
+    // Shutdown drop-path: cancel every project's token and drop its handles before
+    // exit. No rebuild lock can be held here — the lock guard is owned by the
+    // in-flight pass frame, and every sweep above is awaited to completion (a
+    // SIGTERM'd pass drains to its committed boundary and releases the guard
+    // before the loop breaks), so a worker shutdown never leaves an orphaned
+    // `rebuild.lock` behind for the next process (issue #109).
     for (_context_id, state) in projects.drain() {
         release_removed_project(state);
     }
@@ -1048,24 +1064,32 @@ async fn deregister_deleted_projects_on_startup(registry: &Registry) {
 /// handles and reused read connection.
 fn release_removed_project(state: ProjectState) {
     state.cancel_token.cancel();
-    // `state` (its `Option<RebuildLock>`, `Db`, and reused read connection) drops
-    // at the end of this scope, closing the rebuild-lock FD and index handles.
+    // `state` (its `Db` and reused read connection) drops at the end of this
+    // scope, closing the index handles. The rebuild-lock guard is NOT here: it is
+    // owned by the in-flight pass frame (`run_project`), which keeps being polled
+    // after this cancellation request and releases the lock only once the
+    // pipeline has exited at a committed boundary (cancel → drain → unlock).
 }
 
 /// Drop every active-set project whose context is no longer in the registry,
-/// cancelling its in-flight rebuild and releasing its rebuild-lock FD.
+/// requesting cancellation of its in-flight rebuild.
 ///
-/// Extracted from [`reload_projects`] so the de-register drop-path can be exercised
-/// deterministically: a dropped project must release its `rebuild.lock` (issue
-/// #109) while a still-registered project retains its lock and keeps rebuilding.
-/// The watcher is only unwatched when no surviving registered context still shares
-/// that source root (linked worktrees share one watch).
+/// Cancellation comes FIRST and is unconditional: watcher cleanup is best-effort
+/// (log-and-continue), so a failed `unwatch` can never skip cancelling a removed
+/// project's pass (which would leave its rebuild running against a gone registry
+/// entry, issue #109). The watcher is only unwatched when no surviving registered
+/// context still shares that source root (linked worktrees share one watch).
+///
+/// This only REQUESTS cancellation. When the removed project's pass is in flight,
+/// its rebuild-lock guard stays owned by the still-polled `run_project` frame and
+/// releases after the pipeline drains to a committed boundary, so a competing
+/// writer can never acquire the lock while the old pass could still write.
 fn drop_deregistered_projects(
     watcher: &mut FileWatcher,
     projects: &mut ProjectStates,
     registered_contexts: &HashSet<String>,
     registered_sources: &HashSet<PathBuf>,
-) -> Result<(), OneupError> {
+) {
     let current_contexts: Vec<String> = projects.keys().cloned().collect();
     for context_id in &current_contexts {
         if registered_contexts.contains(context_id) {
@@ -1077,15 +1101,20 @@ fn drop_deregistered_projects(
                 context_id,
                 state.project_root.display()
             );
+            state.cancel_token.cancel();
             state.watch_status = DaemonWatchStatus::DaemonStopped;
             persist_daemon_context_status_for_state(&state);
             if !registered_sources.contains(&canonical_project_root(&state.source_root)) {
-                watcher.unwatch(&state.source_root)?;
+                if let Err(err) = watcher.unwatch(&state.source_root) {
+                    warn!(
+                        "failed to unwatch removed source root {}: {err}",
+                        state.source_root.display()
+                    );
+                }
             }
             release_removed_project(state);
         }
     }
-    Ok(())
 }
 
 async fn reload_projects(
@@ -1111,7 +1140,7 @@ async fn reload_projects(
         .map(|entry| canonical_project_root(entry.source_root()))
         .collect();
 
-    drop_deregistered_projects(watcher, projects, &registered_contexts, &registered_sources)?;
+    drop_deregistered_projects(watcher, projects, &registered_contexts, &registered_sources);
 
     for entry in &registry.projects {
         let context_id = entry.context_id();
@@ -1249,7 +1278,6 @@ async fn build_project_state(
         // A child of the daemon's shared token: SIGTERM cancels the parent and
         // thus this project too, while a de-register cancels only this child.
         cancel_token: parent_token.child_token(),
-        rebuild_lock: None,
     })))
 }
 
@@ -1691,14 +1719,28 @@ fn next_dirty_project_key(projects: &ProjectStates, preferred_key: Option<&str>)
 /// SIGTERM is consumed here, so callers detect shutdown via
 /// `cancel_token.is_cancelled()` (the main loop guard) rather than a second
 /// `sigterm.recv()`.
+///
+/// SIGHUP is serviced INSIDE the sweep (see `run_unit_while_servicing_events`):
+/// a registry reload delivered mid-rebuild is observed while the pass is still
+/// running, so de-registering the rebuilding project cancels that pass instead of
+/// waiting — possibly minutes — for the pipeline to finish (issue #109).
 async fn run_dirty_projects_until_clean_or_cancelled(
     watcher: &mut FileWatcher,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
     cancel_token: &CancellationToken,
     sigterm: &mut Signal,
+    sighup: &mut Signal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
-    let sweep = run_dirty_projects_until_clean(watcher, projects, cancel_token, search_requests_rx);
+    let sweep = run_dirty_projects_until_clean(
+        watcher,
+        projects,
+        deferred,
+        cancel_token,
+        sighup,
+        search_requests_rx,
+    );
     tokio::pin!(sweep);
 
     tokio::select! {
@@ -1716,7 +1758,9 @@ async fn run_dirty_projects_until_clean_or_cancelled(
 async fn run_dirty_projects_until_clean(
     watcher: &mut FileWatcher,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
     cancel_token: &CancellationToken,
+    sighup: &mut Signal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
     let mut preferred_key: Option<String> = None;
@@ -1730,7 +1774,16 @@ async fn run_dirty_projects_until_clean(
         }
         preferred_key = None;
 
-        let result = run_project(&key, projects, search_requests_rx, watcher).await;
+        let result = run_project(
+            &key,
+            projects,
+            deferred,
+            search_requests_rx,
+            watcher,
+            cancel_token,
+            sighup,
+        )
+        .await;
 
         let filtered = watcher::filter_changed_paths(watcher, watcher.drain_events_nowait());
         record_file_check_for_all_projects(projects, Utc::now(), false);
@@ -1772,12 +1825,24 @@ async fn run_dirty_projects_until_clean(
                     &e,
                     OneupError::Indexing(crate::shared::errors::IndexingError::Cancelled)
                 ) {
-                    // SIGTERM cancelled the pass at a unit boundary. `run_project`
-                    // already re-queued the scope (the context stays dirty so the
-                    // restarted binary re-indexes the remainder). Stop the sweep;
-                    // the main loop guard will break for shutdown.
-                    debug!("re-index sweep for context {key} cancelled for shutdown");
-                    break;
+                    if cancel_token.is_cancelled() {
+                        // SIGTERM cancelled the pass at a unit boundary.
+                        // `run_project` already re-queued the scope (the context
+                        // stays dirty so the restarted binary re-indexes the
+                        // remainder). Stop the sweep; the main loop guard will
+                        // break for shutdown.
+                        debug!("re-index sweep for context {key} cancelled for shutdown");
+                        break;
+                    }
+                    // Only this project's child token was cancelled: a SIGHUP
+                    // reload de-registered it mid-pass. Its rebuild stopped at a
+                    // committed boundary and its lock has been released; keep
+                    // sweeping the surviving projects.
+                    debug!(
+                        "re-index pass for context {key} cancelled by de-registration; \
+                         continuing sweep for remaining projects"
+                    );
+                    continue;
                 }
                 if matches!(
                     &e,
@@ -1969,8 +2034,8 @@ fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
     }
 }
 
-/// Run `unit` to completion, servicing queued daemon search requests as they
-/// arrive in the meantime.
+/// Run `unit` (a project's pipeline pass) to completion, servicing queued daemon
+/// search requests AND SIGHUP registry reloads as they arrive in the meantime.
 ///
 /// Confirmed hazard: a refresh sweep's per-project pass can run for
 /// seconds — far past `DAEMON_READ_TIMEOUT_MS` — so yielding only at project
@@ -1982,9 +2047,24 @@ fn mark_all_contexts_daemon_stopped(projects: &mut ProjectStates) {
 /// takes its own brief, per-call slice of `projects` rather than the
 /// long-lived borrow `unit` may or may not hold, so a search for any OTHER
 /// project never contends with `unit`'s (potentially long) execution here.
-async fn run_unit_while_servicing_search<F: Future>(
+///
+/// The SIGHUP arm is what makes a registry reload observable DURING a rebuild
+/// (issue #109): previously no active-sweep path polled `sighup.recv()`, so a
+/// SIGHUP delivered mid-pass stayed queued until the pipeline finished and the
+/// de-registration drop-path could never cancel an in-flight rebuild. A reload
+/// here may remove the very project `unit` is rebuilding: `reload_projects`
+/// cancels the removed project's child token and drops its map entry, then this
+/// loop keeps polling the SAME `unit` future so the pipeline unwinds
+/// cooperatively at its next committed boundary (never dropped mid-flush).
+/// `run_project` then finalizes without requiring the map entry and releases the
+/// rebuild-lock guard LAST.
+async fn run_unit_while_servicing_events<F: Future>(
     unit: F,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
+    watcher: &mut FileWatcher,
+    daemon_token: &CancellationToken,
+    sighup: &mut Signal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) -> F::Output {
     tokio::pin!(unit);
@@ -1994,6 +2074,14 @@ async fn run_unit_while_servicing_search<F: Future>(
             Some(queued) = search_requests_rx.recv() => {
                 let response = handle_search_request(projects, queued.request).await;
                 let _ = queued.respond_to.send(response);
+            }
+            _ = sighup.recv() => {
+                info!("received SIGHUP during a rebuild pass, reloading project registry");
+                if let Err(e) = reload_projects(watcher, projects, deferred, daemon_token).await {
+                    error!("failed to reload projects during a rebuild pass: {e}");
+                } else {
+                    record_file_check_for_all_projects(projects, Utc::now(), true);
+                }
             }
         }
     }
@@ -2081,8 +2169,11 @@ fn deregister_deleted_project(
 async fn run_project(
     context_id: &str,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
     watcher: &mut FileWatcher,
+    daemon_token: &CancellationToken,
+    sighup: &mut Signal,
 ) -> Result<pipeline::PipelineStats, OneupError> {
     // Acquire the single-writer rebuild lock BEFORE `start_run` consumes the
     // pending scope, so a contended pass leaves the project dirty (its queued
@@ -2137,11 +2228,17 @@ async fn run_project(
         }
         SourcePresence::Present => {}
     }
-    // Held on this stack frame through the short setup awaits below, then moved
-    // into the active-set entry (`state.rebuild_lock`) for the long pipeline pass
-    // so a de-register/shutdown that drops the project releases the FD (issue
-    // #109). Reclaimed after the pass so it drops on every remaining exit path.
-    let rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
+    // Owned by THIS frame for the entire pass — through setup, the pipeline
+    // window, and finalization — and dropped only when this function returns.
+    // This is the in-flight pass's managed run state (issue #109): a SIGHUP
+    // reload that de-registers this project mid-pass cancels the per-project
+    // token but never touches this guard; the caller keeps polling this same
+    // frame until the pipeline exits at a committed boundary, so the
+    // `rebuild.lock` FD releases strictly AFTER the pass can no longer write
+    // (cancel → drain → unlock) and is never orphaned by a removal during the
+    // setup awaits below (the guard was previously unreachable on this stack
+    // until it was parked in the map entry just before the pipeline).
+    let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             debug!(
@@ -2412,7 +2509,7 @@ async fn run_project(
     // Take the embedding runtime OUT of the map-borrowed state before the
     // (potentially multi-second) prepare+pipeline pass, so `projects` is never
     // held across it: a queued daemon search for ANY project runs
-    // via `run_unit_while_servicing_search` below without contending with this
+    // via `run_unit_while_servicing_events` below without contending with this
     // pass for the whole-map borrow. `EmbeddingRuntime` is cheap to move
     // (`Default`-backed cache), so this is a pointer-swap, not a reload.
     let mut embedding_runtime = {
@@ -2441,59 +2538,104 @@ async fn run_project(
     };
     log_indexing_embedding_status(&project_root, indexing_config.embed_threads, &status);
 
-    let pipeline_unit = pipeline::run_with_context_scope_setup_and_progress_root(
-        &conn,
-        &context,
-        embedding_runtime.current_embedder(),
-        &scope,
-        &indexing_config,
-        None,
-        true,
-        Some(setup),
-        daemon_fallback_reason,
-        Some(&project_root),
-        &project_cancel_token,
-    );
-    // Move the rebuild-lock guard from this stack frame into the active-set entry
-    // for the in-flight window. If a SIGHUP reload or shutdown drops this project
-    // while the pass is running, dropping the entry releases the `rebuild.lock` FD
-    // deterministically instead of orphaning it (issue #109).
-    {
-        let state = projects
-            .get_mut(context_id)
-            .expect("dirty project must exist while starting the pipeline pass");
-        state.rebuild_lock = Some(rebuild_lock);
+    let pipeline_unit = async {
+        test_rebuild_hold(&project_root).await;
+        pipeline::run_with_context_scope_setup_and_progress_root(
+            &conn,
+            &context,
+            embedding_runtime.current_embedder(),
+            &scope,
+            &indexing_config,
+            None,
+            true,
+            Some(setup),
+            daemon_fallback_reason,
+            Some(&project_root),
+            &project_cancel_token,
+        )
+        .await
+    };
+    let result = run_unit_while_servicing_events(
+        pipeline_unit,
+        projects,
+        deferred,
+        watcher,
+        daemon_token,
+        sighup,
+        search_requests_rx,
+    )
+    .await;
+
+    // The SIGHUP arm inside `run_unit_while_servicing_events` may have
+    // de-registered THIS project mid-pass: its map entry is gone — or was
+    // replaced by a freshly re-registered state that never started this pass
+    // (only `start_run` sets `running`, so a replacement is distinguishable).
+    // Finalize through the entry only when it is still this pass's own state and
+    // never `expect` it: a successful mid-pass removal used to panic the worker
+    // here.
+    match projects.get_mut(context_id) {
+        Some(state) if state.run_state.running => {
+            state.embedding_runtime = embedding_runtime;
+            state.run_state.finish_run();
+
+            if matches!(
+                &result,
+                Err(OneupError::Indexing(
+                    crate::shared::errors::IndexingError::Cancelled
+                ))
+            ) {
+                // A cancelled pass is neither complete nor failed: it stopped at
+                // a committed boundary with the remainder unindexed. Re-queue the
+                // scope so the context stays dirty (refresh state -> Pending) and
+                // the remaining files re-index on the next pass — here if the
+                // daemon survives, or on the restarted binary's startup
+                // reconciliation after a SIGTERM drain.
+                mark_refresh_pending(state, scope, Some("cancelled".to_string()));
+                return result;
+            }
+
+            mark_refresh_finished(state, Utc::now(), result.as_ref().map(|_| ()));
+        }
+        _ => {
+            // De-registered mid-pass: the drop path already cancelled the token
+            // and persisted the stopped status, and there is no entry to write
+            // refresh state into. The pipeline above exited at a committed
+            // boundary, and `_rebuild_lock` drops when this frame returns —
+            // strictly after that exit — so a competing writer can only acquire
+            // the lock once this pass can no longer write.
+            debug!(
+                "project context {context_id} was de-registered during its rebuild pass; \
+                 skipping state finalization"
+            );
+        }
     }
-    let result = run_unit_while_servicing_search(pipeline_unit, projects, search_requests_rx).await;
-
-    let state = projects
-        .get_mut(context_id)
-        .expect("dirty project must exist while finishing a run");
-    // Reclaim the guard so the lock releases when this pass ends (dropped at
-    // function exit on every remaining path). If the project was dropped mid-pass
-    // the entry — and its guard — is already gone, so this is simply `None`.
-    let _rebuild_lock = state.rebuild_lock.take();
-    state.embedding_runtime = embedding_runtime;
-    state.run_state.finish_run();
-
-    if matches!(
-        &result,
-        Err(OneupError::Indexing(
-            crate::shared::errors::IndexingError::Cancelled
-        ))
-    ) {
-        // A cancelled pass is neither complete nor failed: it stopped at a
-        // committed boundary with the remainder unindexed. Re-queue the scope so
-        // the context stays dirty (refresh state -> Pending) and the remaining
-        // files re-index on the next pass — here if the daemon survives, or on
-        // the restarted binary's startup reconciliation after a SIGTERM drain.
-        mark_refresh_pending(state, scope, Some("cancelled".to_string()));
-        return result;
-    }
-
-    mark_refresh_finished(state, Utc::now(), result.as_ref().map(|_| ()));
 
     result
+}
+
+/// Test-only seam for the SIGHUP-during-rebuild lifecycle tests: when
+/// [`REBUILD_HOLD_ENV_VAR`] is set, a pass parks here — inside the pipeline
+/// window, rebuild lock held, daemon events (search/SIGHUP) still being
+/// serviced — for as long as `<state_root>/.1up/`[`REBUILD_HOLD_FILE_NAME`]
+/// exists, writing [`REBUILD_HOLD_ENTERED_FILE_NAME`] so the test can detect the
+/// parked pass. The wait deliberately ignores the cancellation token: it
+/// emulates a long unit of work between two committed boundaries, letting tests
+/// observe the window where cancellation has been requested but the pipeline has
+/// not yet reached its next safe yield (the rebuild lock must still be held
+/// there). No-op — a single env read — outside tests.
+async fn test_rebuild_hold(state_root: &Path) {
+    if std::env::var(REBUILD_HOLD_ENV_VAR).is_err() {
+        return;
+    }
+    let dot_dir = config::project_dot_dir(state_root);
+    let hold_path = dot_dir.join(REBUILD_HOLD_FILE_NAME);
+    if !hold_path.exists() {
+        return;
+    }
+    let _ = std::fs::write(dot_dir.join(REBUILD_HOLD_ENTERED_FILE_NAME), b"held");
+    while hold_path.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 async fn handle_search_request(
@@ -2808,7 +2950,6 @@ mod tests {
             last_refresh_error: None,
             last_file_check_persisted_at: None,
             cancel_token: CancellationToken::new(),
-            rebuild_lock: None,
         }
     }
 
@@ -3283,7 +3424,18 @@ mod tests {
         // that ever completes.
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
-        let result = run_project(&key, &mut projects, &mut search_requests_rx, &mut watcher).await;
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut sighup,
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -3364,7 +3516,18 @@ mod tests {
 
         // Run the project: it should detect the missing root, deregister, and return
         // success (default stats) rather than error or infinite loop
-        let result = run_project(&key, &mut projects, &mut search_requests_rx, &mut watcher).await;
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut sighup,
+        )
+        .await;
 
         // After deletion handling:
         // 1. run_project should return Ok (not an error)
@@ -3437,7 +3600,18 @@ mod tests {
             "main/state root must survive for the test"
         );
 
-        let result = run_project(&key, &mut projects, &mut search_requests_rx, &mut watcher).await;
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut sighup,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -3511,7 +3685,17 @@ mod tests {
 
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
-        let result = run_project(&key, &mut projects, &mut search_requests_rx, &mut watcher).await;
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &CancellationToken::new(),
+            &mut sighup,
+        )
+        .await;
 
         assert!(
             matches!(
@@ -3551,10 +3735,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
+        let mut deferred: DeferredProjects = HashMap::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
         run_dirty_projects_until_clean(
             &mut watcher,
             &mut projects,
+            &mut deferred,
             &cancel_token,
+            &mut sighup,
             &mut search_requests_rx,
         )
         .await;
@@ -3688,89 +3876,324 @@ mod tests {
         );
     }
 
-    /// issue #109: a project dropped from the active set on a SIGHUP registry
-    /// reload must release its in-flight rebuild lock. Before the fix the lock lived
-    /// as a `run_project` stack local, unreachable from the reload path, so the
-    /// `rebuild.lock` FD was orphaned and every later `1up reindex` wedged on a
-    /// contention timeout against a flock that never cleared. Now the guard lives in
-    /// the active-set entry, so dropping the de-registered project releases it.
-    #[tokio::test]
-    async fn reload_drop_path_releases_rebuild_lock_of_deregistered_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        ensure_secure_project_root(&root).unwrap();
-        let db = Db::open_rw(&config::project_db_path(&root)).await.unwrap();
+    /// Restores redirected env vars on drop — even if an assertion panics — so a
+    /// redirected data root or seam gate never leaks into other tests in this
+    /// binary. Mirrors `cli::gc`'s `DataRootGuard`.
+    struct EnvVarsGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarsGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn dirty_full_run_state() -> ProjectRunState {
+        ProjectRunState {
+            running: false,
+            dirty: true,
+            pending_scope: Some(RunScope::Full),
+            pending_fallback_reason: None,
+        }
+    }
+
+    async fn seeded_project_db(root: &Path) -> Db {
+        ensure_secure_project_root(root).unwrap();
+        let db = Db::open_rw(&config::project_db_path(root)).await.unwrap();
         schema::initialize(&db.connect_tuned().await.unwrap())
             .await
             .unwrap();
+        db
+    }
+
+    fn registry_entry(context_id: &str, root: &Path) -> ProjectEntry {
+        // Branch fields mirror `test_context` so a reload of a retained project
+        // compares equal in `branch_context_changed`.
+        ProjectEntry {
+            project_id: context_id.to_string(),
+            project_root: root.to_path_buf(),
+            source_root: Some(root.to_path_buf()),
+            context_id: Some(context_id.to_string()),
+            main_worktree_root: Some(root.to_path_buf()),
+            worktree_role: Some(crate::shared::types::WorktreeRole::Main),
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            branch_status: Some(crate::shared::types::BranchStatus::Named),
+            head_oid: Some("0000000000000000000000000000000000000000".to_string()),
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: None,
+        }
+    }
+
+    /// issue #109, production-path lifecycle: a SIGHUP registry reload delivered
+    /// WHILE a rebuild pass is running — through the real sweep
+    /// (`run_dirty_projects_until_clean` → `run_project` →
+    /// `run_unit_while_servicing_events`), a real `rebuild.lock` acquired by that
+    /// pass, a mutated on-disk registry, and a real SIGHUP — must cancel the
+    /// de-registered pass, keep the lock held until the pipeline exits at a
+    /// committed boundary, release it only then, and leave the worker and the
+    /// retained sibling project fully healthy.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sighup_during_rebuild_cancels_pass_and_releases_lock_only_after_drain() {
+        // Every test in this binary that mutates HOME/XDG_DATA_HOME (`dirs::*`
+        // reads them at call time) must serialize on this crate-wide lock, or a
+        // concurrent mutation in another module corrupts this test's resolved
+        // registry path.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvVarsGuard::new(&["HOME", "XDG_DATA_HOME", REBUILD_HOLD_ENV_VAR]);
+        let home = tempfile::tempdir().unwrap();
+        let home_root = home.path().canonicalize().unwrap();
+        std::env::set_var("HOME", &home_root);
+        std::env::set_var("XDG_DATA_HOME", home_root.join(".local").join("share"));
+        std::env::set_var(REBUILD_HOLD_ENV_VAR, "1");
+
+        // Two dirty projects; keys sort so the held project's pass runs first.
+        let tmp_a = tempfile::tempdir().unwrap();
+        let root_a = tmp_a.path().canonicalize().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let root_b = tmp_b.path().canonicalize().unwrap();
+        for root in [&root_a, &root_b] {
+            for i in 0..4 {
+                std::fs::write(
+                    root.join(format!("mod_{i}.rs")),
+                    format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+                )
+                .unwrap();
+            }
+        }
+        let db_a = seeded_project_db(&root_a).await;
+        let db_b = seeded_project_db(&root_b).await;
+
+        let key_a = "sighup-a-held".to_string();
+        let key_b = "sighup-b-kept".to_string();
+        let mut state_a = project_state(&root_a, &root_a, db_a, dirty_full_run_state());
+        state_a.context.context_id = key_a.clone();
+        let mut state_b = project_state(&root_b, &root_b, db_b, dirty_full_run_state());
+        state_b.context.context_id = key_b.clone();
+        let token_a = state_a.cancel_token.clone();
+        let token_b = state_b.cancel_token.clone();
+
+        let mut projects = HashMap::new();
+        insert_project(&mut projects, state_a);
+        insert_project(&mut projects, state_b);
+
+        // The registry the SIGHUP reload will re-read: initially both projects.
+        Registry {
+            projects: vec![
+                registry_entry(&key_a, &root_a),
+                registry_entry(&key_b, &root_b),
+            ],
+        }
+        .save()
+        .unwrap();
+
+        // Park A's pass inside its pipeline window (lock held) until released.
+        let hold_path = config::project_dot_dir(&root_a).join(REBUILD_HOLD_FILE_NAME);
+        let entered_path = config::project_dot_dir(&root_a).join(REBUILD_HOLD_ENTERED_FILE_NAME);
+        std::fs::write(&hold_path, b"hold").unwrap();
+
+        let mut watcher = FileWatcher::new().unwrap();
+        watcher.watch(&root_a).unwrap();
+        watcher.watch(&root_b).unwrap();
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut deferred: DeferredProjects = HashMap::new();
+
+        // The sweep future mutably borrows `projects`; scope it so the borrow
+        // ends before the post-sweep assertions below inspect the map.
+        {
+            let sweep = run_dirty_projects_until_clean(
+                &mut watcher,
+                &mut projects,
+                &mut deferred,
+                &daemon_token,
+                &mut sighup,
+                &mut search_requests_rx,
+            );
+            tokio::pin!(sweep);
+
+            // Drives the pinned sweep concurrently with the test's observations and
+            // panics if the sweep finishes while a phase still expects it parked.
+            macro_rules! drive_sweep_tick {
+                () => {
+                    tokio::select! {
+                        _ = &mut sweep => panic!("sweep must not finish while pass A is parked"),
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                };
+            }
+
+            // Phase 1: the real pass owns the real rebuild lock (it entered the hold,
+            // which sits after lock acquisition inside the pipeline window).
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !entered_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pass A never entered the pipeline hold"
+                );
+                drive_sweep_tick!();
+            }
+            assert!(
+                lifecycle::try_acquire_rebuild_lock(&root_a)
+                    .unwrap()
+                    .is_none(),
+                "the in-flight pass must own the real rebuild lock"
+            );
+
+            // Phase 2: de-register A in the on-disk registry and deliver a real
+            // SIGHUP while A's pass is still running.
+            Registry {
+                projects: vec![registry_entry(&key_b, &root_b)],
+            }
+            .save()
+            .unwrap();
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).unwrap();
+
+            while !token_a.is_cancelled() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the SIGHUP reload never cancelled the de-registered in-flight pass"
+                );
+                drive_sweep_tick!();
+            }
+            // Cancellation has been REQUESTED but the pass has not reached its next
+            // safe yield (the hold is still in place): the lock must STILL be held.
+            // Releasing it here would let a competing writer in while the old
+            // pipeline can still write — the exact ordering bug under review.
+            for _ in 0..10 {
+                drive_sweep_tick!();
+                assert!(
+                    lifecycle::try_acquire_rebuild_lock(&root_a)
+                        .unwrap()
+                        .is_none(),
+                    "the rebuild lock must stay held until the cancelled pass drains \
+                 to a committed boundary"
+                );
+            }
+            assert!(
+                !token_b.is_cancelled(),
+                "the retained sibling must not be cancelled by the reload"
+            );
+
+            // Phase 3: release the hold. The cancelled pass exits at its first
+            // committed boundary, run_project finalizes without the map entry (no
+            // panic), the guard drops, and the sweep goes on to finish sibling B.
+            std::fs::remove_file(&hold_path).unwrap();
+            tokio::time::timeout(Duration::from_secs(120), &mut sweep)
+                .await
+                .expect("the sweep must complete after the cancelled pass drains");
+        }
+
+        assert!(
+            lifecycle::try_acquire_rebuild_lock(&root_a)
+                .unwrap()
+                .is_some(),
+            "the de-registered pass must release its rebuild.lock FD once drained (issue #109)"
+        );
+        assert!(
+            !projects.contains_key(&key_a),
+            "the de-registered project must leave the active set"
+        );
+        let retained = projects
+            .get(&key_b)
+            .expect("the retained sibling must survive the reload");
+        assert!(
+            !token_b.is_cancelled(),
+            "the retained sibling must stay uncancelled after the sweep"
+        );
+        assert_eq!(
+            retained.last_refresh_state,
+            DaemonRefreshState::Complete,
+            "the retained sibling's own pass must run to completion"
+        );
+        // Committed boundary: the aborted project's index is intact and readable.
+        let db_a = Db::open_rw(&config::project_db_path(&root_a))
+            .await
+            .unwrap();
+        let conn_a = db_a.connect_tuned().await.unwrap();
+        segments::count_segments(&conn_a)
+            .await
+            .expect("the aborted pass must leave a readable index (committed boundary)");
+    }
+
+    /// The de-register drop-path must cancel a removed project's in-flight pass
+    /// even when watcher cleanup cannot succeed: the watched source root is
+    /// deleted before the reload, so `unwatch` is exercised on a gone path and is
+    /// best-effort (log-and-continue). Before the fix the `?` on `unwatch` could
+    /// return out of `drop_deregistered_projects` without ever cancelling the
+    /// removed project's pipeline token.
+    #[tokio::test]
+    async fn reload_drop_path_cancels_removed_project_even_when_watcher_cleanup_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let db = seeded_project_db(&root).await;
 
         let mut projects = HashMap::new();
         let key = insert_project(
             &mut projects,
             project_state(&root, &root, db, ProjectRunState::default()),
         );
-
-        // Simulate an in-flight rebuild: the active-set entry owns the lock guard.
-        let held = lifecycle::try_acquire_rebuild_lock(&root)
-            .unwrap()
-            .expect("rebuild lock must be free before the simulated pass");
-        projects.get_mut(&key).unwrap().rebuild_lock = Some(held);
         let token = projects.get(&key).unwrap().cancel_token.clone();
 
-        // The lock is genuinely held: a fresh probe (separate FD) is contended.
-        assert!(
-            lifecycle::try_acquire_rebuild_lock(&root)
-                .unwrap()
-                .is_none(),
-            "rebuild lock must be held while the pass is in flight"
-        );
-
-        // SIGHUP reload observes an empty registry: this context is de-registered.
         let mut watcher = FileWatcher::new().unwrap();
         watcher.watch(&root).unwrap();
+        // Delete the watched root so the unwatch attempt inside the drop path
+        // runs against a gone directory.
+        drop(tmp);
+        assert!(!root.exists(), "source root must be deleted for the test");
+
+        // SIGHUP reload observes an empty registry: this context is de-registered.
         drop_deregistered_projects(
             &mut watcher,
             &mut projects,
             &HashSet::new(),
             &HashSet::new(),
-        )
-        .unwrap();
+        );
 
         assert!(
             !projects.contains_key(&key),
-            "a de-registered project must leave the active set"
+            "a de-registered project must leave the active set even when watcher \
+             cleanup fails"
         );
         assert!(
             token.is_cancelled(),
-            "the dropped project's in-flight rebuild must be cancelled"
-        );
-        assert!(
-            lifecycle::try_acquire_rebuild_lock(&root)
-                .unwrap()
-                .is_some(),
-            "dropping the de-registered project must release its rebuild.lock FD (issue #109)"
+            "watcher cleanup failure must never skip cancelling the removed \
+             project's in-flight rebuild"
         );
     }
 
     /// issue #109 regression: dropping one project on reload must not disturb a
-    /// project that is still registered — its in-flight rebuild keeps running, with
-    /// its lock still held and its cancellation token untouched.
+    /// project that is still registered — its cancellation token stays untouched
+    /// so an in-flight rebuild would keep running.
     #[tokio::test]
-    async fn reload_drop_path_keeps_retained_project_rebuilding() {
-        async fn seed(tmp: &tempfile::TempDir) -> (PathBuf, Db) {
-            let root = tmp.path().canonicalize().unwrap();
-            ensure_secure_project_root(&root).unwrap();
-            let db = Db::open_rw(&config::project_db_path(&root)).await.unwrap();
-            schema::initialize(&db.connect_tuned().await.unwrap())
-                .await
-                .unwrap();
-            (root, db)
-        }
-
+    async fn reload_drop_path_keeps_retained_project_uncancelled() {
         let tmp_a = tempfile::tempdir().unwrap();
         let tmp_b = tempfile::tempdir().unwrap();
-        let (root_a, db_a) = seed(&tmp_a).await;
-        let (root_b, db_b) = seed(&tmp_b).await;
+        let root_a = tmp_a.path().canonicalize().unwrap();
+        let root_b = tmp_b.path().canonicalize().unwrap();
+        let db_a = seeded_project_db(&root_a).await;
+        let db_b = seeded_project_db(&root_b).await;
 
         let mut projects = HashMap::new();
         let key_a = insert_project(
@@ -3780,18 +4203,6 @@ mod tests {
         let key_b = insert_project(
             &mut projects,
             project_state(&root_b, &root_b, db_b, ProjectRunState::default()),
-        );
-
-        // Both projects are mid-rebuild: each active-set entry owns its lock guard.
-        projects.get_mut(&key_a).unwrap().rebuild_lock = Some(
-            lifecycle::try_acquire_rebuild_lock(&root_a)
-                .unwrap()
-                .unwrap(),
-        );
-        projects.get_mut(&key_b).unwrap().rebuild_lock = Some(
-            lifecycle::try_acquire_rebuild_lock(&root_b)
-                .unwrap()
-                .unwrap(),
         );
         let token_a = projects.get(&key_a).unwrap().cancel_token.clone();
         let token_b = projects.get(&key_b).unwrap().cancel_token.clone();
@@ -3808,10 +4219,8 @@ mod tests {
             &mut projects,
             &registered_contexts,
             &registered_sources,
-        )
-        .unwrap();
+        );
 
-        // Repo A survives and keeps rebuilding: retained, lock still held, not cancelled.
         assert!(
             projects.contains_key(&key_a),
             "the still-registered project must stay in the active set"
@@ -3821,14 +4230,6 @@ mod tests {
             "the retained project's in-flight rebuild must not be cancelled"
         );
         assert!(
-            lifecycle::try_acquire_rebuild_lock(&root_a)
-                .unwrap()
-                .is_none(),
-            "the retained project must keep holding its rebuild lock"
-        );
-
-        // Repo B is dropped and its lock released.
-        assert!(
             !projects.contains_key(&key_b),
             "the de-registered project must leave the active set"
         );
@@ -3836,16 +4237,6 @@ mod tests {
             token_b.is_cancelled(),
             "the dropped project's in-flight rebuild must be cancelled"
         );
-        assert!(
-            lifecycle::try_acquire_rebuild_lock(&root_b)
-                .unwrap()
-                .is_some(),
-            "dropping the de-registered project must release its rebuild.lock FD (issue #109)"
-        );
-
-        // Keep repo A's guard owned by the map until here so the held-lock probe
-        // above measured the entry's guard, not a dangling one.
-        drop(projects);
     }
 
     #[tokio::test]
@@ -3876,7 +4267,7 @@ mod tests {
     /// decoupled from the sweep's `&mut projects` borrow, not merely
     /// interleaved with it at a coarser boundary.
     ///
-    /// This drives `run_unit_while_servicing_search` — the exact seam
+    /// This drives `run_unit_while_servicing_events` — the exact seam
     /// `run_project` uses to run its (potentially multi-second) pipeline pass
     /// — with an injected slow unit standing in for that pass (pipeline.rs is
     /// out of scope to modify directly), and asserts a search queued while the
@@ -3899,8 +4290,19 @@ mod tests {
         // `DAEMON_READ_TIMEOUT_MS`, so a search starved until it completes
         // would fail the assertion below.
         let slow_unit = tokio::time::sleep(Duration::from_millis(DAEMON_READ_TIMEOUT_MS * 4));
-        let run =
-            run_unit_while_servicing_search(slow_unit, &mut projects, &mut search_requests_rx);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let mut deferred: DeferredProjects = HashMap::new();
+        let run = run_unit_while_servicing_events(
+            slow_unit,
+            &mut projects,
+            &mut deferred,
+            &mut watcher,
+            &daemon_token,
+            &mut sighup,
+            &mut search_requests_rx,
+        );
         tokio::pin!(run);
 
         let (respond_to, response_rx) = oneshot::channel();
@@ -4738,7 +5140,18 @@ mod tests {
         );
 
         // Run the first project: it should handle the deletion gracefully
-        let result = run_project(&key1, &mut projects, &mut search_requests_rx, &mut watcher).await;
+        let daemon_token = CancellationToken::new();
+        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let result = run_project(
+            &key1,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut sighup,
+        )
+        .await;
 
         // First project should be handled without error
         assert!(
