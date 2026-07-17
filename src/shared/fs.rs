@@ -15,7 +15,13 @@ use crate::shared::errors::{FilesystemError, OneupError};
 /// Test-only: serializes process-wide environment mutation (HOME/XDG_*) across every
 /// module's tests. `dirs::*` reads these env vars at call time, so two tests mutating
 /// them concurrently — even in different modules — corrupt each other's resolved paths.
-/// Every test that mutates the process environment must hold this single lock.
+/// Every test that mutates the process environment must hold this single lock; it is the
+/// one process-wide env-serialization mutex (the former `config`/`update` locks were
+/// consolidated onto it so no two env-mutating tests in this binary can run concurrently).
+///
+/// Lock order where a test also holds a model lock: `MODEL_MUTEX` -> `ENV_MUTEX`
+/// (acquire the model lock first, then this one). Acquire poison-tolerantly via
+/// `unwrap_or_else(PoisonError::into_inner)` so a panicking test cannot cascade.
 #[cfg(test)]
 pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -219,9 +219,6 @@ fn read_positive_env(name: &str) -> Result<Option<usize>, OneupError> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<OsString>)>,
@@ -257,7 +254,12 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_prefers_cli_then_env_then_registry() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Route onto the single process-wide `shared::fs::ENV_MUTEX` so this
+        // env-mutating test serializes against every other one in the binary
+        // (not just config.rs's own tests). Poison-tolerant acquire.
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -279,7 +281,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_uses_registry_when_cli_and_env_missing() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -295,7 +299,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_uses_conservative_defaults() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -318,7 +324,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_keeps_single_file_registry_override() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -334,7 +342,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_with_globs_prefers_cli_over_registry() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -372,7 +382,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_with_globs_falls_back_to_registry_then_empty() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
@@ -409,7 +421,9 @@ mod tests {
 
     #[test]
     fn resolve_indexing_config_rejects_invalid_env_values() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::new(&[
             INDEX_JOBS_ENV_VAR,
             EMBED_THREADS_ENV_VAR,
