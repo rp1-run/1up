@@ -739,13 +739,30 @@ mod driver_tests {
         assert!(other.exists(), "non-lock files must never be reaped");
     }
 
-    /// Regression for the inode-identity race: a candidate is selected, then
-    /// the pathname is unlinked (a concurrent reaper) and recreated (a
-    /// concurrent startup) before `reap_one` runs. The recreated lock has a
-    /// new inode, so identity gate 1 must abandon it — even though it is
-    /// backdated stale enough that the age gate alone would have deleted it.
+    /// Regression for the replacement race: a candidate is selected, then the
+    /// pathname is unlinked (a concurrent reaper) and recreated (a concurrent
+    /// startup) before `reap_one` runs. Identity gate 1 must abandon the
+    /// candidate so the replacement survives.
+    ///
+    /// Filesystems are free to hand the replacement the *same* inode number
+    /// as the just-unlinked original (APFS and tmpfs both can), so this test
+    /// must not — and does not — assume the inode differs. The deterministic
+    /// discriminator is the mtime component of the `(dev, ino, mtime)`
+    /// identity triple: the candidate was selected with the original's
+    /// explicitly-backdated mtime (> `LOCK_REAP_MAX_AGE_SECS` old), while the
+    /// replacement is created fresh, so the two mtimes differ by ~a week
+    /// regardless of inode reuse. A fresh replacement loses no coverage:
+    /// `reap_one` never re-checks age, so a broken identity gate would unlink
+    /// the fresh file all the same.
+    ///
+    /// The one variant deliberately not asserted here: a replacement that
+    /// reuses the inode AND carries the identical stale mtime is equal on the
+    /// whole identity triple, i.e. indistinguishable from the original by
+    /// design — it *is* the stale file for every observable purpose, deleting
+    /// it is correct behavior, and that outcome is already covered by
+    /// `old_unheld_lock_is_reaped`.
     #[test]
-    fn replaced_inode_is_not_reaped() {
+    fn replaced_lock_file_is_not_reaped_even_if_inode_reused() {
         let dir = tempfile::tempdir().unwrap();
         let root = root_of(&dir);
         let lock = root.join(format!("mcp-{}.lock", hex_key(0xd)));
@@ -753,23 +770,23 @@ mod driver_tests {
         backdate(&lock, LOCK_REAP_MAX_AGE_SECS + 60);
         let selected = candidate_for(&lock);
 
-        // Replacement between selection and reap: unlink + recreate, and make
-        // the replacement look stale by age too (worst case for the reaper).
+        // Replacement between selection and reap: unlink + recreate fresh.
+        // The replacement's mtime is "now", ~LOCK_REAP_MAX_AGE_SECS newer
+        // than the selected candidate's, so identity gate 1 fails on mtime
+        // even if the filesystem reuses the original's inode number.
         std::fs::remove_file(&lock).unwrap();
-        File::create(&lock).unwrap();
-        backdate(&lock, LOCK_REAP_MAX_AGE_SECS + 60);
-        let replacement = std::fs::symlink_metadata(&lock).unwrap();
-        assert_ne!(
-            replacement.ino(),
-            selected.ino,
-            "test premise: the replacement must be a fresh inode"
-        );
+        std::fs::write(&lock, b"replacement").unwrap();
 
         reap_one(&root, &selected);
 
         assert!(
             lock.exists(),
             "a lock recreated at the selected pathname must survive the reap"
+        );
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            b"replacement",
+            "the surviving file must be the replacement, not a resurrected original"
         );
     }
 
