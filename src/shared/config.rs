@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::shared::constants::{
-    EMBED_THREADS_ENV_VAR, GC_MIGRATION_PRUNE_ENV_VAR, INDEX_JOBS_ENV_VAR,
-    INDEX_WRITE_BATCH_FILES_ENV_VAR, MODEL_ARTIFACT_MANIFEST_FILENAME,
+    EMBED_THREADS_ENV_VAR, FORCE_ANN_SEARCH_ENV_VAR, GC_MIGRATION_PRUNE_ENV_VAR,
+    INDEX_JOBS_ENV_VAR, INDEX_WRITE_BATCH_FILES_ENV_VAR, MODEL_ARTIFACT_MANIFEST_FILENAME,
     MODEL_CURRENT_MANIFEST_FILENAME, MODEL_STAGING_DIRNAME, MODEL_VERIFIED_DIRNAME,
     UPDATE_CHECK_CACHE_FILENAME,
 };
@@ -180,6 +180,19 @@ pub fn migration_gc_prune_enabled() -> bool {
 }
 
 fn migration_gc_prune_enabled_value(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|raw| !raw.is_empty() && raw != "0")
+}
+
+/// Reports whether the approximate `vector_top_k` DiskANN search path is force
+/// opted-in via [`FORCE_ANN_SEARCH_ENV_VAR`]. Default OFF: unset, empty, or
+/// `"0"` keep the exact `vector_distance_cos` scan as the default for all corpus
+/// sizes; any other value opts into the ANN path (mirrors
+/// [`migration_gc_prune_enabled`]'s env-flag convention).
+pub fn force_ann_search_enabled() -> bool {
+    force_ann_search_enabled_value(std::env::var_os(FORCE_ANN_SEARCH_ENV_VAR))
+}
+
+fn force_ann_search_enabled_value(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|raw| !raw.is_empty() && raw != "0")
 }
 
@@ -421,5 +434,16 @@ mod tests {
         assert!(migration_gc_prune_enabled_value(Some(OsString::from(
             "true"
         ))));
+    }
+
+    #[test]
+    fn force_ann_search_enabled_value_semantics() {
+        use std::ffi::OsString;
+
+        assert!(!force_ann_search_enabled_value(None));
+        assert!(!force_ann_search_enabled_value(Some(OsString::from(""))));
+        assert!(!force_ann_search_enabled_value(Some(OsString::from("0"))));
+        assert!(force_ann_search_enabled_value(Some(OsString::from("1"))));
+        assert!(force_ann_search_enabled_value(Some(OsString::from("true"))));
     }
 }

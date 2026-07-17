@@ -1,9 +1,13 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use libsql::{Connection, Row};
 
 use crate::search::ranking::tokenize_text;
 use crate::search::scope::SearchScope;
+use crate::shared::config::force_ann_search_enabled;
 use crate::shared::constants::{
-    VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS, VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K,
+    FORCE_ANN_SEARCH_ENV_VAR, VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS,
+    VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K,
 };
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
@@ -203,19 +207,56 @@ pub(crate) async fn has_indexed_embeddings(
 /// How the vector stage computes nearest-neighbour candidates for a context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VectorSearchPath {
-    /// Full `vector_distance_cos` scan over the context's vectors: exact and
-    /// fast at small corpus sizes where graph traversal is read-bound.
+    /// Full `vector_distance_cos` scan over the context's vectors: exact and,
+    /// measured, the fast path at every realistic single-repo corpus size (an
+    /// in-memory linear pass of ~N x 384 dot products, sub-second well past
+    /// 256k vectors). This is the unconditional default.
     ExhaustiveScan,
-    /// `vector_top_k` traversal of the approximate vector index: amortizes
-    /// above [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`].
+    /// `vector_top_k` traversal of the approximate DiskANN index. Demoted to
+    /// explicit opt-in ([`FORCE_ANN_SEARCH_ENV_VAR`]) because it is
+    /// pathologically slow and *superlinear* in practice — ~7s @ 4.5k vectors,
+    /// ~45s @ 27k vectors (measured on the emdash corpus) — so it never wins
+    /// automatically until it is demonstrably faster.
     AnnIndex,
 }
 
-pub(crate) fn vector_search_path_for_corpus(context_vector_count: usize) -> VectorSearchPath {
-    if context_vector_count <= VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS {
-        VectorSearchPath::ExhaustiveScan
-    } else {
+/// Pure path-selection gate (unit-testable, no process env access).
+///
+/// The exact `vector_distance_cos` scan is the default for ALL corpus sizes
+/// because the approximate `vector_top_k` DiskANN path is measured slower and
+/// superlinear (~7s @ 4.5k, ~45s @ 27k vectors). The ANN path is only reachable
+/// when `force_ann` is set (via [`FORCE_ANN_SEARCH_ENV_VAR`] at the call site),
+/// and even then only above the historic [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`]
+/// cutoff, where the memory-resident linear pass would finally lose.
+pub(crate) fn vector_search_path_for_corpus(
+    context_vector_count: usize,
+    force_ann: bool,
+) -> VectorSearchPath {
+    if force_ann && context_vector_count > VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS {
         VectorSearchPath::AnnIndex
+    } else {
+        VectorSearchPath::ExhaustiveScan
+    }
+}
+
+/// Emits a single process-wide `tracing::warn!` the first time a context's
+/// vector count exceeds [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`]. Above this
+/// (deliberately high) bound the default exact scan is still served, but its
+/// latency grows linearly with corpus size, so the operator gets one heads-up
+/// rather than a per-query log flood.
+fn warn_once_above_exhaustive_cliff(vector_count: usize) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    if vector_count > VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS
+        && WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "vector corpus has {vector_count} vectors, above the {VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS} exhaustive-scan cliff; \
+             the default exact vector scan stays correct but its latency grows linearly with corpus size \
+             (set {FORCE_ANN_SEARCH_ENV_VAR}=1 to opt into the approximate DiskANN path, which is currently slower)"
+        );
     }
 }
 
@@ -254,8 +295,9 @@ pub(crate) async fn fetch_vector_candidates_with_count(
             Some(count) => count,
             None => count_vector_rows_for_context(conn, scope).await?,
         };
+        warn_once_above_exhaustive_cliff(vector_count);
         (
-            vector_search_path_for_corpus(vector_count),
+            vector_search_path_for_corpus(vector_count, force_ann_search_enabled()),
             Some(vector_count),
         )
     };
@@ -1016,22 +1058,43 @@ mod tests {
     }
 
     #[test]
-    fn vector_search_path_pins_threshold_boundaries() {
+    fn vector_search_path_defaults_to_exhaustive_for_all_sizes() {
+        // Without the ANN opt-in, every corpus size — including well above the
+        // old cliff — routes to the exact scan, which is the measured-fast path.
+        for count in [
+            0,
+            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1,
+            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS,
+            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1,
+            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS * 4,
+        ] {
+            assert_eq!(
+                vector_search_path_for_corpus(count, false),
+                VectorSearchPath::ExhaustiveScan,
+                "count {count} must default to the exact scan without the ANN opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_search_path_opts_into_ann_above_cliff_when_forced() {
+        // With the ANN opt-in the historic count-based cutoff applies: at or
+        // below the cliff the exact scan still wins; above it, ANN takes over.
         assert_eq!(
-            vector_search_path_for_corpus(0),
+            vector_search_path_for_corpus(0, true),
             VectorSearchPath::ExhaustiveScan
         );
         assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1),
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1, true),
             VectorSearchPath::ExhaustiveScan
         );
         assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS),
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS, true),
             VectorSearchPath::ExhaustiveScan,
             "the threshold itself stays on the exact path"
         );
         assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1),
+            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1, true),
             VectorSearchPath::AnnIndex
         );
     }
@@ -1094,7 +1157,7 @@ mod tests {
         let live = count_vector_rows_for_context(&conn, &scope).await.unwrap();
         assert_eq!(live, 10, "fixture seeds ten context vectors");
         assert_eq!(
-            vector_search_path_for_corpus(live),
+            vector_search_path_for_corpus(live, false),
             VectorSearchPath::ExhaustiveScan,
             "ten vectors stay on the exact path"
         );
