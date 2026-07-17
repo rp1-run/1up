@@ -2470,12 +2470,17 @@ async fn run_project(
                 // Missing readiness would only carry a generic next_action.
                 // Best-effort: runs the synchronous walk off the async executor
                 // (matching FIX C) and never blocks or fails the idle return.
-                let persist_state_root = state_root.to_path_buf();
-                let persist_source_root = source_root.to_path_buf();
+                // The walk observes this pass's per-project child token, like the
+                // gate walk above: SIGTERM cancels the daemon parent (and thus
+                // this child), and a de-register cancels only this child.
+                let persist_state_root = state_root.clone();
+                let persist_source_root = source_root.clone();
+                let persist_cancel_token = project_cancel_token.clone();
                 match tokio::task::spawn_blocking(move || {
                     crate::mcp::ops::persist_scope_proposal_for_gate(
                         &persist_state_root,
                         &persist_source_root,
+                        &persist_cancel_token,
                     )
                 })
                 .await

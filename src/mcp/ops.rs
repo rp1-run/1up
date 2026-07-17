@@ -8,6 +8,7 @@ use anyhow::{bail, Context};
 use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::daemon::lifecycle;
 use crate::daemon::registry::Registry;
@@ -3337,11 +3338,29 @@ fn save_persisted_scope_proposal(
 /// off the async executor (the walk is synchronous) and `warn!` on error. This
 /// is what lets a later `oneup_status` surface ranked scope suggestions when the
 /// daemon — not the synchronous MCP walk — fired the monorepo gate.
+///
+/// Cancel-aware: the walk checks `cancel_token` periodically (same cadence as
+/// the daemon's gate walk) so a SIGTERM during proposal building does not pin
+/// the daemon's bounded drain for a full repo walk. On cancellation it returns
+/// `Ok(())` without persisting — the persist is best-effort and must never
+/// error the idle return.
 pub fn persist_scope_proposal_for_gate(
     state_root: &Path,
     source_root: &Path,
+    cancel_token: &CancellationToken,
 ) -> Result<(), OneupError> {
-    let dir_counts = count_files_per_directory(source_root)?;
+    // Stamp the freshness key from BEFORE the walk: if HEAD or the root mtime
+    // drift mid-walk, the persisted (pre-change) stats then read back stale —
+    // the safe direction — instead of being labelled with the post-change key.
+    let key = cache_key_to_string(&build_directory_walk_cache_key(source_root));
+    let dir_counts = match count_files_per_directory_cancellable(source_root, cancel_token) {
+        Ok(counts) => counts,
+        Err(e) if cancel_token.is_cancelled() => {
+            tracing::debug!("scope proposal walk cancelled; skipping persist: {e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let file_count_total: usize = dir_counts.values().sum();
 
     let mut per_directory_stats: Vec<PersistedDirectoryStat> = dir_counts
@@ -3360,7 +3379,7 @@ pub fn persist_scope_proposal_for_gate(
     per_directory_stats.retain(|stat| !EXCLUDED_DOT_DIRS.contains(&stat.directory.as_str()));
 
     let proposal = PersistedScopeProposal {
-        key: cache_key_to_string(&build_directory_walk_cache_key(source_root)),
+        key,
         per_directory_stats,
         file_count_total,
         // The daemon has no launch subdirectory concept; MCP/CLI invocations do.
@@ -3546,7 +3565,25 @@ fn get_file_count_threshold() -> usize {
 /// Cache invalidates on git HEAD drift or root directory mtime change,
 /// ensuring <1s repeat call latency while maintaining correctness.
 /// F5/N4b: Uses both in-process and persistent (disk-based) caches for cross-process reuse.
+///
+/// Non-cancellable convenience wrapper for synchronous callers (facts envelope,
+/// coverage disclosure, refuse-and-propose) whose walks must run to completion;
+/// cancel-aware callers (the daemon gate-fired branch) use
+/// [`count_files_per_directory_cancellable`] directly.
 fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
+    count_files_per_directory_cancellable(source_root, &CancellationToken::new())
+}
+
+/// Cancel-aware core of [`count_files_per_directory`]. A cold cache runs the
+/// full repo walk, which checks `cancel_token` every ~100 entries (mirroring
+/// the daemon's `count_files_gitignore_aware` gate walk) so SIGTERM can
+/// interrupt it. On cancellation the partial result is discarded — never
+/// cached in-process or on disk — and an error is returned for the caller to
+/// map into its best-effort semantics.
+fn count_files_per_directory_cancellable(
+    source_root: &Path,
+    cancel_token: &CancellationToken,
+) -> Result<BTreeMap<String, usize>, OneupError> {
     // Build cache key from repo identity and current state
     let cache_key = build_directory_walk_cache_key(source_root);
 
@@ -3575,7 +3612,7 @@ fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usiz
     }
 
     // Not in either cache, compute via gitignore-aware walk
-    let result = count_files_per_directory_uncached(source_root)?;
+    let result = count_files_per_directory_uncached(source_root, cancel_token)?;
 
     // Store in both caches for future calls
     if let Ok(mut cache) = get_directory_walk_cache().lock() {
@@ -3631,6 +3668,7 @@ fn build_vcs_aware_walker(source_root: &Path) -> ignore::WalkBuilder {
 /// the indexer's actual file counts and exclude untracked build trees.
 fn count_files_per_directory_uncached(
     source_root: &Path,
+    cancel_token: &CancellationToken,
 ) -> Result<BTreeMap<String, usize>, OneupError> {
     let mut dir_counts: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -3638,7 +3676,14 @@ fn count_files_per_directory_uncached(
     let walker = build_vcs_aware_walker(source_root).build();
 
     // Aggregate files by their top-level directory
-    for entry in walker.flatten() {
+    for (idx, entry) in walker.flatten().enumerate() {
+        // Check cancellation every 100 entries (same cadence as the daemon's
+        // count_files_gitignore_aware gate walk) so SIGTERM can interrupt.
+        if idx % 100 == 0 && cancel_token.is_cancelled() {
+            return Err(OneupError::Other(anyhow::anyhow!(
+                "directory walk cancelled"
+            )));
+        }
         // Only count files, not directories
         if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             // Get the relative path from source_root
@@ -3667,7 +3712,12 @@ fn count_files_per_directory_uncached(
         let walker = build_vcs_aware_walker(source_root).build();
 
         let mut root_count = 0;
-        for entry in walker.flatten() {
+        for (idx, entry) in walker.flatten().enumerate() {
+            if idx % 100 == 0 && cancel_token.is_cancelled() {
+                return Err(OneupError::Other(anyhow::anyhow!(
+                    "directory walk cancelled"
+                )));
+            }
             if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 if let Ok(rel_path) = entry.path().strip_prefix(source_root) {
                     // N1: Skip files under VCS directories
@@ -7046,5 +7096,108 @@ mod tests {
         attach_scope_proposal_if_fresh(&mut payload, &state_root, &source_root);
 
         assert!(payload.scope_proposal.is_none());
+    }
+
+    // --- Walk-cache key sensitivity (real components behind the freshness gate) ---
+
+    fn git_in(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command runs");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Bumps the source root's mtime past whole-second granularity (the walk
+    /// cache key stores seconds) without a wall-clock dependency: sets an
+    /// explicit future mtime through std's `File::set_modified`, falling back
+    /// to a >1s sleep plus a direct-child touch on platforms where opening a
+    /// directory handle fails (e.g. Windows).
+    fn bump_root_mtime_past_second(repo: &Path, baseline_secs: u64) {
+        let target = SystemTime::UNIX_EPOCH + Duration::from_secs(baseline_secs + 5);
+        let bumped = std::fs::File::open(repo)
+            .and_then(|dir| dir.set_modified(target))
+            .is_ok();
+        if !bumped {
+            std::thread::sleep(Duration::from_millis(1100));
+            fs::write(repo.join("mtime_fallback_touch"), "x").unwrap();
+        }
+    }
+
+    /// The freshness matrix above exercises `is_scope_proposal_fresh` with
+    /// synthetic strings; this pins the REAL key builder to each component:
+    /// a direct-child change moves the root-mtime component, a new commit
+    /// moves the HEAD component, and distinct roots yield distinct identities.
+    #[test]
+    fn walk_cache_key_tracks_real_head_mtime_and_repo_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        git_in(&repo, &["init"]);
+        git_in(&repo, &["config", "user.email", "test@example.com"]);
+        git_in(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "initial"]);
+
+        let baseline_key = build_directory_walk_cache_key(&repo);
+        let baseline = cache_key_to_string(&baseline_key);
+        let baseline_mtime = baseline_key.root_mtime.expect("root mtime readable");
+
+        // (a) Root mtime component: create a direct child of the source root
+        // (which touches the root directory's mtime) and push the mtime past
+        // second granularity so the seconds-resolution key must move.
+        fs::write(repo.join("new_child.txt"), "content").unwrap();
+        bump_root_mtime_past_second(&repo, baseline_mtime);
+        let after_mtime_key = build_directory_walk_cache_key(&repo);
+        assert_ne!(
+            baseline_key.root_mtime, after_mtime_key.root_mtime,
+            "direct-child change must move the root mtime component"
+        );
+        assert_ne!(
+            baseline,
+            cache_key_to_string(&after_mtime_key),
+            "root mtime drift must change the stringified key"
+        );
+
+        // (b) HEAD component: advance HEAD with a real commit. Commits write
+        // under .git/ (not a direct child of the root), so against the
+        // post-mtime key only the HEAD component moves.
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "advance HEAD"]);
+        let after_commit_key = build_directory_walk_cache_key(&repo);
+        assert_ne!(
+            after_mtime_key.head_commit, after_commit_key.head_commit,
+            "a new commit must move the HEAD component"
+        );
+        assert_ne!(
+            cache_key_to_string(&after_mtime_key),
+            cache_key_to_string(&after_commit_key),
+            "HEAD drift must change the stringified key"
+        );
+
+        // (c) Repo identity component: two distinct roots produce distinct
+        // keys regardless of their HEAD/mtime state.
+        let other = temp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let other = other.canonicalize().unwrap();
+        let other_key = build_directory_walk_cache_key(&other);
+        assert_ne!(
+            after_commit_key.repo_identity, other_key.repo_identity,
+            "distinct roots must have distinct repo identities"
+        );
+        assert_ne!(
+            cache_key_to_string(&after_commit_key),
+            cache_key_to_string(&other_key),
+            "distinct roots must produce distinct stringified keys"
+        );
     }
 }
