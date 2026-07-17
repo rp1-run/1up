@@ -23,10 +23,11 @@ const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
 /// `Unreadable` (torn/corrupt) file is retried up to
 /// [`STATUS_READ_RETRY_ATTEMPTS`] times with a [`STATUS_READ_RETRY_DELAY_MS`]
 /// pause between attempts (a torn write from a concurrent atomic replace settles
-/// within one `rename(2)`); if it is still unparseable we `tracing::warn!` and
+/// within one `rename(2)`); if it is still unparseable we `tracing::error!` and
 /// return `None`. Returning `None` here means "no information" — the surface
 /// renders as unavailable/indeterminate and never fabricates zero progress from
-/// a corrupt file, and the warning ensures the corruption is not swallowed
+/// a corrupt file, and the error (visible at default verbosity) ensures the
+/// corruption is not swallowed
 /// silently. Sync (`std::thread::sleep`) because every display caller is sync
 /// with respect to this read.
 fn read_status_for_display<T: DeserializeOwned>(path: &Path, what: &str) -> Option<T> {
@@ -36,7 +37,7 @@ fn read_status_for_display<T: DeserializeOwned>(path: &Path, what: &str) -> Opti
             StatusFileRead::Parsed(value) => return Some(value),
             StatusFileRead::Unreadable(err) => {
                 if attempt == STATUS_READ_RETRY_ATTEMPTS {
-                    tracing::warn!(
+                    tracing::error!(
                         "{what} file {} is unreadable after {STATUS_READ_RETRY_ATTEMPTS} attempts ({err}); reporting as unavailable, not empty progress",
                         path.display(),
                     );
@@ -52,7 +53,7 @@ fn read_status_for_display<T: DeserializeOwned>(path: &Path, what: &str) -> Opti
 pub(crate) fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let path = config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
     // Retry-or-propagate: Absent -> None (not yet written); Unreadable -> retry
-    // then warn + None (never rendered as valid empty progress).
+    // then error + None (never rendered as valid empty progress).
     read_status_for_display(&path, "index_status.json")
 }
 

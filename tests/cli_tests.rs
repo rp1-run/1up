@@ -2391,10 +2391,11 @@ fn status_and_list_ignore_daemon_status_from_other_contexts() {
 
 #[test]
 fn status_with_corrupt_index_status_warns_and_does_not_report_empty_progress() {
-    // A torn/corrupt `index_status.json` must be surfaced (a warning to stderr)
-    // instead of silently swallowed to `None` and rendered as valid empty
-    // progress. Regression for the torn-read-as-empty defect (#118 / REQ-002):
-    // the old `.ok()?` swallow emitted no warning and hid the corruption.
+    // A torn/corrupt `index_status.json` must be surfaced (an error to stderr
+    // at DEFAULT verbosity — no `-v` needed) instead of silently swallowed to
+    // `None` and rendered as valid empty progress. Regression for the
+    // torn-read-as-empty defect (#118 / REQ-002): the old `.ok()?` swallow
+    // emitted no warning and hid the corruption.
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
@@ -2416,13 +2417,7 @@ fn status_with_corrupt_index_status_warns_and_does_not_report_empty_progress() {
     );
 
     let output = cmd_with_home(&canonical_home)
-        .args([
-            "-v",
-            "status",
-            project.to_str().unwrap(),
-            "--format",
-            "json",
-        ])
+        .args(["status", project.to_str().unwrap(), "--format", "json"])
         .output()
         .unwrap();
 
@@ -2437,7 +2432,7 @@ fn status_with_corrupt_index_status_warns_and_does_not_report_empty_progress() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("index_status.json") && stderr.to_lowercase().contains("unreadable"),
-        "expected a warning naming the unreadable status file; stderr={stderr}",
+        "expected an error naming the unreadable status file; stderr={stderr}",
     );
 
     // A corrupt file must never render as a valid running/indexing state.

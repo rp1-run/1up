@@ -3047,7 +3047,8 @@ fn only_references(results: Vec<SymbolResult>) -> Vec<SymbolResult> {
 /// corrupt) file is retried up to [`STATUS_READ_RETRY_ATTEMPTS`] times with an
 /// async [`STATUS_READ_RETRY_DELAY_MS`] `tokio::time::sleep` (async so a rare
 /// corrupt-file retry never blocks a tokio worker); if it is still unparseable
-/// we `tracing::warn!` and return `None` so readiness degrades to its
+/// we `tracing::error!` (visible at default verbosity) and return `None` so
+/// readiness degrades to its
 /// indeterminate/blocked classification rather than confidently reporting "no
 /// index" from a corrupt file. `None` is never treated as valid empty progress.
 async fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
@@ -3065,7 +3066,7 @@ async fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
             }
             StatusFileRead::Unreadable(err) => {
                 if attempt == STATUS_READ_RETRY_ATTEMPTS {
-                    tracing::warn!(
+                    tracing::error!(
                         "index_status.json at {} is unreadable after {STATUS_READ_RETRY_ATTEMPTS} attempts ({err}); treating readiness as indeterminate, not \"no index\"",
                         path.display(),
                     );
