@@ -29,10 +29,12 @@ use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
     FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_SYMBOLS_PER_LIST,
     NO_INDEXED_EMBEDDINGS_REASON, PROJECT_STATE_DIR_MODE, SCOPE_TRUNCATION_REASON,
-    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, SYMBOL_LIST_TRUNCATION_REASON,
+    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, STATUS_READ_RETRY_ATTEMPTS,
+    STATUS_READ_RETRY_DELAY_MS, SYMBOL_LIST_TRUNCATION_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
+use crate::shared::progress::{read_status_file, StatusFileRead};
 use crate::shared::project;
 use crate::shared::types::{
     combine_degraded_reasons, DaemonProjectStatus, IndexProgress, IndexScope, IndexState,
@@ -669,6 +671,7 @@ fn spawn_rebuild_task(
                     &roots.worktree_context,
                     err.to_string(),
                 )
+                .await
             }
         }
     })
@@ -822,7 +825,8 @@ pub async fn classify_readiness(
     let project_initialized = project_id_result.is_ok();
     let db_path = project_db_path(state_root);
     let index_present = db_path.exists();
-    let index_progress = read_index_progress_for_context(state_root, &worktree_context.context_id);
+    let index_progress =
+        read_index_progress_for_context(state_root, &worktree_context.context_id).await;
     let daemon_context_status = crate::cli::project_status_files::read_daemon_context_status(
         state_root,
         &worktree_context.context_id,
@@ -1123,7 +1127,7 @@ fn apply_head_drift(
     payload.current_head = Some(current);
 }
 
-pub fn blocked_readiness(
+pub async fn blocked_readiness(
     state_root: &Path,
     source_root: &Path,
     worktree_context: &WorktreeContext,
@@ -1131,7 +1135,8 @@ pub fn blocked_readiness(
 ) -> ReadinessPayload {
     let project_initialized = project::read_project_id(state_root).is_ok();
     let db_path = project_db_path(state_root);
-    let index_progress = read_index_progress_for_context(state_root, &worktree_context.context_id);
+    let index_progress =
+        read_index_progress_for_context(state_root, &worktree_context.context_id).await;
     let daemon_status = crate::cli::project_status_files::read_daemon_status_for_context(
         state_root,
         &worktree_context.context_id,
@@ -1750,7 +1755,8 @@ async fn run_index_then_classify(
             &roots.source_root,
             &roots.worktree_context,
             err.to_string(),
-        )),
+        )
+        .await),
     }
 }
 
@@ -3034,22 +3040,49 @@ fn only_references(results: Vec<SymbolResult>) -> Vec<SymbolResult> {
         .collect()
 }
 
-fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
+/// Read the index-progress status file for MCP readiness classification.
+///
+/// Retry-or-propagate policy for the MCP readiness call-site class: an `Absent`
+/// file resolves to `None` (no index recorded yet). An `Unreadable` (torn or
+/// corrupt) file is retried up to [`STATUS_READ_RETRY_ATTEMPTS`] times with an
+/// async [`STATUS_READ_RETRY_DELAY_MS`] `tokio::time::sleep` (async so a rare
+/// corrupt-file retry never blocks a tokio worker); if it is still unparseable
+/// we `tracing::warn!` and return `None` so readiness degrades to its
+/// indeterminate/blocked classification rather than confidently reporting "no
+/// index" from a corrupt file. `None` is never treated as valid empty progress.
+async fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let path = project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let progress = serde_json::from_str(&content).ok()?;
-
-    // Check if the progress file is stale (Running state, dead process, age > 5 min).
-    // Treat stale progress as if no index exists, so agents don't poll indefinitely.
-    if is_index_progress_stale(&progress, &path) {
-        return None;
+    for attempt in 1..=STATUS_READ_RETRY_ATTEMPTS {
+        match read_status_file::<IndexProgress>(&path) {
+            StatusFileRead::Absent => return None,
+            StatusFileRead::Parsed(progress) => {
+                // Check if the progress file is stale (Running state, dead process, age > 5 min).
+                // Treat stale progress as if no index exists, so agents don't poll indefinitely.
+                if is_index_progress_stale(&progress, &path) {
+                    return None;
+                }
+                return Some(progress);
+            }
+            StatusFileRead::Unreadable(err) => {
+                if attempt == STATUS_READ_RETRY_ATTEMPTS {
+                    tracing::warn!(
+                        "index_status.json at {} is unreadable after {STATUS_READ_RETRY_ATTEMPTS} attempts ({err}); treating readiness as indeterminate, not \"no index\"",
+                        path.display(),
+                    );
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(STATUS_READ_RETRY_DELAY_MS)).await;
+            }
+        }
     }
-
-    Some(progress)
+    None
 }
 
-fn read_index_progress_for_context(project_root: &Path, context_id: &str) -> Option<IndexProgress> {
-    read_index_progress(project_root).filter(|progress| {
+async fn read_index_progress_for_context(
+    project_root: &Path,
+    context_id: &str,
+) -> Option<IndexProgress> {
+    read_index_progress(project_root).await.filter(|progress| {
         progress
             .context_id
             .as_deref()

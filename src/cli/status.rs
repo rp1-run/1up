@@ -138,6 +138,9 @@ pub async fn exec(args: StatusArgs, format: OutputFormat) -> anyhow::Result<()> 
         }
     };
 
+    // `read_index_progress` retries a torn file then warns and returns `None`,
+    // so a `None` here is "no progress info" (not-yet-written or unavailable) and
+    // is never rendered as valid empty/zero progress.
     let index_progress = read_index_progress(&project_root).filter(|progress| {
         progress
             .context_id

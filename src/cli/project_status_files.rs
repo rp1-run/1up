@@ -1,8 +1,13 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
 
 use crate::shared::config;
+use crate::shared::constants::{STATUS_READ_RETRY_ATTEMPTS, STATUS_READ_RETRY_DELAY_MS};
 use crate::shared::fs::atomic_replace_within_project_root;
+use crate::shared::progress::{read_status_file, StatusFileRead};
 use crate::shared::types::{
     DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus, IndexProgress,
 };
@@ -10,10 +15,45 @@ use crate::shared::types::{
 const INDEX_PROGRESS_FILE_NAME: &str = "index_status.json";
 const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
 
+/// Read a JSON status file for a read-only display surface (`1up status` /
+/// `1up list`).
+///
+/// Retry-or-propagate policy for this call-site class: an `Absent` file is the
+/// legitimate not-yet-written state and resolves to `None` silently. An
+/// `Unreadable` (torn/corrupt) file is retried up to
+/// [`STATUS_READ_RETRY_ATTEMPTS`] times with a [`STATUS_READ_RETRY_DELAY_MS`]
+/// pause between attempts (a torn write from a concurrent atomic replace settles
+/// within one `rename(2)`); if it is still unparseable we `tracing::warn!` and
+/// return `None`. Returning `None` here means "no information" — the surface
+/// renders as unavailable/indeterminate and never fabricates zero progress from
+/// a corrupt file, and the warning ensures the corruption is not swallowed
+/// silently. Sync (`std::thread::sleep`) because every display caller is sync
+/// with respect to this read.
+fn read_status_for_display<T: DeserializeOwned>(path: &Path, what: &str) -> Option<T> {
+    for attempt in 1..=STATUS_READ_RETRY_ATTEMPTS {
+        match read_status_file::<T>(path) {
+            StatusFileRead::Absent => return None,
+            StatusFileRead::Parsed(value) => return Some(value),
+            StatusFileRead::Unreadable(err) => {
+                if attempt == STATUS_READ_RETRY_ATTEMPTS {
+                    tracing::warn!(
+                        "{what} file {} is unreadable after {STATUS_READ_RETRY_ATTEMPTS} attempts ({err}); reporting as unavailable, not empty progress",
+                        path.display(),
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(STATUS_READ_RETRY_DELAY_MS));
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn read_index_progress(project_root: &Path) -> Option<IndexProgress> {
     let path = config::project_dot_dir(project_root).join(INDEX_PROGRESS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // Retry-or-propagate: Absent -> None (not yet written); Unreadable -> retry
+    // then warn + None (never rendered as valid empty progress).
+    read_status_for_display(&path, "index_status.json")
 }
 
 pub(crate) fn read_daemon_status(project_root: &Path) -> Option<DaemonProjectStatus> {
@@ -43,8 +83,10 @@ pub(crate) fn read_daemon_context_status(
 
 fn read_daemon_context_status_file(project_root: &Path) -> Option<DaemonContextStatusFile> {
     let path = config::project_dot_dir(project_root).join(DAEMON_CONTEXT_STATUS_FILE_NAME);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // Retry-or-propagate: Absent -> None (not yet written); Unreadable -> retry
+    // then warn + None. `prune_daemon_context_status` treats `None` as a no-op,
+    // which correctly leaves a corrupt file intact instead of clobbering it.
+    read_status_for_display(&path, "daemon_context_status.json")
 }
 
 /// Remove the given context ids from `daemon_context_status.json` so pruned contexts
@@ -74,8 +116,9 @@ pub(crate) fn prune_daemon_context_status(
 
 fn read_legacy_daemon_status(project_root: &Path) -> Option<DaemonProjectStatus> {
     let path = config::project_daemon_status_path(project_root);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // Retry-or-propagate: Absent -> None (not yet written); Unreadable -> retry
+    // then warn + None (never rendered as a valid check timestamp).
+    read_status_for_display(&path, "daemon_status.json")
 }
 
 #[cfg(test)]

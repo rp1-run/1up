@@ -755,6 +755,10 @@ fn readiness_context_metadata(
     roots: &McpProjectRoots,
     payload: &ReadinessPayload,
 ) -> ReadinessContextMetadata {
+    // Retry-or-propagate lives inside the reader: Absent -> None (not yet
+    // written); Unreadable -> bounded retry then warn + None. A `None` here
+    // leaves the readiness metadata at its default/indeterminate values rather
+    // than fabricating fields from a corrupt file.
     let context_status = crate::cli::project_status_files::read_daemon_context_status(
         &roots.state_root,
         &roots.worktree_context.context_id,

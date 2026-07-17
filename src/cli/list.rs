@@ -45,6 +45,8 @@ pub async fn exec(_args: ListArgs, format: OutputFormat) -> anyhow::Result<()> {
 
 async fn project_list_item(entry: &ProjectEntry, daemon_running: bool) -> ProjectListItem {
     let context_id = entry.context_id();
+    // `read_index_progress` retries a torn file then warns and returns `None`, so
+    // a `None` here is "no progress info" and never a valid empty-progress record.
     let index_progress = read_index_progress(&entry.project_root).filter(|progress| {
         progress
             .context_id

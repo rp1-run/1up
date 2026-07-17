@@ -2389,6 +2389,62 @@ fn status_and_list_ignore_daemon_status_from_other_contexts() {
     assert_eq!(list_json["projects"][0]["segments"], 0);
 }
 
+#[test]
+fn status_with_corrupt_index_status_warns_and_does_not_report_empty_progress() {
+    // A torn/corrupt `index_status.json` must be surfaced (a warning to stderr)
+    // instead of silently swallowed to `None` and rendered as valid empty
+    // progress. Regression for the torn-read-as-empty defect (#118 / REQ-002):
+    // the old `.ok()?` swallow emitted no warning and hid the corruption.
+    let home = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let project = project_dir.path().canonicalize().unwrap();
+    let dot_dir = project.join(".1up");
+    fs::create_dir_all(&dot_dir).unwrap();
+    fs::write(dot_dir.join("project_id"), "corrupt-status-project").unwrap();
+    // Present but unparseable (a truncated / torn write).
+    fs::write(dot_dir.join("index_status.json"), b"{\"state\":\"run").unwrap();
+    write_registry(
+        &canonical_home,
+        serde_json::json!([
+            {
+                "project_id": "corrupt-status-project",
+                "project_root": project,
+                "registered_at": "2026-05-01T00:10:00Z"
+            }
+        ]),
+    );
+
+    let output = cmd_with_home(&canonical_home)
+        .args([
+            "-v",
+            "status",
+            project.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status must stay readable with a corrupt progress file; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The corruption must be surfaced to logs rather than silently swallowed.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("index_status.json") && stderr.to_lowercase().contains("unreadable"),
+        "expected a warning naming the unreadable status file; stderr={stderr}",
+    );
+
+    // A corrupt file must never render as a valid running/indexing state.
+    let status_json = json_stdout(&output);
+    assert_ne!(status_json["last_update_state"], "running");
+}
+
 #[cfg(unix)]
 #[test]
 fn start_warns_on_stale_schema() {
