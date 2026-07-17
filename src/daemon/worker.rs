@@ -778,13 +778,27 @@ fn is_entry_dead(root_probe: PathPresence, db_probe: PathPresence) -> bool {
     root_probe == PathPresence::DefinitelyAbsent && db_probe == PathPresence::DefinitelyAbsent
 }
 
+/// Probe whether a single registry entry is dead *right now*: true only when
+/// both its project root and its derived `index.db` (via
+/// [`config::project_db_path`]) are `DefinitelyAbsent`.
+///
+/// Pure and injected with `probe` so it is deterministic and unit-testable (the
+/// daemon passes [`probe_path_presence`]). Shared by the pre-lock candidate scan
+/// ([`dead_project_context_ids`]) and the under-lock re-validation predicate, so
+/// the two cannot drift.
+fn probe_entry_dead(entry: &ProjectEntry, probe: &dyn Fn(&Path) -> PathPresence) -> bool {
+    let root_probe = probe(&entry.project_root);
+    let db_probe = probe(&config::project_db_path(&entry.project_root));
+    is_entry_dead(root_probe, db_probe)
+}
+
 /// Select the context ids of registry entries whose project root AND `index.db`
 /// are both definitively gone (a fully-deleted project).
 ///
 /// Pure and injected with `probe` so it is deterministic and unit-testable (the
-/// daemon passes [`probe_path_presence`]). Each entry's `index.db` path is derived
-/// from its project root via [`config::project_db_path`], matching where the index
-/// actually lives.
+/// daemon passes [`probe_path_presence`]). This is only a cheap pre-lock
+/// candidate filter: the paths are re-probed under the registry lock before any
+/// entry is actually removed.
 fn dead_project_context_ids(
     registry: &Registry,
     probe: &dyn Fn(&Path) -> PathPresence,
@@ -792,11 +806,7 @@ fn dead_project_context_ids(
     registry
         .projects
         .iter()
-        .filter(|entry| {
-            let root_probe = probe(&entry.project_root);
-            let db_probe = probe(&config::project_db_path(&entry.project_root));
-            is_entry_dead(root_probe, db_probe)
-        })
+        .filter(|entry| probe_entry_dead(entry, probe))
         .map(ProjectEntry::context_id)
         .collect()
 }
@@ -816,27 +826,41 @@ fn dead_project_context_ids(
 /// Every step is best-effort: a de-register hiccup is logged and swallowed so it
 /// can never block or fail daemon startup. The registry is reloaded fresh before
 /// mutating so a concurrent registration is not clobbered, and the removal goes
-/// through the existing atomic save under the registry lock
-/// ([`Registry::deregister_context_ids`]).
+/// through the atomic save under the registry lock
+/// ([`Registry::deregister_context_ids_if`]).
+///
+/// The pre-lock scan is only a candidate filter: context ids are deterministic
+/// for the same state root, source root, and branch, so a project recreated and
+/// re-registered by a concurrent `1up start` between the scan and the locked
+/// mutation would carry the same id as the stale snapshot entry. Each candidate
+/// is therefore re-probed ([`probe_entry_dead`]) under the registry lock, after
+/// the fresh reload, and removed only if its project root and `index.db` are
+/// still definitively gone at save time.
 async fn deregister_deleted_projects_on_startup(registry: &Registry) {
     let dead_ids = dead_project_context_ids(registry, &|p: &Path| probe_path_presence(p));
     if dead_ids.is_empty() {
         return;
     }
 
-    // One info line per removed entry, naming the project root for diagnosability.
+    // One info line per candidate entry, naming the project root for
+    // diagnosability. A candidate is only actually removed if it still probes
+    // dead under the registry lock below.
     let dead_set: HashSet<String> = dead_ids.into_iter().collect();
     for entry in &registry.projects {
         if dead_set.contains(&entry.context_id()) {
             info!(
-                "de-registering fully-deleted project on startup: {} (context {})",
+                "fully-deleted project candidate for de-registration on startup: {} (context {})",
                 entry.project_root.display(),
                 entry.context_id()
             );
         }
     }
 
-    match Registry::load().and_then(|mut r| r.deregister_context_ids(&dead_set)) {
+    match Registry::load().and_then(|mut r| {
+        r.deregister_context_ids_if(&dead_set, &|entry| {
+            probe_entry_dead(entry, &|p: &Path| probe_path_presence(p))
+        })
+    }) {
         Ok(removed) => {
             info!("de-registered {removed} fully-deleted project(s) on startup");
         }
@@ -3900,6 +3924,41 @@ mod tests {
         };
         let dead = dead_project_context_ids(&registry, &|_| PathPresence::Indeterminate);
         assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn revived_candidate_no_longer_probes_dead_at_removal_time() {
+        // Regression companion for the startup TOCTOU fix: candidates come from
+        // a stale snapshot, so each one is re-probed under the registry lock via
+        // `probe_entry_dead` before removal. Once the project root and index.db
+        // are recreated (e.g. a concurrent `1up start` re-registering the same
+        // deterministic context id), the shared predicate must flip to "alive"
+        // so the conditional removal keeps the entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("revived");
+        let registry = Registry {
+            projects: vec![dead_test_entry(&root, "revive000001")],
+        };
+
+        // Snapshot scan: fully deleted, so the entry is a removal candidate.
+        let dead = dead_project_context_ids(&registry, &|p| probe_path_presence(p));
+        assert_eq!(dead, vec!["revive000001".to_string()]);
+
+        // Concurrent recreation before the locked mutation: root + index.db
+        // are back, so the re-probe must no longer classify the entry as dead.
+        std::fs::create_dir_all(config::project_dot_dir(&root)).unwrap();
+        std::fs::write(config::project_db_path(&root), b"db").unwrap();
+        assert!(
+            !probe_entry_dead(&registry.projects[0], &|p| probe_path_presence(p)),
+            "revived entry must survive the under-lock re-probe"
+        );
+
+        // A candidate that is still fully deleted keeps probing dead and is
+        // therefore still removed.
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(probe_entry_dead(&registry.projects[0], &|p| {
+            probe_path_presence(p)
+        }));
     }
 
     #[tokio::test]
