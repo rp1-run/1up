@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Duration, Utc};
 use libsql::Connection;
 use sha2::{Digest, Sha256};
 
@@ -1287,6 +1288,96 @@ pub async fn prunable_segments_proxy(
         }
     }
     Ok(total)
+}
+
+/// Pure predicate: is `candidate` a stale per-branch snapshot of the `active`
+/// live worktree — recorded under the same `state_root` and `source_root` but a
+/// *different* `context_id` (the `context_id` embeds the branch, so a
+/// same-worktree context that is not the active one is a leftover per-branch
+/// index that rebuilds on demand if the branch is revisited)?
+///
+/// This is the single source of truth for "stale-branch snapshot" shared by
+/// `1up gc`'s classifier, the `1up status`/`1up list` disclosure stats, and the
+/// daemon's conservative auto-prune, so the three can never disagree on which
+/// contexts a `1up gc` would reclaim. It intentionally does not check source
+/// existence: a stale-branch snapshot shares the *active* worktree's
+/// `source_root`, which is live by construction (a dead worktree is handled by
+/// the source-missing path instead).
+pub fn is_stale_branch_snapshot(active: &WorktreeContext, candidate: &IndexedContextRow) -> bool {
+    candidate.context_id != active.context_id
+        && candidate.state_root == active.state_root
+        && candidate.source_root == active.source_root
+}
+
+/// True when `updated_at` (a `datetime('now')`-formatted TEXT value,
+/// `YYYY-MM-DD HH:MM:SS`, UTC — see `worktree_contexts.updated_at`) is at least
+/// `min_age` old relative to `now`. Unparseable input degrades to `false` (not
+/// old enough): a retention decision must never prune on ambiguous data. Shared
+/// by `1up gc`'s retention policy and the daemon's stale-branch auto-prune age
+/// gate.
+pub fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Duration) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
+        Ok(parsed) => now - parsed.and_utc() >= min_age,
+        Err(_) => false,
+    }
+}
+
+/// Cheap, bounded, best-effort disclosure stats for `1up status`/`1up list`:
+/// the count of stale-branch snapshot contexts for the active worktree (what
+/// `1up gc` would reclaim unconditionally) plus an estimate of reclaimable
+/// bytes.
+///
+/// The byte estimate is the exact already-free `freelist` floor plus a
+/// proportional proxy for the segments belonging to prunable contexts
+/// (source-missing peers via [`prunable_segments_proxy`] and stale-branch
+/// snapshots), sized against the current `index.db` file. It is an estimate —
+/// exact bytes are only known after `1up gc --apply`'s VACUUM. Bounded: it lists
+/// the (few) recorded contexts and counts segments per prunable one; no full
+/// table walk and never a VACUUM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisclosureStats {
+    /// Number of stale-branch snapshot contexts for the active worktree.
+    pub stale_contexts: u64,
+    /// Estimated bytes `1up gc --apply` could reclaim (freelist floor + prunable
+    /// segment proxy).
+    pub reclaimable_bytes: u64,
+}
+
+pub async fn disclosure_stats(
+    conn: &Connection,
+    db_path: &Path,
+    active: &WorktreeContext,
+) -> Result<DisclosureStats, OneupError> {
+    let freelist_bytes = freelist_reclaimable_bytes(conn).await?;
+    // Source-missing peers are reclaimable too; reuse the single-source proxy.
+    // These are disjoint from stale-branch snapshots (whose source_root equals
+    // the live active source_root, which exists), so summing never double-counts.
+    let source_missing_segments = prunable_segments_proxy(conn, &active.context_id).await?;
+
+    let contexts = list_worktree_contexts(conn).await?;
+    let mut stale_contexts = 0u64;
+    let mut stale_segments = 0u64;
+    for ctx in &contexts {
+        if is_stale_branch_snapshot(active, ctx) {
+            stale_contexts += 1;
+            stale_segments = stale_segments
+                .saturating_add(count_segments_for_context(conn, &ctx.context_id).await?);
+        }
+    }
+
+    let prunable_segments = source_missing_segments.saturating_add(stale_segments);
+    let total_segments = count_segments(conn).await?;
+    let proxy_bytes = if prunable_segments == 0 || total_segments == 0 {
+        0
+    } else {
+        let file_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        ((prunable_segments as f64 / total_segments as f64) * file_size as f64).round() as u64
+    };
+
+    Ok(DisclosureStats {
+        stale_contexts,
+        reclaimable_bytes: freelist_bytes.saturating_add(proxy_bytes),
+    })
 }
 
 /// Count total number of segments in the database.
@@ -4756,6 +4847,56 @@ mod tests {
         // is excluded regardless (it is the caller's own context), and `live`'s
         // source_root is the crate's own manifest directory, which exists.
         assert_eq!(prunable, 1);
+    }
+
+    fn disclosure_row(context_id: &str, state_root: &str, source_root: &str) -> IndexedContextRow {
+        IndexedContextRow {
+            context_id: context_id.to_string(),
+            state_root: PathBuf::from(state_root),
+            source_root: PathBuf::from(source_root),
+            branch_name: None,
+            updated_at: "2026-01-01 00:00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn is_stale_branch_snapshot_matches_same_roots_different_context() {
+        let active = test_worktree_context_row_with_source("active000000", "/repo");
+        // Same state_root + source_root as active but a different context_id: a
+        // leftover per-branch snapshot.
+        let stale = disclosure_row("oldbranch001", "/tmp/state", "/repo");
+        assert!(is_stale_branch_snapshot(&active, &stale));
+    }
+
+    #[test]
+    fn is_stale_branch_snapshot_excludes_active_and_other_worktrees() {
+        let active = test_worktree_context_row_with_source("active000000", "/repo");
+        // The active context itself is never a stale snapshot.
+        let same_id = disclosure_row("active000000", "/tmp/state", "/repo");
+        assert!(!is_stale_branch_snapshot(&active, &same_id));
+        // A different worktree (different source_root) sharing the index is not a
+        // snapshot of the active worktree.
+        let other = disclosure_row("otherwt00001", "/tmp/state", "/repo-feature");
+        assert!(!is_stale_branch_snapshot(&active, &other));
+    }
+
+    #[test]
+    fn context_age_at_least_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(context_age_at_least(
+            "2026-01-01 00:00:00",
+            now,
+            Duration::days(30)
+        ));
+        assert!(!context_age_at_least(
+            "2026-06-20 00:00:00",
+            now,
+            Duration::days(30)
+        ));
+        // Unparseable input never counts as old enough.
+        assert!(!context_age_at_least("not-a-date", now, Duration::days(0)));
     }
 
     fn test_worktree_context_row_with_source(

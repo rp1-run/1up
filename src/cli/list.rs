@@ -12,7 +12,7 @@ use crate::daemon::registry::{ProjectEntry, Registry};
 use crate::shared::config;
 use crate::shared::types::{
     DaemonContextStatus, DaemonRefreshState, DaemonWatchStatus, IndexProgress, IndexState,
-    OutputFormat,
+    OutputFormat, WorktreeContext,
 };
 use crate::storage::db::Db;
 use crate::storage::schema;
@@ -53,8 +53,18 @@ async fn project_list_item(entry: &ProjectEntry, daemon_running: bool) -> Projec
     });
     let daemon_context_status = read_daemon_context_status(&entry.project_root, &context_id);
     let daemon_status = read_daemon_status_for_context(&entry.project_root, &context_id);
-    let (index_status, files, segments) =
-        read_index_health(&entry.project_root, Some(context_id.as_str())).await;
+    // Resolve the current live worktree context (best-effort) so disclosure stats
+    // can identify stale-branch snapshots against the active branch. A resolution
+    // failure (e.g. the source root is gone) simply omits the disclosure fields.
+    let active = crate::shared::project::resolve_project_root(entry.source_root())
+        .ok()
+        .map(|resolved| resolved.worktree_context);
+    let (index_status, files, segments, disclosure) = read_index_health(
+        &entry.project_root,
+        Some(context_id.as_str()),
+        active.as_ref(),
+    )
+    .await;
     let files = files.or_else(|| {
         index_progress
             .as_ref()
@@ -97,6 +107,8 @@ async fn project_list_item(entry: &ProjectEntry, daemon_running: bool) -> Projec
         index_status,
         files,
         segments,
+        stale_contexts: disclosure.map(|d| d.stale_contexts),
+        reclaimable_bytes: disclosure.map(|d| d.reclaimable_bytes),
         last_file_check_at: daemon_status.map(|status| status.last_file_check_at),
         index_progress,
     }
@@ -138,17 +150,23 @@ fn project_state(daemon_running: bool, progress: Option<&IndexProgress>) -> Life
 async fn read_index_health(
     project_root: &Path,
     context_id: Option<&str>,
-) -> (ProjectListIndexStatus, Option<u64>, Option<u64>) {
+    active: Option<&WorktreeContext>,
+) -> (
+    ProjectListIndexStatus,
+    Option<u64>,
+    Option<u64>,
+    Option<segments::DisclosureStats>,
+) {
     let db_path = config::project_db_path(project_root);
     if !db_path.exists() {
-        return (ProjectListIndexStatus::NotBuilt, None, None);
+        return (ProjectListIndexStatus::NotBuilt, None, None, None);
     }
 
     let Ok(db) = Db::open_ro(&db_path).await else {
-        return (ProjectListIndexStatus::Unavailable, None, None);
+        return (ProjectListIndexStatus::Unavailable, None, None, None);
     };
     let Ok(conn) = db.connect() else {
-        return (ProjectListIndexStatus::Unavailable, None, None);
+        return (ProjectListIndexStatus::Unavailable, None, None, None);
     };
     if schema::ensure_current_tolerating_init(
         &conn,
@@ -157,7 +175,7 @@ async fn read_index_health(
     .await
     .is_err()
     {
-        return (ProjectListIndexStatus::Unavailable, None, None);
+        return (ProjectListIndexStatus::Unavailable, None, None, None);
     }
 
     let files = match context_id {
@@ -166,16 +184,24 @@ async fn read_index_health(
             .ok(),
         None => segments::count_files(&conn).await.ok(),
     };
-    let segments = match context_id {
+    let segment_count = match context_id {
         Some(context_id) => segments::count_segments_for_context(&conn, context_id)
             .await
             .ok(),
         None => segments::count_segments(&conn).await.ok(),
     };
-    let status = if segments == Some(0) {
+    let status = if segment_count == Some(0) {
         ProjectListIndexStatus::NotBuilt
     } else {
         ProjectListIndexStatus::Ready
     };
-    (status, files, segments)
+    // Best-effort disclosure stats — any read failure omits the fields rather
+    // than failing the listing.
+    let disclosure = match active {
+        Some(active) => segments::disclosure_stats(&conn, &db_path, active)
+            .await
+            .ok(),
+        None => None,
+    };
+    (status, files, segment_count, disclosure)
 }

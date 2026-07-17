@@ -17,7 +17,9 @@ use crate::shared::fs::{probe_source_presence, SourcePresence};
 use crate::shared::project::resolve_project_root;
 use crate::shared::types::{OutputFormat, WorktreeContext};
 use crate::storage::db::Db;
-use crate::storage::segments::{self, ContextDeletionCounts, IndexedContextRow};
+use crate::storage::segments::{
+    self, context_age_at_least, is_stale_branch_snapshot, ContextDeletionCounts, IndexedContextRow,
+};
 use std::io;
 
 /// Arguments for the `gc` command. The authoritative long-form help (preview-first
@@ -117,18 +119,6 @@ struct SupersededSameSourceContext<'a> {
     now: DateTime<Utc>,
 }
 
-/// True when `updated_at` (a `datetime('now')`-formatted TEXT value,
-/// `YYYY-MM-DD HH:MM:SS`, UTC — see `worktree_contexts.updated_at`) is at
-/// least `min_age` old relative to `now`. Unparseable input degrades to
-/// `false` (not old enough): a retention decision must never prune on
-/// ambiguous data.
-fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Duration) -> bool {
-    match chrono::NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S") {
-        Ok(parsed) => now - parsed.and_utc() >= min_age,
-        Err(_) => false,
-    }
-}
-
 /// Decide whether one recorded context is prunable relative to `active` (the live
 /// worktree+branch this invocation resolved to). Pure and injected with the
 /// candidate's resolved `source_presence` and `is_git_root` so it is
@@ -171,7 +161,7 @@ fn prune_reason(
         SourcePresence::Indeterminate => return None,
         SourcePresence::Present => {}
     }
-    if candidate.state_root == active.state_root && candidate.source_root == active.source_root {
+    if is_stale_branch_snapshot(active, candidate) {
         return Some(PruneReason::StaleBranchSnapshot);
     }
     if candidate.state_root == active.state_root

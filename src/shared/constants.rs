@@ -782,6 +782,32 @@ pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
 /// the emdash corpus) and stays off until it is demonstrably faster.
 pub const FORCE_ANN_SEARCH_ENV_VAR: &str = "ONEUP_FORCE_ANN_SEARCH";
 
+/// Minimum age in days a stale-branch snapshot of a *live* worktree must reach
+/// (by `worktree_contexts.updated_at`) before the daemon's conservative
+/// startup/idle auto-prune will drop it, and only in addition to its branch no
+/// longer existing in the repo. Deliberately generous (~30 days): a snapshot of
+/// a branch a developer might still return to is retained until it is both
+/// branch-deleted and untouched for a full month, and it rebuilds on demand if
+/// the branch is ever revisited. Explicit `1up gc --apply` is unaffected by this
+/// age gate — it prunes stale-branch snapshots unconditionally (a manual
+/// decision), so a user who wants immediate reclamation still has it.
+pub const GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS: i64 = 30;
+
+/// Disclosure threshold: minimum number of reclaimable stale-branch snapshot
+/// contexts for the active worktree before `1up status`/`1up list` surface the
+/// one-line "run 1up gc" hint. Conservative floor so the hint appears only once
+/// per-branch index accumulation is worth acting on, never for a single
+/// just-switched branch. The hint is purely advisory; actual deletion always
+/// stays a manual `1up gc --apply` decision.
+pub const DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR: u64 = 3;
+
+/// Disclosure threshold: minimum estimated reclaimable bytes before
+/// `1up status`/`1up list` surface the one-line "run 1up gc" hint. Either this
+/// or [`DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR`] being met triggers the hint.
+/// Conservative 100 MiB floor so a small reclaim is not nagged about; advisory
+/// only.
+pub const DISCLOSURE_RECLAIMABLE_BYTES_FLOOR: u64 = 100 * 1024 * 1024;
+
 /// Per-file size cap to prevent unbounded memory use.
 ///
 /// Files larger than this are skipped with a warning during indexing.

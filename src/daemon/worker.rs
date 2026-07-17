@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use libsql::Connection;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -23,14 +23,14 @@ use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
     DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, DAEMON_IDLE_SHUTDOWN_ENV_VAR, DAEMON_IDLE_SHUTDOWN_SECS,
-    MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
-    STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
+    GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
+    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{
     atomic_replace, ensure_secure_project_root, probe_source_presence, SourcePresence,
 };
-use crate::shared::project::canonical_project_root;
+use crate::shared::project::{branch_ref_exists, canonical_project_root, resolve_project_root};
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
     combine_degraded_reasons, DaemonContextStatus, DaemonContextStatusFile, DaemonProjectStatus,
@@ -627,6 +627,14 @@ async fn load_and_watch_projects(
     deregister_deleted_projects_on_startup(&registry).await;
     let registry = Registry::load().unwrap_or(registry);
 
+    // Second, conservative half of the accumulation prune (issue #114): drop
+    // stale per-branch snapshots of *live* worktrees whose branch is gone and
+    // that have been unused past the documented age threshold. Same best-effort,
+    // non-blocking safety rails; it deregisters what it prunes, so reload again
+    // and watch only the survivors.
+    prune_stale_branch_contexts_on_startup(&registry).await;
+    let registry = Registry::load().unwrap_or(registry);
+
     for entry in &registry.projects {
         load_registered_project(entry, watcher, projects, deferred, parent_token).await?;
     }
@@ -815,6 +823,36 @@ pub fn classify_source_missing_contexts(
         }
     }
     selection
+}
+
+/// Select the stale-branch snapshots of the `active` live worktree that are
+/// eligible for conservative auto-prune: their branch no longer exists in the
+/// repo AND they have been unused for at least `max_age`.
+///
+/// Pure and injected with `branch_exists` + `now` so it is deterministic and
+/// unit-testable. Selection rides the shared [`segments::is_stale_branch_snapshot`]
+/// predicate, so it can never disagree with `1up gc` or the disclosure stats on
+/// what a stale-branch snapshot is; the auto-prune adds two conservative gates on
+/// top. Unlike `1up gc --apply` (which prunes stale-branch snapshots
+/// unconditionally, a manual decision), a snapshot whose branch still exists —
+/// or that is younger than `max_age` — is always retained here, and it rebuilds
+/// on demand if the branch is revisited. The `active` worktree's own context and
+/// every other worktree's contexts are never selected (the predicate keys on the
+/// active `state_root` + `source_root` and excludes the active `context_id`).
+pub fn stale_branch_autoprune_context_ids(
+    active: &WorktreeContext,
+    contexts: &[IndexedContextRow],
+    branch_exists: &dyn Fn(&IndexedContextRow) -> bool,
+    now: DateTime<Utc>,
+    max_age: Duration,
+) -> Vec<String> {
+    contexts
+        .iter()
+        .filter(|ctx| segments::is_stale_branch_snapshot(active, ctx))
+        .filter(|ctx| !branch_exists(ctx))
+        .filter(|ctx| segments::context_age_at_least(&ctx.updated_at, now, max_age))
+        .map(|ctx| ctx.context_id.clone())
+        .collect()
 }
 
 /// Best-effort startup prune of contexts whose source worktree directory has been
@@ -1152,6 +1190,163 @@ fn drop_deregistered_projects(
                 }
             }
             release_removed_project(state);
+        }
+    }
+}
+
+/// Best-effort startup prune of stale-branch snapshots of *live* worktrees whose
+/// branch no longer exists in the repo AND that have been unused for at least
+/// [`GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS`] days.
+///
+/// This complements [`prune_source_missing_contexts_on_startup`] with the second
+/// half of issue #114's accumulation problem: per-branch index snapshots that
+/// pile up for a still-present worktree. It is deliberately far more conservative
+/// than `1up gc` (which prunes every stale-branch snapshot unconditionally, a
+/// manual decision): only a snapshot whose branch is gone AND untouched for a
+/// full month is dropped, and it rebuilds on demand if that branch ever returns.
+/// The same non-blocking safety rails as the source-missing prune apply — the
+/// single-writer rebuild lock is taken **non-blocking** per index DB, **no
+/// `VACUUM`** runs on startup, and every step is best-effort so a failure can
+/// never block or fail daemon startup. Registered entries are grouped by their
+/// shared `index.db` path, carrying every live worktree source root so each
+/// snapshot is judged against its own worktree's current branch.
+async fn prune_stale_branch_contexts_on_startup(registry: &Registry) {
+    let mut by_db: HashMap<PathBuf, (PathBuf, Vec<PathBuf>)> = HashMap::new();
+    for entry in &registry.projects {
+        let db_path = config::project_db_path(&entry.project_root);
+        let slot = by_db
+            .entry(db_path)
+            .or_insert_with(|| (entry.project_root.clone(), Vec::new()));
+        let source_root = entry.source_root().to_path_buf();
+        if !slot.1.contains(&source_root) {
+            slot.1.push(source_root);
+        }
+    }
+
+    for (state_root, source_roots) in by_db.into_values() {
+        let pruned = prune_stale_branch_contexts_for_state_root(&state_root, &source_roots).await;
+        if pruned.is_empty() {
+            continue;
+        }
+
+        // Best-effort bookkeeping (mirrors the source-missing prune): the index
+        // rows are already gone, so a hiccup here is a warning, never a startup
+        // failure. `deregister_context_ids` reloads the registry fresh.
+        let pruned_ids: HashSet<String> = pruned.iter().cloned().collect();
+        if let Err(err) = prune_daemon_context_status(&state_root, &pruned_ids) {
+            warn!(
+                "failed to prune daemon status for stale-branch contexts at {}: {err}",
+                state_root.display()
+            );
+        }
+        if let Err(err) = Registry::load().and_then(|mut r| r.deregister_context_ids(&pruned_ids)) {
+            warn!(
+                "failed to deregister stale-branch contexts at {}: {err}",
+                state_root.display()
+            );
+        }
+        info!(
+            "pruned {} stale-branch context(s) from {} on startup: {}",
+            pruned.len(),
+            state_root.display(),
+            pruned.join(", ")
+        );
+    }
+}
+
+/// Prune eligible stale-branch snapshots from a single shared index DB, returning
+/// the ids that were deleted.
+///
+/// The non-blocking rebuild lock is held only across the read + delete and
+/// dropped when this function returns. `source_roots` are the live worktrees
+/// sharing this index; each is resolved to its current branch context so a
+/// recorded snapshot's branch existence can be tested against the right repo, and
+/// eligible ids are unioned across them. Returns an empty vec (never an error)
+/// when the DB is absent, the lock is contended, nothing qualifies, or any step
+/// fails: every failure is logged and swallowed so startup is never broken. NO
+/// `VACUUM` runs here — deletes free pages for reuse without the exclusive
+/// compaction.
+async fn prune_stale_branch_contexts_for_state_root(
+    state_root: &Path,
+    source_roots: &[PathBuf],
+) -> Vec<String> {
+    let db_path = config::project_db_path(state_root);
+    if !db_path.exists() {
+        return Vec::new();
+    }
+
+    let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(state_root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            debug!(
+                "skipping stale-branch prune for {}: rebuild lock held by another process",
+                state_root.display()
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            warn!(
+                "skipping stale-branch prune for {}: {err}",
+                state_root.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let pruned = async {
+        let db = Db::open_rw(&db_path).await?;
+        let conn = db.connect_tuned().await?;
+        let contexts = segments::list_worktree_contexts(&conn).await?;
+        let now = Utc::now();
+        let max_age = Duration::days(GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS);
+
+        let mut to_prune: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for source_root in source_roots {
+            // Resolve the *current* live context for this worktree to obtain its
+            // active context_id and the git directories used to test whether a
+            // recorded snapshot's branch still exists. A resolution failure (e.g.
+            // the worktree vanished mid-startup) simply skips this worktree.
+            let Ok(resolved) = resolve_project_root(source_root) else {
+                continue;
+            };
+            let active = resolved.worktree_context;
+            let git_dir = active.git_dir.clone();
+            let common_git_dir = active.common_git_dir.clone();
+            let branch_exists = |ctx: &IndexedContextRow| -> bool {
+                match (&ctx.branch_name, &git_dir, &common_git_dir) {
+                    (Some(name), Some(gd), Some(cgd)) => {
+                        branch_ref_exists(gd, cgd, &format!("refs/heads/{name}"))
+                    }
+                    // Without a recorded branch name or resolvable git dirs we
+                    // cannot prove the branch is gone, so retain conservatively.
+                    _ => true,
+                }
+            };
+            for id in
+                stale_branch_autoprune_context_ids(&active, &contexts, &branch_exists, now, max_age)
+            {
+                if seen.insert(id.clone()) {
+                    to_prune.push(id);
+                }
+            }
+        }
+
+        for context_id in &to_prune {
+            segments::delete_context(&conn, context_id).await?;
+        }
+        Ok::<_, OneupError>(to_prune)
+    }
+    .await;
+
+    match pruned {
+        Ok(pruned) => pruned,
+        Err(err) => {
+            warn!(
+                "failed to prune stale-branch contexts from {}: {err}",
+                db_path.display()
+            );
+            Vec::new()
         }
     }
 }
@@ -5292,6 +5487,134 @@ mod tests {
         assert!(probe_entry_dead(&registry.projects[0], &|p| {
             probe_path_presence(p)
         }));
+    }
+
+    fn autoprune_active() -> WorktreeContext {
+        use crate::shared::types::{BranchStatus, WorktreeRole};
+        WorktreeContext {
+            context_id: "active000001".to_string(),
+            state_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
+            main_worktree_root: PathBuf::from("/repo"),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: Some("refs/heads/main".to_string()),
+            head_oid: None,
+            branch_status: BranchStatus::Named,
+        }
+    }
+
+    fn stale_row(context_id: &str, branch: &str, updated_at: &str) -> IndexedContextRow {
+        IndexedContextRow {
+            context_id: context_id.to_string(),
+            state_root: PathBuf::from("/repo"),
+            source_root: PathBuf::from("/repo"),
+            branch_name: Some(branch.to_string()),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    fn autoprune_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn autoprune_selects_only_deleted_branch_and_old_snapshots() {
+        let active = autoprune_active();
+        let contexts = [
+            active_row(&active),
+            // Deleted branch, old enough: the one eligible candidate.
+            stale_row("oldgone00001", "gone", "2026-01-01 00:00:00"),
+        ];
+        // `gone` no longer resolves; every other branch is considered live.
+        let branch_exists = |ctx: &IndexedContextRow| ctx.branch_name.as_deref() != Some("gone");
+        let pruned = stale_branch_autoprune_context_ids(
+            &active,
+            &contexts,
+            &branch_exists,
+            autoprune_now(),
+            chrono::Duration::days(30),
+        );
+        assert_eq!(pruned, vec!["oldgone00001".to_string()]);
+    }
+
+    #[test]
+    fn autoprune_retains_live_branch_snapshots_regardless_of_age() {
+        let active = autoprune_active();
+        // A stale snapshot whose branch STILL exists, and is ancient: retained.
+        let contexts = [
+            active_row(&active),
+            stale_row("oldlive00001", "feature", "2020-01-01 00:00:00"),
+        ];
+        let branch_exists = |_: &IndexedContextRow| true;
+        let pruned = stale_branch_autoprune_context_ids(
+            &active,
+            &contexts,
+            &branch_exists,
+            autoprune_now(),
+            chrono::Duration::days(30),
+        );
+        assert!(
+            pruned.is_empty(),
+            "a snapshot whose branch still exists is never auto-pruned"
+        );
+    }
+
+    #[test]
+    fn autoprune_retains_young_deleted_branch_snapshots() {
+        let active = autoprune_active();
+        // Branch is gone but the snapshot is younger than the age threshold: kept.
+        let contexts = [
+            active_row(&active),
+            stale_row("younggone001", "gone", "2026-06-20 00:00:00"),
+        ];
+        let branch_exists = |_: &IndexedContextRow| false;
+        let pruned = stale_branch_autoprune_context_ids(
+            &active,
+            &contexts,
+            &branch_exists,
+            autoprune_now(),
+            chrono::Duration::days(30),
+        );
+        assert!(
+            pruned.is_empty(),
+            "a deleted-branch snapshot younger than max_age is retained"
+        );
+    }
+
+    #[test]
+    fn autoprune_never_selects_the_active_or_other_worktree_contexts() {
+        let active = autoprune_active();
+        let mut other_worktree = stale_row("otherwt00001", "gone", "2020-01-01 00:00:00");
+        // A different worktree (different source_root) sharing the index: not ours.
+        other_worktree.source_root = PathBuf::from("/repo-feature");
+        let contexts = [active_row(&active), other_worktree];
+        let branch_exists = |_: &IndexedContextRow| false;
+        let pruned = stale_branch_autoprune_context_ids(
+            &active,
+            &contexts,
+            &branch_exists,
+            autoprune_now(),
+            chrono::Duration::days(30),
+        );
+        assert!(
+            pruned.is_empty(),
+            "the active context and other worktrees' contexts are never selected"
+        );
+    }
+
+    fn active_row(active: &WorktreeContext) -> IndexedContextRow {
+        IndexedContextRow {
+            context_id: active.context_id.clone(),
+            state_root: active.state_root.clone(),
+            source_root: active.source_root.clone(),
+            branch_name: active.branch_name.clone(),
+            updated_at: "2026-06-30 00:00:00".to_string(),
+        }
     }
 
     #[tokio::test]

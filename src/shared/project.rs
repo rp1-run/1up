@@ -545,6 +545,16 @@ fn read_branch_identity(info: &GitWorktreeInfo) -> BranchIdentity {
     }
 }
 
+/// True when `branch_ref` (e.g. `refs/heads/feature`) still resolves to a commit
+/// oid in the repo whose worktree/common git directories are `git_dir` /
+/// `common_git_dir`. Best-effort: an unreadable repo or an absent ref reads as
+/// `false` (does not exist). Used by the daemon's conservative stale-branch
+/// auto-prune to confirm a per-branch snapshot's branch is genuinely gone before
+/// it is eligible for pruning.
+pub fn branch_ref_exists(git_dir: &Path, common_git_dir: &Path, branch_ref: &str) -> bool {
+    read_ref_oid(git_dir, common_git_dir, branch_ref).is_some()
+}
+
 fn read_ref_oid(git_dir: &Path, common_git_dir: &Path, branch_ref: &str) -> Option<String> {
     [git_dir, common_git_dir]
         .into_iter()
