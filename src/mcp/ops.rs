@@ -3214,36 +3214,57 @@ fn get_density_cache() -> &'static Mutex<HashMap<DirectoryWalkCacheKey, f64>> {
     DENSITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// FIX B: Load cached density from persistent storage if it exists.
-/// Returns None on any error (missing file, parse error, etc.); errors are non-fatal.
-#[allow(dead_code)] // Future use for cross-process density persistence
-fn load_persistent_density_cache(state_root: &Path) -> Option<f64> {
+/// Persistent on-disk cache for computed repository density.
+///
+/// Stored as JSON in the `.1up` directory (`density_cache.json`), keyed by the
+/// same `cache_key_to_string` signal as the directory walk cache
+/// (`repo_identity` + git HEAD + root mtime). That keying IS the invalidation
+/// design: a HEAD move or a root-directory mtime change produces a different
+/// key, so a stale entry simply misses and forces a fresh walk that rewrites the
+/// map. Entries are never mutated in place or explicitly expired. Surviving a
+/// process restart lets a cold MCP process reuse a prior walk instead of
+/// re-walking the tree (Fixes #87).
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct PersistentDensityCache {
+    entries: HashMap<String, f64>, // key: cache_key_to_string(&DirectoryWalkCacheKey)
+}
+
+/// Load the persistent density cache from the `.1up` directory.
+/// Returns an empty map on any error (missing file, parse error, etc.); the
+/// cache is an optimization, so read failures degrade silently to a fresh walk.
+fn load_persistent_density_cache(state_root: &Path) -> HashMap<String, f64> {
     let cache_path = project_dot_dir(state_root).join("density_cache.json");
     match std::fs::read_to_string(&cache_path) {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(obj) => obj.get("density").and_then(|v| v.as_f64()),
-            Err(_) => None,
+        Ok(content) => match serde_json::from_str::<PersistentDensityCache>(&content) {
+            Ok(cached) => cached.entries,
+            Err(e) => {
+                tracing::debug!("ignoring unreadable density cache: {}", e);
+                HashMap::new()
+            }
         },
-        Err(_) => None,
+        Err(_) => HashMap::new(),
     }
 }
 
-/// FIX B: Persist computed density to disk for cross-process reuse.
-/// Only writes if .1up directory already exists (same guard as directory walk cache).
-#[allow(dead_code)] // Future use for cross-process density persistence
-fn save_persistent_density_cache(state_root: &Path, density: f64) {
+/// Persist the density cache to disk for cross-process reuse.
+/// Only writes if the `.1up` directory already exists (same guard as the
+/// directory walk cache: never create `.1up` during a blocked/failed attempt).
+/// Write failures are non-fatal and never fail the request.
+fn save_persistent_density_cache(state_root: &Path, entries: &HashMap<String, f64>) {
     let dot_dir = project_dot_dir(state_root);
     if !dot_dir.exists() {
         return;
     }
 
-    let cache_data = serde_json::json!({ "density": density });
+    let cache = PersistentDensityCache {
+        entries: entries.clone(),
+    };
     let cache_path = dot_dir.join("density_cache.json");
     if let Err(e) = std::fs::write(
         &cache_path,
-        serde_json::to_string(&cache_data).unwrap_or_default(),
+        serde_json::to_string(&cache).unwrap_or_default(),
     ) {
-        tracing::warn!("failed to persist density cache: {}", e);
+        tracing::debug!("failed to persist density cache: {}", e);
     }
 }
 
@@ -3495,14 +3516,31 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
         root_mtime: get_root_mtime(source_root),
     };
 
-    // FIX B: Check in-process cache first
+    let cache_key_str = cache_key_to_string(&cache_key);
+
+    // Lookup order: in-process cache (fastest, preserves warm-path behavior).
     if let Ok(cache) = get_density_cache().lock() {
         if let Some(cached_density) = cache.get(&cache_key) {
             return Ok(*cached_density);
         }
     }
 
-    // FIX B: If not in memory, compute the density by walking the repo
+    // Not in memory; consult the persistent cache for cross-process reuse
+    // (Fixes #87). A stale HEAD/mtime yields a different key, so only a
+    // key-matched entry is a hit. generate_facts_envelope runs before any state
+    // is written, so mirror count_files_per_directory and treat source_root as
+    // the state root (.1up lives at source_root/.1up for the cold-start case).
+    let potential_state_root = source_root;
+    let persistent_cache = load_persistent_density_cache(potential_state_root);
+    if let Some(cached_density) = persistent_cache.get(&cache_key_str) {
+        // Restore into the in-process cache for the rest of this process.
+        if let Ok(mut in_process) = get_density_cache().lock() {
+            in_process.insert(cache_key.clone(), *cached_density);
+        }
+        return Ok(*cached_density);
+    }
+
+    // Not in either cache; compute the density by walking the repo.
     let density_table = get_density_table();
     let walker = build_vcs_aware_walker(source_root).build();
 
@@ -3537,10 +3575,14 @@ fn compute_avg_density_for_repo(source_root: &Path) -> Result<f64, OneupError> {
         15.0 // Fallback for completely unmeasured ecosystems
     };
 
-    // FIX B: Cache the result for this repo state
+    // Populate both caches after the fresh walk: in-process for this process
+    // and persistent for future cold processes (Fixes #87).
     if let Ok(mut cache) = get_density_cache().lock() {
         cache.insert(cache_key, avg_segments_per_file);
     }
+    let mut persistent = persistent_cache;
+    persistent.insert(cache_key_str, avg_segments_per_file);
+    save_persistent_density_cache(potential_state_root, &persistent);
 
     Ok(avg_segments_per_file)
 }
@@ -3725,7 +3767,12 @@ pub async fn generate_facts_envelope(
     let dir_counts = count_files_per_directory(source_root)?;
     let file_count_total: usize = dir_counts.values().sum();
 
-    // N2: Compute calibrated density once, use for both global and per-directory estimates
+    // N2: Compute calibrated density once, use for both global and per-directory estimates.
+    // Kept as a separate walk from count_files_per_directory above: the two aggregate
+    // differently (per-directory counts vs per-extension density), own distinct in-process
+    // and persistent caches, and are each called independently elsewhere. Folding them into
+    // one walk would be broad restructuring across those call sites; the persistent density
+    // cache (Fixes #87) already keeps this walk to at most once per repo state per process.
     let avg_segments_per_file = compute_avg_density_for_repo(source_root)?;
 
     // Build directory stats with calibrated estimates (N2: consistent with global estimate)
@@ -6037,6 +6084,117 @@ mod tests {
         assert_eq!(
             density1, density2,
             "density should be consistent across calls"
+        );
+    }
+
+    /// Builds the persistent density cache key string for a repo the same way
+    /// compute_avg_density_for_repo does, so tests can seed/inspect entries.
+    fn density_cache_key_str(root: &Path) -> String {
+        let key = DirectoryWalkCacheKey {
+            repo_identity: root
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+            head_commit: get_head_commit(root),
+            root_mtime: get_root_mtime(root),
+        };
+        cache_key_to_string(&key)
+    }
+
+    #[test]
+    fn test_persistent_density_cache_hit_avoids_walk() {
+        // Fixes #87: a persisted entry keyed to the current repo state is used
+        // without re-walking. Seed a sentinel value distinct from any real walk
+        // result and assert it is returned verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        // .1up must exist for the persistent cache to be written.
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let sentinel = 123.5_f64;
+        let mut entries = HashMap::new();
+        entries.insert(density_cache_key_str(root), sentinel);
+        save_persistent_density_cache(root, &entries);
+
+        let density = compute_avg_density_for_repo(root).expect("density computation should work");
+        assert_eq!(
+            density, sentinel,
+            "a key-matched persisted entry must be returned without walking"
+        );
+    }
+
+    #[test]
+    fn test_stale_persistent_density_entry_falls_back_and_rewrites() {
+        // Fixes #87: a persisted entry under a non-matching (stale) key must miss,
+        // forcing a fresh walk, and the fresh result must be written under the
+        // current key.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src").join("lib.rs"), "pub fn lib() {}").unwrap();
+        fs::create_dir_all(root.join(".1up")).unwrap();
+
+        let sentinel = 999.0_f64;
+        let stale_key = format!("{}_stale_head_0", root.to_string_lossy());
+        let mut entries = HashMap::new();
+        entries.insert(stale_key.clone(), sentinel);
+        save_persistent_density_cache(root, &entries);
+
+        let density = compute_avg_density_for_repo(root).expect("density computation should work");
+        assert_ne!(
+            density, sentinel,
+            "a stale-keyed entry must not be used; a fresh walk should run"
+        );
+        assert!(
+            density > 0.0,
+            "fresh walk should produce a positive density; got {}",
+            density
+        );
+
+        // The fresh result must be persisted under the current key (rewrite),
+        // while the stale entry is preserved untouched.
+        let reloaded = load_persistent_density_cache(root);
+        let current_key = density_cache_key_str(root);
+        assert_eq!(
+            reloaded.get(&current_key).copied(),
+            Some(density),
+            "fresh walk result must be rewritten under the current key"
+        );
+        assert_eq!(
+            reloaded.get(&stale_key).copied(),
+            Some(sentinel),
+            "the stale entry should remain in the persisted map"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_persistent_density_cache_degrades_gracefully() {
+        // Fixes #87: an unparseable cache file must not fail the request; the
+        // function degrades to a fresh walk.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(root.join(".1up")).unwrap();
+        fs::write(
+            root.join(".1up").join("density_cache.json"),
+            "{ not valid json ]]]",
+        )
+        .unwrap();
+
+        let density = compute_avg_density_for_repo(root)
+            .expect("corrupt cache must degrade to a walk, not error");
+        assert!(
+            density > 0.0,
+            "fresh walk should produce a positive density; got {}",
+            density
         );
     }
 
