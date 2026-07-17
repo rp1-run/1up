@@ -30,6 +30,7 @@ use crate::shared::errors::OneupError;
 use crate::shared::fs::{
     atomic_replace, ensure_secure_project_root, probe_source_presence, SourcePresence,
 };
+use crate::shared::progress::{read_status_file, StatusFileRead};
 use crate::shared::project::{branch_ref_exists, canonical_project_root, resolve_project_root};
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
@@ -1786,10 +1787,23 @@ fn persist_daemon_context_status(project_root: &Path, status: &DaemonContextStat
     };
 
     let path = daemon_context_status_path(project_root);
-    let mut file = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<DaemonContextStatusFile>(&content).ok())
-        .unwrap_or_default();
+    // Read-modify-write pre-read: propagate a torn read instead of defaulting.
+    // `Absent` is a legitimate not-yet-written state (start from an empty file),
+    // but an `Unreadable` (torn/corrupt) file must NOT be defaulted here: a
+    // defaulted merge would drop every other context's entry when written back.
+    // Abort this persist round with a warning, leaving the existing file intact
+    // so a later successful read recovers the full set.
+    let mut file = match read_status_file::<DaemonContextStatusFile>(&path) {
+        StatusFileRead::Absent => DaemonContextStatusFile::default(),
+        StatusFileRead::Parsed(file) => file,
+        StatusFileRead::Unreadable(err) => {
+            warn!(
+                "skipping daemon context status persist for {}: existing file unreadable ({err}); leaving it intact",
+                project_root.display()
+            );
+            return;
+        }
+    };
     file.contexts
         .insert(status.context_id.clone(), status.clone());
 
@@ -2125,10 +2139,12 @@ fn persist_carried_scope(
 
     let status_path = config::project_dot_dir(state_root).join("index_status.json");
 
-    // Read existing progress or create a new one
-    let mut progress: IndexProgress = if status_path.exists() {
-        let content = std::fs::read_to_string(&status_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| IndexProgress {
+    // Read-modify-write pre-read. `Absent` is a legitimate not-yet-written state
+    // (start from a default progress record); an `Unreadable` (torn/corrupt) file
+    // aborts this persist round with a warning, leaving the existing file intact
+    // rather than overwriting live progress with a defaulted record.
+    let mut progress: IndexProgress = match read_status_file::<IndexProgress>(&status_path) {
+        StatusFileRead::Absent => IndexProgress {
             state: IndexState::Idle,
             phase: IndexPhase::Pending,
             context_id: None,
@@ -2153,33 +2169,14 @@ fn persist_carried_scope(
             prefilter: None,
             indexer_pid: None,
             updated_at: Utc::now(),
-        })
-    } else {
-        IndexProgress {
-            state: IndexState::Idle,
-            phase: IndexPhase::Pending,
-            context_id: None,
-            source_root: None,
-            branch_name: None,
-            branch_status: None,
-            files_total: 0,
-            files_scanned: 0,
-            files_processed: 0,
-            files_indexed: 0,
-            files_skipped: 0,
-            files_deleted: 0,
-            segments_stored: 0,
-            embeddings_enabled: false,
-            embedding_unavailable_reason: None,
-            vector_rows: None,
-            embeddable_segments: None,
-            message: None,
-            parallelism: None,
-            timings: None,
-            scope: None,
-            prefilter: None,
-            indexer_pid: None,
-            updated_at: Utc::now(),
+        },
+        StatusFileRead::Parsed(progress) => progress,
+        StatusFileRead::Unreadable(err) => {
+            warn!(
+                "skipping carried-scope persist for {}: existing index_status.json unreadable ({err}); leaving it intact",
+                state_root.display()
+            );
+            return Ok(());
         }
     };
 
@@ -2187,9 +2184,18 @@ fn persist_carried_scope(
     progress.scope = Some(scope_info.clone());
     progress.updated_at = Utc::now();
 
-    // Write back to file
-    let json = serde_json::to_string_pretty(&progress)?;
-    std::fs::write(&status_path, json)?;
+    // Write back atomically (temp + fsync + rename) so a concurrent reader never
+    // observes a torn index_status.json and misreports a live index as empty.
+    let payload = serde_json::to_vec_pretty(&progress)?;
+    let secure_root = ensure_secure_project_root(state_root).map_err(std::io::Error::other)?;
+    atomic_replace(
+        &status_path,
+        &payload,
+        &secure_root,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    )
+    .map_err(std::io::Error::other)?;
 
     Ok(())
 }
@@ -3724,6 +3730,41 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(context_status_path).unwrap()).unwrap();
         let old_entry = context_status.contexts.get(&old_context_id).unwrap();
         assert_eq!(old_entry.watch_status, DaemonWatchStatus::DaemonStopped);
+    }
+
+    #[test]
+    fn persist_daemon_context_status_skips_and_preserves_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+
+        // Seed a torn/corrupt context-status file (truncated JSON).
+        let status_path = daemon_context_status_path(&project_root);
+        std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        let corrupt = br#"{"contexts":{"other":"#;
+        std::fs::write(&status_path, corrupt).unwrap();
+
+        let status = DaemonContextStatus {
+            context_id: "ctx-new".to_string(),
+            source_root: Some(project_root.clone()),
+            watch_status: DaemonWatchStatus::Watching,
+            last_file_check_at: None,
+            last_refresh_state: DaemonRefreshState::Unknown,
+            last_refresh_started_at: None,
+            last_refresh_completed_at: None,
+            last_refresh_error: None,
+            branch_name: Some("main".to_string()),
+            branch_status: crate::shared::types::BranchStatus::Named,
+        };
+
+        persist_daemon_context_status(&project_root, &status);
+
+        // A torn pre-read aborts the round and leaves the file byte-identical
+        // rather than overwriting it with a defaulted single-context document
+        // (which would drop every other context's entry).
+        let after = std::fs::read(&status_path).unwrap();
+        assert_eq!(after, corrupt);
     }
 
     #[test]

@@ -1831,13 +1831,27 @@ async fn run_index(
             indexer_pid: Some(std::process::id()),
             updated_at: chrono::Utc::now(),
         };
-        // Write progress file so scope is visible immediately
-        let dot_dir = config::project_dot_dir(&roots.state_root);
-        let _ = tokio::fs::create_dir_all(&dot_dir).await; // Ensure directory exists
-        let progress_path = dot_dir.join("index_status.json");
-        if let Err(e) =
-            tokio::fs::write(&progress_path, serde_json::to_string(&initial_progress)?).await
-        {
+        // Write the progress file atomically (temp + fsync + rename) so scope is
+        // visible immediately without a concurrent reader ever observing a torn or
+        // zero-length index_status.json and misreporting a scoped rebuild as "no
+        // index". Best-effort: a failure to record the initial scope is logged and
+        // indexing continues. The blocking secure-fs write runs on a blocking pool
+        // so it never stalls a tokio worker.
+        let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
+        let payload = serde_json::to_vec_pretty(&initial_progress)?;
+        let state_root = roots.state_root.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let secure_root = crate::shared::fs::ensure_secure_project_root(&state_root)?;
+            crate::shared::fs::atomic_replace(
+                &progress_path,
+                &payload,
+                &secure_root,
+                crate::shared::constants::PROJECT_STATE_DIR_MODE,
+                crate::shared::constants::SECURE_STATE_FILE_MODE,
+            )
+        })
+        .await?;
+        if let Err(e) = write_result {
             tracing::warn!("failed to write initial progress with scope info: {}", e);
             // Continue anyway - initial progress write is best-effort
         }
