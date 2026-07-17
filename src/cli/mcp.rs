@@ -81,6 +81,12 @@ struct McpInstanceLock;
 #[cfg(unix)]
 fn acquire_mcp_instance_lock(project_root: &Path) -> anyhow::Result<McpInstanceLock> {
     let xdg_root = ensure_secure_xdg_root()?;
+    // Opportunistic, best-effort sweep of abandoned per-project lock files. This
+    // is a natural integration point: we have just resolved the XDG root and are
+    // about to create another lock file in it, and MCP server start is a process
+    // boundary where a bounded background-debt sweep is acceptable. It never
+    // errors and never meaningfully delays startup.
+    crate::shared::lock_reap::reap_stale_locks(&xdg_root);
     let lock_path = mcp_lock_path(&xdg_root, project_root);
     let validated_path = validate_regular_file_path(&lock_path, &xdg_root)?;
     let file = OpenOptions::new()

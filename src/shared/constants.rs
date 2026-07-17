@@ -325,6 +325,49 @@ pub const REBUILD_LOCK_RETRY_INTERVAL_MS: u64 = 200;
 /// the file is treated as stale and auto-reconciled or cleared.
 pub const STALENESS_THRESHOLD_SECS: u64 = 300; // 5 minutes
 
+/// Maximum age a per-project lock file (`mcp-*.lock`, `startup-*.lock`) may
+/// reach before the opportunistic reaper (`shared::lock_reap`) treats it as a
+/// stale-abandonment candidate.
+///
+/// These files are created per project (keyed by a path hash) and are never
+/// deleted on the normal path — a machine that opens many distinct projects
+/// accumulates one file per project forever (issue #117 observed 4076). Seven
+/// days is deliberately generous: a lock still in active use has a fresh mtime
+/// (the file is (re)opened on every `1up mcp`/`1up start`), so a mtime older
+/// than this window means no process has touched that project's lock for a
+/// week. Age alone never authorizes a delete — the reaper additionally requires
+/// a passing non-blocking exclusive flock probe, so a genuinely held lock is
+/// kept regardless of mtime.
+pub const LOCK_REAP_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Upper bound on the number of stale lock files the reaper will delete in a
+/// single opportunistic run.
+///
+/// The reaper runs at process-startup boundaries and must never dominate
+/// startup latency, so each run reaps at most this many files (oldest first); a
+/// large backlog drains over several startups. Paired with
+/// [`LOCK_REAP_TIME_BUDGET_MS`] as the two independent bounds on per-run work.
+pub const LOCK_REAP_MAX_CANDIDATES_PER_RUN: usize = 128;
+
+/// Wall-clock budget for a single opportunistic lock-reap run, in milliseconds.
+///
+/// The reaper checks this budget between candidates and stops early once it is
+/// exceeded, so an unexpectedly slow filesystem can never make a best-effort
+/// startup sweep delay `1up mcp`/`1up start` by more than roughly this bound.
+pub const LOCK_REAP_TIME_BUDGET_MS: u64 = 250;
+
+/// Filename prefixes identifying per-project lock files eligible for reaping.
+///
+/// The reaper only ever considers files whose name starts with one of these
+/// prefixes AND ends with [`LOCK_FILE_SUFFIX`]; every other file in the XDG data
+/// dir (model artifacts, `update-check.json`, the daemon pid/socket, etc.) is
+/// untouchable. Kept in sync with the `mcp-{key}.lock` / `startup-{key}.lock`
+/// names minted in `cli::mcp` and `cli::start`.
+pub const LOCK_REAP_NAME_PREFIXES: [&str; 2] = ["mcp-", "startup-"];
+
+/// Filename suffix shared by every reapable per-project lock file.
+pub const LOCK_FILE_SUFFIX: &str = ".lock";
+
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 

@@ -389,6 +389,12 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn acquire_project_startup_guard(project_root: &Path) -> anyhow::Result<StartupGuardAcquire> {
     let xdg_root = ensure_secure_xdg_root()?;
+    // Opportunistic, best-effort sweep of abandoned per-project lock files. Like
+    // the MCP path, this is a natural integration point: the XDG root is already
+    // resolved and about to gain another lock file, and `1up start`/daemon start
+    // is a process boundary where a bounded sweep is acceptable. Never errors,
+    // never meaningfully delays startup.
+    crate::shared::lock_reap::reap_stale_locks(&xdg_root);
     let lock_path = startup_lock_path(&xdg_root, project_root);
     let validated_path = validate_regular_file_path(&lock_path, &xdg_root)?;
     let mut file = open_startup_lock_file(&validated_path)?;
