@@ -27,10 +27,11 @@ use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
     FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_SYMBOLS_PER_LIST,
-    NO_INDEXED_EMBEDDINGS_REASON, SCOPE_TRUNCATION_REASON, STALE_REBUILD_REASON,
-    SYMBOL_LIST_TRUNCATION_REASON,
+    NO_INDEXED_EMBEDDINGS_REASON, PROJECT_STATE_DIR_MODE, SCOPE_TRUNCATION_REASON,
+    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, SYMBOL_LIST_TRUNCATION_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
+use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
 use crate::shared::project;
 use crate::shared::types::{
     combine_degraded_reasons, DaemonProjectStatus, IndexProgress, IndexScope, IndexState,
@@ -130,6 +131,29 @@ pub struct ReadinessPayload {
     pub daemon_status: Option<DaemonProjectStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_scope: Option<IndexScope>,
+    /// Ranked scope proposal surfaced on a Missing readiness when the daemon
+    /// gate fired on an over-threshold unscoped repo. Present only when a fresh
+    /// proposal was persisted; the MCP layer turns it into `scope_add`
+    /// next_actions so the refusal is actionable rather than generic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_proposal: Option<ScopeProposalSummary>,
+}
+
+/// Ranked scope suggestions attached to a Missing readiness payload, rebuilt
+/// from the daemon-persisted proposal. Mirrors the synchronous facts-envelope
+/// suggestions so `oneup_status` and a follow-up unscoped `oneup_start` surface
+/// the same actionable cones.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeProposalSummary {
+    /// Total gitignore-aware tracked file count that tripped the monorepo gate.
+    pub file_count_total: usize,
+    /// Launch subdirectory captured before project-root resolution, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_subdir: Option<String>,
+    /// Human-readable ranked suggestions (e.g. "Index the largest directory: services").
+    pub suggestions: Vec<String>,
+    /// Ranked top-level directory names (largest first) usable as `scope_add` values.
+    pub scope_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -833,6 +857,7 @@ pub async fn classify_readiness(
         index_progress,
         daemon_status,
         index_scope: None,
+        scope_proposal: None,
     };
 
     if let Err(err) = project_id_result {
@@ -880,6 +905,7 @@ pub async fn classify_readiness(
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No usable 1up index is available for this repository.".to_string();
         payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
+        attach_scope_proposal_if_fresh(&mut payload, state_root, source_root);
         return payload;
     }
 
@@ -1010,6 +1036,7 @@ pub async fn classify_readiness(
         payload.status = ReadinessStatus::Missing;
         payload.summary = "No indexed code is available for this repository.".to_string();
         payload.reason = Some("run oneup_start with an explicit indexing mode".to_string());
+        attach_scope_proposal_if_fresh(&mut payload, state_root, source_root);
         return payload;
     }
 
@@ -1128,6 +1155,7 @@ pub fn blocked_readiness(
         index_progress,
         daemon_status,
         index_scope: None,
+        scope_proposal: None,
     }
 }
 
@@ -1153,6 +1181,7 @@ pub fn blocked_readiness_for_path(path: &str, reason: impl Into<String>) -> Read
         index_progress: None,
         daemon_status: None,
         index_scope: None,
+        scope_proposal: None,
     }
 }
 
@@ -3206,6 +3235,183 @@ fn save_persistent_directory_walk_cache(
     }
 }
 
+/// Builds the walk-cache key (repo identity + HEAD + root mtime) for a repo.
+/// Single source of truth so every reader/writer that keys on repo state — the
+/// directory-walk cache, the density cache, and the persisted scope proposal —
+/// derives a byte-identical key and their staleness comparisons agree.
+fn build_directory_walk_cache_key(source_root: &Path) -> DirectoryWalkCacheKey {
+    DirectoryWalkCacheKey {
+        repo_identity: source_root
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
+        head_commit: get_head_commit(source_root),
+        root_mtime: get_root_mtime(source_root),
+    }
+}
+
+/// Tool/editor dot-directories filtered out of scope suggestions so they never
+/// appear as ranked cone candidates. Single-sourced across the synchronous
+/// facts envelope and the daemon-persisted scope proposal.
+const EXCLUDED_DOT_DIRS: [&str; 5] = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
+
+/// Filename of the persisted scope proposal written alongside the directory
+/// walk cache inside `.1up`. Keyed by the walk-cache key so a HEAD/mtime drift
+/// invalidates it as stale.
+const SCOPE_PROPOSAL_FILENAME: &str = "scope_proposal.json";
+
+/// A single ranked directory in a persisted scope proposal. Ordered largest
+/// first with dot-directories already filtered; carries only the fields needed
+/// to rebuild ranked `scope_add` suggestions cheaply (no vector estimate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedDirectoryStat {
+    directory: String,
+    file_count: usize,
+}
+
+/// Scope proposal persisted by the daemon gate-fired branch so the MCP
+/// Missing-readiness path can surface ranked scope suggestions even when the
+/// synchronous `oneup_start` walk is hidden by the daemon-alive timing race.
+///
+/// `key` is the stringified walk-cache key at write time; a mismatch against
+/// the current repo state means the proposal is stale and must not be surfaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedScopeProposal {
+    key: String,
+    per_directory_stats: Vec<PersistedDirectoryStat>,
+    file_count_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_subdir: Option<String>,
+}
+
+/// Pure staleness gate: a persisted proposal is fresh only when its recorded
+/// walk-cache key exactly matches the current repo state key. A HEAD or mtime
+/// drift changes the key, marking the proposal stale.
+fn is_scope_proposal_fresh(persisted_key: &str, current_key: &str) -> bool {
+    persisted_key == current_key
+}
+
+/// Loads the persisted scope proposal from `.1up`, or `None` when the file is
+/// absent or unparseable (both non-fatal: the proposal is an optimization, and
+/// a caller falls back to the generic next_action).
+fn load_persisted_scope_proposal(state_root: &Path) -> Option<PersistedScopeProposal> {
+    let path = project_dot_dir(state_root).join(SCOPE_PROPOSAL_FILENAME);
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Atomically persists a scope proposal into `.1up`, mirroring the walk-cache
+/// guard: it never creates `.1up` (a gated attempt must leave no side effects)
+/// and rides the secure root-clamped `atomic_replace` idiom. A serialization or
+/// write failure returns an error for the best-effort caller to `warn!` on.
+fn save_persisted_scope_proposal(
+    state_root: &Path,
+    proposal: &PersistedScopeProposal,
+) -> Result<(), OneupError> {
+    let dot_dir = project_dot_dir(state_root);
+    // Never create .1up during a blocked/gated attempt (same guard as the
+    // directory walk cache): only persist when the project dir already exists.
+    if !dot_dir.exists() {
+        return Ok(());
+    }
+    let secure_root = ensure_secure_project_root(state_root)?;
+    let payload = serde_json::to_vec_pretty(proposal)
+        .map_err(|e| OneupError::Other(anyhow::anyhow!("serialize scope proposal: {e}")))?;
+    let path = dot_dir.join(SCOPE_PROPOSAL_FILENAME);
+    atomic_replace(
+        &path,
+        &payload,
+        &secure_root,
+        PROJECT_STATE_DIR_MODE,
+        SECURE_STATE_FILE_MODE,
+    )?;
+    Ok(())
+}
+
+/// Builds and persists a scope proposal for the daemon gate-fired branch.
+///
+/// Runs the gitignore-aware per-directory walk (cached), ranks the top-level
+/// directories largest-first with dot-directories filtered, and writes the
+/// result keyed by the current walk-cache key. Best-effort: callers invoke it
+/// off the async executor (the walk is synchronous) and `warn!` on error. This
+/// is what lets a later `oneup_status` surface ranked scope suggestions when the
+/// daemon — not the synchronous MCP walk — fired the monorepo gate.
+pub fn persist_scope_proposal_for_gate(
+    state_root: &Path,
+    source_root: &Path,
+) -> Result<(), OneupError> {
+    let dir_counts = count_files_per_directory(source_root)?;
+    let file_count_total: usize = dir_counts.values().sum();
+
+    let mut per_directory_stats: Vec<PersistedDirectoryStat> = dir_counts
+        .into_iter()
+        .map(|(directory, file_count)| PersistedDirectoryStat {
+            directory,
+            file_count,
+        })
+        .collect();
+    // Largest first, ties broken by name for a deterministic ranking.
+    per_directory_stats.sort_by(|a, b| {
+        b.file_count
+            .cmp(&a.file_count)
+            .then_with(|| a.directory.cmp(&b.directory))
+    });
+    per_directory_stats.retain(|stat| !EXCLUDED_DOT_DIRS.contains(&stat.directory.as_str()));
+
+    let proposal = PersistedScopeProposal {
+        key: cache_key_to_string(&build_directory_walk_cache_key(source_root)),
+        per_directory_stats,
+        file_count_total,
+        // The daemon has no launch subdirectory concept; MCP/CLI invocations do.
+        launch_subdir: None,
+    };
+    save_persisted_scope_proposal(state_root, &proposal)
+}
+
+/// Attaches a fresh persisted scope proposal to a Missing-readiness payload.
+///
+/// Loads the proposal the daemon gate-fired branch persisted, verifies it is
+/// fresh against the current repo walk-cache key, and — only when fresh —
+/// populates `payload.scope_proposal` with ranked suggestions and cone
+/// candidates. A stale, absent, or unreadable proposal is a no-op, leaving the
+/// generic Missing next_action to stand.
+fn attach_scope_proposal_if_fresh(
+    payload: &mut ReadinessPayload,
+    state_root: &Path,
+    source_root: &Path,
+) {
+    let Some(proposal) = load_persisted_scope_proposal(state_root) else {
+        return;
+    };
+    let current_key = cache_key_to_string(&build_directory_walk_cache_key(source_root));
+    if !is_scope_proposal_fresh(&proposal.key, &current_key) {
+        return;
+    }
+
+    // Rebuild ranked human-readable suggestions from the persisted stats,
+    // reusing the same generator the synchronous facts envelope uses so the
+    // wording cannot drift. estimated_vectors is irrelevant to ranking.
+    let stats: Vec<DirectoryStats> = proposal
+        .per_directory_stats
+        .iter()
+        .map(|stat| DirectoryStats {
+            directory: stat.directory.clone(),
+            file_count: stat.file_count,
+            estimated_vectors: 0,
+        })
+        .collect();
+    let suggestions = generate_ranked_suggestions(&stats, &proposal.launch_subdir);
+    let scope_candidates = stats.iter().map(|stat| stat.directory.clone()).collect();
+
+    payload.scope_proposal = Some(ScopeProposalSummary {
+        file_count_total: proposal.file_count_total,
+        launch_subdir: proposal.launch_subdir,
+        suggestions,
+        scope_candidates,
+    });
+}
+
 // FIX B: Density computation cache to avoid second uncached walk on every envelope call.
 // Keyed by (repo_identity, HEAD, mtime) - same as directory walk cache key.
 static DENSITY_CACHE: OnceLock<Mutex<HashMap<DirectoryWalkCacheKey, f64>>> = OnceLock::new();
@@ -3342,15 +3548,7 @@ fn get_file_count_threshold() -> usize {
 /// F5/N4b: Uses both in-process and persistent (disk-based) caches for cross-process reuse.
 fn count_files_per_directory(source_root: &Path) -> Result<BTreeMap<String, usize>, OneupError> {
     // Build cache key from repo identity and current state
-    let cache_key = DirectoryWalkCacheKey {
-        repo_identity: source_root
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
-        head_commit: get_head_commit(source_root),
-        root_mtime: get_root_mtime(source_root),
-    };
+    let cache_key = build_directory_walk_cache_key(source_root);
 
     let cache_key_str = cache_key_to_string(&cache_key);
 
@@ -3540,15 +3738,7 @@ fn compute_avg_density_for_repo(state_root: &Path, source_root: &Path) -> Result
     // in-process cache accepts that bound (it dies with the process); the
     // persistent cache does not, and additionally declines reuse while the
     // worktree is dirty (see below).
-    let cache_key = DirectoryWalkCacheKey {
-        repo_identity: source_root
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| source_root.to_string_lossy().into_owned()),
-        head_commit: get_head_commit(source_root),
-        root_mtime: get_root_mtime(source_root),
-    };
+    let cache_key = build_directory_walk_cache_key(source_root);
 
     let cache_key_str = cache_key_to_string(&cache_key);
 
@@ -3880,8 +4070,7 @@ pub async fn generate_facts_envelope(
 
     // Filter out tool/editor dot-directories from stats
     // Excludes: .idea, .claude, .vscode, .1up, .agentdocs (noise in suggestions)
-    let excluded_dot_dirs = [".idea", ".claude", ".vscode", ".1up", ".agentdocs"];
-    per_directory_stats.retain(|stat| !excluded_dot_dirs.contains(&stat.directory.as_str()));
+    per_directory_stats.retain(|stat| !EXCLUDED_DOT_DIRS.contains(&stat.directory.as_str()));
 
     // Calibrate global vector estimate (N2: reuses same computed density)
     let (vector_estimate_total, basis, low_bound, high_bound) =
@@ -6716,5 +6905,146 @@ mod tests {
         let display = generate_ranked_suggestions(&stats, &None);
         let reasons: Vec<String> = suggestions.into_iter().map(|s| s.reason).collect();
         assert_eq!(display, reasons);
+    }
+
+    // --- Persisted scope proposal (daemon gate-fired surface, issue #86) ---
+
+    fn sample_proposal(key: &str) -> PersistedScopeProposal {
+        PersistedScopeProposal {
+            key: key.to_string(),
+            per_directory_stats: vec![
+                PersistedDirectoryStat {
+                    directory: "services".to_string(),
+                    file_count: 2000,
+                },
+                PersistedDirectoryStat {
+                    directory: "libs".to_string(),
+                    file_count: 800,
+                },
+            ],
+            file_count_total: 2800,
+            launch_subdir: None,
+        }
+    }
+
+    #[test]
+    fn scope_proposal_persist_load_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+
+        let proposal = sample_proposal("repo_HEAD1_1000");
+        save_persisted_scope_proposal(&state_root, &proposal).unwrap();
+
+        let loaded = load_persisted_scope_proposal(&state_root).expect("proposal round-trips");
+        assert_eq!(loaded, proposal);
+    }
+
+    #[test]
+    fn scope_proposal_save_is_noop_without_dot_dir() {
+        // The gated path must never create .1up as a side effect.
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+
+        save_persisted_scope_proposal(&state_root, &sample_proposal("k")).unwrap();
+
+        assert!(!project_dot_dir(&state_root).exists());
+        assert!(load_persisted_scope_proposal(&state_root).is_none());
+    }
+
+    #[test]
+    fn scope_proposal_load_absent_file_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+
+        // .1up exists but no proposal file written yet -> fall back.
+        assert!(load_persisted_scope_proposal(&state_root).is_none());
+    }
+
+    #[test]
+    fn scope_proposal_freshness_matches_only_identical_key() {
+        // Fresh: identical key (same repo identity + HEAD + mtime).
+        assert!(is_scope_proposal_fresh(
+            "repo_HEAD1_1000",
+            "repo_HEAD1_1000"
+        ));
+        // Stale: HEAD drift.
+        assert!(!is_scope_proposal_fresh(
+            "repo_HEAD1_1000",
+            "repo_HEAD2_1000"
+        ));
+        // Stale: mtime drift.
+        assert!(!is_scope_proposal_fresh(
+            "repo_HEAD1_1000",
+            "repo_HEAD1_2000"
+        ));
+        // Stale: different repo identity.
+        assert!(!is_scope_proposal_fresh(
+            "repoA_HEAD1_1000",
+            "repoB_HEAD1_1000"
+        ));
+    }
+
+    #[test]
+    fn attach_scope_proposal_surfaces_ranked_suggestions_when_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("repo");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source_root = source_root.canonicalize().unwrap();
+        let state_root = source_root.clone();
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+
+        // Persist a proposal keyed by the CURRENT walk-cache key so it is fresh.
+        let current_key = cache_key_to_string(&build_directory_walk_cache_key(&source_root));
+        save_persisted_scope_proposal(&state_root, &sample_proposal(&current_key)).unwrap();
+
+        let mut payload = blocked_readiness_for_path("repo", "fixture");
+        attach_scope_proposal_if_fresh(&mut payload, &state_root, &source_root);
+
+        let proposal = payload.scope_proposal.expect("fresh proposal attaches");
+        assert_eq!(proposal.file_count_total, 2800);
+        assert_eq!(
+            proposal.scope_candidates,
+            vec!["services".to_string(), "libs".to_string()]
+        );
+        // Suggestions are rebuilt from the persisted stats (largest first).
+        assert_eq!(
+            proposal.suggestions.first().map(String::as_str),
+            Some("Index the largest directory: services")
+        );
+    }
+
+    #[test]
+    fn attach_scope_proposal_is_noop_when_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("repo");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source_root = source_root.canonicalize().unwrap();
+        let state_root = source_root.clone();
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+
+        // A key that cannot match the current repo state -> stale -> fall back.
+        save_persisted_scope_proposal(&state_root, &sample_proposal("stale_key_xyz")).unwrap();
+
+        let mut payload = blocked_readiness_for_path("repo", "fixture");
+        attach_scope_proposal_if_fresh(&mut payload, &state_root, &source_root);
+
+        assert!(payload.scope_proposal.is_none());
+    }
+
+    #[test]
+    fn attach_scope_proposal_is_noop_when_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("repo");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source_root = source_root.canonicalize().unwrap();
+        let state_root = source_root.clone();
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+
+        let mut payload = blocked_readiness_for_path("repo", "fixture");
+        attach_scope_proposal_if_fresh(&mut payload, &state_root, &source_root);
+
+        assert!(payload.scope_proposal.is_none());
     }
 }

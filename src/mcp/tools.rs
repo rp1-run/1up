@@ -33,6 +33,9 @@ use crate::shared::types::{
 const DEFAULT_SEARCH_LIMIT: usize = 5;
 const MCP_FIELD_SEP: &str = "  ";
 const MCP_PLACEHOLDER: &str = "-";
+/// Maximum ranked `scope_add` cones surfaced in Missing-readiness next_actions,
+/// matching the synchronous facts-envelope suggestion budget.
+const SCOPE_SUGGESTION_LIMIT: usize = 3;
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
 impl OneupMcpServer {
@@ -802,6 +805,64 @@ fn readiness_context_metadata(
     }
 }
 
+/// Builds the Missing-readiness next_actions. When the daemon gate persisted a
+/// fresh scope proposal (over-threshold unscoped repo), surface ranked
+/// `scope_add` cones — the same actionable choices the synchronous facts
+/// envelope offers — so the refusal is durably actionable through `oneup_status`
+/// and a follow-up unscoped `oneup_start`. Absent a proposal, fall back to the
+/// generic "create the index" action.
+fn missing_readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
+    let Some(proposal) = payload.scope_proposal.as_ref() else {
+        return vec![action(
+            TOOL_START,
+            "Create the local 1up index explicitly before searching.",
+            Some(json!({ "mode": "index_if_missing" })),
+        )];
+    };
+
+    let mut actions = Vec::new();
+    if let Some(launch_subdir) = proposal.launch_subdir.as_ref() {
+        actions.push(action(
+            TOOL_START,
+            format!("Index the launch subdirectory first: {}", launch_subdir),
+            Some(json!({ "mode": "index_if_needed", "scope_add": [launch_subdir] })),
+        ));
+    }
+
+    for candidate in proposal
+        .scope_candidates
+        .iter()
+        .take(SCOPE_SUGGESTION_LIMIT)
+    {
+        if proposal.launch_subdir.as_deref() == Some(candidate.as_str()) {
+            continue;
+        }
+        let reason = if actions.is_empty() {
+            format!(
+                "Large repository ({} files) needs a scope; index the largest directory: {}",
+                proposal.file_count_total, candidate
+            )
+        } else {
+            format!("Or index another directory: {}", candidate)
+        };
+        actions.push(action(
+            TOOL_START,
+            reason,
+            Some(json!({ "mode": "index_if_needed", "scope_add": [candidate] })),
+        ));
+    }
+
+    // Defensive: a proposal with no usable cones still needs an actionable step.
+    if actions.is_empty() {
+        actions.push(action(
+            TOOL_START,
+            "Create the local 1up index explicitly before searching.",
+            Some(json!({ "mode": "index_if_missing" })),
+        ));
+    }
+    actions
+}
+
 fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
     let mut actions = match payload.status {
         ReadinessStatus::Ready => vec![action(
@@ -821,11 +882,7 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
                 Some(json!({})),
             ),
         ],
-        ReadinessStatus::Missing => vec![action(
-            TOOL_START,
-            "Create the local 1up index explicitly before searching.",
-            Some(json!({ "mode": "index_if_missing" })),
-        )],
+        ReadinessStatus::Missing => missing_readiness_next_actions(payload),
         ReadinessStatus::Indexing => vec![action(
             TOOL_STATUS,
             "Poll readiness until indexing completes.",
@@ -1782,6 +1839,49 @@ mod tests {
             panic!("expected arguments to be Some");
         }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    #[test]
+    fn missing_readiness_without_proposal_falls_back_to_generic_start() {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Missing;
+
+        let actions = missing_readiness_next_actions(&payload);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_START);
+        assert_eq!(
+            actions[0].arguments.as_ref().unwrap()["mode"],
+            "index_if_missing"
+        );
+    }
+
+    #[test]
+    fn missing_readiness_with_fresh_proposal_surfaces_ranked_scope_add_actions() {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Missing;
+        payload.scope_proposal = Some(ops::ScopeProposalSummary {
+            file_count_total: 5000,
+            launch_subdir: None,
+            suggestions: vec![
+                "Index the largest directory: services".to_string(),
+                "Or index 2nd: libs".to_string(),
+            ],
+            scope_candidates: vec!["services".to_string(), "libs".to_string()],
+        });
+
+        let actions = missing_readiness_next_actions(&payload);
+        assert_eq!(actions.len(), 2, "one scope_add action per ranked cone");
+        assert!(actions.iter().all(|a| a.tool == TOOL_START));
+        assert_eq!(
+            actions[0].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["services"])
+        );
+        assert_eq!(
+            actions[1].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["libs"])
+        );
+        // The over-threshold file count is surfaced so the refusal is legible.
+        assert!(actions[0].reason.contains("5000"));
     }
 
     #[test]
