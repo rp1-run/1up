@@ -1039,11 +1039,11 @@ fn delete_context_removes_only_the_target_context() {
 
 /// The daemon's startup auto-prune must delete exactly the contexts whose source
 /// worktree directory is gone — selected against the real filesystem — and leave a
-/// live context untouched. Guards the `worker::source_missing_context_ids` ->
-/// `segments::delete_context` composition end to end: real-`exists` selection (not
-/// a hardcoded id) drives which context's rows are removed, the live one's rows and
-/// its `worktree_contexts` row survive, and no stale-branch snapshot of the live
-/// worktree is ever in scope.
+/// live context untouched. Guards the `worker::classify_source_missing_contexts` ->
+/// `segments::delete_context` composition end to end: real three-state probe
+/// selection (not a hardcoded id) drives which context's rows are removed, the live
+/// one's rows and its `worktree_contexts` row survive, and no stale-branch snapshot
+/// of the live worktree is ever in scope.
 ///
 /// Adapted to the shared-store model: both contexts share one pooled
 /// embedding, so the prune must reference-count it down and leave the live
@@ -1051,7 +1051,8 @@ fn delete_context_removes_only_the_target_context() {
 #[cfg(unix)]
 #[test]
 fn startup_prune_removes_only_source_missing_contexts() {
-    use oneup::daemon::worker::source_missing_context_ids;
+    use oneup::daemon::worker::classify_source_missing_contexts;
+    use oneup::shared::fs::probe_source_presence;
     use oneup::shared::types::{BranchStatus, WorktreeContext, WorktreeRole};
 
     fn context(state_root: &Path, source_root: &Path, id: &str) -> WorktreeContext {
@@ -1141,12 +1142,18 @@ fn startup_prune_removes_only_source_missing_contexts() {
 
         // Select against the real filesystem: only the gone worktree's context.
         let listed = segments::list_worktree_contexts(&conn).await.unwrap();
-        let pruned = source_missing_context_ids(&listed, &|p: &Path| p.exists());
+        let selection =
+            classify_source_missing_contexts(&listed, &|p: &Path| probe_source_presence(p));
         assert_eq!(
-            pruned,
+            selection.to_prune,
             vec!["ctx-gone".to_string()],
             "only the source-missing context is selected; the live one is retained"
         );
+        assert!(
+            selection.indeterminate.is_empty(),
+            "both sources probe cleanly, so nothing is indeterminate"
+        );
+        let pruned = selection.to_prune;
 
         // The shared embedding is stored once and referenced by both contexts.
         assert_eq!(

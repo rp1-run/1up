@@ -27,7 +27,9 @@ use crate::shared::constants::{
     STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
-use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
+use crate::shared::fs::{
+    atomic_replace, ensure_secure_project_root, probe_source_presence, SourcePresence,
+};
 use crate::shared::project::canonical_project_root;
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
@@ -580,25 +582,49 @@ fn prewarm_project_embedders(projects: &mut ProjectStates) {
     }
 }
 
-/// Select the recorded contexts whose source worktree directory no longer exists.
+/// The result of classifying recorded contexts by whether their source worktree
+/// directory is still present, using a three-state probe.
 ///
-/// Pure and injected with `source_exists` so it is deterministic and
-/// unit-testable (the daemon passes `|p| p.exists()`). This mirrors the
-/// source-missing arm of `cli::gc::prune_reason`, but deliberately selects on
-/// *source-root absence alone*: unlike `1up gc`, the daemon's startup prune never
+/// `to_prune` holds the contexts whose source is *definitely absent* and are
+/// therefore eligible for deletion. `indeterminate` holds contexts whose source
+/// probe could not decide (a transient/mount failure): they are **retained** this
+/// cycle and surfaced so the caller can `warn!` about the skipped prune rather
+/// than destructively deleting a live-but-unreachable source's rows.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SourceMissingSelection {
+    pub to_prune: Vec<String>,
+    pub indeterminate: Vec<String>,
+}
+
+/// Classify the recorded contexts by source-root presence for a startup prune.
+///
+/// Pure and injected with `probe` so it is deterministic and unit-testable (the
+/// daemon passes [`crate::shared::fs::probe_source_presence`]). Only sources that
+/// are *definitely absent* ([`SourcePresence::Absent`]) are selected for pruning;
+/// a source whose probe is [`SourcePresence::Indeterminate`] (a permission/IO
+/// fault on a flaky or unmounted network mount) is retained and reported
+/// separately so a transient failure never false-prunes a live source's index
+/// rows. A [`SourcePresence::Present`] source is always retained.
+///
+/// Like the source-missing arm of `cli::gc::prune_reason`, this deliberately
+/// selects on *source-root absence alone*: the daemon's startup prune never
 /// touches stale-branch snapshots of a still-present worktree — those rebuild on
 /// demand and stay a manual decision. A context whose `source_root` still exists
 /// is therefore always retained, including a same-`state_root`, other-branch
 /// snapshot that shares a live worktree.
-pub fn source_missing_context_ids(
+pub fn classify_source_missing_contexts(
     contexts: &[IndexedContextRow],
-    source_exists: &dyn Fn(&Path) -> bool,
-) -> Vec<String> {
-    contexts
-        .iter()
-        .filter(|ctx| !source_exists(&ctx.source_root))
-        .map(|ctx| ctx.context_id.clone())
-        .collect()
+    probe: &dyn Fn(&Path) -> SourcePresence,
+) -> SourceMissingSelection {
+    let mut selection = SourceMissingSelection::default();
+    for ctx in contexts {
+        match probe(&ctx.source_root) {
+            SourcePresence::Present => {}
+            SourcePresence::Absent => selection.to_prune.push(ctx.context_id.clone()),
+            SourcePresence::Indeterminate => selection.indeterminate.push(ctx.context_id.clone()),
+        }
+    }
+    selection
 }
 
 /// Best-effort startup prune of contexts whose source worktree directory has been
@@ -606,7 +632,7 @@ pub fn source_missing_context_ids(
 /// in the shared index until a manual `1up gc`.
 ///
 /// Scope is deliberately the *source-missing* subset only (via
-/// [`source_missing_context_ids`]) — never stale-branch snapshots of a live
+/// [`classify_source_missing_contexts`]) — never stale-branch snapshots of a live
 /// worktree, which stay a manual decision. The safety boundaries are all enforced
 /// here: the single-writer rebuild lock is taken **non-blocking** per index DB (a
 /// contended or un-openable DB is skipped this cycle, never waited on), **no
@@ -671,7 +697,11 @@ async fn prune_source_missing_contexts_on_startup(registry: &Registry) {
 /// caller's startup path is never broken.
 async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<String> {
     let db_path = config::project_db_path(state_root);
-    // A registered entry without an on-disk index yet has nothing to prune.
+    // A registered entry without an on-disk index yet has nothing to prune. A
+    // boolean `exists()` is deliberate here: a transient false-negative only skips
+    // this DB's prune for one cycle (non-destructive), so the three-state probe —
+    // reserved for decisions that delete rows or change registration — is not
+    // needed.
     if !db_path.exists() {
         return Vec::new();
     }
@@ -704,11 +734,20 @@ async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect_tuned().await?;
         let contexts = segments::list_worktree_contexts(&conn).await?;
-        let pruned = source_missing_context_ids(&contexts, &|p: &Path| p.exists());
-        for context_id in &pruned {
+        let selection =
+            classify_source_missing_contexts(&contexts, &|p: &Path| probe_source_presence(p));
+        if !selection.indeterminate.is_empty() {
+            warn!(
+                "retaining {} context(s) with indeterminate source presence (transient probe failure, e.g. an unreachable network mount) at {}: {}",
+                selection.indeterminate.len(),
+                db_path.display(),
+                selection.indeterminate.join(", ")
+            );
+        }
+        for context_id in &selection.to_prune {
             segments::delete_context(&conn, context_id).await?;
         }
-        Ok::<_, OneupError>(pruned)
+        Ok::<_, OneupError>(selection.to_prune)
     }
     .await;
 
@@ -824,22 +863,48 @@ fn mark_startup_reconciliation_pending(state: &mut ProjectState) {
 }
 
 async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState>, OneupError> {
-    if !entry.project_root.exists() {
-        warn!(
-            "skipping non-existent project: {}",
-            entry.project_root.display()
-        );
-        return Ok(None);
+    match probe_source_presence(&entry.project_root) {
+        SourcePresence::Present => {}
+        SourcePresence::Absent => {
+            warn!(
+                "skipping non-existent project: {}",
+                entry.project_root.display()
+            );
+            return Ok(None);
+        }
+        SourcePresence::Indeterminate => {
+            // A transient probe failure on the state root: skip this cycle without
+            // recording anything, so a flaky mount is never mistaken for deletion.
+            warn!(
+                "skipping project {} this cycle: state root presence is indeterminate (transient probe failure)",
+                entry.project_root.display()
+            );
+            return Ok(None);
+        }
     }
     let source_root = entry.source_root().to_path_buf();
-    if !source_root.exists() {
-        warn!(
-            "skipping project {} because source root is missing: {}",
-            entry.project_root.display(),
-            source_root.display()
-        );
-        persist_source_missing_context_status(entry);
-        return Ok(None);
+    match probe_source_presence(&source_root) {
+        SourcePresence::Present => {}
+        SourcePresence::Absent => {
+            warn!(
+                "skipping project {} because source root is missing: {}",
+                entry.project_root.display(),
+                source_root.display()
+            );
+            persist_source_missing_context_status(entry);
+            return Ok(None);
+        }
+        SourcePresence::Indeterminate => {
+            // Do NOT persist source-missing status on a transient probe failure: an
+            // unreachable/unmounted network source must not be recorded as deleted.
+            // Skip this cycle and retry once the source is reachable again.
+            warn!(
+                "skipping project {} this cycle: source root presence is indeterminate (transient probe failure): {}",
+                entry.project_root.display(),
+                source_root.display()
+            );
+            return Ok(None);
+        }
     }
 
     let db_path = config::project_db_path(&entry.project_root);
@@ -1713,21 +1778,38 @@ async fn run_project(
     // its event loop while a one-shot rebuild holds the lock. The guard releases
     // on drop — including when an in-flight pass is cancelled and this frame
     // unwinds — freeing the lock for the restarted binary.
-    let (lock_root, source_missing) = {
+    let (lock_root, source_presence) = {
         let state = projects
             .get(context_id)
             .expect("dirty project must exist while running");
-        (state.project_root.clone(), !state.source_root.exists())
+        (
+            state.project_root.clone(),
+            probe_source_presence(&state.source_root),
+        )
     };
     // Detect a deleted source root BEFORE attempting the rebuild lock.
     // For a *linked* worktree the state_root (main repo, owns `.1up/`) can survive
     // while the source_root (the worktree) is deleted, so the lock — which is keyed
     // on state_root — would still acquire and the deleted-source cleanup below
-    // would never run, leaving the daemon refreshing a gone worktree. Statting
+    // would never run, leaving the daemon refreshing a gone worktree. Probing
     // source_root independently covers both the main-repo case (state_root ==
     // source_root) and the linked-worktree split.
-    if source_missing {
-        return deregister_deleted_project(context_id, projects, watcher, &lock_root);
+    //
+    // Only a *definitely-absent* source deregisters: a transient/indeterminate
+    // probe (an unreachable network mount) must never trigger destructive
+    // deregistration, so it falls through to the normal pass — indexing then
+    // fails or no-ops and leaves the project dirty for a later retry.
+    match source_presence {
+        SourcePresence::Absent => {
+            return deregister_deleted_project(context_id, projects, watcher, &lock_root);
+        }
+        SourcePresence::Indeterminate => {
+            warn!(
+                "source root presence indeterminate for {} (transient probe failure); retaining registration and attempting this pass",
+                lock_root.display()
+            );
+        }
+        SourcePresence::Present => {}
     }
     let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
         Ok(Some(lock)) => lock,
@@ -1744,9 +1826,10 @@ async fn run_project(
         Err(e) => {
             // The source root existed at the top of this pass; a lock error here is
             // a genuine lock/IO fault, or a race where the root vanished mid-pass.
-            // Re-check once for that race and clean up, otherwise propagate.
+            // Re-check once for that race and clean up only on a *definite* absence
+            // (a transient probe failure must not deregister), otherwise propagate.
             let state = projects.get(context_id).expect("dirty project must exist");
-            if !state.source_root.exists() {
+            if probe_source_presence(&state.source_root) == SourcePresence::Absent {
                 return deregister_deleted_project(context_id, projects, watcher, &lock_root);
             }
             return Err(e);
@@ -3631,14 +3714,40 @@ mod tests {
     }
 
     #[test]
-    fn source_missing_selects_only_contexts_whose_source_is_gone() {
+    fn source_missing_selects_only_contexts_whose_source_is_absent() {
         let contexts = [
             context_row("live00000001", "/repo", "/repo"),
             context_row("gone00000001", "/repo", "/repo-feature"),
         ];
-        // Only `/repo-feature` is gone; the live `/repo` context is retained.
-        let pruned = source_missing_context_ids(&contexts, &|p| p != Path::new("/repo-feature"));
-        assert_eq!(pruned, vec!["gone00000001".to_string()]);
+        // Only `/repo-feature` is absent; the live `/repo` context is retained.
+        let selection = classify_source_missing_contexts(&contexts, &|p| {
+            if p == Path::new("/repo-feature") {
+                SourcePresence::Absent
+            } else {
+                SourcePresence::Present
+            }
+        });
+        assert_eq!(selection.to_prune, vec!["gone00000001".to_string()]);
+        assert!(selection.indeterminate.is_empty());
+    }
+
+    #[test]
+    fn indeterminate_source_is_retained_not_pruned() {
+        // A transient probe failure (e.g. an unreachable network mount) must never
+        // be treated as deletion: the context is reported as indeterminate and
+        // retained, while a genuinely-absent sibling is still pruned.
+        let contexts = [
+            context_row("flaky0000001", "/repo", "/mnt/nfs/repo"),
+            context_row("gone00000001", "/repo", "/repo-feature"),
+        ];
+        let selection =
+            classify_source_missing_contexts(&contexts, &|p| match p.to_str().unwrap() {
+                "/mnt/nfs/repo" => SourcePresence::Indeterminate,
+                "/repo-feature" => SourcePresence::Absent,
+                _ => SourcePresence::Present,
+            });
+        assert_eq!(selection.to_prune, vec!["gone00000001".to_string()]);
+        assert_eq!(selection.indeterminate, vec!["flaky0000001".to_string()]);
     }
 
     #[test]
@@ -3650,17 +3759,20 @@ mod tests {
             context_row("active000001", "/repo", "/repo"),
             context_row("oldbranch001", "/repo", "/repo"),
         ];
-        assert!(source_missing_context_ids(&contexts, &|_| true).is_empty());
+        let selection = classify_source_missing_contexts(&contexts, &|_| SourcePresence::Present);
+        assert!(selection.to_prune.is_empty());
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[test]
     fn source_missing_on_empty_input_is_empty() {
-        assert!(source_missing_context_ids(&[], &|_| true).is_empty());
-        assert!(source_missing_context_ids(&[], &|_| false).is_empty());
+        let selection = classify_source_missing_contexts(&[], &|_| SourcePresence::Present);
+        assert!(selection.to_prune.is_empty());
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[test]
-    fn source_missing_selects_every_gone_context_and_keeps_the_live_one() {
+    fn source_missing_selects_every_absent_context_and_keeps_the_live_one() {
         let contexts = [
             context_row("gone00000001", "/repo", "/wt-a"),
             context_row("live00000001", "/repo", "/repo"),
@@ -3668,11 +3780,18 @@ mod tests {
         ];
         // Every context whose source is absent is selected, order-preserved; the
         // single live context is the only one retained.
-        let pruned = source_missing_context_ids(&contexts, &|p| p == Path::new("/repo"));
+        let selection = classify_source_missing_contexts(&contexts, &|p| {
+            if p == Path::new("/repo") {
+                SourcePresence::Present
+            } else {
+                SourcePresence::Absent
+            }
+        });
         assert_eq!(
-            pruned,
+            selection.to_prune,
             vec!["gone00000001".to_string(), "gone00000002".to_string()]
         );
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[tokio::test]
