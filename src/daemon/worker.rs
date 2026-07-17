@@ -210,6 +210,37 @@ pub async fn run() -> Result<(), OneupError> {
     run_inner().await
 }
 
+/// Registry-reload trigger source consumed by the rebuild sweep.
+///
+/// Production threads the process SIGHUP stream (`run_inner` owns the sole
+/// [`Signal`]) through this seam unchanged; lifecycle tests inject reload
+/// ticks over a plain channel instead. The seam exists because raising a
+/// process-global SIGHUP from a test is unreliable under the parallel test
+/// harness: the signal is process-wide, other tests' tokio signal listeners
+/// can consume it, and delivery races the sweep's select loop — whereas a
+/// channel send is delivered deterministically to exactly this consumer.
+trait ReloadSignal {
+    /// Completes when a registry reload has been requested. Mirrors
+    /// [`Signal::recv`]; `None` means the source can never fire again.
+    async fn recv(&mut self) -> Option<()>;
+}
+
+impl ReloadSignal for Signal {
+    async fn recv(&mut self) -> Option<()> {
+        Signal::recv(self).await
+    }
+}
+
+/// Test-side injected reload source: each queued `()` is one reload tick,
+/// delivered to the sweep exactly like a SIGHUP wake-up but without touching
+/// process-global signal state.
+#[cfg(test)]
+impl ReloadSignal for mpsc::UnboundedReceiver<()> {
+    async fn recv(&mut self) -> Option<()> {
+        mpsc::UnboundedReceiver::recv(self).await
+    }
+}
+
 async fn run_inner() -> Result<(), OneupError> {
     info!("daemon worker starting (pid={})", std::process::id());
 
@@ -245,7 +276,13 @@ async fn run_inner() -> Result<(), OneupError> {
     };
 
     let mut deferred: DeferredProjects = HashMap::new();
-    load_and_watch_projects(&mut file_watcher, &mut projects, &mut deferred, &cancel_token).await?;
+    load_and_watch_projects(
+        &mut file_watcher,
+        &mut projects,
+        &mut deferred,
+        &cancel_token,
+    )
+    .await?;
     prewarm_project_embedders(&mut projects);
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
     run_dirty_projects_until_clean_or_cancelled(
@@ -674,7 +711,9 @@ async fn retry_deferred_projects(
 
     let entries: Vec<ProjectEntry> = deferred.values().cloned().collect();
     for entry in entries {
-        if let Err(e) = load_registered_project(&entry, watcher, projects, deferred, parent_token).await {
+        if let Err(e) =
+            load_registered_project(&entry, watcher, projects, deferred, parent_token).await
+        {
             debug!(
                 "retry of deferred project {} failed; keeping it deferred: {e}",
                 entry.project_root.display()
@@ -1730,7 +1769,7 @@ async fn run_dirty_projects_until_clean_or_cancelled(
     deferred: &mut DeferredProjects,
     cancel_token: &CancellationToken,
     sigterm: &mut Signal,
-    sighup: &mut Signal,
+    sighup: &mut impl ReloadSignal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
     let sweep = run_dirty_projects_until_clean(
@@ -1760,7 +1799,7 @@ async fn run_dirty_projects_until_clean(
     projects: &mut ProjectStates,
     deferred: &mut DeferredProjects,
     cancel_token: &CancellationToken,
-    sighup: &mut Signal,
+    sighup: &mut impl ReloadSignal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) {
     let mut preferred_key: Option<String> = None;
@@ -2064,7 +2103,7 @@ async fn run_unit_while_servicing_events<F: Future>(
     deferred: &mut DeferredProjects,
     watcher: &mut FileWatcher,
     daemon_token: &CancellationToken,
-    sighup: &mut Signal,
+    sighup: &mut impl ReloadSignal,
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
 ) -> F::Output {
     tokio::pin!(unit);
@@ -2173,7 +2212,7 @@ async fn run_project(
     search_requests_rx: &mut mpsc::Receiver<QueuedSearchRequest>,
     watcher: &mut FileWatcher,
     daemon_token: &CancellationToken,
-    sighup: &mut Signal,
+    sighup: &mut impl ReloadSignal,
 ) -> Result<pipeline::PipelineStats, OneupError> {
     // Acquire the single-writer rebuild lock BEFORE `start_run` consumes the
     // pending scope, so a contended pass leaves the project dirty (its queued
@@ -3425,7 +3464,7 @@ mod tests {
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let result = run_project(
             &key,
             &mut projects,
@@ -3433,7 +3472,7 @@ mod tests {
             &mut search_requests_rx,
             &mut watcher,
             &daemon_token,
-            &mut sighup,
+            &mut reload_rx,
         )
         .await;
         assert!(
@@ -3517,7 +3556,7 @@ mod tests {
         // Run the project: it should detect the missing root, deregister, and return
         // success (default stats) rather than error or infinite loop
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let result = run_project(
             &key,
             &mut projects,
@@ -3525,7 +3564,7 @@ mod tests {
             &mut search_requests_rx,
             &mut watcher,
             &daemon_token,
-            &mut sighup,
+            &mut reload_rx,
         )
         .await;
 
@@ -3601,7 +3640,7 @@ mod tests {
         );
 
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let result = run_project(
             &key,
             &mut projects,
@@ -3609,7 +3648,7 @@ mod tests {
             &mut search_requests_rx,
             &mut watcher,
             &daemon_token,
-            &mut sighup,
+            &mut reload_rx,
         )
         .await;
 
@@ -3685,7 +3724,7 @@ mod tests {
 
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let result = run_project(
             &key,
             &mut projects,
@@ -3693,7 +3732,7 @@ mod tests {
             &mut search_requests_rx,
             &mut watcher,
             &CancellationToken::new(),
-            &mut sighup,
+            &mut reload_rx,
         )
         .await;
 
@@ -3736,13 +3775,13 @@ mod tests {
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut watcher = FileWatcher::new().unwrap();
         let mut deferred: DeferredProjects = HashMap::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         run_dirty_projects_until_clean(
             &mut watcher,
             &mut projects,
             &mut deferred,
             &cancel_token,
-            &mut sighup,
+            &mut reload_rx,
             &mut search_requests_rx,
         )
         .await;
@@ -3794,7 +3833,9 @@ mod tests {
         let entry = test_entry(&project_root, Some(&loop_path));
         assert!(
             matches!(
-                build_project_state(&entry, &CancellationToken::new()).await.unwrap(),
+                build_project_state(&entry, &CancellationToken::new())
+                    .await
+                    .unwrap(),
                 ProjectStateBuild::Defer
             ),
             "an indeterminate source-root probe must defer, not drop, the entry"
@@ -3804,7 +3845,9 @@ mod tests {
         let entry = test_entry(&loop_path, None);
         assert!(
             matches!(
-                build_project_state(&entry, &CancellationToken::new()).await.unwrap(),
+                build_project_state(&entry, &CancellationToken::new())
+                    .await
+                    .unwrap(),
                 ProjectStateBuild::Defer
             ),
             "an indeterminate state-root probe must defer, not drop, the entry"
@@ -3814,7 +3857,9 @@ mod tests {
         let entry = test_entry(&project_root, Some(&root.join("definitely-missing")));
         assert!(
             matches!(
-                build_project_state(&entry, &CancellationToken::new()).await.unwrap(),
+                build_project_state(&entry, &CancellationToken::new())
+                    .await
+                    .unwrap(),
                 ProjectStateBuild::Skip
             ),
             "a definitely-absent source root must skip, exactly as before"
@@ -3842,7 +3887,13 @@ mod tests {
         let mut watcher = FileWatcher::new().unwrap();
 
         // Still unreachable: the entry must be retained, neither loaded nor dropped.
-        retry_deferred_projects(&mut watcher, &mut projects, &mut deferred, &CancellationToken::new()).await;
+        retry_deferred_projects(
+            &mut watcher,
+            &mut projects,
+            &mut deferred,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(
             projects.is_empty(),
             "an indeterminate probe must not load the project"
@@ -3857,7 +3908,13 @@ mod tests {
         std::fs::create_dir_all(&source_root).unwrap();
         std::fs::write(source_root.join("lib.rs"), "pub fn f() {}\n").unwrap();
 
-        retry_deferred_projects(&mut watcher, &mut projects, &mut deferred, &CancellationToken::new()).await;
+        retry_deferred_projects(
+            &mut watcher,
+            &mut projects,
+            &mut deferred,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(
             deferred.is_empty(),
             "a recovered project must leave the deferred set"
@@ -3946,10 +4003,18 @@ mod tests {
     /// WHILE a rebuild pass is running — through the real sweep
     /// (`run_dirty_projects_until_clean` → `run_project` →
     /// `run_unit_while_servicing_events`), a real `rebuild.lock` acquired by that
-    /// pass, a mutated on-disk registry, and a real SIGHUP — must cancel the
-    /// de-registered pass, keep the lock held until the pipeline exits at a
-    /// committed boundary, release it only then, and leave the worker and the
-    /// retained sibling project fully healthy.
+    /// pass, and a mutated on-disk registry — must cancel the de-registered
+    /// pass, keep the lock held until the pipeline exits at a committed
+    /// boundary, release it only then, and leave the worker and the retained
+    /// sibling project fully healthy.
+    ///
+    /// The reload trigger is INJECTED through the [`ReloadSignal`] seam (a
+    /// channel tick sent while the pass is parked in the rebuild hold) rather
+    /// than a raised process-global SIGHUP: a real signal is process-wide, so
+    /// concurrent tests' tokio signal listeners can consume it and its delivery
+    /// races the sweep's select loop, making the test flaky under the parallel
+    /// harness. The seam feeds the exact select arm production wires SIGHUP
+    /// into, so the covered reload path is unchanged.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn sighup_during_rebuild_cancels_pass_and_releases_lock_only_after_drain() {
@@ -4016,7 +4081,9 @@ mod tests {
         watcher.watch(&root_a).unwrap();
         watcher.watch(&root_b).unwrap();
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        // Injected reload source (see the test doc): `reload_tx` stands in for
+        // the kernel delivering a SIGHUP, feeding the same sweep select arm.
+        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let (_tx, mut search_requests_rx) = mpsc::channel(1);
         let mut deferred: DeferredProjects = HashMap::new();
 
@@ -4028,7 +4095,7 @@ mod tests {
                 &mut projects,
                 &mut deferred,
                 &daemon_token,
-                &mut sighup,
+                &mut reload_rx,
                 &mut search_requests_rx,
             );
             tokio::pin!(sweep);
@@ -4061,19 +4128,21 @@ mod tests {
                 "the in-flight pass must own the real rebuild lock"
             );
 
-            // Phase 2: de-register A in the on-disk registry and deliver a real
-            // SIGHUP while A's pass is still running.
+            // Phase 2: de-register A in the on-disk registry and inject the
+            // reload tick while A's pass is still running. The pass is parked
+            // in the rebuild hold with the lock held, so the tick is delivered
+            // deterministically at the intended point.
             Registry {
                 projects: vec![registry_entry(&key_b, &root_b)],
             }
             .save()
             .unwrap();
-            nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).unwrap();
+            reload_tx.send(()).unwrap();
 
             while !token_a.is_cancelled() {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the SIGHUP reload never cancelled the de-registered in-flight pass"
+                    "the injected reload never cancelled the de-registered in-flight pass"
                 );
                 drive_sweep_tick!();
             }
@@ -4292,7 +4361,7 @@ mod tests {
         let slow_unit = tokio::time::sleep(Duration::from_millis(DAEMON_READ_TIMEOUT_MS * 4));
         let mut watcher = FileWatcher::new().unwrap();
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let mut deferred: DeferredProjects = HashMap::new();
         let run = run_unit_while_servicing_events(
             slow_unit,
@@ -4300,7 +4369,7 @@ mod tests {
             &mut deferred,
             &mut watcher,
             &daemon_token,
-            &mut sighup,
+            &mut reload_rx,
             &mut search_requests_rx,
         );
         tokio::pin!(run);
@@ -5141,7 +5210,7 @@ mod tests {
 
         // Run the first project: it should handle the deletion gracefully
         let daemon_token = CancellationToken::new();
-        let mut sighup = signal(SignalKind::hangup()).unwrap();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
         let result = run_project(
             &key1,
             &mut projects,
@@ -5149,7 +5218,7 @@ mod tests {
             &mut search_requests_rx,
             &mut watcher,
             &daemon_token,
-            &mut sighup,
+            &mut reload_rx,
         )
         .await;
 
