@@ -535,13 +535,16 @@ mod tests {
 
     #[test]
     fn search_response_results_serializes_with_daemon_version() {
+        // The `daemon_version` field now carries the full build-identity stamp
+        // (`{semver}+{git}[.dirty]`), not bare semver, so the authority gate can
+        // discriminate a same-semver daemon from a different build.
         let response = SearchResponse::Results {
             results: vec![],
-            daemon_version: Some("0.1.0".to_string()),
+            daemon_version: Some("0.1.0+abc1234.dirty".to_string()),
             degraded_reason: None,
         };
         let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"daemon_version\":\"0.1.0\""));
+        assert!(json.contains("\"daemon_version\":\"0.1.0+abc1234.dirty\""));
         assert!(json.contains("\"status\":\"results\""));
     }
 

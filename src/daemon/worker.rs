@@ -22,9 +22,10 @@ use crate::indexer::pipeline;
 use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config;
 use crate::shared::constants::{
-    DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, DAEMON_IDLE_SHUTDOWN_ENV_VAR, DAEMON_IDLE_SHUTDOWN_SECS,
-    GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS, MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE,
-    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
+    BUILD_IDENTITY, DAEMON_FILE_CHECK_PERSIST_INTERVAL_MS, DAEMON_IDLE_SHUTDOWN_ENV_VAR,
+    DAEMON_IDLE_SHUTDOWN_SECS, GC_STALE_BRANCH_AUTOPRUNE_MAX_AGE_DAYS,
+    MAX_DAEMON_IN_FLIGHT_REQUESTS, PROJECT_STATE_DIR_MODE, SECURE_STATE_FILE_MODE,
+    STALE_REBUILD_REASON, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
 use crate::shared::fs::{
@@ -3202,7 +3203,10 @@ async fn handle_search_request(
     match results {
         Ok(results) => SearchResponse::Results {
             results,
-            daemon_version: Some(VERSION.to_string()),
+            // Stamp the full build identity (not bare semver) so a same-semver
+            // daemon from a different build is discriminated by the authority
+            // gate rather than trusted.
+            daemon_version: Some(BUILD_IDENTITY.to_string()),
             degraded_reason,
         },
         Err(err) => {
