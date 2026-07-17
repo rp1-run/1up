@@ -1254,6 +1254,28 @@ async fn prune_stale_branch_contexts_on_startup(registry: &Registry) {
     }
 }
 
+/// The production branch-existence probe for the stale-branch auto-prune: a
+/// candidate snapshot's branch "exists" when its recorded `branch_name` still
+/// resolves as `refs/heads/{name}` in the active worktree's repo (loose or
+/// packed, worktree or common git dir — see
+/// [`branch_ref_exists`]). Without a recorded branch name or resolvable git
+/// dirs the branch cannot be proven gone, so the probe conservatively reports
+/// it as existing (the snapshot is retained). Named rather than inlined in
+/// [`prune_stale_branch_contexts_for_state_root`] so tests can drive the
+/// selector with the real `branch_ref_exists`-backed probe against a real
+/// repository.
+fn live_branch_probe(
+    git_dir: Option<PathBuf>,
+    common_git_dir: Option<PathBuf>,
+) -> impl Fn(&IndexedContextRow) -> bool {
+    move |ctx: &IndexedContextRow| match (&ctx.branch_name, &git_dir, &common_git_dir) {
+        (Some(name), Some(gd), Some(cgd)) => {
+            branch_ref_exists(gd, cgd, &format!("refs/heads/{name}"))
+        }
+        _ => true,
+    }
+}
+
 /// Prune eligible stale-branch snapshots from a single shared index DB, returning
 /// the ids that were deleted.
 ///
@@ -1311,18 +1333,8 @@ async fn prune_stale_branch_contexts_for_state_root(
                 continue;
             };
             let active = resolved.worktree_context;
-            let git_dir = active.git_dir.clone();
-            let common_git_dir = active.common_git_dir.clone();
-            let branch_exists = |ctx: &IndexedContextRow| -> bool {
-                match (&ctx.branch_name, &git_dir, &common_git_dir) {
-                    (Some(name), Some(gd), Some(cgd)) => {
-                        branch_ref_exists(gd, cgd, &format!("refs/heads/{name}"))
-                    }
-                    // Without a recorded branch name or resolvable git dirs we
-                    // cannot prove the branch is gone, so retain conservatively.
-                    _ => true,
-                }
-            };
+            let branch_exists =
+                live_branch_probe(active.git_dir.clone(), active.common_git_dir.clone());
             for id in
                 stale_branch_autoprune_context_ids(&active, &contexts, &branch_exists, now, max_age)
             {
@@ -5615,6 +5627,148 @@ mod tests {
             branch_name: active.branch_name.clone(),
             updated_at: "2026-06-30 00:00:00".to_string(),
         }
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        // Per-command `-c` config only: no global env or config mutation.
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "user.name=1up Test",
+                "-c",
+                "user.email=oneup-test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn autoprune_production_probe_selects_deleted_branch_and_retains_live() {
+        // Unlike the synthetic-closure selector tests above, this drives the
+        // selector with the PRODUCTION probe (`live_branch_probe`, backed by
+        // `branch_ref_exists`) against a real repository, so a broken probe
+        // that misreads live branches as gone (mass-prune) or gone branches as
+        // live (never prunes) fails here.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        run_git(&repo, &["init"]);
+        std::fs::write(repo.join("lib.rs"), "// probe\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["branch", "feature/live"]);
+        run_git(&repo, &["branch", "feature/gone"]);
+        run_git(&repo, &["branch", "-D", "feature/gone"]);
+
+        let git_dir = repo.join(".git");
+        let mut active = autoprune_active();
+        active.state_root = repo.clone();
+        active.source_root = repo.clone();
+        active.git_dir = Some(git_dir.clone());
+        active.common_git_dir = Some(git_dir);
+
+        let reroot = |mut row: IndexedContextRow| {
+            row.state_root = repo.clone();
+            row.source_root = repo.clone();
+            row
+        };
+        // All three candidates are old enough; only the deleted branch is
+        // eligible. The nameless row exercises the probe's conservative
+        // "cannot prove the branch is gone" retain arm.
+        let gone = reroot(stale_row(
+            "realgone0001",
+            "feature/gone",
+            "2026-01-01 00:00:00",
+        ));
+        let live = reroot(stale_row(
+            "reallive0001",
+            "feature/live",
+            "2026-01-01 00:00:00",
+        ));
+        let mut nameless = reroot(stale_row("noname000001", "unused", "2026-01-01 00:00:00"));
+        nameless.branch_name = None;
+
+        let branch_exists =
+            live_branch_probe(active.git_dir.clone(), active.common_git_dir.clone());
+        let pruned = stale_branch_autoprune_context_ids(
+            &active,
+            &[active_row(&active), gone, live, nameless],
+            &branch_exists,
+            autoprune_now(),
+            chrono::Duration::days(30),
+        );
+        assert_eq!(
+            pruned,
+            vec!["realgone0001".to_string()],
+            "only the really-deleted branch's snapshot is selected; live and \
+             nameless snapshots are retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_branch_prune_skips_when_rebuild_lock_is_contended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        ensure_secure_project_root(&root).unwrap();
+        let db = Db::open_rw(&config::project_db_path(&root)).await.unwrap();
+        let conn = db.connect_tuned().await.unwrap();
+        schema::initialize(&conn).await.unwrap();
+        // A recorded context row that must survive the skipped prune untouched.
+        segments::upsert_worktree_context(&conn, &test_context(&root, &root), "test-project")
+            .await
+            .unwrap();
+
+        // Simulate a competing writer: hold the same non-blocking rebuild lock
+        // the prune takes (a fresh fd, so the prune's attempt sees contention).
+        let held = lifecycle::try_acquire_rebuild_lock(&root)
+            .unwrap()
+            .expect("test must acquire the rebuild lock first");
+
+        let pruned =
+            prune_stale_branch_contexts_for_state_root(&root, std::slice::from_ref(&root)).await;
+        assert!(
+            pruned.is_empty(),
+            "a contended rebuild lock must skip the prune, got {pruned:?}"
+        );
+        let contexts = segments::list_worktree_contexts(&conn).await.unwrap();
+        assert_eq!(
+            contexts.len(),
+            1,
+            "all context rows must remain intact after a lock-contention skip"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn stale_branch_prune_is_a_noop_without_an_index_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let pruned =
+            prune_stale_branch_contexts_for_state_root(&root, std::slice::from_ref(&root)).await;
+
+        assert!(
+            pruned.is_empty(),
+            "an absent index DB must be a graceful empty return, got {pruned:?}"
+        );
+        assert!(
+            !config::project_db_path(&root).exists(),
+            "the prune must never create an index DB"
+        );
+        assert!(
+            !config::project_dot_dir(&root).exists(),
+            "the prune must never create the .1up state dir"
+        );
     }
 
     #[tokio::test]

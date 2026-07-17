@@ -1224,4 +1224,105 @@ mod tests {
         fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
         fs::write(ref_path, format!("{oid}\n")).unwrap();
     }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        // Per-command `-c` config only: no global env or config mutation.
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "user.name=1up Test",
+                "-c",
+                "user.email=oneup-test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation failed");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn branch_ref_exists_tracks_loose_packed_worktree_and_deleted_refs() {
+        // Real repository (not synthetic ref files): the daemon's stale-branch
+        // auto-prune trusts this probe to decide whether a branch is genuinely
+        // gone, so it must read git's actual loose AND packed ref layouts.
+        //
+        // Deliberately NOT canonicalized (unlike the synthetic-ref tests above):
+        // on Windows `canonicalize` yields an extended-length `\\?\C:\...` path,
+        // which git rejects in `git worktree add` ("could not create leading
+        // directories ... Invalid argument"). git accepts the raw tempdir path on
+        // every platform, and the probe under test canonicalizes internally where
+        // it matters (`resolve_linked_worktree_info` -> `canonical_path`).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init"]);
+        fs::write(repo.join("probe.rs"), "fn probe() {}\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["branch", "feature/slashed-name"]);
+
+        let git_dir = repo.join(".git");
+        let branch_ref = "refs/heads/feature/slashed-name";
+
+        // Loose ref (covers slashed branch names living in subdirectories).
+        assert!(
+            git_dir.join(branch_ref).is_file(),
+            "precondition: the branch starts as a loose ref"
+        );
+        assert!(branch_ref_exists(&git_dir, &git_dir, branch_ref));
+
+        // Packed ref: pack-refs removes the loose file, so this exercises the
+        // packed-refs fallback path.
+        run_git(&repo, &["pack-refs", "--all"]);
+        assert!(
+            !git_dir.join(branch_ref).exists(),
+            "precondition: pack-refs must remove the loose ref"
+        );
+        assert!(branch_ref_exists(&git_dir, &git_dir, branch_ref));
+
+        // Linked worktree: probing through the worktree's own git dirs finds
+        // the branch via the common git dir.
+        let worktree = tmp.path().join("wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().unwrap(),
+                "feature/slashed-name",
+            ],
+        );
+        let info = resolve_linked_worktree_info(&worktree).expect("linked worktree resolves");
+        assert_ne!(
+            info.git_dir, info.common_git_dir,
+            "precondition: a linked worktree has a private git dir"
+        );
+        assert!(branch_ref_exists(
+            &info.git_dir,
+            &info.common_git_dir,
+            branch_ref
+        ));
+
+        // Deleted branch: the probe flips to false (the worktree must go first,
+        // git refuses to delete a checked-out branch).
+        run_git(&repo, &["worktree", "remove", worktree.to_str().unwrap()]);
+        run_git(&repo, &["branch", "-D", "feature/slashed-name"]);
+        assert!(!branch_ref_exists(&git_dir, &git_dir, branch_ref));
+
+        // A branch that never existed reads as absent, not an error.
+        assert!(!branch_ref_exists(
+            &git_dir,
+            &git_dir,
+            "refs/heads/never-existed"
+        ));
+    }
 }
