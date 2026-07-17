@@ -529,10 +529,12 @@ pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
 /// gitignore-aware first-index gate walk, holding the walk open so a test can
 /// deliver SIGTERM mid-walk and assert cooperative cancellation.
 ///
-/// Unset or non-positive disables the throttle (production default), so the walk
-/// runs at full speed. This exists purely to make the SIGTERM-cancels-the-gate-walk
-/// behaviour deterministic in a debug build without a huge fixture; nothing on the
-/// production path reads it.
+/// Unset or non-positive disables the throttle, so the walk runs at full speed.
+/// This exists purely to make the SIGTERM-cancels-the-gate-walk behaviour
+/// deterministic in a debug build without a huge fixture. The hook is
+/// debug-builds-only: the env-var read and the sleep are gated behind
+/// `cfg!(debug_assertions)` in `count_files_gitignore_aware`, so in release
+/// builds the throttle is inert (compiled out) and the variable is never read.
 pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY_DELAY_MS";
 
 /// Schema version for database layout.

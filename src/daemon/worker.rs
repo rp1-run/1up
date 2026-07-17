@@ -2147,13 +2147,18 @@ fn count_files_gitignore_aware(
     use ignore::WalkBuilder;
 
     // Test-only: read once. Holds the walk open (a small sleep every N entries)
-    // so a test can land SIGTERM mid-walk; disabled (None) on the production path.
-    let throttle_delay =
+    // so a test can land SIGTERM mid-walk. Compiled to a constant `None` in
+    // release builds so a stray env var can never throttle a production gate
+    // walk (1000ms on a 185k-file repo would add ~5 hours).
+    let throttle_delay = if cfg!(debug_assertions) {
         std::env::var(crate::shared::constants::TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR)
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .filter(|ms| *ms > 0)
-            .map(std::time::Duration::from_millis);
+            .map(std::time::Duration::from_millis)
+    } else {
+        None
+    };
 
     let walker = WalkBuilder::new(source_root)
         .hidden(false)
@@ -2393,10 +2398,10 @@ async fn run_project(
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
             // Run the gate walk in spawn_blocking so the async executor stays
-            // responsive to SIGTERM and can cancel the daemon token, which this
-            // pass's per-project child token observes (SIGTERM cancels the
-            // parent; a de-register cancels only this child) and the walk
-            // aborts on cooperatively.
+            // responsive to signals. The walk observes this pass's per-project
+            // child token and aborts cooperatively: SIGTERM cancels the daemon
+            // token and thus this child via parentage, while a de-register
+            // cancels only this child.
             let source_root_clone = source_root.clone();
             let cancel_token_clone = project_cancel_token.clone();
             let walk_result: Result<usize, OneupError> = tokio::task::spawn_blocking(move || {

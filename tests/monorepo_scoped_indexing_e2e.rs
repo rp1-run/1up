@@ -1151,6 +1151,42 @@ fn test_daemon_gate_walk_sigterm_aborts_without_opening_gate() {
         !index_status.exists(),
         "index_status.json must not exist: a cancelled gate walk must not open a first index"
     );
+
+    // Discriminate the cancelled-walk abort from an idle gate-blocked daemon,
+    // which would also satisfy every assertion above (alive at +2s, prompt exit,
+    // no index_status.json). The abort arm records `last_refresh_state: pending`
+    // in daemon_context_status.json (a re-index is still owed), while the
+    // gate-block path calls `mark_refresh_finished(.., Ok(()))` and records
+    // `complete`. Seeing `complete` (or anything non-pending) here means the
+    // throttle was silently inert, the walk finished in milliseconds, and the
+    // gate blocked normally — i.e. the test passed vacuously without exercising
+    // mid-walk cancellation at all.
+    let context_status_path = root.join(".1up").join("daemon_context_status.json");
+    let context_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&context_status_path)
+            .expect("daemon_context_status.json must exist: the daemon persists it both on the abort path and on the gate-block path"),
+    )
+    .expect("daemon_context_status.json must be valid JSON");
+    let contexts = context_status["contexts"]
+        .as_object()
+        .expect("daemon_context_status.json must have a contexts map");
+    assert_eq!(
+        contexts.len(),
+        1,
+        "fixture registers exactly one context, got: {contexts:?}"
+    );
+    let refresh_state = contexts
+        .values()
+        .next()
+        .and_then(|ctx| ctx["last_refresh_state"].as_str())
+        .expect("context entry must carry last_refresh_state");
+    assert_eq!(
+        refresh_state, "pending",
+        "cancelled gate walk must record last_refresh_state=pending (re-index still owed); \
+         a non-pending state (e.g. `complete` from the gate-block path) means the throttle \
+         was inert and the walk completed before SIGTERM — the test would be passing \
+         vacuously without covering mid-walk cancellation"
+    );
 }
 
 /// Gate fires on over-threshold repository without scope
