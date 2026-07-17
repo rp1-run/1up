@@ -81,7 +81,7 @@ pub struct Registry {
 impl Registry {
     pub fn load() -> Result<Self, OneupError> {
         let xdg_root = ensure_secure_xdg_root()?;
-        Self::load_from_path(&config::projects_registry_path()?, &xdg_root)
+        Self::load_from_path_with_repair(&config::projects_registry_path()?, &xdg_root)
     }
 
     #[allow(dead_code)]
@@ -90,12 +90,60 @@ impl Registry {
         self.save_to_path(&config::projects_registry_path()?, &xdg_root)
     }
 
+    /// Read the registry from disk, normalizing and collapsing duplicate
+    /// entries in memory. Never writes: callers already holding the registry
+    /// lock (the `*_at_path` mutators) persist through their own `save_to_path`,
+    /// and unlocked readers must not clobber concurrent registrations.
     fn load_from_path(path: &Path, approved_root: &Path) -> Result<Self, OneupError> {
+        Ok(Self::read_deduplicated(path, approved_root)?.0)
+    }
+
+    /// Load the registry and, if the unlocked read found duplicate entries,
+    /// repair the on-disk file under the registry lock. Repair is best-effort:
+    /// a lock, re-read, or write failure is logged and swallowed so a read-only
+    /// or racing environment still receives the clean in-memory registry. The
+    /// on-disk duplicates self-heal on a later successful load or registration.
+    fn load_from_path_with_repair(path: &Path, approved_root: &Path) -> Result<Self, OneupError> {
+        let (registry, had_duplicates) = Self::read_deduplicated(path, approved_root)?;
+        if !had_duplicates {
+            return Ok(registry);
+        }
+
+        match Self::repair_duplicates_at_path(path, approved_root) {
+            Ok(repaired) => Ok(repaired),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist deduplicated project registry; using in-memory dedup"
+                );
+                Ok(registry)
+            }
+        }
+    }
+
+    /// Persist a deduplicated registry under the registry lock. Re-reads the
+    /// file after acquiring the lock so a registration saved between an
+    /// unlocked read and this repair is preserved, and saves only when the
+    /// fresh state actually contained duplicates. Callers must not already
+    /// hold the registry lock: the flock is not re-entrant across descriptors.
+    fn repair_duplicates_at_path(path: &Path, approved_root: &Path) -> Result<Self, OneupError> {
+        let _lock = acquire_registry_lock(approved_root)?;
+        let (fresh, had_duplicates) = Self::read_deduplicated(path, approved_root)?;
+        if had_duplicates {
+            fresh.save_to_path(path, approved_root)?;
+        }
+        Ok(fresh)
+    }
+
+    /// Read, parse, normalize, and collapse the registry purely in memory.
+    /// Returns the deduplicated registry and whether any duplicates were
+    /// removed.
+    fn read_deduplicated(path: &Path, approved_root: &Path) -> Result<(Self, bool), OneupError> {
         let path = validate_regular_file_path(path, approved_root).map_err(|err| {
             DaemonError::WatcherError(format!("failed to validate registry path: {err}"))
         })?;
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), false));
         }
 
         let content = std::fs::read_to_string(&path)
@@ -104,24 +152,9 @@ impl Registry {
         let mut registry: Registry = serde_json::from_str(&content)
             .map_err(|e| DaemonError::WatcherError(format!("failed to parse registry: {e}")))?;
         registry.normalize_entries();
-        if registry.collapse_duplicate_entries() {
-            registry.write_back_after_dedup(&path, approved_root);
-        }
+        let had_duplicates = registry.collapse_duplicate_entries();
 
-        Ok(registry)
-    }
-
-    /// Persist a registry that was just deduplicated on load. Best-effort: a
-    /// write-back failure is logged and swallowed so a read-only or racing
-    /// environment still receives the clean in-memory registry. The on-disk
-    /// duplicates self-heal on a later successful load or registration.
-    fn write_back_after_dedup(&self, path: &Path, approved_root: &Path) {
-        if let Err(err) = self.save_to_path(path, approved_root) {
-            tracing::warn!(
-                error = %err,
-                "failed to persist deduplicated project registry; using in-memory dedup"
-            );
-        }
+        Ok((registry, had_duplicates))
     }
 
     fn save_to_path(&self, path: &Path, approved_root: &Path) -> Result<(), OneupError> {
@@ -430,6 +463,9 @@ impl Registry {
     /// This is the self-healing counterpart to identity-keyed upsert: even a
     /// registry already polluted with per-`head_oid` duplicates (issue #116)
     /// converges to one entry per `(project_root, source_root, branch)` on load.
+    /// Like `upsert_project`, the survivor absorbs durable configuration
+    /// (`indexing`) from collapsed duplicates so a newer lifecycle registration
+    /// without indexing config never erases an older CLI registration's config.
     fn collapse_duplicate_entries(&mut self) -> bool {
         let before = self.projects.len();
         if before < 2 {
@@ -444,7 +480,11 @@ impl Registry {
             match index_by_identity.get(&identity) {
                 Some(&position) => {
                     if entry_supersedes(&entry, &survivors[position]) {
+                        let mut entry = entry;
+                        absorb_durable_config(&mut entry, &survivors[position]);
                         survivors[position] = entry;
+                    } else {
+                        absorb_durable_config(&mut survivors[position], &entry);
                     }
                 }
                 None => {
@@ -537,6 +577,19 @@ fn entry_supersedes(candidate: &ProjectEntry, incumbent: &ProjectEntry) -> bool 
             candidate_ts > incumbent_ts
         }
         _ => entry_completeness(candidate) > entry_completeness(incumbent),
+    }
+}
+
+/// Merge durable, caller-provided configuration from a collapsed duplicate
+/// into the surviving entry when the survivor lacks it. `indexing` is the only
+/// such field: it is set exclusively by explicit registrations (the CLI), while
+/// every other optional field on [`ProjectEntry`] is a mutable worktree fact
+/// that `apply_context` refreshes wholesale, so the newer survivor's values
+/// (including `None`) are authoritative for those. Mirrors `upsert_project`,
+/// which keeps existing `indexing` when a registration passes `None`.
+fn absorb_durable_config(survivor: &mut ProjectEntry, collapsed: &ProjectEntry) {
+    if survivor.indexing.is_none() {
+        survivor.indexing = collapsed.indexing.clone();
     }
 }
 
@@ -1314,7 +1367,12 @@ mod tests {
         fs::create_dir_all(&xdg_root).unwrap();
         fs::create_dir_all(&project).unwrap();
 
-        let mut older = test_entry("old", project.clone(), None, None);
+        let mut older = test_entry(
+            "old",
+            project.clone(),
+            None,
+            Some(IndexingConfig::new(4, 2, 1).unwrap()),
+        );
         older.registered_at = "2026-01-01T00:00:00Z".to_string();
         let mut newer = test_entry("new", project.clone(), None, None);
         newer.registered_at = "2026-08-01T00:00:00Z".to_string();
@@ -1327,35 +1385,232 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        let loaded = Registry::load_from_path_with_repair(&registry_path, &xdg_root).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].project_id, "new");
+        // Durable config from the collapsed older CLI registration survives.
+        assert_eq!(
+            loaded.projects[0].indexing,
+            Some(IndexingConfig::new(4, 2, 1).unwrap())
+        );
 
-        let on_disk = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
-        assert_eq!(on_disk.projects.len(), 1);
-        assert_eq!(on_disk.projects[0].project_id, "new");
+        // The repair persisted the compacted registry: the raw file holds one row.
+        let raw: Registry =
+            serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+        assert_eq!(raw.projects.len(), 1);
+        assert_eq!(raw.projects[0].project_id, "new");
+        assert_eq!(
+            raw.projects[0].indexing,
+            Some(IndexingConfig::new(4, 2, 1).unwrap())
+        );
     }
 
     #[test]
-    fn write_back_after_dedup_swallows_persist_failure() {
+    fn registry_plain_load_never_writes_back() {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
         let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
         let project = tmp_root.join("main");
         fs::create_dir_all(&xdg_root).unwrap();
         fs::create_dir_all(&project).unwrap();
 
-        let registry = Registry {
-            projects: vec![test_entry("only", project, None, None)],
+        let mut older = test_entry("old", project.clone(), None, None);
+        older.registered_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = test_entry("new", project.clone(), None, None);
+        newer.registered_at = "2026-08-01T00:00:00Z".to_string();
+        let polluted = Registry {
+            projects: vec![older, newer],
         };
+        let raw_before = serde_json::to_string_pretty(&polluted).unwrap();
+        fs::write(&registry_path, &raw_before).unwrap();
 
-        // A target outside the approved root makes `save_to_path` fail; the
-        // best-effort write-back must swallow the error rather than panic or
-        // propagate, so a `load` that just deduplicated never fails.
-        let outside = tmp_root.join("outside").join("projects.json");
-        fs::create_dir_all(outside.parent().unwrap()).unwrap();
-        assert!(registry.save_to_path(&outside, &xdg_root).is_err());
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].project_id, "new");
 
-        registry.write_back_after_dedup(&outside, &xdg_root);
+        // The unlocked plain load deduplicated only in memory.
+        assert_eq!(fs::read_to_string(&registry_path).unwrap(), raw_before);
+    }
+
+    #[test]
+    fn registry_repair_rereads_fresh_state_and_preserves_concurrent_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project_a = tmp_root.join("project-a");
+        let project_b = tmp_root.join("project-b");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+
+        // 1. On-disk registry is polluted with duplicates for project A.
+        let mut older = test_entry("a-old", project_a.clone(), None, None);
+        older.registered_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = test_entry("a-new", project_a.clone(), None, None);
+        newer.registered_at = "2026-08-01T00:00:00Z".to_string();
+        let polluted = Registry {
+            projects: vec![older, newer],
+        };
+        fs::write(
+            &registry_path,
+            serde_json::to_string_pretty(&polluted).unwrap(),
+        )
+        .unwrap();
+
+        // 2. A reader takes an unlocked snapshot and sees duplicates, so it
+        //    will attempt a repair. The snapshot itself must not write.
+        let stale_snapshot = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(stale_snapshot.projects.len(), 1);
+
+        // 3. Before the repair runs, a concurrent registration saves project B.
+        let mut concurrent = Registry::default();
+        concurrent
+            .register_at_path(
+                "b-id",
+                &project_b,
+                &project_b,
+                None,
+                &registry_path,
+                &xdg_root,
+            )
+            .unwrap();
+
+        // 4. The reader's repair must lock and re-read fresh state rather than
+        //    persist its stale snapshot, so B's registration survives.
+        let repaired = Registry::repair_duplicates_at_path(&registry_path, &xdg_root).unwrap();
+        assert_eq!(repaired.projects.len(), 2);
+
+        let on_disk: Registry =
+            serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+        assert_eq!(on_disk.projects.len(), 2);
+        assert!(on_disk
+            .projects
+            .iter()
+            .any(|entry| entry.project_id == "a-new"));
+        assert!(on_disk
+            .projects
+            .iter()
+            .any(|entry| entry.project_id == "b-id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_load_with_repair_swallows_repair_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project = tmp_root.join("main");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project).unwrap();
+
+        let mut older = test_entry("old", project.clone(), None, None);
+        older.registered_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = test_entry("new", project.clone(), None, None);
+        newer.registered_at = "2026-08-01T00:00:00Z".to_string();
+        let polluted = Registry {
+            projects: vec![older, newer],
+        };
+        let raw_before = serde_json::to_string_pretty(&polluted).unwrap();
+        fs::write(&registry_path, &raw_before).unwrap();
+
+        // A directory at the lock path makes lock acquisition fail, so the
+        // repair errs. Load must swallow that and still return the in-memory
+        // dedup while leaving the duplicated file untouched.
+        fs::create_dir_all(xdg_root.join(REGISTRY_LOCK_FILE)).unwrap();
+
+        let loaded = Registry::load_from_path_with_repair(&registry_path, &xdg_root).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].project_id, "new");
+        assert_eq!(fs::read_to_string(&registry_path).unwrap(), raw_before);
+    }
+
+    #[test]
+    fn collapse_duplicate_entries_preserves_indexing_from_collapsed_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let project = tmp_root.join("main");
+        fs::create_dir_all(&project).unwrap();
+
+        let indexing = IndexingConfig::new(4, 2, 1).unwrap();
+        // Fully-populated duplicates (same identity, distinct mutable facts) so
+        // `normalize_entries` leaves them untouched, matching a real polluted
+        // registry written by successive registrations.
+        let make_duplicate = |project_id: &str, registered_at: &str, head_byte: &str| {
+            let mut entry = test_entry(project_id, project.clone(), None, None);
+            entry.context_id = Some(head_byte.repeat(32));
+            entry.main_worktree_root = Some(project.clone());
+            entry.worktree_role = Some(WorktreeRole::Main);
+            entry.branch_name = Some("main".to_string());
+            entry.branch_ref = Some("refs/heads/main".to_string());
+            entry.branch_status = Some(BranchStatus::Named);
+            entry.head_oid = Some(head_byte.repeat(40));
+            entry.registered_at = registered_at.to_string();
+            entry
+        };
+        let make_cli_entry = || {
+            let mut entry = make_duplicate("cli-id", "2026-01-01T00:00:00Z", "a");
+            entry.indexing = Some(indexing.clone());
+            entry
+        };
+        let make_lifecycle_entry = || make_duplicate("lifecycle-id", "2026-08-01T00:00:00Z", "b");
+
+        // Both file orders: older-first (newer entry supersedes the incumbent)
+        // and newer-first (older entry loses against the incumbent).
+        for projects in [
+            vec![make_cli_entry(), make_lifecycle_entry()],
+            vec![make_lifecycle_entry(), make_cli_entry()],
+        ] {
+            let mut registry = Registry { projects };
+            registry.normalize_entries();
+
+            assert!(registry.collapse_duplicate_entries());
+            assert_eq!(registry.projects.len(), 1);
+            let survivor = &registry.projects[0];
+            // Newer facts win...
+            assert_eq!(survivor.project_id, "lifecycle-id");
+            assert_eq!(survivor.registered_at, "2026-08-01T00:00:00Z");
+            assert_eq!(survivor.head_oid.as_deref(), Some("b".repeat(40).as_str()));
+            // ...but the durable indexing config is not erased.
+            assert_eq!(survivor.indexing, Some(indexing.clone()));
+        }
+    }
+
+    #[test]
+    fn collapse_duplicate_entries_keeps_survivor_indexing_over_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let project = tmp_root.join("main");
+        fs::create_dir_all(&project).unwrap();
+
+        let mut older = test_entry(
+            "old",
+            project.clone(),
+            None,
+            Some(IndexingConfig::new(2, 1, 1).unwrap()),
+        );
+        older.registered_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = test_entry(
+            "new",
+            project.clone(),
+            None,
+            Some(IndexingConfig::new(8, 4, 2).unwrap()),
+        );
+        newer.registered_at = "2026-08-01T00:00:00Z".to_string();
+
+        let mut registry = Registry {
+            projects: vec![older, newer],
+        };
+        registry.normalize_entries();
+
+        assert!(registry.collapse_duplicate_entries());
+        assert_eq!(registry.projects.len(), 1);
+        assert_eq!(registry.projects[0].project_id, "new");
+        assert_eq!(
+            registry.projects[0].indexing,
+            Some(IndexingConfig::new(8, 4, 2).unwrap())
+        );
     }
 }
