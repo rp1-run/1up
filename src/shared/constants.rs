@@ -351,22 +351,49 @@ pub const LOCK_REAP_MAX_CANDIDATES_PER_RUN: usize = 128;
 
 /// Wall-clock budget for a single opportunistic lock-reap run, in milliseconds.
 ///
-/// The reaper checks this budget between candidates and stops early once it is
-/// exceeded, so an unexpectedly slow filesystem can never make a best-effort
-/// startup sweep delay `1up mcp`/`1up start` by more than roughly this bound.
+/// The reaper checks this budget on every directory entry during the scan and
+/// again between deletions, stopping early once it is exceeded, so neither a
+/// huge XDG data directory nor an unexpectedly slow filesystem can make a
+/// best-effort startup sweep delay `1up mcp`/`1up start` by more than roughly
+/// this bound.
 pub const LOCK_REAP_TIME_BUDGET_MS: u64 = 250;
+
+/// Filename prefix of the per-project MCP instance lock (`cli::mcp`).
+pub const MCP_LOCK_PREFIX: &str = "mcp-";
+
+/// Filename prefix of the per-project startup guard lock (`cli::start`).
+pub const STARTUP_LOCK_PREFIX: &str = "startup-";
 
 /// Filename prefixes identifying per-project lock files eligible for reaping.
 ///
-/// The reaper only ever considers files whose name starts with one of these
-/// prefixes AND ends with [`LOCK_FILE_SUFFIX`]; every other file in the XDG data
-/// dir (model artifacts, `update-check.json`, the daemon pid/socket, etc.) is
-/// untouchable. Kept in sync with the `mcp-{key}.lock` / `startup-{key}.lock`
-/// names minted in `cli::mcp` and `cli::start`.
-pub const LOCK_REAP_NAME_PREFIXES: [&str; 2] = ["mcp-", "startup-"];
+/// The reaper only ever considers files whose complete name is one of these
+/// prefixes + exactly [`LOCK_KEY_HEX_LEN`] lowercase hex characters +
+/// [`LOCK_FILE_SUFFIX`] (see `shared::lock_reap::is_reapable_name`); every
+/// other file in the XDG data dir (model artifacts, `update-check.json`, the
+/// daemon pid/socket, etc.) is untouchable. The same names are minted through
+/// `shared::lock_reap::lock_file_name` by `cli::mcp` and `cli::start`, so
+/// creation and reaping share one namespace authority.
+pub const LOCK_REAP_NAME_PREFIXES: [&str; 2] = [MCP_LOCK_PREFIX, STARTUP_LOCK_PREFIX];
 
 /// Filename suffix shared by every reapable per-project lock file.
 pub const LOCK_FILE_SUFFIX: &str = ".lock";
+
+/// Exact length in hex characters of a per-project lock key: the first 16
+/// bytes of the SHA-256 of the project path, lowercase hex-encoded (see
+/// `shared::lock_reap::project_lock_key`).
+pub const LOCK_KEY_HEX_LEN: usize = 32;
+
+/// Bounded retries for lock acquisition when a freshly flocked descriptor no
+/// longer matches its pathname.
+///
+/// A concurrent stale-lock reaper can unlink a lock file between an acquirer's
+/// open and flock; the acquirer would then hold a lock on an orphaned inode
+/// that excludes nobody. After each successful flock the acquirer re-checks
+/// that the pathname still names the locked inode and, if not, drops the
+/// orphan and retries this many times before giving up. One retry suffices in
+/// principle (the recreated file cannot be reaped again — it is brand new),
+/// so three is generous headroom without risking an unbounded loop.
+pub const LOCK_ACQUIRE_IDENTITY_RETRIES: usize = 3;
 
 /// Number of retries for transient database lock failures.
 pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
