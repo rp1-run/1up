@@ -3257,7 +3257,12 @@ fn watched_project_refreshes_added_edited_and_deleted_files() {
         true,
     );
 
-    thread::sleep(Duration::from_secs(2));
+    // Confirm the watcher is armed and idle before the second wave of edits,
+    // rather than sleeping a fixed 2s and hoping the daemon settled under load.
+    // The initial refresh already completed (waited on above), so this returns
+    // as soon as the watcher reports it is watching; the subsequent refresh is
+    // detected by content hash, so no fixed mtime/debounce pacing is needed.
+    wait_for_status("watch_status", "watching");
     fs::write(
         canonical_dir.join("watched.rs"),
         "pub fn watched_refresh_after_marker() -> &'static str { \"after\" }\n",

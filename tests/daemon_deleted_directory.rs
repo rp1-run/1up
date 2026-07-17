@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::HideModelGuard;
+use common::{poll_until, HideModelGuard};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -177,19 +177,23 @@ fn daemon_deleted_directory_detection_within_5s() {
         serde_json::json!({ "mode": "index_if_needed" }),
     );
 
-    // Give daemon time to start and register the project
-    thread::sleep(Duration::from_millis(500));
-
-    // Get status after indexing started
-    let status_after_start = client.call_tool("oneup_status", serde_json::json!({}));
-    let initial_status = status_after_start["structuredContent"]["status"]
-        .as_str()
-        .unwrap_or("");
-
-    // If not yet indexed, wait a moment
-    if initial_status == "indexing" || initial_status == "pending_refresh" {
-        thread::sleep(Duration::from_millis(500));
-    }
+    // Wait until the daemon is responsive and reports a recognized readiness
+    // status for the project (the auto-started daemon legitimately reports
+    // "missing" here — an index need not exist for deletion detection), rather
+    // than sleeping a fixed 500ms and hoping the daemon booted under load. This
+    // establishes the live daemon that the upcoming deletion must be handled by.
+    poll_until(
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_millis(100),
+        "daemon to report a readiness status for the project",
+        || {
+            let result = client.call_tool("oneup_status", serde_json::json!({}));
+            match result["structuredContent"]["status"].as_str() {
+                Some("ready" | "missing" | "indexing" | "stale" | "degraded" | "blocked") => Ok(()),
+                other => Err(format!("no recognized status yet; got {other:?}")),
+            }
+        },
+    );
 
     // Delete the project directory to trigger detection
     fs::remove_dir_all(&project_path).expect("failed to delete project directory");

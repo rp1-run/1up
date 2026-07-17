@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::HideModelGuard;
+use common::{poll_until, HideModelGuard};
 use oneup::mcp::types::{TOOL_CONTEXT, TOOL_GET, TOOL_SEARCH, TOOL_START, TOOL_STATUS};
 use oneup::storage::db::Db;
 use std::fs;
@@ -542,33 +542,35 @@ fn monorepo_scope_persistence_in_meta_table() {
     // Verify scope is persisted in meta table. oneup_start is non-blocking
     // and a daemon refresh can win the first-searchable race with an
     // unscoped build, so poll until the scoped rebuild's meta write lands
-    // rather than reading once.
-    block_on(async {
-        let index_path = root.join(".1up").join("index.db");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut last_scope: Option<Vec<String>> = None;
-        loop {
-            if index_path.exists() {
+    // rather than reading once. The probe drives its async DB reads to
+    // completion via `block_on`, so the poll stays on the plain test thread
+    // and no blocking sleep runs on an async runtime.
+    let index_path = root.join(".1up").join("index.db");
+    let roots = poll_until(
+        std::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_millis(500),
+        "scoped rebuild scope persisted in meta table",
+        || {
+            if !index_path.exists() {
+                return Err("index.db not yet created".to_string());
+            }
+            let scope = block_on(async {
                 let db = Db::open_rw(&index_path).await.unwrap();
                 let conn = db.connect().unwrap();
-                last_scope = oneup::storage::schema::read_scope_from_meta(&conn)
+                oneup::storage::schema::read_scope_from_meta(&conn)
                     .await
-                    .unwrap();
-                if last_scope.is_some() {
-                    break;
-                }
+                    .unwrap()
+            });
+            match scope {
+                Some(roots) => Ok(roots),
+                None => Err("scope not yet written to meta".to_string()),
             }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let roots = last_scope.expect("scope should be persisted in meta table within 30s");
-        assert!(
-            roots.iter().any(|r| r.contains("auth")),
-            "scope should contain services/auth; got {roots:?}"
-        );
-    });
+        },
+    );
+    assert!(
+        roots.iter().any(|r| r.contains("auth")),
+        "scope should contain services/auth; got {roots:?}"
+    );
 }
 
 /// Test scenario: Out-of-scope context serves with disclosure
@@ -1670,6 +1672,11 @@ fn test_daemon_alive_worker_not_sigterm_immune() {
     }
 
     // Parent exit: the daemon must survive its launcher (persistence contract).
+    // Intentional fixed observation window (kept, not converted to a condition
+    // poll): this is a negative/liveness assertion — we want the daemon to *stay*
+    // alive after the parent exits, so there is no readiness state to poll for.
+    // We give the parent-exit teardown a real span to (fail to) take the daemon
+    // down before asserting it is still running.
     drop(client);
     thread::sleep(Duration::from_secs(2));
     assert!(

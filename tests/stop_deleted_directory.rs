@@ -9,10 +9,11 @@
 mod common;
 
 use assert_cmd::prelude::*;
-use common::HideModelGuard;
+use common::{poll_until, HideModelGuard};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn test_data_dir(home: &Path) -> PathBuf {
@@ -166,14 +167,48 @@ fn stop_deleted_directory_succeeds_via_registry_fallback() {
         .args(["-f", &worker_pattern])
         .output();
 
-    // Give the daemon a moment to release file handles
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Poll until this test's worker has actually exited (its process is gone)
+    // and thus released its file handles, rather than sleeping a fixed 200ms and
+    // hoping it died under load.
+    poll_until(
+        Instant::now() + Duration::from_secs(10),
+        Duration::from_millis(50),
+        "test worker process to exit after pkill",
+        || {
+            let out = StdCommand::new("pgrep")
+                .args(["-f", &worker_pattern])
+                .output()
+                .expect("pgrep should run");
+            // pgrep exits non-zero with empty stdout when no process matches.
+            if out.stdout.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "worker still running: {}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ))
+            }
+        },
+    );
 
     // Now delete the temp_base which will delete the entire directory tree
     drop(temp_base);
 
-    // Give cleanup a moment to complete
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Poll until the tree is actually gone rather than sleeping a fixed 100ms; a
+    // straggling worker can briefly recreate paths, so wait for the settled
+    // deleted state before asserting.
+    poll_until(
+        Instant::now() + Duration::from_secs(10),
+        Duration::from_millis(50),
+        "project directory to be fully deleted",
+        || {
+            if canonical_project_path.exists() {
+                Err("project directory still present".to_string())
+            } else {
+                Ok(())
+            }
+        },
+    );
 
     // Verify the directory is actually deleted
     assert!(
