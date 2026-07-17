@@ -148,6 +148,33 @@ def matches_known_issue_110(message):
     return isinstance(message, str) and FIXTURE_SEARCH_HIT_MISSING in message
 
 
+# Hard expiry for the #110 known-issue gate: on/after this date the gate no
+# longer converts the matched failure into passed_with_known_issue.
+KNOWN_ISSUE_110_EXPIRY = "2026-10-15"
+
+
+def known_issue_110_gate_decision():
+    """Decide whether the #110 known-issue gate converts the matched failure.
+
+    Returns ``(active, reason)``. ``ONEUP_SMOKE_KNOWN_ISSUE_110`` overrides
+    the default: ``"0"`` forces the gate off (hard-fail restored), ``"1"``
+    forces it on. Unset, the gate applies until ``KNOWN_ISSUE_110_EXPIRY``
+    and hard-fails on/after it.
+    """
+    override = os.environ.get("ONEUP_SMOKE_KNOWN_ISSUE_110", "")
+    if override == "0":
+        return False, "ONEUP_SMOKE_KNOWN_ISSUE_110=0 forces the gate off"
+    if override == "1":
+        return True, "ONEUP_SMOKE_KNOWN_ISSUE_110=1 forces the gate on"
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if today >= KNOWN_ISSUE_110_EXPIRY:
+        return False, (
+            f"gate expired on {KNOWN_ISSUE_110_EXPIRY}; fix rp1-run/1up#110 "
+            "or deliberately re-key/extend KNOWN_ISSUE_110_EXPIRY"
+        )
+    return True, f"default gate active until {KNOWN_ISSUE_110_EXPIRY}"
+
+
 binary_path = sys.argv[1]
 repo_path = sys.argv[2]
 output_path = sys.argv[3]
@@ -231,12 +258,9 @@ def ensure_fixture_repo():
     for relative_path, content in FIXTURE_FILES.items():
         path = repo / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            existing = path.read_text(encoding="utf-8")
-            if existing != content:
-                raise SmokeFailure(
-                    f"fixture file already exists with different content: {relative_path}"
-                )
+        # Compare raw bytes: read_text universal newlines would treat a
+        # CRLF-on-disk fixture as equal and silently keep it.
+        if path.exists() and path.read_bytes() == content.encode("utf-8"):
             continue
         path.write_bytes(content.encode("utf-8"))
         artifact["fixture_files_created"].append(relative_path)
@@ -486,7 +510,7 @@ def require_fixture_segment(records):
             continue
         content = segment.get("content")
         if (
-            segment.get("path") == "src/policy.rs"
+            normalize_fixture_path(segment.get("path")) == "src/policy.rs"
             and isinstance(content, str)
             and "PolicyRuleValidator" in content
         ):
@@ -502,12 +526,14 @@ def require_fixture_symbol_evidence(envelope):
     if references is not None and not isinstance(references, list):
         raise SmokeFailure("oneup_symbol references field is not structured as an array")
     if not any(
-        isinstance(record, dict) and record.get("path") == "src/policy.rs"
+        isinstance(record, dict)
+        and normalize_fixture_path(record.get("path")) == "src/policy.rs"
         for record in definitions
     ):
         raise SmokeFailure("oneup_symbol did not return the fixture definition path")
     if not any(
-        isinstance(record, dict) and record.get("path") == "src/runner.rs"
+        isinstance(record, dict)
+        and normalize_fixture_path(record.get("path")) == "src/runner.rs"
         for record in references or []
     ):
         raise SmokeFailure("oneup_symbol did not return the fixture reference path")
@@ -524,7 +550,7 @@ def require_fixture_location_context(records):
         line_start = context.get("line_start")
         line_end = context.get("line_end")
         if (
-            context.get("path") == "src/policy.rs"
+            normalize_fixture_path(context.get("path")) == "src/policy.rs"
             and isinstance(content, str)
             and "validate(&self" in content
             and isinstance(line_start, int)
@@ -543,7 +569,7 @@ def require_fixture_structural_match(envelope):
         if not isinstance(result, dict):
             continue
         if (
-            result.get("file_path") == "src/policy.rs"
+            normalize_fixture_path(result.get("file_path")) == "src/policy.rs"
             and result.get("language") == "rust"
             and result.get("content") == "PolicyRuleValidator"
         ):
@@ -839,7 +865,19 @@ except SmokeFailure as exc:
         if stderr:
             artifact["diagnostics"].append(f"MCP stderr: {stderr[-1000:]}")
     if sys.platform == "win32" and matches_known_issue_110(str(exc)):
-        record_known_issue_110(str(exc))
+        gate_active, gate_reason = known_issue_110_gate_decision()
+        print(
+            "[release-assets] WARNING: known-issue rp1-run/1up#110 gate "
+            f"{'applies' if gate_active else 'does not apply'}: {gate_reason}",
+            file=sys.stderr,
+        )
+        if gate_active:
+            record_known_issue_110(str(exc))
+        else:
+            artifact["diagnostics"].append(
+                f"known-issue #110 gate not applied: {gate_reason}"
+            )
+            sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
     else:
         sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
 except Exception as exc:
