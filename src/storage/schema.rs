@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use libsql::Connection;
 
-use crate::shared::constants::{DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, SCHEMA_VERSION};
+use crate::shared::constants::{
+    DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, SCHEMA_INIT_WAIT_ATTEMPTS,
+    SCHEMA_INIT_WAIT_DELAY_MS, SCHEMA_VERSION,
+};
 use crate::shared::errors::{OneupError, StorageError};
 use crate::storage::db::is_lock_error;
 use crate::storage::queries;
@@ -312,18 +315,23 @@ pub async fn ensure_current(conn: &Connection, ctx: &SchemaContext<'_>) -> Resul
     }
 }
 
-/// [`ensure_current`], but tolerant of the brief window in which a freshly
-/// created index has its tables but not yet its `schema_version` row.
+/// [`ensure_current`], but tolerant of the window in which a freshly created
+/// index has its tables but not yet its `schema_version` row.
 ///
 /// [`initialize`] creates every table first and writes the `schema_version`
 /// row last, and is not a single transaction. A reader that races the daemon's
-/// first index — or the atomic swap at the end of a rebuild — can momentarily
-/// see "tables exist, version absent", which [`ensure_current`] reports as the
-/// transient [`is_initializing_schema_error`] shape. The writer commits the
-/// version row microseconds later, so we retry on exactly that shape (reusing
-/// the shared DB-lock retry budget) to let initialization settle. A genuine
-/// version mismatch (`out of date` / `newer than this binary supports`) is a
-/// distinct shape and still fails fast on the first attempt.
+/// first index — or the atomic swap at the end of a rebuild — can observe
+/// "tables exist, version absent", which [`ensure_current`] reports as the
+/// transient [`is_initializing_schema_error`] shape. We retry on exactly that
+/// shape to let initialization settle. A genuine version mismatch (`out of
+/// date` / `newer than this binary supports`) is a distinct shape and still
+/// fails fast on the first attempt.
+///
+/// The wait budget is [`SCHEMA_INIT_WAIT_ATTEMPTS`] × [`SCHEMA_INIT_WAIT_DELAY_MS`]
+/// (roughly 5 s), sized for a concurrent *full schema initialization/upgrade* —
+/// which on a large index can take several seconds — rather than the
+/// millisecond-scale DB-lock retry budget it previously borrowed (GitHub issue
+/// #93). See those constants for the rationale.
 ///
 /// Read commands should call this instead of [`ensure_current`] so that
 /// `search`/`status` right after a `reindex` (or during a daemon rebuild) ride
@@ -333,14 +341,36 @@ pub async fn ensure_current_tolerating_init(
     conn: &Connection,
     ctx: &SchemaContext<'_>,
 ) -> Result<(), OneupError> {
-    let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
+    ensure_current_tolerating_init_with_budget(
+        conn,
+        ctx,
+        SCHEMA_INIT_WAIT_ATTEMPTS,
+        Duration::from_millis(SCHEMA_INIT_WAIT_DELAY_MS),
+    )
+    .await
+}
+
+/// [`ensure_current_tolerating_init`] with an explicit retry budget.
+///
+/// Factored out so the public entry point pins the production
+/// [`SCHEMA_INIT_WAIT_ATTEMPTS`]/[`SCHEMA_INIT_WAIT_DELAY_MS`] budget while tests
+/// can exercise budget exhaustion with a tiny, fast budget. `attempts` is the
+/// total number of [`ensure_current`] validations; between failures on the
+/// transient initializing shape it sleeps `retry_delay`, so the total wait is
+/// `(attempts - 1) × retry_delay`.
+async fn ensure_current_tolerating_init_with_budget(
+    conn: &Connection,
+    ctx: &SchemaContext<'_>,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<(), OneupError> {
     let mut attempt = 0;
     loop {
         match ensure_current(conn, ctx).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 attempt += 1;
-                if attempt >= DB_LOCK_RETRY_ATTEMPTS || !is_initializing_schema_error(&err) {
+                if attempt >= attempts || !is_initializing_schema_error(&err) {
                     return Err(err);
                 }
                 // Yield rather than block: this is an async fn and a caller (the
@@ -1264,6 +1294,117 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("out of date"));
         assert!(msg.contains("run `1up reindex`"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_tolerating_init_does_not_wait_on_version_mismatch() {
+        // A definitive version mismatch must fail on the very first attempt with
+        // zero waits, never spending the (now several-second) schema-init budget
+        // on a shape that can never resolve. We pass an absurd per-attempt delay:
+        // if the loop erroneously slept even once (misclassifying the mismatch as
+        // the transient init window) this test would hang for an hour instead of
+        // returning immediately.
+        let (_db, conn) = setup().await;
+        seed_schema_version(&conn, SCHEMA_VERSION - 1).await;
+
+        let err = ensure_current_tolerating_init_with_budget(
+            &conn,
+            &SchemaContext::unspecified(),
+            SCHEMA_INIT_WAIT_ATTEMPTS,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap_err();
+        assert!(!is_initializing_schema_error(&err));
+        assert!(err.to_string().contains("out of date"));
+    }
+
+    #[tokio::test]
+    async fn ensure_current_tolerating_init_recovers_when_version_appears_within_budget() {
+        // GitHub issue #93's happy resolution: a reader observes the "tables
+        // present, version absent" init window while another process is running a
+        // full schema initialization, then that initializer commits the
+        // `schema_version` row within the wait budget, and the read succeeds
+        // instead of surfacing a spurious "reindex required".
+        //
+        // A file-backed DB is required (unlike the other tests' `:memory:` DBs,
+        // whose connections are isolated) so the reader and the concurrent
+        // initializer share state; WAL (`connect_tuned`) lets the reader poll
+        // without blocking on the writer's brief commit lock.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let db = Db::open_rw(&crate::shared::config::project_db_path(&project_root))
+            .await
+            .unwrap();
+        let reader = db.connect_tuned().await.unwrap();
+        let writer = db.connect_tuned().await.unwrap();
+
+        // Fully initialize, then remove only the version row to re-enter the
+        // transient init window that `ensure_current` reports as `initializing`.
+        initialize(&reader).await.unwrap();
+        writer
+            .execute("DELETE FROM meta WHERE key = ?1", [META_KEY_SCHEMA_VERSION])
+            .await
+            .unwrap();
+        assert!(
+            is_initializing_schema_error(
+                &ensure_current(&reader, &SchemaContext::unspecified())
+                    .await
+                    .unwrap_err()
+            ),
+            "removing only the version row must reproduce the transient init shape"
+        );
+
+        // A concurrent initializer commits the version row shortly after the
+        // reader starts waiting; the reader must ride out the window and succeed.
+        let init_writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            set_schema_version(&writer, SCHEMA_VERSION).await.unwrap();
+        });
+
+        ensure_current_tolerating_init_with_budget(
+            &reader,
+            &SchemaContext::unspecified(),
+            SCHEMA_INIT_WAIT_ATTEMPTS,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("reader must recover once the version row is committed within budget");
+
+        init_writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_current_tolerating_init_exhausts_budget_with_clear_schema_error() {
+        // Tables exist but the version row is never written (a stuck / crashed
+        // initializer, or a wait budget too short for a very large index). After
+        // exhausting its budget the tolerance loop must surface the same clear
+        // initializing schema error `ensure_current` produces rather than hang
+        // forever. A tiny zero-delay budget keeps the test fast while still
+        // exercising the exhaustion path.
+        let (_db, conn) = setup().await;
+        conn.execute("CREATE TABLE segments (id TEXT PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        assert!(database_has_user_tables(&conn).await.unwrap());
+        assert!(get_schema_version(&conn).await.unwrap().is_none());
+
+        let err = ensure_current_tolerating_init_with_budget(
+            &conn,
+            &SchemaContext::unspecified(),
+            3,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            is_initializing_schema_error(&err),
+            "budget exhaustion must surface the transient initializing shape, got: {err}"
+        );
+        assert!(err
+            .to_string()
+            .contains(SCHEMA_MISSING_OR_UNREADABLE_FRAGMENT));
     }
 
     #[tokio::test]
