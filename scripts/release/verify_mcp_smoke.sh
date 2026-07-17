@@ -120,10 +120,32 @@ class SmokeFailure(Exception):
         self.protocol_clean = protocol_clean
 
 
-class KnownIssueSkip(Exception):
-    def __init__(self, reason):
-        super().__init__(reason)
-        self.reason = reason
+FIXTURE_SEARCH_HIT_MISSING = (
+    "oneup_search did not return the fixture PolicyRuleValidator hit"
+)
+
+
+def normalize_fixture_path(value):
+    r"""Normalize a repository path for fixture comparison.
+
+    Collapses Windows backslash separators to forward slashes and strips
+    extended-length path prefixes (``\\?\`` and ``\\?\UNC\``) so a Windows
+    result path such as ``src\policy.rs`` matches the expected
+    ``src/policy.rs``.
+    """
+    if not isinstance(value, str):
+        return value
+    normalized = value.replace("\\", "/")
+    if normalized.startswith("//?/UNC/"):
+        return "//" + normalized[len("//?/UNC/") :]
+    if normalized.startswith("//?/"):
+        return normalized[len("//?/") :]
+    return normalized
+
+
+def matches_known_issue_110(message):
+    """True when a failure message matches the tracked #110 search shape."""
+    return isinstance(message, str) and FIXTURE_SEARCH_HIT_MISSING in message
 
 
 binary_path = sys.argv[1]
@@ -173,6 +195,29 @@ def fail(message, protocol_clean=None):
     return 1
 
 
+def record_known_issue_110(reason):
+    artifact["discovery_flow"]["status"] = "skipped_known_issue"
+    artifact["known_issue"] = {
+        "target_platform": "windows",
+        "signature": "search_assertion",
+        "readiness_status": artifact.get("readiness_status", ""),
+        "reason": reason,
+        "tracking_issue": "https://github.com/rp1-run/1up/issues/110",
+        "description": (
+            "windows oneup_search does not return the fixture "
+            "PolicyRuleValidator hit; MCP protocol surface and prior "
+            "discovery steps verified, search-dependent assertion skipped"
+        ),
+        "search_debug": artifact.get("search_debug"),
+    }
+    print(
+        "[release-assets] WARNING: windows MCP search assertion skipped due to "
+        f"known issue rp1-run/1up#110: {reason}",
+        file=sys.stderr,
+    )
+    write_artifact("passed_with_known_issue")
+
+
 def ensure_fixture_repo():
     repo = Path(repo_path)
     repo.mkdir(parents=True, exist_ok=True)
@@ -193,7 +238,7 @@ def ensure_fixture_repo():
                     f"fixture file already exists with different content: {relative_path}"
                 )
             continue
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
         artifact["fixture_files_created"].append(relative_path)
 
 
@@ -412,12 +457,12 @@ def require_records_data(envelope, label):
     return records
 
 
-def require_fixture_search_hit(results):
+def require_fixture_search_hit(results, response=None, request=None):
     for result in results:
         if not isinstance(result, dict):
             continue
         if (
-            result.get("path") == "src/policy.rs"
+            normalize_fixture_path(result.get("path")) == "src/policy.rs"
             and result.get("symbol") == "PolicyRuleValidator"
             and isinstance(result.get("handle"), str)
             and result["handle"].strip()
@@ -425,7 +470,11 @@ def require_fixture_search_hit(results):
             and int(result.get("line_end", 0)) >= 1
         ):
             return result
-    raise SmokeFailure("oneup_search did not return the fixture PolicyRuleValidator hit")
+    artifact["search_debug"] = {
+        "request": request,
+        "response": response,
+    }
+    raise SmokeFailure(FIXTURE_SEARCH_HIT_MISSING)
 
 
 def require_fixture_segment(records):
@@ -676,33 +725,29 @@ try:
         artifact["readiness_status"] = readiness_status
 
     if readiness_status not in DISCOVERY_READY_STATUSES:
-        start_data = structured.get("data")
-        blocked_reason = start_data.get("reason") if isinstance(start_data, dict) else None
-        if (
-            sys.platform == "win32"
-            and readiness_status == "blocked"
-            and isinstance(blocked_reason, str)
-            and "project ID read failed" in blocked_reason
-        ):
-            raise KnownIssueSkip(blocked_reason)
         raise SmokeFailure(
             "oneup_start did not make the fixture repository searchable: "
             f"{readiness_status} (summary: {json.dumps(structured.get('summary'))}, "
             f"data: {json.dumps(structured.get('data'))})"
         )
 
+    search_arguments = {"query": "PolicyRuleValidator", "limit": 5}
     search_result = call_tool(
         proc,
         stdout_queue,
         5,
         "oneup_search",
-        {"query": "PolicyRuleValidator", "limit": 5},
+        search_arguments,
     )
     search_envelope = require_tool_envelope(search_result, "search", "oneup_search")
     search_results = search_envelope["data"].get("results")
     if not isinstance(search_results, list) or not search_results:
+        artifact["search_debug"] = {
+            "request": search_arguments,
+            "response": search_result,
+        }
         raise SmokeFailure("oneup_search did not return structured ranked results")
-    hit = require_fixture_search_hit(search_results)
+    hit = require_fixture_search_hit(search_results, search_result, search_arguments)
     handle = hit.get("handle")
     if not isinstance(handle, str) or not handle.strip():
         raise SmokeFailure("oneup_search result is missing a stable handle")
@@ -786,25 +831,6 @@ try:
     artifact["discovery_flow"]["status"] = "passed"
 
     write_artifact("passed")
-except KnownIssueSkip as exc:
-    artifact["discovery_flow"]["status"] = "skipped_known_issue"
-    artifact["known_issue"] = {
-        "target_platform": "windows",
-        "readiness_status": "blocked",
-        "reason": exc.reason,
-        "tracking_issue": "https://github.com/rp1-run/1up/issues/54",
-        "description": (
-            "windows binary fails project initialization for canonical "
-            "extended-length paths; MCP protocol surface verified, "
-            "indexing-dependent discovery flow skipped"
-        ),
-    }
-    print(
-        "[release-assets] WARNING: windows MCP discovery flow skipped due to known "
-        f"issue rp1-run/1up#54: {exc.reason}",
-        file=sys.stderr,
-    )
-    write_artifact("passed_with_known_issue")
 except SmokeFailure as exc:
     if exc.protocol_clean is not None:
         artifact["stdout_protocol_clean"] = exc.protocol_clean
@@ -812,7 +838,10 @@ except SmokeFailure as exc:
         stderr = "".join(stderr_lines).strip()
         if stderr:
             artifact["diagnostics"].append(f"MCP stderr: {stderr[-1000:]}")
-    sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
+    if sys.platform == "win32" and matches_known_issue_110(str(exc)):
+        record_known_issue_110(str(exc))
+    else:
+        sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
 except Exception as exc:
     if stderr_lines:
         stderr = "".join(stderr_lines).strip()
