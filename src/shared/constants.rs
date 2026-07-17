@@ -525,6 +525,16 @@ pub const FILE_COUNT_THRESHOLD: usize = 3_000;
 /// Environment variable to override the file count threshold for monorepo facts envelope.
 pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
 
+/// Test-only knob: milliseconds to sleep periodically during the daemon's
+/// gitignore-aware first-index gate walk, holding the walk open so a test can
+/// deliver SIGTERM mid-walk and assert cooperative cancellation.
+///
+/// Unset or non-positive disables the throttle (production default), so the walk
+/// runs at full speed. This exists purely to make the SIGTERM-cancels-the-gate-walk
+/// behaviour deterministic in a debug build without a huge fixture; nothing on the
+/// production path reads it.
+pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY_DELAY_MS";
+
 /// Schema version for database layout.
 ///
 /// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta

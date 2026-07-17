@@ -2126,14 +2126,34 @@ async fn run_unit_while_servicing_events<F: Future>(
     }
 }
 
+/// Number of walk entries between test-only throttle sleeps (see
+/// [`TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR`]). Small so a modest fixture yields many
+/// deliberate yield points, each followed by a cancellation check.
+const TEST_GATE_WALK_THROTTLE_EVERY: usize = 10;
+
 /// Count files in a gitignore-aware manner for gate-check purposes.
-/// Returns the count of regular files that are not ignored by .gitignore.
-/// Checks the cancellation token every 100 entries to allow SIGTERM interruption.
+///
+/// Returns the count of regular files that are not ignored by `.gitignore`.
+/// Checks the cancellation token every 100 entries so a SIGTERM-driven token
+/// cancellation aborts the walk promptly. A cancelled walk returns
+/// [`IndexingError::Cancelled`] — a distinct outcome from a genuine empty walk
+/// (`Ok(0)`) — so the caller never mistakes "cancelled during shutdown" for
+/// "zero files" and opens the first-index gate while draining.
 fn count_files_gitignore_aware(
     source_root: &Path,
     cancel_token: &CancellationToken,
 ) -> Result<usize, OneupError> {
+    use crate::shared::errors::IndexingError;
     use ignore::WalkBuilder;
+
+    // Test-only: read once. Holds the walk open (a small sleep every N entries)
+    // so a test can land SIGTERM mid-walk; disabled (None) on the production path.
+    let throttle_delay =
+        std::env::var(crate::shared::constants::TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis);
 
     let walker = WalkBuilder::new(source_root)
         .hidden(false)
@@ -2145,9 +2165,20 @@ fn count_files_gitignore_aware(
         // Check cancellation every 100 entries to allow timely SIGTERM exit
         if idx % 100 == 0 && cancel_token.is_cancelled() {
             debug!("count_files_gitignore_aware cancelled at {} entries", count);
-            return Err(OneupError::Other(anyhow::anyhow!(
-                "walk cancelled by SIGTERM"
-            )));
+            return Err(IndexingError::Cancelled.into());
+        }
+
+        // Test-only throttle: sleep at a fixed cadence and re-check cancellation
+        // immediately after the yield so a mid-walk SIGTERM aborts within one
+        // throttle interval rather than waiting for the next 100-entry boundary.
+        if let Some(delay) = throttle_delay {
+            if idx % TEST_GATE_WALK_THROTTLE_EVERY == 0 {
+                std::thread::sleep(delay);
+                if cancel_token.is_cancelled() {
+                    debug!("count_files_gitignore_aware cancelled at {} entries", count);
+                    return Err(IndexingError::Cancelled.into());
+                }
+            }
         }
 
         if let Ok(entry) = result {
@@ -2332,18 +2363,26 @@ async fn run_project(
     // Before starting a first index, check if file count is over threshold without scope.
     // If so, stay idle and let the MCP oneup_start path handle the gate.
     {
-        let state = projects
-            .get(context_id)
-            .expect("dirty project must exist while gating");
-        let state_root = &state.project_root;
-        let source_root = &state.source_root;
-
-        // Check if this is a first index: index.db exists but has no indexed content
-        // (empty schema created at startup). This is more robust than checking file existence,
-        // which would be defeated by the empty DB created in build_project_state.
-        let is_first_index = {
-            let conn = state.db.connect_tuned().await?;
-            segments::count_segments(&conn).await.unwrap_or(0) == 0
+        // Snapshot the roots and first-index decision as owned values so the
+        // immutable borrow of `projects` ends before the (cancellable) gate walk
+        // and the `get_mut` used on the abort path below.
+        let (state_root, source_root, is_first_index) = {
+            let state = projects
+                .get(context_id)
+                .expect("dirty project must exist while gating");
+            // Check if this is a first index: index.db exists but has no indexed
+            // content (empty schema created at startup). This is more robust than
+            // checking file existence, which would be defeated by the empty DB
+            // created in build_project_state.
+            let is_first_index = {
+                let conn = state.db.connect_tuned().await?;
+                segments::count_segments(&conn).await.unwrap_or(0) == 0
+            };
+            (
+                state.project_root.clone(),
+                state.source_root.clone(),
+                is_first_index,
+            )
         };
 
         if is_first_index {
@@ -2353,21 +2392,56 @@ async fn run_project(
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
-            // FIX C: Run the gate walk in spawn_blocking so the async executor
-            // stays responsive to SIGTERM signals and can cancel the token.
-            let source_root_clone = source_root.to_path_buf();
+            // Run the gate walk in spawn_blocking so the async executor stays
+            // responsive to SIGTERM and can cancel the daemon token, which this
+            // pass's per-project child token observes (SIGTERM cancels the
+            // parent; a de-register cancels only this child) and the walk
+            // aborts on cooperatively.
+            let source_root_clone = source_root.clone();
             let cancel_token_clone = project_cancel_token.clone();
-            let file_count = tokio::task::spawn_blocking(move || {
+            let walk_result: Result<usize, OneupError> = tokio::task::spawn_blocking(move || {
                 count_files_gitignore_aware(&source_root_clone, &cancel_token_clone)
             })
             .await
-            .unwrap_or(Err(OneupError::Other(anyhow::anyhow!(
-                "blocking task panicked"
-            ))))
-            .unwrap_or(0);
+            .unwrap_or_else(|join_err| {
+                Err(OneupError::Other(anyhow::anyhow!(
+                    "gate walk task failed to join: {join_err}"
+                )))
+            });
+
+            // A cancelled (or otherwise failed) gate walk must NOT collapse to
+            // `file_count = 0`: that value passes the file-count gate and would
+            // start a first index during the shutdown drain (defect 2). Abort the
+            // pass instead. The gate walk runs before `start_run`, so the project
+            // is still dirty with its pending scope intact and re-runs on a later
+            // pass. A genuinely empty repo still returns `Ok(0)` and takes the
+            // normal gate path below.
+            let file_count = match walk_result {
+                Ok(count) => count,
+                Err(e) => {
+                    let state = projects
+                        .get_mut(context_id)
+                        .expect("dirty project must exist while aborting an interrupted gate walk");
+                    if matches!(
+                        &e,
+                        OneupError::Indexing(crate::shared::errors::IndexingError::Cancelled)
+                    ) {
+                        // Cancellation is neither complete nor failed: record the
+                        // refresh as pending (mirroring the pipeline cancel path)
+                        // so status readers see a re-index is still owed.
+                        state.last_refresh_state = DaemonRefreshState::Pending;
+                        state.last_refresh_error = None;
+                        persist_daemon_context_status_for_state(state);
+                    } else {
+                        // A genuine walk/join fault: record failure, leave dirty.
+                        mark_refresh_finished(state, Utc::now(), Err(&e));
+                    }
+                    return Err(e);
+                }
+            };
 
             // Check if scope is recorded in the progress file
-            let scope_recorded = read_index_progress(state_root)
+            let scope_recorded = read_index_progress(&state_root)
                 .and_then(|progress| progress.scope)
                 .is_some();
 
@@ -2902,6 +2976,57 @@ mod tests {
     use std::time::Duration;
 
     use crate::shared::constants::DAEMON_READ_TIMEOUT_MS;
+
+    #[test]
+    fn cancelled_gate_walk_aborts_instead_of_opening_the_gate() {
+        use crate::shared::errors::IndexingError;
+
+        // A gate walk cancelled by SIGTERM must surface as a distinct
+        // `Cancelled` outcome, never as `Ok(0)`. Collapsing to zero would feed
+        // `file_count = 0` into the gate, which passes for any threshold and would
+        // open a first index during the shutdown drain (defect 2).
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..250 {
+            std::fs::write(tmp.path().join(format!("file_{i}.rs")), "fn x() {}").unwrap();
+        }
+
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel(); // pre-cancelled: the walk aborts at its first check
+
+        let result = count_files_gitignore_aware(tmp.path(), &cancel_token);
+        assert!(
+            matches!(result, Err(OneupError::Indexing(IndexingError::Cancelled))),
+            "a cancelled gate walk must return Cancelled, got {result:?}"
+        );
+
+        // Document the trap the fix avoids: a collapsed `file_count = 0` would
+        // OPEN the gate (0 is never over threshold), whereas the real over-threshold
+        // count would correctly BLOCK it. The cancelled walk must therefore never
+        // yield a count at all.
+        assert!(
+            lifecycle::gate_allows_first_index(true, 0, 10, false),
+            "sanity: file_count=0 opens the gate — exactly why a cancelled walk must not collapse to 0"
+        );
+        assert!(
+            !lifecycle::gate_allows_first_index(true, 250, 10, false),
+            "sanity: the true over-threshold count blocks the gate"
+        );
+    }
+
+    #[test]
+    fn uncancelled_gate_walk_counts_files() {
+        // Guard the happy path: without cancellation the walk returns the real
+        // (nonzero) file count, so the Ok arm still feeds the gate a true value.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("file_{i}.rs")), "fn x() {}").unwrap();
+        }
+
+        let cancel_token = CancellationToken::new();
+        let count = count_files_gitignore_aware(tmp.path(), &cancel_token)
+            .expect("an uncancelled walk succeeds");
+        assert_eq!(count, 5, "walk must count all non-ignored regular files");
+    }
 
     #[test]
     fn should_idle_shutdown_only_when_empty_past_timeout() {
