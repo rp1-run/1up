@@ -3660,47 +3660,87 @@ pub async fn should_return_facts_envelope(
     Ok(total_files > threshold)
 }
 
-/// Generates ranked scope suggestions from top-level directories.
-/// Provides multiple ranked suggestions without dangling "Or" wording.
-/// Returns up to 3 suggestions formatted as actionable scope cone names.
-/// Excludes launch_subdir from suggestions if already matched (avoids duplication).
-fn generate_ranked_suggestions(
+/// A ranked scope suggestion pairing a target directory with a coherent,
+/// standalone reason. Single source of truth for both the display
+/// `FactsEnvelope.suggestions` strings and the facts-envelope `next_actions`,
+/// which also needs the `directory` to build the `scope_add` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeSuggestion {
+    pub directory: String,
+    pub reason: String,
+}
+
+/// Generates ranked scope suggestions from the largest top-level directories.
+///
+/// Returns up to 3 suggestions, each carrying the target directory and a
+/// coherent standalone reason. The first emitted reason is a primary imperative
+/// only when no `launch_subdir` precedes it; when a `launch_subdir` is present
+/// (shown separately in the display envelope, or emitted as the leading
+/// `next_action`), every scope suggestion reads as an alternative so the first
+/// one is never a dangling primary. No reason ever begins with "Or ". The
+/// `launch_subdir` directory is skipped to avoid duplicating its dedicated
+/// suggestion, while ordinals stay truthful to the actual rank.
+pub(crate) fn generate_ranked_scope_suggestions(
     per_directory_stats: &[DirectoryStats],
     launch_subdir: &Option<String>,
-) -> Vec<String> {
-    let mut suggestions = Vec::new();
+) -> Vec<ScopeSuggestion> {
+    let mut suggestions: Vec<ScopeSuggestion> = Vec::new();
 
     for (idx, stat) in per_directory_stats.iter().take(3).enumerate() {
-        // Skip suggesting the launch_subdir (redundant with top-level launch_subdir suggestion)
+        // Skip suggesting the launch_subdir (redundant with its dedicated suggestion).
         if let Some(subdir) = launch_subdir {
             if &stat.directory == subdir {
                 continue;
             }
         }
 
-        let suggestion = if suggestions.is_empty() {
-            // First emitted suggestion is primary (no "Or"), even when the
-            // top-ranked directory was skipped as the launch_subdir.
-            if idx == 0 {
-                format!("Index the largest directory: {}", stat.directory)
-            } else {
-                // Keep the ordinal truthful to the actual rank, not the
-                // emitted position.
-                format!(
-                    "Index the {} largest directory: {}",
-                    ordinal(idx + 1),
-                    stat.directory
-                )
-            }
-        } else {
-            // Subsequent suggestions are ranked alternatives
-            format!("Or index {}: {}", ordinal(idx + 1), stat.directory)
+        let is_primary = suggestions.is_empty() && launch_subdir.is_none();
+        let reason = match (is_primary, idx) {
+            (true, 0) => format!("Index the largest directory: {}", stat.directory),
+            (true, _) => format!(
+                "Index the {} largest directory: {}",
+                ordinal(idx + 1),
+                stat.directory
+            ),
+            (false, 0) => format!(
+                "Alternatively, index the largest directory: {}",
+                stat.directory
+            ),
+            (false, _) => format!(
+                "Alternatively, index the {} largest directory: {}",
+                ordinal(idx + 1),
+                stat.directory
+            ),
         };
 
-        suggestions.push(suggestion);
+        suggestions.push(ScopeSuggestion {
+            directory: stat.directory.clone(),
+            reason,
+        });
     }
 
     suggestions
+}
+
+/// Display-string view of the ranked scope suggestions for
+/// `FactsEnvelope.suggestions`, derived from the structured source of truth.
+fn generate_ranked_suggestions(
+    per_directory_stats: &[DirectoryStats],
+    launch_subdir: &Option<String>,
+) -> Vec<String> {
+    generate_ranked_scope_suggestions(per_directory_stats, launch_subdir)
+        .into_iter()
+        .map(|s| s.reason)
+        .collect()
+}
+
+/// Structured ranked scope suggestions for a facts envelope, sharing the exact
+/// source of truth with `FactsEnvelope.suggestions`. Each entry carries the
+/// target `directory` (for the `scope_add` argument) and a coherent standalone
+/// `reason`, so the facts-envelope `next_actions` builder never re-derives its
+/// own wording.
+pub(crate) fn ranked_scope_suggestions(facts: &FactsEnvelope) -> Vec<ScopeSuggestion> {
+    generate_ranked_scope_suggestions(&facts.per_directory_stats, &facts.launch_subdir)
 }
 
 /// Helper to convert numeric position to ordinal (1st, 2nd, 3rd, etc.)
@@ -6203,11 +6243,21 @@ mod tests {
             .collect()
     }
 
+    fn assert_no_leading_or(reasons: &[String]) {
+        for reason in reasons {
+            assert!(
+                !reason.starts_with("Or "),
+                "no reason may begin with 'Or '; got {:?}",
+                reasons
+            );
+        }
+    }
+
     #[test]
     fn test_ranked_suggestions_no_leading_or_when_top_dir_is_launch_subdir() {
-        // When the launch_subdir is the top-ranked directory, the first
-        // emitted suggestion must not start with "Or" and must keep the
-        // truthful rank ordinal.
+        // When the launch_subdir is the top-ranked directory, it is skipped and
+        // every remaining scope suggestion reads as an alternative (the launch
+        // action is the implied primary). No reason begins with "Or ".
         let stats = ranked_stats(&["services", "libs", "tools"]);
         let launch_subdir = Some("services".to_string());
 
@@ -6216,20 +6266,18 @@ mod tests {
         assert_eq!(
             suggestions,
             vec![
-                "Index the 2nd largest directory: libs".to_string(),
-                "Or index 3rd: tools".to_string(),
+                "Alternatively, index the 2nd largest directory: libs".to_string(),
+                "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
-        assert!(
-            !suggestions[0].starts_with("Or"),
-            "first suggestion must never start with 'Or'; got {:?}",
-            suggestions
-        );
+        assert_no_leading_or(&suggestions);
     }
 
     #[test]
-    fn test_ranked_suggestions_without_launch_subdir_keep_existing_shape() {
-        // Regression: no launch_subdir leaves the original output unchanged.
+    fn test_ranked_suggestions_without_launch_subdir_first_is_primary() {
+        // No launch_subdir: the first suggestion is the primary imperative and
+        // the rest are alternatives. Multiple ranked suggestions, none with a
+        // leading "Or ".
         let stats = ranked_stats(&["services", "libs", "tools"]);
 
         let suggestions = generate_ranked_suggestions(&stats, &None);
@@ -6238,10 +6286,11 @@ mod tests {
             suggestions,
             vec![
                 "Index the largest directory: services".to_string(),
-                "Or index 2nd: libs".to_string(),
-                "Or index 3rd: tools".to_string(),
+                "Alternatively, index the 2nd largest directory: libs".to_string(),
+                "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
+        assert_no_leading_or(&suggestions);
     }
 
     #[test]
@@ -6254,13 +6303,14 @@ mod tests {
             suggestions,
             vec!["Index the largest directory: services".to_string()]
         );
+        assert_no_leading_or(&suggestions);
     }
 
     #[test]
     fn test_ranked_suggestions_skip_second_ranked_launch_subdir() {
-        // When the launch_subdir is a non-top-ranked directory, the primary
-        // suggestion is unchanged and the "Or" alternatives skip the subdir
-        // while keeping truthful ordinals.
+        // When the launch_subdir is a non-top-ranked directory it is skipped;
+        // because a launch_subdir is present, the remaining scope suggestions
+        // all read as alternatives with truthful ordinals and no leading "Or ".
         let stats = ranked_stats(&["services", "libs", "tools"]);
         let launch_subdir = Some("libs".to_string());
 
@@ -6269,9 +6319,42 @@ mod tests {
         assert_eq!(
             suggestions,
             vec![
-                "Index the largest directory: services".to_string(),
-                "Or index 3rd: tools".to_string(),
+                "Alternatively, index the largest directory: services".to_string(),
+                "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
+        assert_no_leading_or(&suggestions);
+    }
+
+    #[test]
+    fn test_ranked_scope_suggestions_pair_directory_with_reason() {
+        // Structured suggestions carry both the target directory (for scope_add)
+        // and the coherent reason, sharing the display source of truth.
+        let stats = ranked_stats(&["services", "libs", "tools"]);
+
+        let suggestions = generate_ranked_scope_suggestions(&stats, &None);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                ScopeSuggestion {
+                    directory: "services".to_string(),
+                    reason: "Index the largest directory: services".to_string(),
+                },
+                ScopeSuggestion {
+                    directory: "libs".to_string(),
+                    reason: "Alternatively, index the 2nd largest directory: libs".to_string(),
+                },
+                ScopeSuggestion {
+                    directory: "tools".to_string(),
+                    reason: "Alternatively, index the 3rd largest directory: tools".to_string(),
+                },
+            ]
+        );
+
+        // The display strings are derived from the same structured source.
+        let display = generate_ranked_suggestions(&stats, &None);
+        let reasons: Vec<String> = suggestions.into_iter().map(|s| s.reason).collect();
+        assert_eq!(display, reasons);
     }
 }

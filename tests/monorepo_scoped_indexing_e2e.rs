@@ -1093,6 +1093,30 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
         "facts should have next_actions with suggestions"
     );
 
+    // Fixed for #88: the facts envelope emits multiple ranked scope actions
+    // (not a single dangling one), each carrying a scope_add directory, and no
+    // reason begins with a dangling "Or ".
+    let next_actions = start_envelope["next_actions"].as_array().unwrap();
+    assert!(
+        next_actions.len() >= 2,
+        "facts envelope must emit multiple ranked scope actions; got {}",
+        next_actions.len()
+    );
+    for action in next_actions {
+        let reason = action["reason"].as_str().unwrap_or("");
+        assert!(
+            !reason.starts_with("Or "),
+            "#88: no facts next_action reason may begin with 'Or '; got {reason:?}"
+        );
+        assert!(
+            action["arguments"]["scope_add"]
+                .as_array()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "each facts next_action must carry a scope_add directory; got {action:?}"
+        );
+    }
+
     // 3. Verify suggestions exclude .gitignore'd directories and VCS directories
     let stats = start_envelope["data"]["per_directory_stats"]
         .as_array()
