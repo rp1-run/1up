@@ -1,7 +1,58 @@
 use std::io::IsTerminal;
+use std::path::Path;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use serde::de::DeserializeOwned;
+
+/// Error explaining why a present status file could not be turned into a value.
+///
+/// Kept as a typed source so call sites can log the underlying cause; the
+/// classifier never acts on the distinction itself.
+#[derive(Debug, thiserror::Error)]
+pub enum StatusReadError {
+    #[error("failed to read status file: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("failed to parse status file: {0}")]
+    Parse(#[source] serde_json::Error),
+}
+
+/// Three-state outcome of reading a JSON status file.
+///
+/// This makes the "not yet written" case (`Absent`) distinct from the
+/// "present but torn/corrupt" case (`Unreadable`), so a reader never silently
+/// degrades a partial write to an empty/default value. Producing this outcome is
+/// pure: [`read_status_file`] performs a single attempt with no sleeps, and any
+/// retry-or-propagate policy lives at the call site.
+#[derive(Debug)]
+pub enum StatusFileRead<T> {
+    /// The file does not exist yet (a legitimate not-yet-written state).
+    Absent,
+    /// The file was read and parsed into a value.
+    Parsed(T),
+    /// The file exists but could not be read or parsed (e.g. a torn write).
+    Unreadable(StatusReadError),
+}
+
+/// Classify a single read of a JSON status file into [`StatusFileRead`].
+///
+/// Pure and sleep-free: exactly one filesystem read and one parse attempt. A
+/// missing file maps to [`StatusFileRead::Absent`]; any other IO failure or a
+/// parse failure (including an empty or truncated file) maps to
+/// [`StatusFileRead::Unreadable`], never a default. Callers own retry/propagate
+/// policy via [`crate::shared::constants::STATUS_READ_RETRY_ATTEMPTS`] and
+/// [`crate::shared::constants::STATUS_READ_RETRY_DELAY_MS`].
+pub fn read_status_file<T: DeserializeOwned>(path: &Path) -> StatusFileRead<T> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return StatusFileRead::Absent,
+        Err(err) => return StatusFileRead::Unreadable(StatusReadError::Io(err)),
+    };
+    match serde_json::from_str(&content) {
+        Ok(value) => StatusFileRead::Parsed(value),
+        Err(err) => StatusFileRead::Unreadable(StatusReadError::Parse(err)),
+    }
+}
 
 const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(80);
 const DRAW_RATE_HZ: u8 = 10;
@@ -233,5 +284,59 @@ mod tests {
         ui.set_state(ProgressState::items("Processing files", 1, 4));
         ui.set_state(ProgressState::bytes("Downloading model", 2, 8));
         ui.success_with("complete");
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct SampleStatus {
+        progress: u32,
+    }
+
+    #[test]
+    fn read_status_file_absent_file_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing_status.json");
+
+        match read_status_file::<SampleStatus>(&path) {
+            StatusFileRead::Absent => {}
+            other => panic!("expected Absent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_status_file_valid_json_is_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, br#"{"progress":42}"#).unwrap();
+
+        match read_status_file::<SampleStatus>(&path) {
+            StatusFileRead::Parsed(value) => {
+                assert_eq!(value, SampleStatus { progress: 42 });
+            }
+            other => panic!("expected Parsed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_status_file_truncated_json_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, br#"{"progress":4"#).unwrap();
+
+        match read_status_file::<SampleStatus>(&path) {
+            StatusFileRead::Unreadable(StatusReadError::Parse(_)) => {}
+            other => panic!("expected Unreadable(Parse), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_status_file_empty_file_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("status.json");
+        std::fs::write(&path, b"").unwrap();
+
+        match read_status_file::<SampleStatus>(&path) {
+            StatusFileRead::Unreadable(StatusReadError::Parse(_)) => {}
+            other => panic!("expected Unreadable(Parse), got {other:?}"),
+        }
     }
 }
