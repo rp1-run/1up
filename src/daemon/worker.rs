@@ -508,6 +508,14 @@ async fn load_and_watch_projects(
     prune_source_missing_contexts_on_startup(&registry).await;
     let registry = Registry::load().unwrap_or(registry);
 
+    // De-register entries for fully-deleted projects (project root AND index.db
+    // both gone). This is the natural companion to the source-missing prune above:
+    // it needs no per-project index.db and complements that prune, which cannot
+    // run once index.db itself is gone. Reload afterwards so the watch loop below
+    // sees only the survivors (issue #115). Best-effort — never fails startup.
+    deregister_deleted_projects_on_startup(&registry).await;
+    let registry = Registry::load().unwrap_or(registry);
+
     for entry in &registry.projects {
         let Some(mut state) = build_project_state(entry).await? else {
             continue;
@@ -720,6 +728,120 @@ async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<
                 db_path.display()
             );
             Vec::new()
+        }
+    }
+}
+
+/// Conservative three-state outcome of a filesystem existence probe for a path
+/// that may have been deleted out from under the registry.
+///
+/// The middle state is the whole point: de-registration mutates the shared
+/// `projects.json`, so a transient stat failure on a flaky or unmounted network
+/// share must never be mistaken for deletion. Only a hard `ErrorKind::NotFound`
+/// counts as definitely gone; every other io error (EIO, ENOTCONN, EACCES, …) is
+/// `Indeterminate` and keeps the entry — matching the conservative posture the
+/// source-missing prune uses before mutating shared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathPresence {
+    /// `symlink_metadata` succeeded: the path exists.
+    Present,
+    /// `symlink_metadata` returned `ErrorKind::NotFound`: the path is gone.
+    DefinitelyAbsent,
+    /// The probe could not decide (any io error other than `NotFound`). Treated
+    /// as "keep" so a transient outage never triggers de-registration.
+    Indeterminate,
+}
+
+/// Conservatively probe whether `path` exists.
+///
+/// Uses `symlink_metadata` so the final component is not followed — a dangling
+/// symlink reports `Present` (the directory entry exists) rather than absent, so a
+/// moved link target never looks like a deleted project. Only a hard
+/// `ErrorKind::NotFound` maps to `DefinitelyAbsent`; any other error is
+/// `Indeterminate`, so a stat failure on a flaky mount is never read as deletion.
+fn probe_path_presence(path: &Path) -> PathPresence {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => PathPresence::Present,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => PathPresence::DefinitelyAbsent,
+        Err(_) => PathPresence::Indeterminate,
+    }
+}
+
+/// Pure decision: is a registry entry dead (safe to de-register on startup)?
+///
+/// True only when BOTH the project root and its `index.db` are `DefinitelyAbsent`.
+/// A live root with a missing `index.db` is a fresh, not-yet-indexed project and
+/// is kept; any `Indeterminate` probe on either input is kept, so a flaky mount
+/// never triggers de-registration. Taking the two probe results as parameters
+/// keeps this deterministic and unit-testable.
+fn is_entry_dead(root_probe: PathPresence, db_probe: PathPresence) -> bool {
+    root_probe == PathPresence::DefinitelyAbsent && db_probe == PathPresence::DefinitelyAbsent
+}
+
+/// Select the context ids of registry entries whose project root AND `index.db`
+/// are both definitively gone (a fully-deleted project).
+///
+/// Pure and injected with `probe` so it is deterministic and unit-testable (the
+/// daemon passes [`probe_path_presence`]). Each entry's `index.db` path is derived
+/// from its project root via [`config::project_db_path`], matching where the index
+/// actually lives.
+fn dead_project_context_ids(
+    registry: &Registry,
+    probe: &dyn Fn(&Path) -> PathPresence,
+) -> Vec<String> {
+    registry
+        .projects
+        .iter()
+        .filter(|entry| {
+            let root_probe = probe(&entry.project_root);
+            let db_probe = probe(&config::project_db_path(&entry.project_root));
+            is_entry_dead(root_probe, db_probe)
+        })
+        .map(ProjectEntry::context_id)
+        .collect()
+}
+
+/// Best-effort startup de-registration of entries for fully-deleted projects —
+/// those whose project root AND `index.db` are both definitively gone.
+///
+/// This runs at daemon startup, next to
+/// [`prune_source_missing_contexts_on_startup`], because it is the one
+/// reconciliation that needs no per-project `index.db`: the source-missing prune
+/// opens each project's `index.db` to delete dead contexts and so cannot run once
+/// that file is itself gone. This complements it by removing the leftover registry
+/// entry, so a project whose entire directory (including `.1up/index.db`) was
+/// deleted stops being reloaded, warned about, and re-skipped on every startup
+/// (issue #115).
+///
+/// Every step is best-effort: a de-register hiccup is logged and swallowed so it
+/// can never block or fail daemon startup. The registry is reloaded fresh before
+/// mutating so a concurrent registration is not clobbered, and the removal goes
+/// through the existing atomic save under the registry lock
+/// ([`Registry::deregister_context_ids`]).
+async fn deregister_deleted_projects_on_startup(registry: &Registry) {
+    let dead_ids = dead_project_context_ids(registry, &|p: &Path| probe_path_presence(p));
+    if dead_ids.is_empty() {
+        return;
+    }
+
+    // One info line per removed entry, naming the project root for diagnosability.
+    let dead_set: HashSet<String> = dead_ids.into_iter().collect();
+    for entry in &registry.projects {
+        if dead_set.contains(&entry.context_id()) {
+            info!(
+                "de-registering fully-deleted project on startup: {} (context {})",
+                entry.project_root.display(),
+                entry.context_id()
+            );
+        }
+    }
+
+    match Registry::load().and_then(|mut r| r.deregister_context_ids(&dead_set)) {
+        Ok(removed) => {
+            info!("de-registered {removed} fully-deleted project(s) on startup");
+        }
+        Err(err) => {
+            warn!("failed to de-register fully-deleted projects on startup: {err}");
         }
     }
 }
@@ -3673,6 +3795,111 @@ mod tests {
             pruned,
             vec!["gone00000001".to_string(), "gone00000002".to_string()]
         );
+    }
+
+    #[test]
+    fn is_entry_dead_only_when_both_definitely_absent() {
+        use PathPresence::*;
+        // Fully-deleted project: both root and index.db are gone.
+        assert!(is_entry_dead(DefinitelyAbsent, DefinitelyAbsent));
+        // Live root with a missing index.db is a fresh, not-yet-indexed project: keep.
+        assert!(!is_entry_dead(Present, DefinitelyAbsent));
+        // Live project (both present): keep.
+        assert!(!is_entry_dead(Present, Present));
+        // Any indeterminate probe (flaky mount) keeps the entry, even when the
+        // other input looks gone — a transient outage must never de-register.
+        assert!(!is_entry_dead(Indeterminate, DefinitelyAbsent));
+        assert!(!is_entry_dead(DefinitelyAbsent, Indeterminate));
+        assert!(!is_entry_dead(Indeterminate, Indeterminate));
+        assert!(!is_entry_dead(Indeterminate, Present));
+    }
+
+    #[test]
+    fn probe_path_presence_present_and_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("here");
+        std::fs::write(&present, b"x").unwrap();
+        assert_eq!(probe_path_presence(&present), PathPresence::Present);
+
+        let missing = tmp.path().join("gone");
+        assert_eq!(
+            probe_path_presence(&missing),
+            PathPresence::DefinitelyAbsent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_path_presence_reports_dangling_symlink_as_present() {
+        // symlink_metadata does not follow the final component, so a dangling
+        // symlink is Present (its directory entry exists), never DefinitelyAbsent:
+        // a project must not be de-registered because a link target moved.
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("nonexistent-target"), &link).unwrap();
+        assert_eq!(probe_path_presence(&link), PathPresence::Present);
+    }
+
+    fn dead_test_entry(project_root: &Path, context_id: &str) -> ProjectEntry {
+        ProjectEntry {
+            project_id: format!("id-{context_id}"),
+            project_root: project_root.to_path_buf(),
+            source_root: None,
+            context_id: Some(context_id.to_string()),
+            main_worktree_root: None,
+            worktree_role: None,
+            branch_name: None,
+            branch_ref: None,
+            branch_status: None,
+            head_oid: None,
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: None,
+        }
+    }
+
+    #[test]
+    fn dead_project_selects_only_fully_deleted_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Live project: root + index.db both exist.
+        let live_root = tmp.path().join("live");
+        std::fs::create_dir_all(config::project_dot_dir(&live_root)).unwrap();
+        std::fs::write(config::project_db_path(&live_root), b"db").unwrap();
+
+        // Fresh project: root exists, index.db not yet created.
+        let fresh_root = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh_root).unwrap();
+
+        // Fully-deleted project: neither root nor index.db exist on disk.
+        let dead_root = tmp.path().join("dead");
+
+        let registry = Registry {
+            projects: vec![
+                dead_test_entry(&live_root, "live00000001"),
+                dead_test_entry(&fresh_root, "fresh0000001"),
+                dead_test_entry(&dead_root, "dead00000001"),
+            ],
+        };
+
+        // Only the fully-deleted entry is selected for removal; the live and
+        // fresh (missing-db) entries survive.
+        let dead = dead_project_context_ids(&registry, &|p| probe_path_presence(p));
+        assert_eq!(dead, vec!["dead00000001".to_string()]);
+    }
+
+    #[test]
+    fn dead_project_keeps_indeterminate_entries() {
+        // An indeterminate probe (e.g. a flaky mount returning EIO) on both inputs
+        // keeps the entry even though the paths appear gone, so a transient outage
+        // never de-registers a live project.
+        let registry = Registry {
+            projects: vec![dead_test_entry(
+                Path::new("/does-not-matter"),
+                "flaky0000001",
+            )],
+        };
+        let dead = dead_project_context_ids(&registry, &|_| PathPresence::Indeterminate);
+        assert!(dead.is_empty());
     }
 
     #[tokio::test]
