@@ -4,28 +4,24 @@
 //! same Cargo semver but were produced from different source (a different commit,
 //! or an uncommitted working tree). Bare semver cannot: a same-version daemon
 //! from a *different* build would otherwise be trusted as authoritative. This
-//! script composes `{CARGO_PKG_VERSION}+{git-short-hash}[.dirty]` and exposes it
-//! as the `ONEUP_BUILD_IDENTITY` compile-time env var (read via `env!` in
-//! `src/shared/constants.rs`).
+//! script composes `{CARGO_PKG_VERSION}+{git-short-hash}[.dirty[.{digest}]]`
+//! and exposes it as the `ONEUP_BUILD_IDENTITY` compile-time env var (read via
+//! `env!` in `src/shared/constants.rs`). The dirty suffix carries a short
+//! content digest of the tracked-file delta so two *different* dirty builds at
+//! the same HEAD also stamp differently (see [`dirty_suffix`]).
 //!
 //! It must never fail the build: a checkout without git (e.g. a source tarball)
 //! degrades to `{CARGO_PKG_VERSION}+unknown`.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
 
     let identity = match git_short_hash() {
-        Some(hash) => {
-            let suffix = if git_worktree_is_dirty() {
-                ".dirty"
-            } else {
-                ""
-            };
-            format!("{version}+{hash}{suffix}")
-        }
+        Some(hash) => format!("{version}+{hash}{}", dirty_suffix()),
         // No git, not a repo, or git failed (source tarball, CI without .git):
         // degrade gracefully rather than failing the build.
         None => format!("{version}+unknown"),
@@ -36,19 +32,85 @@ fn main() {
     // Refresh the stamp when git state moves. HEAD moves on checkout, the ref
     // file and packed-refs move on commit, and the index moves on `git add`.
     // A bare unstaged working-tree edit does not touch any of these, so the
-    // `.dirty` suffix only refreshes on the next commit, stage, or clean
-    // rebuild; the trust-critical path (release builds) is a clean committed
-    // tree, where the stamp is exact.
+    // `.dirty` suffix (digest included) only refreshes on the next commit,
+    // stage, or clean rebuild; the trust-critical path (release builds) is a
+    // clean committed tree, where the stamp is exact.
     emit_git_rerun_triggers();
+}
+
+/// Suffix discriminating dirty builds, or `""` for a clean tree.
+///
+/// A bare boolean `.dirty` would stamp two *different* dirty builds at the
+/// same HEAD identically, so the daemon's exact-match trust gate would still
+/// trust a daemon left over from an earlier, differently-dirty build — the
+/// same wrong-build failure mode this stamp exists to prevent. To
+/// discriminate, the suffix folds in a content digest of the tracked-file
+/// delta: `.dirty.{first 8 lowercase hex chars of the digest}`.
+///
+/// The digested input is the output of exactly one command, `git diff HEAD`,
+/// which covers both staged and unstaged changes to tracked files relative to
+/// HEAD — the same tracked-files-only scope as the dirty probe. The digest is
+/// computed with `git hash-object --stdin` (git's blob object id) rather than
+/// SHA-256 so the build script needs no crate dependencies; 8 hex chars gives
+/// collision *discrimination* between concurrent working states, not
+/// cryptographic integrity, and it only refreshes when the build script
+/// reruns (see `emit_git_rerun_triggers` for the limits).
+///
+/// If the digest probe fails, degrade to plain `.dirty`: still conservatively
+/// marked dirty, merely without cross-dirty-build discrimination.
+fn dirty_suffix() -> String {
+    if !git_worktree_is_dirty() {
+        return String::new();
+    }
+    match dirty_digest() {
+        Some(digest) => format!(".dirty.{digest}"),
+        None => ".dirty".to_string(),
+    }
+}
+
+/// First 8 lowercase hex chars of `git hash-object --stdin` over the
+/// `git diff HEAD` output, or `None` when either probe fails.
+fn dirty_digest() -> Option<String> {
+    let diff = git().args(["diff", "HEAD"]).output().ok()?;
+    if !diff.status.success() {
+        return None;
+    }
+
+    let mut hasher = git()
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    hasher.stdin.take()?.write_all(&diff.stdout).ok()?;
+    let output = hasher.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let hash = String::from_utf8(output.stdout).ok()?.trim().to_lowercase();
+    if hash.len() < 8 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hash[..8].to_string())
+}
+
+/// A `git` command with optional locking disabled (`GIT_OPTIONAL_LOCKS=0`),
+/// so probe commands like `status` and `diff` never opportunistically rewrite
+/// `.git/index` as a side effect. Without this, every build's probes would
+/// freshen the index stat cache, and the registered `index` rerun trigger
+/// would re-dirty the build script on every subsequent build.
+fn git() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
 }
 
 /// Short commit hash for `HEAD`, or `None` when git is unavailable / this is
 /// not a repository.
 fn git_short_hash() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
+    let output = git().args(["rev-parse", "--short", "HEAD"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -66,7 +128,7 @@ fn git_short_hash() -> Option<String> {
 /// they are not compiled into the binary, so they must not discriminate the
 /// build identity. This matches `git describe --dirty` semantics.
 fn git_worktree_is_dirty() -> bool {
-    let output = match Command::new("git")
+    let output = match git()
         .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
     {
@@ -86,14 +148,29 @@ fn emit_git_rerun_triggers() {
         return;
     };
 
-    for rel in ["HEAD", "index", "packed-refs"] {
+    // Per-worktree files: in a linked worktree `--absolute-git-dir` is
+    // `.git/worktrees/<name>`, which holds that worktree's HEAD and index.
+    for rel in ["HEAD", "index"] {
         let path = git_dir.join(rel);
         if path.exists() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 
-    if let Some(ref_path) = head_ref_path(&git_dir) {
+    // Shared (common) files: packed-refs and refs/heads/<branch> live in the
+    // *common* git dir, which differs from `git_dir` in a linked worktree.
+    // Without these, a commit made in a linked worktree (empty commit,
+    // `reset --soft`, message-only amend) advances HEAD without touching any
+    // registered file, baking a stale hash into the next build. For the main
+    // worktree the common dir equals `git_dir`, so this also covers it.
+    let common_dir = git_common_dir().unwrap_or_else(|| git_dir.clone());
+
+    let packed_refs = common_dir.join("packed-refs");
+    if packed_refs.exists() {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
+
+    if let Some(ref_path) = head_ref_path(&git_dir, &common_dir) {
         if ref_path.exists() {
             println!("cargo:rerun-if-changed={}", ref_path.display());
         }
@@ -103,7 +180,7 @@ fn emit_git_rerun_triggers() {
 /// Resolves the git directory (handles linked worktrees, where `.git` is a
 /// file pointing at the real git dir).
 fn git_dir() -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = git()
         .args(["rev-parse", "--absolute-git-dir"])
         .output()
         .ok()?;
@@ -118,10 +195,37 @@ fn git_dir() -> Option<PathBuf> {
     }
 }
 
+/// Resolves the *common* git directory shared by all worktrees (where
+/// `packed-refs` and `refs/heads/*` live). Equals [`git_dir`] for the main
+/// worktree. Git may print it relative to the current directory, so a
+/// relative result is resolved against the build script's cwd (the package
+/// root).
+fn git_common_dir() -> Option<PathBuf> {
+    let output = git()
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(dir);
+    if dir.is_absolute() {
+        Some(dir)
+    } else {
+        Some(std::env::current_dir().ok()?.join(dir))
+    }
+}
+
 /// The concrete ref file that `HEAD` points at (e.g. `refs/heads/main`), so a
-/// commit that advances the branch tip retriggers the build script.
-fn head_ref_path(git_dir: &Path) -> Option<PathBuf> {
+/// commit that advances the branch tip retriggers the build script. `HEAD`
+/// itself is per-worktree, but the ref it names resolves against the common
+/// dir: in a linked worktree `refs/heads/<branch>` exists only there.
+fn head_ref_path(git_dir: &Path, common_dir: &Path) -> Option<PathBuf> {
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let reference = head.trim().strip_prefix("ref: ")?;
-    Some(git_dir.join(reference))
+    Some(common_dir.join(reference))
 }

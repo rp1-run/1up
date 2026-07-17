@@ -6,7 +6,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Build-identity stamp discriminating this binary beyond its semver.
 ///
-/// Composed by `build.rs` as `{VERSION}+{git-short-hash}[.dirty]`, degrading to
+/// Composed by `build.rs` as `{VERSION}+{git-short-hash}[.dirty[.{digest}]]`, degrading to
 /// `{VERSION}+unknown` when git is unavailable (e.g. a source tarball). Unlike
 /// [`VERSION`], two builds sharing the same semver but produced from a different
 /// commit — or a dirty working tree — carry *different* identities. This is the

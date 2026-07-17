@@ -222,7 +222,7 @@ fn serve_daemon_results(
 /// Whether a daemon search response may be served as authoritative.
 ///
 /// Authoritative only when the daemon stamped the *exact* build identity of this
-/// binary ([`BUILD_IDENTITY`], i.e. `{semver}+{git}[.dirty]`). A different build
+/// binary ([`BUILD_IDENTITY`], i.e. `{semver}+{git}[.dirty[.{digest}]]`). A different build
 /// id — even one sharing the same semver — is refused, and so is an *absent*
 /// stamp: an unstamped daemon predates this handshake and cannot prove its build,
 /// so it is treated as non-authoritative and takes the drain-and-restart path
