@@ -19,6 +19,52 @@ use crate::shared::errors::{FilesystemError, OneupError};
 #[cfg(test)]
 pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Three-state outcome of probing whether a filesystem path is present.
+///
+/// A boolean `Path::exists()` collapses "definitely absent" and "could not tell"
+/// into `false`, which lets a transient failure on a flaky or unmounted network
+/// mount masquerade as deletion. Any decision that destructively prunes index
+/// state on absence must distinguish the two so it never false-prunes a live
+/// source that is merely unreachable this cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePresence {
+    /// The path resolved to an existing filesystem object.
+    Present,
+    /// The path is definitively absent: `NotFound`, or an ancestor component is
+    /// not a directory (`NotADirectory`), so the path cannot exist.
+    Absent,
+    /// The probe could not decide — a non-`NotFound` error such as permission
+    /// denied, `EIO`, `ENOTCONN`, or `ESTALE` (typical of an unreachable network
+    /// mount). Callers gating a destructive prune must retain the source this
+    /// cycle.
+    Indeterminate,
+}
+
+/// Probe whether `path` exists, distinguishing a definitively-absent path from an
+/// indeterminate/transient failure.
+///
+/// Follows symlinks (matching `Path::exists` / `Path::try_exists` semantics) via
+/// `fs::metadata`. `NotFound` and `NotADirectory` map to [`SourcePresence::Absent`]
+/// (a missing path, or a path whose ancestor is not a directory, cannot exist);
+/// every other error maps to [`SourcePresence::Indeterminate`] so a permission or
+/// I/O fault on a flaky mount is never mistaken for deletion.
+pub fn probe_source_presence(path: &Path) -> SourcePresence {
+    match fs::metadata(path) {
+        Ok(_) => SourcePresence::Present,
+        Err(err) => presence_from_probe_error(err.kind()),
+    }
+}
+
+/// Pure `ErrorKind` -> [`SourcePresence`] mapping, split out so the transient vs
+/// definitely-absent classification is unit-testable without provoking a real
+/// permission or I/O fault.
+fn presence_from_probe_error(kind: ErrorKind) -> SourcePresence {
+    match kind {
+        ErrorKind::NotFound | ErrorKind::NotADirectory => SourcePresence::Absent,
+        _ => SourcePresence::Indeterminate,
+    }
+}
+
 pub fn ensure_secure_xdg_root() -> Result<PathBuf, OneupError> {
     ensure_secure_dir(&config::data_dir()?, XDG_STATE_DIR_MODE)
 }
@@ -651,6 +697,56 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn probe_source_presence_reports_present_for_an_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(probe_source_presence(tmp.path()), SourcePresence::Present);
+    }
+
+    #[test]
+    fn probe_source_presence_reports_absent_for_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(probe_source_presence(&missing), SourcePresence::Absent);
+    }
+
+    #[test]
+    fn probe_source_presence_reports_absent_when_an_ancestor_is_not_a_directory() {
+        // A path whose parent component is a regular file yields `NotADirectory`,
+        // which is still a definitive "cannot exist" — never indeterminate.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a-file");
+        fs::write(&file, b"x").unwrap();
+        let under_file = file.join("child");
+        assert_eq!(probe_source_presence(&under_file), SourcePresence::Absent);
+    }
+
+    #[test]
+    fn probe_error_mapping_treats_notfound_as_absent() {
+        assert_eq!(
+            presence_from_probe_error(ErrorKind::NotFound),
+            SourcePresence::Absent
+        );
+    }
+
+    #[test]
+    fn probe_error_mapping_treats_transient_errors_as_indeterminate() {
+        // Permission/IO faults on a flaky or unmounted network mount must never be
+        // read as deletion.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                presence_from_probe_error(kind),
+                SourcePresence::Indeterminate,
+                "{kind:?} must be indeterminate, not treated as deletion"
+            );
+        }
+    }
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<OsString>)>,

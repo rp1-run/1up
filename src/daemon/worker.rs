@@ -27,7 +27,9 @@ use crate::shared::constants::{
     STALE_REBUILD_REASON, VERSION, WATCHER_DEBOUNCE_MS,
 };
 use crate::shared::errors::OneupError;
-use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
+use crate::shared::fs::{
+    atomic_replace, ensure_secure_project_root, probe_source_presence, SourcePresence,
+};
 use crate::shared::project::canonical_project_root;
 use crate::shared::types::WorktreeContext;
 use crate::shared::types::{
@@ -131,6 +133,29 @@ struct QueuedSearchRequest {
 
 type ProjectStates = HashMap<String, ProjectState>;
 
+/// Outcome of building one registry entry's in-memory daemon state.
+enum ProjectStateBuild {
+    /// The project is loadable now: insert it, watch it, and queue its startup
+    /// reconciliation.
+    Ready(Box<ProjectState>),
+    /// The project is definitely unusable (absent root/source, or a schema that
+    /// needs a clean rebuild): drop it until the next registry reload.
+    Skip,
+    /// A presence probe could not decide (transient failure, e.g. an
+    /// unreachable network mount): the entry must be retained in
+    /// [`DeferredProjects`] and re-probed on the daemon's normal cycle, so
+    /// recovery never depends on SIGHUP, a daemon restart, or an unrelated
+    /// watcher event.
+    Defer,
+}
+
+/// Registered projects whose load-time presence probe was indeterminate, keyed
+/// by context id. Retried by [`retry_deferred_projects`] on every debounce
+/// tick, and rebuilt from the fresh registry on SIGHUP reload. A deferred
+/// project counts as registered for idle-shutdown accounting so a temporarily
+/// unreachable source can never cause the daemon to reap itself.
+type DeferredProjects = HashMap<String, ProjectEntry>;
+
 /// Idle-shutdown grace as a `Duration`, honouring the runtime override
 /// [`DAEMON_IDLE_SHUTDOWN_ENV_VAR`] and otherwise [`DAEMON_IDLE_SHUTDOWN_SECS`].
 fn daemon_idle_shutdown_timeout() -> std::time::Duration {
@@ -196,7 +221,8 @@ async fn run_inner() -> Result<(), OneupError> {
         }
     };
 
-    load_and_watch_projects(&mut file_watcher, &mut projects).await?;
+    let mut deferred: DeferredProjects = HashMap::new();
+    load_and_watch_projects(&mut file_watcher, &mut projects, &mut deferred).await?;
     prewarm_project_embedders(&mut projects);
     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
     run_dirty_projects_until_clean_or_cancelled(
@@ -215,9 +241,11 @@ async fn run_inner() -> Result<(), OneupError> {
     // behind by `1up stop` (last project deregistered) or orphaned by a
     // crashed/ended parent does not accumulate. Registration precedes daemon
     // spawn, so a fresh daemon loads a non-empty registry and never idles out
-    // at startup.
+    // at startup. A deferred (indeterminate-probe) project still counts as
+    // registered, so a temporarily unreachable source never idles the daemon
+    // out from under the project it must keep retrying.
     let mut empty_since: Option<std::time::Instant> =
-        projects.is_empty().then(std::time::Instant::now);
+        (projects.is_empty() && deferred.is_empty()).then(std::time::Instant::now);
 
     while !cancel_token.is_cancelled() {
         tokio::select! {
@@ -262,7 +290,7 @@ async fn run_inner() -> Result<(), OneupError> {
             }
             _ = sighup.recv() => {
                 info!("received SIGHUP, reloading project registry");
-                if let Err(e) = reload_projects(&mut file_watcher, &mut projects).await {
+                if let Err(e) = reload_projects(&mut file_watcher, &mut projects, &mut deferred).await {
                     error!("failed to reload projects: {e}");
                 } else {
                     record_file_check_for_all_projects(&mut projects, Utc::now(), true);
@@ -284,7 +312,11 @@ async fn run_inner() -> Result<(), OneupError> {
                 break;
             }
             _ = tokio::time::sleep(debounce) => {
-                let is_empty = projects.is_empty();
+                // Re-probe deferred (indeterminate at load time) projects first,
+                // so one that just recovered is loaded, watched, and marked dirty
+                // before this tick's dirty sweep runs.
+                retry_deferred_projects(&mut file_watcher, &mut projects, &mut deferred).await;
+                let is_empty = projects.is_empty() && deferred.is_empty();
                 let empty_for = if is_empty {
                     Some(empty_since.get_or_insert_with(std::time::Instant::now).elapsed())
                 } else {
@@ -493,6 +525,7 @@ fn log_search_embedding_status(
 async fn load_and_watch_projects(
     watcher: &mut FileWatcher,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
 ) -> Result<(), OneupError> {
     let registry = Registry::load()?;
 
@@ -509,25 +542,94 @@ async fn load_and_watch_projects(
     let registry = Registry::load().unwrap_or(registry);
 
     for entry in &registry.projects {
-        let Some(mut state) = build_project_state(entry).await? else {
-            continue;
-        };
-
-        let source_root = state.source_root.clone();
-        mark_startup_reconciliation_pending(&mut state);
-        watcher.watch(&source_root)?;
-        let context_id = state.context.context_id.clone();
-        projects.insert(context_id.clone(), state);
-
-        info!(
-            "watching project: {} (context {}, source {})",
-            entry.project_root.display(),
-            context_id,
-            source_root.display()
-        );
+        load_registered_project(entry, watcher, projects, deferred).await?;
     }
 
     Ok(())
+}
+
+/// Build, watch, and insert one registry entry's project state, or record the
+/// entry for a later retry.
+///
+/// A `Defer` outcome (indeterminate presence probe) keeps the entry in
+/// `deferred` — warning on the first deferral, debug thereafter — so
+/// [`retry_deferred_projects`] re-probes it on the daemon's normal cycle
+/// instead of dropping it until SIGHUP. A `Skip` outcome is a *definite*
+/// decision, so any deferred record is cleared.
+async fn load_registered_project(
+    entry: &ProjectEntry,
+    watcher: &mut FileWatcher,
+    projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
+) -> Result<(), OneupError> {
+    match build_project_state(entry).await? {
+        ProjectStateBuild::Ready(state) => {
+            let mut state = *state;
+            let source_root = state.source_root.clone();
+            mark_startup_reconciliation_pending(&mut state);
+            watcher.watch(&source_root)?;
+            let context_id = state.context.context_id.clone();
+            projects.insert(context_id.clone(), state);
+            deferred.remove(&context_id);
+
+            info!(
+                "watching project: {} (context {}, source {})",
+                entry.project_root.display(),
+                context_id,
+                source_root.display()
+            );
+        }
+        ProjectStateBuild::Skip => {
+            deferred.remove(&entry.context_id());
+        }
+        ProjectStateBuild::Defer => {
+            let context_id = entry.context_id();
+            let newly_deferred = deferred.insert(context_id.clone(), entry.clone()).is_none();
+            if newly_deferred {
+                warn!(
+                    "deferring project {} (context {}): presence probe indeterminate (transient failure); retrying on the daemon's normal cycle",
+                    entry.project_root.display(),
+                    context_id
+                );
+            } else {
+                debug!(
+                    "project {} (context {}) still deferred: presence probe indeterminate",
+                    entry.project_root.display(),
+                    context_id
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-probe registered projects whose load-time presence probe was
+/// indeterminate. Called on every debounce tick so a project on a temporarily
+/// unreachable source (e.g. a flaky network mount) is loaded, watched, and
+/// queued for reconciliation as soon as its probe recovers — recovery must
+/// never depend on SIGHUP, a daemon restart, or an unrelated watcher event.
+/// Best-effort: a load/watch failure keeps the entry deferred for the next
+/// tick, since a fault while the source is flapping is exactly the transient
+/// case being retried.
+async fn retry_deferred_projects(
+    watcher: &mut FileWatcher,
+    projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
+) {
+    if deferred.is_empty() {
+        return;
+    }
+
+    let entries: Vec<ProjectEntry> = deferred.values().cloned().collect();
+    for entry in entries {
+        if let Err(e) = load_registered_project(&entry, watcher, projects, deferred).await {
+            debug!(
+                "retry of deferred project {} failed; keeping it deferred: {e}",
+                entry.project_root.display()
+            );
+        }
+    }
 }
 
 /// Prewarm every loaded project's embedding runtime immediately after
@@ -580,25 +682,49 @@ fn prewarm_project_embedders(projects: &mut ProjectStates) {
     }
 }
 
-/// Select the recorded contexts whose source worktree directory no longer exists.
+/// The result of classifying recorded contexts by whether their source worktree
+/// directory is still present, using a three-state probe.
 ///
-/// Pure and injected with `source_exists` so it is deterministic and
-/// unit-testable (the daemon passes `|p| p.exists()`). This mirrors the
-/// source-missing arm of `cli::gc::prune_reason`, but deliberately selects on
-/// *source-root absence alone*: unlike `1up gc`, the daemon's startup prune never
+/// `to_prune` holds the contexts whose source is *definitely absent* and are
+/// therefore eligible for deletion. `indeterminate` holds contexts whose source
+/// probe could not decide (a transient/mount failure): they are **retained** this
+/// cycle and surfaced so the caller can `warn!` about the skipped prune rather
+/// than destructively deleting a live-but-unreachable source's rows.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SourceMissingSelection {
+    pub to_prune: Vec<String>,
+    pub indeterminate: Vec<String>,
+}
+
+/// Classify the recorded contexts by source-root presence for a startup prune.
+///
+/// Pure and injected with `probe` so it is deterministic and unit-testable (the
+/// daemon passes [`crate::shared::fs::probe_source_presence`]). Only sources that
+/// are *definitely absent* ([`SourcePresence::Absent`]) are selected for pruning;
+/// a source whose probe is [`SourcePresence::Indeterminate`] (a permission/IO
+/// fault on a flaky or unmounted network mount) is retained and reported
+/// separately so a transient failure never false-prunes a live source's index
+/// rows. A [`SourcePresence::Present`] source is always retained.
+///
+/// Like the source-missing arm of `cli::gc::prune_reason`, this deliberately
+/// selects on *source-root absence alone*: the daemon's startup prune never
 /// touches stale-branch snapshots of a still-present worktree — those rebuild on
 /// demand and stay a manual decision. A context whose `source_root` still exists
 /// is therefore always retained, including a same-`state_root`, other-branch
 /// snapshot that shares a live worktree.
-pub fn source_missing_context_ids(
+pub fn classify_source_missing_contexts(
     contexts: &[IndexedContextRow],
-    source_exists: &dyn Fn(&Path) -> bool,
-) -> Vec<String> {
-    contexts
-        .iter()
-        .filter(|ctx| !source_exists(&ctx.source_root))
-        .map(|ctx| ctx.context_id.clone())
-        .collect()
+    probe: &dyn Fn(&Path) -> SourcePresence,
+) -> SourceMissingSelection {
+    let mut selection = SourceMissingSelection::default();
+    for ctx in contexts {
+        match probe(&ctx.source_root) {
+            SourcePresence::Present => {}
+            SourcePresence::Absent => selection.to_prune.push(ctx.context_id.clone()),
+            SourcePresence::Indeterminate => selection.indeterminate.push(ctx.context_id.clone()),
+        }
+    }
+    selection
 }
 
 /// Best-effort startup prune of contexts whose source worktree directory has been
@@ -606,7 +732,7 @@ pub fn source_missing_context_ids(
 /// in the shared index until a manual `1up gc`.
 ///
 /// Scope is deliberately the *source-missing* subset only (via
-/// [`source_missing_context_ids`]) — never stale-branch snapshots of a live
+/// [`classify_source_missing_contexts`]) — never stale-branch snapshots of a live
 /// worktree, which stay a manual decision. The safety boundaries are all enforced
 /// here: the single-writer rebuild lock is taken **non-blocking** per index DB (a
 /// contended or un-openable DB is skipped this cycle, never waited on), **no
@@ -671,7 +797,11 @@ async fn prune_source_missing_contexts_on_startup(registry: &Registry) {
 /// caller's startup path is never broken.
 async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<String> {
     let db_path = config::project_db_path(state_root);
-    // A registered entry without an on-disk index yet has nothing to prune.
+    // A registered entry without an on-disk index yet has nothing to prune. A
+    // boolean `exists()` is deliberate here: a transient false-negative only skips
+    // this DB's prune for one cycle (non-destructive), so the three-state probe —
+    // reserved for decisions that delete rows or change registration — is not
+    // needed.
     if !db_path.exists() {
         return Vec::new();
     }
@@ -704,11 +834,20 @@ async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<
         let db = Db::open_rw(&db_path).await?;
         let conn = db.connect_tuned().await?;
         let contexts = segments::list_worktree_contexts(&conn).await?;
-        let pruned = source_missing_context_ids(&contexts, &|p: &Path| p.exists());
-        for context_id in &pruned {
+        let selection =
+            classify_source_missing_contexts(&contexts, &|p: &Path| probe_source_presence(p));
+        if !selection.indeterminate.is_empty() {
+            warn!(
+                "retaining {} context(s) with indeterminate source presence (transient probe failure, e.g. an unreachable network mount) at {}: {}",
+                selection.indeterminate.len(),
+                db_path.display(),
+                selection.indeterminate.join(", ")
+            );
+        }
+        for context_id in &selection.to_prune {
             segments::delete_context(&conn, context_id).await?;
         }
-        Ok::<_, OneupError>(pruned)
+        Ok::<_, OneupError>(selection.to_prune)
     }
     .await;
 
@@ -727,8 +866,14 @@ async fn prune_source_missing_contexts_for_state_root(state_root: &Path) -> Vec<
 async fn reload_projects(
     watcher: &mut FileWatcher,
     projects: &mut ProjectStates,
+    deferred: &mut DeferredProjects,
 ) -> Result<(), OneupError> {
     let registry = Registry::load()?;
+    // The fresh registry supersedes the deferred snapshot: entries that were
+    // deregistered must stop being retried, and entries that are still
+    // registered (and still indeterminate) re-enter the deferred set through
+    // `load_registered_project` below.
+    deferred.clear();
     let registered_contexts: HashSet<String> = registry
         .projects
         .iter()
@@ -794,22 +939,7 @@ async fn reload_projects(
             continue;
         }
 
-        let Some(mut state) = build_project_state(entry).await? else {
-            continue;
-        };
-
-        let entry_source_root = state.source_root.clone();
-        let context_id = state.context.context_id.clone();
-        mark_startup_reconciliation_pending(&mut state);
-        watcher.watch(&entry_source_root)?;
-        projects.insert(context_id.clone(), state);
-
-        info!(
-            "now watching project: {} (context {}, source {})",
-            entry.project_root.display(),
-            context_id,
-            entry_source_root.display()
-        );
+        load_registered_project(entry, watcher, projects, deferred).await?;
     }
 
     Ok(())
@@ -823,23 +953,52 @@ fn mark_startup_reconciliation_pending(state: &mut ProjectState) {
     );
 }
 
-async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState>, OneupError> {
-    if !entry.project_root.exists() {
-        warn!(
-            "skipping non-existent project: {}",
-            entry.project_root.display()
-        );
-        return Ok(None);
+async fn build_project_state(entry: &ProjectEntry) -> Result<ProjectStateBuild, OneupError> {
+    match probe_source_presence(&entry.project_root) {
+        SourcePresence::Present => {}
+        SourcePresence::Absent => {
+            warn!(
+                "skipping non-existent project: {}",
+                entry.project_root.display()
+            );
+            return Ok(ProjectStateBuild::Skip);
+        }
+        SourcePresence::Indeterminate => {
+            // A transient probe failure on the state root: defer without
+            // recording anything, so a flaky mount is never mistaken for
+            // deletion; the caller retains the entry and re-probes it on the
+            // daemon's normal cycle.
+            debug!(
+                "deferring project {}: state root presence is indeterminate (transient probe failure)",
+                entry.project_root.display()
+            );
+            return Ok(ProjectStateBuild::Defer);
+        }
     }
     let source_root = entry.source_root().to_path_buf();
-    if !source_root.exists() {
-        warn!(
-            "skipping project {} because source root is missing: {}",
-            entry.project_root.display(),
-            source_root.display()
-        );
-        persist_source_missing_context_status(entry);
-        return Ok(None);
+    match probe_source_presence(&source_root) {
+        SourcePresence::Present => {}
+        SourcePresence::Absent => {
+            warn!(
+                "skipping project {} because source root is missing: {}",
+                entry.project_root.display(),
+                source_root.display()
+            );
+            persist_source_missing_context_status(entry);
+            return Ok(ProjectStateBuild::Skip);
+        }
+        SourcePresence::Indeterminate => {
+            // Do NOT persist source-missing status on a transient probe failure: an
+            // unreachable/unmounted network source must not be recorded as deleted.
+            // Defer so the caller retains the entry and re-probes it once the
+            // source is reachable again.
+            debug!(
+                "deferring project {}: source root presence is indeterminate (transient probe failure): {}",
+                entry.project_root.display(),
+                source_root.display()
+            );
+            return Ok(ProjectStateBuild::Defer);
+        }
     }
 
     let db_path = config::project_db_path(&entry.project_root);
@@ -850,14 +1009,14 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
             "skipping project {} until a clean rebuild succeeds: {e}",
             entry.project_root.display()
         );
-        return Ok(None);
+        return Ok(ProjectStateBuild::Skip);
     }
     // Record the inode the handle now refers to so a later build-aside swap (a
     // one-shot rebuild atomically renaming a fresh index over `index.db`) is
     // detectable and the handle gets reopened before it writes.
     let index_identity = index_file_identity(&db_path);
 
-    Ok(Some(ProjectState {
+    Ok(ProjectStateBuild::Ready(Box::new(ProjectState {
         project_root: entry.project_root.clone(),
         source_root,
         context: context_from_entry(entry),
@@ -874,7 +1033,7 @@ async fn build_project_state(entry: &ProjectEntry) -> Result<Option<ProjectState
         last_refresh_completed_at: None,
         last_refresh_error: None,
         last_file_check_persisted_at: None,
-    }))
+    })))
 }
 
 /// On-disk `(device, inode)` identity of an `index.db` file, or `None` when the
@@ -1407,13 +1566,16 @@ async fn run_dirty_projects_until_clean(
                     &e,
                     OneupError::Daemon(
                         crate::shared::errors::DaemonError::RebuildLockContended { .. }
+                            | crate::shared::errors::DaemonError::SourceProbeIndeterminate { .. }
                     )
                 ) {
-                    // The pass deferred to a competing one-shot rebuild and left
-                    // the project dirty. Return to the select loop instead of
-                    // immediately re-selecting the same key (which would
-                    // busy-spin on the held lock); the next debounce tick or
-                    // file event retries once the other writer releases it.
+                    // The pass deferred — either to a competing one-shot rebuild
+                    // or because the source presence probe was indeterminate —
+                    // and left the project dirty with its queued scope intact.
+                    // Return to the select loop instead of immediately
+                    // re-selecting the same key (which would busy-spin on the
+                    // held lock or the unreachable source); the next debounce
+                    // tick or file event retries once the condition clears.
                     debug!("deferring re-index sweep for context {key}: {e}");
                     break;
                 }
@@ -1713,21 +1875,51 @@ async fn run_project(
     // its event loop while a one-shot rebuild holds the lock. The guard releases
     // on drop — including when an in-flight pass is cancelled and this frame
     // unwinds — freeing the lock for the restarted binary.
-    let (lock_root, source_missing) = {
+    let (lock_root, source_root, source_presence) = {
         let state = projects
             .get(context_id)
             .expect("dirty project must exist while running");
-        (state.project_root.clone(), !state.source_root.exists())
+        (
+            state.project_root.clone(),
+            state.source_root.clone(),
+            probe_source_presence(&state.source_root),
+        )
     };
     // Detect a deleted source root BEFORE attempting the rebuild lock.
     // For a *linked* worktree the state_root (main repo, owns `.1up/`) can survive
     // while the source_root (the worktree) is deleted, so the lock — which is keyed
     // on state_root — would still acquire and the deleted-source cleanup below
-    // would never run, leaving the daemon refreshing a gone worktree. Statting
+    // would never run, leaving the daemon refreshing a gone worktree. Probing
     // source_root independently covers both the main-repo case (state_root ==
     // source_root) and the linked-worktree split.
-    if source_missing {
-        return deregister_deleted_project(context_id, projects, watcher, &lock_root);
+    //
+    // Only a *definitely-absent* source deregisters: a transient/indeterminate
+    // probe (an unreachable network mount) must never trigger destructive
+    // deregistration. An indeterminate probe also must not *attempt* the pass:
+    // `start_run` below clears `dirty` and consumes the queued scope, and an
+    // ordinary pass failure does not restore them, so proceeding would spend
+    // the only pending refresh on a source that is not readable right now.
+    // Defer instead — return before the lock and before `start_run`, leaving
+    // the project dirty with its scope intact so the next debounce tick
+    // re-probes and retries (the same deferral shape as a contended rebuild
+    // lock below).
+    match source_presence {
+        SourcePresence::Absent => {
+            return deregister_deleted_project(context_id, projects, watcher, &lock_root);
+        }
+        SourcePresence::Indeterminate => {
+            debug!(
+                "source presence indeterminate for {} (transient probe failure); deferring re-index and keeping the pending scope queued",
+                source_root.display()
+            );
+            return Err(
+                crate::shared::errors::DaemonError::SourceProbeIndeterminate {
+                    source_root: source_root.display().to_string(),
+                }
+                .into(),
+            );
+        }
+        SourcePresence::Present => {}
     }
     let _rebuild_lock = match lifecycle::try_acquire_rebuild_lock(&lock_root) {
         Ok(Some(lock)) => lock,
@@ -1744,9 +1936,10 @@ async fn run_project(
         Err(e) => {
             // The source root existed at the top of this pass; a lock error here is
             // a genuine lock/IO fault, or a race where the root vanished mid-pass.
-            // Re-check once for that race and clean up, otherwise propagate.
+            // Re-check once for that race and clean up only on a *definite* absence
+            // (a transient probe failure must not deregister), otherwise propagate.
             let state = projects.get(context_id).expect("dirty project must exist");
-            if !state.source_root.exists() {
+            if probe_source_presence(&state.source_root) == SourcePresence::Absent {
                 return deregister_deleted_project(context_id, projects, watcher, &lock_root);
             }
             return Err(e);
@@ -3038,6 +3231,253 @@ mod tests {
         );
     }
 
+    /// Create a self-referencing symlink at `dir/indeterminate-src`.
+    /// `fs::metadata` follows it into `ELOOP`, which maps to neither `NotFound`
+    /// nor `NotADirectory`, so the presence probe reports `Indeterminate`
+    /// deterministically — on every Unix host and independent of uid (unlike a
+    /// permission-denied setup, which root bypasses).
+    fn indeterminate_source_path(dir: &Path) -> PathBuf {
+        let path = dir.join("indeterminate-src");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert_eq!(
+            probe_source_presence(&path),
+            SourcePresence::Indeterminate,
+            "a self-referencing symlink must probe as indeterminate"
+        );
+        path
+    }
+
+    /// A dirty project whose state root (and DB) are healthy but whose source
+    /// root probes `Indeterminate`, queued with a paths scope so the tests can
+    /// prove the scope survives a deferred pass un-consumed.
+    async fn indeterminate_source_project(
+        tmp: &tempfile::TempDir,
+    ) -> (ProjectStates, String, RunScope) {
+        let main_root = tmp.path().canonicalize().unwrap();
+        let db_path = config::project_db_path(&main_root);
+        ensure_secure_project_root(&main_root).unwrap();
+        let db = Db::open_rw(&db_path).await.unwrap();
+        schema::initialize(&db.connect_tuned().await.unwrap())
+            .await
+            .unwrap();
+
+        let source_root = indeterminate_source_path(&main_root);
+        let pending = RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap();
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(
+                &main_root,
+                &source_root,
+                db,
+                ProjectRunState {
+                    running: false,
+                    dirty: true,
+                    pending_scope: Some(pending.clone()),
+                    pending_fallback_reason: None,
+                },
+            ),
+        );
+        (projects, key, pending)
+    }
+
+    #[tokio::test]
+    async fn run_project_defers_indeterminate_source_and_preserves_pending_scope() {
+        // Regression (PR #120 review): the indeterminate branch used to fall
+        // through to `start_run`, which cleared `dirty` and consumed the only
+        // pending scope; the pass then failed without restoring either, so the
+        // refresh was silently lost until an unrelated event re-marked the
+        // project. A deferred pass must leave the retry state fully intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut projects, key, pending) = indeterminate_source_project(&tmp).await;
+
+        let cancel_token = CancellationToken::new();
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let result = run_project(
+            &key,
+            &mut projects,
+            &cancel_token,
+            &mut search_requests_rx,
+            &mut watcher,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(OneupError::Daemon(
+                    crate::shared::errors::DaemonError::SourceProbeIndeterminate { .. }
+                ))
+            ),
+            "an indeterminate source probe must defer the pass, got: {result:?}"
+        );
+        assert!(
+            projects.contains_key(&key),
+            "an indeterminate source must never deregister the project"
+        );
+        let run_state = &projects.get(&key).unwrap().run_state;
+        assert!(!run_state.running, "no run may be left in flight");
+        assert!(
+            run_state.dirty,
+            "the project must stay dirty so the next debounce tick retries"
+        );
+        assert_eq!(
+            run_state.pending_scope,
+            Some(pending),
+            "the queued scope must survive the deferred pass un-consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_sweep_defers_indeterminate_source_without_busy_spinning() {
+        // The sweep must treat the deferral like a contended rebuild lock:
+        // return to the select loop (this call terminating at all proves it did
+        // not re-select the still-dirty project forever) while `dirty` and the
+        // queued scope stay intact for the next tick's retry.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut projects, key, pending) = indeterminate_source_project(&tmp).await;
+
+        let cancel_token = CancellationToken::new();
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        run_dirty_projects_until_clean(
+            &mut watcher,
+            &mut projects,
+            &cancel_token,
+            &mut search_requests_rx,
+        )
+        .await;
+
+        let run_state = &projects.get(&key).unwrap().run_state;
+        assert!(
+            run_state.dirty,
+            "the deferred project must remain dirty after the sweep returns"
+        );
+        assert_eq!(
+            run_state.pending_scope,
+            Some(pending),
+            "the queued scope must remain queued after the sweep returns"
+        );
+    }
+
+    fn test_entry(project_root: &Path, source_root: Option<&Path>) -> ProjectEntry {
+        ProjectEntry {
+            project_id: "test-project".to_string(),
+            project_root: project_root.to_path_buf(),
+            source_root: source_root.map(Path::to_path_buf),
+            context_id: Some(format!(
+                "test-entry-{}",
+                project_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("root")
+            )),
+            main_worktree_root: None,
+            worktree_role: None,
+            branch_name: Some("main".to_string()),
+            branch_ref: None,
+            branch_status: None,
+            head_oid: None,
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            indexing: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_project_state_defers_indeterminate_probes_and_skips_definite_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project_root = root.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let loop_path = indeterminate_source_path(&root);
+
+        // Indeterminate source root: defer (retain for retry), never skip.
+        let entry = test_entry(&project_root, Some(&loop_path));
+        assert!(
+            matches!(
+                build_project_state(&entry).await.unwrap(),
+                ProjectStateBuild::Defer
+            ),
+            "an indeterminate source-root probe must defer, not drop, the entry"
+        );
+
+        // Indeterminate state root: same deferral.
+        let entry = test_entry(&loop_path, None);
+        assert!(
+            matches!(
+                build_project_state(&entry).await.unwrap(),
+                ProjectStateBuild::Defer
+            ),
+            "an indeterminate state-root probe must defer, not drop, the entry"
+        );
+
+        // A definitely-absent source root still skips (dropped until reload).
+        let entry = test_entry(&project_root, Some(&root.join("definitely-missing")));
+        assert!(
+            matches!(
+                build_project_state(&entry).await.unwrap(),
+                ProjectStateBuild::Skip
+            ),
+            "a definitely-absent source root must skip, exactly as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_deferred_projects_loads_and_watches_once_the_probe_recovers() {
+        // Regression (PR #120 review): a startup-indeterminate project used to
+        // be dropped (`build_project_state` returned `None`) until a SIGHUP
+        // registry reload or daemon restart. It must instead stay in the
+        // deferred set and be loaded by the daemon's own retry cycle as soon
+        // as the probe recovers.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project_root = root.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        ensure_secure_project_root(&project_root).unwrap();
+        let source_root = indeterminate_source_path(&root);
+
+        let entry = test_entry(&project_root, Some(&source_root));
+        let context_id = entry.context_id();
+        let mut deferred: DeferredProjects = HashMap::from([(context_id.clone(), entry)]);
+        let mut projects: ProjectStates = HashMap::new();
+        let mut watcher = FileWatcher::new().unwrap();
+
+        // Still unreachable: the entry must be retained, neither loaded nor dropped.
+        retry_deferred_projects(&mut watcher, &mut projects, &mut deferred).await;
+        assert!(
+            projects.is_empty(),
+            "an indeterminate probe must not load the project"
+        );
+        assert!(
+            deferred.contains_key(&context_id),
+            "the entry must stay deferred for the next cycle"
+        );
+
+        // The probe recovers: replace the symlink loop with a real directory.
+        std::fs::remove_file(&source_root).unwrap();
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("lib.rs"), "pub fn f() {}\n").unwrap();
+
+        retry_deferred_projects(&mut watcher, &mut projects, &mut deferred).await;
+        assert!(
+            deferred.is_empty(),
+            "a recovered project must leave the deferred set"
+        );
+        let state = projects
+            .get(&context_id)
+            .expect("the recovered project must be loaded without SIGHUP or a daemon restart");
+        assert!(
+            state.run_state.dirty,
+            "the recovered project must be queued for reconciliation"
+        );
+        assert_eq!(state.run_state.pending_scope, Some(RunScope::Full));
+        assert_eq!(
+            state.run_state.pending_fallback_reason.as_deref(),
+            Some(STARTUP_RECONCILIATION_REASON)
+        );
+    }
+
     #[tokio::test]
     async fn handle_search_request_uses_safe_unavailable_reason_for_missing_project() {
         let mut projects = HashMap::new();
@@ -3631,14 +4071,40 @@ mod tests {
     }
 
     #[test]
-    fn source_missing_selects_only_contexts_whose_source_is_gone() {
+    fn source_missing_selects_only_contexts_whose_source_is_absent() {
         let contexts = [
             context_row("live00000001", "/repo", "/repo"),
             context_row("gone00000001", "/repo", "/repo-feature"),
         ];
-        // Only `/repo-feature` is gone; the live `/repo` context is retained.
-        let pruned = source_missing_context_ids(&contexts, &|p| p != Path::new("/repo-feature"));
-        assert_eq!(pruned, vec!["gone00000001".to_string()]);
+        // Only `/repo-feature` is absent; the live `/repo` context is retained.
+        let selection = classify_source_missing_contexts(&contexts, &|p| {
+            if p == Path::new("/repo-feature") {
+                SourcePresence::Absent
+            } else {
+                SourcePresence::Present
+            }
+        });
+        assert_eq!(selection.to_prune, vec!["gone00000001".to_string()]);
+        assert!(selection.indeterminate.is_empty());
+    }
+
+    #[test]
+    fn indeterminate_source_is_retained_not_pruned() {
+        // A transient probe failure (e.g. an unreachable network mount) must never
+        // be treated as deletion: the context is reported as indeterminate and
+        // retained, while a genuinely-absent sibling is still pruned.
+        let contexts = [
+            context_row("flaky0000001", "/repo", "/mnt/nfs/repo"),
+            context_row("gone00000001", "/repo", "/repo-feature"),
+        ];
+        let selection =
+            classify_source_missing_contexts(&contexts, &|p| match p.to_str().unwrap() {
+                "/mnt/nfs/repo" => SourcePresence::Indeterminate,
+                "/repo-feature" => SourcePresence::Absent,
+                _ => SourcePresence::Present,
+            });
+        assert_eq!(selection.to_prune, vec!["gone00000001".to_string()]);
+        assert_eq!(selection.indeterminate, vec!["flaky0000001".to_string()]);
     }
 
     #[test]
@@ -3650,17 +4116,20 @@ mod tests {
             context_row("active000001", "/repo", "/repo"),
             context_row("oldbranch001", "/repo", "/repo"),
         ];
-        assert!(source_missing_context_ids(&contexts, &|_| true).is_empty());
+        let selection = classify_source_missing_contexts(&contexts, &|_| SourcePresence::Present);
+        assert!(selection.to_prune.is_empty());
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[test]
     fn source_missing_on_empty_input_is_empty() {
-        assert!(source_missing_context_ids(&[], &|_| true).is_empty());
-        assert!(source_missing_context_ids(&[], &|_| false).is_empty());
+        let selection = classify_source_missing_contexts(&[], &|_| SourcePresence::Present);
+        assert!(selection.to_prune.is_empty());
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[test]
-    fn source_missing_selects_every_gone_context_and_keeps_the_live_one() {
+    fn source_missing_selects_every_absent_context_and_keeps_the_live_one() {
         let contexts = [
             context_row("gone00000001", "/repo", "/wt-a"),
             context_row("live00000001", "/repo", "/repo"),
@@ -3668,11 +4137,18 @@ mod tests {
         ];
         // Every context whose source is absent is selected, order-preserved; the
         // single live context is the only one retained.
-        let pruned = source_missing_context_ids(&contexts, &|p| p == Path::new("/repo"));
+        let selection = classify_source_missing_contexts(&contexts, &|p| {
+            if p == Path::new("/repo") {
+                SourcePresence::Present
+            } else {
+                SourcePresence::Absent
+            }
+        });
         assert_eq!(
-            pruned,
+            selection.to_prune,
             vec!["gone00000001".to_string(), "gone00000002".to_string()]
         );
+        assert!(selection.indeterminate.is_empty());
     }
 
     #[tokio::test]

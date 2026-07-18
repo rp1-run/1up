@@ -13,6 +13,7 @@ use crate::shared::config;
 use crate::shared::constants::{
     GC_SUPERSEDED_SAME_SOURCE_KEEP_COUNT, GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS,
 };
+use crate::shared::fs::{probe_source_presence, SourcePresence};
 use crate::shared::project::resolve_project_root;
 use crate::shared::types::{OutputFormat, WorktreeContext};
 use crate::storage::db::Db;
@@ -129,11 +130,18 @@ fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Duration)
 }
 
 /// Decide whether one recorded context is prunable relative to `active` (the live
-/// worktree+branch this invocation resolved to). Pure and injected with
-/// `source_exists` and `is_git_root` so it is deterministic and unit-testable.
+/// worktree+branch this invocation resolved to). Pure and injected with the
+/// candidate's resolved `source_presence` and `is_git_root` so it is
+/// deterministic and unit-testable.
 ///
-/// The active context is never prunable. A context is pruned when its source
-/// directory is gone, when it shares the active worktree's roots but not its
+/// A context is pruned when its source directory is *definitely absent*; a source
+/// whose presence is [`SourcePresence::Indeterminate`] (a transient probe failure
+/// on a flaky or unmounted network mount) is always retained so `gc` never
+/// destructively prunes a live-but-unreachable source — re-run once it is
+/// reachable again.
+///
+/// The active context is never prunable. Otherwise a context is pruned when its
+/// source directory is gone, when it shares the active worktree's roots but not its
 /// `context_id` (a stale per-branch snapshot), or when its source is a non-git-root
 /// subdirectory strictly inside the active source (a nested-subdir orphan the
 /// resolution clamp can no longer mint). Contexts belonging to other still-present
@@ -149,14 +157,19 @@ fn prune_reason(
     active: &WorktreeContext,
     candidate: &IndexedContextRow,
     retention: Option<&SupersededSameSourceContext>,
-    source_exists: &dyn Fn(&Path) -> bool,
+    source_presence: SourcePresence,
     is_git_root: &dyn Fn(&Path) -> bool,
 ) -> Option<PruneReason> {
     if candidate.context_id == active.context_id {
         return None;
     }
-    if !source_exists(&candidate.source_root) {
-        return Some(PruneReason::SourceMissing);
+    match source_presence {
+        SourcePresence::Absent => return Some(PruneReason::SourceMissing),
+        // A transient/indeterminate probe (an unreachable network mount) must
+        // never prune: retain the context this cycle and leave any prune to a
+        // re-run once the source is reachable again.
+        SourcePresence::Indeterminate => return None,
+        SourcePresence::Present => {}
     }
     if candidate.state_root == active.state_root && candidate.source_root == active.source_root {
         return Some(PruneReason::StaleBranchSnapshot);
@@ -304,11 +317,19 @@ pub async fn exec(args: GcArgs, format: OutputFormat) -> anyhow::Result<()> {
                         rank_among_same_source: rank,
                         now,
                     });
+            let source_presence = probe_source_presence(&ctx.source_root);
+            if source_presence == SourcePresence::Indeterminate {
+                tracing::warn!(
+                    "gc: retaining context {} — source presence is indeterminate (transient probe failure): {}",
+                    ctx.context_id,
+                    ctx.source_root.display()
+                );
+            }
             if let Some(reason) = prune_reason(
                 &active,
                 ctx,
                 retention.as_ref(),
-                &|p: &Path| p.exists(),
+                source_presence,
                 &is_git_root,
             ) {
                 let segments = segments::count_segments_for_context(&conn, &ctx.context_id).await?;
@@ -629,24 +650,40 @@ mod tests {
         let active = active_context();
         let candidate = row("active000000", "/repo", "/repo");
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|_| {
+                false
+            }),
             None
         );
     }
 
     #[test]
-    fn missing_source_root_is_pruned_even_when_roots_differ() {
+    fn absent_source_root_is_pruned_even_when_roots_differ() {
         let active = active_context();
+        let candidate = row("other0000001", "/gone", "/gone");
+        assert_eq!(
+            prune_reason(&active, &candidate, None, SourcePresence::Absent, &|_| {
+                false
+            },),
+            Some(PruneReason::SourceMissing)
+        );
+    }
+
+    #[test]
+    fn indeterminate_source_is_retained_not_pruned() {
+        let active = active_context();
+        // Same shape as the absent-source case, but the probe could not decide (a
+        // transient mount failure): the candidate must be retained, never pruned.
         let candidate = row("other0000001", "/gone", "/gone");
         assert_eq!(
             prune_reason(
                 &active,
                 &candidate,
                 None,
-                &|p| p != Path::new("/gone"),
+                SourcePresence::Indeterminate,
                 &|_| false,
             ),
-            Some(PruneReason::SourceMissing)
+            None
         );
     }
 
@@ -656,7 +693,9 @@ mod tests {
         // Same roots as the active worktree, different id => an older branch's index.
         let candidate = row("oldbranch001", "/repo", "/repo");
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|_| {
+                false
+            }),
             Some(PruneReason::StaleBranchSnapshot)
         );
     }
@@ -668,7 +707,9 @@ mod tests {
         // active source: not ours to judge.
         let candidate = row("linked000001", "/repo", "/repo-feature");
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|_| {
+                false
+            }),
             None
         );
     }
@@ -680,7 +721,9 @@ mod tests {
         // and not itself a git root.
         let candidate = row("nested000001", "/repo", "/repo/src/search");
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|_| {
+                false
+            }),
             Some(PruneReason::NestedSubdirContext)
         );
     }
@@ -692,7 +735,7 @@ mod tests {
         // carries a `.git` file, so the git-root predicate protects it from the rule.
         let candidate = row("nestedwt0001", "/repo", "/repo/linked-wt");
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|p| p
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|p| p
                 == Path::new("/repo/linked-wt"),),
             None
         );
@@ -725,9 +768,13 @@ mod tests {
                 .with_timezone(&Utc),
         };
         assert_eq!(
-            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                Some(&retention),
+                SourcePresence::Present,
+                &|_| { false }
+            ),
             Some(PruneReason::SupersededSameSource)
         );
     }
@@ -750,9 +797,13 @@ mod tests {
                 .with_timezone(&Utc),
         };
         assert_eq!(
-            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                Some(&retention),
+                SourcePresence::Present,
+                &|_| { false }
+            ),
             None
         );
     }
@@ -776,9 +827,13 @@ mod tests {
                 .with_timezone(&Utc),
         };
         assert_eq!(
-            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                Some(&retention),
+                SourcePresence::Present,
+                &|_| { false }
+            ),
             None
         );
     }
@@ -795,7 +850,9 @@ mod tests {
             "2020-01-01 00:00:00",
         );
         assert_eq!(
-            prune_reason(&active, &candidate, None, &|_| true, &|_| false),
+            prune_reason(&active, &candidate, None, SourcePresence::Present, &|_| {
+                false
+            }),
             None
         );
     }
@@ -820,9 +877,13 @@ mod tests {
                 .with_timezone(&Utc),
         };
         assert_eq!(
-            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                Some(&retention),
+                SourcePresence::Present,
+                &|_| { false }
+            ),
             None
         );
     }
@@ -843,9 +904,13 @@ mod tests {
                 .with_timezone(&Utc),
         };
         assert_eq!(
-            prune_reason(&active, &candidate, Some(&retention), &|_| true, &|_| {
-                false
-            }),
+            prune_reason(
+                &active,
+                &candidate,
+                Some(&retention),
+                SourcePresence::Present,
+                &|_| { false }
+            ),
             Some(PruneReason::StaleBranchSnapshot)
         );
     }

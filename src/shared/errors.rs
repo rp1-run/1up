@@ -145,6 +145,11 @@ pub enum DaemonError {
     )]
     RebuildLockContended { state_root: String },
 
+    #[error(
+        "source presence for {source_root} is indeterminate (transient probe failure); deferring re-index"
+    )]
+    SourceProbeIndeterminate { source_root: String },
+
     #[error("request error: {0}")]
     RequestError(String),
 
