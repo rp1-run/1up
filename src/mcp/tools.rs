@@ -104,36 +104,7 @@ impl OneupMcpServer {
                             Err(err) => return indexed_tool_error(err.to_string()),
                         };
 
-                        let mut next_actions = vec![];
-                        if let Some(launch_subdir) = facts.launch_subdir.as_ref() {
-                            next_actions.push(action(
-                                TOOL_START,
-                                format!("Index the launch subdirectory first: {}", launch_subdir),
-                                Some(json!({
-                                    "mode": "index_if_needed",
-                                    "scope_add": [launch_subdir]
-                                })),
-                            ));
-                        }
-
-                        if let Some(largest_dir) = facts
-                            .per_directory_stats
-                            .first()
-                            .map(|d| d.directory.clone())
-                        {
-                            if next_actions.is_empty()
-                                || facts.launch_subdir.as_deref() != Some(&largest_dir)
-                            {
-                                next_actions.push(action(
-                                    TOOL_START,
-                                    format!("Or index the largest directory: {}", largest_dir),
-                                    Some(json!({
-                                        "mode": "index_if_needed",
-                                        "scope_add": [largest_dir]
-                                    })),
-                                ));
-                            }
-                        }
+                        let next_actions = facts_next_actions(&facts);
 
                         let env = envelope(
                             "refuse_and_propose_scope",
@@ -1634,6 +1605,43 @@ fn envelope(
     }
 }
 
+/// Builds the facts-envelope `next_actions` for a large-monorepo scope refusal.
+///
+/// Keeps the `launch_subdir` action first when present, then emits the top-N
+/// ranked `scope_add` actions from the same source of truth as
+/// `facts.suggestions` (`ops::ranked_scope_suggestions`). Reasons are coherent
+/// standalone imperatives — the first is a primary imperative unless a
+/// `launch_subdir` action precedes it, in which case every scope suggestion
+/// reads as an alternative so none is a dangling primary and none begins with
+/// "Or ". The envelope shape stays additive: only `next_actions` grows.
+fn facts_next_actions(facts: &crate::mcp::types::FactsEnvelope) -> Vec<NextAction> {
+    let mut next_actions = Vec::new();
+
+    if let Some(launch_subdir) = facts.launch_subdir.as_ref() {
+        next_actions.push(action(
+            TOOL_START,
+            format!("Index the launch subdirectory first: {}", launch_subdir),
+            Some(json!({
+                "mode": "index_if_needed",
+                "scope_add": [launch_subdir]
+            })),
+        ));
+    }
+
+    for suggestion in ops::ranked_scope_suggestions(facts) {
+        next_actions.push(action(
+            TOOL_START,
+            suggestion.reason,
+            Some(json!({
+                "mode": "index_if_needed",
+                "scope_add": [suggestion.directory]
+            })),
+        ));
+    }
+
+    next_actions
+}
+
 fn action(tool: &str, reason: impl Into<String>, arguments: Option<Value>) -> NextAction {
     debug_assert!(
         RETAINED_PUBLIC_TOOLS.contains(&tool),
@@ -2700,6 +2708,121 @@ mod tests {
             get.arguments,
             Some(json!({ "handles": [":only"] })),
             "a single result recommends exactly that one handle"
+        );
+    }
+
+    fn facts_fixture(
+        launch_subdir: Option<&str>,
+        directories: &[&str],
+    ) -> crate::mcp::types::FactsEnvelope {
+        use crate::mcp::types::{DirectoryStats, FactsEnvelope};
+
+        let per_directory_stats = directories
+            .iter()
+            .enumerate()
+            .map(|(idx, directory)| DirectoryStats {
+                directory: directory.to_string(),
+                file_count: 100 - idx * 10,
+                estimated_vectors: (100 - idx * 10) * 10,
+            })
+            .collect();
+
+        FactsEnvelope {
+            per_directory_stats,
+            workspace_manifests: vec![],
+            sparse_checkout: None,
+            launch_subdir: launch_subdir.map(|s| s.to_string()),
+            suggestions: vec![],
+            file_count_total: 5000,
+            vector_estimate_total: 50000,
+            vector_estimate_basis: None,
+            vector_estimate_low: None,
+            vector_estimate_high: None,
+        }
+    }
+
+    fn scope_add_dirs(action: &NextAction) -> Vec<String> {
+        action.arguments.as_ref().unwrap()["scope_add"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn facts_next_actions_repo_root_emits_multiple_actions_without_dangling_or() {
+        // Repo-root path (no launch_subdir): first action is a primary
+        // imperative, followed by ranked alternatives. Multiple actions, all
+        // carrying scope_add, none beginning with "Or ".
+        let facts = facts_fixture(None, &["services", "libs", "tools"]);
+
+        let actions = facts_next_actions(&facts);
+
+        assert!(
+            actions.len() >= 2,
+            "repo-root facts must emit multiple ranked actions; got {}",
+            actions.len()
+        );
+        for action in &actions {
+            assert_eq!(action.tool, TOOL_START);
+            assert!(
+                !action.reason.starts_with("Or "),
+                "no next_action reason may begin with 'Or '; got {:?}",
+                action.reason
+            );
+            assert!(
+                !scope_add_dirs(action).is_empty(),
+                "every scope action must carry a scope_add directory"
+            );
+        }
+        assert_eq!(actions[0].reason, "Index the largest directory: services");
+        assert_eq!(scope_add_dirs(&actions[0]), vec!["services".to_string()]);
+    }
+
+    #[test]
+    fn facts_next_actions_launch_subdir_first_then_alternatives_without_dangling_or() {
+        // launch_subdir path: the launch action is first, then ranked scope
+        // alternatives (the launch directory is skipped). Multiple actions, all
+        // carrying scope_add, none beginning with "Or ".
+        let facts = facts_fixture(Some("services"), &["services", "libs", "tools"]);
+
+        let actions = facts_next_actions(&facts);
+
+        assert!(
+            actions.len() >= 2,
+            "launch_subdir facts must emit multiple actions; got {}",
+            actions.len()
+        );
+        assert_eq!(
+            actions[0].reason,
+            "Index the launch subdirectory first: services"
+        );
+        assert_eq!(scope_add_dirs(&actions[0]), vec!["services".to_string()]);
+
+        for action in &actions {
+            assert_eq!(action.tool, TOOL_START);
+            assert!(
+                !action.reason.starts_with("Or "),
+                "no next_action reason may begin with 'Or '; got {:?}",
+                action.reason
+            );
+            assert!(
+                !scope_add_dirs(action).is_empty(),
+                "every scope action must carry a scope_add directory"
+            );
+        }
+
+        // The launch directory is not re-suggested as a scope alternative.
+        let scope_dirs: Vec<String> = actions[1..].iter().flat_map(scope_add_dirs).collect();
+        assert!(
+            !scope_dirs.contains(&"services".to_string()),
+            "launch_subdir must not be duplicated as a scope alternative; got {:?}",
+            scope_dirs
+        );
+        assert_eq!(
+            actions[1].reason,
+            "Alternatively, index the 2nd largest directory: libs"
         );
     }
 }
