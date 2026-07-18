@@ -12,7 +12,6 @@ use clap::Args;
 use nix::errno::Errno;
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
-use sha2::{Digest, Sha256};
 
 use crate::cli::output::{
     formatter_for, Formatter, ProjectListIndexStatus, StartResultInfo, StartStatus,
@@ -26,6 +25,9 @@ use crate::shared::config;
 use crate::shared::constants;
 #[cfg(unix)]
 use crate::shared::fs::{ensure_secure_xdg_root, validate_regular_file_path};
+#[cfg(unix)]
+use crate::shared::lock_reap::flock_still_names_path;
+use crate::shared::lock_reap::{lock_file_name, project_lock_key};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::project;
 use crate::shared::types::{IndexingConfig, OutputFormat, SetupTimings, WorktreeContext};
@@ -391,14 +393,55 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn acquire_project_startup_guard(project_root: &Path) -> anyhow::Result<StartupGuardAcquire> {
     let xdg_root = ensure_secure_xdg_root()?;
-    let lock_path = startup_lock_path(&xdg_root, project_root);
-    let validated_path = validate_regular_file_path(&lock_path, &xdg_root)?;
+    // Opportunistic, best-effort sweep of abandoned per-project lock files. Like
+    // the MCP path, this is a natural integration point: the XDG root is already
+    // resolved and about to gain another lock file, and `1up start`/daemon start
+    // is a process boundary where a bounded sweep is acceptable. Never errors,
+    // never meaningfully delays startup.
+    crate::shared::lock_reap::reap_stale_locks(&xdg_root);
+    acquire_project_startup_guard_in(&xdg_root, project_root)
+}
+
+/// Acquisition core, split from [`acquire_project_startup_guard`] so tests can
+/// drive it against an isolated root instead of the real XDG data dir.
+///
+/// A successful flock is not sufficient on its own: a concurrent stale-lock
+/// reaper may unlink the guard file between our open and our flock, leaving us
+/// holding an orphaned inode that excludes nobody — a concurrent `1up start`
+/// could then create and lock a fresh file at the same pathname. After every
+/// successful flock we therefore verify the pathname still names the locked
+/// inode and, if not, drop the orphan, reopen, and retry, bounded by
+/// [`constants::LOCK_ACQUIRE_IDENTITY_RETRIES`] (independent of the busy-wait
+/// deadline, which keeps governing the contended case).
+#[cfg(unix)]
+fn acquire_project_startup_guard_in(
+    xdg_root: &Path,
+    project_root: &Path,
+) -> anyhow::Result<StartupGuardAcquire> {
+    let lock_path = startup_lock_path(xdg_root, project_root);
+    let validated_path = validate_regular_file_path(&lock_path, xdg_root)?;
     let mut file = open_startup_lock_file(&validated_path)?;
     let deadline = Instant::now() + STARTUP_GUARD_TIMEOUT;
+    let mut identity_retries = 0usize;
 
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Ok(StartupGuardAcquire::Acquired(StartupGuard { _lock: lock })),
+            Ok(lock) => {
+                if flock_still_names_path(&lock, &validated_path) {
+                    return Ok(StartupGuardAcquire::Acquired(StartupGuard { _lock: lock }));
+                }
+                // Reaped/replaced between our open and flock; the descriptor
+                // is orphaned and excludes nobody. Drop it and re-acquire.
+                identity_retries += 1;
+                if identity_retries > constants::LOCK_ACQUIRE_IDENTITY_RETRIES {
+                    return Err(anyhow::anyhow!(
+                        "startup guard {} kept being replaced during acquisition",
+                        validated_path.display()
+                    ));
+                }
+                drop(lock);
+                file = open_startup_lock_file(&validated_path)?;
+            }
             Err((returned_file, Errno::EWOULDBLOCK)) => {
                 let probe = lifecycle::probe_daemon()?;
                 if matches!(probe, DaemonProbeState::Running(_)) || Instant::now() >= deadline {
@@ -435,17 +478,10 @@ fn open_startup_lock_file(path: &Path) -> anyhow::Result<File> {
 }
 
 fn startup_lock_path(xdg_root: &Path, project_root: &Path) -> PathBuf {
-    xdg_root.join(format!("startup-{}.lock", startup_lock_key(project_root)))
-}
-
-fn startup_lock_key(project_root: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(project_root.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    xdg_root.join(lock_file_name(
+        constants::STARTUP_LOCK_PREFIX,
+        &project_lock_key(project_root),
+    ))
 }
 
 fn registry_contains_context(
@@ -1044,5 +1080,62 @@ mod tests {
                 "unsupported daemon guidance must not mention hidden command {hidden}; message={message}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+
+    /// Canonicalize the tempdir (macOS `/var` -> `/private/var`) so secure-fs
+    /// path validation sees a symlink-free root, matching production
+    /// `ensure_secure_xdg_root` guarantees.
+    fn root_of(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn startup_lock_name_matches_reaper_namespace() {
+        let name_path = startup_lock_path(Path::new("/xdg"), Path::new("/some/project"));
+        let name = name_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            crate::shared::lock_reap::is_reapable_name(name),
+            "minted guard name {name:?} must parse under the reaper's strict namespace"
+        );
+    }
+
+    #[test]
+    fn startup_guard_acquires_in_isolated_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_of(&dir);
+        let project = Path::new("/some/project");
+
+        let acquired = acquire_project_startup_guard_in(&root, project).unwrap();
+        assert!(
+            matches!(acquired, StartupGuardAcquire::Acquired(_)),
+            "uncontended startup guard must be acquired"
+        );
+    }
+
+    #[test]
+    fn startup_guard_survives_prior_unlinked_holder_descriptor() {
+        // A descriptor orphaned by the reaper (open + unlinked pathname) must
+        // not exclude a fresh acquirer: acquisition recreates the path and
+        // verifies its own descriptor still names it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_of(&dir);
+        let project = Path::new("/some/project");
+        let lock_path = startup_lock_path(&root, project);
+
+        let orphan = File::create(&lock_path).unwrap();
+        let orphan_lock = Flock::lock(orphan, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, errno)| errno)
+            .unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let acquired = acquire_project_startup_guard_in(&root, project)
+            .expect("an orphaned (unlinked) holder must not block acquisition");
+        assert!(matches!(acquired, StartupGuardAcquire::Acquired(_)));
+        drop(orphan_lock);
     }
 }
