@@ -432,6 +432,17 @@ pub const SCHEMA_INIT_WAIT_ATTEMPTS: usize = 50;
 /// millisecond-scale [`DB_LOCK_RETRY_DELAY_MS`] lock-contention budget.
 pub const SCHEMA_INIT_WAIT_DELAY_MS: u64 = 100;
 
+/// Number of bounded retries a status-file reader performs on an `Unreadable`
+/// (torn/partial) result before propagating the read as indeterminate. A torn
+/// read is the brief window between an atomic writer's temp-write and `rename(2)`,
+/// so a small retry budget clears it without masking a genuinely corrupt file.
+/// Single source of truth for every retrying status-read call site.
+pub const STATUS_READ_RETRY_ATTEMPTS: usize = 3;
+
+/// Delay between status-file read retries, in milliseconds. Combined with
+/// [`STATUS_READ_RETRY_ATTEMPTS`] this bounds the retry budget to roughly 150 ms.
+pub const STATUS_READ_RETRY_DELAY_MS: u64 = 50;
+
 /// Write-ahead-log autocheckpoint threshold, in WAL pages, for the write/staging
 /// connection profile only.
 ///

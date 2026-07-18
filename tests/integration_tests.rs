@@ -7530,6 +7530,9 @@ async fn count_segments_ro(db_path: &Path) -> Result<i64, String> {
             Ok(count) => return Ok(count),
             Err(err) => {
                 last = err;
+                // Intentional short fixed backoff (kept, not a readiness wait):
+                // mirrors the production `retry_on_db_lock` cadence so a momentary
+                // checkpoint/rename lock during the atomic swap is absorbed.
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
@@ -7636,6 +7639,10 @@ fn reindex_switch_over_is_all_or_nothing_with_atomic_inode_replacement() {
             let mut samples = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 samples.push(rt.block_on(count_segments_ro(&db_path)));
+                // Intentional fixed sampling cadence (kept, not a readiness
+                // wait): this background reader deliberately straddles the live
+                // reindex to prove the swap is all-or-nothing, so it must sample
+                // as fast as is reasonable rather than poll for a condition.
                 thread::sleep(Duration::from_millis(1));
             }
             // A few more samples after the reindex returns so some land on the

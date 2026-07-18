@@ -1751,6 +1751,10 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
 
+    // Serializes model-file setup across these tests. Tests that also mutate the
+    // process environment acquire in the order `MODEL_MUTEX` -> `shared::fs::ENV_MUTEX`
+    // (model lock first, then the single process-wide env lock); both are acquired
+    // poison-tolerantly so one panicking test cannot cascade.
     static MODEL_MUTEX: Mutex<()> = Mutex::new(());
 
     fn write_fake_model_files(dir: &std::path::Path, model: &[u8], tokenizer: &[u8]) {

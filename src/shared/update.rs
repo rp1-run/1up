@@ -1342,9 +1342,6 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static UPDATE_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct ScopedEnvGuard {
         key: &'static str,
@@ -1697,7 +1694,12 @@ mod tests {
 
     #[test]
     fn configured_update_manifest_url_uses_runtime_override() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Route onto the single process-wide `shared::fs::ENV_MUTEX` so this
+        // env-mutating test serializes against every other one in the binary
+        // (not just update.rs's own tests). Poison-tolerant acquire.
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = ScopedEnvGuard::set(
             UPDATE_MANIFEST_URL_ENV_VAR,
             "https://example.com/update-manifest.json",
@@ -1712,7 +1714,9 @@ mod tests {
 
     #[test]
     fn configured_update_manifest_url_allows_runtime_disable_override() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
 
         assert_eq!(configured_update_manifest_url(), None);
@@ -1821,7 +1825,9 @@ mod tests {
 
     #[test]
     fn write_and_read_cache_round_trip() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1848,7 +1854,9 @@ mod tests {
 
     #[test]
     fn read_compatible_update_cache_clears_version_mismatched_cache() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1870,7 +1878,9 @@ mod tests {
     fn write_update_cache_uses_secure_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1896,7 +1906,9 @@ mod tests {
     #[test]
     fn write_update_cache_does_not_panic_on_failure() {
         // write_update_cache with a bad path should silently fail
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         // Point at a path that will fail (file exists as non-directory)
         std::env::set_var("XDG_DATA_HOME", "/dev/null");
@@ -1913,7 +1925,9 @@ mod tests {
 
     #[test]
     fn refresh_cache_if_stale_clears_cache_when_updates_disabled() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _manifest_guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -1929,7 +1943,9 @@ mod tests {
 
     #[test]
     fn refresh_cache_if_stale_does_not_reuse_version_mismatched_cache() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _manifest_guard = ScopedEnvGuard::set(
             UPDATE_MANIFEST_URL_ENV_VAR,
             "http://127.0.0.1:9/update-manifest.json",
@@ -2302,7 +2318,9 @@ mod tests {
 
     #[test]
     fn format_update_notification_returns_none_when_updates_disabled() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _manifest_guard = ScopedEnvGuard::set(UPDATE_MANIFEST_URL_ENV_VAR, "");
         let tmp = tempfile::tempdir().unwrap();
         let tmp_root = tmp.path().canonicalize().unwrap();
@@ -2317,7 +2335,9 @@ mod tests {
 
     #[test]
     fn format_update_notification_ignores_version_mismatched_cache() {
-        let _lock = UPDATE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _manifest_guard = ScopedEnvGuard::set(
             UPDATE_MANIFEST_URL_ENV_VAR,
             "https://example.com/update-manifest.json",

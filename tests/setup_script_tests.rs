@@ -211,6 +211,10 @@ impl LocalHttp {
                         thread::spawn(move || handle_request(stream, &root));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Intentional fixed backoff (kept, not a readiness wait):
+                        // this is the accept-loop poll interval for the mock
+                        // HTTP server's non-blocking listener, not a wait on a
+                        // test condition.
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
@@ -1528,6 +1532,10 @@ fn local_http_serves_fixture_files() {
             }
             Err(error) => {
                 last_error = Some(error);
+                // Intentional fixed retry interval inside the enclosing
+                // `while Instant::now() < deadline` deadline loop (kept): this is
+                // the poll cadence for the mock server becoming reachable, not a
+                // standalone fixed readiness sleep.
                 thread::sleep(Duration::from_millis(20));
             }
         }

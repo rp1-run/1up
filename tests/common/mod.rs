@@ -3,6 +3,43 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// Polls `probe` every `interval` until it reports the awaited condition,
+/// returning the probe's value, or panics once `deadline` passes. This is the
+/// shared deadline-polling primitive behind the per-binary `wait_for_*`
+/// readiness helpers: it replaces fixed `thread::sleep` guesses with a
+/// condition wait so tests neither flake under load nor sleep longer than
+/// necessary.
+///
+/// `probe` returns `Ok(value)` when the condition holds (the value is handed
+/// back to the caller) or `Err(observation)` describing the current
+/// not-yet-ready state. On timeout the panic message carries `description` and
+/// the last observation, mirroring the "deadline + last-payload panic" idiom of
+/// helpers like `wait_for_mcp_searchable_readiness`.
+///
+/// The helper is synchronous (`std::thread::sleep`); async call sites drive
+/// their futures to completion inside `probe` (e.g. via `block_on`) so no
+/// blocking sleep ever runs on an async runtime.
+#[allow(dead_code)]
+pub fn poll_until<T>(
+    deadline: Instant,
+    interval: Duration,
+    description: &str,
+    mut probe: impl FnMut() -> Result<T, String>,
+) -> T {
+    loop {
+        match probe() {
+            Ok(value) => return value,
+            Err(observed) => {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for {description}; last observed: {observed}");
+                }
+            }
+        }
+        std::thread::sleep(interval);
+    }
+}
 
 /// Serializes tests that mutate the shared on-disk embedding model state
 /// within one test binary.
