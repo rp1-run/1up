@@ -3420,8 +3420,14 @@ fn attach_scope_proposal_if_fresh(
             estimated_vectors: 0,
         })
         .collect();
-    let suggestions = generate_ranked_suggestions(&stats, &proposal.launch_subdir);
-    let scope_candidates = stats.iter().map(|stat| stat.directory.clone()).collect();
+    // Derive BOTH vectors from the one ranked output so `suggestions[i]`
+    // always describes `scope_candidates[i]`: the MCP layer zips them into
+    // `scope_add` next_actions, so rank alignment is a contract, not a
+    // coincidence. The generator already caps the list and skips the
+    // launch_subdir cone (which carries its own dedicated action).
+    let ranked = generate_ranked_scope_suggestions(&stats, &proposal.launch_subdir);
+    let suggestions: Vec<String> = ranked.iter().map(|s| s.reason.clone()).collect();
+    let scope_candidates: Vec<String> = ranked.into_iter().map(|s| s.directory).collect();
 
     payload.scope_proposal = Some(ScopeProposalSummary {
         file_count_total: proposal.file_count_total,
@@ -6999,6 +7005,59 @@ mod tests {
         save_persisted_scope_proposal(&state_root, &sample_proposal("k")).unwrap();
 
         assert!(!project_dot_dir(&state_root).exists());
+        assert!(load_persisted_scope_proposal(&state_root).is_none());
+    }
+
+    #[test]
+    fn cancelled_directory_walk_returns_err_not_counts() {
+        // The proposal walk observes the daemon pass's cancellation token; a
+        // cancelled walk must surface as an error, never as partial (or empty)
+        // per-directory counts that downstream code could persist as a
+        // proposal. The cadence check runs at idx 0, so a pre-cancelled token
+        // aborts deterministically on the first walked entry.
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = canonical_state_root(&temp);
+        std::fs::create_dir_all(source_root.join("services")).unwrap();
+        for i in 0..5 {
+            std::fs::write(source_root.join("services").join(format!("f{i}.rs")), "x").unwrap();
+        }
+
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let result = count_files_per_directory_cancellable(&source_root, &cancel_token);
+        assert!(
+            result.is_err(),
+            "a pre-cancelled walk must return Err, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn persist_scope_proposal_skips_persist_when_cancelled() {
+        // A SIGTERM-cancelled proposal walk is a benign shutdown outcome: the
+        // persist call reports Ok (nothing for the daemon to warn about) and
+        // writes NO scope_proposal.json — a proposal from an aborted walk
+        // would rank cones from a partial count.
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = canonical_state_root(&temp);
+        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
+        std::fs::create_dir_all(state_root.join("services")).unwrap();
+        for i in 0..5 {
+            std::fs::write(state_root.join("services").join(format!("f{i}.rs")), "x").unwrap();
+        }
+
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        persist_scope_proposal_for_gate(&state_root, &state_root, &cancel_token)
+            .expect("a cancelled proposal walk is not an error");
+
+        assert!(
+            !project_dot_dir(&state_root)
+                .join(SCOPE_PROPOSAL_FILENAME)
+                .exists(),
+            "a cancelled walk must not persist a proposal"
+        );
         assert!(load_persisted_scope_proposal(&state_root).is_none());
     }
 
