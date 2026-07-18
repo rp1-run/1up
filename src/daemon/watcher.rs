@@ -117,11 +117,39 @@ impl FileWatcher {
     }
 }
 
+/// Whether a watcher event can possibly represent a content change.
+///
+/// Access events are reads, not writes: Linux's inotify backend reports
+/// `Access(Open)` / `Access(Read)` / `Access(Close(Read))` for every `open(2)`
+/// and `read(2)` of a watched path — including the indexer's OWN scan opening
+/// the watched source root. Treating those as changes made every rebuild pass
+/// re-dirty its own project (the pass opens the root directory, the open shows
+/// up as an "ambiguous" directory event, and the dirty sweep queues a full
+/// re-index that opens the root again), so on Linux the daemon re-indexed
+/// forever and the SIGHUP drain sweep test never went clean. macOS's FSEvents
+/// backend emits no access events, which is why the loop never appeared there.
+///
+/// `Access(Close(Write))` is the one access event that implies mutation
+/// (`IN_CLOSE_WRITE`), so it is kept, even though the preceding `Modify`
+/// events already cover it, to stay conservative for backends that may
+/// coalesce differently.
+fn event_kind_can_modify(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        _ => true,
+    }
+}
+
 fn collect_event_paths(result: notify::Result<Event>, changed: &mut WatcherChanges) {
     match result {
         Ok(event) => {
             if event.paths.is_empty() {
                 changed.has_unscoped_error = true;
+                return;
+            }
+            if !event_kind_can_modify(&event.kind) {
                 return;
             }
 
@@ -255,6 +283,82 @@ mod tests {
         let mut watcher = FileWatcher::new().expect("watcher creation");
         watcher.watched_roots = roots(paths);
         watcher
+    }
+
+    /// Regression: on Linux, inotify reports `Access(Open)` for every
+    /// `open(2)` of a watched path — including the indexer's own scan opening
+    /// the watched source root. Recording that as an (ambiguous, directory)
+    /// change made each rebuild pass re-dirty its own project, so the dirty
+    /// sweep re-indexed forever. Access-only events must be dropped before
+    /// classification.
+    #[test]
+    fn access_only_events_are_not_changes() {
+        use notify::event::{AccessKind, AccessMode, EventAttributes, EventKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Any),
+        ] {
+            let mut changed = WatcherChanges::default();
+            let event = Event {
+                kind,
+                paths: vec![tmp.path().to_path_buf()],
+                attrs: EventAttributes::default(),
+            };
+            collect_event_paths(Ok(event), &mut changed);
+            assert!(
+                changed.is_empty(),
+                "an access-only event ({kind:?}) must never be recorded as a change"
+            );
+        }
+    }
+
+    /// `Access(Close(Write))` (`IN_CLOSE_WRITE`) is the one access event that
+    /// implies mutation, so it still records a change.
+    #[test]
+    fn close_write_access_event_still_records_a_change() {
+        use notify::event::{AccessKind, AccessMode, EventAttributes, EventKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("written.rs");
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+
+        let mut changed = WatcherChanges::default();
+        let event = Event {
+            kind: EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            paths: vec![file.clone()],
+            attrs: EventAttributes::default(),
+        };
+        collect_event_paths(Ok(event), &mut changed);
+        assert_eq!(
+            changed.file_paths,
+            BTreeSet::from([file]),
+            "a close-after-write event must still be recorded as a file change"
+        );
+    }
+
+    /// Non-access events on a still-existing directory (e.g. a directory
+    /// rename) must keep flowing into `ambiguous_paths` exactly as before.
+    #[test]
+    fn modify_event_on_directory_stays_ambiguous() {
+        use notify::event::{EventAttributes, EventKind, ModifyKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut changed = WatcherChanges::default();
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![tmp.path().to_path_buf()],
+            attrs: EventAttributes::default(),
+        };
+        collect_event_paths(Ok(event), &mut changed);
+        assert_eq!(
+            changed.ambiguous_paths,
+            BTreeSet::from([tmp.path().to_path_buf()]),
+            "a modify event on an existing directory must stay ambiguous"
+        );
     }
 
     #[test]
