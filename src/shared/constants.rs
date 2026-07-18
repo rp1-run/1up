@@ -69,19 +69,26 @@ pub const NON_EMBEDDABLE_CHUNK_LANGUAGES: [&str; 9] = [
 /// recall/latency tradeoff originally tuned for quantization noise.
 pub const VECTOR_PREFILTER_K: usize = 400;
 
-/// Maximum context-scoped vector count served by the exhaustive-scan path.
+/// Corpus-size boundary above which exact-scan latency is warned about, and the
+/// count-based cutoff for the opt-in approximate path.
 ///
 /// The disk-based approximate vector index answers `vector_top_k` by beam
 /// traversal over a neighbor graph, which is read-heavy and pathologically
 /// slow — and, contrary to the original "amortizes at scale" assumption, it
 /// gets WORSE as the corpus grows, not better: ~7s single-thread CPU over
-/// ~4.5k vectors, and ~45s over ~27k vectors (measured on the emdash corpus).
-/// The exhaustive path is the inverse: an exact `vector_distance_cos` scan is
-/// a single linear pass of ~N x 384 dot products (~6.3M MACs at 16384, well
-/// under 10ms) and stays sub-second well past 256k vectors. So the exact scan
-/// is preferred for all realistic single-repo corpus sizes; the `vector_top_k`
-/// graph path only takes over above this (deliberately high) bound, where the
-/// memory-resident linear pass would finally lose to the disk-based index.
+/// ~4.5k vectors, and ~45s over ~27k vectors (measured on the emdash corpus),
+/// i.e. superlinear. The exhaustive path is the inverse: an exact
+/// `vector_distance_cos` scan is a single linear pass of ~N x 384 dot products
+/// (~6.3M MACs at 16384, well under 10ms) and stays sub-second well past 256k
+/// vectors.
+///
+/// Because of that measured evidence the exact scan is now the **unconditional
+/// default for every corpus size**; this constant is no longer an auto-switch
+/// point. It serves two remaining roles: (1) the boundary above which a
+/// one-time `tracing::warn!` notes that exact-scan latency grows linearly with
+/// corpus size, and (2) the count cutoff applied *only* when the approximate
+/// path is explicitly opted into via [`FORCE_ANN_SEARCH_ENV_VAR`], for the day
+/// the DiskANN path becomes demonstrably faster.
 pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 262_144;
 
 /// Maximum number of indexed worktree contexts used to scale vector prefiltering.
@@ -752,6 +759,16 @@ pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
 /// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
 /// switch either way.
 pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
+
+/// Env var name for the opt-in (default OFF) switch that forces the approximate
+/// `vector_top_k` DiskANN search path. Unset, empty, or `"0"` keeps the exact
+/// `vector_distance_cos` scan as the default for ALL corpus sizes (the safe,
+/// measured-fast path); any other value opts into the ANN graph path, which
+/// then applies the count-based [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`] cutoff.
+/// The ANN path is demoted to opt-in because it is pathologically slow and
+/// superlinear in practice (~7s @ 4.5k vectors, ~45s @ 27k vectors, measured on
+/// the emdash corpus) and stays off until it is demonstrably faster.
+pub const FORCE_ANN_SEARCH_ENV_VAR: &str = "ONEUP_FORCE_ANN_SEARCH";
 
 /// Per-file size cap to prevent unbounded memory use.
 ///
