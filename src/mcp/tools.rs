@@ -802,6 +802,71 @@ fn readiness_context_metadata(
     }
 }
 
+/// Builds the Missing-readiness next_actions. When the daemon gate persisted a
+/// fresh scope proposal (over-threshold unscoped repo), surface ranked
+/// `scope_add` cones — the same actionable choices the synchronous facts
+/// envelope offers — so the refusal is durably actionable through `oneup_status`
+/// and a follow-up unscoped `oneup_start`. Absent a proposal, fall back to the
+/// generic "create the index" action.
+fn missing_readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
+    let Some(proposal) = payload.scope_proposal.as_ref() else {
+        return vec![action(
+            TOOL_START,
+            "Create the local 1up index explicitly before searching.",
+            Some(json!({ "mode": "index_if_missing" })),
+        )];
+    };
+
+    let mut actions = Vec::new();
+    if let Some(launch_subdir) = proposal.launch_subdir.as_ref() {
+        actions.push(action(
+            TOOL_START,
+            format!("Index the launch subdirectory first: {}", launch_subdir),
+            Some(json!({ "mode": "index_if_needed", "scope_add": [launch_subdir] })),
+        ));
+    }
+
+    // Reuse the rank-aligned suggestion strings as the scope_add reasons:
+    // `suggestions[i]` describes `scope_candidates[i]` by construction (both
+    // derive from the same ranked generator in `attach_scope_proposal_if_fresh`),
+    // so this stays a single phrasing source with the synchronous facts
+    // envelope. Agents consume next_actions reasons individually (issue #88),
+    // so every reason must read standalone — the generator guarantees the
+    // first entry is a primary imperative exactly when no launch_subdir action
+    // precedes it, phrases the rest as "Alternatively, …", and never emits a
+    // reason beginning with "Or ". The leading action additionally carries the
+    // over-threshold file count so the refusal stays legible on its own.
+    for (candidate, suggestion) in proposal
+        .scope_candidates
+        .iter()
+        .zip(proposal.suggestions.iter())
+    {
+        let reason = if actions.is_empty() {
+            format!(
+                "Large repository ({} files) needs a scope. {}",
+                proposal.file_count_total, suggestion
+            )
+        } else {
+            suggestion.clone()
+        };
+        actions.push(action(
+            TOOL_START,
+            reason,
+            Some(json!({ "mode": "index_if_needed", "scope_add": [candidate] })),
+        ));
+    }
+
+    // Defensive: a proposal with no usable cones still needs an actionable step.
+    if actions.is_empty() {
+        actions.push(action(
+            TOOL_START,
+            "Create the local 1up index explicitly before searching.",
+            Some(json!({ "mode": "index_if_missing" })),
+        ));
+    }
+    actions
+}
+
 fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
     let mut actions = match payload.status {
         ReadinessStatus::Ready => vec![action(
@@ -821,11 +886,7 @@ fn readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction> {
                 Some(json!({})),
             ),
         ],
-        ReadinessStatus::Missing => vec![action(
-            TOOL_START,
-            "Create the local 1up index explicitly before searching.",
-            Some(json!({ "mode": "index_if_missing" })),
-        )],
+        ReadinessStatus::Missing => missing_readiness_next_actions(payload),
         ReadinessStatus::Indexing => vec![action(
             TOOL_STATUS,
             "Poll readiness until indexing completes.",
@@ -1782,6 +1843,115 @@ mod tests {
             panic!("expected arguments to be Some");
         }
         assert_eq!(drift_actions[0].tool, TOOL_SEARCH);
+    }
+
+    #[test]
+    fn missing_readiness_without_proposal_falls_back_to_generic_start() {
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Missing;
+
+        let actions = missing_readiness_next_actions(&payload);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, TOOL_START);
+        assert_eq!(
+            actions[0].arguments.as_ref().unwrap()["mode"],
+            "index_if_missing"
+        );
+    }
+
+    #[test]
+    fn missing_readiness_with_fresh_proposal_surfaces_ranked_scope_add_actions() {
+        // Suggestions as `attach_scope_proposal_if_fresh` derives them:
+        // rank-aligned with scope_candidates and phrased by
+        // `generate_ranked_scope_suggestions` (primary imperative first, then
+        // standalone alternatives).
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Missing;
+        payload.scope_proposal = Some(ops::ScopeProposalSummary {
+            file_count_total: 5000,
+            launch_subdir: None,
+            suggestions: vec![
+                "Index the largest directory: services".to_string(),
+                "Alternatively, index the 2nd largest directory: libs".to_string(),
+            ],
+            scope_candidates: vec!["services".to_string(), "libs".to_string()],
+        });
+
+        let actions = missing_readiness_next_actions(&payload);
+        assert_eq!(actions.len(), 2, "one scope_add action per ranked cone");
+        assert!(actions.iter().all(|a| a.tool == TOOL_START));
+        assert_eq!(
+            actions[0].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["services"])
+        );
+        assert_eq!(
+            actions[1].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["libs"])
+        );
+        // The over-threshold file count is surfaced so the refusal is legible,
+        // and the reason embeds the rank-aligned suggestion string verbatim
+        // rather than re-deriving its own wording.
+        assert_eq!(
+            actions[0].reason,
+            "Large repository (5000 files) needs a scope. Index the largest directory: services"
+        );
+        assert_eq!(
+            actions[1].reason,
+            "Alternatively, index the 2nd largest directory: libs"
+        );
+        // Issue #88 regression guard: agents consume next_actions reasons
+        // individually, so no reason may lean on a preceding sibling.
+        assert!(
+            actions.iter().all(|a| !a.reason.starts_with("Or ")),
+            "no next_action reason may begin with \"Or \": {:?}",
+            actions.iter().map(|a| &a.reason).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn missing_readiness_with_launch_subdir_leads_with_it_and_keeps_reasons_standalone() {
+        // A launch_subdir cone gets the dedicated leading action; the ranked
+        // suggestions (which the generator already de-duplicated against the
+        // launch_subdir) follow as standalone alternatives — never a dangling
+        // primary and never an "Or "-prefixed fragment.
+        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
+        payload.status = ReadinessStatus::Missing;
+        payload.scope_proposal = Some(ops::ScopeProposalSummary {
+            file_count_total: 5000,
+            launch_subdir: Some("services".to_string()),
+            suggestions: vec![
+                "Alternatively, index the 2nd largest directory: libs".to_string(),
+                "Alternatively, index the 3rd largest directory: tools".to_string(),
+            ],
+            scope_candidates: vec!["libs".to_string(), "tools".to_string()],
+        });
+
+        let actions = missing_readiness_next_actions(&payload);
+        assert_eq!(actions.len(), 3, "launch_subdir action plus one per cone");
+        assert_eq!(
+            actions[0].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["services"])
+        );
+        assert!(actions[0].reason.contains("launch subdirectory"));
+        // The launch_subdir cone appears exactly once: the ranked candidates
+        // were de-duplicated at derivation, not re-filtered here.
+        assert_eq!(
+            actions[1].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["libs"])
+        );
+        assert_eq!(
+            actions[1].reason,
+            "Alternatively, index the 2nd largest directory: libs"
+        );
+        assert_eq!(
+            actions[2].arguments.as_ref().unwrap()["scope_add"],
+            serde_json::json!(["tools"])
+        );
+        assert!(
+            actions.iter().all(|a| !a.reason.starts_with("Or ")),
+            "no next_action reason may begin with \"Or \": {:?}",
+            actions.iter().map(|a| &a.reason).collect::<Vec<_>>()
+        );
     }
 
     #[test]

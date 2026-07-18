@@ -1337,6 +1337,139 @@ fn test_daemon_alive_gate_fires_on_over_threshold_missing_repo() {
     // This satisfies the acceptance criterion: no indexing happens until scope is provided.
 }
 
+/// Poll for the daemon-persisted scope proposal file (issue #86 gate-fired
+/// signal). Returns the parsed JSON once it appears, or panics after the
+/// deadline. Waiting on the durable persisted file — not a response budget —
+/// makes the daemon-alive gate path deterministic.
+fn wait_for_scope_proposal(root: &Path) -> serde_json::Value {
+    let path = root.join(".1up").join("scope_proposal.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                return value;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "daemon did not persist scope proposal at {} within 90s",
+                path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Regression test for issue #86: when the DAEMON (not the synchronous MCP
+/// walk) fires the monorepo gate, it must persist a scope proposal so the
+/// Missing readiness surfaces ranked `scope_add` cones instead of a generic
+/// next_action. Determinism comes from waiting on the persisted-proposal file
+/// and polling readiness — NOT from pinning ONEUP_START_RESPONSE_BUDGET_MS, so
+/// this exercises the daemon-alive timing race the synchronous refusal hides.
+#[test]
+fn test_daemon_gate_fired_scope_proposal_surfaces_in_readiness() {
+    let _guard = HideModelGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+
+    let total_files = create_monorepo_scale_fixture(&root);
+    assert!(
+        total_files >= 3_000,
+        "fixture should exceed threshold; got {total_files}"
+    );
+
+    // Reproduce the real startup sequence: an empty schema db is present before
+    // the daemon runs the gate (this is what defeated the old
+    // !index.db-exists() predicate).
+    create_empty_schema_db(&root);
+
+    // Default response budget on purpose: we assert the daemon-persisted
+    // proposal path, not the synchronous-walk budget race.
+    let mut client = McpTestClient::start_with_isolated_state(&root);
+
+    // The daemon auto-starts, fires the monorepo gate, and persists the scope
+    // proposal. Wait on that durable signal (T2) rather than the start timing.
+    let proposal = wait_for_scope_proposal(&root);
+    assert!(
+        proposal["per_directory_stats"]
+            .as_array()
+            .map(|dirs| !dirs.is_empty())
+            .unwrap_or(false),
+        "persisted proposal must carry ranked directories; got {proposal:?}"
+    );
+
+    // oneup_status now surfaces ranked scope_add suggestions on the Missing
+    // readiness (T3). Poll to ride out the brief refresh-finishing window after
+    // the file lands; the terminal state is Missing with scope_add actions.
+    let status_result = wait_for_status(
+        &mut client,
+        "missing readiness carrying daemon-fired scope proposal",
+        |env| {
+            env["status"].as_str() == Some("missing")
+                && env["next_actions"]
+                    .as_array()
+                    .map(|actions| {
+                        actions
+                            .iter()
+                            .any(|a| a["arguments"].get("scope_add").is_some())
+                    })
+                    .unwrap_or(false)
+        },
+    );
+    let status_envelope = mcp_structured(&status_result);
+
+    // The readiness payload carries the structured proposal, and its
+    // next_actions offer concrete scope_add cones.
+    assert!(
+        status_envelope["data"]["scope_proposal"]["scope_candidates"]
+            .as_array()
+            .map(|candidates| !candidates.is_empty())
+            .unwrap_or(false),
+        "readiness data must include scope_proposal candidates; got {:?}",
+        status_envelope["data"]
+    );
+    let scope_add_count = status_envelope["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["arguments"].get("scope_add").is_some())
+        .count();
+    assert!(
+        scope_add_count >= 1,
+        "oneup_status must surface at least one scope_add cone; got {:?}",
+        status_envelope["next_actions"]
+    );
+
+    // A follow-up unscoped oneup_start still refuses with actionable scope
+    // guidance (it must never silently full-index the over-threshold repo).
+    let start_result = client.call_tool(
+        TOOL_START,
+        serde_json::json!({ "mode": "index_if_missing" }),
+    );
+    let start_envelope = mcp_structured(&start_result);
+    let start_status = start_envelope["status"].as_str();
+    assert!(
+        matches!(
+            start_status,
+            Some("refuse_and_propose_scope") | Some("missing")
+        ),
+        "unscoped oneup_start must surface scope guidance, not index; got {start_status:?}"
+    );
+    let start_offers_scope = start_envelope["next_actions"]
+        .as_array()
+        .map(|actions| {
+            actions
+                .iter()
+                .any(|a| a["arguments"].get("scope_add").is_some())
+        })
+        .unwrap_or(false);
+    assert!(
+        start_offers_scope,
+        "unscoped oneup_start must offer scope_add cones; got {:?}",
+        start_envelope["next_actions"]
+    );
+}
+
 /// Scoped start applies scope and indexes only cone files
 ///
 /// Acceptance: `oneup_start {scope_add: [...]}` scans ~cone file count (not full repo),

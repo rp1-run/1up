@@ -2463,6 +2463,38 @@ async fn run_project(
                     file_count,
                     threshold
                 );
+                // Persist a scope proposal so a later oneup_status/oneup_start can
+                // surface ranked scope suggestions for this daemon-fired gate —
+                // the synchronous MCP walk that builds the facts envelope is
+                // hidden by the daemon-alive timing race, so without this the
+                // Missing readiness would only carry a generic next_action.
+                // Best-effort: runs the synchronous walk off the async executor
+                // (matching FIX C) and never blocks or fails the idle return.
+                // The walk observes this pass's per-project child token, like the
+                // gate walk above: SIGTERM cancels the daemon parent (and thus
+                // this child), and a de-register cancels only this child.
+                let persist_state_root = state_root.clone();
+                let persist_source_root = source_root.clone();
+                let persist_cancel_token = project_cancel_token.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::mcp::ops::persist_scope_proposal_for_gate(
+                        &persist_state_root,
+                        &persist_source_root,
+                        &persist_cancel_token,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(
+                        "failed to persist scope proposal for gated project {}: {e}",
+                        state_root.display()
+                    ),
+                    Err(e) => warn!(
+                        "scope proposal persistence task panicked for {}: {e}",
+                        state_root.display()
+                    ),
+                }
                 // Consume the pending run WITHOUT re-queueing: the dirty flag
                 // is only cleared by start_run(), so returning without it made
                 // the scheduler re-select this project immediately and re-run
