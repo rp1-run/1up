@@ -6,6 +6,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::shared::constants::{
+    DISCLOSURE_RECLAIMABLE_BYTES_FLOOR, DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR,
+};
 use crate::shared::progress::{ProgressState, ProgressUi};
 use crate::shared::types::{
     BranchStatus, DaemonRefreshState, DaemonWatchStatus, IndexPhase, IndexProgress, IndexState,
@@ -109,10 +112,16 @@ pub struct StatusInfo {
     pub context_count: Option<usize>,
     /// Reclaimable-bytes estimate: `PRAGMA freelist_count * PRAGMA page_size`
     /// (exact, already-free pages) plus a proportional proxy for segments in
-    /// contexts whose source no longer exists on disk. Labeled as an estimate in
-    /// rendered output — exact bytes are only known after `1up gc --apply`'s
-    /// VACUUM. `None` when the index is absent/unreadable.
+    /// prunable contexts (source-missing peers and stale-branch snapshots of the
+    /// active worktree). Labeled as an estimate in rendered output — exact bytes
+    /// are only known after `1up gc --apply`'s VACUUM. `None` when the index is
+    /// absent/unreadable.
     pub reclaimable_bytes: Option<u64>,
+    /// Count of stale per-branch index snapshots for the active worktree — the
+    /// contexts `1up gc` would reclaim. Drives the one-line disclosure hint when
+    /// it (or [`reclaimable_bytes`](Self::reclaimable_bytes)) crosses a documented
+    /// threshold. `None` when the index is absent/unreadable.
+    pub stale_contexts: Option<u64>,
     /// Variant-aware embedding-model identity recorded in the index `meta` table
     /// (e.g. `all-MiniLM-L6-v2@int8`), read via `schema::get_embedding_model`.
     /// `None` when the index is absent/unreadable or predates model tracking.
@@ -205,6 +214,14 @@ pub struct ProjectListItem {
     pub index_status: ProjectListIndexStatus,
     pub files: Option<u64>,
     pub segments: Option<u64>,
+    /// Count of stale per-branch index snapshots for this project's active
+    /// worktree — the contexts `1up gc` would reclaim. `None` when the index is
+    /// absent/unreadable.
+    pub stale_contexts: Option<u64>,
+    /// Reclaimable-bytes estimate for this project (see
+    /// [`StatusInfo::reclaimable_bytes`]). `None` when the index is
+    /// absent/unreadable.
+    pub reclaimable_bytes: Option<u64>,
     pub last_file_check_at: Option<DateTime<Utc>>,
     pub index_progress: Option<IndexProgress>,
 }
@@ -452,6 +469,7 @@ impl Formatter for JsonFormatter {
             "embeddable_segments": status.embeddable_segments,
             "context_count": status.context_count,
             "reclaimable_bytes": status.reclaimable_bytes,
+            "stale_contexts": status.stale_contexts,
             "embedding_model": &status.embedding_model,
             "schema_version": status.schema_version,
             "project_id": &status.project_id,
@@ -476,6 +494,9 @@ impl Formatter for JsonFormatter {
         });
         if let Some(reason) = &status.index_unavailable_reason {
             payload["index_unavailable_reason"] = serde_json::json!(reason);
+        }
+        if let Some(hint) = disclosure_hint(status.stale_contexts, status.reclaimable_bytes) {
+            payload["disclosure_hint"] = serde_json::json!(hint);
         }
         to_json(&payload)
     }
@@ -758,6 +779,9 @@ impl Formatter for HumanFormatter {
                 render_bytes_human(bytes)
             ));
         }
+        if let Some(hint) = disclosure_hint(status.stale_contexts, status.reclaimable_bytes) {
+            out.push_str(&format!("{}\n", hint.yellow()));
+        }
         if let (Some(vectors), Some(embeddable)) = (status.vector_rows, status.embeddable_segments)
         {
             if vectors == 0 && embeddable > 0 {
@@ -910,6 +934,11 @@ impl Formatter for HumanFormatter {
         out.push_str(&format_project_list_separator(&widths));
         for row in rows {
             out.push_str(&format_project_list_row(&row, &widths));
+        }
+        for project in &projects.projects {
+            if let Some(hint) = disclosure_hint(project.stale_contexts, project.reclaimable_bytes) {
+                out.push_str(&format!("! {}: {}\n", project.project_id, hint.yellow()));
+            }
         }
         out
     }
@@ -1271,6 +1300,12 @@ impl Formatter for PlainFormatter {
         if let Some(bytes) = status.reclaimable_bytes {
             out.push_str(&format!("\treclaimable_bytes:{bytes}"));
         }
+        if let Some(stale) = status.stale_contexts {
+            out.push_str(&format!("\tstale_contexts:{stale}"));
+        }
+        if let Some(hint) = disclosure_hint(status.stale_contexts, status.reclaimable_bytes) {
+            out.push_str(&format!("\tdisclosure_hint:{}", plain_field(&hint)));
+        }
         if let Some(progress) = &status.index_progress {
             let work = WorkSummary::from(progress);
             out.push_str(&format!(
@@ -1365,7 +1400,7 @@ impl Formatter for PlainFormatter {
         let mut out = String::new();
         for project in &projects.projects {
             out.push_str(&format!(
-                "project:{}\tstate:{}\tproject_root:{}\tsource_root:{}\tindex:{}\tfiles:{}\tsegments:{}\tlast_file_check:{}\tregistered_at:{}\tmain_worktree:{}\tworktree_role:{}\tbranch:{}\tbranch_status:{}\twatch:{}\tlast_update:{}\n",
+                "project:{}\tstate:{}\tproject_root:{}\tsource_root:{}\tindex:{}\tfiles:{}\tsegments:{}\tstale_contexts:{}\treclaimable_bytes:{}\tlast_file_check:{}\tregistered_at:{}\tmain_worktree:{}\tworktree_role:{}\tbranch:{}\tbranch_status:{}\twatch:{}\tlast_update:{}\n",
                 plain_field(&project.project_id),
                 project.state.as_str(),
                 plain_field(&project.project_root.display().to_string()),
@@ -1373,6 +1408,8 @@ impl Formatter for PlainFormatter {
                 project.index_status.as_str(),
                 render_optional_count(project.files),
                 render_optional_count(project.segments),
+                render_optional_count(project.stale_contexts),
+                render_optional_count(project.reclaimable_bytes),
                 render_optional_time(project.last_file_check_at.as_ref()),
                 project.registered_at,
                 plain_field(&project.main_worktree_root.display().to_string()),
@@ -1834,6 +1871,31 @@ fn render_bytes_human(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// One-line advisory hint surfaced by `1up status`/`1up list` when reclaimable
+/// stale-branch context accumulation crosses a documented disclosure threshold.
+///
+/// Returns `None` when there are no stale-branch contexts, or when neither the
+/// count floor ([`DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR`]) nor the bytes floor
+/// ([`DISCLOSURE_RECLAIMABLE_BYTES_FLOOR`]) is met — so a small, expected amount
+/// of per-branch accumulation is never nagged about. The hint is purely
+/// advisory; deletion always stays a manual `1up gc` decision. Pure and
+/// threshold-gated so every output format renders an identical string.
+fn disclosure_hint(stale_contexts: Option<u64>, reclaimable_bytes: Option<u64>) -> Option<String> {
+    let stale = stale_contexts.unwrap_or(0);
+    if stale == 0 {
+        return None;
+    }
+    let bytes = reclaimable_bytes.unwrap_or(0);
+    if stale < DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR && bytes < DISCLOSURE_RECLAIMABLE_BYTES_FLOOR {
+        return None;
+    }
+    Some(format!(
+        "{stale} stale branch context{} (~{} reclaimable) — run 1up gc",
+        if stale == 1 { "" } else { "s" },
+        render_bytes_human(bytes),
+    ))
 }
 
 fn render_index_watch_message(progress: &IndexProgress) -> String {
@@ -2615,6 +2677,7 @@ mod tests {
             embeddable_segments: Some(14),
             context_count: Some(2),
             reclaimable_bytes: Some(2048),
+            stale_contexts: Some(0),
             embedding_model: Some("all-MiniLM-L6-v2@int8".to_string()),
             schema_version: Some(18),
             project_id: Some("project-123".to_string()),
@@ -2871,6 +2934,7 @@ mod tests {
             embeddable_segments: None,
             context_count: None,
             reclaimable_bytes: None,
+            stale_contexts: None,
             embedding_model: None,
             schema_version: None,
             project_id: None,
@@ -2917,6 +2981,7 @@ mod tests {
             embeddable_segments: None,
             context_count: None,
             reclaimable_bytes: None,
+            stale_contexts: None,
             embedding_model: None,
             schema_version: None,
             project_id: None,
@@ -2994,6 +3059,8 @@ mod tests {
                 index_status: ProjectListIndexStatus::Ready,
                 files: Some(3),
                 segments: Some(14),
+                stale_contexts: None,
+                reclaimable_bytes: None,
                 last_file_check_at: Some(sample_progress().updated_at),
                 index_progress: None,
             }],
@@ -3001,9 +3068,44 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "project:project-123\tstate:active\tproject_root:/repo\tsource_root:/repo/src\tindex:ready\tfiles:3\tsegments:14\tlast_file_check:2026-04-03T06:07:08+00:00\tregistered_at:2026-05-01T00:00:00Z\tmain_worktree:/repo\tworktree_role:linked\tbranch:feature\tbranch_status:named\twatch:watching\tlast_update:complete\n"
+            "project:project-123\tstate:active\tproject_root:/repo\tsource_root:/repo/src\tindex:ready\tfiles:3\tsegments:14\tstale_contexts:unknown\treclaimable_bytes:unknown\tlast_file_check:2026-04-03T06:07:08+00:00\tregistered_at:2026-05-01T00:00:00Z\tmain_worktree:/repo\tworktree_role:linked\tbranch:feature\tbranch_status:named\twatch:watching\tlast_update:complete\n"
         );
         assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn disclosure_hint_absent_below_both_floors() {
+        // Two stale contexts and a tiny reclaim: below the count floor (3) and the
+        // bytes floor, so no hint is surfaced.
+        assert_eq!(disclosure_hint(Some(2), Some(1024)), None);
+    }
+
+    #[test]
+    fn disclosure_hint_absent_without_stale_contexts() {
+        // Even a large freelist reclaim with zero stale branch contexts does not
+        // produce the stale-branch hint.
+        assert_eq!(
+            disclosure_hint(Some(0), Some(DISCLOSURE_RECLAIMABLE_BYTES_FLOOR * 4)),
+            None
+        );
+        assert_eq!(disclosure_hint(None, None), None);
+    }
+
+    #[test]
+    fn disclosure_hint_present_at_count_floor() {
+        let hint = disclosure_hint(Some(DISCLOSURE_STALE_CONTEXT_COUNT_FLOOR), Some(0))
+            .expect("count floor must trigger the hint");
+        assert!(hint.contains("stale branch context"));
+        assert!(hint.contains("run 1up gc"));
+    }
+
+    #[test]
+    fn disclosure_hint_present_when_bytes_cross_floor_below_count_floor() {
+        // Below the count floor but a large reclaim: the bytes floor triggers it.
+        let hint = disclosure_hint(Some(1), Some(DISCLOSURE_RECLAIMABLE_BYTES_FLOOR))
+            .expect("bytes floor must trigger the hint");
+        assert!(hint.starts_with("1 stale branch context "));
+        assert!(!hint.contains("contexts "), "singular form for exactly one");
     }
 
     #[test]
@@ -3043,6 +3145,8 @@ mod tests {
                 index_status: ProjectListIndexStatus::NotBuilt,
                 files: None,
                 segments: None,
+                stale_contexts: None,
+                reclaimable_bytes: None,
                 last_file_check_at: None,
                 index_progress: None,
             }],
@@ -3104,6 +3208,8 @@ mod tests {
                 index_status: ProjectListIndexStatus::Ready,
                 files: Some(132),
                 segments: Some(3732),
+                stale_contexts: None,
+                reclaimable_bytes: None,
                 last_file_check_at: Some(sample_progress().updated_at),
                 index_progress: None,
             }],
