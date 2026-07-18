@@ -236,6 +236,33 @@ impl Registry {
         )
     }
 
+    /// Conditionally remove registry entries by context id, re-validating each
+    /// candidate under the registry lock immediately before removal.
+    ///
+    /// [`Registry::deregister_context_ids`] removes purely by id. When the
+    /// candidate ids were computed from a pre-lock snapshot plus filesystem
+    /// probes, that is racy: context ids are deterministic for the same state
+    /// root, source root, and branch, so a project recreated and re-registered
+    /// between the probe and the locked mutation carries the same id and would
+    /// be removed even though its paths are present again. This variant reloads
+    /// the latest entries while the lock is held and calls `still_dead` on each
+    /// candidate entry, removing it only if the predicate still holds at save
+    /// time. The predicate is injected so the registry stays free of
+    /// caller-specific liveness policy (the daemon passes its filesystem probe).
+    pub fn deregister_context_ids_if(
+        &mut self,
+        context_ids: &HashSet<String>,
+        still_dead: &dyn Fn(&ProjectEntry) -> bool,
+    ) -> Result<usize, OneupError> {
+        let xdg_root = ensure_secure_xdg_root()?;
+        self.deregister_context_ids_if_at_path(
+            context_ids,
+            still_dead,
+            &config::projects_registry_path()?,
+            &xdg_root,
+        )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.projects.is_empty()
     }
@@ -355,6 +382,27 @@ impl Registry {
         latest
             .projects
             .retain(|entry| !context_ids.contains(&entry.context_id()));
+        let removed = before - latest.projects.len();
+        if removed > 0 {
+            latest.save_to_path(path, approved_root)?;
+        }
+        *self = latest;
+        Ok(removed)
+    }
+
+    fn deregister_context_ids_if_at_path(
+        &mut self,
+        context_ids: &HashSet<String>,
+        still_dead: &dyn Fn(&ProjectEntry) -> bool,
+        path: &Path,
+        approved_root: &Path,
+    ) -> Result<usize, OneupError> {
+        let _lock = acquire_registry_lock(approved_root)?;
+        let mut latest = Self::load_from_path(path, approved_root)?;
+        let before = latest.projects.len();
+        latest
+            .projects
+            .retain(|entry| !(context_ids.contains(&entry.context_id()) && still_dead(entry)));
         let removed = before - latest.projects.len();
         if removed > 0 {
             latest.save_to_path(path, approved_root)?;
@@ -1194,6 +1242,120 @@ mod tests {
         assert_eq!(loaded.projects[0].project_id, "main-id");
         assert!(loaded.contains_context(&main_context));
         assert!(!loaded.contains_context(&linked_context));
+    }
+
+    #[test]
+    fn registry_deregister_context_ids_if_keeps_candidate_revived_before_locked_removal() {
+        // Regression for the startup TOCTOU: candidate ids are computed from a
+        // snapshot where the project is dead, but the project is recreated and
+        // re-registered (context ids are deterministic, so the fresh entry has
+        // the same id) before the locked mutation. The conditional removal
+        // re-probes under the lock and must keep the revived entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let project = tmp_root.join("project");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&project).unwrap();
+
+        let context = test_context(
+            &project,
+            &project,
+            "11111111111111111111111111111111",
+            "main",
+        );
+        let mut registry = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        registry
+            .register_context_at_path("proj-id", &context, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        // Startup scan snapshots the fully-deleted project as a candidate.
+        fs::remove_dir_all(&project).unwrap();
+        let snapshot = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        let candidates: HashSet<String> = snapshot
+            .projects
+            .iter()
+            .map(ProjectEntry::context_id)
+            .collect();
+        assert_eq!(candidates.len(), 1);
+
+        // Concurrent revival before the locked mutation: the project root and
+        // its index.db come back and the same context is re-registered.
+        fs::create_dir_all(project.join(".1up")).unwrap();
+        fs::write(project.join(".1up").join("index.db"), b"db").unwrap();
+        registry
+            .register_context_at_path("proj-id", &context, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        let still_dead = |entry: &ProjectEntry| {
+            !entry.project_root.exists() && !entry.project_root.join(".1up/index.db").exists()
+        };
+        let removed = registry
+            .deregister_context_ids_if_at_path(&candidates, &still_dead, &registry_path, &xdg_root)
+            .unwrap();
+
+        assert_eq!(
+            removed, 0,
+            "revived project must survive the conditional removal"
+        );
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert!(loaded.contains_context(&context));
+    }
+
+    #[test]
+    fn registry_deregister_context_ids_if_removes_only_still_dead_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let xdg_root = tmp_root.join("xdg-root");
+        let registry_path = xdg_root.join("projects.json");
+        let dead_project = tmp_root.join("dead");
+        let live_project = tmp_root.join("live");
+        fs::create_dir_all(&xdg_root).unwrap();
+        fs::create_dir_all(&dead_project).unwrap();
+        fs::create_dir_all(live_project.join(".1up")).unwrap();
+        fs::write(live_project.join(".1up").join("index.db"), b"db").unwrap();
+
+        let dead_context = test_context(
+            &dead_project,
+            &dead_project,
+            "11111111111111111111111111111111",
+            "main",
+        );
+        let live_context = test_context(
+            &live_project,
+            &live_project,
+            "22222222222222222222222222222222",
+            "main",
+        );
+        let mut registry = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        registry
+            .register_context_at_path("dead-id", &dead_context, None, &registry_path, &xdg_root)
+            .unwrap();
+        registry
+            .register_context_at_path("live-id", &live_context, None, &registry_path, &xdg_root)
+            .unwrap();
+
+        // Both entries are candidates, but only the still-dead one may go.
+        fs::remove_dir_all(&dead_project).unwrap();
+        let candidates: HashSet<String> = registry
+            .projects
+            .iter()
+            .map(ProjectEntry::context_id)
+            .collect();
+        assert_eq!(candidates.len(), 2);
+
+        let still_dead = |entry: &ProjectEntry| {
+            !entry.project_root.exists() && !entry.project_root.join(".1up/index.db").exists()
+        };
+        let removed = registry
+            .deregister_context_ids_if_at_path(&candidates, &still_dead, &registry_path, &xdg_root)
+            .unwrap();
+
+        assert_eq!(removed, 1, "only the still-dead entry is removed");
+        let loaded = Registry::load_from_path(&registry_path, &xdg_root).unwrap();
+        assert!(!loaded.contains_context(&dead_context));
+        assert!(loaded.contains_context(&live_context));
     }
 
     #[test]
