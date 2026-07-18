@@ -331,6 +331,30 @@ pub const DB_LOCK_RETRY_ATTEMPTS: usize = 10;
 /// Delay between transient database lock retries.
 pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 
+/// Number of validation attempts a reader makes while tolerating the schema-init
+/// window (`ensure_current_tolerating_init`).
+///
+/// Distinct from [`DB_LOCK_RETRY_ATTEMPTS`]: that budget (10 attempts × 50 ms ≈
+/// 450 ms) is sized for *transient SQLite lock contention*, which clears in
+/// milliseconds. This budget instead covers a separate process running a *full
+/// schema initialization/upgrade*, which — on a large index with many segments,
+/// embeddings, and the DiskANN vector index — can legitimately take several
+/// seconds before the `schema_version` row is committed (see GitHub issue #93).
+/// Borrowing the ~450 ms lock budget here made a reader racing that initialization
+/// give up far too early. With [`SCHEMA_INIT_WAIT_DELAY_MS`] this yields roughly a
+/// 5 s total wait (49 sleeps × 100 ms) before a still-uninitialized index is
+/// surfaced as its clear schema error. Used *only* by
+/// `ensure_current_tolerating_init`; the DB-lock retry loops keep
+/// [`DB_LOCK_RETRY_ATTEMPTS`]/[`DB_LOCK_RETRY_DELAY_MS`].
+pub const SCHEMA_INIT_WAIT_ATTEMPTS: usize = 50;
+
+/// Delay between schema-init tolerance validation attempts, in milliseconds.
+///
+/// See [`SCHEMA_INIT_WAIT_ATTEMPTS`] for the rationale: a longer, several-second
+/// total budget sized for concurrent full schema initialization rather than the
+/// millisecond-scale [`DB_LOCK_RETRY_DELAY_MS`] lock-contention budget.
+pub const SCHEMA_INIT_WAIT_DELAY_MS: u64 = 100;
+
 /// Write-ahead-log autocheckpoint threshold, in WAL pages, for the write/staging
 /// connection profile only.
 ///
