@@ -3042,18 +3042,47 @@ fn prior_schema_version_index_fails_closed_with_reindex_guidance() {
     );
 
     let project_root = tmp.path().canonicalize().unwrap();
+    let db_path = project_root.join(".1up").join("index.db");
     block_on(async {
-        let db = Db::open_rw(&project_root.join(".1up").join("index.db"))
-            .await
-            .unwrap();
+        let db = Db::open_rw(&db_path).await.unwrap();
         let conn = db.connect().unwrap();
-        conn.execute(
-            queries::UPSERT_META,
-            ["schema_version", &(SCHEMA_VERSION - 1).to_string()],
-        )
-        .await
-        .unwrap();
+        // The shared-HOME daemon holds its own RW handle to this index and can
+        // transiently own the write lock, so retry the downgrade on
+        // `database is locked` the way production writers do instead of
+        // failing the fixture on a transient lock.
+        let mut attempts = 0;
+        loop {
+            match conn
+                .execute(
+                    queries::UPSERT_META,
+                    ["schema_version", &(SCHEMA_VERSION - 1).to_string()],
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(err) if attempts < 100 && err.to_string().to_lowercase().contains("locked") => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("failed to downgrade schema_version: {err}"),
+            }
+        }
     });
+    // Land the downgraded index on a NEW inode, the same shape as the
+    // build-aside swap that installs any prior-version index in production
+    // (e.g. an older binary's reindex). A warm daemon in the shared HOME may
+    // hold an already-validated handle to the old inode — the schema gate is
+    // validated at adoption, not per query — so an in-place meta edit alone
+    // would be served from that handle and never reach the fail-closed path.
+    // The inode change forces `reopen_if_index_swapped` -> `prepare_for_write`
+    // to revalidate and refuse the stale schema, making the CLI fall back to
+    // its local fail-closed check deterministically, daemon or no daemon.
+    // (Any live WAL carrying the meta edit stays alongside `index.db` and is
+    // replayed against the byte-identical copy, so the downgrade remains
+    // visible either way.)
+    let stale_copy = db_path.with_extension("db.stale");
+    fs::copy(&db_path, &stale_copy).unwrap();
+    fs::rename(&stale_copy, &db_path).unwrap();
 
     let (stdout, stderr, ok) = run_core_cmd(&[
         "search",
