@@ -95,6 +95,7 @@ impl OneupMcpServer {
                         // Generate and return facts envelope instead of indexing
                         // Gate fires before ops::start to prevent background spawning
                         let facts = match ops::generate_facts_envelope(
+                            &roots.state_root,
                             &roots.source_root,
                             roots.launch_subdir.clone(),
                         )

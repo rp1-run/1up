@@ -305,7 +305,9 @@ pub async fn exec(args: StartArgs, format: OutputFormat) -> anyhow::Result<()> {
         };
 
         // Gate fires: return facts envelope instead of indexing
-        match crate::mcp::ops::generate_facts_envelope(&source_root, launch_subdir).await {
+        match crate::mcp::ops::generate_facts_envelope(&project_root, &source_root, launch_subdir)
+            .await
+        {
             Ok(facts) => {
                 // Output facts envelope in appropriate format
                 match format {
