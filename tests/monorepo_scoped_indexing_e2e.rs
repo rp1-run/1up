@@ -1009,6 +1009,186 @@ edition = "2021"
     total_files
 }
 
+/// Create a small git-backed fixture with `num_files` tracked files in one cone.
+///
+/// Paired with a low `ONEUP_FILE_COUNT_THRESHOLD`, the daemon treats it as
+/// over-threshold and runs the first-index gate walk — without needing a
+/// multi-thousand-file fixture. Returns the number of tracked files created.
+#[allow(dead_code)]
+fn create_small_gate_fixture(root: &Path, num_files: usize) -> usize {
+    let git_dir = root.join(".git");
+    fs::create_dir_all(git_dir.join("objects")).unwrap();
+    fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        git_dir.join("refs").join("heads").join("main"),
+        "0000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "build/\ntarget/\n").unwrap();
+
+    let cone = root.join("src");
+    fs::create_dir_all(&cone).unwrap();
+    for i in 0..num_files {
+        fs::write(
+            cone.join(format!("file_{i:04}.rs")),
+            format!("// file {i}\npub fn module_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    num_files
+}
+
+/// SIGTERM during the daemon's first-index gate walk aborts cooperatively instead
+/// of ignoring the signal or opening the file-count gate.
+///
+/// Regression for issue #85: on a large over-threshold repo the daemon ran the
+/// gitignore-aware gate walk on a blocking thread. A mid-walk SIGTERM was ignored
+/// until the (potentially minutes-long) walk finished, and a cancelled walk was
+/// swallowed to `file_count = 0`, which passes the file-count gate and started a
+/// first index during the shutdown drain.
+///
+/// A test-only throttle (`ONEUP_TEST_GATE_WALK_ENTRY_DELAY_MS`) holds the walk
+/// open on a small fixture so the SIGTERM lands mid-walk deterministically without
+/// a huge fixture (debug-build friendly). Assertions:
+/// - the daemon exits well within the throttled walk's natural duration, proving
+///   the in-flight walk observed the cancellation token (defect 1 wiring); and
+/// - no `index_status.json` is written, proving the cancelled walk did not collapse
+///   to `file_count = 0` and open a first-index pass during drain (defect 2).
+#[test]
+#[cfg(unix)]
+fn test_daemon_gate_walk_sigterm_aborts_without_opening_gate() {
+    let _guard = HideModelGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+
+    // ~400 entries * a 500ms sleep every 10 entries keeps the uncancelled walk
+    // open for ~20s — a wide, deterministic window to land SIGTERM mid-walk. A low
+    // threshold makes this small fixture "over-threshold" so the gate is engaged.
+    create_small_gate_fixture(&root, 400);
+
+    let client = McpTestClient::start_with_isolated_state_and_envs(
+        &root,
+        &[
+            ("ONEUP_FILE_COUNT_THRESHOLD", "10"),
+            ("ONEUP_TEST_GATE_WALK_ENTRY_DELAY_MS", "500"),
+        ],
+    );
+    let server_pid = client.child.id();
+
+    // The MCP server auto-spawns a daemon on startup; that daemon marks the freshly
+    // registered project dirty and runs the first-index gate walk immediately, held
+    // open by the throttle. Discover it via the parent relationship, never a
+    // machine-wide pattern match.
+    let mut daemon_pid: Option<i32> = None;
+    for _ in 0..40 {
+        let output = std::process::Command::new("pgrep")
+            .args(["-P", &server_pid.to_string(), "-f", "__worker"])
+            .output()
+            .expect("pgrep should run");
+        if let Some(pid) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<i32>().ok())
+        {
+            daemon_pid = Some(pid);
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let daemon_pid = daemon_pid.expect("MCP server should spawn a __worker daemon child");
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    // Drop the client so the MCP server exits on stdin EOF; the daemon then
+    // reparents to init and its eventual exit is reaped there. Probing exit while
+    // the parent server is still alive would read the daemon's zombie as alive
+    // forever. The daemon persists across the parent exit and keeps running the
+    // throttled gate walk.
+    drop(client);
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        alive(daemon_pid),
+        "daemon (pid {daemon_pid}) should persist across parent exit and still be walking the gate"
+    );
+
+    // SIGTERM mid-walk: the throttle keeps the walk open well past this point.
+    let sigterm_at = std::time::Instant::now();
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+
+    // A worker that ignored SIGTERM during the walk (the #85 regression) would run
+    // the whole ~20s walk before exiting; a cooperative one exits within a couple
+    // of throttle intervals.
+    let mut exited = false;
+    for _ in 0..16 {
+        if !alive(daemon_pid) {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let exit_elapsed = sigterm_at.elapsed();
+    if !exited {
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        exited && exit_elapsed < Duration::from_secs(8),
+        "daemon (pid {daemon_pid}) did not exit promptly on SIGTERM during the gate walk \
+         (elapsed {exit_elapsed:?}); the in-flight walk did not observe cancellation"
+    );
+
+    // Only a real pipeline pass writes index_status.json (the daemon gate paths
+    // write only daemon_context_status.json). Its absence proves the cancelled walk
+    // aborted instead of collapsing to file_count=0 and opening a first index.
+    let index_status = root.join(".1up").join("index_status.json");
+    assert!(
+        !index_status.exists(),
+        "index_status.json must not exist: a cancelled gate walk must not open a first index"
+    );
+
+    // Discriminate the cancelled-walk abort from an idle gate-blocked daemon,
+    // which would also satisfy every assertion above (alive at +2s, prompt exit,
+    // no index_status.json). The abort arm records `last_refresh_state: pending`
+    // in daemon_context_status.json (a re-index is still owed), while the
+    // gate-block path calls `mark_refresh_finished(.., Ok(()))` and records
+    // `complete`. Seeing `complete` (or anything non-pending) here means the
+    // throttle was silently inert, the walk finished in milliseconds, and the
+    // gate blocked normally — i.e. the test passed vacuously without exercising
+    // mid-walk cancellation at all.
+    let context_status_path = root.join(".1up").join("daemon_context_status.json");
+    let context_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&context_status_path)
+            .expect("daemon_context_status.json must exist: the daemon persists it both on the abort path and on the gate-block path"),
+    )
+    .expect("daemon_context_status.json must be valid JSON");
+    let contexts = context_status["contexts"]
+        .as_object()
+        .expect("daemon_context_status.json must have a contexts map");
+    assert_eq!(
+        contexts.len(),
+        1,
+        "fixture registers exactly one context, got: {contexts:?}"
+    );
+    let refresh_state = contexts
+        .values()
+        .next()
+        .and_then(|ctx| ctx["last_refresh_state"].as_str())
+        .expect("context entry must carry last_refresh_state");
+    assert_eq!(
+        refresh_state, "pending",
+        "cancelled gate walk must record last_refresh_state=pending (re-index still owed); \
+         a non-pending state (e.g. `complete` from the gate-block path) means the throttle \
+         was inert and the walk completed before SIGTERM — the test would be passing \
+         vacuously without covering mid-walk cancellation"
+    );
+}
+
 /// Gate fires on over-threshold repository without scope
 ///
 /// Acceptance: On an over-threshold Missing repo, launch MCP server with daemon alive,
