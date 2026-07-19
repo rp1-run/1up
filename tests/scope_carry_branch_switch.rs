@@ -78,6 +78,7 @@ async fn scope_carry_branch_switch_database_sharing() {
         }),
         prefilter: None,
         indexer_pid: None,
+        run_id: None,
         updated_at: chrono::Utc::now(),
     };
     let json = serde_json::to_string_pretty(&progress).unwrap();

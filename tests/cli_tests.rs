@@ -2260,6 +2260,21 @@ fn segment_count_for_file_panics_on_database_errors() {
     segment_count_for_file(&dir, "src/lib.rs");
 }
 
+/// The fail-loud contract must also hold past a successful open: a database
+/// that opens but cannot serve the tuned connection / queries (garbage bytes
+/// instead of a SQLite file) must panic somewhere in the helper, never read
+/// as zero. The expected message is the helper's common panic prefix, so the
+/// test pins fail-loud behavior wherever the corruption is first detected.
+#[test]
+#[should_panic(expected = "segment_count_for_file:")]
+fn segment_count_for_file_panics_on_unreadable_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(dir.join(".1up")).unwrap();
+    fs::write(project_db_path(&dir), b"this is not a sqlite database").unwrap();
+    segment_count_for_file(&dir, "src/lib.rs");
+}
+
 fn seed_current_index_for_context(dir: &Path, context_id: &str) {
     fs::create_dir_all(dir.join(".1up")).unwrap();
     fs::write(dir.join(".1up").join("project_id"), "context-count-project").unwrap();

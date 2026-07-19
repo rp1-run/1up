@@ -755,6 +755,12 @@ pub enum IndexState {
     Idle,
     Running,
     Complete,
+    /// Terminal state of an indexing run that failed after publishing
+    /// `Running` progress. Distinct from `Idle` so readiness classification
+    /// can keep reporting the failure (blocked/degraded with the recorded
+    /// reason) instead of silently reverting to ready/missing; superseded by
+    /// the next run's progress writes.
+    Failed,
 }
 
 /// Current milestone within an indexing run.
@@ -817,6 +823,14 @@ pub struct IndexProgress {
     /// PID of the indexing process, used for liveness checks
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexer_pid: Option<u32>,
+    /// Identity of the `oneup_start` run that published this record (stamped
+    /// on the pre-spawn scope snapshot and on terminal failure records). A
+    /// PID alone cannot distinguish overlapping starts within the same
+    /// long-lived MCP process, so failure cleanup keys on this to avoid
+    /// overwriting a newer run's record. Pipeline progress writes leave it
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -846,6 +860,7 @@ impl IndexProgress {
             scope: None,
             prefilter: None,
             indexer_pid: None,
+            run_id: None,
             updated_at: Utc::now(),
         }
     }

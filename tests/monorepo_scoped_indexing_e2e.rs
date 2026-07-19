@@ -1769,16 +1769,16 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         }),
     );
 
-    // The scoped start must have been accepted: `ops::start` now makes scope
-    // publication part of the start outcome (a scope that cannot be validated
-    // or durably recorded returns `blocked` instead of spawning), so any
-    // non-blocked scoped start guarantees the requested scope is already
-    // persisted.
+    // The scoped start must land in the exact accepted state: `ops::start`
+    // publishes the scope (a Running snapshot) before spawning and detaches at
+    // the zero response budget, so the returned readiness deterministically
+    // classifies as `indexing` — publication failure would be `blocked`, and a
+    // skipped publication would read `missing`.
     let scoped_start_envelope = mcp_structured(&scoped_start_result);
-    let start_status = scoped_start_envelope["status"].as_str().unwrap_or_default();
-    assert!(
-        start_status != "blocked" && start_status != "error",
-        "scoped start must be accepted; got envelope: {scoped_start_envelope}"
+    assert_eq!(
+        scoped_start_envelope["status"].as_str(),
+        Some("indexing"),
+        "scoped start must return the accepted (indexing) readiness; got envelope: {scoped_start_envelope}"
     );
 
     // No sleep: `ops::start` records the requested scope in the progress file

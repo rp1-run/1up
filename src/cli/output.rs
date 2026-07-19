@@ -1805,6 +1805,7 @@ fn render_index_state_human(state: IndexState) -> String {
         IndexState::Idle => "idle".dimmed().to_string(),
         IndexState::Running => "running".yellow().to_string(),
         IndexState::Complete => "complete".green().to_string(),
+        IndexState::Failed => "failed".red().to_string(),
     }
 }
 
@@ -1939,6 +1940,7 @@ fn render_index_state_plain(state: IndexState) -> &'static str {
         IndexState::Idle => "idle",
         IndexState::Running => "running",
         IndexState::Complete => "complete",
+        IndexState::Failed => "failed",
     }
 }
 
@@ -2445,6 +2447,7 @@ mod tests {
             scope: None,
             prefilter: None,
             indexer_pid: None,
+            run_id: None,
             updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-03T06:07:08Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),

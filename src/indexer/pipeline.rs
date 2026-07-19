@@ -157,6 +157,10 @@ fn refresh_progress(
         scope,
         prefilter: update.prefilter,
         indexer_pid: Some(std::process::id()),
+        // Pipeline writes carry no per-start identity; MCP failure cleanup
+        // claims them only while holding the rebuild lock (see
+        // `record_rebuild_failure_progress` in mcp/ops.rs).
+        run_id: None,
         updated_at: chrono::Utc::now(),
     };
     if update.persist {
