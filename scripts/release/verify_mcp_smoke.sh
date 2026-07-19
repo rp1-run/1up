@@ -120,32 +120,66 @@ class SmokeFailure(Exception):
         self.protocol_clean = protocol_clean
 
 
+class KnownIssue110Failure(SmokeFailure):
+    """The tracked rp1-run/1up#110 shape: `oneup_search` yields no fixture
+    PolicyRuleValidator hit (an empty result set or a result set without the
+    hit). The known-issue gate keys on this exact type, never on message
+    text, so an unrelated failure whose message happens to contain the same
+    words can never be converted into a known-issue pass."""
+
+
 FIXTURE_SEARCH_HIT_MISSING = (
     "oneup_search did not return the fixture PolicyRuleValidator hit"
 )
 
 
+def strip_extended_length_prefix(path):
+    r"""Strips Windows extended-length prefixes (``//?/`` and ``//?/UNC/``)
+    from an already forward-slashed path."""
+    if path.startswith("//?/UNC/"):
+        return "//" + path[len("//?/UNC/") :]
+    if path.startswith("//?/"):
+        return path[len("//?/") :]
+    return path
+
+
+# Forward-slashed, prefix-stripped spellings of the fixture repository root
+# (as given and fully resolved); populated once ``repo_path`` is parsed.
+FIXTURE_REPO_ROOT_VARIANTS = []
+
+
 def normalize_fixture_path(value):
     r"""Normalize a repository path for fixture comparison.
 
-    Collapses Windows backslash separators to forward slashes and strips
-    extended-length path prefixes (``\\?\`` and ``\\?\UNC\``) so a Windows
-    result path such as ``src\policy.rs`` matches the expected
-    ``src/policy.rs``.
+    Collapses Windows backslash separators to forward slashes, strips
+    extended-length path prefixes (``\\?\`` and ``\\?\UNC\``), and
+    relativizes a path under the fixture repository root — an absolute
+    result path such as ``C:\runner\fixture\src\policy.rs`` can never
+    compare equal to the fixture-relative ``src/policy.rs`` otherwise.
+    Absolute paths outside the fixture root are returned as-is, so they
+    simply never match a fixture expectation.
     """
     if not isinstance(value, str):
         return value
-    normalized = value.replace("\\", "/")
-    if normalized.startswith("//?/UNC/"):
-        return "//" + normalized[len("//?/UNC/") :]
-    if normalized.startswith("//?/"):
-        return normalized[len("//?/") :]
+    normalized = strip_extended_length_prefix(value.replace("\\", "/"))
+    # Windows paths compare case-insensitively (drive letter and 8.3 casing
+    # both vary across producers); POSIX paths do not.
+    haystack = normalized.lower() if sys.platform == "win32" else normalized
+    for root in FIXTURE_REPO_ROOT_VARIANTS:
+        needle = root.lower() if sys.platform == "win32" else root
+        if haystack.startswith(needle + "/"):
+            return normalized[len(root) + 1 :]
     return normalized
 
 
-def matches_known_issue_110(message):
-    """True when a failure message matches the tracked #110 search shape."""
-    return isinstance(message, str) and FIXTURE_SEARCH_HIT_MISSING in message
+def parse_line_number(value):
+    """Best-effort integer conversion: ``None`` for malformed metadata, so a
+    bad record reads as a non-match instead of crashing the smoke before its
+    diagnostics are captured."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # Hard expiry for the #110 known-issue gate: on/after this date the gate no
@@ -156,21 +190,27 @@ KNOWN_ISSUE_110_EXPIRY = "2026-10-15"
 def known_issue_110_gate_decision():
     """Decide whether the #110 known-issue gate converts the matched failure.
 
-    Returns ``(active, reason)``. ``ONEUP_SMOKE_KNOWN_ISSUE_110`` overrides
-    the default: ``"0"`` forces the gate off (hard-fail restored), ``"1"``
-    forces it on. Unset, the gate applies until ``KNOWN_ISSUE_110_EXPIRY``
-    and hard-fails on/after it.
+    Returns ``(active, reason)``. ``ONEUP_SMOKE_KNOWN_ISSUE_110=0`` forces
+    the gate off (hard-fail restored) and is always honored. The hard expiry
+    is enforced next: on/after ``KNOWN_ISSUE_110_EXPIRY`` the gate is off and
+    no override can extend it — re-keying the deadline requires a deliberate
+    edit here. Before expiry, ``"1"`` forces the gate on and unset defaults
+    to on.
     """
     override = os.environ.get("ONEUP_SMOKE_KNOWN_ISSUE_110", "")
     if override == "0":
         return False, "ONEUP_SMOKE_KNOWN_ISSUE_110=0 forces the gate off"
-    if override == "1":
-        return True, "ONEUP_SMOKE_KNOWN_ISSUE_110=1 forces the gate on"
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if today >= KNOWN_ISSUE_110_EXPIRY:
         return False, (
             f"gate expired on {KNOWN_ISSUE_110_EXPIRY}; fix rp1-run/1up#110 "
-            "or deliberately re-key/extend KNOWN_ISSUE_110_EXPIRY"
+            "or deliberately re-key/extend KNOWN_ISSUE_110_EXPIRY "
+            "(ONEUP_SMOKE_KNOWN_ISSUE_110=1 cannot extend the hard expiry)"
+        )
+    if override == "1":
+        return True, (
+            "ONEUP_SMOKE_KNOWN_ISSUE_110=1 forces the gate on "
+            f"(until the hard expiry {KNOWN_ISSUE_110_EXPIRY})"
         )
     return True, f"default gate active until {KNOWN_ISSUE_110_EXPIRY}"
 
@@ -178,6 +218,10 @@ def known_issue_110_gate_decision():
 binary_path = sys.argv[1]
 repo_path = sys.argv[2]
 output_path = sys.argv[3]
+for _root in (repo_path, str(Path(repo_path).resolve())):
+    _cleaned = strip_extended_length_prefix(_root.replace("\\", "/")).rstrip("/")
+    if _cleaned and _cleaned not in FIXTURE_REPO_ROOT_VARIANTS:
+        FIXTURE_REPO_ROOT_VARIANTS.append(_cleaned)
 server_command = [binary_path, "mcp", "--path", repo_path]
 artifact = {
     "schema": "mcp_smoke.v2",
@@ -258,6 +302,14 @@ def ensure_fixture_repo():
     for relative_path, content in FIXTURE_FILES.items():
         path = repo / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Never write through a symlink or onto a non-regular file: the
+        # rewrite below must only ever mutate the fixture file itself, not
+        # whatever an existing link happens to point at.
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SmokeFailure(
+                f"fixture path {relative_path} exists but is not a regular "
+                "file; refusing to overwrite it"
+            )
         # Compare raw bytes: read_text universal newlines would treat a
         # CRLF-on-disk fixture as equal and silently keep it.
         if path.exists() and path.read_bytes() == content.encode("utf-8"):
@@ -482,23 +534,31 @@ def require_records_data(envelope, label):
 
 
 def require_fixture_search_hit(results, response=None, request=None):
+    # Capture the raw payload BEFORE parsing any result field: a malformed
+    # record must never escape this function without the diagnostics needed
+    # to explain it. Cleared again on the success path below.
+    artifact["search_debug"] = {
+        "request": request,
+        "response": response,
+    }
     for result in results:
         if not isinstance(result, dict):
             continue
+        line_start = parse_line_number(result.get("line_start", 0))
+        line_end = parse_line_number(result.get("line_end", 0))
         if (
             normalize_fixture_path(result.get("path")) == "src/policy.rs"
             and result.get("symbol") == "PolicyRuleValidator"
             and isinstance(result.get("handle"), str)
             and result["handle"].strip()
-            and int(result.get("line_start", 0)) <= 1
-            and int(result.get("line_end", 0)) >= 1
+            and line_start is not None
+            and line_start <= 1
+            and line_end is not None
+            and line_end >= 1
         ):
+            artifact.pop("search_debug", None)
             return result
-    artifact["search_debug"] = {
-        "request": request,
-        "response": response,
-    }
-    raise SmokeFailure(FIXTURE_SEARCH_HIT_MISSING)
+    raise KnownIssue110Failure(FIXTURE_SEARCH_HIT_MISSING)
 
 
 def require_fixture_segment(records):
@@ -767,12 +827,25 @@ try:
     )
     search_envelope = require_tool_envelope(search_result, "search", "oneup_search")
     search_results = search_envelope["data"].get("results")
-    if not isinstance(search_results, list) or not search_results:
+    if not isinstance(search_results, list):
+        # A structurally malformed envelope is NOT the #110 shape: it stays a
+        # hard failure everywhere.
         artifact["search_debug"] = {
             "request": search_arguments,
             "response": search_result,
         }
         raise SmokeFailure("oneup_search did not return structured ranked results")
+    if not search_results:
+        # An empty result set is the primary #110 failure shape — route it
+        # through the same typed failure as a present-but-hitless result set
+        # so the Windows known-issue gate recognizes both.
+        artifact["search_debug"] = {
+            "request": search_arguments,
+            "response": search_result,
+        }
+        raise KnownIssue110Failure(
+            f"oneup_search returned an empty result set; {FIXTURE_SEARCH_HIT_MISSING}"
+        )
     hit = require_fixture_search_hit(search_results, search_result, search_arguments)
     handle = hit.get("handle")
     if not isinstance(handle, str) or not handle.strip():
@@ -864,7 +937,7 @@ except SmokeFailure as exc:
         stderr = "".join(stderr_lines).strip()
         if stderr:
             artifact["diagnostics"].append(f"MCP stderr: {stderr[-1000:]}")
-    if sys.platform == "win32" and matches_known_issue_110(str(exc)):
+    if sys.platform == "win32" and isinstance(exc, KnownIssue110Failure):
         gate_active, gate_reason = known_issue_110_gate_decision()
         print(
             "[release-assets] WARNING: known-issue rp1-run/1up#110 gate "
