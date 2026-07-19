@@ -31,11 +31,17 @@ fn main() {
 
     // Refresh the stamp when git state moves. HEAD moves on checkout, the ref
     // file and packed-refs move on commit, and the index moves on `git add`.
-    // A bare unstaged working-tree edit does not touch any of these, so the
-    // `.dirty` suffix (digest included) only refreshes on the next commit,
-    // stage, or clean rebuild; the trust-critical path (release builds) is a
-    // clean committed tree, where the stamp is exact.
     emit_git_rerun_triggers();
+
+    // Refresh the stamp on bare unstaged edits too. Git metadata alone misses
+    // them: an unstaged tracked-file edit recompiles the crate without touching
+    // HEAD, the index, or any ref, so Cargo would reuse the previous
+    // `ONEUP_BUILD_IDENTITY` and the rebuilt binary — compiled from *different*
+    // source — would carry the old dirty digest and still pass the exact-match
+    // authority gate. Registering every tracked file closes that hole: any
+    // tracked edit reruns this script, the `git diff HEAD` digest refreshes,
+    // and the changed env var recompiles the consumers.
+    emit_tracked_file_rerun_triggers();
 }
 
 /// Suffix discriminating dirty builds, or `""` for a clean tree.
@@ -53,8 +59,10 @@ fn main() {
 /// computed with `git hash-object --stdin` (git's blob object id) rather than
 /// SHA-256 so the build script needs no crate dependencies; 8 hex chars gives
 /// collision *discrimination* between concurrent working states, not
-/// cryptographic integrity, and it only refreshes when the build script
-/// reruns (see `emit_git_rerun_triggers` for the limits).
+/// cryptographic integrity. The script reruns whenever git metadata or any
+/// tracked file changes (see `emit_git_rerun_triggers` and
+/// `emit_tracked_file_rerun_triggers`), so the digest tracks every rebuild
+/// that can consume changed tracked source.
 ///
 /// If the digest probe fails, degrade to plain `.dirty`: still conservatively
 /// marked dirty, merely without cross-dirty-build discrimination.
@@ -170,10 +178,44 @@ fn emit_git_rerun_triggers() {
         println!("cargo:rerun-if-changed={}", packed_refs.display());
     }
 
+    // Registered even when the loose ref file does not exist yet: with
+    // packed-only refs (post `git pack-refs`, or a linked worktree cut from
+    // one) the first commit *creates* the loose ref, and an existence guard
+    // here would have suppressed the one directive that could observe it —
+    // baking the pre-commit hash into the next build. Cargo treats a missing
+    // registered path as always-changed, so until the loose ref appears this
+    // script reruns each build; that is a few git probes, and the unchanged
+    // identity env means no recompilation cascades.
     if let Some(ref_path) = head_ref_path(&git_dir, &common_dir) {
-        if ref_path.exists() {
-            println!("cargo:rerun-if-changed={}", ref_path.display());
-        }
+        println!("cargo:rerun-if-changed={}", ref_path.display());
+    }
+}
+
+/// Emits `cargo:rerun-if-changed` for every git-tracked file, so a bare
+/// unstaged edit — which changes no git metadata — still reruns this script
+/// and refreshes the dirty digest before the crate rebuilds from the edited
+/// source.
+///
+/// Untracked files are deliberately not registered: they never enter the
+/// digest, so their churn must not rerun the script. A tracked file deleted
+/// from the working tree registers a missing path, which Cargo treats as
+/// always-changed — the script then reruns each build (cheap) while the
+/// digest, which already reflects the deletion via `git diff HEAD`, stays
+/// stable, so no recompilation cascades. Degrades to no-op without git.
+fn emit_tracked_file_rerun_triggers() {
+    let Ok(output) = git().args(["ls-files", "-z"]).output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    for path in output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| std::str::from_utf8(p).ok())
+    {
+        println!("cargo:rerun-if-changed={path}");
     }
 }
 
