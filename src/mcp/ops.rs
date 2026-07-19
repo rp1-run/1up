@@ -688,6 +688,76 @@ fn maybe_panic_for_test(state_root: &Path) {
     }
 }
 
+/// Serializes this process's `index_status.json` publication and
+/// failure-cleanup writes.
+///
+/// `record_rebuild_failure_progress` is a read-check-write: it reads the
+/// current record, decides ownership, then persists the terminal snapshot.
+/// Pre-spawn scope publication (`write_initial_scope_progress`) deliberately
+/// runs WITHOUT the rebuild lock — `ops::start` must not block behind a
+/// long-running rebuild — so without mutual exclusion a newer start's
+/// publication can land between an older failure's ownership check and its
+/// write, and the stale `Failed` snapshot would silently overwrite the newer
+/// run's `Running` record. Holding this lock across both operations makes the
+/// ownership check atomic with respect to publications. Pipeline progress
+/// writes need no seat here: a run's pipeline only writes after that run's
+/// publication, which this lock already orders after any in-flight cleanup.
+/// (Cross-process writers — daemon, CLI — are outside this lock and remain
+/// guarded by the PID check alone.)
+fn progress_publication_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(Default::default)
+}
+
+/// Test-only rendezvous for pausing a failure cleanup between its ownership
+/// check and its terminal write (inside the publication lock), so tests can
+/// deterministically drive the cleanup-vs-newer-publication interleaving.
+/// Keyed by state root so concurrently running tests can never trip each
+/// other's gate.
+#[cfg(test)]
+type CleanupPauseGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static CLEANUP_PAUSE_GATES: OnceLock<Mutex<std::collections::HashMap<PathBuf, CleanupPauseGate>>> =
+    OnceLock::new();
+
+/// Arms a one-shot pause in the next failure cleanup for `state_root`.
+/// Returns (`reached`, `proceed`): `reached` resolves once the cleanup has
+/// passed its ownership check and holds the publication lock; sending on
+/// `proceed` lets it continue to the write.
+#[cfg(test)]
+fn arm_cleanup_pause_for_test(
+    state_root: &Path,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    CLEANUP_PAUSE_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(state_root.to_path_buf(), (reached_tx, proceed_rx));
+    (reached_rx, proceed_tx)
+}
+
+#[cfg(test)]
+async fn maybe_pause_cleanup_for_test(state_root: &Path) {
+    let gate = CLEANUP_PAUSE_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(state_root);
+    if let Some((reached_tx, proceed_rx)) = gate {
+        let _ = reached_tx.send(());
+        let _ = proceed_rx.await;
+    }
+}
+
 /// Human-readable reason extracted from a caught panic payload.
 fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
     panic
@@ -2019,6 +2089,10 @@ async fn write_initial_scope_progress(
         run_id: Some(run_id.to_string()),
         updated_at: chrono::Utc::now(),
     };
+    // Under the publication lock so this write can never land inside a
+    // concurrent failure cleanup's read-check-write window (see
+    // `progress_publication_lock`).
+    let _publication_guard = progress_publication_lock().lock().await;
     write_index_progress_atomic(&roots.state_root, &initial_progress).await
 }
 
@@ -2055,6 +2129,11 @@ enum RebuildLockHeld {
 ///   rule stays strict, so an older start can never overwrite a record
 ///   published by a newer overlapping start in the same process.
 ///
+/// The whole read-check-write runs under `progress_publication_lock`, which
+/// pre-spawn publication also takes: the ownership check would otherwise be
+/// checked-then-stale, letting a newer start publish between this run's check
+/// and its write.
+///
 /// Counters and scope from the failed attempt are preserved so the terminal
 /// snapshot still shows what was attempted. A cleanup failure is logged, not
 /// propagated: the caller's blocked readiness already carries the primary
@@ -2065,6 +2144,11 @@ async fn record_rebuild_failure_progress(
     lock_held: RebuildLockHeld,
     reason: &str,
 ) {
+    // Hold the publication lock across the read, the ownership check, and the
+    // write: the check is only meaningful if no publication can land in
+    // between, and pre-spawn publication does not take the rebuild lock (see
+    // `progress_publication_lock`).
+    let _publication_guard = progress_publication_lock().lock().await;
     let Some(progress) = read_index_progress(&roots.state_root).await else {
         return;
     };
@@ -2078,6 +2162,8 @@ async fn record_rebuild_failure_progress(
     if !owned {
         return;
     }
+    #[cfg(test)]
+    maybe_pause_cleanup_for_test(&roots.state_root).await;
     let terminal = IndexProgress {
         state: IndexState::Failed,
         message: Some(format!("indexing failed: {reason}")),
@@ -6869,6 +6955,59 @@ mod tests {
             IndexState::Failed,
             "under the lock, the holder's own pipeline record must be reclaimed"
         );
+    }
+
+    /// The ownership check must be atomic with the write it guards: a newer
+    /// start's publication (which never takes the rebuild lock) must not be
+    /// able to land between an older failure cleanup's read-check and its
+    /// terminal write, or the stale `Failed` snapshot would overwrite the
+    /// newer run's `Running` record. This drives that exact interleaving via
+    /// the test gate: run-a's cleanup is paused after its ownership check,
+    /// run-b publishes concurrently, and the newer record must win.
+    #[tokio::test]
+    async fn stale_failure_cleanup_cannot_clobber_a_concurrent_newer_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = scope_progress_test_roots(tmp.path());
+        write_initial_scope_progress(&roots, &["services/auth".to_string()], "run-a")
+            .await
+            .unwrap();
+
+        // Pause run-a's cleanup between its ownership check (which passes:
+        // the record IS run-a's right now) and its terminal write.
+        let (reached, proceed) = arm_cleanup_pause_for_test(&roots.state_root);
+        let cleanup_roots = roots.clone();
+        let cleanup = tokio::spawn(async move {
+            record_rebuild_failure_progress(&cleanup_roots, "run-a", RebuildLockHeld::No, "boom")
+                .await;
+        });
+        reached.await.expect("cleanup must reach its paused write");
+
+        // A newer start (run-b) publishes while the cleanup's check is stale.
+        // It must block until the in-flight cleanup finishes its write.
+        let publish_roots = roots.clone();
+        let mut publication = tokio::spawn(async move {
+            write_initial_scope_progress(&publish_roots, &["libs/core".to_string()], "run-b").await
+        });
+        let raced =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut publication).await;
+        assert!(
+            raced.is_err(),
+            "run-b's publication must not land inside run-a's read-check-write window"
+        );
+
+        proceed.send(()).expect("paused cleanup must be waiting");
+        cleanup.await.unwrap();
+        publication.await.unwrap().unwrap();
+
+        let progress = read_index_progress(&roots.state_root)
+            .await
+            .expect("the newer run's record must survive");
+        assert_eq!(
+            progress.state,
+            IndexState::Running,
+            "run-a's stale failure write must not clobber run-b's Running record"
+        );
+        assert_eq!(progress.run_id.as_deref(), Some("run-b"));
     }
 
     /// A persisted `Failed` record must keep the failure visible to readiness
