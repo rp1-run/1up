@@ -2174,24 +2174,33 @@ fn create_current_index(dir: &Path) {
 
 /// Count segments stored for `file_path` (repo-relative) in the first worktree
 /// context of the project's index. Returns 0 if the DB/context/file is absent.
+/// Counts the indexed segments recorded for `file_path`.
+///
+/// Errors PANIC instead of reading as zero: every caller asserts against the
+/// real count after a successful index, and an error swallowed into `0` turns
+/// a transient `SQLITE_BUSY` (e.g. the CLI-spawned daemon holding the index
+/// open) into a false "file not indexed" flake. `connect_tuned` applies the
+/// read pragma profile, whose `busy_timeout` rides out that contention. Only
+/// a genuinely empty index (no recorded contexts) legitimately counts zero.
 fn segment_count_for_file(dir: &Path, file_path: &str) -> usize {
     block_on(async {
-        let Ok(db) = Db::open_ro(&project_db_path(dir)).await else {
-            return 0;
-        };
-        let Ok(conn) = db.connect() else {
-            return 0;
-        };
-        let Ok(contexts) = segments::list_worktree_contexts(&conn).await else {
-            return 0;
-        };
+        let db = Db::open_ro(&project_db_path(dir))
+            .await
+            .expect("segment_count_for_file: open index db");
+        let conn = db
+            .connect_tuned()
+            .await
+            .expect("segment_count_for_file: connect");
+        let contexts = segments::list_worktree_contexts(&conn)
+            .await
+            .expect("segment_count_for_file: list worktree contexts");
         let Some(ctx) = contexts.first() else {
             return 0;
         };
         segments::get_segments_by_file_for_context(&conn, &ctx.context_id, file_path)
             .await
-            .map(|segs| segs.len())
-            .unwrap_or(0)
+            .expect("segment_count_for_file: query segments")
+            .len()
     })
 }
 
