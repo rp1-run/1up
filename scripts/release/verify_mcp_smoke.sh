@@ -289,6 +289,24 @@ def record_known_issue_110(reason):
     write_artifact("passed_with_known_issue")
 
 
+def require_real_ancestors(repo, relative_path):
+    """Rejects a symlinked (or otherwise non-directory) ancestor of a fixture
+    path, so a fixture write can never traverse a link out of the controlled
+    tree — the file-level guard below covers only the final path component.
+    Not-yet-existing ancestors are fine: mkdir creates them as real
+    directories. The repo root itself is already physically resolved by the
+    wrapping bash script (`pwd -P`)."""
+    current = repo
+    for part in Path(relative_path).parent.parts:
+        current = current / part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise SmokeFailure(
+                f"fixture ancestor {current.relative_to(repo)} of "
+                f"{relative_path} is not a real directory; refusing to write "
+                "through it"
+            )
+
+
 def ensure_fixture_repo():
     repo = Path(repo_path)
     repo.mkdir(parents=True, exist_ok=True)
@@ -301,6 +319,7 @@ def ensure_fixture_repo():
 
     for relative_path, content in FIXTURE_FILES.items():
         path = repo / relative_path
+        require_real_ancestors(repo, relative_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Never write through a symlink or onto a non-regular file: the
         # rewrite below must only ever mutate the fixture file itself, not
