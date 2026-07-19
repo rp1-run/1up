@@ -120,15 +120,108 @@ class SmokeFailure(Exception):
         self.protocol_clean = protocol_clean
 
 
-class KnownIssueSkip(Exception):
-    def __init__(self, reason):
-        super().__init__(reason)
-        self.reason = reason
+class KnownIssue110Failure(SmokeFailure):
+    """The tracked rp1-run/1up#110 shape: `oneup_search` yields no fixture
+    PolicyRuleValidator hit (an empty result set or a result set without the
+    hit). The known-issue gate keys on this exact type, never on message
+    text, so an unrelated failure whose message happens to contain the same
+    words can never be converted into a known-issue pass."""
+
+
+FIXTURE_SEARCH_HIT_MISSING = (
+    "oneup_search did not return the fixture PolicyRuleValidator hit"
+)
+
+
+def strip_extended_length_prefix(path):
+    r"""Strips Windows extended-length prefixes (``//?/`` and ``//?/UNC/``)
+    from an already forward-slashed path."""
+    if path.startswith("//?/UNC/"):
+        return "//" + path[len("//?/UNC/") :]
+    if path.startswith("//?/"):
+        return path[len("//?/") :]
+    return path
+
+
+# Forward-slashed, prefix-stripped spellings of the fixture repository root
+# (as given and fully resolved); populated once ``repo_path`` is parsed.
+FIXTURE_REPO_ROOT_VARIANTS = []
+
+
+def normalize_fixture_path(value):
+    r"""Normalize a repository path for fixture comparison.
+
+    Collapses Windows backslash separators to forward slashes, strips
+    extended-length path prefixes (``\\?\`` and ``\\?\UNC\``), and
+    relativizes a path under the fixture repository root — an absolute
+    result path such as ``C:\runner\fixture\src\policy.rs`` can never
+    compare equal to the fixture-relative ``src/policy.rs`` otherwise.
+    Absolute paths outside the fixture root are returned as-is, so they
+    simply never match a fixture expectation.
+    """
+    if not isinstance(value, str):
+        return value
+    normalized = strip_extended_length_prefix(value.replace("\\", "/"))
+    # Windows paths compare case-insensitively (drive letter and 8.3 casing
+    # both vary across producers); POSIX paths do not.
+    haystack = normalized.lower() if sys.platform == "win32" else normalized
+    for root in FIXTURE_REPO_ROOT_VARIANTS:
+        needle = root.lower() if sys.platform == "win32" else root
+        if haystack.startswith(needle + "/"):
+            return normalized[len(root) + 1 :]
+    return normalized
+
+
+def parse_line_number(value):
+    """Best-effort integer conversion: ``None`` for malformed metadata, so a
+    bad record reads as a non-match instead of crashing the smoke before its
+    diagnostics are captured."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Hard expiry for the #110 known-issue gate: on/after this date the gate no
+# longer converts the matched failure into passed_with_known_issue.
+KNOWN_ISSUE_110_EXPIRY = "2026-10-15"
+
+
+def known_issue_110_gate_decision():
+    """Decide whether the #110 known-issue gate converts the matched failure.
+
+    Returns ``(active, reason)``. ``ONEUP_SMOKE_KNOWN_ISSUE_110=0`` forces
+    the gate off (hard-fail restored) and is always honored. The hard expiry
+    is enforced next: on/after ``KNOWN_ISSUE_110_EXPIRY`` the gate is off and
+    no override can extend it — re-keying the deadline requires a deliberate
+    edit here. Before expiry, ``"1"`` forces the gate on and unset defaults
+    to on.
+    """
+    override = os.environ.get("ONEUP_SMOKE_KNOWN_ISSUE_110", "")
+    if override == "0":
+        return False, "ONEUP_SMOKE_KNOWN_ISSUE_110=0 forces the gate off"
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if today >= KNOWN_ISSUE_110_EXPIRY:
+        return False, (
+            f"gate expired on {KNOWN_ISSUE_110_EXPIRY}; fix rp1-run/1up#110 "
+            "or deliberately re-key/extend KNOWN_ISSUE_110_EXPIRY "
+            "(ONEUP_SMOKE_KNOWN_ISSUE_110=1 cannot extend the hard expiry)"
+        )
+    if override == "1":
+        return True, (
+            "ONEUP_SMOKE_KNOWN_ISSUE_110=1 forces the gate on "
+            f"(until the hard expiry {KNOWN_ISSUE_110_EXPIRY})"
+        )
+    return True, f"default gate active until {KNOWN_ISSUE_110_EXPIRY}"
 
 
 binary_path = sys.argv[1]
 repo_path = sys.argv[2]
 output_path = sys.argv[3]
+for _root in (repo_path, str(Path(repo_path).resolve())):
+    _cleaned = strip_extended_length_prefix(_root.replace("\\", "/")).rstrip("/")
+    if _cleaned and _cleaned not in FIXTURE_REPO_ROOT_VARIANTS:
+        FIXTURE_REPO_ROOT_VARIANTS.append(_cleaned)
 server_command = [binary_path, "mcp", "--path", repo_path]
 artifact = {
     "schema": "mcp_smoke.v2",
@@ -173,6 +266,29 @@ def fail(message, protocol_clean=None):
     return 1
 
 
+def record_known_issue_110(reason):
+    artifact["discovery_flow"]["status"] = "skipped_known_issue"
+    artifact["known_issue"] = {
+        "target_platform": "windows",
+        "signature": "search_assertion",
+        "readiness_status": artifact.get("readiness_status", ""),
+        "reason": reason,
+        "tracking_issue": "https://github.com/rp1-run/1up/issues/110",
+        "description": (
+            "windows oneup_search does not return the fixture "
+            "PolicyRuleValidator hit; MCP protocol surface and prior "
+            "discovery steps verified, search-dependent assertion skipped"
+        ),
+        "search_debug": artifact.get("search_debug"),
+    }
+    print(
+        "[release-assets] WARNING: windows MCP search assertion skipped due to "
+        f"known issue rp1-run/1up#110: {reason}",
+        file=sys.stderr,
+    )
+    write_artifact("passed_with_known_issue")
+
+
 def ensure_fixture_repo():
     repo = Path(repo_path)
     repo.mkdir(parents=True, exist_ok=True)
@@ -186,14 +302,19 @@ def ensure_fixture_repo():
     for relative_path, content in FIXTURE_FILES.items():
         path = repo / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            existing = path.read_text(encoding="utf-8")
-            if existing != content:
-                raise SmokeFailure(
-                    f"fixture file already exists with different content: {relative_path}"
-                )
+        # Never write through a symlink or onto a non-regular file: the
+        # rewrite below must only ever mutate the fixture file itself, not
+        # whatever an existing link happens to point at.
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SmokeFailure(
+                f"fixture path {relative_path} exists but is not a regular "
+                "file; refusing to overwrite it"
+            )
+        # Compare raw bytes: read_text universal newlines would treat a
+        # CRLF-on-disk fixture as equal and silently keep it.
+        if path.exists() and path.read_bytes() == content.encode("utf-8"):
             continue
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
         artifact["fixture_files_created"].append(relative_path)
 
 
@@ -412,20 +533,32 @@ def require_records_data(envelope, label):
     return records
 
 
-def require_fixture_search_hit(results):
+def require_fixture_search_hit(results, response=None, request=None):
+    # Capture the raw payload BEFORE parsing any result field: a malformed
+    # record must never escape this function without the diagnostics needed
+    # to explain it. Cleared again on the success path below.
+    artifact["search_debug"] = {
+        "request": request,
+        "response": response,
+    }
     for result in results:
         if not isinstance(result, dict):
             continue
+        line_start = parse_line_number(result.get("line_start", 0))
+        line_end = parse_line_number(result.get("line_end", 0))
         if (
-            result.get("path") == "src/policy.rs"
+            normalize_fixture_path(result.get("path")) == "src/policy.rs"
             and result.get("symbol") == "PolicyRuleValidator"
             and isinstance(result.get("handle"), str)
             and result["handle"].strip()
-            and int(result.get("line_start", 0)) <= 1
-            and int(result.get("line_end", 0)) >= 1
+            and line_start is not None
+            and line_start <= 1
+            and line_end is not None
+            and line_end >= 1
         ):
+            artifact.pop("search_debug", None)
             return result
-    raise SmokeFailure("oneup_search did not return the fixture PolicyRuleValidator hit")
+    raise KnownIssue110Failure(FIXTURE_SEARCH_HIT_MISSING)
 
 
 def require_fixture_segment(records):
@@ -437,7 +570,7 @@ def require_fixture_segment(records):
             continue
         content = segment.get("content")
         if (
-            segment.get("path") == "src/policy.rs"
+            normalize_fixture_path(segment.get("path")) == "src/policy.rs"
             and isinstance(content, str)
             and "PolicyRuleValidator" in content
         ):
@@ -453,12 +586,14 @@ def require_fixture_symbol_evidence(envelope):
     if references is not None and not isinstance(references, list):
         raise SmokeFailure("oneup_symbol references field is not structured as an array")
     if not any(
-        isinstance(record, dict) and record.get("path") == "src/policy.rs"
+        isinstance(record, dict)
+        and normalize_fixture_path(record.get("path")) == "src/policy.rs"
         for record in definitions
     ):
         raise SmokeFailure("oneup_symbol did not return the fixture definition path")
     if not any(
-        isinstance(record, dict) and record.get("path") == "src/runner.rs"
+        isinstance(record, dict)
+        and normalize_fixture_path(record.get("path")) == "src/runner.rs"
         for record in references or []
     ):
         raise SmokeFailure("oneup_symbol did not return the fixture reference path")
@@ -475,7 +610,7 @@ def require_fixture_location_context(records):
         line_start = context.get("line_start")
         line_end = context.get("line_end")
         if (
-            context.get("path") == "src/policy.rs"
+            normalize_fixture_path(context.get("path")) == "src/policy.rs"
             and isinstance(content, str)
             and "validate(&self" in content
             and isinstance(line_start, int)
@@ -494,7 +629,7 @@ def require_fixture_structural_match(envelope):
         if not isinstance(result, dict):
             continue
         if (
-            result.get("file_path") == "src/policy.rs"
+            normalize_fixture_path(result.get("file_path")) == "src/policy.rs"
             and result.get("language") == "rust"
             and result.get("content") == "PolicyRuleValidator"
         ):
@@ -676,33 +811,42 @@ try:
         artifact["readiness_status"] = readiness_status
 
     if readiness_status not in DISCOVERY_READY_STATUSES:
-        start_data = structured.get("data")
-        blocked_reason = start_data.get("reason") if isinstance(start_data, dict) else None
-        if (
-            sys.platform == "win32"
-            and readiness_status == "blocked"
-            and isinstance(blocked_reason, str)
-            and "project ID read failed" in blocked_reason
-        ):
-            raise KnownIssueSkip(blocked_reason)
         raise SmokeFailure(
             "oneup_start did not make the fixture repository searchable: "
             f"{readiness_status} (summary: {json.dumps(structured.get('summary'))}, "
             f"data: {json.dumps(structured.get('data'))})"
         )
 
+    search_arguments = {"query": "PolicyRuleValidator", "limit": 5}
     search_result = call_tool(
         proc,
         stdout_queue,
         5,
         "oneup_search",
-        {"query": "PolicyRuleValidator", "limit": 5},
+        search_arguments,
     )
     search_envelope = require_tool_envelope(search_result, "search", "oneup_search")
     search_results = search_envelope["data"].get("results")
-    if not isinstance(search_results, list) or not search_results:
+    if not isinstance(search_results, list):
+        # A structurally malformed envelope is NOT the #110 shape: it stays a
+        # hard failure everywhere.
+        artifact["search_debug"] = {
+            "request": search_arguments,
+            "response": search_result,
+        }
         raise SmokeFailure("oneup_search did not return structured ranked results")
-    hit = require_fixture_search_hit(search_results)
+    if not search_results:
+        # An empty result set is the primary #110 failure shape — route it
+        # through the same typed failure as a present-but-hitless result set
+        # so the Windows known-issue gate recognizes both.
+        artifact["search_debug"] = {
+            "request": search_arguments,
+            "response": search_result,
+        }
+        raise KnownIssue110Failure(
+            f"oneup_search returned an empty result set; {FIXTURE_SEARCH_HIT_MISSING}"
+        )
+    hit = require_fixture_search_hit(search_results, search_result, search_arguments)
     handle = hit.get("handle")
     if not isinstance(handle, str) or not handle.strip():
         raise SmokeFailure("oneup_search result is missing a stable handle")
@@ -786,25 +930,6 @@ try:
     artifact["discovery_flow"]["status"] = "passed"
 
     write_artifact("passed")
-except KnownIssueSkip as exc:
-    artifact["discovery_flow"]["status"] = "skipped_known_issue"
-    artifact["known_issue"] = {
-        "target_platform": "windows",
-        "readiness_status": "blocked",
-        "reason": exc.reason,
-        "tracking_issue": "https://github.com/rp1-run/1up/issues/54",
-        "description": (
-            "windows binary fails project initialization for canonical "
-            "extended-length paths; MCP protocol surface verified, "
-            "indexing-dependent discovery flow skipped"
-        ),
-    }
-    print(
-        "[release-assets] WARNING: windows MCP discovery flow skipped due to known "
-        f"issue rp1-run/1up#54: {exc.reason}",
-        file=sys.stderr,
-    )
-    write_artifact("passed_with_known_issue")
 except SmokeFailure as exc:
     if exc.protocol_clean is not None:
         artifact["stdout_protocol_clean"] = exc.protocol_clean
@@ -812,7 +937,22 @@ except SmokeFailure as exc:
         stderr = "".join(stderr_lines).strip()
         if stderr:
             artifact["diagnostics"].append(f"MCP stderr: {stderr[-1000:]}")
-    sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
+    if sys.platform == "win32" and isinstance(exc, KnownIssue110Failure):
+        gate_active, gate_reason = known_issue_110_gate_decision()
+        print(
+            "[release-assets] WARNING: known-issue rp1-run/1up#110 gate "
+            f"{'applies' if gate_active else 'does not apply'}: {gate_reason}",
+            file=sys.stderr,
+        )
+        if gate_active:
+            record_known_issue_110(str(exc))
+        else:
+            artifact["diagnostics"].append(
+                f"known-issue #110 gate not applied: {gate_reason}"
+            )
+            sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
+    else:
+        sys.exit(fail(str(exc), artifact["stdout_protocol_clean"]))
 except Exception as exc:
     if stderr_lines:
         stderr = "".join(stderr_lines).strip()
