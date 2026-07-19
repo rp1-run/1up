@@ -659,17 +659,42 @@ fn spawn_rebuild_task(
 ) -> tokio::task::JoinHandle<ReadinessPayload> {
     let roots = roots.clone();
     tokio::spawn(async move {
-        match run_index_then_classify(&roots, rebuild, scope_add, scope_narrow).await {
-            Ok(payload) => payload,
-            Err(err) => {
+        // Catch panics so every failure after the pre-spawn scope publication
+        // durably records a terminal state: a panicking rebuild would otherwise
+        // strand the persisted `Running` snapshot exactly like an error would.
+        let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            run_index_then_classify(&roots, rebuild, scope_add, scope_narrow),
+        ))
+        .await;
+        match outcome {
+            Ok(Ok(payload)) => payload,
+            Ok(Err(err)) => {
                 // Surface the failure as blocked readiness rather than losing it
                 // to a log line; progress remains available via status.
                 tracing::warn!("background rebuild task failed: {}", err);
+                let reason = err.to_string();
+                record_rebuild_failure_progress(&roots, &reason).await;
                 blocked_readiness(
                     &roots.state_root,
                     &roots.source_root,
                     &roots.worktree_context,
-                    err.to_string(),
+                    reason,
+                )
+                .await
+            }
+            Err(panic) => {
+                let reason = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::warn!("background rebuild task panicked: {reason}");
+                record_rebuild_failure_progress(&roots, &reason).await;
+                blocked_readiness(
+                    &roots.state_root,
+                    &roots.source_root,
+                    &roots.worktree_context,
+                    format!("indexing task panicked: {reason}"),
                 )
                 .await
             }
@@ -753,23 +778,34 @@ pub async fn start(
         // background task reaches its own progress write (it computes scope,
         // loads the registry, and resolves config first), and a client that
         // polls `oneup_status` immediately after `oneup_start` returns must
-        // already see `index_scope`. Best-effort: a validation or write failure
-        // here is deferred to the rebuild task, which recomputes the scope and
-        // surfaces the same error through its own paths.
+        // already see `index_scope`. Publication is part of the start outcome:
+        // a scope that cannot be validated or durably recorded returns Blocked
+        // with the reason instead of spawning, so any non-blocked scoped start
+        // implies the requested scope is already visible to `oneup_status`.
         if scope_affects_rebuild {
-            match compute_new_scope(&roots.state_root, scope_add.clone(), scope_narrow.clone())
-                .await
-            {
-                Ok(new_scope) => {
-                    if let Err(err) = write_initial_scope_progress(roots, &new_scope).await {
-                        tracing::warn!(
-                            "failed to record requested index scope before spawning rebuild: {err}"
-                        );
+            let new_scope =
+                match compute_new_scope(&roots.state_root, scope_add.clone(), scope_narrow.clone())
+                    .await
+                {
+                    Ok(new_scope) => new_scope,
+                    Err(err) => {
+                        return Ok(blocked_readiness(
+                            &roots.state_root,
+                            &roots.source_root,
+                            &roots.worktree_context,
+                            format!("invalid index scope request: {err}"),
+                        )
+                        .await);
                     }
-                }
-                Err(err) => {
-                    tracing::debug!("scope validation deferred to the rebuild task: {err}");
-                }
+                };
+            if let Err(err) = write_initial_scope_progress(roots, &new_scope).await {
+                return Ok(blocked_readiness(
+                    &roots.state_root,
+                    &roots.source_root,
+                    &roots.worktree_context,
+                    format!("failed to record the requested index scope: {err}"),
+                )
+                .await);
             }
         }
 
@@ -1775,13 +1811,17 @@ async fn run_index_then_classify(
 ) -> anyhow::Result<ReadinessPayload> {
     match run_index(roots, rebuild, scope_add, scope_narrow).await {
         Ok(_) => Ok(classify_after_index(roots).await),
-        Err(err) => Ok(blocked_readiness(
-            &roots.state_root,
-            &roots.source_root,
-            &roots.worktree_context,
-            err.to_string(),
-        )
-        .await),
+        Err(err) => {
+            let reason = err.to_string();
+            record_rebuild_failure_progress(roots, &reason).await;
+            Ok(blocked_readiness(
+                &roots.state_root,
+                &roots.source_root,
+                &roots.worktree_context,
+                reason,
+            )
+            .await)
+        }
     }
 }
 
@@ -1797,17 +1837,43 @@ async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
     payload
 }
 
+/// Atomically persists `progress` as the project's `index_status.json`
+/// (temp + fsync + rename via `atomic_replace`), so a concurrent reader never
+/// observes a torn or zero-length file and misreports the index state. The
+/// blocking secure-fs write runs on the blocking pool so it never stalls a
+/// tokio worker.
+async fn write_index_progress_atomic(
+    state_root: &Path,
+    progress: &IndexProgress,
+) -> anyhow::Result<()> {
+    let progress_path = config::project_dot_dir(state_root).join(INDEX_PROGRESS_FILE_NAME);
+    let payload = serde_json::to_vec_pretty(progress)?;
+    let state_root = state_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let secure_root = crate::shared::fs::ensure_secure_project_root(&state_root)?;
+        crate::shared::fs::atomic_replace(
+            &progress_path,
+            &payload,
+            &secure_root,
+            crate::shared::constants::PROJECT_STATE_DIR_MODE,
+            crate::shared::constants::SECURE_STATE_FILE_MODE,
+        )
+    })
+    .await??;
+    Ok(())
+}
+
 /// Writes the initial `index_status.json` carrying the requested scope, so
 /// `oneup_status` reports `index_scope` from the moment a scoped rebuild is
 /// requested — before the pipeline's own progress updates. No-op for an empty
 /// (unscoped) scope.
 ///
-/// The write is atomic (temp + fsync + rename) so a concurrent reader never
-/// observes a torn or zero-length `index_status.json` and misreports a scoped
-/// rebuild as "no index". A failed write is logged and swallowed (best-effort:
-/// indexing must proceed regardless); only serialization or blocking-pool join
-/// failures propagate. The blocking secure-fs write runs on a blocking pool so
-/// it never stalls a tokio worker.
+/// Fail-loud: a failed write propagates so publication is part of the caller's
+/// outcome — `ops::start` returns Blocked instead of spawning, and `run_index`
+/// fails the run. A swallowed failure here would let a "successful" scoped
+/// start return while `oneup_status` reports no scope, silently breaking the
+/// invariant that a non-blocked scoped start makes the requested scope
+/// immediately visible.
 async fn write_initial_scope_progress(
     roots: &McpProjectRoots,
     new_scope: &[String],
@@ -1848,25 +1914,45 @@ async fn write_initial_scope_progress(
         indexer_pid: Some(std::process::id()),
         updated_at: chrono::Utc::now(),
     };
-    let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
-    let payload = serde_json::to_vec_pretty(&initial_progress)?;
-    let state_root = roots.state_root.clone();
-    let write_result = tokio::task::spawn_blocking(move || {
-        let secure_root = crate::shared::fs::ensure_secure_project_root(&state_root)?;
-        crate::shared::fs::atomic_replace(
-            &progress_path,
-            &payload,
-            &secure_root,
-            crate::shared::constants::PROJECT_STATE_DIR_MODE,
-            crate::shared::constants::SECURE_STATE_FILE_MODE,
-        )
-    })
-    .await?;
-    if let Err(e) = write_result {
-        tracing::warn!("failed to write initial progress with scope info: {}", e);
-        // Continue anyway - initial progress write is best-effort
+    write_index_progress_atomic(&roots.state_root, &initial_progress).await
+}
+
+/// Durably transitions this process's `Running` progress record to a terminal
+/// `Idle` snapshot carrying the failure reason.
+///
+/// `ops::start` publishes a `Running` snapshot stamped with this (long-lived
+/// MCP server) PID before the rebuild task spawns. If the rebuild then fails
+/// anywhere — registry load, rebuild-lock acquisition, staging open, the
+/// pipeline itself — the failure is otherwise returned only in memory: the
+/// persisted snapshot keeps claiming `Running`, and stale-progress repair can
+/// never reclaim it because the recorded PID stays alive, so `oneup_status`
+/// would report a phantom indexing run indefinitely.
+///
+/// Ownership guard: only a `Running` record stamped with this process's PID is
+/// replaced; a record owned by another process (a concurrent daemon or CLI
+/// indexer) is left alone. Counters and scope from the failed attempt are
+/// preserved so the terminal snapshot still shows what was attempted. A
+/// cleanup failure is logged, not propagated: the caller's blocked readiness
+/// already carries the primary error.
+async fn record_rebuild_failure_progress(roots: &McpProjectRoots, reason: &str) {
+    let Some(progress) = read_index_progress(&roots.state_root).await else {
+        return;
+    };
+    if progress.state != IndexState::Running || progress.indexer_pid != Some(std::process::id()) {
+        return;
     }
-    Ok(())
+    let terminal = IndexProgress {
+        state: IndexState::Idle,
+        message: Some(format!("indexing failed: {reason}")),
+        indexer_pid: None,
+        updated_at: chrono::Utc::now(),
+        ..progress
+    };
+    if let Err(err) = write_index_progress_atomic(&roots.state_root, &terminal).await {
+        tracing::warn!(
+            "failed to record the terminal state of a failed rebuild (status may briefly report a stale indexing run): {err}"
+        );
+    }
 }
 
 async fn run_index(
@@ -6413,6 +6499,162 @@ mod tests {
 
         // Give spawned task a brief moment to initialize
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    /// Minimal roots over a temp dir for exercising the progress-file
+    /// publication helpers directly. Canonicalized because the secure-fs
+    /// write path refuses symlinked components (macOS `/var` → `/private/var`).
+    fn scope_progress_test_roots(state_root: &Path) -> McpProjectRoots {
+        let state_root = &state_root.canonicalize().unwrap();
+        std::fs::create_dir_all(state_root.join(".1up")).unwrap();
+        let worktree_context = WorktreeContext {
+            context_id: "test-context".to_string(),
+            state_root: state_root.to_path_buf(),
+            source_root: state_root.to_path_buf(),
+            main_worktree_root: state_root.to_path_buf(),
+            worktree_role: crate::shared::types::WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: crate::shared::types::BranchStatus::Unknown,
+        };
+        McpProjectRoots {
+            state_root: state_root.to_path_buf(),
+            source_root: state_root.to_path_buf(),
+            worktree_context,
+            launch_subdir: None,
+        }
+    }
+
+    /// The pre-spawn publication `ops::start` performs (fail-loud, before
+    /// `spawn_rebuild_task`) must persist the EXACT requested scope in a
+    /// `Running` snapshot owned by this process. This pins the publication
+    /// contents deterministically, independent of rebuild-task scheduling.
+    #[tokio::test]
+    async fn write_initial_scope_progress_publishes_exact_requested_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = scope_progress_test_roots(tmp.path());
+        let requested = vec!["services/auth".to_string(), "libs/core".to_string()];
+
+        write_initial_scope_progress(&roots, &requested)
+            .await
+            .expect("publication must succeed on a healthy state root");
+
+        let progress = read_index_progress(&roots.state_root)
+            .await
+            .expect("published progress must be readable");
+        assert_eq!(progress.state, IndexState::Running);
+        assert_eq!(progress.indexer_pid, Some(std::process::id()));
+        assert_eq!(progress.context_id.as_deref(), Some("test-context"));
+        let scope = progress.scope.expect("published progress must carry scope");
+        assert_eq!(scope.roots, requested);
+    }
+
+    /// A rebuild failure after the pre-spawn publication must not strand the
+    /// persisted `Running` snapshot: the recorded PID is this long-lived
+    /// process, so stale-progress repair can never reclaim it on its own.
+    #[tokio::test]
+    async fn failed_rebuild_transitions_owned_running_progress_to_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = scope_progress_test_roots(tmp.path());
+        let requested = vec!["services/auth".to_string()];
+        write_initial_scope_progress(&roots, &requested)
+            .await
+            .unwrap();
+
+        record_rebuild_failure_progress(&roots, "registry load failed").await;
+
+        let progress = read_index_progress(&roots.state_root)
+            .await
+            .expect("terminal progress must be readable");
+        assert_eq!(
+            progress.state,
+            IndexState::Idle,
+            "failed rebuild must not leave progress claiming Running"
+        );
+        assert_eq!(progress.indexer_pid, None);
+        assert!(
+            progress
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("registry load failed"),
+            "terminal snapshot must carry the failure reason; got {:?}",
+            progress.message
+        );
+        let scope = progress.scope.expect("failed attempt keeps its scope");
+        assert_eq!(
+            scope.roots, requested,
+            "scope of the failed attempt is preserved"
+        );
+    }
+
+    /// End-to-end over the spawn path: a rebuild that fails after the
+    /// pre-spawn publication must surface Blocked AND durably transition the
+    /// persisted snapshot out of `Running` — otherwise `oneup_status` reports
+    /// a phantom indexing run forever, because the snapshot's PID (this
+    /// long-lived process) defeats stale-progress repair.
+    #[tokio::test]
+    async fn failed_spawned_rebuild_returns_blocked_and_clears_running_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = scope_progress_test_roots(tmp.path());
+        let requested = vec!["services/auth".to_string()];
+        write_initial_scope_progress(&roots, &requested)
+            .await
+            .unwrap();
+        // Force a deterministic rebuild failure: `index.db` as a directory can
+        // be neither opened nor staged.
+        std::fs::create_dir_all(roots.state_root.join(".1up").join("index.db")).unwrap();
+
+        let payload = spawn_rebuild_task(&roots, true, Some(requested), None)
+            .await
+            .expect("rebuild task must not panic the join handle");
+
+        assert_eq!(
+            payload.status,
+            ReadinessStatus::Blocked,
+            "a failed rebuild must surface as blocked readiness"
+        );
+        let progress = read_index_progress(&roots.state_root)
+            .await
+            .expect("progress must remain readable after a failed rebuild");
+        assert_ne!(
+            progress.state,
+            IndexState::Running,
+            "a failed rebuild must not leave the persisted snapshot claiming Running"
+        );
+    }
+
+    /// A `Running` record stamped by ANOTHER process (a concurrent daemon or
+    /// CLI indexer) is not ours to clean up; the failure recorder must leave
+    /// it untouched.
+    #[tokio::test]
+    async fn failed_rebuild_leaves_foreign_running_progress_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = scope_progress_test_roots(tmp.path());
+        let foreign = IndexProgress {
+            state: IndexState::Running,
+            context_id: Some("test-context".to_string()),
+            indexer_pid: Some(std::process::id().wrapping_add(1)),
+            ..IndexProgress::pending()
+        };
+        write_index_progress_atomic(&roots.state_root, &foreign)
+            .await
+            .unwrap();
+
+        record_rebuild_failure_progress(&roots, "boom").await;
+
+        let progress = read_index_progress(&roots.state_root)
+            .await
+            .expect("foreign progress must still be readable");
+        assert_eq!(progress.state, IndexState::Running);
+        assert_eq!(
+            progress.indexer_pid,
+            Some(std::process::id().wrapping_add(1)),
+            "another indexer's Running record must not be clobbered"
+        );
     }
 
     #[test]

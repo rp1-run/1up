@@ -1761,7 +1761,7 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         thread::sleep(Duration::from_millis(500));
     };
 
-    let _ = client.call_tool(
+    let scoped_start_result = client.call_tool(
         TOOL_START,
         serde_json::json!({
             "mode": "index_if_missing",
@@ -1769,27 +1769,47 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         }),
     );
 
+    // The scoped start must have been accepted: `ops::start` now makes scope
+    // publication part of the start outcome (a scope that cannot be validated
+    // or durably recorded returns `blocked` instead of spawning), so any
+    // non-blocked scoped start guarantees the requested scope is already
+    // persisted.
+    let scoped_start_envelope = mcp_structured(&scoped_start_result);
+    let start_status = scoped_start_envelope["status"].as_str().unwrap_or_default();
+    assert!(
+        start_status != "blocked" && start_status != "error",
+        "scoped start must be accepted; got envelope: {scoped_start_envelope}"
+    );
+
     // No sleep: `ops::start` records the requested scope in the progress file
     // BEFORE spawning the rebuild task, so scope visibility is an invariant of
-    // `oneup_start` having returned — a fixed sleep here previously raced the
-    // background task's own (later) progress write and flaked under load.
+    // a non-blocked `oneup_start` having returned — a fixed sleep here
+    // previously raced the background task's own (later) progress write and
+    // flaked under load. (The exact pre-spawn publication contents are pinned
+    // deterministically by the `write_initial_scope_progress_*` unit tests in
+    // `src/mcp/ops.rs`; this asserts the same invariant end-to-end over MCP.)
     let status_result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let status_envelope = mcp_structured(&status_result);
 
-    // index_scope should be visible even during indexing
+    // index_scope should be visible even during indexing, and must be exactly
+    // the requested scope — not merely the same number of roots.
     let index_scope = &status_envelope["data"]["index_scope"];
     assert!(
         index_scope.is_object(),
-        "index_scope should be visible during indexing"
+        "index_scope should be visible during indexing; status envelope: {status_envelope}"
     );
-    assert!(
-        index_scope["roots"].is_array(),
-        "index_scope roots should be present during indexing"
-    );
+    let mut actual_roots: Vec<String> = index_scope["roots"]
+        .as_array()
+        .expect("index_scope roots should be present during indexing")
+        .iter()
+        .filter_map(|root| root.as_str().map(String::from))
+        .collect();
+    actual_roots.sort();
+    let mut expected_roots = suggested_scope.clone();
+    expected_roots.sort();
     assert_eq!(
-        index_scope["roots"].as_array().unwrap().len(),
-        suggested_scope.len(),
-        "index_scope roots should match requested scope"
+        actual_roots, expected_roots,
+        "index_scope roots must be exactly the requested scope"
     );
 }
 
