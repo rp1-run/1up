@@ -4,6 +4,18 @@ pub const EMBEDDING_DIM: usize = 384;
 /// 1up version from Cargo.toml, embedded at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Build-identity stamp discriminating this binary beyond its semver.
+///
+/// Composed by `build.rs` as `{VERSION}+{git-short-hash}[.dirty[.{digest}]]`, degrading to
+/// `{VERSION}+unknown` when git is unavailable (e.g. a source tarball). Unlike
+/// [`VERSION`], two builds sharing the same semver but produced from a different
+/// commit — or a dirty working tree — carry *different* identities. This is the
+/// discriminator the daemon version-handshake stamps and compares so a
+/// same-semver daemon from a different build is not trusted as authoritative.
+/// It deliberately does not replace [`VERSION`], which retains its update-manifest
+/// semver semantics and user-facing display role.
+pub const BUILD_IDENTITY: &str = env!("ONEUP_BUILD_IDENTITY");
+
 /// Default batch size for embedding inference.
 ///
 /// Held at 32: a partial best-of-3 reindex benchmark over this repo's own ~1.5k

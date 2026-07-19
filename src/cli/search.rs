@@ -11,7 +11,7 @@ use crate::indexer::embedder::{
 };
 use crate::search::{retrieval, HybridSearchEngine, SearchScope};
 use crate::shared::config::project_db_path;
-use crate::shared::constants::{NO_INDEXED_EMBEDDINGS_REASON, VERSION};
+use crate::shared::constants::{BUILD_IDENTITY, NO_INDEXED_EMBEDDINGS_REASON};
 use crate::shared::project;
 use crate::shared::types::SearchResult;
 use crate::storage::db::Db;
@@ -66,10 +66,10 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
     )
     .await
     {
-        // Classify by version BEFORE writing. A daemon still running the
-        // previous binary stamps a mismatched `daemon_version`; its results must
-        // never be served as authoritative, so the version check now gates the
-        // write instead of trailing a soft warning after results were already
+        // Classify by build identity BEFORE writing. A daemon from a different
+        // build stamps a mismatched (or, if unstamped, absent) build identity;
+        // its results must never be served as authoritative, so the check gates
+        // the write instead of trailing a soft warning after results were already
         // emitted (the headline write-then-warn bug).
         if daemon_response_is_authoritative(daemon_version.as_deref()) {
             serve_daemon_results(&results, degraded_reason)?;
@@ -83,9 +83,9 @@ pub async fn exec(args: SearchArgs) -> anyhow::Result<()> {
         // gating. The specific idle/size thresholds are a deliberately deferred
         // owner decision; a future owner introduces the gate here without
         // re-deriving the rationale.
-        let stale_version = daemon_version.as_deref().unwrap_or("unknown");
+        let stale_identity = daemon_version.as_deref().unwrap_or("unknown");
         eprintln!(
-            "warning: daemon is running a stale binary version ({stale_version}); CLI is ({VERSION}). Draining the stale daemon and restarting under the current binary."
+            "warning: daemon build identity ({stale_identity}) does not match this binary ({BUILD_IDENTITY}). Draining the stale daemon and restarting under the current binary."
         );
 
         match drain_and_restart_stale_daemon(&project_root, &source_root) {
@@ -221,12 +221,14 @@ fn serve_daemon_results(
 
 /// Whether a daemon search response may be served as authoritative.
 ///
-/// A response whose `daemon_version` matches the running binary is authoritative.
-/// A *known* mismatch is refused so results produced by a daemon still
-/// running the previous binary are never served; an absent version is treated as
-/// authoritative to preserve the established no-version-info behavior.
-fn daemon_response_is_authoritative(daemon_version: Option<&str>) -> bool {
-    daemon_version.is_none_or(|dv| dv == VERSION)
+/// Authoritative only when the daemon stamped the *exact* build identity of this
+/// binary ([`BUILD_IDENTITY`], i.e. `{semver}+{git}[.dirty[.{digest}]]`). A different build
+/// id — even one sharing the same semver — is refused, and so is an *absent*
+/// stamp: an unstamped daemon predates this handshake and cannot prove its build,
+/// so it is treated as non-authoritative and takes the drain-and-restart path
+/// rather than being trusted. Pure so it stays unit-testable.
+fn daemon_response_is_authoritative(daemon_build_identity: Option<&str>) -> bool {
+    daemon_build_identity == Some(BUILD_IDENTITY)
 }
 
 /// Refuses a stale-binary daemon: drains the running daemon then
@@ -297,7 +299,7 @@ fn warn_if_degraded_branch_context(scope: &SearchScope) {
 #[cfg(test)]
 mod tests {
     use super::{daemon_response_is_authoritative, SearchArgs};
-    use crate::shared::constants::VERSION;
+    use crate::shared::constants::BUILD_IDENTITY;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -318,22 +320,55 @@ mod tests {
         assert_eq!(cli.args.limit, 7);
     }
 
-    /// A daemon response whose `daemon_version` differs from the running
-    /// binary must be refused (non-authoritative) so the caller takes the
-    /// drain/restart path instead of writing stale-binary results. A matching or
-    /// absent version stays authoritative. This is the inverted-ordering guard;
-    /// before the fix there was no version gate and stale results were written.
+    /// The authority gate compares the full build identity, not bare semver, and
+    /// treats an absent stamp as non-authoritative. This guards the trust
+    /// boundary that a same-semver daemon from a *different* build (issue #108)
+    /// is not served as authoritative.
     #[test]
-    fn daemon_response_authority_is_gated_by_version() {
-        // Known mismatch -> refused, so the write is skipped and the mismatch
-        // (drain+restart) path is taken.
+    fn daemon_response_authority_is_gated_by_build_identity() {
+        // Identical full stamp -> authoritative, results may be served.
+        assert!(daemon_response_is_authoritative(Some(BUILD_IDENTITY)));
+
+        // Same semver, different build id -> refused (the #108 hazard), so the
+        // drain-and-restart path is taken.
+        let same_semver_different_build = format!(
+            "{}+deadbee",
+            BUILD_IDENTITY.split('+').next().unwrap_or(BUILD_IDENTITY)
+        );
+        assert_ne!(same_semver_different_build, BUILD_IDENTITY);
+        assert!(!daemon_response_is_authoritative(Some(
+            &same_semver_different_build
+        )));
+
+        // A wholly different stamp -> refused.
         assert!(!daemon_response_is_authoritative(Some(
             "0.0.0-stale-binary"
         )));
-        // Same binary -> authoritative, results may be served.
-        assert!(daemon_response_is_authoritative(Some(VERSION)));
-        // No version reported -> authoritative (preserves prior behavior; we
-        // only refuse on a *known* mismatch).
-        assert!(daemon_response_is_authoritative(None));
+
+        // Absent stamp (unstamped/pre-handshake daemon) -> non-authoritative:
+        // it cannot prove its build, so it is never trusted.
+        assert!(!daemon_response_is_authoritative(None));
+    }
+
+    /// The unknown-git fallback (`{semver}+unknown`, emitted when git is
+    /// unavailable at build time) still compares as an exact string, so a daemon
+    /// and CLI built from the same fallback binary agree, while a bare-semver or
+    /// differently-suffixed stamp does not.
+    #[test]
+    fn unknown_git_fallback_compares_consistently_within_one_build() {
+        // Within one build, BUILD_IDENTITY is a single fixed string; identity
+        // with itself always holds regardless of whether git was available.
+        assert!(daemon_response_is_authoritative(Some(BUILD_IDENTITY)));
+
+        let semver = BUILD_IDENTITY.split('+').next().unwrap_or(BUILD_IDENTITY);
+        let unknown_fallback = format!("{semver}+unknown");
+        // The fallback shape is authoritative only if this binary *is* the
+        // fallback build; either way the comparison is a pure exact match and a
+        // bare-semver stamp (no build id) is never authoritative.
+        assert_eq!(
+            daemon_response_is_authoritative(Some(&unknown_fallback)),
+            unknown_fallback == BUILD_IDENTITY
+        );
+        assert!(!daemon_response_is_authoritative(Some(semver)));
     }
 }

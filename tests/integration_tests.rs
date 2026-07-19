@@ -6894,9 +6894,12 @@ fn daemon_response_carries_lean_results() {
         assert_eq!(payload["limit"], 3);
 
         // Lean SearchResult: segment_id required, score u32 integer, no
-        // complexity/role/referenced_symbols/called_symbols fields.
+        // complexity/role/referenced_symbols/called_symbols fields. The response
+        // must stamp this build's identity or the CLI's authority gate treats
+        // the fake daemon as a stale build and drains it instead of rendering.
         let response = serde_json::json!({
             "status": "results",
+            "daemon_version": oneup::shared::constants::BUILD_IDENTITY,
             "results": [
                 {
                     "segment_id": "daemonseg000",
@@ -7855,8 +7858,11 @@ fn cli_search_keeps_stale_rebuild_notice_off_stdout() {
             let (mut stream, _) = listener.accept().unwrap();
             let _request = read_framed_json(&mut stream);
 
+            // Stamp this build's identity so the CLI's authority gate accepts
+            // the fake daemon's response instead of draining it as stale.
             let mut response = serde_json::json!({
                 "status": "results",
+                "daemon_version": oneup::shared::constants::BUILD_IDENTITY,
                 "results": [{
                     "segment_id": "servedseg000",
                     "file_path": "src/lib.rs",
