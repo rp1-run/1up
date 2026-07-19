@@ -2172,27 +2172,107 @@ fn create_current_index(dir: &Path) {
     });
 }
 
-/// Count segments stored for `file_path` (repo-relative) in the first worktree
-/// context of the project's index. Returns 0 if the DB/context/file is absent.
+/// Counts the indexed segments recorded for `file_path` (repo-relative) in
+/// the first worktree context of the project's index.
+///
+/// Contract: any database error PANICS instead of reading as zero — every
+/// caller asserts against the real count after a successful index, and an
+/// error swallowed into `0` turns a transient `SQLITE_BUSY` (e.g. the
+/// CLI-spawned daemon holding the index open) into a false "file not indexed"
+/// flake. `connect_tuned` applies the read pragma profile, whose
+/// `busy_timeout` rides out that contention. Zero is returned only for a
+/// genuinely empty result: an index with no recorded worktree contexts, or a
+/// context with no segments stored for `file_path`.
 fn segment_count_for_file(dir: &Path, file_path: &str) -> usize {
     block_on(async {
-        let Ok(db) = Db::open_ro(&project_db_path(dir)).await else {
-            return 0;
-        };
-        let Ok(conn) = db.connect() else {
-            return 0;
-        };
-        let Ok(contexts) = segments::list_worktree_contexts(&conn).await else {
-            return 0;
-        };
+        let db = Db::open_ro(&project_db_path(dir))
+            .await
+            .expect("segment_count_for_file: open index db");
+        let conn = db
+            .connect_tuned()
+            .await
+            .expect("segment_count_for_file: connect");
+        let contexts = segments::list_worktree_contexts(&conn)
+            .await
+            .expect("segment_count_for_file: list worktree contexts");
         let Some(ctx) = contexts.first() else {
             return 0;
         };
         segments::get_segments_by_file_for_context(&conn, &ctx.context_id, file_path)
             .await
-            .map(|segs| segs.len())
-            .unwrap_or(0)
+            .expect("segment_count_for_file: query segments")
+            .len()
     })
+}
+
+/// Pins the zero-side of `segment_count_for_file`'s contract: only genuinely
+/// empty results — no recorded contexts, or no segments for the file — read
+/// as zero.
+#[test]
+fn segment_count_for_file_returns_zero_only_for_genuinely_empty_results() {
+    // Schema initialized but no worktree context recorded: legitimately zero.
+    let empty = tempfile::tempdir().unwrap();
+    let empty_dir = empty.path().canonicalize().unwrap();
+    fs::create_dir_all(empty_dir.join(".1up")).unwrap();
+    create_current_index(&empty_dir);
+    assert_eq!(segment_count_for_file(&empty_dir, "src/lib.rs"), 0);
+
+    // A recorded context counts its real segments; a file with none is zero.
+    let seeded = tempfile::tempdir().unwrap();
+    let seeded_dir = seeded.path().canonicalize().unwrap();
+    seed_current_index_for_context(&seeded_dir, "segment-count-context");
+    block_on(async {
+        use oneup::shared::types::{BranchStatus, WorktreeContext, WorktreeRole};
+        let db = Db::open_rw(&project_db_path(&seeded_dir)).await.unwrap();
+        let conn = db.connect().unwrap();
+        let context = WorktreeContext {
+            context_id: "segment-count-context".to_string(),
+            state_root: seeded_dir.clone(),
+            source_root: seeded_dir.clone(),
+            main_worktree_root: seeded_dir.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+        segments::upsert_worktree_context(&conn, &context, "context-count-project")
+            .await
+            .unwrap();
+    });
+    assert_eq!(segment_count_for_file(&seeded_dir, "src/other.rs"), 1);
+    assert_eq!(segment_count_for_file(&seeded_dir, "src/absent.rs"), 0);
+}
+
+/// Pins the fail-loud side of the contract: a database error must PANIC, not
+/// read as zero — the swallowed-error-to-`0` conversion is exactly what turned
+/// a transient `SQLITE_BUSY` into the `start_scope_on_empty_index` CI flake.
+#[test]
+#[should_panic(expected = "segment_count_for_file: open index db")]
+fn segment_count_for_file_panics_on_database_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(dir.join(".1up")).unwrap();
+    // No index.db exists, so opening the database fails; the helper must
+    // surface that as a panic rather than a zero segment count.
+    segment_count_for_file(&dir, "src/lib.rs");
+}
+
+/// The fail-loud contract must also hold past a successful open: a database
+/// that opens but cannot serve the tuned connection / queries (garbage bytes
+/// instead of a SQLite file) must panic somewhere in the helper, never read
+/// as zero. The expected message is the helper's common panic prefix, so the
+/// test pins fail-loud behavior wherever the corruption is first detected.
+#[test]
+#[should_panic(expected = "segment_count_for_file:")]
+fn segment_count_for_file_panics_on_unreadable_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(dir.join(".1up")).unwrap();
+    fs::write(project_db_path(&dir), b"this is not a sqlite database").unwrap();
+    segment_count_for_file(&dir, "src/lib.rs");
 }
 
 fn seed_current_index_for_context(dir: &Path, context_id: &str) {

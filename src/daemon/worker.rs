@@ -2169,6 +2169,7 @@ fn persist_carried_scope(
             scope: None,
             prefilter: None,
             indexer_pid: None,
+            run_id: None,
             updated_at: Utc::now(),
         },
         StatusFileRead::Parsed(progress) => progress,
