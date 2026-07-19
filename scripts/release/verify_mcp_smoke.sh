@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/common.sh"
 BINARY_PATH=""
 REPO_PATH=""
 OUTPUT_PATH=""
+SELF_TEST_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,25 +24,40 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_PATH="${2:-}"
       shift 2
       ;;
+    --self-test-only)
+      SELF_TEST_ONLY=1
+      shift
+      ;;
     *)
       fail "unknown argument: $1"
       ;;
   esac
 done
 
-if [[ -z "$BINARY_PATH" || -z "$REPO_PATH" || -z "$OUTPUT_PATH" ]]; then
-  fail "usage: $(basename "$0") --binary <path> --repo <path> --output <path>"
-fi
+# --self-test-only runs just the ancestor-guard self-test (no MCP server, no
+# binary) so CI can exercise the platform-specific guard branches — notably
+# the Windows directory-junction branch — without a full release smoke.
+if [[ "$SELF_TEST_ONLY" == "1" ]]; then
+  if [[ -z "$OUTPUT_PATH" ]]; then
+    fail "usage: $(basename "$0") --self-test-only --output <path>"
+  fi
+  BINARY_PATH="(self-test-only)"
+  REPO_PATH="(self-test-only)"
+else
+  if [[ -z "$BINARY_PATH" || -z "$REPO_PATH" || -z "$OUTPUT_PATH" ]]; then
+    fail "usage: $(basename "$0") --binary <path> --repo <path> --output <path>"
+  fi
 
-require_cmd jq
-require_file "$BINARY_PATH"
+  require_cmd jq
+  require_file "$BINARY_PATH"
 
-if [[ ! -d "$REPO_PATH" ]]; then
-  fail "missing required repository directory: $(relative_path "$REPO_PATH")"
-fi
+  if [[ ! -d "$REPO_PATH" ]]; then
+    fail "missing required repository directory: $(relative_path "$REPO_PATH")"
+  fi
 
-if [[ ! -x "$BINARY_PATH" ]]; then
-  fail "binary is not executable: $(relative_path "$BINARY_PATH")"
+  if [[ ! -x "$BINARY_PATH" ]]; then
+    fail "binary is not executable: $(relative_path "$BINARY_PATH")"
+  fi
 fi
 
 PYTHON_CMD=()
@@ -55,20 +71,28 @@ else
   fail "missing required command: python3 or python"
 fi
 
-BINARY_PATH=$(cd "$(dirname "$BINARY_PATH")" && pwd -P)/$(basename "$BINARY_PATH")
-REPO_PATH=$(cd "$REPO_PATH" && pwd -P)
+if [[ "$SELF_TEST_ONLY" != "1" ]]; then
+  BINARY_PATH=$(cd "$(dirname "$BINARY_PATH")" && pwd -P)/$(basename "$BINARY_PATH")
+  REPO_PATH=$(cd "$REPO_PATH" && pwd -P)
+fi
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 OUTPUT_PATH=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/$(basename "$OUTPUT_PATH")
 
+RUN_MODE="full"
+if [[ "$SELF_TEST_ONLY" == "1" ]]; then
+  RUN_MODE="self-test-only"
+fi
+
 # UTF-8 mode: windows python otherwise decodes child output as cp1252 and
 # fails on multibyte CLI output such as the version banner emoji.
-if PYTHONUTF8=1 "${PYTHON_CMD[@]}" - "$BINARY_PATH" "$REPO_PATH" "$OUTPUT_PATH" <<'PY'
+if PYTHONUTF8=1 "${PYTHON_CMD[@]}" - "$BINARY_PATH" "$REPO_PATH" "$OUTPUT_PATH" "$RUN_MODE" <<'PY'
 import json
 import os
 import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -219,13 +243,16 @@ def known_issue_110_gate_decision():
 binary_path = sys.argv[1]
 repo_path = sys.argv[2]
 output_path = sys.argv[3]
-for _root in (repo_path, str(Path(repo_path).resolve())):
-    _cleaned = strip_extended_length_prefix(_root.replace("\\", "/")).rstrip("/")
-    if _cleaned and _cleaned not in FIXTURE_REPO_ROOT_VARIANTS:
-        FIXTURE_REPO_ROOT_VARIANTS.append(_cleaned)
+self_test_only = len(sys.argv) > 4 and sys.argv[4] == "self-test-only"
+if not self_test_only:
+    for _root in (repo_path, str(Path(repo_path).resolve())):
+        _cleaned = strip_extended_length_prefix(_root.replace("\\", "/")).rstrip("/")
+        if _cleaned and _cleaned not in FIXTURE_REPO_ROOT_VARIANTS:
+            FIXTURE_REPO_ROOT_VARIANTS.append(_cleaned)
 server_command = [binary_path, "mcp", "--path", repo_path]
 artifact = {
     "schema": "mcp_smoke.v2",
+    "mode": "self_test_only" if self_test_only else "full",
     "status": "failed",
     "binary": binary_path,
     "version": "",
@@ -361,9 +388,14 @@ def self_test_ancestor_guard():
     the fixture write to refuse and proves the outside sentinel and target
     directory were left untouched. Also proves the healthy path still writes
     through real directories, so the guard cannot silently break fixture
-    creation."""
-    base = Path(output_path).parent / ".ancestor-guard-selftest"
-    shutil.rmtree(base, ignore_errors=True)
+    creation.
+
+    The scratch root is a fresh `mkdtemp` directory the test itself creates:
+    a fixed reusable path could hold legitimate pre-existing data (which the
+    cleanup here would delete) or be pre-planted as a symlink/junction that
+    redirects every scratch write outside the tree the test believes it
+    owns."""
+    base = Path(tempfile.mkdtemp(prefix="oneup-ancestor-guard-selftest-"))
     outside = base / "outside-target"
     outside.mkdir(parents=True)
     sentinel = outside / "sentinel.txt"
@@ -774,6 +806,20 @@ def require_fixture_overview(envelope):
         raise SmokeFailure("oneup_overview did not include suggested next actions")
 
 
+# Focused CI mode: run just the adversarial guard self-test (which builds the
+# platform-specific redirect — a directory junction on Windows) and stop
+# before anything that needs the release binary.
+if self_test_only:
+    try:
+        self_test_ancestor_guard()
+    except SmokeFailure as exc:
+        sys.exit(fail(str(exc)))
+    except Exception as exc:
+        sys.exit(fail(f"ancestor-guard self-test failed unexpectedly: {exc}"))
+    write_artifact("passed")
+    print(f"[release-assets] ancestor-guard self-test: {artifact['ancestor_guard_selftest']}")
+    sys.exit(0)
+
 try:
     self_test_ancestor_guard()
     ensure_fixture_repo()
@@ -1090,7 +1136,11 @@ finally:
                 pass
 PY
 then
-  log "MCP smoke passed and wrote $(relative_path "$OUTPUT_PATH")"
+  if [[ "$SELF_TEST_ONLY" == "1" ]]; then
+    log "ancestor-guard self-test passed and wrote $(relative_path "$OUTPUT_PATH")"
+  else
+    log "MCP smoke passed and wrote $(relative_path "$OUTPUT_PATH")"
+  fi
 else
   exit 1
 fi
