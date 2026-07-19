@@ -122,6 +122,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Execute (not just build past) the Windows-specific ancestor-guard
+      # regression: the self-test creates a real directory junction via
+      # _winapi.CreateJunction and requires the smoke fixture writer to
+      # refuse it. Only a Windows runner can exercise this branch.
+      - name: run ancestor-guard junction self-test
+        shell: bash
+        run: scripts/release/verify_mcp_smoke.sh --self-test-only --output target/release-smoke/ancestor-guard-selftest.json
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: cache rust build artifacts
