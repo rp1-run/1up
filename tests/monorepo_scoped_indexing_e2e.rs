@@ -1769,8 +1769,10 @@ fn test_daemon_alive_index_scope_visible_during_indexing() {
         }),
     );
 
-    // Check status during indexing (within 1 second)
-    thread::sleep(Duration::from_millis(100));
+    // No sleep: `ops::start` records the requested scope in the progress file
+    // BEFORE spawning the rebuild task, so scope visibility is an invariant of
+    // `oneup_start` having returned — a fixed sleep here previously raced the
+    // background task's own (later) progress write and flaked under load.
     let status_result = client.call_tool(TOOL_STATUS, serde_json::json!({}));
     let status_envelope = mcp_structured(&status_result);
 

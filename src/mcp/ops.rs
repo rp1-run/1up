@@ -748,6 +748,31 @@ pub async fn start(
     };
 
     if should_spawn {
+        // Make a requested scope observable BEFORE the rebuild task is spawned:
+        // this function can detach at the response budget long before the
+        // background task reaches its own progress write (it computes scope,
+        // loads the registry, and resolves config first), and a client that
+        // polls `oneup_status` immediately after `oneup_start` returns must
+        // already see `index_scope`. Best-effort: a validation or write failure
+        // here is deferred to the rebuild task, which recomputes the scope and
+        // surfaces the same error through its own paths.
+        if scope_affects_rebuild {
+            match compute_new_scope(&roots.state_root, scope_add.clone(), scope_narrow.clone())
+                .await
+            {
+                Ok(new_scope) => {
+                    if let Err(err) = write_initial_scope_progress(roots, &new_scope).await {
+                        tracing::warn!(
+                            "failed to record requested index scope before spawning rebuild: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("scope validation deferred to the rebuild task: {err}");
+                }
+            }
+        }
+
         // Spawn the rebuild in the background so oneup_start returns promptly
         tracing::debug!(
             "ops::start: spawning rebuild (rebuild_mode={}, scope_add={:?})",
@@ -1772,6 +1797,78 @@ async fn classify_after_index(roots: &McpProjectRoots) -> ReadinessPayload {
     payload
 }
 
+/// Writes the initial `index_status.json` carrying the requested scope, so
+/// `oneup_status` reports `index_scope` from the moment a scoped rebuild is
+/// requested — before the pipeline's own progress updates. No-op for an empty
+/// (unscoped) scope.
+///
+/// The write is atomic (temp + fsync + rename) so a concurrent reader never
+/// observes a torn or zero-length `index_status.json` and misreports a scoped
+/// rebuild as "no index". A failed write is logged and swallowed (best-effort:
+/// indexing must proceed regardless); only serialization or blocking-pool join
+/// failures propagate. The blocking secure-fs write runs on a blocking pool so
+/// it never stalls a tokio worker.
+async fn write_initial_scope_progress(
+    roots: &McpProjectRoots,
+    new_scope: &[String],
+) -> anyhow::Result<()> {
+    if new_scope.is_empty() {
+        return Ok(());
+    }
+    let scope_info = crate::shared::types::IndexScopeInfo {
+        requested: format!("scoped:{}", new_scope.len()),
+        executed: String::new(), // Will be updated by pipeline
+        changed_paths: 0,
+        fallback_reason: None,
+        roots: new_scope.to_vec(),
+    };
+    let initial_progress = crate::shared::types::IndexProgress {
+        state: crate::shared::types::IndexState::Running,
+        phase: crate::shared::types::IndexPhase::Pending,
+        context_id: Some(roots.worktree_context.context_id.clone()),
+        source_root: Some(roots.source_root.clone()),
+        branch_name: roots.worktree_context.branch_name.clone(),
+        branch_status: Some(roots.worktree_context.branch_status),
+        files_total: 0,
+        files_scanned: 0,
+        files_processed: 0,
+        files_indexed: 0,
+        files_skipped: 0,
+        files_deleted: 0,
+        segments_stored: 0,
+        embeddings_enabled: false,
+        embedding_unavailable_reason: None,
+        vector_rows: None,
+        embeddable_segments: None,
+        message: Some("Preparing to index...".to_string()),
+        parallelism: None,
+        timings: None,
+        scope: Some(scope_info),
+        prefilter: None,
+        indexer_pid: Some(std::process::id()),
+        updated_at: chrono::Utc::now(),
+    };
+    let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
+    let payload = serde_json::to_vec_pretty(&initial_progress)?;
+    let state_root = roots.state_root.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        let secure_root = crate::shared::fs::ensure_secure_project_root(&state_root)?;
+        crate::shared::fs::atomic_replace(
+            &progress_path,
+            &payload,
+            &secure_root,
+            crate::shared::constants::PROJECT_STATE_DIR_MODE,
+            crate::shared::constants::SECURE_STATE_FILE_MODE,
+        )
+    })
+    .await?;
+    if let Err(e) = write_result {
+        tracing::warn!("failed to write initial progress with scope info: {}", e);
+        // Continue anyway - initial progress write is best-effort
+    }
+    Ok(())
+}
+
 async fn run_index(
     roots: &McpProjectRoots,
     rebuild: bool,
@@ -1797,71 +1894,10 @@ async fn run_index(
 
     // Write initial progress file with scope info BEFORE rebuild lock acquisition.
     // This ensures scope is visible during the rebuilding phase, even if the progress file
-    // isn't updated again until the pipeline starts running.
-    let initial_scope_info = if !new_scope.is_empty() {
-        Some(crate::shared::types::IndexScopeInfo {
-            requested: format!("scoped:{}", new_scope.len()),
-            executed: String::new(), // Will be updated by pipeline
-            changed_paths: 0,
-            fallback_reason: None,
-            roots: new_scope.clone(),
-        })
-    } else {
-        None
-    };
-
-    if let Some(scope_info) = &initial_scope_info {
-        let initial_progress = crate::shared::types::IndexProgress {
-            state: crate::shared::types::IndexState::Running,
-            phase: crate::shared::types::IndexPhase::Pending,
-            context_id: Some(roots.worktree_context.context_id.clone()),
-            source_root: Some(roots.source_root.clone()),
-            branch_name: roots.worktree_context.branch_name.clone(),
-            branch_status: Some(roots.worktree_context.branch_status),
-            files_total: 0,
-            files_scanned: 0,
-            files_processed: 0,
-            files_indexed: 0,
-            files_skipped: 0,
-            files_deleted: 0,
-            segments_stored: 0,
-            embeddings_enabled: false,
-            embedding_unavailable_reason: None,
-            vector_rows: None,
-            embeddable_segments: None,
-            message: Some("Preparing to index...".to_string()),
-            parallelism: None,
-            timings: None,
-            scope: Some(scope_info.clone()),
-            prefilter: None,
-            indexer_pid: Some(std::process::id()),
-            updated_at: chrono::Utc::now(),
-        };
-        // Write the progress file atomically (temp + fsync + rename) so scope is
-        // visible immediately without a concurrent reader ever observing a torn or
-        // zero-length index_status.json and misreporting a scoped rebuild as "no
-        // index". Best-effort: a failure to record the initial scope is logged and
-        // indexing continues. The blocking secure-fs write runs on a blocking pool
-        // so it never stalls a tokio worker.
-        let progress_path = config::project_dot_dir(&roots.state_root).join("index_status.json");
-        let payload = serde_json::to_vec_pretty(&initial_progress)?;
-        let state_root = roots.state_root.clone();
-        let write_result = tokio::task::spawn_blocking(move || {
-            let secure_root = crate::shared::fs::ensure_secure_project_root(&state_root)?;
-            crate::shared::fs::atomic_replace(
-                &progress_path,
-                &payload,
-                &secure_root,
-                crate::shared::constants::PROJECT_STATE_DIR_MODE,
-                crate::shared::constants::SECURE_STATE_FILE_MODE,
-            )
-        })
-        .await?;
-        if let Err(e) = write_result {
-            tracing::warn!("failed to write initial progress with scope info: {}", e);
-            // Continue anyway - initial progress write is best-effort
-        }
-    }
+    // isn't updated again until the pipeline starts running. (The `ops::start` path
+    // also writes this before spawning the rebuild task; this write keeps
+    // `run_index` self-contained for any caller.)
+    write_initial_scope_progress(roots, &new_scope).await?;
 
     let mut setup = SetupTimings::new(Instant::now());
 
