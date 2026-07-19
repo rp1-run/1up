@@ -66,6 +66,7 @@ if PYTHONUTF8=1 "${PYTHON_CMD[@]}" - "$BINARY_PATH" "$REPO_PATH" "$OUTPUT_PATH" 
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -290,21 +291,134 @@ def record_known_issue_110(reason):
 
 
 def require_real_ancestors(repo, relative_path):
-    """Rejects a symlinked (or otherwise non-directory) ancestor of a fixture
-    path, so a fixture write can never traverse a link out of the controlled
+    """Rejects a redirecting (or otherwise non-directory) ancestor of a
+    fixture path, so a fixture write can never traverse out of the controlled
     tree — the file-level guard below covers only the final path component.
     Not-yet-existing ancestors are fine: mkdir creates them as real
     directories. The repo root itself is already physically resolved by the
-    wrapping bash script (`pwd -P`)."""
-    current = repo
+    wrapping bash script (`pwd -P`).
+
+    Two independent checks are required: `is_symlink()` catches POSIX
+    symlinks (including broken ones, where `exists()` is False), but is False
+    for a Windows directory junction, whose reparse point `exists()`/`is_dir()`
+    happily follow. Junctions — and any other reparse redirect — are caught by
+    comparing each component's physical resolution (`os.path.realpath`, which
+    resolves junctions) against the physical path it would have if every
+    component were a real directory."""
+    resolved_expected = Path(os.path.realpath(repo))
+    current = Path(repo)
     for part in Path(relative_path).parent.parts:
         current = current / part
+        resolved_expected = resolved_expected / part
         if current.is_symlink() or (current.exists() and not current.is_dir()):
             raise SmokeFailure(
                 f"fixture ancestor {current.relative_to(repo)} of "
                 f"{relative_path} is not a real directory; refusing to write "
                 "through it"
             )
+        if current.exists():
+            resolved = Path(os.path.realpath(current))
+            if os.path.normcase(str(resolved)) != os.path.normcase(
+                str(resolved_expected)
+            ):
+                raise SmokeFailure(
+                    f"fixture ancestor {current.relative_to(repo)} of "
+                    f"{relative_path} physically resolves to {resolved} "
+                    "(a junction or other reparse redirect); refusing to "
+                    "write through it"
+                )
+
+
+def write_fixture_file(repo, relative_path, content):
+    """Writes one fixture file under `repo` behind the ancestor and final-
+    component guards. Returns True when the file was (re)written, False when
+    an identical file already exists. Shared by `ensure_fixture_repo` and the
+    adversarial self-test so the test exercises the real write path."""
+    path = repo / relative_path
+    require_real_ancestors(repo, relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Never write through a symlink or onto a non-regular file: the
+    # rewrite below must only ever mutate the fixture file itself, not
+    # whatever an existing link happens to point at.
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise SmokeFailure(
+            f"fixture path {relative_path} exists but is not a regular "
+            "file; refusing to overwrite it"
+        )
+    # Compare raw bytes: read_text universal newlines would treat a
+    # CRLF-on-disk fixture as equal and silently keep it.
+    if path.exists() and path.read_bytes() == content.encode("utf-8"):
+        return False
+    path.write_bytes(content.encode("utf-8"))
+    return True
+
+
+def self_test_ancestor_guard():
+    """Adversarial regression test for the ancestor guard, run on every smoke
+    invocation on every platform: builds a scratch repo whose `src` ancestor
+    redirects to an outside directory — a POSIX symlink here, a real directory
+    junction on Windows (the case `is_symlink()` cannot see) — then requires
+    the fixture write to refuse and proves the outside sentinel and target
+    directory were left untouched. Also proves the healthy path still writes
+    through real directories, so the guard cannot silently break fixture
+    creation."""
+    base = Path(output_path).parent / ".ancestor-guard-selftest"
+    shutil.rmtree(base, ignore_errors=True)
+    outside = base / "outside-target"
+    outside.mkdir(parents=True)
+    sentinel = outside / "sentinel.txt"
+    sentinel_content = b"must remain untouched"
+    sentinel.write_bytes(sentinel_content)
+    scratch_repo = base / "repo"
+    scratch_repo.mkdir()
+    redirect = scratch_repo / "src"
+
+    try:
+        if sys.platform == "win32":
+            import _winapi
+
+            _winapi.CreateJunction(str(outside), str(redirect))
+            flavor = "directory junction"
+        else:
+            os.symlink(str(outside), str(redirect), target_is_directory=True)
+            flavor = "symlink"
+
+        refused = False
+        try:
+            write_fixture_file(scratch_repo, "src/escape.py", "escape-attempt")
+        except SmokeFailure:
+            refused = True
+        if not refused:
+            raise SmokeFailure(
+                f"ancestor-guard self-test failed: a {flavor} ancestor was "
+                "accepted for a fixture write"
+            )
+        if (outside / "escape.py").exists():
+            raise SmokeFailure(
+                f"ancestor-guard self-test failed: a fixture write escaped "
+                f"through a {flavor} ancestor into {outside}"
+            )
+        if sentinel.read_bytes() != sentinel_content or len(list(outside.iterdir())) != 1:
+            raise SmokeFailure(
+                f"ancestor-guard self-test failed: the outside target changed "
+                f"after a refused write through a {flavor} ancestor"
+            )
+
+        # Healthy-path control: real (and not-yet-existing) directories must
+        # still be accepted, or the guard would break fixture creation itself.
+        if not write_fixture_file(scratch_repo, "lib/util.py", "healthy write"):
+            raise SmokeFailure(
+                "ancestor-guard self-test failed: a healthy fixture write "
+                "reported nothing written"
+            )
+        if (scratch_repo / "lib" / "util.py").read_bytes() != b"healthy write":
+            raise SmokeFailure(
+                "ancestor-guard self-test failed: the healthy fixture write "
+                "did not land in the scratch repo"
+            )
+        artifact["ancestor_guard_selftest"] = f"refused {flavor} ancestor"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def ensure_fixture_repo():
@@ -318,23 +432,8 @@ def ensure_fixture_repo():
         raise SmokeFailure(".git exists but is neither a directory nor a worktree file")
 
     for relative_path, content in FIXTURE_FILES.items():
-        path = repo / relative_path
-        require_real_ancestors(repo, relative_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Never write through a symlink or onto a non-regular file: the
-        # rewrite below must only ever mutate the fixture file itself, not
-        # whatever an existing link happens to point at.
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise SmokeFailure(
-                f"fixture path {relative_path} exists but is not a regular "
-                "file; refusing to overwrite it"
-            )
-        # Compare raw bytes: read_text universal newlines would treat a
-        # CRLF-on-disk fixture as equal and silently keep it.
-        if path.exists() and path.read_bytes() == content.encode("utf-8"):
-            continue
-        path.write_bytes(content.encode("utf-8"))
-        artifact["fixture_files_created"].append(relative_path)
+        if write_fixture_file(repo, relative_path, content):
+            artifact["fixture_files_created"].append(relative_path)
 
 
 def isolated_child_env():
@@ -676,6 +775,7 @@ def require_fixture_overview(envelope):
 
 
 try:
+    self_test_ancestor_guard()
     ensure_fixture_repo()
     smoke_env = isolated_child_env()
 except SmokeFailure as exc:
