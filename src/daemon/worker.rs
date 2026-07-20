@@ -110,6 +110,24 @@ struct ProjectState {
     /// `reopen_if_index_swapped` so a build-aside swap never serves a stale count
     /// into the vector stage's large-corpus latency warning and diagnostics.
     cached_vector_count: Option<usize>,
+    /// Cached result of the first-index gate's gitignore-aware file-count walk
+    /// (see [`count_files_gitignore_aware`]), populated the first time this
+    /// project's dirty-signal pass runs the gate while `is_first_index` holds.
+    /// While a project stays gated (over-threshold, unscoped, no indexed
+    /// content), every subsequent dirty signal re-enters the same gate check;
+    /// without this cache each one repeats a full-tree walk, pinning a core on
+    /// a large gated monorepo that keeps producing filesystem events.
+    ///
+    /// Invalidation policy: cleared to `None` only on a registry reload
+    /// (SIGHUP, `reload_projects`) — the only event that can change the
+    /// project's scope/registry state while it stays gated between dirty
+    /// signals (e.g. an operator applies `--scope` out of band and reloads).
+    /// No wall-clock TTL is needed: a dirty signal alone cannot change
+    /// whether the repo is over threshold, so re-walking on every signal buys
+    /// nothing but CPU. Once the gate opens (scope recorded or content
+    /// indexed), `is_first_index` goes false and this cache is simply no
+    /// longer consulted.
+    cached_gate_file_count: Option<usize>,
     /// One reused tuned read [`Connection`] to the open index, serving repeated
     /// daemon searches without a fresh per-request `connect()` + PRAGMA pass.
     /// Created lazily on the first search and dropped (`None`) whenever
@@ -1399,6 +1417,13 @@ async fn reload_projects(
     for entry in &registry.projects {
         let context_id = entry.context_id();
         if let Some(existing) = projects.get_mut(&context_id) {
+            // A registry reload is the only event that can change scope/registry
+            // state while a project stays gated between dirty signals (e.g. an
+            // operator applies `--scope` out of band and sends SIGHUP), so it is
+            // the sanctioned invalidation point for the gate's cached file
+            // count. See `ProjectState::cached_gate_file_count` for the full
+            // invalidation policy.
+            existing.cached_gate_file_count = None;
             let entry_context = context_from_entry(entry);
             let branch_changed = branch_context_changed(&existing.context, &entry_context);
             if branch_changed {
@@ -1519,6 +1544,7 @@ async fn build_project_state(
         db,
         index_identity,
         cached_vector_count: None,
+        cached_gate_file_count: None,
         read_conn: None,
         indexing: entry.indexing.clone(),
         embedding_runtime: EmbeddingRuntime::default(),
@@ -2353,18 +2379,22 @@ const TEST_GATE_WALK_THROTTLE_EVERY: usize = 10;
 
 /// Count files in a gitignore-aware manner for gate-check purposes.
 ///
-/// Returns the count of regular files that are not ignored by `.gitignore`.
-/// Checks the cancellation token every 100 entries so a SIGTERM-driven token
-/// cancellation aborts the walk promptly. A cancelled walk returns
-/// [`IndexingError::Cancelled`] — a distinct outcome from a genuine empty walk
-/// (`Ok(0)`) — so the caller never mistakes "cancelled during shutdown" for
-/// "zero files" and opens the first-index gate while draining.
+/// Returns the count of regular files that are not ignored by `.gitignore`,
+/// excluding VCS metadata directories (`.git`, `.hg`, `.svn`) via the same
+/// [`crate::mcp::ops::is_under_vcs_dir`] filter the MCP facts-envelope gate
+/// uses, so the two gates can never disagree about whether the same repo is
+/// over the file-count threshold. Checks the cancellation token every 100
+/// entries so a SIGTERM-driven token cancellation aborts the walk promptly. A
+/// cancelled walk returns [`IndexingError::Cancelled`] — a distinct outcome
+/// from a genuine empty walk (`Ok(0)`) — so the caller never mistakes
+/// "cancelled during shutdown" for "zero files" and opens the first-index
+/// gate while draining.
 fn count_files_gitignore_aware(
     source_root: &Path,
     cancel_token: &CancellationToken,
 ) -> Result<usize, OneupError> {
+    use crate::mcp::ops::{build_vcs_aware_walker, is_under_vcs_dir};
     use crate::shared::errors::IndexingError;
-    use ignore::WalkBuilder;
 
     // Test-only: read once. Holds the walk open (a small sleep every N entries)
     // so a test can land SIGTERM mid-walk. Compiled to a constant `None` in
@@ -2380,10 +2410,7 @@ fn count_files_gitignore_aware(
         None
     };
 
-    let walker = WalkBuilder::new(source_root)
-        .hidden(false)
-        .ignore(true) // Respect .gitignore
-        .build();
+    let walker = build_vcs_aware_walker(source_root).build();
 
     let mut count = 0;
     for (idx, result) in walker.into_iter().enumerate() {
@@ -2408,7 +2435,14 @@ fn count_files_gitignore_aware(
 
         if let Ok(entry) = result {
             if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                count += 1;
+                let is_vcs = entry
+                    .path()
+                    .strip_prefix(source_root)
+                    .map(is_under_vcs_dir)
+                    .unwrap_or(false);
+                if !is_vcs {
+                    count += 1;
+                }
             }
         }
     }
@@ -2591,7 +2625,7 @@ async fn run_project(
         // Snapshot the roots and first-index decision as owned values so the
         // immutable borrow of `projects` ends before the (cancellable) gate walk
         // and the `get_mut` used on the abort path below.
-        let (state_root, source_root, is_first_index) = {
+        let (state_root, source_root, is_first_index, cached_gate_file_count) = {
             let state = projects
                 .get(context_id)
                 .expect("dirty project must exist while gating");
@@ -2607,6 +2641,7 @@ async fn run_project(
                 state.project_root.clone(),
                 state.source_root.clone(),
                 is_first_index,
+                state.cached_gate_file_count,
             )
         };
 
@@ -2617,51 +2652,66 @@ async fn run_project(
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
-            // Run the gate walk in spawn_blocking so the async executor stays
-            // responsive to signals. The walk observes this pass's per-project
-            // child token and aborts cooperatively: SIGTERM cancels the daemon
-            // token and thus this child via parentage, while a de-register
-            // cancels only this child.
-            let source_root_clone = source_root.clone();
-            let cancel_token_clone = project_cancel_token.clone();
-            let walk_result: Result<usize, OneupError> = tokio::task::spawn_blocking(move || {
-                count_files_gitignore_aware(&source_root_clone, &cancel_token_clone)
-            })
-            .await
-            .unwrap_or_else(|join_err| {
-                Err(OneupError::Other(anyhow::anyhow!(
-                    "gate walk task failed to join: {join_err}"
-                )))
-            });
+            // Reuse the cached gate file count while this project stays gated
+            // between dirty signals instead of re-walking the full tree on every
+            // one (see `ProjectState::cached_gate_file_count`). Only a registry
+            // reload (SIGHUP) clears it.
+            let file_count = if let Some(cached) = cached_gate_file_count {
+                cached
+            } else {
+                // Run the gate walk in spawn_blocking so the async executor stays
+                // responsive to signals. The walk observes this pass's per-project
+                // child token and aborts cooperatively: SIGTERM cancels the daemon
+                // token and thus this child via parentage, while a de-register
+                // cancels only this child.
+                let source_root_clone = source_root.clone();
+                let cancel_token_clone = project_cancel_token.clone();
+                let walk_result: Result<usize, OneupError> =
+                    tokio::task::spawn_blocking(move || {
+                        count_files_gitignore_aware(&source_root_clone, &cancel_token_clone)
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        Err(OneupError::Other(anyhow::anyhow!(
+                            "gate walk task failed to join: {join_err}"
+                        )))
+                    });
 
-            // A cancelled (or otherwise failed) gate walk must NOT collapse to
-            // `file_count = 0`: that value passes the file-count gate and would
-            // start a first index during the shutdown drain (defect 2). Abort the
-            // pass instead. The gate walk runs before `start_run`, so the project
-            // is still dirty with its pending scope intact and re-runs on a later
-            // pass. A genuinely empty repo still returns `Ok(0)` and takes the
-            // normal gate path below.
-            let file_count = match walk_result {
-                Ok(count) => count,
-                Err(e) => {
-                    let state = projects
-                        .get_mut(context_id)
-                        .expect("dirty project must exist while aborting an interrupted gate walk");
-                    if matches!(
-                        &e,
-                        OneupError::Indexing(crate::shared::errors::IndexingError::Cancelled)
-                    ) {
-                        // Cancellation is neither complete nor failed: record the
-                        // refresh as pending (mirroring the pipeline cancel path)
-                        // so status readers see a re-index is still owed.
-                        state.last_refresh_state = DaemonRefreshState::Pending;
-                        state.last_refresh_error = None;
-                        persist_daemon_context_status_for_state(state);
-                    } else {
-                        // A genuine walk/join fault: record failure, leave dirty.
-                        mark_refresh_finished(state, Utc::now(), Err(&e));
+                // A cancelled (or otherwise failed) gate walk must NOT collapse to
+                // `file_count = 0`: that value passes the file-count gate and would
+                // start a first index during the shutdown drain (defect 2). Abort the
+                // pass instead. The gate walk runs before `start_run`, so the project
+                // is still dirty with its pending scope intact and re-runs on a later
+                // pass. A genuinely empty repo still returns `Ok(0)` and takes the
+                // normal gate path below.
+                match walk_result {
+                    Ok(count) => {
+                        let state = projects
+                            .get_mut(context_id)
+                            .expect("dirty project must exist while caching a completed gate walk");
+                        state.cached_gate_file_count = Some(count);
+                        count
                     }
-                    return Err(e);
+                    Err(e) => {
+                        let state = projects.get_mut(context_id).expect(
+                            "dirty project must exist while aborting an interrupted gate walk",
+                        );
+                        if matches!(
+                            &e,
+                            OneupError::Indexing(crate::shared::errors::IndexingError::Cancelled)
+                        ) {
+                            // Cancellation is neither complete nor failed: record the
+                            // refresh as pending (mirroring the pipeline cancel path)
+                            // so status readers see a re-index is still owed.
+                            state.last_refresh_state = DaemonRefreshState::Pending;
+                            state.last_refresh_error = None;
+                            persist_daemon_context_status_for_state(state);
+                        } else {
+                            // A genuine walk/join fault: record failure, leave dirty.
+                            mark_refresh_finished(state, Utc::now(), Err(&e));
+                        }
+                        return Err(e);
+                    }
                 }
             };
 
@@ -3282,6 +3332,47 @@ mod tests {
     }
 
     #[test]
+    fn daemon_gate_count_matches_mcp_vcs_aware_count() {
+        // The daemon's first-index gate and the MCP facts-envelope gate must
+        // never disagree about whether the same repo is over the file-count
+        // threshold. Before this fix, the daemon's walk had no VCS-dir filter
+        // and counted everything under `.git/`, while the MCP-side walk
+        // (`mcp::ops::count_total_tracked_files`) excludes it — a repo with a
+        // small working tree but a `.git/` full of loose objects could read as
+        // over-threshold on the daemon side and under-threshold on the MCP
+        // side. Both counters must agree on a fixture repo with many files
+        // stashed under `.git/`.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("file_{i}.rs")), "fn x() {}").unwrap();
+        }
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        for i in 0..50 {
+            std::fs::write(
+                git_dir.join("objects").join(format!("obj_{i}")),
+                "loose object",
+            )
+            .unwrap();
+        }
+
+        let cancel_token = CancellationToken::new();
+        let daemon_count = count_files_gitignore_aware(tmp.path(), &cancel_token)
+            .expect("an uncancelled walk succeeds");
+        let mcp_count = crate::mcp::ops::count_total_tracked_files(tmp.path())
+            .expect("the MCP-side walk succeeds");
+
+        assert_eq!(
+            daemon_count, 5,
+            "the daemon gate must exclude .git/ contents from its count"
+        );
+        assert_eq!(
+            daemon_count, mcp_count,
+            "the daemon gate and the MCP gate must agree on the same repo"
+        );
+    }
+
+    #[test]
     fn should_idle_shutdown_only_when_empty_past_timeout() {
         let timeout = Duration::from_secs(60);
         // A daemon that still owns a project never idles out.
@@ -3356,6 +3447,7 @@ mod tests {
             db,
             index_identity: index_file_identity(&config::project_db_path(project_root)),
             cached_vector_count: None,
+            cached_gate_file_count: None,
             read_conn: None,
             indexing: None,
             embedding_runtime: EmbeddingRuntime::default(),
@@ -3913,6 +4005,111 @@ mod tests {
             projects.get(&key).unwrap().last_refresh_state,
             DaemonRefreshState::Pending,
             "a cancelled pass is pending re-index, neither complete nor failed"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gated_project_reuses_cached_file_count_across_dirty_signals() {
+        // A gated (over-threshold, unscoped, empty-index) project keeps
+        // receiving dirty signals from filesystem events while it stays
+        // gated. Before this fix each signal re-ran the full-tree gate walk;
+        // now the first walk's result is cached on `ProjectState` and reused
+        // until a registry reload. Prove no re-walk by growing the fixture
+        // between two passes and asserting the SECOND pass still reports the
+        // file count observed by the FIRST — a fresh walk would see the new
+        // files and the cache would no longer match.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard =
+            EnvVarsGuard::new(&[crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR]);
+        std::env::set_var(crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR, "3");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let db = seeded_project_db(&root).await;
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(&root, &root, db, dirty_full_run_state()),
+        );
+
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+
+        let first = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "an over-threshold first-index pass stays gated (idle, Ok), got {first:?}"
+        );
+        // `ensure_secure_project_root`/`schema::initialize` also create a
+        // `.1up/` state directory in the fixture, so the true walked count
+        // includes those files, not just the 6 `.rs` fixtures written above.
+        // Capture whatever the first walk actually observed rather than
+        // hardcoding it, then prove the second pass reuses exactly that value.
+        let cached_after_first = projects
+            .get(&key)
+            .unwrap()
+            .cached_gate_file_count
+            .expect("the gate walk must cache the observed file count");
+        assert!(
+            cached_after_first >= 6,
+            "the cached count must include at least the 6 fixture files, got {cached_after_first}"
+        );
+
+        // Grow the fixture past what was cached. A re-walk would see more files.
+        for i in 6..9 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+        projects
+            .get_mut(&key)
+            .unwrap()
+            .run_state
+            .mark_dirty(RunScope::Full);
+
+        let second = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "a repeat dirty signal while still gated stays gated, got {second:?}"
+        );
+        assert_eq!(
+            projects.get(&key).unwrap().cached_gate_file_count,
+            Some(cached_after_first),
+            "a second dirty-signal pass while gated must reuse the cached count, not re-walk \
+             (a fresh walk would have observed the 3 files added after the first pass)"
         );
     }
 
@@ -4718,6 +4915,61 @@ mod tests {
         assert!(
             token_b.is_cancelled(),
             "the dropped project's in-flight rebuild must be cancelled"
+        );
+    }
+
+    /// A registry reload (SIGHUP) is the sanctioned invalidation point for the
+    /// first-index gate's cached file count (see
+    /// `ProjectState::cached_gate_file_count`): it is the only event that can
+    /// change scope/registry state while a project stays gated between dirty
+    /// signals. A retained (still-registered, branch-unchanged) project must
+    /// have its cache cleared on reload so the next gate check re-walks
+    /// instead of trusting a possibly-stale count.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reload_clears_cached_gate_file_count_for_retained_project() {
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvVarsGuard::new(&["HOME", "XDG_DATA_HOME"]);
+        let home = tempfile::tempdir().unwrap();
+        let home_root = home.path().canonicalize().unwrap();
+        std::env::set_var("HOME", &home_root);
+        std::env::set_var("XDG_DATA_HOME", home_root.join(".local").join("share"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let db = seeded_project_db(&root).await;
+
+        let key = "reload-retained".to_string();
+        let mut state = project_state(&root, &root, db, ProjectRunState::default());
+        state.context.context_id = key.clone();
+        state.cached_gate_file_count = Some(42);
+
+        let mut projects = HashMap::new();
+        insert_project(&mut projects, state);
+
+        Registry {
+            projects: vec![registry_entry(&key, &root)],
+        }
+        .save()
+        .unwrap();
+
+        let mut watcher = FileWatcher::new().unwrap();
+        let mut deferred = HashMap::new();
+        let daemon_token = CancellationToken::new();
+        reload_projects(&mut watcher, &mut projects, &mut deferred, &daemon_token)
+            .await
+            .unwrap();
+
+        assert!(
+            projects.contains_key(&key),
+            "the still-registered project must be retained across reload"
+        );
+        assert_eq!(
+            projects.get(&key).unwrap().cached_gate_file_count,
+            None,
+            "a registry reload must clear the cached gate file count for a retained project"
         );
     }
 
