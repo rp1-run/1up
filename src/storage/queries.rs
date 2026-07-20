@@ -49,8 +49,8 @@ pub const CREATE_INDEX_LANGUAGE: &str =
     "CREATE INDEX IF NOT EXISTS idx_segments_language ON segments(language)";
 
 /// Content-addressed embedding store. One row per distinct `(model_id,
-/// embedding_dim, embed_input)` content key, holding the shared vector bytes and
-/// the DiskANN index. `ref_count` tracks how many `segment_vectors` rows
+/// embedding_dim, embed_input)` content key, holding the shared vector bytes.
+/// `ref_count` tracks how many `segment_vectors` rows
 /// reference the row across every context; a row is physically deleted only when
 /// its last referencing segment is gone (centralized in `delete_context`).
 pub const CREATE_EMBEDDING_POOL_TABLE: &str = "
@@ -111,9 +111,6 @@ CREATE TABLE IF NOT EXISTS segment_relations (
         edge_identity_kind
     )
 )";
-
-pub const CREATE_INDEX_EMBEDDING_POOL_EMBEDDING: &str =
-    "/* KEEP: max_neighbors=32 caps DiskANN fanout to hold the <=80 MiB index-size budget; default (~62 for 384d) pushes the node block to a larger page tier (~95 MiB) with no measurable recall gain on the hand-curated corpus. */ CREATE INDEX IF NOT EXISTS idx_embedding_pool_embedding ON embedding_pool (libsql_vector_idx(embedding_vec, 'metric=cosine', 'compress_neighbors=float8', 'max_neighbors=32'))";
 
 pub const CREATE_INDEX_SEGMENT_SYMBOLS_EXACT: &str =
     "CREATE INDEX IF NOT EXISTS idx_segment_symbols_exact ON segment_symbols(context_id, canonical_symbol, reference_kind)";
@@ -203,7 +200,6 @@ DROP TRIGGER IF EXISTS segments_au;
 DROP TRIGGER IF EXISTS segments_vector_ad;
 DROP TRIGGER IF EXISTS segments_symbol_ad;
 DROP TABLE IF EXISTS segments_fts;
-DROP INDEX IF EXISTS idx_embedding_pool_embedding;
 DROP INDEX IF EXISTS idx_segment_symbols_exact;
 DROP INDEX IF EXISTS idx_segment_symbols_prefix;
 DROP INDEX IF EXISTS idx_segment_relations_source;
@@ -271,65 +267,14 @@ JOIN segments AS s ON s.id = sv.segment_id
 WHERE s.context_id = ?1
 LIMIT 1";
 
-pub const COUNT_VECTOR_CONTEXTS: &str = "
-SELECT COUNT(DISTINCT s.context_id)
-FROM segment_vectors AS sv
-JOIN segments AS s ON s.id = sv.segment_id";
-
-/// Context-agnostic sibling of [`SELECT_VECTOR_CANDIDATES_FOR_CONTEXT`] (no
-/// `context_id` filter). Kept in lockstep with the pooled schema so it joins the
-/// relocated pool index and fans out through `content_key`; the `s.id` secondary
-/// sort keeps fan-out ties deterministic.
-#[allow(dead_code)]
-pub const SELECT_VECTOR_CANDIDATES: &str = "
-WITH vector_matches AS (
-    SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
-)
-SELECT s.id, s.file_path, s.language, s.block_type,
-       s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
-FROM vector_matches AS v
-JOIN embedding_pool AS p ON p.rowid = v.id
-JOIN segment_vectors AS sv ON sv.content_key = p.content_key
-JOIN segments AS s ON s.id = sv.segment_id
-ORDER BY v.rank, s.id";
-
-/// Approximate (ANN) vector candidates for a context, used only above
-/// `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`. `vector_top_k` runs over the relocated
-/// pool index and returns one rowid per distinct pool vector (`?2` = over-fetch
-/// budget, scaled by indexed-context count at the call site so enough top
-/// vectors survive the per-context filter). Each pool row then fans out across
-/// every `segment_vectors` reference sharing its `content_key`; the result is
-/// filtered to the context and truncated to `?4` (the base candidate budget K).
-/// The secondary sort `s.id` is load-bearing: one pool row now maps to multiple
-/// segments, so `v.rank` alone leaves ties unordered — `ORDER BY v.rank, s.id`
-/// makes the truncation deterministic.
-pub const SELECT_VECTOR_CANDIDATES_FOR_CONTEXT: &str = "
-WITH vector_matches AS (
-    SELECT row_number() OVER () AS rank, id
-    FROM vector_top_k('idx_embedding_pool_embedding', vector8(?1), ?2)
-)
-SELECT s.id, s.file_path, s.language, s.block_type,
-       s.line_start, s.line_end, s.breadcrumb, s.complexity,
-       s.role, s.defined_symbols, s.referenced_symbols, s.called_symbols, s.content
-FROM vector_matches AS v
-JOIN embedding_pool AS p ON p.rowid = v.id
-JOIN segment_vectors AS sv ON sv.content_key = p.content_key
-JOIN segments AS s ON s.id = sv.segment_id
-WHERE s.context_id = ?3
-ORDER BY v.rank, s.id
-LIMIT ?4";
-
-/* KEEP: the exhaustive path must not touch idx_embedding_pool_embedding.
-Below VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS a full ordered scan over the
-context's vectors is both exact and orders of magnitude faster than beam
-traversal over the disk-based approximate index, which the profiling for the
-small-corpus latency fix showed spending seconds in read-heavy graph walks.
-The `segment_vectors -> embedding_pool` join is 1:1 (each reference names exactly
-one pool row), so the candidate row set, the `vector_distance_cos` values, and the
-`ORDER BY ..., s.id` ordering are byte-for-byte identical to the pre-pooling inline
-column (confirmed by measurement) — the vector bytes simply moved into the shared pool. */
+/* The exact vector path: a full ordered `vector_distance_cos` scan over the
+context's vectors, measured faster than the removed approximate DiskANN
+`vector_top_k` path at every tested corpus size (see
+docs/diskann-removal.md). The `segment_vectors -> embedding_pool` join is 1:1
+(each reference names exactly one pool row), so the candidate row set, the
+`vector_distance_cos` values, and the `ORDER BY ..., s.id` ordering are
+byte-for-byte identical to the pre-pooling inline column (confirmed by
+measurement) — the vector bytes simply moved into the shared pool. */
 pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
@@ -343,10 +288,9 @@ LIMIT ?3";
 
 /// Path-prefix-scoped sibling of [`SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`]:
 /// `?4` is the bound `LIKE` pattern built by
-/// `SearchScope::path_prefix_like_pattern`. Scoped vector search is always
-/// forced onto this exhaustive path (never `vector_top_k`) so the prefix
-/// filter cannot starve out results the ANN path would otherwise truncate
-/// before the filter runs.
+/// `SearchScope::path_prefix_like_pattern`. The prefix filter runs inside the
+/// full scan, so it can never starve out in-scope results the way a
+/// truncate-then-filter approximate path would.
 pub const SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT_SCOPED: &str = "
 SELECT s.id, s.file_path, s.language, s.block_type,
        s.line_start, s.line_end, s.breadcrumb, s.complexity,
@@ -438,8 +382,8 @@ pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
 
 /// Idempotent insert of a shared pool vector. The vector bytes for a given
 /// `content_key` are a deterministic function of (model, content), so a key
-/// already present is left untouched (`DO NOTHING`) rather than rewritten —
-/// avoiding needless churn in the DiskANN index shadow tables. Concurrency-safe:
+/// already present is left untouched (`DO NOTHING`) rather than rewritten.
+/// Concurrency-safe:
 /// two writers inserting the same new content collapse to one row.
 /// `ref_count` is reconciled separately (incremented on the `segment_vectors`
 /// write, decremented by the `segments_vector_ad` AFTER DELETE trigger).
@@ -484,7 +428,7 @@ UPDATE embedding_pool
 /// but never removes a pool row, so a vector whose last referencer is gone
 /// lingers as a zero-ref orphan. `delete_context` runs this sweep after its
 /// context-scoped segment deletes to drop exactly those orphans, freeing the
-/// shared bytes and the DiskANN index entry. The `<= 0` floor is defensive: a
+/// shared bytes. The `<= 0` floor is defensive: a
 /// correctly maintained count never goes negative, but any row at or below zero
 /// is unreferenced and safe to delete. Pool rows still referenced by another
 /// context keep `ref_count >= 1`, so this never touches a live vector — the

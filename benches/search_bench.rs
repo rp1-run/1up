@@ -1039,9 +1039,9 @@ fn bench_impact_horizon(c: &mut Criterion) {
 }
 
 /// Vector corpus size for the exhaustive-scan guardrail bench. Matches the
-/// repo scale where `vector_top_k` beam traversal was observed taking
+/// repo scale where the removed approximate DiskANN path was observed taking
 /// multiple seconds per query while an exhaustive scan stays in single-digit
-/// milliseconds.
+/// milliseconds (see docs/diskann-removal.md).
 const EXHAUSTIVE_SCAN_BENCH_VECTORS: u64 = 4_500;
 
 fn seeded_bench_embedding(seed: u64) -> Vec<f32> {

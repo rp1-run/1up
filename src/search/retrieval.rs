@@ -4,11 +4,7 @@ use libsql::{Connection, Row};
 
 use crate::search::ranking::tokenize_text;
 use crate::search::scope::SearchScope;
-use crate::shared::config::force_ann_search_enabled;
-use crate::shared::constants::{
-    FORCE_ANN_SEARCH_ENV_VAR, VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS,
-    VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT, VECTOR_PREFILTER_K,
-};
+use crate::shared::constants::{VECTOR_EXACT_SCAN_WARN_THRESHOLD, VECTOR_PREFILTER_K};
 use crate::shared::errors::{OneupError, SearchError};
 use crate::shared::types::SegmentRole;
 use crate::storage::queries;
@@ -204,58 +200,22 @@ pub(crate) async fn has_indexed_embeddings(
     }
 }
 
-/// How the vector stage computes nearest-neighbour candidates for a context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VectorSearchPath {
-    /// Full `vector_distance_cos` scan over the context's vectors: exact and,
-    /// measured, the fast path at every realistic single-repo corpus size (an
-    /// in-memory linear pass of ~N x 384 dot products, sub-second well past
-    /// 256k vectors). This is the unconditional default.
-    ExhaustiveScan,
-    /// `vector_top_k` traversal of the approximate DiskANN index. Demoted to
-    /// explicit opt-in ([`FORCE_ANN_SEARCH_ENV_VAR`]) because it is
-    /// pathologically slow and *superlinear* in practice — ~7s @ 4.5k vectors,
-    /// ~45s @ 27k vectors (measured on the emdash corpus) — so it never wins
-    /// automatically until it is demonstrably faster.
-    AnnIndex,
-}
-
-/// Pure path-selection gate (unit-testable, no process env access).
-///
-/// The exact `vector_distance_cos` scan is the default for ALL corpus sizes
-/// because the approximate `vector_top_k` DiskANN path is measured slower and
-/// superlinear (~7s @ 4.5k, ~45s @ 27k vectors). The ANN path is only reachable
-/// when `force_ann` is set (via [`FORCE_ANN_SEARCH_ENV_VAR`] at the call site),
-/// and even then only above the historic [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`]
-/// cutoff, where the memory-resident linear pass would finally lose.
-pub(crate) fn vector_search_path_for_corpus(
-    context_vector_count: usize,
-    force_ann: bool,
-) -> VectorSearchPath {
-    if force_ann && context_vector_count > VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS {
-        VectorSearchPath::AnnIndex
-    } else {
-        VectorSearchPath::ExhaustiveScan
-    }
-}
-
 /// Emits a single process-wide `tracing::warn!` the first time a context's
-/// vector count exceeds [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`]. Above this
-/// (deliberately high) bound the default exact scan is still served, but its
-/// latency grows linearly with corpus size, so the operator gets one heads-up
-/// rather than a per-query log flood.
-fn warn_once_above_exhaustive_cliff(vector_count: usize) {
+/// vector count exceeds [`VECTOR_EXACT_SCAN_WARN_THRESHOLD`]. Above this
+/// (deliberately high) bound the exact scan — the only vector path — stays
+/// correct, but its latency grows linearly with corpus size, so the operator
+/// gets one heads-up rather than a per-query log flood.
+fn warn_once_above_exact_scan_threshold(vector_count: usize) {
     static WARNED: AtomicBool = AtomicBool::new(false);
 
-    if vector_count > VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS
+    if vector_count > VECTOR_EXACT_SCAN_WARN_THRESHOLD
         && WARNED
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
         tracing::warn!(
-            "vector corpus has {vector_count} vectors, above the {VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS} exhaustive-scan cliff; \
-             the default exact vector scan stays correct but its latency grows linearly with corpus size \
-             (set {FORCE_ANN_SEARCH_ENV_VAR}=1 to opt into the approximate DiskANN path, which is currently slower)"
+            "vector corpus has {vector_count} vectors, above the {VECTOR_EXACT_SCAN_WARN_THRESHOLD} warn threshold; \
+             the exact vector scan stays correct but its latency grows linearly with corpus size"
         );
     }
 }
@@ -271,9 +231,10 @@ pub(crate) async fn fetch_vector_candidates(
 /// Like [`fetch_vector_candidates`], but accepts a pre-computed per-context
 /// vector count so a caller that already knows it (the daemon caches it on
 /// `ProjectState`, invalidated on index swap) can skip the per-query
-/// `COUNT(*)`. The cached count MUST equal the live `COUNT(*)` for the open
-/// index, so path selection (`vector_search_path_for_corpus`) is identical to
-/// the live-count path; passing `None` falls back to the live count.
+/// `COUNT(*)`. The count feeds only the one-time large-corpus latency warning
+/// and the debug line below — never the served results — and the cached value
+/// MUST equal the live `COUNT(*)` for the open index; passing `None` falls
+/// back to the live count.
 pub(crate) async fn fetch_vector_candidates_with_count(
     conn: &Connection,
     scope: &SearchScope,
@@ -283,36 +244,24 @@ pub(crate) async fn fetch_vector_candidates_with_count(
     let started = std::time::Instant::now();
     let query_embedding = serialize_query_embedding(query_embedding)?;
 
-    // A `path_prefix` scope forces the exhaustive scan unconditionally,
-    // bypassing both the ANN index and the count-based path selection below:
-    // `vector_top_k` applies the path filter only after truncating to its
-    // top-K budget, which would starve out in-scope results that did not
-    // survive that truncation (design decision).
-    let (path, vector_count) = if scope.path_prefix().is_some() {
-        (VectorSearchPath::ExhaustiveScan, None)
+    // A `path_prefix` scope skips the count: the scoped scan is already
+    // bounded by the prefix filter, and the warning is about whole-context
+    // corpus growth.
+    let vector_count = if scope.path_prefix().is_some() {
+        None
     } else {
-        let vector_count = match cached_count {
+        let count = match cached_count {
             Some(count) => count,
             None => count_vector_rows_for_context(conn, scope).await?,
         };
-        warn_once_above_exhaustive_cliff(vector_count);
-        (
-            vector_search_path_for_corpus(vector_count, force_ann_search_enabled()),
-            Some(vector_count),
-        )
+        warn_once_above_exact_scan_threshold(count);
+        Some(count)
     };
 
-    let results = match path {
-        VectorSearchPath::ExhaustiveScan => {
-            fetch_vector_candidates_exhaustive(conn, scope, &query_embedding).await?
-        }
-        VectorSearchPath::AnnIndex => {
-            fetch_vector_candidates_ann(conn, scope, &query_embedding).await?
-        }
-    };
+    let results = fetch_vector_candidates_exhaustive(conn, scope, &query_embedding).await?;
 
     tracing::debug!(
-        "vector stage: {path:?} over {vector_count:?} context vectors (path_prefix={:?}) returned {} candidates in {:?}",
+        "vector stage: exact scan over {vector_count:?} context vectors (path_prefix={:?}) returned {} candidates in {:?}",
         scope.path_prefix(),
         results.len(),
         started.elapsed()
@@ -356,32 +305,6 @@ async fn fetch_vector_candidates_exhaustive(
     collect_candidate_rows(&mut rows, "vector exhaustive scan row iteration").await
 }
 
-async fn fetch_vector_candidates_ann(
-    conn: &Connection,
-    scope: &SearchScope,
-    serialized_embedding: &str,
-) -> Result<Vec<CandidateRow>, OneupError> {
-    // `vector_top_k` over the pool index returns distinct pool vectors; the
-    // context-scaled over-fetch ensures enough survive the per-context fan-out
-    // filter, after which we truncate back to the base budget K so the ANN path
-    // yields the same candidate count as the exhaustive path.
-    let over_fetch = vector_prefilter_k(conn).await?;
-    let mut rows = conn
-        .query(
-            queries::SELECT_VECTOR_CANDIDATES_FOR_CONTEXT,
-            libsql::params![
-                serialized_embedding,
-                over_fetch as i64,
-                scope.context_id(),
-                VECTOR_PREFILTER_K as i64
-            ],
-        )
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("vector search: {e}")))?;
-
-    collect_candidate_rows(&mut rows, "vector row iteration").await
-}
-
 async fn collect_candidate_rows(
     rows: &mut libsql::Rows,
     iteration_context: &str,
@@ -422,37 +345,6 @@ pub(crate) async fn count_vector_rows_for_context(
         ))
         .into()),
     }
-}
-
-async fn vector_prefilter_k(conn: &Connection) -> Result<usize, OneupError> {
-    let context_count = count_vector_contexts(conn).await?;
-    Ok(scaled_vector_prefilter_k(context_count))
-}
-
-async fn count_vector_contexts(conn: &Connection) -> Result<usize, OneupError> {
-    let mut rows = conn
-        .query(queries::COUNT_VECTOR_CONTEXTS, ())
-        .await
-        .map_err(|e| SearchError::QueryFailed(format!("failed to count vector contexts: {e}")))?;
-
-    match rows.next().await {
-        Ok(Some(row)) => {
-            let count: i64 = row.get(0).map_err(|e| {
-                SearchError::QueryFailed(format!("read vector context count failed: {e}"))
-            })?;
-            Ok(usize::try_from(count.max(1)).unwrap_or(usize::MAX))
-        }
-        Ok(None) => Ok(1),
-        Err(e) => Err(SearchError::QueryFailed(format!(
-            "vector context count iteration failed: {e}"
-        ))
-        .into()),
-    }
-}
-
-fn scaled_vector_prefilter_k(context_count: usize) -> usize {
-    let scale = context_count.clamp(1, VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT);
-    VECTOR_PREFILTER_K.saturating_mul(scale)
 }
 
 pub(crate) async fn fetch_fts_candidates(
@@ -1057,48 +949,6 @@ mod tests {
             .any(|result| result.file_path == "config/settings.ini"));
     }
 
-    #[test]
-    fn vector_search_path_defaults_to_exhaustive_for_all_sizes() {
-        // Without the ANN opt-in, every corpus size — including well above the
-        // old cliff — routes to the exact scan, which is the measured-fast path.
-        for count in [
-            0,
-            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1,
-            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS,
-            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1,
-            VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS * 4,
-        ] {
-            assert_eq!(
-                vector_search_path_for_corpus(count, false),
-                VectorSearchPath::ExhaustiveScan,
-                "count {count} must default to the exact scan without the ANN opt-in"
-            );
-        }
-    }
-
-    #[test]
-    fn vector_search_path_opts_into_ann_above_cliff_when_forced() {
-        // With the ANN opt-in the historic count-based cutoff applies: at or
-        // below the cliff the exact scan still wins; above it, ANN takes over.
-        assert_eq!(
-            vector_search_path_for_corpus(0, true),
-            VectorSearchPath::ExhaustiveScan
-        );
-        assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS - 1, true),
-            VectorSearchPath::ExhaustiveScan
-        );
-        assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS, true),
-            VectorSearchPath::ExhaustiveScan,
-            "the threshold itself stays on the exact path"
-        );
-        assert_eq!(
-            vector_search_path_for_corpus(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1, true),
-            VectorSearchPath::AnnIndex
-        );
-    }
-
     #[tokio::test]
     async fn exhaustive_scan_ranks_nearest_vector_first() {
         let conn = setup().await;
@@ -1130,11 +980,11 @@ mod tests {
     }
 
     // TDD: a cached per-context vector count threaded into
-    // the vector stage MUST select the same path and return byte-identical
-    // candidates as the live `COUNT(*)`. This pins the "cached count is a
-    // pure optimization, never a behavior change" contract: the daemon caches
-    // the count on `ProjectState` and the served results must not depend on
-    // whether the count came from the cache or a live query.
+    // the vector stage MUST return byte-identical candidates to the live
+    // `COUNT(*)`. This pins the "cached count is a pure optimization, never a
+    // behavior change" contract: the daemon caches the count on
+    // `ProjectState` and the served results must not depend on whether the
+    // count came from the cache or a live query.
     #[tokio::test]
     async fn cached_count_yields_identical_candidates_to_live_count() {
         let conn = setup().await;
@@ -1156,11 +1006,6 @@ mod tests {
 
         let live = count_vector_rows_for_context(&conn, &scope).await.unwrap();
         assert_eq!(live, 10, "fixture seeds ten context vectors");
-        assert_eq!(
-            vector_search_path_for_corpus(live, false),
-            VectorSearchPath::ExhaustiveScan,
-            "ten vectors stay on the exact path"
-        );
 
         let with_live = fetch_vector_candidates_with_count(&conn, &scope, &query_embedding, None)
             .await
@@ -1177,47 +1022,13 @@ mod tests {
         assert_eq!(with_cached[0].segment_id, "seg-3");
     }
 
+    // TDD: under pooling, one pool row can back many
+    // `segment_vectors` references, so the exhaustive query must fan out to
+    // every reference sharing a `content_key`. The expected ascending-id
+    // ordering documents the `ORDER BY ..., s.id` tiebreak contract, which
+    // guarantees determinism independent of query plan.
     #[tokio::test]
-    async fn ann_index_roundtrip_at_new_element_type() {
-        let conn = setup().await;
-
-        for i in 0..10 {
-            let embedding = embedding_with(&[(i, 1.0)]);
-            insert_segment(
-                &conn,
-                &format!("seg-{i}"),
-                &format!("src/file_{i}.rs"),
-                &format!("fn item_{i}() {{ }}"),
-                Some(&embedding),
-            )
-            .await;
-        }
-
-        // The above-threshold path is exercised directly so the vector_top_k
-        // SQL stays covered without inserting threshold-many vectors.
-        let query_embedding = embedding_with(&[(3, 0.95), (4, 0.05)]);
-        let serialized = serialize_query_embedding(&query_embedding).unwrap();
-        let candidates =
-            fetch_vector_candidates_ann(&conn, &SearchScope::default_context(), &serialized)
-                .await
-                .unwrap();
-
-        assert!(!candidates.is_empty(), "vector_top_k returned no rows");
-        assert_eq!(candidates[0].segment_id, "seg-3");
-    }
-
-    // TDD: under pooling, the ANN `vector_top_k` returns
-    // one row per distinct pool vector, so the query must fan out to every
-    // `segment_vectors` reference sharing that `content_key`. This is the
-    // discriminating assertion — a missing/wrong fan-out join yields the wrong
-    // rows (verified: it returns 2 unrelated rows instead of all 5). The expected
-    // ascending-id ordering documents the `ORDER BY v.rank, s.id` tiebreak
-    // contract; it guarantees determinism independent of query plan even
-    // though the current libSQL plan already scans `segment_vectors` by its
-    // segment-id PK. The full pre/post search-identical guard is covered
-    // separately.
-    #[tokio::test]
-    async fn ann_path_fans_out_shared_pool_row_with_deterministic_tiebreak() {
+    async fn exhaustive_scan_fans_out_shared_pool_row_with_deterministic_tiebreak() {
         let conn = setup().await;
 
         // Five segments share one embedding -> a single pool row with five
@@ -1251,7 +1062,7 @@ mod tests {
 
         let query = serialize_query_embedding(&shared).unwrap();
         let candidates =
-            fetch_vector_candidates_ann(&conn, &SearchScope::default_context(), &query)
+            fetch_vector_candidates_exhaustive(&conn, &SearchScope::default_context(), &query)
                 .await
                 .unwrap();
 
@@ -1357,51 +1168,6 @@ mod tests {
         assert_eq!(candidates.len(), 2);
     }
 
-    // TDD: scoped vector search must force the exhaustive
-    // scan and bypass count-based path selection entirely, even when the
-    // (cached or live) vector count is above `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`.
-    // Before this fix, a large count routed to `vector_top_k`, which has no
-    // path-prefix filter and would leak the sibling row.
-    #[tokio::test]
-    async fn vector_search_with_path_prefix_bypasses_ann_above_threshold() {
-        let conn = setup().await;
-        let embedding = embedding_with(&[(0, 1.0)]);
-
-        insert_segment(
-            &conn,
-            "seg-in-scope",
-            "src/foo/a.rs",
-            "fn scoped_item() {}",
-            Some(&embedding),
-        )
-        .await;
-        insert_segment(
-            &conn,
-            "seg-sibling",
-            "src/foobar/a.rs",
-            "fn sibling_item() {}",
-            Some(&embedding),
-        )
-        .await;
-
-        let scope = SearchScope::default_context().with_path_prefix("src/foo");
-        let candidates = fetch_vector_candidates_with_count(
-            &conn,
-            &scope,
-            &embedding,
-            Some(VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS + 1),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            candidates.len(),
-            1,
-            "a high cached count must not route a scoped search onto the unfiltered ANN path"
-        );
-        assert_eq!(candidates[0].segment_id, "seg-in-scope");
-    }
-
     // TDD: the FTS candidate query must apply the same
     // directory-boundary `path_prefix` filter as the vector stage.
     #[tokio::test]
@@ -1467,16 +1233,5 @@ mod tests {
                 .unwrap();
 
         assert_eq!(candidates.len(), 2, "no prefix must return every match");
-    }
-
-    #[test]
-    fn vector_prefilter_scales_with_context_count_up_to_bound() {
-        assert_eq!(scaled_vector_prefilter_k(0), VECTOR_PREFILTER_K);
-        assert_eq!(scaled_vector_prefilter_k(1), VECTOR_PREFILTER_K);
-        assert_eq!(scaled_vector_prefilter_k(3), VECTOR_PREFILTER_K * 3);
-        assert_eq!(
-            scaled_vector_prefilter_k(VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT + 1),
-            VECTOR_PREFILTER_K * VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT
-        );
     }
 }

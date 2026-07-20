@@ -139,7 +139,7 @@ fn create_partial_current_index(dir: &Path) {
         let db = Db::open_rw(&db_path(dir)).await.unwrap();
         let conn = db.connect().unwrap();
         schema::initialize(&conn).await.unwrap();
-        conn.execute("DROP INDEX idx_embedding_pool_embedding", ())
+        conn.execute("DROP INDEX idx_segment_vectors_content_key", ())
             .await
             .unwrap();
     });
@@ -207,7 +207,7 @@ fn partial_current_index_search_requires_explicit_reindex_guidance() {
         .failure()
         .stderr(
             predicate::str::contains("incomplete")
-                .and(predicate::str::contains("idx_embedding_pool_embedding"))
+                .and(predicate::str::contains("idx_segment_vectors_content_key"))
                 .and(predicate::str::contains("1up reindex")),
         );
 }

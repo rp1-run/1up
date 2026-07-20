@@ -63,14 +63,7 @@ impl StagingRebuild {
         // connection, so it takes the write/staging PRAGMA profile (raised
         // cache_size + wal_autocheckpoint) to cut mid-rebuild checkpoint churn.
         let conn = db.connect_tuned_staging().await?;
-        // Defer the `idx_embedding_pool_embedding` DiskANN build: on a cold full
-        // rebuild every pool row is known up front, so building the graph once after
-        // the pool is loaded (in `finalize_and_swap`) is far cheaper than the
-        // incremental per-insert maintenance the index does when it already exists.
-        // The staging schema is therefore intentionally incomplete until the
-        // deferred build runs; the served `index.db` only ever appears via the swap,
-        // which happens strictly after that build.
-        schema::initialize_with_vector_index(&conn, schema::VectorIndexBuild::Deferred).await?;
+        schema::initialize(&conn).await?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
             staging_path,
@@ -98,20 +91,6 @@ impl StagingRebuild {
     /// prior `index.db` is left intact and the staging file is cleaned up (by the
     /// swap on a swap failure, otherwise by this guard's `Drop`).
     pub async fn finalize_and_swap(mut self) -> Result<(), OneupError> {
-        // Build the deferred DiskANN vector index now that the pool is fully loaded,
-        // before releasing the connection. This is the after-pool-load,
-        // before-finalize hook: every `embedding_pool` row inserted by the rebuild
-        // pipeline is present, so the graph is built once over the full pool instead
-        // of being maintained per insert. It completes the deferred schema so the
-        // finalized file passes `ensure_current`.
-        {
-            let conn = self
-                .conn
-                .as_ref()
-                .expect("staging connection is live until finalize_and_swap consumes the guard");
-            schema::build_embedding_pool_vector_index(conn).await?;
-        }
-
         // Release the build connection so the finalize checkpoint can truncate the
         // staging WAL into a single self-contained file.
         self.conn = None;
@@ -282,8 +261,7 @@ async fn retire_prior_index_sidecars(index_path: &Path) -> Result<(), OneupError
     // Force the file open + WAL recovery and best-effort fold; a non-zero `busy`
     // (a reader held part of the WAL) is expected and fine, only a hard query
     // failure is surfaced. A transient `database is locked` — a sibling handle
-    // mid-close briefly holding the lock, made likelier now that the index carries
-    // the `embedding_pool` DiskANN sidecar tables — is retried within the shared
+    // mid-close briefly holding the lock — is retried within the shared
     // lock budget rather than failing the swap, mirroring `checkpoint_truncate`.
     let retry_delay = Duration::from_millis(DB_LOCK_RETRY_DELAY_MS);
     for attempt in 0..DB_LOCK_RETRY_ATTEMPTS {
@@ -847,21 +825,12 @@ mod tests {
         );
     }
 
-    /// Deferred-build acceptance: a cold rebuild that *defers* the DiskANN build
-    /// (the `StagingRebuild` path) serves byte-identical ranked results to one that
-    /// builds the index incrementally/immediately, and the served read path is the
-    /// exact `vector_distance_cos` scan at this corpus size (well below
-    /// `VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`).
-    ///
-    /// Built test-first: pointing `StagingRebuild::open` back at the immediate
-    /// `initialize` (so the index exists during the build) does not change the served
-    /// ranking — the equivalence holds by construction because the exact scan never
-    /// consults the DiskANN graph. The teeth here are on the *deferred build actually
-    /// running*: removing the `build_embedding_pool_vector_index` call from
-    /// `finalize_and_swap` makes the served index miss its required DiskANN index, so
-    /// `read_through_ensure_current` below fails closed.
+    /// Staging-rebuild acceptance: a cold rebuild through the `StagingRebuild`
+    /// guard serves byte-identical ranked results to an index built in place
+    /// (the daemon/incremental path), and the served index passes the reader
+    /// schema gate.
     #[tokio::test]
-    async fn deferred_build_search_equivalent_to_immediate_and_uses_exact_scan() {
+    async fn staging_rebuild_search_equivalent_to_in_place_build() {
         // Three embeddable segments with well-separated vectors and a probe nearest
         // to `s-mid`, then `s-near`, then `s-far` — a deterministic expected order.
         let seeds: [(&str, &str, Vec<f32>); 3] = [
@@ -871,10 +840,9 @@ mod tests {
         ];
         let probe = probe_vector(1.0);
 
-        // (A) Reference index built the IMMEDIATE way (DiskANN index created inline,
-        // as the daemon/incremental path does).
+        // (A) Reference index built in place, as the daemon/incremental path does.
         let tmp_imm = tempfile::tempdir().unwrap();
-        let imm_index = config::project_db_path(&project_root(&tmp_imm, "immediate"));
+        let imm_index = config::project_db_path(&project_root(&tmp_imm, "in-place"));
         {
             let db = Db::open_rw(&imm_index).await.unwrap();
             let conn = db.connect_tuned().await.unwrap();
@@ -887,48 +855,36 @@ mod tests {
         }
         let imm_db = Db::open_ro(&imm_index).await.unwrap();
         let imm_conn = imm_db.connect().unwrap();
-        let immediate_order = exact_scan_order(&imm_conn, &probe).await;
+        let in_place_order = exact_scan_order(&imm_conn, &probe).await;
 
-        // (B) Served index built the DEFERRED way through the real staging rebuild
-        // guard: pool/vector rows inserted first, DiskANN index built once in
-        // `finalize_and_swap`, then atomically swapped into place.
+        // (B) Served index built through the real staging rebuild guard, then
+        // atomically swapped into place.
         let tmp_def = tempfile::tempdir().unwrap();
-        let root = project_root(&tmp_def, "deferred");
-        let def_index = config::project_db_path(&root);
+        let root = project_root(&tmp_def, "staged");
+        let staged_index = config::project_db_path(&root);
         let _lock = lifecycle::acquire_rebuild_lock(&root).unwrap();
         let staged = StagingRebuild::open(&root).await.unwrap();
-        // Mid-rebuild the staging schema is intentionally incomplete (no DiskANN
-        // index yet); the served index only ever appears after the deferred build.
-        assert!(
-            !schema_object_exists_named(staged.connection(), "idx_embedding_pool_embedding").await,
-            "deferred staging schema must omit the DiskANN index until finalize"
-        );
         for (id, key, vec) in &seeds {
             seed_embeddable_segment(staged.connection(), id, key, vec).await;
         }
         staged.finalize_and_swap().await.unwrap();
 
-        // The served index passes the reader schema gate (proving the deferred build
-        // completed the schema) and carries the DiskANN index.
-        let def_db = Db::open_ro(&def_index).await.unwrap();
+        // The served index passes the reader schema gate.
+        let def_db = Db::open_ro(&staged_index).await.unwrap();
         let def_conn = def_db.connect().unwrap();
         schema::ensure_current(&def_conn, &schema::SchemaContext::unspecified())
             .await
-            .expect("deferred-built served index must pass ensure_current");
-        assert!(
-            schema_object_exists_named(&def_conn, "idx_embedding_pool_embedding").await,
-            "deferred build must leave the DiskANN index present on the served index"
-        );
+            .expect("staging-built served index must pass ensure_current");
 
-        let deferred_order = exact_scan_order(&def_conn, &probe).await;
+        let staged_order = exact_scan_order(&def_conn, &probe).await;
 
         // Search equivalence: identical ranked segment_id ordering.
         assert_eq!(
-            deferred_order, immediate_order,
-            "deferred-built index must return identical ranked order to the immediate build"
+            staged_order, in_place_order,
+            "staging-built index must return identical ranked order to the in-place build"
         );
         assert_eq!(
-            deferred_order,
+            staged_order,
             vec![
                 "s-mid".to_string(),
                 "s-near".to_string(),
@@ -936,26 +892,5 @@ mod tests {
             ],
             "ranked order must follow vector_distance_cos to the probe"
         );
-
-        // The served path is the exact scan, not the DiskANN beam search: the exact
-        // query plan reads `embedding_pool` via the 1:1 `segment_vectors` join and
-        // never references `vector_top_k`/the DiskANN index.
-        assert!(
-            !queries::SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT.contains("vector_top_k"),
-            "the served exact scan must not consult the DiskANN index at this corpus size"
-        );
-    }
-
-    /// Whether a named object exists in the database (test convenience for the
-    /// vector-index presence assertions).
-    async fn schema_object_exists_named(conn: &libsql::Connection, name: &str) -> bool {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE name = ?1 LIMIT 1",
-                [name],
-            )
-            .await
-            .unwrap();
-        rows.next().await.unwrap().is_some()
     }
 }

@@ -25,8 +25,8 @@ pub struct HybridSearchEngine<'a> {
     has_vectors: Option<bool>,
     /// Pre-computed per-context vector `COUNT(*)`, cached by the daemon
     /// on `ProjectState` and invalidated on index swap. When `Some`, the vector
-    /// stage skips its per-query `COUNT(*)` for path selection; it MUST equal the
-    /// live count so selection is identical. `None` falls back to the live count.
+    /// stage skips its per-query `COUNT(*)`; it MUST equal the live count.
+    /// `None` falls back to the live count.
     vector_count: Option<usize>,
 }
 
@@ -59,8 +59,8 @@ impl<'a> HybridSearchEngine<'a> {
     }
 
     /// Supply a cached per-context vector count so the vector stage skips its
-    /// per-query `COUNT(*)` for path selection. The supplied value MUST
-    /// equal the live `COUNT(*)` for the open index.
+    /// per-query `COUNT(*)`. The supplied value MUST equal the live
+    /// `COUNT(*)` for the open index.
     pub fn with_vector_count(mut self, vector_count: usize) -> Self {
         self.vector_count = Some(vector_count);
         self
