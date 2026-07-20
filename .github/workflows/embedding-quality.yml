@@ -29,6 +29,18 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      capture_baseline:
+        description: >-
+          Run `just eval-recall-baseline` instead of the gate and upload the
+          captured recall-baseline.json as an artifact. The pinned baseline
+          must be captured on this runner platform: int8 embedding inference
+          differs slightly between architectures (macOS-arm64 captures were
+          measured a constant 2.22pp/1.67pp above what this runner scores, an
+          offset larger than the 0.02 gate tolerance). Download the artifact
+          and commit it via a PR — this job has no write permission.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -71,8 +83,14 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: run gated recall
+        if: ${{ !inputs.capture_baseline }}
         shell: bash
         run: just eval-recall
+
+      - name: capture recall baseline
+        if: ${{ inputs.capture_baseline }}
+        shell: bash
+        run: just eval-recall-baseline
 
       - name: upload recall results
         if: always()
@@ -80,5 +98,14 @@ jobs:
         with:
           name: recall-results
           path: evals/suites/1up-search/recall-results.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: upload captured baseline
+        if: ${{ inputs.capture_baseline }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-baseline
+          path: evals/suites/1up-search/recall-baseline.json
           if-no-files-found: error
           retention-days: 30
