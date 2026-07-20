@@ -547,10 +547,14 @@ pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY
 /// is removed from the schema. The exact `vector_distance_cos` scan is the
 /// only vector search path — it was measured faster than the DiskANN
 /// `vector_top_k` beam traversal at every tested corpus size (see
-/// docs/diskann-removal.md for the preserved measurements). Indexes built at
-/// v19 still carry the index and its `_shadow` graph-storage table (observed
-/// at ~109 MiB inside a 2.2 GiB index), so they are declared incompatible and
-/// fail closed with `1up reindex`, which rebuilds without them.
+/// docs/diskann-removal.md for the preserved measurements).
+/// `idx_segment_vectors_content_key` is dropped with it: that index existed
+/// solely to back the ANN fan-out join, while the exact scan probes
+/// `embedding_pool` by its `content_key` primary key (measured latency
+/// unchanged without it). Indexes built at v19 still carry both indexes and
+/// the `_shadow` graph-storage table (observed at ~109 MiB inside a 2.2 GiB
+/// index), so they are declared incompatible and fail closed with
+/// `1up reindex`, which rebuilds without them.
 ///
 /// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta
 /// table as `scope_roots_v1` (JSON-serialized `Vec<String>`), applied uniformly

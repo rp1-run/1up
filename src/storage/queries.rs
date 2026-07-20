@@ -70,16 +70,6 @@ CREATE TABLE IF NOT EXISTS segment_vectors (
     content_key TEXT NOT NULL
 )";
 
-/// Secondary index on `segment_vectors.content_key`. The ANN fan-out
-/// query joins `segment_vectors AS sv ON sv.content_key = p.content_key` to map a
-/// pooled `embedding_pool` row back to every referencing segment; the reverse
-/// `content_key -> segment_id` direction has no covering index otherwise
-/// (`segment_vectors`'s only index is its `segment_id` primary key), forcing a
-/// full scan per fan-out. This index makes that join key-seekable. It does not
-/// change which rows match, so ranked ordering and recall are unaffected.
-pub const CREATE_INDEX_SEGMENT_VECTORS_CONTENT_KEY: &str =
-    "CREATE INDEX IF NOT EXISTS idx_segment_vectors_content_key ON segment_vectors(content_key)";
-
 pub const CREATE_SEGMENT_SYMBOLS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS segment_symbols (
     context_id TEXT NOT NULL DEFAULT 'default',

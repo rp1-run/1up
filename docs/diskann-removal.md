@@ -9,6 +9,13 @@ rebuild. The exact `vector_distance_cos` scan
 (`SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`) is the only vector search
 path.
 
+v20 also drops `idx_segment_vectors_content_key`. That index existed solely to
+back the ANN fan-out join (mapping `vector_top_k` pool hits back to segments
+via `segment_vectors.content_key`); the exact scan drives the join from
+`segment_vectors` into `embedding_pool`'s `content_key` primary key, and
+benchmarking the v20 query without the index showed no measurable latency
+change.
+
 This note preserves the measurements that justified the removal, so the
 machinery itself does not have to be kept around as documentation.
 
@@ -70,12 +77,13 @@ remnant of the old auto-switch cutoff and now serves only the warning.
 
 ## Compatibility
 
-Removing the index changes the persisted schema contract
-(`REQUIRED_SCHEMA_OBJECTS` no longer contains `idx_embedding_pool_embedding`,
-and fresh initializes no longer create it), so `SCHEMA_VERSION` is bumped to
-20. v19 indexes fail closed with the standard "out of date … run `1up
-reindex`" guidance; the rebuild sheds the index and its `_shadow` table. No
-in-place migration is attempted, per the project's fail-closed schema policy.
+Removing the indexes changes the persisted schema contract
+(`REQUIRED_SCHEMA_OBJECTS` no longer contains `idx_embedding_pool_embedding`
+or `idx_segment_vectors_content_key`, and fresh initializes no longer create
+them), so `SCHEMA_VERSION` is bumped to 20. v19 indexes fail closed with the
+standard "out of date … run `1up reindex`" guidance; the rebuild sheds both
+indexes and the `_shadow` table. No in-place migration is attempted, per the
+project's fail-closed schema policy.
 
 ## If ANN is ever needed again
 
