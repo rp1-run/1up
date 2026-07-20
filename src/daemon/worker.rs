@@ -45,11 +45,14 @@ const DAEMON_CONTEXT_STATUS_FILE_NAME: &str = "daemon_context_status.json";
 const STARTUP_RECONCILIATION_REASON: &str = "startup_reconciliation";
 
 /// Test-only seam gate for [`test_rebuild_hold`]; never set in production.
+#[cfg(test)]
 const REBUILD_HOLD_ENV_VAR: &str = "ONEUP_TEST_REBUILD_HOLD";
 /// While this file exists under a project's `.1up/`, a pass with the seam
 /// enabled parks inside its pipeline window (rebuild lock held).
+#[cfg(test)]
 const REBUILD_HOLD_FILE_NAME: &str = "test-rebuild.hold";
 /// Written by a parked pass so tests can detect it deterministically.
+#[cfg(test)]
 const REBUILD_HOLD_ENTERED_FILE_NAME: &str = "test-rebuild.hold-entered";
 
 #[derive(Debug, Default)]
@@ -105,7 +108,7 @@ struct ProjectState {
     /// lazily on the first search that needs it and reused across requests so the
     /// hot path skips a per-query `COUNT(*)`. MUST be invalidated (`None`) on
     /// `reopen_if_index_swapped` so a build-aside swap never serves a stale count
-    /// into `vector_search_path_for_corpus` (exhaustive-vs-ANN) path selection.
+    /// into the vector stage's large-corpus latency warning and diagnostics.
     cached_vector_count: Option<usize>,
     /// One reused tuned read [`Connection`] to the open index, serving repeated
     /// daemon searches without a fresh per-request `connect()` + PRAGMA pass.
@@ -790,7 +793,7 @@ fn prewarm_project_embedders(projects: &mut ProjectStates) {
 /// probe could not decide (a transient/mount failure): they are **retained** this
 /// cycle and surfaced so the caller can `warn!` about the skipped prune rather
 /// than destructively deleting a live-but-unreachable source's rows.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct SourceMissingSelection {
     pub to_prune: Vec<String>,
     pub indeterminate: Vec<String>,
@@ -1191,7 +1194,10 @@ fn drop_deregistered_projects(
                     );
                 }
             }
-            release_removed_project(state);
+            // `state` drops here, releasing its Db handles and reused read
+            // connection; cancellation was already requested above, before
+            // status persistence and watcher cleanup (see
+            // `release_removed_project` for the drop-order contract).
         }
     }
 }
@@ -1595,9 +1601,8 @@ async fn reopen_if_index_swapped(state: &mut ProjectState) -> Result<(), OneupEr
     // profile on the new handle.
     state.read_conn = None;
     // The swapped-in index has its own vector population; drop the cached count
-    // so the next search recomputes it against the refreshed index. A
-    // stale count here could flip `vector_search_path_for_corpus` between the
-    // exhaustive scan and the ANN path and silently change served candidates.
+    // so the next search recomputes it against the refreshed index and the
+    // vector stage's diagnostics never describe the wrong generation.
     state.cached_vector_count = None;
     Ok(())
 }
@@ -2987,7 +2992,9 @@ async fn run_project(
 /// emulates a long unit of work between two committed boundaries, letting tests
 /// observe the window where cancellation has been requested but the pipeline has
 /// not yet reached its next safe yield (the rebuild lock must still be held
-/// there). No-op — a single env read — outside tests.
+/// there). Compiled out entirely (empty inline no-op) in non-test builds, so
+/// release binaries carry no env read or hold-file polling.
+#[cfg(test)]
 async fn test_rebuild_hold(state_root: &Path) {
     if std::env::var(REBUILD_HOLD_ENV_VAR).is_err() {
         return;
@@ -3002,6 +3009,9 @@ async fn test_rebuild_hold(state_root: &Path) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+#[cfg(not(test))]
+async fn test_rebuild_hold(_state_root: &Path) {}
 
 async fn handle_search_request(
     projects: &mut ProjectStates,
@@ -3240,10 +3250,11 @@ mod tests {
         // `Cancelled` outcome, never as `Ok(0)`. Collapsing to zero would feed
         // `file_count = 0` into the gate, which passes for any threshold and would
         // open a first index during the shutdown drain (defect 2).
+        // (A single file suffices: the pre-cancelled token aborts the walk at
+        // its first entry check. The gate's 0-opens/over-threshold-blocks
+        // boundary is pinned by lifecycle's own gate_allows_first_index tests.)
         let tmp = tempfile::tempdir().unwrap();
-        for i in 0..250 {
-            std::fs::write(tmp.path().join(format!("file_{i}.rs")), "fn x() {}").unwrap();
-        }
+        std::fs::write(tmp.path().join("file_0.rs"), "fn x() {}").unwrap();
 
         let cancel_token = CancellationToken::new();
         cancel_token.cancel(); // pre-cancelled: the walk aborts at its first check
@@ -3252,19 +3263,6 @@ mod tests {
         assert!(
             matches!(result, Err(OneupError::Indexing(IndexingError::Cancelled))),
             "a cancelled gate walk must return Cancelled, got {result:?}"
-        );
-
-        // Document the trap the fix avoids: a collapsed `file_count = 0` would
-        // OPEN the gate (0 is never over threshold), whereas the real over-threshold
-        // count would correctly BLOCK it. The cancelled walk must therefore never
-        // yield a count at all.
-        assert!(
-            lifecycle::gate_allows_first_index(true, 0, 10, false),
-            "sanity: file_count=0 opens the gate — exactly why a cancelled walk must not collapse to 0"
-        );
-        assert!(
-            !lifecycle::gate_allows_first_index(true, 250, 10, false),
-            "sanity: the true over-threshold count blocks the gate"
         );
     }
 
@@ -5093,10 +5091,9 @@ mod tests {
     }
 
     /// The per-context vector-count cache on `ProjectState`
-    /// MUST be invalidated when a build-aside rebuild swaps the index. A stale
-    /// count surviving the swap could flip `vector_search_path_for_corpus`
-    /// between the exhaustive scan and the ANN path and silently change served
-    /// candidates, so `reopen_if_index_swapped` clears it; the next search then
+    /// MUST be invalidated when a build-aside rebuild swaps the index, so a
+    /// stale count never describes the wrong generation to the vector stage's
+    /// diagnostics; `reopen_if_index_swapped` clears it and the next search
     /// recomputes against the refreshed index.
     #[cfg(unix)]
     #[tokio::test]

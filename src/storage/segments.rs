@@ -1334,7 +1334,7 @@ pub fn context_age_at_least(updated_at: &str, now: DateTime<Utc>, min_age: Durat
 /// exact bytes are only known after `1up gc --apply`'s VACUUM. Bounded: it lists
 /// the (few) recorded contexts and counts segments per prunable one; no full
 /// table walk and never a VACUUM.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DisclosureStats {
     /// Number of stale-branch snapshot contexts for the active worktree.
     pub stale_contexts: u64,

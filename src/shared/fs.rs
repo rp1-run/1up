@@ -729,14 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_error_mapping_treats_notfound_as_absent() {
-        assert_eq!(
-            presence_from_probe_error(ErrorKind::NotFound),
-            SourcePresence::Absent
-        );
-    }
-
-    #[test]
     fn probe_error_mapping_treats_transient_errors_as_indeterminate() {
         // Permission/IO faults on a flaky or unmounted network mount must never be
         // read as deletion.

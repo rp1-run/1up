@@ -822,13 +822,6 @@ fn missing_readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction>
     };
 
     let mut actions = Vec::new();
-    if let Some(launch_subdir) = proposal.launch_subdir.as_ref() {
-        actions.push(action(
-            TOOL_START,
-            format!("Index the launch subdirectory first: {}", launch_subdir),
-            Some(json!({ "mode": "index_if_needed", "scope_add": [launch_subdir] })),
-        ));
-    }
 
     // Reuse the rank-aligned suggestion strings as the scope_add reasons:
     // `suggestions[i]` describes `scope_candidates[i]` by construction (both
@@ -836,10 +829,10 @@ fn missing_readiness_next_actions(payload: &ReadinessPayload) -> Vec<NextAction>
     // so this stays a single phrasing source with the synchronous facts
     // envelope. Agents consume next_actions reasons individually (issue #88),
     // so every reason must read standalone — the generator guarantees the
-    // first entry is a primary imperative exactly when no launch_subdir action
-    // precedes it, phrases the rest as "Alternatively, …", and never emits a
-    // reason beginning with "Or ". The leading action additionally carries the
-    // over-threshold file count so the refusal stays legible on its own.
+    // first entry is a primary imperative, phrases the rest as
+    // "Alternatively, …", and never emits a reason beginning with "Or ". The
+    // leading action additionally carries the over-threshold file count so
+    // the refusal stays legible on its own.
     for (candidate, suggestion) in proposal
         .scope_candidates
         .iter()
@@ -1675,7 +1668,7 @@ fn envelope(
 ///
 /// Keeps the `launch_subdir` action first when present, then emits the top-N
 /// ranked `scope_add` actions from the same source of truth as
-/// `facts.suggestions` (`ops::ranked_scope_suggestions`). Reasons are coherent
+/// `facts.suggestions` (`ops::generate_ranked_scope_suggestions`). Reasons are coherent
 /// standalone imperatives — the first is a primary imperative unless a
 /// `launch_subdir` action precedes it, in which case every scope suggestion
 /// reads as an alternative so none is a dangling primary and none begins with
@@ -1694,7 +1687,9 @@ fn facts_next_actions(facts: &crate::mcp::types::FactsEnvelope) -> Vec<NextActio
         ));
     }
 
-    for suggestion in ops::ranked_scope_suggestions(facts) {
+    for suggestion in
+        ops::generate_ranked_scope_suggestions(&facts.per_directory_stats, &facts.launch_subdir)
+    {
         next_actions.push(action(
             TOOL_START,
             suggestion.reason,
@@ -1873,7 +1868,6 @@ mod tests {
         payload.status = ReadinessStatus::Missing;
         payload.scope_proposal = Some(ops::ScopeProposalSummary {
             file_count_total: 5000,
-            launch_subdir: None,
             suggestions: vec![
                 "Index the largest directory: services".to_string(),
                 "Alternatively, index the 2nd largest directory: libs".to_string(),
@@ -1905,52 +1899,6 @@ mod tests {
         );
         // Issue #88 regression guard: agents consume next_actions reasons
         // individually, so no reason may lean on a preceding sibling.
-        assert!(
-            actions.iter().all(|a| !a.reason.starts_with("Or ")),
-            "no next_action reason may begin with \"Or \": {:?}",
-            actions.iter().map(|a| &a.reason).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn missing_readiness_with_launch_subdir_leads_with_it_and_keeps_reasons_standalone() {
-        // A launch_subdir cone gets the dedicated leading action; the ranked
-        // suggestions (which the generator already de-duplicated against the
-        // launch_subdir) follow as standalone alternatives — never a dangling
-        // primary and never an "Or "-prefixed fragment.
-        let mut payload = ops::blocked_readiness_for_path("repo", "fixture");
-        payload.status = ReadinessStatus::Missing;
-        payload.scope_proposal = Some(ops::ScopeProposalSummary {
-            file_count_total: 5000,
-            launch_subdir: Some("services".to_string()),
-            suggestions: vec![
-                "Alternatively, index the 2nd largest directory: libs".to_string(),
-                "Alternatively, index the 3rd largest directory: tools".to_string(),
-            ],
-            scope_candidates: vec!["libs".to_string(), "tools".to_string()],
-        });
-
-        let actions = missing_readiness_next_actions(&payload);
-        assert_eq!(actions.len(), 3, "launch_subdir action plus one per cone");
-        assert_eq!(
-            actions[0].arguments.as_ref().unwrap()["scope_add"],
-            serde_json::json!(["services"])
-        );
-        assert!(actions[0].reason.contains("launch subdirectory"));
-        // The launch_subdir cone appears exactly once: the ranked candidates
-        // were de-duplicated at derivation, not re-filtered here.
-        assert_eq!(
-            actions[1].arguments.as_ref().unwrap()["scope_add"],
-            serde_json::json!(["libs"])
-        );
-        assert_eq!(
-            actions[1].reason,
-            "Alternatively, index the 2nd largest directory: libs"
-        );
-        assert_eq!(
-            actions[2].arguments.as_ref().unwrap()["scope_add"],
-            serde_json::json!(["tools"])
-        );
         assert!(
             actions.iter().all(|a| !a.reason.starts_with("Or ")),
             "no next_action reason may begin with \"Or \": {:?}",

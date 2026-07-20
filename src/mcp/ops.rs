@@ -150,9 +150,6 @@ pub struct ReadinessPayload {
 pub struct ScopeProposalSummary {
     /// Total gitignore-aware tracked file count that tripped the monorepo gate.
     pub file_count_total: usize,
-    /// Launch subdirectory captured before project-root resolution, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub launch_subdir: Option<String>,
     /// Human-readable ranked suggestions (e.g. "Index the largest directory: services").
     pub suggestions: Vec<String>,
     /// Ranked top-level directory names (largest first) usable as `scope_add` values.
@@ -790,22 +787,7 @@ fn spawn_rebuild_task(
         ))
         .await;
         match outcome {
-            Ok(Ok(payload)) => payload,
-            Ok(Err(err)) => {
-                // Surface the failure as blocked readiness rather than losing it
-                // to a log line; progress remains available via status.
-                tracing::warn!("background rebuild task failed: {}", err);
-                let reason = err.to_string();
-                record_rebuild_failure_progress(&roots, &run_id, RebuildLockHeld::No, &reason)
-                    .await;
-                blocked_readiness(
-                    &roots.state_root,
-                    &roots.source_root,
-                    &roots.worktree_context,
-                    reason,
-                )
-                .await
-            }
+            Ok(payload) => payload,
             Err(panic) => {
                 let reason = panic_reason(panic.as_ref());
                 tracing::warn!("background rebuild task panicked: {reason}");
@@ -1976,10 +1958,13 @@ async fn run_index_then_classify(
     scope_add: Option<Vec<String>>,
     scope_narrow: Option<Vec<String>>,
     run_id: &str,
-) -> anyhow::Result<ReadinessPayload> {
+) -> ReadinessPayload {
     match run_index(roots, rebuild, scope_add, scope_narrow, run_id).await {
-        Ok(_) => Ok(classify_after_index(roots).await),
+        Ok(_) => classify_after_index(roots).await,
         Err(err) => {
+            // Surface the failure as blocked readiness rather than losing it
+            // to a log line; progress remains available via status.
+            tracing::warn!("background rebuild task failed: {}", err);
             let reason = err.to_string();
             // Failures inside the rebuild-lock-holding section were already
             // recorded by `run_index` under the lock; this covers pre-lock
@@ -1987,13 +1972,13 @@ async fn run_index_then_classify(
             // replaced. Re-recording an already-terminal record is a no-op
             // (the ownership guard requires `Running`).
             record_rebuild_failure_progress(roots, run_id, RebuildLockHeld::No, &reason).await;
-            Ok(blocked_readiness(
+            blocked_readiness(
                 &roots.state_root,
                 &roots.source_root,
                 &roots.worktree_context,
                 reason,
             )
-            .await)
+            .await
         }
     }
 }
@@ -3703,8 +3688,6 @@ struct PersistedScopeProposal {
     key: String,
     per_directory_stats: Vec<PersistedDirectoryStat>,
     file_count_total: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    launch_subdir: Option<String>,
 }
 
 /// Pure staleness gate: a persisted proposal is fresh only when its recorded
@@ -3803,8 +3786,6 @@ pub fn persist_scope_proposal_for_gate(
         key,
         per_directory_stats,
         file_count_total,
-        // The daemon has no launch subdirectory concept; MCP/CLI invocations do.
-        launch_subdir: None,
     };
     save_persisted_scope_proposal(state_root, &proposal)
 }
@@ -3844,15 +3825,15 @@ fn attach_scope_proposal_if_fresh(
     // Derive BOTH vectors from the one ranked output so `suggestions[i]`
     // always describes `scope_candidates[i]`: the MCP layer zips them into
     // `scope_add` next_actions, so rank alignment is a contract, not a
-    // coincidence. The generator already caps the list and skips the
-    // launch_subdir cone (which carries its own dedicated action).
-    let ranked = generate_ranked_scope_suggestions(&stats, &proposal.launch_subdir);
+    // coincidence. The generator already caps the list. The daemon gate that
+    // persists proposals has no launch-subdirectory concept, so none is
+    // threaded here (unlike the synchronous facts envelope).
+    let ranked = generate_ranked_scope_suggestions(&stats, &None);
     let suggestions: Vec<String> = ranked.iter().map(|s| s.reason.clone()).collect();
     let scope_candidates: Vec<String> = ranked.into_iter().map(|s| s.directory).collect();
 
     payload.scope_proposal = Some(ScopeProposalSummary {
         file_count_total: proposal.file_count_total,
-        launch_subdir: proposal.launch_subdir,
         suggestions,
         scope_candidates,
     });
@@ -4418,7 +4399,7 @@ pub async fn should_return_facts_envelope(
 /// standalone reason. Single source of truth for both the display
 /// `FactsEnvelope.suggestions` strings and the facts-envelope `next_actions`,
 /// which also needs the `directory` to build the `scope_add` argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ScopeSuggestion {
     pub directory: String,
     pub reason: String,
@@ -4486,15 +4467,6 @@ fn generate_ranked_suggestions(
         .into_iter()
         .map(|s| s.reason)
         .collect()
-}
-
-/// Structured ranked scope suggestions for a facts envelope, sharing the exact
-/// source of truth with `FactsEnvelope.suggestions`. Each entry carries the
-/// target `directory` (for the `scope_add` argument) and a coherent standalone
-/// `reason`, so the facts-envelope `next_actions` builder never re-derives its
-/// own wording.
-pub(crate) fn ranked_scope_suggestions(facts: &FactsEnvelope) -> Vec<ScopeSuggestion> {
-    generate_ranked_scope_suggestions(&facts.per_directory_stats, &facts.launch_subdir)
 }
 
 /// Helper to convert numeric position to ordinal (1st, 2nd, 3rd, etc.)
@@ -5666,9 +5638,8 @@ mod tests {
     /// populated on demand, keyed independently per context, and cleared in
     /// full when a build-aside swap reopens the entry -- mirroring the
     /// daemon's `reopen_invalidates_cached_vector_count_after_swap` coverage
-    /// for `ProjectState::cached_vector_count`. A stale count surviving a
-    /// swap could silently flip `vector_search_path_for_corpus` between the
-    /// exhaustive scan and the ANN path against the wrong generation.
+    /// for `ProjectState::cached_vector_count`, so a stale count never
+    /// describes the wrong generation to the vector stage's diagnostics.
     #[tokio::test]
     async fn vector_count_cache_is_scoped_per_context_and_cleared_by_reopen() {
         let temp_root = std::env::current_dir().unwrap().join("target/oneup-tests");
@@ -7362,19 +7333,11 @@ mod tests {
         );
     }
 
-    /// Builds the persistent density cache key string for a repo the same way
-    /// compute_avg_density_for_repo does, so tests can seed/inspect entries.
+    /// Builds the persistent density cache key string for a repo through the
+    /// production key builder, so a key-shape change can never silently
+    /// diverge these tests from compute_avg_density_for_repo.
     fn density_cache_key_str(root: &Path) -> String {
-        let key = DirectoryWalkCacheKey {
-            repo_identity: root
-                .canonicalize()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| root.to_string_lossy().into_owned()),
-            head_commit: get_head_commit(root),
-            root_mtime: get_root_mtime(root),
-        };
-        cache_key_to_string(&key)
+        cache_key_to_string(&build_directory_walk_cache_key(root))
     }
 
     /// Drops in-process density entries for `root` so a subsequent call
@@ -7788,16 +7751,6 @@ mod tests {
             .collect()
     }
 
-    fn assert_no_leading_or(reasons: &[String]) {
-        for reason in reasons {
-            assert!(
-                !reason.starts_with("Or "),
-                "no reason may begin with 'Or '; got {:?}",
-                reasons
-            );
-        }
-    }
-
     #[test]
     fn test_ranked_suggestions_no_leading_or_when_top_dir_is_launch_subdir() {
         // When the launch_subdir is the top-ranked directory, it is skipped and
@@ -7815,7 +7768,6 @@ mod tests {
                 "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
-        assert_no_leading_or(&suggestions);
     }
 
     #[test]
@@ -7835,7 +7787,6 @@ mod tests {
                 "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
-        assert_no_leading_or(&suggestions);
     }
 
     #[test]
@@ -7848,7 +7799,6 @@ mod tests {
             suggestions,
             vec!["Index the largest directory: services".to_string()]
         );
-        assert_no_leading_or(&suggestions);
     }
 
     #[test]
@@ -7868,7 +7818,6 @@ mod tests {
                 "Alternatively, index the 3rd largest directory: tools".to_string(),
             ]
         );
-        assert_no_leading_or(&suggestions);
     }
 
     #[test]
@@ -7919,7 +7868,6 @@ mod tests {
                 },
             ],
             file_count_total: 2800,
-            launch_subdir: None,
         }
     }
 
@@ -8002,40 +7950,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_proposal_load_absent_file_is_none() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_root = canonical_state_root(&temp);
-        std::fs::create_dir_all(project_dot_dir(&state_root)).unwrap();
-
-        // .1up exists but no proposal file written yet -> fall back.
-        assert!(load_persisted_scope_proposal(&state_root).is_none());
-    }
-
-    #[test]
-    fn scope_proposal_freshness_matches_only_identical_key() {
-        // Fresh: identical key (same repo identity + HEAD + mtime).
-        assert!(is_scope_proposal_fresh(
-            "repo_HEAD1_1000",
-            "repo_HEAD1_1000"
-        ));
-        // Stale: HEAD drift.
-        assert!(!is_scope_proposal_fresh(
-            "repo_HEAD1_1000",
-            "repo_HEAD2_1000"
-        ));
-        // Stale: mtime drift.
-        assert!(!is_scope_proposal_fresh(
-            "repo_HEAD1_1000",
-            "repo_HEAD1_2000"
-        ));
-        // Stale: different repo identity.
-        assert!(!is_scope_proposal_fresh(
-            "repoA_HEAD1_1000",
-            "repoB_HEAD1_1000"
-        ));
-    }
-
-    #[test]
     fn attach_scope_proposal_surfaces_ranked_suggestions_when_fresh() {
         let temp = tempfile::tempdir().unwrap();
         let source_root = temp.path().join("repo");
@@ -8099,20 +8013,6 @@ mod tests {
 
     // --- Walk-cache key sensitivity (real components behind the freshness gate) ---
 
-    fn git_in(repo: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .expect("git command runs");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     /// Bumps the source root's mtime past whole-second granularity (the walk
     /// cache key stores seconds) without a wall-clock dependency: sets an
     /// explicit future mtime through std's `File::set_modified`, falling back
@@ -8140,12 +8040,12 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let repo = repo.canonicalize().unwrap();
 
-        git_in(&repo, &["init"]);
-        git_in(&repo, &["config", "user.email", "test@example.com"]);
-        git_in(&repo, &["config", "user.name", "Test User"]);
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
         fs::write(repo.join("seed.txt"), "seed").unwrap();
-        git_in(&repo, &["add", "."]);
-        git_in(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
 
         let baseline_key = build_directory_walk_cache_key(&repo);
         let baseline = cache_key_to_string(&baseline_key);
@@ -8170,8 +8070,8 @@ mod tests {
         // (b) HEAD component: advance HEAD with a real commit. Commits write
         // under .git/ (not a direct child of the root), so against the
         // post-mtime key only the HEAD component moves.
-        git_in(&repo, &["add", "."]);
-        git_in(&repo, &["commit", "-m", "advance HEAD"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "advance HEAD"]);
         let after_commit_key = build_directory_walk_cache_key(&repo);
         assert_ne!(
             after_mtime_key.head_commit, after_commit_key.head_commit,

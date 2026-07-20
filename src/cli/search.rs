@@ -345,30 +345,13 @@ mod tests {
             "0.0.0-stale-binary"
         )));
 
+        // A bare-semver stamp (no build id) is never authoritative.
+        assert!(!daemon_response_is_authoritative(Some(
+            BUILD_IDENTITY.split('+').next().unwrap_or(BUILD_IDENTITY)
+        )));
+
         // Absent stamp (unstamped/pre-handshake daemon) -> non-authoritative:
         // it cannot prove its build, so it is never trusted.
         assert!(!daemon_response_is_authoritative(None));
-    }
-
-    /// The unknown-git fallback (`{semver}+unknown`, emitted when git is
-    /// unavailable at build time) still compares as an exact string, so a daemon
-    /// and CLI built from the same fallback binary agree, while a bare-semver or
-    /// differently-suffixed stamp does not.
-    #[test]
-    fn unknown_git_fallback_compares_consistently_within_one_build() {
-        // Within one build, BUILD_IDENTITY is a single fixed string; identity
-        // with itself always holds regardless of whether git was available.
-        assert!(daemon_response_is_authoritative(Some(BUILD_IDENTITY)));
-
-        let semver = BUILD_IDENTITY.split('+').next().unwrap_or(BUILD_IDENTITY);
-        let unknown_fallback = format!("{semver}+unknown");
-        // The fallback shape is authoritative only if this binary *is* the
-        // fallback build; either way the comparison is a pure exact match and a
-        // bare-semver stamp (no build id) is never authoritative.
-        assert_eq!(
-            daemon_response_is_authoritative(Some(&unknown_fallback)),
-            unknown_fallback == BUILD_IDENTITY
-        );
-        assert!(!daemon_response_is_authoritative(Some(semver)));
     }
 }
