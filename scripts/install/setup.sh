@@ -7,9 +7,12 @@
 #
 # Env vars (names start with a digit, so set them via `env NAME=VALUE ...`
 # or from a shell that accepts digit-leading identifiers):
-#   1UP_VERSION       pin to a specific release tag (default: latest)
-#   1UP_INSTALL_DIR   override install directory (default: $HOME/.local/bin)
-#   1UP_REPO          override GitHub repo slug (default: rp1-run/1up)
+#   1UP_VERSION          pin to a specific release tag (default: latest)
+#   1UP_INSTALL_DIR      override install directory (default: $HOME/.local/bin)
+#   1UP_REPO             override GitHub repo slug (default: rp1-run/1up)
+#   ONEUP_SKIP_CHECKSUM  set to 1 to install an unverified binary when a
+#                        release has no published SHA256SUMS (default: unset;
+#                        the installer fails closed instead)
 #
 # bash 3.2 compatible. No $0-relative paths. All expansions quoted.
 
@@ -270,10 +273,15 @@ classify_sums_fetch() {
 verify_checksum() {
     case "$SUMS_STATE" in
         unpublished)
-            # Genuinely no checksum for this tag: preserve warn-and-continue so
-            # releases that legitimately ship without SHA256SUMS still install.
-            warn "warning: SHA256SUMS not published for $TAG; integrity not verified."
-            return
+            # Genuinely no checksum for this tag. Fail closed by default: an
+            # unverified binary must be an explicit, informed choice, not a
+            # silent default. ONEUP_SKIP_CHECKSUM=1 is the opt-out for a user
+            # who accepts the risk.
+            if [ "$(read_env ONEUP_SKIP_CHECKSUM)" = "1" ]; then
+                warn "warning: SHA256SUMS not published for $TAG; ONEUP_SKIP_CHECKSUM=1 set, installing UNVERIFIED binary."
+                return
+            fi
+            fail "SHA256SUMS not published for $TAG; refusing to install an unverified binary. Set ONEUP_SKIP_CHECKSUM=1 to override and accept the risk."
             ;;
         transient)
             # The checksum may exist but we could not obtain it. Fail closed

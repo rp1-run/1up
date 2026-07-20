@@ -88,7 +88,9 @@ pub struct SearchInput {
 #[serde(deny_unknown_fields)]
 pub struct GetInput {
     #[serde(default)]
-    #[schemars(description = "Durable result handles returned by oneup_search or oneup_symbol.")]
+    #[schemars(
+        description = "Durable result handles returned by oneup_search or oneup_symbol. Capped at 50 handles per call; split a larger batch across multiple calls."
+    )]
     pub handles: Vec<String>,
     pub path: Option<String>,
     #[serde(default)]

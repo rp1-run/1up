@@ -8,7 +8,8 @@
 //!
 //! Smoke coverage:
 //!   happy_path, idempotent_re_run, checksum_mismatch,
-//!   missing_sha256sums_warn, transient_sums_fatal, sums_entry_missing,
+//!   missing_sha256sums_hard_fail, skip_checksum_override,
+//!   transient_sums_fatal, sums_entry_missing,
 //!   attestation_disproved, attestation_no_verifier, attestation_cannot_run,
 //!   unsupported_platform, unsupported_intel_macos, pinned_version,
 //!   pinned_version_missing, latest_release, legacy_oneup_tag,
@@ -532,6 +533,7 @@ struct RunInput<'a> {
     install_dir: Option<&'a Path>,
     version_pin: Option<&'a str>,
     shell_override: &'a str,
+    skip_checksum: bool,
 }
 
 fn run_setup(input: RunInput) -> std::process::Output {
@@ -571,6 +573,7 @@ fn run_setup_with_extra_path(input: RunInput, extra_path: Option<&Path>) -> std:
         .env_remove("1UP_INSTALL_DIR")
         .env_remove("1UP_VERSION")
         .env_remove("1UP_REPO")
+        .env_remove("ONEUP_SKIP_CHECKSUM")
         // Block bash startup hooks that the caller's interactive shell may
         // export (e.g. an `~/.bashrc` that defines `BASH_ENV` for cron).
         // Without this, non-interactive `bash <script>` would source the
@@ -588,6 +591,9 @@ fn run_setup_with_extra_path(input: RunInput, extra_path: Option<&Path>) -> std:
     }
     if let Some(pin) = input.version_pin {
         cmd.env("1UP_VERSION", pin);
+    }
+    if input.skip_checksum {
+        cmd.env("ONEUP_SKIP_CHECKSUM", "1");
     }
 
     cmd.output().unwrap()
@@ -613,6 +619,7 @@ fn setup_installs_binary_and_updates_path_on_happy_path() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
 
     assert!(
@@ -657,6 +664,7 @@ fn setup_is_idempotent_on_second_run() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
     assert!(first.status.success());
 
@@ -669,6 +677,7 @@ fn setup_is_idempotent_on_second_run() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
     assert!(
         second.status.success(),
@@ -720,6 +729,7 @@ fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
     assert!(
         first.status.success(),
@@ -743,6 +753,7 @@ fn setup_replaces_path_block_on_rerun_with_new_install_dir() {
         install_dir: Some(&alt_dir),
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
     assert!(
         second.status.success(),
@@ -803,6 +814,7 @@ fn setup_migrates_legacy_managed_path_block_to_local_bin() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/zsh",
+        skip_checksum: false,
     });
 
     assert!(
@@ -847,6 +859,7 @@ fn setup_does_not_edit_rc_when_local_bin_is_already_on_path() {
             install_dir: None,
             version_pin: Some(FIXTURE_TAG),
             shell_override: "/bin/zsh",
+            skip_checksum: false,
         },
         Some(&local_bin),
     );
@@ -883,6 +896,7 @@ fn setup_fails_on_checksum_mismatch() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -904,8 +918,9 @@ fn setup_fails_on_checksum_mismatch() {
 }
 
 #[test]
-fn setup_warns_and_installs_without_sha256sums() {
-    // Missing SHA256SUMS is a warn-and-continue path.
+fn setup_missing_sha256sums_hard_fails_by_default() {
+    // Missing SHA256SUMS (unpublished) must fail closed by default: installing
+    // an unverified binary is no longer acceptable behavior.
     let host_home = tempfile::tempdir().unwrap();
     let wrapper_dir = tempfile::tempdir().unwrap();
     let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), false);
@@ -918,20 +933,60 @@ fn setup_warns_and_installs_without_sha256sums() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
-        output.status.success(),
-        "setup.sh must succeed when SHA256SUMS is absent: stderr={}",
+        !output.status.success(),
+        "setup.sh must fail when SHA256SUMS is unpublished: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("SHA256SUMS not published"),
-        "stderr should carry the integrity warning: {stderr}"
+        "stderr should name the failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("ONEUP_SKIP_CHECKSUM"),
+        "stderr should mention the override escape hatch: {stderr}"
+    );
+    assert!(
+        !host_home.path().join(".local/bin/1up").is_file(),
+        "binary must not be installed on an unverified release"
+    );
+}
+
+#[test]
+fn setup_skip_checksum_override_installs_unverified_binary() {
+    // ONEUP_SKIP_CHECKSUM=1 is an explicit, loud opt-out for the unpublished
+    // case: the user accepts the risk and installation proceeds.
+    let host_home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let fixture = ReleaseFixture::new(FIXTURE_TAG, host_target(), false);
+    let server = LocalHttp::start(fixture.serve_root.clone());
+    install_curl_wrapper(wrapper_dir.path(), &server.url());
+
+    let output = run_setup(RunInput {
+        home: host_home.path(),
+        wrapper_dir: wrapper_dir.path(),
+        install_dir: None,
+        version_pin: Some(FIXTURE_TAG),
+        shell_override: "/bin/bash",
+        skip_checksum: true,
+    });
+    assert!(
+        output.status.success(),
+        "setup.sh must succeed under ONEUP_SKIP_CHECKSUM=1: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ONEUP_SKIP_CHECKSUM"),
+        "stderr should carry a loud warning naming the override: {stderr}"
     );
     assert!(
         host_home.path().join(".local/bin/1up").is_file(),
-        "binary must still be installed"
+        "binary must be installed under the explicit override"
     );
 }
 
@@ -956,6 +1011,7 @@ fn setup_treats_transient_sums_fetch_as_fatal() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -1010,6 +1066,7 @@ fn setup_fails_when_sums_published_but_entry_missing() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -1049,6 +1106,7 @@ fn setup_fails_when_attestation_is_disproved() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -1085,6 +1143,7 @@ fn setup_degrades_when_no_attestation_verifier_present() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),
@@ -1126,6 +1185,7 @@ fn setup_degrades_when_attestation_cannot_be_verified() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),
@@ -1167,6 +1227,7 @@ fn setup_rejects_unsupported_platform() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(!output.status.success(), "must fail on FreeBSD");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1198,6 +1259,7 @@ fn setup_honors_pinned_version() {
         install_dir: None,
         version_pin: Some(pinned),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),
@@ -1238,6 +1300,7 @@ fn setup_rejects_intel_macos_with_specific_message() {
         install_dir: None,
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(!output.status.success(), "must fail on Intel macOS");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1274,6 +1337,7 @@ fn setup_resolves_latest_release_when_unpinned() {
         install_dir: None,
         version_pin: None,
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),
@@ -1325,6 +1389,7 @@ fn setup_strips_oneup_prefix_for_legacy_tags() {
         install_dir: None,
         version_pin: None,
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),
@@ -1363,6 +1428,7 @@ fn setup_fails_cleanly_on_missing_pinned_version() {
         install_dir: None,
         version_pin: Some(missing_tag),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -1405,6 +1471,7 @@ fn setup_rejects_unsafe_install_dir_characters() {
         install_dir: Some(&unsafe_dir),
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         !output.status.success(),
@@ -1444,6 +1511,7 @@ fn setup_honors_custom_install_dir() {
         install_dir: Some(&alt_dir),
         version_pin: Some(FIXTURE_TAG),
         shell_override: "/bin/bash",
+        skip_checksum: false,
     });
     assert!(
         output.status.success(),

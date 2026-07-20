@@ -132,6 +132,15 @@ pub const MAX_SEARCH_QUERIES: usize = 4;
 /// a batch of four cannot re-inflate the envelope.
 pub const HYDRATION_BATCH_MAX_HANDLES: usize = 4;
 
+/// Upper bound on the number of handles accepted in a single `oneup_get` call.
+///
+/// A batch this large already exceeded the intended discovery workflow (search
+/// a handful of candidates, hydrate a handful of them): an uncapped `handles`
+/// array let 50k handles produce a ~12.9MB response envelope. Enforced before
+/// any index open or hydration work is attempted, so an over-cap call is
+/// rejected up front rather than paying for partial work that is discarded.
+pub const MAX_GET_HANDLES_PER_CALL: usize = 50;
+
 /// Maximum size of a framed daemon request payload in bytes.
 pub const MAX_DAEMON_REQUEST_BYTES: usize = 16 * 1024;
 

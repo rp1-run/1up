@@ -27,10 +27,10 @@ use crate::search::{HybridSearchEngine, SearchScope, StructuralSearchEngine, Sym
 use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
-    FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_SYMBOLS_PER_LIST,
-    NO_INDEXED_EMBEDDINGS_REASON, PROJECT_STATE_DIR_MODE, SCOPE_TRUNCATION_REASON,
-    SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON, STATUS_READ_RETRY_ATTEMPTS,
-    STATUS_READ_RETRY_DELAY_MS, SYMBOL_LIST_TRUNCATION_REASON,
+    FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_GET_HANDLES_PER_CALL,
+    MAX_SYMBOLS_PER_LIST, NO_INDEXED_EMBEDDINGS_REASON, PROJECT_STATE_DIR_MODE,
+    SCOPE_TRUNCATION_REASON, SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON,
+    STATUS_READ_RETRY_ATTEMPTS, STATUS_READ_RETRY_DELAY_MS, SYMBOL_LIST_TRUNCATION_REASON,
 };
 use crate::shared::errors::{OneupError, ProjectError};
 use crate::shared::fs::{atomic_replace, ensure_secure_project_root};
@@ -1606,12 +1606,26 @@ async fn run_search_once(
     })
 }
 
+/// Pure gate rejecting an over-cap `oneup_get` batch before any index open or
+/// hydration work is attempted. Deterministic and unit-testable in isolation.
+fn check_get_handles_cap(handle_count: usize) -> Result<(), String> {
+    if handle_count > MAX_GET_HANDLES_PER_CALL {
+        return Err(format!(
+            "oneup_get accepts at most {MAX_GET_HANDLES_PER_CALL} handles per call; received {handle_count}. Split the batch into calls of {MAX_GET_HANDLES_PER_CALL} handles or fewer."
+        ));
+    }
+    Ok(())
+}
+
 pub async fn get_handles(
     state_root: &Path,
     worktree_context: &WorktreeContext,
     handles: &[String],
     verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
+    if let Err(message) = check_get_handles_cap(handles.len()) {
+        bail!(message);
+    }
     retry_on_db_lock(|| async {
         get_handles_once(state_root, worktree_context, handles, verbosity).await
     })
@@ -5682,6 +5696,94 @@ mod tests {
             cached_vector_count_for_context(&reopened.db_path, "ctx-a").await,
             None,
             "a build-aside swap must invalidate any cached per-context vector count"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handles_at_cap_proceeds_past_the_gate() {
+        // Exactly MAX_GET_HANDLES_PER_CALL handles must not be rejected by the
+        // cap gate: the call proceeds to real hydration work.
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        // Canonicalize: secure-fs rejects symlinked path components (macOS
+        // tempdir() lives under `/var -> /private/var`).
+        let root = temp_dir.path().canonicalize().unwrap();
+        {
+            let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+            let conn = db.connect().unwrap();
+            schema::initialize(&conn).await.unwrap();
+        }
+
+        let context = WorktreeContext {
+            context_id: "ctx-cap".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+
+        let handles: Vec<String> = (0..MAX_GET_HANDLES_PER_CALL)
+            .map(|i| format!("handle{i:04}"))
+            .collect();
+
+        let payload = get_handles(&root, &context, &handles, None)
+            .await
+            .expect("exactly-at-cap batch must pass the gate and resolve");
+        assert_eq!(
+            payload.records.len(),
+            MAX_GET_HANDLES_PER_CALL,
+            "every handle in the at-cap batch must produce an outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handles_over_cap_rejects_before_any_index_open() {
+        // One handle over the cap must be rejected before `open_current_index`
+        // runs. Deliberately do not build an index at `root`: if the cap check
+        // ran after opening the index, this would surface the "no current
+        // index found" error instead, masking the gate ordering.
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        let context = WorktreeContext {
+            context_id: "ctx-cap".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+
+        let over_cap = MAX_GET_HANDLES_PER_CALL + 1;
+        let handles: Vec<String> = (0..over_cap).map(|i| format!("handle{i:04}")).collect();
+
+        let err = get_handles(&root, &context, &handles, None)
+            .await
+            .expect_err("over-cap batch must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains(&MAX_GET_HANDLES_PER_CALL.to_string()),
+            "error must name the cap: {message}"
+        );
+        assert!(
+            message.contains(&over_cap.to_string()),
+            "error must name the received count: {message}"
+        );
+        assert!(
+            !message.contains("no current index found"),
+            "cap gate must run before index open, not surface an index-open error: {message}"
         );
     }
 
