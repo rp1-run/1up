@@ -63,3 +63,31 @@ versions by equality, not against a hardcoded epoch), so no code change is requi
 schema 19 — parity is enforced generically and the drift guard in
 `recall-compare.test.ts` confirms the baseline and results stay on a single
 schema with a shared corpus identity.
+
+## Schema-20 repair (DiskANN removal)
+
+Schema v20 removed the approximate DiskANN vector index and its query
+machinery (see `docs/diskann-removal.md`), which invalidated two gold labels
+whose anchors named deleted symbols. Both were repaired as reviewed contracts
+to the current canonical seams — never to make the gate pass:
+
+- **"vector_top_k candidate retrieval from HNSW index"** → reworded to
+  "exhaustive vector candidate retrieval ordered by cosine distance". The
+  `SELECT_VECTOR_CANDIDATES` anchor (deleted with the ANN path) moved to
+  `SELECT_VECTOR_CANDIDATES_EXHAUSTIVE_FOR_CONTEXT`, the production vector
+  candidate query. Sibling anchors `fetch_vector_candidates` and
+  `serialize_query_embedding` are unchanged and present.
+- **"libsql vector index DDL using libsql_vector_idx"** → the DDL no longer
+  exists anywhere; reworded to "embedding pool table DDL with FLOAT8 vector
+  column", anchored to `CREATE_EMBEDDING_POOL_TABLE` and the
+  `embedding_vec FLOAT8(384)` column line — the canonical vector-storage DDL
+  seam at v20.
+
+Corpus sha256 after repair:
+`7335591215137a69f2887b13878ecd80ef659f26d3dd7fce18ed7111373d7c11`.
+
+The pinned `recall-baseline.json` (schema 19, old corpus sha) MUST be
+recaptured via `just eval-recall-baseline` (MANUAL, model-enabled — never
+in-agent) before the scheduled embedding-quality gate can pass again: the
+compare step fails closed on both the schema-version change (19 → 20) and the
+corpus-identity change.

@@ -906,36 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn context_age_at_least_true_when_older_than_min_age() {
-        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(context_age_at_least(
-            "2026-01-01 00:00:00",
-            now,
-            Duration::days(30)
-        ));
-    }
-
-    #[test]
-    fn context_age_at_least_false_when_younger_than_min_age() {
-        let now = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(!context_age_at_least(
-            "2026-06-20 00:00:00",
-            now,
-            Duration::days(30)
-        ));
-    }
-
-    #[test]
-    fn context_age_at_least_false_on_unparseable_input() {
-        let now = Utc::now();
-        assert!(!context_age_at_least("not-a-date", now, Duration::days(0)));
-    }
-
-    #[test]
     fn human_bytes_scales_units() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");

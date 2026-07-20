@@ -219,8 +219,7 @@ def known_issue_110_gate_decision():
     the gate off (hard-fail restored) and is always honored. The hard expiry
     is enforced next: on/after ``KNOWN_ISSUE_110_EXPIRY`` the gate is off and
     no override can extend it — re-keying the deadline requires a deliberate
-    edit here. Before expiry, ``"1"`` forces the gate on and unset defaults
-    to on.
+    edit here. Before expiry the gate defaults to on.
     """
     override = os.environ.get("ONEUP_SMOKE_KNOWN_ISSUE_110", "")
     if override == "0":
@@ -231,11 +230,6 @@ def known_issue_110_gate_decision():
             f"gate expired on {KNOWN_ISSUE_110_EXPIRY}; fix rp1-run/1up#110 "
             "or deliberately re-key/extend KNOWN_ISSUE_110_EXPIRY "
             "(ONEUP_SMOKE_KNOWN_ISSUE_110=1 cannot extend the hard expiry)"
-        )
-    if override == "1":
-        return True, (
-            "ONEUP_SMOKE_KNOWN_ISSUE_110=1 forces the gate on "
-            f"(until the hard expiry {KNOWN_ISSUE_110_EXPIRY})"
         )
     return True, f"default gate active until {KNOWN_ISSUE_110_EXPIRY}"
 
@@ -683,7 +677,7 @@ def require_records_data(envelope, label):
     return records
 
 
-def require_fixture_search_hit(results, response=None, request=None):
+def require_fixture_search_hit(results, response, request):
     # Capture the raw payload BEFORE parsing any result field: a malformed
     # record must never escape this function without the diagnostics needed
     # to explain it. Cleared again on the success path below.

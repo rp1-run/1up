@@ -33,7 +33,7 @@
 //! The pure selector and its helpers are exercised on every platform by the unit
 //! tests but only invoked in production on unix (the driver is `#[cfg(unix)]`),
 //! so the module tolerates dead code on the non-unix build like `shared::fs`.
-#![allow(dead_code)]
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -197,21 +197,6 @@ impl ReapSelector {
             .map(|entry| entry.0)
             .collect()
     }
-}
-
-/// Pure batch form of [`ReapSelector`], kept as the unit-test surface for the
-/// selection contract.
-fn select_reapable(
-    candidates: Vec<LockCandidate>,
-    now: SystemTime,
-    max_age: Duration,
-    cap: usize,
-) -> Vec<LockCandidate> {
-    let mut selector = ReapSelector::new(now, max_age, cap);
-    for candidate in candidates {
-        selector.offer(candidate);
-    }
-    selector.into_oldest_first()
 }
 
 /// Reap provably-stale per-project lock files under `xdg_root`, best-effort.
@@ -474,6 +459,21 @@ fn reap_one(xdg_root: &std::path::Path, candidate: &LockCandidate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pure batch form of [`ReapSelector`], kept as the unit-test surface for
+    /// the selection contract.
+    fn select_reapable(
+        candidates: Vec<LockCandidate>,
+        now: SystemTime,
+        max_age: Duration,
+        cap: usize,
+    ) -> Vec<LockCandidate> {
+        let mut selector = ReapSelector::new(now, max_age, cap);
+        for candidate in candidates {
+            selector.offer(candidate);
+        }
+        selector.into_oldest_first()
+    }
 
     /// A 32-lowercase-hex key derived from `seed`, the exact shape
     /// `project_lock_key` produces.

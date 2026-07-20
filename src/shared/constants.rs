@@ -73,42 +73,23 @@ pub const NON_EMBEDDABLE_CHUNK_LANGUAGES: [&str; 9] = [
 /// enough coverage to recover gold segments that drift out of the top 200 but
 /// are still in the right neighbourhood. Doubling K closed the recall gap
 /// introduced by the FLOAT32 -> FLOAT8 column shift with no measurable search
-/// latency impact. The constant serves both vector paths: it is the LIMIT of
-/// the exhaustive-scan path (where candidate cost is one sort, so 400 keeps
-/// the reranker pool identical to the index path) and the per-context K for
-/// the approximate index path above
-/// [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`], where it remains the
-/// recall/latency tradeoff originally tuned for quantization noise.
+/// latency impact. It is the LIMIT of the exact-scan vector path, where
+/// candidate cost is one sort, so 400 keeps the reranker pool wide at no
+/// measurable latency.
 pub const VECTOR_PREFILTER_K: usize = 400;
 
-/// Corpus-size boundary above which exact-scan latency is warned about, and the
-/// count-based cutoff for the opt-in approximate path.
+/// Corpus-size boundary above which the exact vector scan's latency growth is
+/// warned about (once per process).
 ///
-/// The disk-based approximate vector index answers `vector_top_k` by beam
-/// traversal over a neighbor graph, which is read-heavy and pathologically
-/// slow — and, contrary to the original "amortizes at scale" assumption, it
-/// gets WORSE as the corpus grows, not better: ~7s single-thread CPU over
-/// ~4.5k vectors, and ~45s over ~27k vectors (measured on the emdash corpus),
-/// i.e. superlinear. The exhaustive path is the inverse: an exact
-/// `vector_distance_cos` scan is a single linear pass of ~N x 384 dot products
-/// (~6.3M MACs at 16384, well under 10ms) and stays sub-second well past 256k
-/// vectors.
-///
-/// Because of that measured evidence the exact scan is now the **unconditional
-/// default for every corpus size**; this constant is no longer an auto-switch
-/// point. It serves two remaining roles: (1) the boundary above which a
-/// one-time `tracing::warn!` notes that exact-scan latency grows linearly with
-/// corpus size, and (2) the count cutoff applied *only* when the approximate
-/// path is explicitly opted into via [`FORCE_ANN_SEARCH_ENV_VAR`], for the day
-/// the DiskANN path becomes demonstrably faster.
-pub const VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS: usize = 262_144;
-
-/// Maximum number of indexed worktree contexts used to scale vector prefiltering.
-///
-/// libSQL vector search runs against the shared vector index before context
-/// filtering, so linked worktrees dilute the active context's candidate share.
-/// Scaling by context count preserves recall while bounding worst-case latency.
-pub const VECTOR_PREFILTER_CONTEXT_SCALE_LIMIT: usize = 8;
+/// The exact `vector_distance_cos` scan is the only vector path: a single
+/// linear pass of ~N x 384 dot products (~6.3M MACs at 16384, well under
+/// 10ms) that stays sub-second well past 256k vectors. It replaced the
+/// approximate DiskANN `vector_top_k` path, which was measured slower and
+/// superlinear at every tested corpus size (~7s @ 4.5k vectors, ~45s @ 27k;
+/// see docs/diskann-removal.md for the preserved measurements). The scan's
+/// latency still grows linearly with corpus size, so above this (deliberately
+/// high) bound the operator gets a one-time heads-up.
+pub const VECTOR_EXACT_SCAN_WARN_THRESHOLD: usize = 262_144;
 
 /// RRF fusion constant.
 pub const RRF_K: f64 = 60.0;
@@ -426,8 +407,8 @@ pub const DB_LOCK_RETRY_DELAY_MS: u64 = 50;
 /// Distinct from [`DB_LOCK_RETRY_ATTEMPTS`]: that budget (10 attempts × 50 ms ≈
 /// 450 ms) is sized for *transient SQLite lock contention*, which clears in
 /// milliseconds. This budget instead covers a separate process running a *full
-/// schema initialization/upgrade*, which — on a large index with many segments,
-/// embeddings, and the DiskANN vector index — can legitimately take several
+/// schema initialization/upgrade*, which — on a large index with many segments
+/// and embeddings — can legitimately take several
 /// seconds before the `schema_version` row is committed (see GitHub issue #93).
 /// Borrowing the ~450 ms lock budget here made a reader racing that initialization
 /// give up far too early. With [`SCHEMA_INIT_WAIT_DELAY_MS`] this yields roughly a
@@ -541,7 +522,7 @@ pub const MODEL_VARIANT_ENV_VAR: &str = "ONEUP_MODEL_VARIANT";
 /// instead of attempting to index everything. Agents receive the facts and
 /// decide scope via scope_add. Conservatively set to 3000 files, which
 /// corresponds to ~30k vectors at ~10 vectors/file average — below the
-/// VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS cliff of 262k. Overridable via
+/// [`VECTOR_EXACT_SCAN_WARN_THRESHOLD`] of 262k. Overridable via
 /// `ONEUP_FILE_COUNT_THRESHOLD` env var for testing and operator tuning.
 pub const FILE_COUNT_THRESHOLD: usize = 3_000;
 
@@ -561,6 +542,19 @@ pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
 pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY_DELAY_MS";
 
 /// Schema version for database layout.
+///
+/// v20: the approximate DiskANN vector index (`idx_embedding_pool_embedding`)
+/// is removed from the schema. The exact `vector_distance_cos` scan is the
+/// only vector search path — it was measured faster than the DiskANN
+/// `vector_top_k` beam traversal at every tested corpus size (see
+/// docs/diskann-removal.md for the preserved measurements).
+/// `idx_segment_vectors_content_key` is dropped with it: that index existed
+/// solely to back the ANN fan-out join, while the exact scan probes
+/// `embedding_pool` by its `content_key` primary key (measured latency
+/// unchanged without it). Indexes built at v19 still carry both indexes and
+/// the `_shadow` graph-storage table (observed at ~109 MiB inside a 2.2 GiB
+/// index), so they are declared incompatible and fail closed with
+/// `1up reindex`, which rebuilds without them.
 ///
 /// v19: monorepo-scoped indexing support. Scope metadata is stored in the meta
 /// table as `scope_roots_v1` (JSON-serialized `Vec<String>`), applied uniformly
@@ -594,7 +588,7 @@ pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY
 /// HTML stripped, link text kept, whitespace collapsed). Stored breadcrumbs
 /// and the embedding text composed from them change shape, so indexes built
 /// at earlier versions are incompatible and require `1up reindex`.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
@@ -794,16 +788,6 @@ pub const GC_SUPERSEDED_SAME_SOURCE_MAX_AGE_DAYS: i64 = 30;
 /// gate finalizes enablement — explicit `1up gc --apply` is unaffected by this
 /// switch either way.
 pub const GC_MIGRATION_PRUNE_ENV_VAR: &str = "ONEUP_GC_MIGRATION_PRUNE";
-
-/// Env var name for the opt-in (default OFF) switch that forces the approximate
-/// `vector_top_k` DiskANN search path. Unset, empty, or `"0"` keeps the exact
-/// `vector_distance_cos` scan as the default for ALL corpus sizes (the safe,
-/// measured-fast path); any other value opts into the ANN graph path, which
-/// then applies the count-based [`VECTOR_EXHAUSTIVE_SCAN_MAX_VECTORS`] cutoff.
-/// The ANN path is demoted to opt-in because it is pathologically slow and
-/// superlinear in practice (~7s @ 4.5k vectors, ~45s @ 27k vectors, measured on
-/// the emdash corpus) and stays off until it is demonstrably faster.
-pub const FORCE_ANN_SEARCH_ENV_VAR: &str = "ONEUP_FORCE_ANN_SEARCH";
 
 /// Minimum age in days a stale-branch snapshot of a *live* worktree must reach
 /// (by `worktree_contexts.updated_at`) before the daemon's conservative

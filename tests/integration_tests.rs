@@ -2985,9 +2985,8 @@ fn markdown_doc_segments_receive_vector_rows_when_embeddings_enabled() {
 fn fresh_index_stores_vector_rows_for_source_segments_when_embeddings_enabled() {
     // Defect A regression: a fresh index run with a working embedder must
     // persist vector rows for source-code segments through the real CLI
-    // pipeline path. Counts are read through libsql: stock SQLite tooling
-    // satisfies COUNT(*) from the DiskANN expression-index btree, which
-    // libsql leaves empty, and therefore under-reports stored vectors as 0.
+    // pipeline path. Counts are read through libsql to match the production
+    // reader stack.
     let _model_guard = RestoreHiddenModelGuard::new();
     let tmp = create_multi_lang_fixture();
     init_project(tmp.path());

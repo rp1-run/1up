@@ -317,26 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn read_status_file_truncated_json_is_unreadable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("status.json");
-        std::fs::write(&path, br#"{"progress":4"#).unwrap();
+    fn read_status_file_torn_content_is_unreadable() {
+        // Both historically observed torn-write symptoms: truncated JSON and a
+        // zero-length file. Same classifier branch, kept together.
+        for torn in [&br#"{"progress":4"#[..], &b""[..]] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("status.json");
+            std::fs::write(&path, torn).unwrap();
 
-        match read_status_file::<SampleStatus>(&path) {
-            StatusFileRead::Unreadable(StatusReadError::Parse(_)) => {}
-            other => panic!("expected Unreadable(Parse), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_status_file_empty_file_is_unreadable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("status.json");
-        std::fs::write(&path, b"").unwrap();
-
-        match read_status_file::<SampleStatus>(&path) {
-            StatusFileRead::Unreadable(StatusReadError::Parse(_)) => {}
-            other => panic!("expected Unreadable(Parse), got {other:?}"),
+            match read_status_file::<SampleStatus>(&path) {
+                StatusFileRead::Unreadable(StatusReadError::Parse(_)) => {}
+                other => panic!("expected Unreadable(Parse) for {torn:?}, got {other:?}"),
+            }
         }
     }
 }
