@@ -384,35 +384,62 @@ struct BranchIdentity {
 /// A `gitdir`/`commondir` pair alone is not trusted: both files can be forged
 /// by dropping a crafted `.git` file into an attacker-controlled tree, which
 /// would otherwise redirect `main_root` (and therefore `state_root`) into an
-/// unrelated victim directory. Before `common_git_dir` is used for anything,
-/// `verify_worktree_reverse_pointer` confirms the mutual link that real git
-/// itself maintains: `<git_dir>/gitdir` must exist and point back at this
-/// exact worktree's `.git` file. A crafted pointer cannot forge this, since
-/// forging it requires control over the *target* repository's own git
-/// metadata. On any verification failure the pointer is ignored (`None`), and
-/// `resolve_project_root` falls back through its existing resolution chain.
+/// unrelated victim directory. Two checks must BOTH pass before
+/// `common_git_dir` is trusted, and their order matters:
+///
+/// 1. **Anchoring**: the canonical `git_dir` must be a direct child of
+///    `<canonical common_git_dir>/worktrees/`. This is what makes the second
+///    check meaningful — without it, an attacker can point `.git` at a
+///    directory they control whose `gitdir` and `commondir` files both agree
+///    with each other (a fully forged chain), and a pure reverse-pointer
+///    equality proves nothing.
+/// 2. **Reverse pointer**: `<git_dir>/gitdir` must point back at this exact
+///    worktree's `.git` file. Once anchoring holds, that file lives inside
+///    the claimed main repository's own `.git/worktrees/` metadata, which an
+///    attacker delivering a crafted tree cannot write into.
+///
+/// On any verification failure the pointer is ignored (`None`), and
+/// `resolve_project_root` falls back through its existing resolution chain,
+/// so state never escapes the project tree.
 fn resolve_linked_worktree_info(start: &Path) -> Option<GitWorktreeInfo> {
     let mut current = Some(start);
     while let Some(dir) = current {
         let dot_git = dir.join(".git");
         if dot_git.is_file() {
             let git_dir = read_gitdir_file(&dot_git, dir)?;
-            if !verify_worktree_reverse_pointer(&git_dir, &dot_git) {
+            let common_git_dir = read_commondir(&git_dir)?;
+            let canonical_git_dir = canonical_path(&git_dir);
+            let canonical_common_git_dir = canonical_path(&common_git_dir);
+
+            let anchored = canonical_git_dir.parent()
+                == Some(canonical_common_git_dir.join("worktrees").as_path());
+            if !anchored {
                 tracing::debug!(
-                    "ignoring unverified worktree pointer at {}: no matching reverse pointer in {}",
+                    "ignoring unverified worktree pointer at {}: git dir {} is not registered \
+                     under {}/worktrees",
                     dot_git.display(),
-                    git_dir.display()
+                    canonical_git_dir.display(),
+                    canonical_common_git_dir.display()
                 );
                 return None;
             }
-            let common_git_dir = read_commondir(&git_dir)?;
-            let main_root = canonical_path(&common_git_dir).parent()?.to_path_buf();
+
+            if !verify_worktree_reverse_pointer(&canonical_git_dir, &dot_git) {
+                tracing::debug!(
+                    "ignoring unverified worktree pointer at {}: no matching reverse pointer in {}",
+                    dot_git.display(),
+                    canonical_git_dir.display()
+                );
+                return None;
+            }
+
+            let main_root = canonical_common_git_dir.parent()?.to_path_buf();
 
             return Some(GitWorktreeInfo {
                 main_root,
                 worktree_root: dir.to_path_buf(),
-                git_dir: canonical_path(&git_dir),
-                common_git_dir: canonical_path(&common_git_dir),
+                git_dir: canonical_git_dir,
+                common_git_dir: canonical_common_git_dir,
                 role: WorktreeRole::Linked,
             });
         }
@@ -425,10 +452,14 @@ fn resolve_linked_worktree_info(start: &Path) -> Option<GitWorktreeInfo> {
 /// directory) is genuinely registered by git as the private git dir for the
 /// worktree whose `.git` file is `worktree_dot_git`. Real git writes a
 /// `gitdir` file inside `git_dir` containing the absolute path back to the
-/// worktree's own `.git` file; this reverse pointer is the one part of the
-/// layout an attacker cannot forge without control over `git_dir` itself
-/// (ordinary directories have no such file, and a real repo's registered
-/// entry points at *its own* worktree, never an attacker's).
+/// worktree's own `.git` file, and a real repo's registered entry points at
+/// *its own* worktree, never an attacker's.
+///
+/// This check is only meaningful AFTER the caller has anchored `git_dir`
+/// under the claimed main repository's `.git/worktrees/` directory (see
+/// `resolve_linked_worktree_info`): anchoring is what places this file in
+/// space the attacker cannot write; on an unanchored `git_dir` the attacker
+/// authors both sides of the comparison and equality proves nothing.
 fn verify_worktree_reverse_pointer(git_dir: &Path, worktree_dot_git: &Path) -> bool {
     let Some(recorded) = std::fs::read_to_string(git_dir.join("gitdir"))
         .ok()
@@ -1179,6 +1210,56 @@ mod tests {
         assert_eq!(
             resolved.state_root, attacker,
             "state must stay within the project tree, never escape to the victim repo"
+        );
+        assert_ne!(resolved.state_root, victim);
+    }
+
+    #[test]
+    fn resolve_linked_worktree_info_rejects_fully_forged_pointer_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+
+        // A real, unrelated victim repository the attacker wants state
+        // redirected into. The attacker cannot write inside it.
+        let victim = tmp_root.join("victim");
+        fs::create_dir_all(victim.join(".git")).unwrap();
+
+        // The attacker forges ALL THREE pointers inside their own tree:
+        //   1. attacker/.git            -> fake git_dir (attacker-owned)
+        //   2. fake git_dir/gitdir      -> attacker/.git (reverse pointer AGREES)
+        //   3. fake git_dir/commondir   -> victim/.git
+        // The reverse-pointer equality passes because the attacker authors
+        // both sides; only the worktrees-anchoring check can reject this,
+        // because the fake git_dir does not live under victim/.git/worktrees/.
+        let attacker = tmp_root.join("attacker");
+        let fake_git_dir = attacker.join(".git-meta").join("fake");
+        fs::create_dir_all(&fake_git_dir).unwrap();
+        fs::write(
+            attacker.join(".git"),
+            format!("gitdir: {}\n", fake_git_dir.display()),
+        )
+        .unwrap();
+        fs::write(
+            fake_git_dir.join("gitdir"),
+            attacker.join(".git").display().to_string(),
+        )
+        .unwrap();
+        fs::write(
+            fake_git_dir.join("commondir"),
+            victim.join(".git").display().to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            resolve_linked_worktree_info(&attacker).is_none(),
+            "a self-consistent forged pointer chain must still be rejected: the git dir is \
+             not registered under the victim's .git/worktrees/"
+        );
+
+        let resolved = resolve_project_root(&attacker).unwrap();
+        assert_eq!(
+            resolved.state_root, attacker,
+            "state must stay within the project tree even against a fully forged chain"
         );
         assert_ne!(resolved.state_root, victim);
     }
