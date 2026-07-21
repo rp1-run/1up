@@ -899,32 +899,6 @@ WHERE context_id = ?1
 ORDER BY id
 LIMIT ?3";
 
-/// Build the exact-id batch-fetch statement for `id_count` segment ids within
-/// one context. Selects the same columns in the same order as
-/// [`SELECT_SEGMENT_BY_ID_FOR_CONTEXT`], so a batched fetch returns rows
-/// byte-identical to issuing `id_count` individual id lookups.
-/// Params: `?1` context id, `?2..?(id_count + 1)` segment ids.
-pub fn select_segments_by_ids_for_context_sql(id_count: usize) -> String {
-    let mut id_placeholders = String::new();
-    for index in 0..id_count {
-        if index > 0 {
-            id_placeholders.push_str(", ");
-        }
-        write!(id_placeholders, "?{}", index + 2).expect("write to String cannot fail");
-    }
-
-    format!(
-        "SELECT id, file_path, language, block_type, content,
-       line_start, line_end, breadcrumb, complexity, role,
-       defined_symbols, referenced_symbols, called_symbols, file_hash,
-       created_at, updated_at
-FROM segments
-WHERE context_id = ?1
-  AND id IN ({ids})",
-        ids = id_placeholders,
-    )
-}
-
 pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";

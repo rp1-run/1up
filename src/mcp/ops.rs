@@ -48,8 +48,7 @@ use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
     count_vector_rows_for_context, get_all_file_paths_for_context, get_segment_by_id_for_context,
     get_segment_by_prefix_for_context, get_segment_ids_by_prefix_for_context,
-    get_segments_by_ids_for_context, get_worktree_context_head_oid, SegmentPrefixLookup,
-    StoredSegment,
+    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
 };
 use crate::storage::swap;
 
@@ -2625,44 +2624,81 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     })
 }
 
+/// Incremental exact-id segment fetcher used by
+/// [`resolve_handle_records_with_fetcher`]. Hydration fetches one exact id at
+/// a time, in the caller's handle order, and stops calling the fetcher
+/// entirely once the response budget is exhausted; the trait boundary is what
+/// lets the regression tests count the fetches that actually execute. A fetch
+/// error fails the whole call (same contract as the index-level failures in
+/// [`open_current_index`]), so lock errors still `?`-propagate to
+/// `retry_on_db_lock`.
+trait ExactSegmentFetcher {
+    async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError>;
+}
+
+/// Live fetcher: one point lookup per distinct exact id, scoped to the
+/// current index context.
+struct DbExactSegmentFetcher<'a> {
+    conn: &'a Connection,
+    context_id: &'a str,
+}
+
+impl ExactSegmentFetcher for DbExactSegmentFetcher<'_> {
+    async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError> {
+        get_segment_by_id_for_context(self.conn, self.context_id, id).await
+    }
+}
+
 /// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
-/// order. The exact-id pass is collapsed into a single `id IN (...)` batch
-/// lookup; only the residual handles that did not exact-match (12-char
-/// display handles and genuine misses) fall back to the per-handle prefix
-/// lookup. Each handle is resolved independently, so the per-handle
-/// Found/NotFound/Ambiguous outcome and the empty-handle rejection are identical
-/// to resolving handles one at a time.
-///
-/// Hydration is additionally metered against [`MAX_GET_RESPONSE_BYTES`] in
-/// input order: the first record is always admitted (any single segment stays
-/// fetchable in a batch of one); once a further record would push the
-/// aggregate serialized size past the budget, it and every remaining handle
-/// receive the structured over-budget outcome instead — no further database
-/// work is done for them — so a batch of near-maximum segments cannot inflate
-/// the response envelope past the budget.
+/// order, against the live database. See
+/// [`resolve_handle_records_with_fetcher`] for the resolution and budgeting
+/// contract.
 async fn resolve_handle_records(
     conn: &Connection,
     context_id: &str,
     handles: &[String],
     verbosity: Option<&str>,
 ) -> anyhow::Result<Vec<ReadRecord>> {
+    let mut fetcher = DbExactSegmentFetcher { conn, context_id };
+    resolve_handle_records_with_fetcher(conn, context_id, handles, verbosity, &mut fetcher).await
+}
+
+/// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
+/// order. Exact ids are hydrated incrementally — one fetch per distinct id,
+/// in input order — and only handles that did not exact-match (12-char
+/// display handles and genuine misses) fall back to the per-handle prefix
+/// lookup. Each handle is resolved independently, so the per-handle
+/// Found/NotFound/Ambiguous outcome and the empty-handle rejection are identical
+/// to resolving handles one at a time.
+///
+/// Hydration is metered against [`MAX_GET_RESPONSE_BYTES`] as it goes: the
+/// first record is always admitted (any single segment stays fetchable in a
+/// batch of one); once a record would push the aggregate serialized size past
+/// the budget, it and every remaining handle receive the structured
+/// over-budget outcome instead, and no further segment fetches — exact or
+/// prefix — are performed. Peak memory for the fetched set is therefore
+/// O(budget): at most the admitted records plus the single record that trips
+/// the budget are ever materialized, regardless of how many distinct
+/// near-maximum segments the batch names.
+async fn resolve_handle_records_with_fetcher<F: ExactSegmentFetcher>(
+    conn: &Connection,
+    context_id: &str,
+    handles: &[String],
+    verbosity: Option<&str>,
+    fetcher: &mut F,
+) -> anyhow::Result<Vec<ReadRecord>> {
     let normalized: Vec<String> = handles
         .iter()
         .map(|handle| normalize_handle(handle))
         .collect();
 
-    // One batched exact-id fetch for the non-empty normalized handles. An id with
-    // no row simply misses the map and falls through to the prefix residual
-    // below — the same per-handle path as resolving exact-then-prefix one at a
-    // time. Duplicate ids are harmless (the map keys on id).
-    let exact_ids: Vec<String> = normalized
-        .iter()
-        .filter(|id| !id.is_empty())
-        .cloned()
-        .collect();
-    let segments_by_id = get_segments_by_ids_for_context(conn, context_id, &exact_ids).await?;
-
     let mut records = Vec::with_capacity(handles.len());
+    // Exact-id results fetched so far, keyed by id, so duplicate handles
+    // hydrate once. Bounded by what the budget admits (plus the one record
+    // that trips it), so the map cannot reintroduce amplification. A `None`
+    // entry records a miss, which falls through to the prefix residual below
+    // — the same per-handle path as resolving exact-then-prefix one at a time.
+    let mut fetched_exact: HashMap<String, Option<StoredSegment>> = HashMap::new();
     // Aggregate response budget: serialized bytes admitted so far and whether
     // a record has already been refused. Once tripped, every remaining handle
     // short-circuits to the over-budget outcome without further database work.
@@ -2678,20 +2714,30 @@ async fn resolve_handle_records(
 
         let record = if normalized.is_empty() {
             read_message(ReadStatus::NotFound, source, "empty segment handle")
-        } else if let Some(segment) = segments_by_id.get(&normalized) {
-            read_segment(source, segment.clone(), verbosity)
         } else {
-            match resolve_handle_via_prefix(
-                conn,
-                context_id,
-                source.clone(),
-                &normalized,
-                verbosity,
-            )
-            .await
-            {
-                Ok(record) => record,
-                Err(err) => isolate_residual_resolution_error(source, err)?,
+            let exact = match fetched_exact.get(&normalized) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = fetcher.fetch_exact(&normalized).await?;
+                    fetched_exact.insert(normalized.clone(), fetched.clone());
+                    fetched
+                }
+            };
+            if let Some(segment) = exact {
+                read_segment(source, segment, verbosity)
+            } else {
+                match resolve_handle_via_prefix(
+                    conn,
+                    context_id,
+                    source.clone(),
+                    &normalized,
+                    verbosity,
+                )
+                .await
+                {
+                    Ok(record) => record,
+                    Err(err) => isolate_residual_resolution_error(source, err)?,
+                }
             }
         };
 
@@ -2717,8 +2763,8 @@ async fn resolve_handle_records(
 /// error is returned as `Err` so it `?`-propagates and `retry_on_db_lock`
 /// retries the whole call; any other error is isolated to a single
 /// `ReadStatus::Error` record carrying the error text, so one handle's failure
-/// never aborts the batch. Index-level failures (the batched exact-id fetch,
-/// `open_current_index`) stay whole-call failures and never reach here.
+/// never aborts the batch. Index-level failures (the incremental exact-id
+/// fetch, `open_current_index`) stay whole-call failures and never reach here.
 fn isolate_residual_resolution_error(
     source: ReadSource,
     err: anyhow::Error,
@@ -6076,6 +6122,132 @@ mod tests {
             envelope.len() <= MAX_GET_RESPONSE_BYTES,
             "the serialized batch must stay within the response budget, got {} bytes",
             envelope.len()
+        );
+    }
+
+    /// Test fetcher: delegates to the live single-id lookup while counting
+    /// how many exact-segment fetches actually execute, which is what lets
+    /// the budget regressions below assert that fetch work — not just the
+    /// response envelope — stops once the budget is exhausted.
+    struct CountingExactFetcher<'a> {
+        conn: &'a Connection,
+        context_id: &'a str,
+        fetches: usize,
+    }
+
+    impl ExactSegmentFetcher for CountingExactFetcher<'_> {
+        async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError> {
+            self.fetches += 1;
+            get_segment_by_id_for_context(self.conn, self.context_id, id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn response_budget_stops_fetches_for_distinct_large_batch() {
+        // Regression for the distinct-segment amplification gap: with bulk
+        // up-front hydration, N distinct near-limit segments materialized
+        // O(N * segment) bytes before the response budget rejected them (the
+        // duplicate-heavy test misses this because duplicate ids collapse to
+        // one map entry). Incremental hydration must stop FETCHING at the
+        // budget: leading records hydrate, trailing handles are refused
+        // without touching the database, so peak memory is O(budget).
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-distinct-budget";
+        let ids = [
+            "aaaa0000aaaa0000",
+            "bbbb1111bbbb1111",
+            "cccc2222cccc2222",
+            "dddd3333dddd3333",
+            "eeee4444eeee4444",
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            let mut segment = test_segment(id, &format!("src/big{index}.rs"));
+            segment.content = "x".repeat(900 * 1024);
+            segments::upsert_segment_for_context(&conn, ctx, &segment)
+                .await
+                .unwrap();
+        }
+
+        let handles: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let mut fetcher = CountingExactFetcher {
+            conn: &conn,
+            context_id: ctx,
+            fetches: 0,
+        };
+        let records = resolve_handle_records_with_fetcher(&conn, ctx, &handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        let statuses: Vec<ReadStatus> = records.iter().map(|record| record.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::Rejected,
+                ReadStatus::Rejected,
+                ReadStatus::Rejected,
+            ],
+            "leading distinct records hydrate; handles past the budget are refused"
+        );
+        assert_eq!(
+            records[0].segment.as_ref().unwrap().content.len(),
+            900 * 1024,
+            "admitted records carry their full content"
+        );
+
+        // The key assertion: only the two admitted records plus the single
+        // record that trips the budget may ever be fetched. The two handles
+        // after exhaustion must not execute a fetch at all.
+        assert_eq!(
+            fetcher.fetches, 3,
+            "fetch work must stop at the budget, not just the response envelope"
+        );
+
+        let envelope = serde_json::to_vec(&records).unwrap();
+        assert!(
+            envelope.len() <= MAX_GET_RESPONSE_BYTES,
+            "the serialized batch must stay within the response budget, got {} bytes",
+            envelope.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_exact_handles_fetch_once() {
+        // Duplicates hydrate from the already-fetched map: one database fetch
+        // per distinct exact id, however many times the batch repeats it.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-dup-fetch";
+        let id = "feedfeedfeedfeed";
+        segments::upsert_segment_for_context(&conn, ctx, &test_segment(id, "src/dup.rs"))
+            .await
+            .unwrap();
+
+        let handles = vec![id.to_string(); 3];
+        let mut fetcher = CountingExactFetcher {
+            conn: &conn,
+            context_id: ctx,
+            fetches: 0,
+        };
+        let records = resolve_handle_records_with_fetcher(&conn, ctx, &handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == ReadStatus::Found),
+            "every duplicate keeps its independent Found outcome"
+        );
+        assert_eq!(
+            fetcher.fetches, 1,
+            "duplicate handles must hydrate from the already-fetched map"
         );
     }
 
