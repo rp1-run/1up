@@ -64,6 +64,15 @@ struct ProjectRunState {
     dirty: bool,
     pending_scope: Option<RunScope>,
     pending_fallback_reason: Option<String>,
+    /// True while the pending dirty run exists SOLELY because a blocked-count
+    /// TTL recheck deadline fired ([`Self::mark_dirty_gate_recheck`]). Any
+    /// real dirty work — a watcher event, reload, or startup reconciliation —
+    /// pending before the deadline fired, or merged in afterwards via
+    /// [`Self::mark_dirty`], clears this flag: dirty reasons/paths merge into
+    /// one pending run, and only a PURELY gate-driven retry may be consumed
+    /// without a pipeline pass when `run_project` observes the index already
+    /// populated (see the gate call site).
+    pending_gate_recheck_only: bool,
 }
 
 impl ProjectRunState {
@@ -74,6 +83,9 @@ impl ProjectRunState {
         }
 
         self.dirty = true;
+        // Real work is now pending: even if a gate-only retry was scheduled
+        // first, the merged run must reach the pipeline.
+        self.pending_gate_recheck_only = false;
     }
 
     fn mark_dirty_with_reason(&mut self, scope: RunScope, reason: String) {
@@ -81,10 +93,21 @@ impl ProjectRunState {
         self.pending_fallback_reason = Some(reason);
     }
 
+    /// Mark this project dirty for a blocked-count TTL recheck
+    /// ([`GATE_RECHECK_REASON`]), remembering whether the pending run exists
+    /// solely for that retry. If the project was already dirty with real work,
+    /// the retry merges into it and the run is NOT gate-only.
+    fn mark_dirty_gate_recheck(&mut self) {
+        let was_dirty = self.dirty;
+        self.mark_dirty_with_reason(RunScope::Full, GATE_RECHECK_REASON.to_string());
+        self.pending_gate_recheck_only = !was_dirty;
+    }
+
     fn start_run(&mut self) -> RunScope {
         debug_assert!(self.dirty, "only dirty projects should start a run");
         self.running = true;
         self.dirty = false;
+        self.pending_gate_recheck_only = false;
         self.pending_scope
             .take()
             .expect("dirty project must have a pending scope")
@@ -137,6 +160,13 @@ struct ProjectState {
     ///   immediately** — a reload can change the project's scope/registry
     ///   state while it stays gated (e.g. an operator applies `--scope` out
     ///   of band and reloads).
+    /// - **External population ends the episode.** Any pass that observes the
+    ///   index already populated (`is_first_index == false`) clears the entry
+    ///   AND disarms [`Self::gate_recheck_at`]: first-index gating is over no
+    ///   matter how the index got populated — including a sanctioned one-shot
+    ///   `1up index`/`1up reindex`, which does not SIGHUP the daemon. Without
+    ///   this, an armed deadline would outlive the gate and fire a redundant
+    ///   full refresh.
     ///
     /// Liveness: a gated pass served from this cache consumes the dirty run
     /// that triggered it, so cache expiry alone must not depend on a LATER
@@ -162,9 +192,14 @@ struct ProjectState {
     /// loop's existing [`WATCHER_DEBOUNCE_MS`] tick — no extra wakeups — and
     /// the within-TTL fast path stays a pure in-memory cache read. Cleared
     /// whenever a fresh gate walk re-decides (blocked or allowed), when the
-    /// gate opens, and on a registry reload (SIGHUP) alongside the cache
-    /// entry. Worst-case unblock latency for a repository that becomes
-    /// eligible with no further events: ≈ TTL + one tick.
+    /// gate opens, on a registry reload (SIGHUP) alongside the cache entry,
+    /// and whenever a pass observes the index already populated — external
+    /// population (`1up index`/`1up reindex`, no SIGHUP) ends the gating
+    /// episode, so the deadline is disarmed and a fired, now-obsolete
+    /// gate-only retry is consumed without a pipeline refresh
+    /// ([`ProjectRunState::pending_gate_recheck_only`]). Worst-case unblock
+    /// latency for a repository that becomes eligible with no further
+    /// events: ≈ TTL + one tick.
     gate_recheck_at: Option<std::time::Instant>,
     /// One reused tuned read [`Connection`] to the open index, serving repeated
     /// daemon searches without a fresh per-request `connect()` + PRAGMA pass.
@@ -2049,6 +2084,13 @@ fn mark_changed_projects(projects: &mut ProjectStates, changes: &watcher::Watche
 /// when ANOTHER cache-served gated pass runs — so a quiescent gated project
 /// walks at most once per armed deadline, and the in-memory flag never touches
 /// the filesystem (nothing here can re-dirty a watched root).
+///
+/// A deadline can outlive the gating episode it belongs to: a sanctioned
+/// external `1up index`/`1up reindex` may populate the index before expiry
+/// without a SIGHUP. The dirty mark scheduled here is therefore tagged
+/// gate-only ([`ProjectRunState::mark_dirty_gate_recheck`]); when the sweep's
+/// pass observes the index already populated, it consumes such a run without
+/// a tree walk or pipeline refresh (see the gate call site in [`run_project`]).
 fn rearm_expired_gate_rechecks(projects: &mut ProjectStates) {
     let now = std::time::Instant::now();
     for state in projects.values_mut() {
@@ -2064,9 +2106,7 @@ fn rearm_expired_gate_rechecks(projects: &mut ProjectStates) {
                 "first-index gate blocked-count TTL expired for {}; scheduling a fresh gate walk",
                 state.project_root.display()
             );
-            state
-                .run_state
-                .mark_dirty_with_reason(RunScope::Full, GATE_RECHECK_REASON.to_string());
+            state.run_state.mark_dirty_gate_recheck();
         }
     }
 }
@@ -2931,6 +2971,40 @@ async fn run_project(
                 .get_mut(context_id)
                 .expect("dirty project must exist after the gate opens")
                 .gate_recheck_at = None;
+        } else {
+            // External population ends the episode: the index is populated,
+            // so first-index gating no longer applies — no matter HOW it got
+            // populated. A sanctioned one-shot `1up index`/`1up reindex` can
+            // complete while a blocked entry (and possibly its TTL recheck
+            // deadline) is still armed; those CLI paths do not SIGHUP the
+            // daemon, so this pass is the first to observe the change. Clear
+            // both pieces of gate state here so an obsolete timer can never
+            // fire later and schedule a redundant full refresh.
+            let state = projects
+                .get_mut(context_id)
+                .expect("dirty project must exist after the gate is bypassed");
+            state.cached_gate_file_count = None;
+            state.gate_recheck_at = None;
+            // If the pending run exists SOLELY because a fired deadline
+            // re-marked this project dirty (a gate-only TTL retry), there is
+            // nothing left to re-check: consume the run without a tree walk
+            // or pipeline refresh. Dirty reasons/paths merge into one pending
+            // run, so any real watcher/reload work that merged with the retry
+            // cleared `pending_gate_recheck_only` (see `mark_dirty`) and
+            // falls through to the pipeline below — only the purely
+            // gate-driven retry is redundant.
+            if state.run_state.pending_gate_recheck_only {
+                debug!(
+                    "index for {} was populated externally while a gate recheck was armed; \
+                     dropping the obsolete gate-only retry",
+                    state.project_root.display()
+                );
+                let _ = state.run_state.start_run();
+                let _ = state.run_state.pending_fallback_reason.take();
+                state.run_state.finish_run();
+                mark_refresh_finished(state, Utc::now(), Ok(()));
+                return Ok(pipeline::PipelineStats::default());
+            }
         }
     }
 
@@ -3752,6 +3826,7 @@ mod tests {
                     dirty: false,
                     pending_scope: None,
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4041,6 +4116,7 @@ mod tests {
                         RunScope::from_paths([PathBuf::from("src/lib.rs")]).unwrap(),
                     ),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4057,6 +4133,7 @@ mod tests {
                         RunScope::from_paths([PathBuf::from("src/mod.rs")]).unwrap(),
                     ),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4103,6 +4180,7 @@ mod tests {
                     dirty: true,
                     pending_scope: Some(RunScope::Full),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4736,6 +4814,286 @@ mod tests {
         );
     }
 
+    /// Populate the index through the storage layer, simulating a sanctioned
+    /// external one-shot `1up index`/`1up reindex` completing outside the
+    /// daemon pipeline. Those CLI paths do not SIGHUP the daemon, so any
+    /// in-memory gate state armed before the external run survives it. One
+    /// segment row is enough to flip `is_first_index` to false.
+    async fn seed_externally_indexed_segment(db: &Db) {
+        let conn = db.connect_tuned().await.unwrap();
+        segments::upsert_segment(
+            &conn,
+            &segments::SegmentInsert {
+                id: "external-seed-segment-000000000".to_string(),
+                file_path: "src/external.rs".to_string(),
+                language: "rust".to_string(),
+                block_type: "function".to_string(),
+                content: "fn external() {}".to_string(),
+                line_start: 1,
+                line_end: 1,
+                content_key: None,
+                embedding_vec: None,
+                breadcrumb: None,
+                complexity: 1,
+                role: "DEFINITION".to_string(),
+                defined_symbols: "[\"external\"]".to_string(),
+                referenced_symbols: "[]".to_string(),
+                referenced_relations: "[]".to_string(),
+                called_symbols: "[]".to_string(),
+                called_relations: "[]".to_string(),
+                file_hash: "external-hash".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_index_population_disarms_gate_retry_without_refresh() {
+        // pr-142-review-003 (MEDIUM): an armed recheck deadline can outlive
+        // the gating episode it belongs to. A sanctioned external
+        // `1up index`/`1up reindex` populates the index without a SIGHUP, so
+        // the obsolete timer still fires — and the pass it scheduled used to
+        // fall through to the ordinary full pipeline path. Prove the fired
+        // gate-only retry now no-ops cheaply: no tree walk, no refresh, and
+        // the gate cache + deadline are fully cleared.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let db = seeded_project_db(&root).await;
+        seed_externally_indexed_segment(&db).await;
+
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(&root, &root, db, ProjectRunState::default()),
+        );
+
+        // Gate state left behind by the pre-population gated passes: a cached
+        // blocked count whose TTL has lapsed (backdated, no sleeping) and the
+        // recheck deadline a cache-served pass armed at that entry's expiry.
+        let ttl = std::time::Duration::from_millis(
+            crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS,
+        );
+        let expired_at = std::time::Instant::now()
+            .checked_sub(ttl + std::time::Duration::from_millis(1_000))
+            .expect("the test host must have been up longer than the gate TTL");
+        {
+            let state = projects.get_mut(&key).unwrap();
+            state.cached_gate_file_count = Some((999, expired_at));
+            state.gate_recheck_at = Some(expired_at + ttl);
+        }
+
+        // The worker tick fires the (now obsolete) deadline.
+        rearm_expired_gate_rechecks(&mut projects);
+        {
+            let state = projects.get(&key).unwrap();
+            assert!(state.run_state.dirty, "the fired deadline must mark dirty");
+            assert!(
+                state.run_state.pending_gate_recheck_only,
+                "a deadline-fired retry with no other pending work must be tagged gate-only"
+            );
+            assert_eq!(
+                state.run_state.pending_fallback_reason.as_deref(),
+                Some(GATE_RECHECK_REASON)
+            );
+        }
+
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+
+        let stats = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await
+        .expect("an obsolete gate-only retry must be consumed cleanly (idle, Ok)");
+        assert_eq!(
+            stats.files_scanned, 0,
+            "the obsolete gate-only retry must not enter the pipeline (no full refresh)"
+        );
+        assert_eq!(
+            stats.segments_stored, 0,
+            "the obsolete gate-only retry must not store anything"
+        );
+
+        {
+            let state = projects.get(&key).unwrap();
+            assert_eq!(
+                state.cached_gate_file_count, None,
+                "external population ends the episode: the cached blocked count must be cleared"
+            );
+            assert_eq!(
+                state.gate_recheck_at, None,
+                "external population ends the episode: the recheck deadline must be disarmed"
+            );
+            assert!(
+                !state.run_state.dirty,
+                "the obsolete retry must be consumed, not left to re-run"
+            );
+            assert!(!state.run_state.pending_gate_recheck_only);
+            assert_eq!(state.run_state.pending_fallback_reason, None);
+        }
+
+        // The index is untouched: still exactly the one externally seeded
+        // row. A full refresh would have indexed the 6 on-disk fixture files.
+        let conn = projects
+            .get(&key)
+            .unwrap()
+            .db
+            .connect_tuned()
+            .await
+            .unwrap();
+        assert_eq!(
+            segments::count_segments(&conn).await.unwrap(),
+            1,
+            "the no-op pass must not touch the externally populated index"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gate_only_retry_merged_with_watcher_work_still_runs_refresh() {
+        // Counterpart to
+        // `external_index_population_disarms_gate_retry_without_refresh`:
+        // dirty reasons/paths merge into ONE pending run (`mark_dirty`), so a
+        // watcher event landing between the fired deadline and the sweep's
+        // pass rides the same run as the obsolete retry. Only the PURELY
+        // gate-driven run may be discarded — the merged run must still reach
+        // the pipeline and execute the watcher-driven work.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvVarsGuard::new(&[
+            "HOME",
+            "XDG_DATA_HOME",
+            crate::shared::constants::DISABLE_MODEL_DOWNLOADS_ENV_VAR,
+        ]);
+        // Fake HOME keeps the pipeline pass hermetic (no real model dir, no
+        // network: downloads disabled), so the merged pass indexes FTS-only.
+        let home = tempfile::tempdir().unwrap();
+        let home_root = home.path().canonicalize().unwrap();
+        std::env::set_var("HOME", &home_root);
+        std::env::set_var("XDG_DATA_HOME", home_root.join(".local").join("share"));
+        std::env::set_var(
+            crate::shared::constants::DISABLE_MODEL_DOWNLOADS_ENV_VAR,
+            "1",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let db = seeded_project_db(&root).await;
+        seed_externally_indexed_segment(&db).await;
+
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(&root, &root, db, ProjectRunState::default()),
+        );
+
+        let ttl = std::time::Duration::from_millis(
+            crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS,
+        );
+        let expired_at = std::time::Instant::now()
+            .checked_sub(ttl + std::time::Duration::from_millis(1_000))
+            .expect("the test host must have been up longer than the gate TTL");
+        {
+            let state = projects.get_mut(&key).unwrap();
+            state.cached_gate_file_count = Some((999, expired_at));
+            state.gate_recheck_at = Some(expired_at + ttl);
+        }
+
+        // The tick fires the obsolete deadline, then a REAL watcher event
+        // merges into the same pending run before the sweep reaches it.
+        rearm_expired_gate_rechecks(&mut projects);
+        projects
+            .get_mut(&key)
+            .unwrap()
+            .run_state
+            .mark_dirty(RunScope::from_paths([PathBuf::from("mod_0.rs")]).unwrap());
+        assert!(
+            !projects
+                .get(&key)
+                .unwrap()
+                .run_state
+                .pending_gate_recheck_only,
+            "real work merged into the pending run must clear the gate-only tag"
+        );
+
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "the merged run must execute the watcher-driven refresh, got {result:?}"
+        );
+
+        // The pipeline really ran: the on-disk fixture files are now indexed
+        // alongside (at least) the externally seeded row. Dropping the merged
+        // run with the obsolete retry would have left only the seeded row.
+        let indexed = {
+            let conn = projects
+                .get(&key)
+                .unwrap()
+                .db
+                .connect_tuned()
+                .await
+                .unwrap();
+            segments::count_segments(&conn).await.unwrap()
+        };
+        assert!(
+            indexed >= 6,
+            "watcher work merged with the gate-only retry must still index the 6 fixture \
+             files, found {indexed} segments"
+        );
+
+        // And the gating episode is still over: both pieces of gate state are
+        // cleared by the populated-index pass.
+        let state = projects.get(&key).unwrap();
+        assert_eq!(
+            state.cached_gate_file_count, None,
+            "a populated-index pass must clear the cached blocked count"
+        );
+        assert_eq!(
+            state.gate_recheck_at, None,
+            "a populated-index pass must leave no recheck armed"
+        );
+    }
+
     #[tokio::test]
     async fn run_project_deregisters_deleted_directory_and_stops_spinning() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4768,6 +5126,7 @@ mod tests {
                     dirty: true,
                     pending_scope: Some(RunScope::Full),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4854,6 +5213,7 @@ mod tests {
                     dirty: true,
                     pending_scope: Some(RunScope::Full),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -4939,6 +5299,7 @@ mod tests {
                     dirty: true,
                     pending_scope: Some(pending.clone()),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -5201,6 +5562,7 @@ mod tests {
             dirty: true,
             pending_scope: Some(RunScope::Full),
             pending_fallback_reason: None,
+            pending_gate_recheck_only: false,
         }
     }
 
@@ -6757,6 +7119,7 @@ mod tests {
                     dirty: true,
                     pending_scope: Some(RunScope::Full),
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
@@ -6772,6 +7135,7 @@ mod tests {
                     dirty: false,
                     pending_scope: None,
                     pending_fallback_reason: None,
+                    pending_gate_recheck_only: false,
                 },
             ),
         );
