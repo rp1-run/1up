@@ -1520,3 +1520,44 @@ LIMIT ?{limit_param}",
         limit_param = key_count + 2,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural guarantee for the residual-prefix discrimination path: the
+    /// candidate query hands back bare ids only. Selecting `content` (or
+    /// wildcarding every column) here would silently reintroduce the
+    /// unmetered full-body hydration that ambiguous short prefixes used to
+    /// trigger outside the oneup_get response budget.
+    #[test]
+    fn prefix_discrimination_query_selects_ids_only() {
+        let sql = SELECT_SEGMENT_IDS_BY_PREFIX_FOR_CONTEXT.to_lowercase();
+        let select_clause = sql
+            .split("from")
+            .next()
+            .expect("query must have a FROM clause");
+
+        assert!(
+            !select_clause.contains("content"),
+            "prefix discrimination must never select the content column: {select_clause}"
+        );
+        assert!(
+            !select_clause.contains('*'),
+            "prefix discrimination must not wildcard the segment columns: {select_clause}"
+        );
+        let selected = select_clause
+            .trim()
+            .strip_prefix("select")
+            .expect("query must start with SELECT")
+            .trim();
+        assert_eq!(
+            selected, "id",
+            "prefix discrimination must select exactly the id column"
+        );
+        assert!(
+            sql.contains("limit ?3"),
+            "candidate scan must stay bounded by the caller-supplied limit"
+        );
+    }
+}

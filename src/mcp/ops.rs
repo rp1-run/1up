@@ -47,8 +47,7 @@ use crate::storage::schema;
 use crate::storage::segments::{
     count_embeddable_segments_for_context, count_files_for_context, count_segments_for_context,
     count_vector_rows_for_context, get_all_file_paths_for_context, get_segment_by_id_for_context,
-    get_segment_by_prefix_for_context, get_segment_ids_by_prefix_for_context,
-    get_worktree_context_head_oid, SegmentPrefixLookup, StoredSegment,
+    get_segment_ids_by_prefix_for_context, get_worktree_context_head_oid, StoredSegment,
 };
 use crate::storage::swap;
 
@@ -64,6 +63,15 @@ const MIN_HANDLE_RECOVERY_PREFIX_CHARS: usize = 8;
 /// recovery. A fetch that saturates this limit means the floor prefix is too
 /// broad to discriminate, so recovery declines rather than guess.
 const HANDLE_RECOVERY_CANDIDATE_LIMIT: usize = 32;
+
+/// Upper bound on candidate ids fetched to discriminate a residual prefix
+/// handle. Mirrors the historical `LIMIT 5` of the content-loading prefix
+/// query it replaced: enough to bound disambiguation hints while still
+/// detecting collisions beyond the first two matches.
+const PREFIX_DISCRIMINATION_CANDIDATE_LIMIT: usize = 5;
+
+/// Shared not-found text for every residual (non-exact) handle outcome.
+const SEGMENT_NOT_FOUND_MESSAGE: &str = "segment handle was not found";
 
 /// Upper bound on the bounded process-global failed-handle retry memory.
 /// Once exceeded, the oldest-recorded entry is evicted first so the memory can
@@ -2624,28 +2632,48 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
     })
 }
 
-/// Incremental exact-id segment fetcher used by
+/// Incremental segment fetcher used by
 /// [`resolve_handle_records_with_fetcher`]. Hydration fetches one exact id at
 /// a time, in the caller's handle order, and stops calling the fetcher
-/// entirely once the response budget is exhausted; the trait boundary is what
-/// lets the regression tests count the fetches that actually execute. A fetch
-/// error fails the whole call (same contract as the index-level failures in
+/// entirely once the response budget is exhausted; prefix discrimination is
+/// id-only and never loads segment content. The trait boundary is what lets
+/// the regression tests count the exact fetches and discrimination queries
+/// that actually execute. An exact-fetch error on the direct exact-id path
+/// fails the whole call (same contract as the index-level failures in
 /// [`open_current_index`]), so lock errors still `?`-propagate to
 /// `retry_on_db_lock`.
-trait ExactSegmentFetcher {
+trait SegmentFetcher {
+    /// Point lookup of one segment (the only content-bearing fetch).
     async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError>;
+
+    /// Id-only discrimination query: up to `limit` segment ids sharing
+    /// `prefix`, in id order. Deliberately never selects segment bodies, so
+    /// ambiguous or missing prefixes cost O(ids), not O(content).
+    async fn prefix_candidate_ids(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, OneupError>;
 }
 
-/// Live fetcher: one point lookup per distinct exact id, scoped to the
-/// current index context.
-struct DbExactSegmentFetcher<'a> {
+/// Live fetcher: one point lookup per distinct exact id and one id-only
+/// candidate scan per discrimination, scoped to the current index context.
+struct DbSegmentFetcher<'a> {
     conn: &'a Connection,
     context_id: &'a str,
 }
 
-impl ExactSegmentFetcher for DbExactSegmentFetcher<'_> {
+impl SegmentFetcher for DbSegmentFetcher<'_> {
     async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError> {
         get_segment_by_id_for_context(self.conn, self.context_id, id).await
+    }
+
+    async fn prefix_candidate_ids(
+        &mut self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, OneupError> {
+        get_segment_ids_by_prefix_for_context(self.conn, self.context_id, prefix, limit).await
     }
 }
 
@@ -2659,8 +2687,8 @@ async fn resolve_handle_records(
     handles: &[String],
     verbosity: Option<&str>,
 ) -> anyhow::Result<Vec<ReadRecord>> {
-    let mut fetcher = DbExactSegmentFetcher { conn, context_id };
-    resolve_handle_records_with_fetcher(conn, context_id, handles, verbosity, &mut fetcher).await
+    let mut fetcher = DbSegmentFetcher { conn, context_id };
+    resolve_handle_records_with_fetcher(handles, verbosity, &mut fetcher).await
 }
 
 /// Resolve every handle in `handles` to a [`ReadRecord`], preserving input
@@ -2680,9 +2708,13 @@ async fn resolve_handle_records(
 /// O(budget): at most the admitted records plus the single record that trips
 /// the budget are ever materialized, regardless of how many distinct
 /// near-maximum segments the batch names.
-async fn resolve_handle_records_with_fetcher<F: ExactSegmentFetcher>(
-    conn: &Connection,
-    context_id: &str,
+///
+/// Residual prefix work is bounded the same way: discrimination is id-only
+/// (never loads content), its outcome is memoized per distinct normalized
+/// handle within the call so duplicates never rerun prefix queries, and a
+/// uniquely-resolved prefix hydrates its single segment through the same
+/// budget-metered exact-id fetch as an exact handle.
+async fn resolve_handle_records_with_fetcher<F: SegmentFetcher>(
     handles: &[String],
     verbosity: Option<&str>,
     fetcher: &mut F,
@@ -2699,6 +2731,11 @@ async fn resolve_handle_records_with_fetcher<F: ExactSegmentFetcher>(
     // entry records a miss, which falls through to the prefix residual below
     // — the same per-handle path as resolving exact-then-prefix one at a time.
     let mut fetched_exact: HashMap<String, Option<StoredSegment>> = HashMap::new();
+    // Residual prefix outcomes discriminated so far, keyed by normalized
+    // handle: repeated identical prefixes replay the memoized outcome instead
+    // of re-running the discrimination queries, so a batch of duplicates costs
+    // one id-only lookup, not one per occurrence.
+    let mut residual_outcomes: HashMap<String, ResidualResolution> = HashMap::new();
     // Aggregate response budget: serialized bytes admitted so far and whether
     // a record has already been refused. Once tripped, every remaining handle
     // short-circuits to the over-budget outcome without further database work.
@@ -2726,18 +2763,15 @@ async fn resolve_handle_records_with_fetcher<F: ExactSegmentFetcher>(
             if let Some(segment) = exact {
                 read_segment(source, segment, verbosity)
             } else {
-                match resolve_handle_via_prefix(
-                    conn,
-                    context_id,
-                    source.clone(),
+                resolve_residual_prefix_record(
+                    fetcher,
+                    &mut fetched_exact,
+                    &mut residual_outcomes,
+                    source,
                     &normalized,
                     verbosity,
                 )
-                .await
-                {
-                    Ok(record) => record,
-                    Err(err) => isolate_residual_resolution_error(source, err)?,
-                }
+                .await?
             }
         };
 
@@ -2775,33 +2809,128 @@ fn isolate_residual_resolution_error(
     Ok(read_message(ReadStatus::Error, source, err.to_string()))
 }
 
-/// Residual prefix resolution for a handle that did not match an exact id:
-/// byte-identical to the prefix branch of the per-handle path, distinguishing
-/// unique matches from ambiguous prefixes via [`SegmentPrefixLookup`].
-async fn resolve_handle_via_prefix(
-    conn: &Connection,
-    context_id: &str,
+/// Outcome of id-only residual prefix discrimination for one normalized
+/// handle. Carries at most a short candidate-id list — never segment content —
+/// so a memoized outcome is O(ids) however it is replayed. `Resolved` defers
+/// hydration to the caller, which routes it through the budget-metered
+/// exact-id fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResidualResolution {
+    /// Exactly one candidate remained; hydrate this id. `recovered_from`
+    /// carries the bounded echo of the supplied handle when the resolution
+    /// came from the unique-prefix recovery gate rather than a direct prefix
+    /// match.
+    Resolved {
+        id: String,
+        recovered_from: Option<String>,
+    },
+    /// Two or more candidates share the prefix; surface the tied ids.
+    Ambiguous {
+        ids: Vec<String>,
+        message: &'static str,
+    },
+    /// No candidate matched, directly or via recovery.
+    NotFound,
+}
+
+/// Residual resolution for a handle that did not match an exact id:
+/// discriminate the prefix id-only (memoized per distinct normalized handle),
+/// then hydrate a unique match through the shared budget-metered exact-id
+/// path. Discrimination and hydration errors are isolated per handle exactly
+/// like the pre-batching per-handle prefix path (lock errors still propagate
+/// for whole-call retry).
+async fn resolve_residual_prefix_record<F: SegmentFetcher>(
+    fetcher: &mut F,
+    fetched_exact: &mut HashMap<String, Option<StoredSegment>>,
+    residual_outcomes: &mut HashMap<String, ResidualResolution>,
     source: ReadSource,
     normalized: &str,
     verbosity: Option<&str>,
 ) -> anyhow::Result<ReadRecord> {
-    Ok(
-        match get_segment_by_prefix_for_context(conn, context_id, normalized).await? {
-            SegmentPrefixLookup::Found(segment) => read_segment(source, *segment, verbosity),
-            SegmentPrefixLookup::NotFound => {
-                attempt_handle_recovery(conn, context_id, source, normalized, verbosity).await?
+    let outcome = match residual_outcomes.get(normalized) {
+        Some(cached) => cached.clone(),
+        None => match discriminate_residual_prefix(fetcher, normalized).await {
+            Ok(outcome) => {
+                residual_outcomes.insert(normalized.to_string(), outcome.clone());
+                outcome
             }
-            SegmentPrefixLookup::Ambiguous(ids) => ReadRecord {
-                status: ReadStatus::Ambiguous,
-                source,
-                segment: None,
-                context: None,
-                matching_handles: ids,
-                recovered_from: None,
-                message: Some("segment handle matched multiple indexed segments".to_string()),
-            },
+            Err(err) => return isolate_residual_resolution_error(source, err.into()),
         },
-    )
+    };
+
+    Ok(match outcome {
+        ResidualResolution::NotFound => {
+            read_message(ReadStatus::NotFound, source, SEGMENT_NOT_FOUND_MESSAGE)
+        }
+        ResidualResolution::Ambiguous { ids, message } => ReadRecord {
+            status: ReadStatus::Ambiguous,
+            source,
+            segment: None,
+            context: None,
+            matching_handles: ids,
+            recovered_from: None,
+            message: Some(message.to_string()),
+        },
+        ResidualResolution::Resolved { id, recovered_from } => {
+            // Hydrate through the same fetched map as exact handles: one
+            // content fetch per distinct id, shared with exact-id duplicates,
+            // and metered by the caller's response budget like any other
+            // content-bearing record.
+            let hydrated = match fetched_exact.get(&id) {
+                Some(cached) => cached.clone(),
+                None => match fetcher.fetch_exact(&id).await {
+                    Ok(fetched) => {
+                        fetched_exact.insert(id.clone(), fetched.clone());
+                        fetched
+                    }
+                    Err(err) => {
+                        return isolate_residual_resolution_error(source, err.into());
+                    }
+                },
+            };
+            match hydrated {
+                Some(segment) => match recovered_from {
+                    Some(echo) => read_recovered_segment(source, segment, verbosity, echo),
+                    None => read_segment(source, segment, verbosity),
+                },
+                // The discriminated id vanished before hydration (e.g. a
+                // concurrent rebuild); stay truthful.
+                None => read_message(ReadStatus::NotFound, source, SEGMENT_NOT_FOUND_MESSAGE),
+            }
+        }
+    })
+}
+
+/// Id-only discrimination of a residual prefix handle. Fetches up to
+/// [`PREFIX_DISCRIMINATION_CANDIDATE_LIMIT`] candidate ids sharing the full
+/// normalized handle; a lone candidate resolves, two or more are ambiguous,
+/// and none falls through to the unique-prefix recovery gate at the floor
+/// prefix. No segment content is ever loaded here — hydration of a resolved
+/// id belongs to the caller's budget-metered fetch.
+async fn discriminate_residual_prefix<F: SegmentFetcher>(
+    fetcher: &mut F,
+    normalized: &str,
+) -> Result<ResidualResolution, OneupError> {
+    let candidates = fetcher
+        .prefix_candidate_ids(normalized, PREFIX_DISCRIMINATION_CANDIDATE_LIMIT)
+        .await?;
+    match candidates.len() {
+        1 => {
+            return Ok(ResidualResolution::Resolved {
+                id: candidates.into_iter().next().unwrap(),
+                recovered_from: None,
+            });
+        }
+        n if n >= 2 => {
+            return Ok(ResidualResolution::Ambiguous {
+                ids: candidates,
+                message: "segment handle matched multiple indexed segments",
+            });
+        }
+        _ => {}
+    }
+
+    attempt_handle_recovery(fetcher, normalized).await
 }
 
 /// Outcome of the pure unique-prefix recovery gate. `candidates` are the
@@ -2822,21 +2951,17 @@ enum HandleRecovery {
 /// Fetches the context-scoped candidate ids sharing the floor prefix
 /// (`supplied[..MIN_HANDLE_RECOVERY_PREFIX_CHARS]`, bounded by
 /// [`HANDLE_RECOVERY_CANDIDATE_LIMIT`]) and runs the pure recovery gate. A
-/// unique longest-prefix candidate is re-fetched by its exact id and returned
-/// as a `Found` record disclosing `recovered_from`; a tie yields an explicit
-/// `Ambiguous` record; anything else stays `NotFound`. Context scoping is
-/// inherited from the storage query, so a foreign-context handle can never be
-/// recovered. A candidate fetch that saturates the limit means
-/// the floor prefix is too broad to discriminate, so recovery declines.
-async fn attempt_handle_recovery(
-    conn: &Connection,
-    context_id: &str,
-    source: ReadSource,
+/// unique longest-prefix candidate resolves — disclosing `recovered_from` —
+/// and is hydrated later through the caller's budget-metered exact-id fetch;
+/// a tie yields an explicit `Ambiguous` outcome; anything else stays
+/// `NotFound`. Context scoping is inherited from the fetcher's storage query,
+/// so a foreign-context handle can never be recovered. A candidate fetch that
+/// saturates the limit means the floor prefix is too broad to discriminate,
+/// so recovery declines.
+async fn attempt_handle_recovery<F: SegmentFetcher>(
+    fetcher: &mut F,
     normalized: &str,
-    verbosity: Option<&str>,
-) -> anyhow::Result<ReadRecord> {
-    const NOT_FOUND_MESSAGE: &str = "segment handle was not found";
-
+) -> Result<ResidualResolution, OneupError> {
     // Below the floor there are not enough characters to discriminate, so a
     // floor prefix cannot even be formed; decline without querying.
     let floor_prefix: String = normalized
@@ -2844,67 +2969,33 @@ async fn attempt_handle_recovery(
         .take(MIN_HANDLE_RECOVERY_PREFIX_CHARS)
         .collect();
     if floor_prefix.chars().count() < MIN_HANDLE_RECOVERY_PREFIX_CHARS {
-        return Ok(read_message(
-            ReadStatus::NotFound,
-            source,
-            NOT_FOUND_MESSAGE,
-        ));
+        return Ok(ResidualResolution::NotFound);
     }
 
-    let candidates = get_segment_ids_by_prefix_for_context(
-        conn,
-        context_id,
-        &floor_prefix,
-        HANDLE_RECOVERY_CANDIDATE_LIMIT,
-    )
-    .await?;
+    let candidates = fetcher
+        .prefix_candidate_ids(&floor_prefix, HANDLE_RECOVERY_CANDIDATE_LIMIT)
+        .await?;
 
     // A saturated fetch means the floor prefix matches too many segments to
     // treat any single one as a unique recovery target.
     if candidates.len() >= HANDLE_RECOVERY_CANDIDATE_LIMIT {
-        return Ok(read_message(
-            ReadStatus::NotFound,
-            source,
-            NOT_FOUND_MESSAGE,
-        ));
+        return Ok(ResidualResolution::NotFound);
     }
 
-    match recover_handle_by_unique_prefix(normalized, &candidates) {
-        HandleRecovery::Found(id) => {
-            match get_segment_by_id_for_context(conn, context_id, &id).await? {
-                Some(segment) => Ok(read_recovered_segment(
-                    source,
-                    segment,
-                    verbosity,
-                    truncate_handle_echo(normalized),
-                )),
-                // The candidate id vanished between the id fetch and the
-                // re-fetch (e.g. a concurrent rebuild); stay truthful.
-                None => Ok(read_message(
-                    ReadStatus::NotFound,
-                    source,
-                    NOT_FOUND_MESSAGE,
-                )),
-            }
-        }
-        HandleRecovery::Ambiguous(ids) => Ok(ReadRecord {
-            status: ReadStatus::Ambiguous,
-            source,
-            segment: None,
-            context: None,
-            matching_handles: ids,
-            recovered_from: None,
-            message: Some(
-                "segment handle prefix matched multiple indexed segments in the active context"
-                    .to_string(),
-            ),
-        }),
-        HandleRecovery::None => Ok(read_message(
-            ReadStatus::NotFound,
-            source,
-            NOT_FOUND_MESSAGE,
-        )),
-    }
+    Ok(
+        match recover_handle_by_unique_prefix(normalized, &candidates) {
+            HandleRecovery::Found(id) => ResidualResolution::Resolved {
+                id,
+                recovered_from: Some(truncate_handle_echo(normalized)),
+            },
+            HandleRecovery::Ambiguous(ids) => ResidualResolution::Ambiguous {
+                ids,
+                message:
+                    "segment handle prefix matched multiple indexed segments in the active context",
+            },
+            HandleRecovery::None => ResidualResolution::NotFound,
+        },
+    )
 }
 
 /// Pure longest-common-prefix recovery gate. Walks prefix lengths
@@ -6125,20 +6216,53 @@ mod tests {
         );
     }
 
-    /// Test fetcher: delegates to the live single-id lookup while counting
-    /// how many exact-segment fetches actually execute, which is what lets
-    /// the budget regressions below assert that fetch work — not just the
-    /// response envelope — stops once the budget is exhausted.
-    struct CountingExactFetcher<'a> {
+    /// Test fetcher: delegates to the live lookups while counting how many
+    /// exact-segment fetches, content-bearing hits, and id-only prefix
+    /// discrimination queries actually execute. This is what lets the budget
+    /// regressions below assert that fetch work — not just the response
+    /// envelope — stops once the budget is exhausted, and that prefix
+    /// discrimination never loads segment bodies.
+    struct CountingSegmentFetcher<'a> {
         conn: &'a Connection,
         context_id: &'a str,
+        /// Exact-id point lookups executed (hits and misses).
         fetches: usize,
+        /// Exact-id lookups that returned a segment body: the only way any
+        /// content can ever be read from the database.
+        content_fetches: usize,
+        /// Id-only prefix discrimination queries executed.
+        prefix_queries: usize,
     }
 
-    impl ExactSegmentFetcher for CountingExactFetcher<'_> {
+    impl<'a> CountingSegmentFetcher<'a> {
+        fn new(conn: &'a Connection, context_id: &'a str) -> Self {
+            Self {
+                conn,
+                context_id,
+                fetches: 0,
+                content_fetches: 0,
+                prefix_queries: 0,
+            }
+        }
+    }
+
+    impl SegmentFetcher for CountingSegmentFetcher<'_> {
         async fn fetch_exact(&mut self, id: &str) -> Result<Option<StoredSegment>, OneupError> {
             self.fetches += 1;
-            get_segment_by_id_for_context(self.conn, self.context_id, id).await
+            let fetched = get_segment_by_id_for_context(self.conn, self.context_id, id).await?;
+            if fetched.is_some() {
+                self.content_fetches += 1;
+            }
+            Ok(fetched)
+        }
+
+        async fn prefix_candidate_ids(
+            &mut self,
+            prefix: &str,
+            limit: usize,
+        ) -> Result<Vec<String>, OneupError> {
+            self.prefix_queries += 1;
+            get_segment_ids_by_prefix_for_context(self.conn, self.context_id, prefix, limit).await
         }
     }
 
@@ -6172,12 +6296,8 @@ mod tests {
         }
 
         let handles: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-        let mut fetcher = CountingExactFetcher {
-            conn: &conn,
-            context_id: ctx,
-            fetches: 0,
-        };
-        let records = resolve_handle_records_with_fetcher(&conn, ctx, &handles, None, &mut fetcher)
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
             .await
             .unwrap();
 
@@ -6230,12 +6350,8 @@ mod tests {
             .unwrap();
 
         let handles = vec![id.to_string(); 3];
-        let mut fetcher = CountingExactFetcher {
-            conn: &conn,
-            context_id: ctx,
-            fetches: 0,
-        };
-        let records = resolve_handle_records_with_fetcher(&conn, ctx, &handles, None, &mut fetcher)
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
             .await
             .unwrap();
 
@@ -6248,6 +6364,243 @@ mod tests {
         assert_eq!(
             fetcher.fetches, 1,
             "duplicate handles must hydrate from the already-fetched map"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_ambiguous_prefixes_discriminate_once_id_only() {
+        // Regression for the residual-prefix amplification gap: each
+        // occurrence of the same ambiguous prefix used to rerun a
+        // full-content prefix query (up to five near-limit segment bodies)
+        // while returning only a tiny Ambiguous record, so a batch of 50
+        // duplicates performed ~O(batch * 5 * segment) database work that the
+        // response budget never saw. Discrimination must be id-only and
+        // memoized: one discrimination query for the whole batch, zero
+        // content-bearing fetches.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-ambiguous-dup";
+        for (id, file) in [
+            ("aaaa1111bbbb2222", "src/a.rs"),
+            ("aaaa1111cccc3333", "src/b.rs"),
+        ] {
+            let mut segment = test_segment(id, file);
+            segment.content = "x".repeat(900 * 1024);
+            segments::upsert_segment_for_context(&conn, ctx, &segment)
+                .await
+                .unwrap();
+        }
+
+        let handles = vec!["aaaa1111".to_string(); MAX_GET_HANDLES_PER_CALL];
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), MAX_GET_HANDLES_PER_CALL);
+        assert!(
+            records.iter().all(|record| {
+                record.status == ReadStatus::Ambiguous
+                    && record.segment.is_none()
+                    && record.matching_handles.len() == 2
+            }),
+            "every duplicate keeps its independent Ambiguous outcome with the tied ids"
+        );
+        assert_eq!(
+            fetcher.prefix_queries, 1,
+            "identical ambiguous prefixes must share one memoized id-only discrimination"
+        );
+        assert_eq!(
+            fetcher.content_fetches, 0,
+            "discriminating an ambiguous prefix must never load segment content"
+        );
+        assert_eq!(
+            fetcher.fetches, 1,
+            "the exact-id miss probe is memoized too: one point lookup for the whole batch"
+        );
+
+        let envelope = serde_json::to_vec(&records).unwrap();
+        assert!(
+            envelope.len() < 64 * 1024,
+            "ambiguous outcomes must stay tiny; got {} bytes",
+            envelope.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_ambiguous_prefixes_discriminate_once_each_id_only() {
+        // Distinct ambiguous prefixes cannot share a memo entry, but each must
+        // still cost exactly one id-only discrimination query and zero
+        // content-bearing fetches, however often it repeats.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-ambiguous-distinct";
+        for (id, file) in [
+            ("aaaa1111bbbb2222", "src/a.rs"),
+            ("aaaa1111cccc3333", "src/b.rs"),
+            ("bbbb2222dddd4444", "src/c.rs"),
+            ("bbbb2222eeee5555", "src/d.rs"),
+        ] {
+            let mut segment = test_segment(id, file);
+            segment.content = "x".repeat(900 * 1024);
+            segments::upsert_segment_for_context(&conn, ctx, &segment)
+                .await
+                .unwrap();
+        }
+
+        let handles: Vec<String> = ["aaaa1111", "bbbb2222"]
+            .iter()
+            .cycle()
+            .take(20)
+            .map(|prefix| prefix.to_string())
+            .collect();
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == ReadStatus::Ambiguous),
+            "every occurrence keeps its independent Ambiguous outcome"
+        );
+        assert_eq!(
+            fetcher.prefix_queries, 2,
+            "one id-only discrimination per distinct ambiguous prefix"
+        );
+        assert_eq!(
+            fetcher.content_fetches, 0,
+            "no ambiguous prefix may ever load segment content"
+        );
+        assert_eq!(
+            fetcher.fetches, 2,
+            "one memoized exact-id miss probe per distinct prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_residual_prefixes_memoize_within_call() {
+        // Every residual outcome memoizes, not just the ambiguous one: a
+        // unique prefix discriminates once and hydrates once (shared with the
+        // exact-id map), and a not-found handle runs its discrimination +
+        // recovery queries once for the whole batch.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-residual-memo";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment("dddd4444eeee5555", "src/u.rs"),
+        )
+        .await
+        .unwrap();
+
+        let handles = vec![
+            "dddd4444eeee".to_string(),     // unique 12-char prefix -> Found
+            "dddd4444eeee".to_string(),     // duplicate -> memoized + shared hydration
+            "zzzznotfound0000".to_string(), // full id, no row -> NotFound
+            "zzzznotfound0000".to_string(), // duplicate -> memoized NotFound
+        ];
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        let statuses: Vec<ReadStatus> = records.iter().map(|record| record.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::NotFound,
+                ReadStatus::NotFound,
+            ]
+        );
+        // Unique prefix: 1 discrimination. Not-found handle: 1 discrimination
+        // + 1 recovery floor scan. Duplicates add nothing.
+        assert_eq!(
+            fetcher.prefix_queries, 3,
+            "residual outcomes must memoize per distinct handle within the call"
+        );
+        // Unique prefix: 1 miss probe + 1 hydration. Not-found: 1 miss probe.
+        assert_eq!(fetcher.fetches, 3);
+        assert_eq!(
+            fetcher.content_fetches, 1,
+            "the resolved segment hydrates exactly once for both duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_prefix_hydration_is_metered_by_response_budget() {
+        // A unique prefix resolves to an id and then hydrates through the
+        // same incremental fetch as an exact handle, so its content counts
+        // toward MAX_GET_RESPONSE_BYTES and — once the budget trips — later
+        // prefix handles are refused without any further discrimination or
+        // fetch work.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-prefix-budget";
+        let ids = [
+            "aaaa0000aaaa0000",
+            "bbbb1111bbbb1111",
+            "cccc2222cccc2222",
+            "dddd3333dddd3333",
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            let mut segment = test_segment(id, &format!("src/big{index}.rs"));
+            segment.content = "x".repeat(900 * 1024);
+            segments::upsert_segment_for_context(&conn, ctx, &segment)
+                .await
+                .unwrap();
+        }
+
+        // 12-char display handles: each misses the exact path and resolves
+        // via a unique prefix.
+        let handles: Vec<String> = ids.iter().map(|id| id[..12].to_string()).collect();
+        let mut fetcher = CountingSegmentFetcher::new(&conn, ctx);
+        let records = resolve_handle_records_with_fetcher(&handles, None, &mut fetcher)
+            .await
+            .unwrap();
+
+        let statuses: Vec<ReadStatus> = records.iter().map(|record| record.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::Rejected,
+                ReadStatus::Rejected,
+            ],
+            "prefix-hydrated content is metered exactly like exact-id content"
+        );
+        assert_eq!(
+            records[0].segment.as_ref().unwrap().content.len(),
+            900 * 1024,
+            "admitted prefix-resolved records carry their full content"
+        );
+        // Handles 1-3 each cost one discrimination, one exact-miss probe, and
+        // one hydration; the handle after the budget trip costs nothing.
+        assert_eq!(
+            fetcher.prefix_queries, 3,
+            "no discrimination may run after the budget trips"
+        );
+        assert_eq!(fetcher.content_fetches, 3);
+        assert_eq!(fetcher.fetches, 6);
+
+        let envelope = serde_json::to_vec(&records).unwrap();
+        assert!(
+            envelope.len() <= MAX_GET_RESPONSE_BYTES,
+            "the serialized batch must stay within the response budget, got {} bytes",
+            envelope.len()
         );
     }
 
@@ -6724,36 +7077,20 @@ mod tests {
         );
     }
 
-    /// Per-item baseline (relocated from the pre-batching `resolve_handle_record`):
-    /// resolve one handle by exact id, then by prefix. The batched
-    /// `resolve_handle_records` must match this field-for-field.
+    /// Per-item baseline: resolve one handle through a batch of exactly one,
+    /// so no within-call memoization or budget state can carry over between
+    /// handles. The batched `resolve_handle_records` must match this
+    /// field-for-field — that is the "each handle resolves independently"
+    /// contract.
     async fn resolve_handle_record_per_item(
         conn: &Connection,
         context_id: &str,
         raw_handle: &str,
         verbosity: Option<&str>,
     ) -> anyhow::Result<ReadRecord> {
-        use crate::storage::segments::get_segment_by_id_for_context;
-
-        let normalized = normalize_handle(raw_handle);
-        let source = ReadSource::Handle {
-            raw: raw_handle.to_string(),
-            normalized: normalized.clone(),
-        };
-
-        if normalized.is_empty() {
-            return Ok(read_message(
-                ReadStatus::NotFound,
-                source,
-                "empty segment handle",
-            ));
-        }
-
-        if let Some(segment) = get_segment_by_id_for_context(conn, context_id, &normalized).await? {
-            return Ok(read_segment(source, segment, verbosity));
-        }
-
-        resolve_handle_via_prefix(conn, context_id, source, &normalized, verbosity).await
+        let records =
+            resolve_handle_records(conn, context_id, &[raw_handle.to_string()], verbosity).await?;
+        Ok(records.into_iter().next().expect("one handle, one record"))
     }
 
     fn test_segment(id: &str, file_path: &str) -> SegmentInsert {
