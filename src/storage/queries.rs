@@ -899,32 +899,6 @@ WHERE context_id = ?1
 ORDER BY id
 LIMIT ?3";
 
-/// Build the exact-id batch-fetch statement for `id_count` segment ids within
-/// one context. Selects the same columns in the same order as
-/// [`SELECT_SEGMENT_BY_ID_FOR_CONTEXT`], so a batched fetch returns rows
-/// byte-identical to issuing `id_count` individual id lookups.
-/// Params: `?1` context id, `?2..?(id_count + 1)` segment ids.
-pub fn select_segments_by_ids_for_context_sql(id_count: usize) -> String {
-    let mut id_placeholders = String::new();
-    for index in 0..id_count {
-        if index > 0 {
-            id_placeholders.push_str(", ");
-        }
-        write!(id_placeholders, "?{}", index + 2).expect("write to String cannot fail");
-    }
-
-    format!(
-        "SELECT id, file_path, language, block_type, content,
-       line_start, line_end, breadcrumb, complexity, role,
-       defined_symbols, referenced_symbols, called_symbols, file_hash,
-       created_at, updated_at
-FROM segments
-WHERE context_id = ?1
-  AND id IN ({ids})",
-        ids = id_placeholders,
-    )
-}
-
 pub const UPSERT_META: &str = "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)";
 
 pub const SELECT_META: &str = "SELECT value FROM meta WHERE key = ?1";
@@ -1545,4 +1519,45 @@ LIMIT ?{limit_param}",
         keys = key_placeholders,
         limit_param = key_count + 2,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural guarantee for the residual-prefix discrimination path: the
+    /// candidate query hands back bare ids only. Selecting `content` (or
+    /// wildcarding every column) here would silently reintroduce the
+    /// unmetered full-body hydration that ambiguous short prefixes used to
+    /// trigger outside the oneup_get response budget.
+    #[test]
+    fn prefix_discrimination_query_selects_ids_only() {
+        let sql = SELECT_SEGMENT_IDS_BY_PREFIX_FOR_CONTEXT.to_lowercase();
+        let select_clause = sql
+            .split("from")
+            .next()
+            .expect("query must have a FROM clause");
+
+        assert!(
+            !select_clause.contains("content"),
+            "prefix discrimination must never select the content column: {select_clause}"
+        );
+        assert!(
+            !select_clause.contains('*'),
+            "prefix discrimination must not wildcard the segment columns: {select_clause}"
+        );
+        let selected = select_clause
+            .trim()
+            .strip_prefix("select")
+            .expect("query must start with SELECT")
+            .trim();
+        assert_eq!(
+            selected, "id",
+            "prefix discrimination must select exactly the id column"
+        );
+        assert!(
+            sql.contains("limit ?3"),
+            "candidate scan must stay bounded by the caller-supplied limit"
+        );
+    }
 }

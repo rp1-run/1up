@@ -208,7 +208,7 @@ impl OneupMcpServer {
 
     #[tool(
         name = "oneup_get",
-        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Use before answering, citing, or editing discovered code. Reading code needs no verbosity argument: the default returns the complete source once in structured data, not mirrored in the text summary, alongside constant-size symbol counts and a ready-to-issue oneup_symbol call when you need the full symbol lists.",
+        description = "Hydrate selected code segments from oneup_search or oneup_symbol handles. Passing 2-4 selected handles per call is the norm: each handle reports an independent, ordered outcome so one bad handle never fails the rest. Capped at 50 handles and 16KiB of aggregate handle bytes per call; split a larger batch across multiple calls. Hydrated content is metered against a 2MiB response budget in input order: handles past the budget return a structured over-budget outcome instead of content — re-request exactly those handles in a smaller batch. Use before answering, citing, or editing discovered code. Reading code needs no verbosity argument: the default returns the complete source once in structured data, not mirrored in the text summary, alongside constant-size symbol counts and a ready-to-issue oneup_symbol call when you need the full symbol lists.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope>().unwrap(),
         annotations(title = "Get Code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -223,6 +223,11 @@ impl OneupMcpServer {
                     None,
                 )],
             );
+        }
+        // Shared request gate (handle count + aggregate handle bytes) so the
+        // structured error and the ops-layer defense-in-depth stay single-source.
+        if let Err(message) = ops::check_get_handles_cap(&input.handles) {
+            return error_result("error", message, vec![]);
         }
         let roots = match self.roots(input.path.as_deref()) {
             Ok(roots) => roots,
