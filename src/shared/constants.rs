@@ -538,12 +538,19 @@ pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
 /// full tree — the cache exists because a large gated monorepo can emit a
 /// dirty signal per filesystem event, and a full-tree walk per event pins a
 /// core (observed ~13 walks in 2 minutes on a 186k-file repo). Once the TTL
-/// elapses, the next dirty signal re-walks, so a repository that has shrunk
+/// elapses, the next gate pass re-walks, so a repository that has shrunk
 /// below the threshold (files deleted, ignore rules tightened) is unblocked
-/// within one TTL instead of staying gated until a SIGHUP. 60s bounds that
-/// worst-case unblock latency to about a minute while still collapsing
-/// event storms — which arrive on second timescales — into one walk per
-/// window.
+/// shortly after the TTL instead of staying gated until a SIGHUP.
+///
+/// Expiry does not wait for a new filesystem event: a gated pass served from
+/// the within-TTL cache consumes the dirty run that triggered it, so it arms a
+/// recheck deadline (`ProjectState::gate_recheck_at`) at the entry's expiry,
+/// and the daemon's existing periodic tick re-marks the project dirty at that
+/// deadline. Worst-case unblock latency for a repository that becomes eligible
+/// is therefore ≈ this TTL + one tick ([`WATCHER_DEBOUNCE_MS`]), with no
+/// external event required. 60s bounds that latency to about a minute while
+/// still collapsing event storms — which arrive on second timescales — into
+/// one walk per window.
 pub const FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS: u64 = 60_000;
 
 /// Test-only knob: milliseconds to sleep periodically during the daemon's
