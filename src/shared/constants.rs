@@ -529,6 +529,23 @@ pub const FILE_COUNT_THRESHOLD: usize = 3_000;
 /// Environment variable to override the file count threshold for monorepo facts envelope.
 pub const FILE_COUNT_THRESHOLD_ENV_VAR: &str = "ONEUP_FILE_COUNT_THRESHOLD";
 
+/// TTL (milliseconds) for the daemon first-index gate's cached blocked file count.
+///
+/// The daemon caches a gate walk's file count only when the walk left the
+/// project gated (over [`FILE_COUNT_THRESHOLD`]); allowed decisions are never
+/// cached, so an admission is always backed by a fresh walk. Within this TTL a
+/// gate re-check reuses the cached blocked count instead of re-walking the
+/// full tree — the cache exists because a large gated monorepo can emit a
+/// dirty signal per filesystem event, and a full-tree walk per event pins a
+/// core (observed ~13 walks in 2 minutes on a 186k-file repo). Once the TTL
+/// elapses, the next dirty signal re-walks, so a repository that has shrunk
+/// below the threshold (files deleted, ignore rules tightened) is unblocked
+/// within one TTL instead of staying gated until a SIGHUP. 60s bounds that
+/// worst-case unblock latency to about a minute while still collapsing
+/// event storms — which arrive on second timescales — into one walk per
+/// window.
+pub const FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS: u64 = 60_000;
+
 /// Test-only knob: milliseconds to sleep periodically during the daemon's
 /// gitignore-aware first-index gate walk, holding the walk open so a test can
 /// deliver SIGTERM mid-walk and assert cooperative cancellation.

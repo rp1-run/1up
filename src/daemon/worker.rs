@@ -111,23 +111,35 @@ struct ProjectState {
     /// into the vector stage's large-corpus latency warning and diagnostics.
     cached_vector_count: Option<usize>,
     /// Cached result of the first-index gate's gitignore-aware file-count walk
-    /// (see [`count_files_gitignore_aware`]), populated the first time this
-    /// project's dirty-signal pass runs the gate while `is_first_index` holds.
-    /// While a project stays gated (over-threshold, unscoped, no indexed
-    /// content), every subsequent dirty signal re-enters the same gate check;
+    /// (see [`count_files_gitignore_aware`]) — the count plus the [`Instant`]
+    /// it was captured — stored ONLY when the walk observed an over-threshold
+    /// (blocked) count. While a project stays gated (over-threshold, unscoped,
+    /// no indexed content), every dirty signal re-enters the same gate check;
     /// without this cache each one repeats a full-tree walk, pinning a core on
     /// a large gated monorepo that keeps producing filesystem events.
     ///
-    /// Invalidation policy: cleared to `None` only on a registry reload
-    /// (SIGHUP, `reload_projects`) — the only event that can change the
-    /// project's scope/registry state while it stays gated between dirty
-    /// signals (e.g. an operator applies `--scope` out of band and reloads).
-    /// No wall-clock TTL is needed: a dirty signal alone cannot change
-    /// whether the repo is over threshold, so re-walking on every signal buys
-    /// nothing but CPU. Once the gate opens (scope recorded or content
-    /// indexed), `is_first_index` goes false and this cache is simply no
-    /// longer consulted.
-    cached_gate_file_count: Option<usize>,
+    /// Invalidation policy (three rules; enforced at the gate call site in
+    /// [`run_project`]):
+    /// - **Allowed decisions are never cached.** A fresh walk that lands
+    ///   at/under the threshold opens the gate and clears any stored entry,
+    ///   so an unscoped first index is always admitted by a fresh walk —
+    ///   a stale low count can never admit an oversized repository.
+    /// - **Blocked counts expire after
+    ///   [`crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS`].**
+    ///   A gate re-check within the TTL reuses the entry without a walk;
+    ///   once it lapses, the next dirty signal re-walks, so a repository
+    ///   that has become eligible (files deleted, ignore rules tightened)
+    ///   is unblocked within one TTL rather than staying gated forever.
+    /// - **A registry reload (SIGHUP, [`reload_projects`]) clears the entry
+    ///   immediately** — a reload can change the project's scope/registry
+    ///   state while it stays gated (e.g. an operator applies `--scope` out
+    ///   of band and reloads).
+    ///
+    /// Deliberately NOT invalidated on every dirty signal: that would
+    /// reinstate the per-event full-tree walk this cache exists to prevent.
+    /// Once the gate opens (scope recorded or content indexed),
+    /// `is_first_index` goes false and this cache is no longer consulted.
+    cached_gate_file_count: Option<(usize, std::time::Instant)>,
     /// One reused tuned read [`Connection`] to the open index, serving repeated
     /// daemon searches without a fresh per-request `connect()` + PRAGMA pass.
     /// Created lazily on the first search and dropped (`None`) whenever
@@ -1417,12 +1429,13 @@ async fn reload_projects(
     for entry in &registry.projects {
         let context_id = entry.context_id();
         if let Some(existing) = projects.get_mut(&context_id) {
-            // A registry reload is the only event that can change scope/registry
-            // state while a project stays gated between dirty signals (e.g. an
-            // operator applies `--scope` out of band and sends SIGHUP), so it is
-            // the sanctioned invalidation point for the gate's cached file
-            // count. See `ProjectState::cached_gate_file_count` for the full
-            // invalidation policy.
+            // A registry reload can change scope/registry state while a project
+            // stays gated between dirty signals (e.g. an operator applies
+            // `--scope` out of band and sends SIGHUP), so it clears the gate's
+            // cached blocked file count immediately — without waiting for the
+            // TTL that otherwise bounds the entry's lifetime. See
+            // `ProjectState::cached_gate_file_count` for the full invalidation
+            // policy (allowed-never-cached, blocked-TTL, SIGHUP).
             existing.cached_gate_file_count = None;
             let entry_context = context_from_entry(entry);
             let branch_changed = branch_context_changed(&existing.context, &entry_context);
@@ -2625,7 +2638,7 @@ async fn run_project(
         // Snapshot the roots and first-index decision as owned values so the
         // immutable borrow of `projects` ends before the (cancellable) gate walk
         // and the `get_mut` used on the abort path below.
-        let (state_root, source_root, is_first_index, cached_gate_file_count) = {
+        let (state_root, source_root, is_first_index, cached_blocked_count) = {
             let state = projects
                 .get(context_id)
                 .expect("dirty project must exist while gating");
@@ -2637,11 +2650,24 @@ async fn run_project(
                 let conn = state.db.connect_tuned().await?;
                 segments::count_segments(&conn).await.unwrap_or(0) == 0
             };
+            // Only a still-fresh (within-TTL) cached BLOCKED count is eligible
+            // for reuse; an expired entry is ignored here so the gate below
+            // re-walks and re-decides against the current tree. See
+            // `ProjectState::cached_gate_file_count`.
+            let cached_blocked_count =
+                state
+                    .cached_gate_file_count
+                    .and_then(|(count, captured_at)| {
+                        let ttl = std::time::Duration::from_millis(
+                            crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS,
+                        );
+                        (captured_at.elapsed() < ttl).then_some(count)
+                    });
             (
                 state.project_root.clone(),
                 state.source_root.clone(),
                 is_first_index,
-                state.cached_gate_file_count,
+                cached_blocked_count,
             )
         };
 
@@ -2652,11 +2678,13 @@ async fn run_project(
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .unwrap_or(crate::shared::constants::FILE_COUNT_THRESHOLD);
 
-            // Reuse the cached gate file count while this project stays gated
-            // between dirty signals instead of re-walking the full tree on every
-            // one (see `ProjectState::cached_gate_file_count`). Only a registry
-            // reload (SIGHUP) clears it.
-            let file_count = if let Some(cached) = cached_gate_file_count {
+            // Cache policy (see `ProjectState::cached_gate_file_count`):
+            // reuse a still-fresh (within-TTL) cached BLOCKED count instead of
+            // re-walking the full tree on every dirty signal. Allowed
+            // decisions are never served from cache — the gate can only open
+            // on a count produced by the fresh walk below — and the entry is
+            // also cleared eagerly by a registry reload (SIGHUP).
+            let file_count = if let Some(cached) = cached_blocked_count {
                 cached
             } else {
                 // Run the gate walk in spawn_blocking so the async executor stays
@@ -2689,7 +2717,18 @@ async fn run_project(
                         let state = projects
                             .get_mut(context_id)
                             .expect("dirty project must exist while caching a completed gate walk");
-                        state.cached_gate_file_count = Some(count);
+                        if count > threshold {
+                            // Over threshold: cache the blocked count with its
+                            // capture time so dirty signals within the TTL skip
+                            // the re-walk while the project stays gated.
+                            state.cached_gate_file_count = Some((count, std::time::Instant::now()));
+                        } else {
+                            // At/under threshold: the gate opens on this fresh
+                            // walk. NEVER cache an allowed decision — and drop
+                            // any stale blocked entry — so an unscoped first
+                            // index can only ever be admitted by a fresh walk.
+                            state.cached_gate_file_count = None;
+                        }
                         count
                     }
                     Err(e) => {
@@ -4014,11 +4053,11 @@ mod tests {
         // A gated (over-threshold, unscoped, empty-index) project keeps
         // receiving dirty signals from filesystem events while it stays
         // gated. Before this fix each signal re-ran the full-tree gate walk;
-        // now the first walk's result is cached on `ProjectState` and reused
-        // until a registry reload. Prove no re-walk by growing the fixture
-        // between two passes and asserting the SECOND pass still reports the
-        // file count observed by the FIRST — a fresh walk would see the new
-        // files and the cache would no longer match.
+        // now the first walk's BLOCKED result is cached on `ProjectState` and
+        // reused while it stays within its TTL. Prove no re-walk by growing
+        // the fixture between two passes and asserting the SECOND pass still
+        // holds the exact entry stored by the FIRST — a fresh walk would see
+        // the new files and re-store a different count and capture time.
         let _env_lock = crate::shared::fs::ENV_MUTEX
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -4065,16 +4104,17 @@ mod tests {
         // `ensure_secure_project_root`/`schema::initialize` also create a
         // `.1up/` state directory in the fixture, so the true walked count
         // includes those files, not just the 6 `.rs` fixtures written above.
-        // Capture whatever the first walk actually observed rather than
-        // hardcoding it, then prove the second pass reuses exactly that value.
+        // Capture whatever the first walk actually stored rather than
+        // hardcoding it, then prove the second pass reuses exactly that entry.
         let cached_after_first = projects
             .get(&key)
             .unwrap()
             .cached_gate_file_count
-            .expect("the gate walk must cache the observed file count");
+            .expect("a blocked gate walk must cache the observed file count");
         assert!(
-            cached_after_first >= 6,
-            "the cached count must include at least the 6 fixture files, got {cached_after_first}"
+            cached_after_first.0 >= 6,
+            "the cached count must include at least the 6 fixture files, got {}",
+            cached_after_first.0
         );
 
         // Grow the fixture past what was cached. A re-walk would see more files.
@@ -4108,8 +4148,222 @@ mod tests {
         assert_eq!(
             projects.get(&key).unwrap().cached_gate_file_count,
             Some(cached_after_first),
-            "a second dirty-signal pass while gated must reuse the cached count, not re-walk \
-             (a fresh walk would have observed the 3 files added after the first pass)"
+            "a second dirty-signal pass within the TTL must reuse the cached blocked entry, \
+             not re-walk (a fresh walk would have observed the 3 files added after the first \
+             pass and re-stamped the capture time)"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn expired_blocked_gate_count_triggers_fresh_walk() {
+        // A cached blocked count bounds staleness with a TTL: a repository
+        // that keeps a stale over-threshold entry forever would stay gated
+        // even after it becomes eligible. Backdate the stored capture time
+        // past the TTL (no sleeping) and prove the next dirty-signal pass
+        // re-walks: the fresh walk observes the files added after the first
+        // pass and re-stores the NEW count.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard =
+            EnvVarsGuard::new(&[crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR]);
+        std::env::set_var(crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR, "3");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let db = seeded_project_db(&root).await;
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(&root, &root, db, dirty_full_run_state()),
+        );
+
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+
+        let first = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "an over-threshold first-index pass stays gated (idle, Ok), got {first:?}"
+        );
+        let (first_count, _) = projects
+            .get(&key)
+            .unwrap()
+            .cached_gate_file_count
+            .expect("a blocked gate walk must cache the observed file count");
+
+        // Grow the fixture so a fresh walk observes a strictly larger count,
+        // then backdate the stored capture time past the TTL — the pass below
+        // must treat the entry as expired and re-walk instead of reusing it.
+        for i in 6..9 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+        let expired_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(
+                crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS + 1_000,
+            ))
+            .expect("the test host must have been up longer than the gate TTL");
+        {
+            let state = projects.get_mut(&key).unwrap();
+            state.cached_gate_file_count = Some((first_count, expired_at));
+            state.run_state.mark_dirty(RunScope::Full);
+        }
+
+        let second = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "a still-over-threshold pass after TTL expiry stays gated (idle, Ok), got {second:?}"
+        );
+        let (second_count, second_at) = projects
+            .get(&key)
+            .unwrap()
+            .cached_gate_file_count
+            .expect("a re-walked blocked gate must re-cache the fresh count");
+        // The fresh walk sees at least the 3 added fixtures (plus whatever
+        // extra `.1up/` state files the first gated pass persisted — scope
+        // proposal, status — so an exact delta would over-specify). A reused
+        // cache entry would still hold exactly `first_count`.
+        assert!(
+            second_count >= first_count + 3,
+            "an expired blocked entry must trigger a fresh walk that observes the 3 added \
+             files; cached {first_count}, re-walk stored {second_count}"
+        );
+        assert!(
+            second_at > expired_at,
+            "the re-walked entry must carry a fresh capture time, not the backdated one"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn allowed_gate_decision_is_never_cached() {
+        // An allowed (at/under-threshold) decision must never be cached — and
+        // must clear any stale blocked entry — so an unscoped first index is
+        // only ever admitted by a fresh walk. Seed an EXPIRED blocked entry
+        // whose count would fail the gate if trusted; the pass must ignore it
+        // (expired), re-walk, open the gate on the fresh under-threshold
+        // count, and leave the cache empty.
+        let _env_lock = crate::shared::fs::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvVarsGuard::new(&[
+            "HOME",
+            "XDG_DATA_HOME",
+            crate::shared::constants::DISABLE_MODEL_DOWNLOADS_ENV_VAR,
+            crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR,
+        ]);
+        // Fake HOME keeps the pipeline pass hermetic (no real model dir, no
+        // network: downloads disabled), so the allowed pass indexes FTS-only.
+        let home = tempfile::tempdir().unwrap();
+        let home_root = home.path().canonicalize().unwrap();
+        std::env::set_var("HOME", &home_root);
+        std::env::set_var("XDG_DATA_HOME", home_root.join(".local").join("share"));
+        std::env::set_var(
+            crate::shared::constants::DISABLE_MODEL_DOWNLOADS_ENV_VAR,
+            "1",
+        );
+        std::env::set_var(
+            crate::shared::constants::FILE_COUNT_THRESHOLD_ENV_VAR,
+            "100",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..6 {
+            std::fs::write(
+                root.join(format!("mod_{i}.rs")),
+                format!("pub fn item_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+
+        let db = seeded_project_db(&root).await;
+        let mut projects = HashMap::new();
+        let key = insert_project(
+            &mut projects,
+            project_state(&root, &root, db, dirty_full_run_state()),
+        );
+
+        // A stale blocked entry from a tree state that no longer exists: its
+        // count (over the 100 threshold) would keep the gate shut if trusted.
+        let expired_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(
+                crate::shared::constants::FIRST_INDEX_GATE_BLOCKED_COUNT_TTL_MS + 1_000,
+            ))
+            .expect("the test host must have been up longer than the gate TTL");
+        projects.get_mut(&key).unwrap().cached_gate_file_count = Some((999, expired_at));
+
+        let (_tx, mut search_requests_rx) = mpsc::channel(1);
+        let mut watcher = FileWatcher::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let (_reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+
+        let result = run_project(
+            &key,
+            &mut projects,
+            &mut HashMap::new(),
+            &mut search_requests_rx,
+            &mut watcher,
+            &daemon_token,
+            &mut reload_rx,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an under-threshold first-index pass must open the gate and index, got {result:?}"
+        );
+        assert_eq!(
+            projects.get(&key).unwrap().cached_gate_file_count,
+            None,
+            "an allowed gate decision must never be cached, and the stale blocked entry must \
+             be cleared by the fresh walk"
+        );
+        // The gate genuinely opened: the pass indexed content, so the project
+        // is no longer a first-index candidate.
+        let conn = projects
+            .get(&key)
+            .unwrap()
+            .db
+            .connect_tuned()
+            .await
+            .unwrap();
+        let indexed = segments::count_segments(&conn).await.unwrap_or(0);
+        assert!(
+            indexed > 0,
+            "the allowed pass must have run a real first index (segments recorded)"
         );
     }
 
@@ -4918,13 +5172,13 @@ mod tests {
         );
     }
 
-    /// A registry reload (SIGHUP) is the sanctioned invalidation point for the
-    /// first-index gate's cached file count (see
-    /// `ProjectState::cached_gate_file_count`): it is the only event that can
-    /// change scope/registry state while a project stays gated between dirty
-    /// signals. A retained (still-registered, branch-unchanged) project must
-    /// have its cache cleared on reload so the next gate check re-walks
-    /// instead of trusting a possibly-stale count.
+    /// A registry reload (SIGHUP) clears the first-index gate's cached blocked
+    /// file count immediately, without waiting for its TTL (see
+    /// `ProjectState::cached_gate_file_count`): a reload can change
+    /// scope/registry state while a project stays gated between dirty signals.
+    /// A retained (still-registered, branch-unchanged) project must have its
+    /// cache cleared on reload so the next gate check re-walks instead of
+    /// trusting a possibly-stale count.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn reload_clears_cached_gate_file_count_for_retained_project() {
@@ -4944,7 +5198,8 @@ mod tests {
         let key = "reload-retained".to_string();
         let mut state = project_state(&root, &root, db, ProjectRunState::default());
         state.context.context_id = key.clone();
-        state.cached_gate_file_count = Some(42);
+        // A fresh (within-TTL) blocked entry: the reload must clear it anyway.
+        state.cached_gate_file_count = Some((42, std::time::Instant::now()));
 
         let mut projects = HashMap::new();
         insert_project(&mut projects, state);
