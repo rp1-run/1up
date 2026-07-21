@@ -4040,7 +4040,12 @@ fn count_files_per_directory_cancellable(
 /// the indexer's actual file counts and exclude untracked build trees.
 /// Helper to determine if a path is under a VCS directory that should be excluded.
 /// N1: VCS directories (.git, .hg, .svn) should never appear in file counts.
-fn is_under_vcs_dir(path: &Path) -> bool {
+///
+/// `pub(crate)` so the daemon's first-index gate walk
+/// (`daemon::worker::count_files_gitignore_aware`) can share this exact
+/// exclusion instead of duplicating it — the two gates must never disagree
+/// about whether the same repo is over the file-count threshold.
+pub(crate) fn is_under_vcs_dir(path: &Path) -> bool {
     const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn"];
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
@@ -4059,7 +4064,9 @@ fn is_under_vcs_dir(path: &Path) -> bool {
 /// Helper to build a gitignore-aware walker with VCS directories excluded.
 /// Excludes .git, .hg, .svn, and other VCS metadata to match indexer behavior.
 /// N1: VCS directories (.git, etc.) should never appear in file counts or suggestions.
-fn build_vcs_aware_walker(source_root: &Path) -> ignore::WalkBuilder {
+///
+/// `pub(crate)` for the same reuse reason as [`is_under_vcs_dir`].
+pub(crate) fn build_vcs_aware_walker(source_root: &Path) -> ignore::WalkBuilder {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(source_root);
@@ -4146,8 +4153,13 @@ fn count_files_per_directory_uncached(
 /// Counts total tracked files in repository using gitignore-aware walk.
 /// Returns the gitignore-aware tracked file count (same definition used by indexer).
 /// Excludes VCS directories (N1).
+///
+/// `pub(crate)` so the daemon gate parity test
+/// (`daemon::worker::tests::daemon_gate_count_matches_mcp_vcs_aware_count`) can
+/// assert the two gates never disagree on the same repo. Only reachable from
+/// `#[cfg(test)]` code today, hence the lint allow.
 #[allow(dead_code)]
-fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
+pub(crate) fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
     let walker = build_vcs_aware_walker(source_root).build();
 
     let count = walker
