@@ -141,6 +141,43 @@ pub const HYDRATION_BATCH_MAX_HANDLES: usize = 4;
 /// rejected up front rather than paying for partial work that is discarded.
 pub const MAX_GET_HANDLES_PER_CALL: usize = 50;
 
+/// Upper bound on the aggregate byte length of the `handles` array accepted by
+/// a single `oneup_get` call (sum of the supplied handle string lengths).
+///
+/// [`MAX_GET_HANDLES_PER_CALL`] bounds cardinality, not bytes: one arbitrarily
+/// long "handle" string still passed the count gate. Real handles are short
+/// opaque segment ids (a few dozen bytes each), so even an at-cap batch stays
+/// far below this budget; only a pathological request can exceed it. Sized to
+/// the [`MAX_DAEMON_REQUEST_BYTES`] request-framing precedent and enforced
+/// alongside the count cap before any index open, so an over-budget call is
+/// rejected up front rather than paying for normalization or hydration work.
+pub const MAX_GET_REQUEST_HANDLE_BYTES: usize = 16 * 1024;
+
+/// Upper bound on the bytes of a single supplied handle echoed back into a
+/// `oneup_get` outcome (the `source.raw`/`source.normalized` echo and the
+/// `recovered_from` recovery disclosure).
+///
+/// Real handles are far shorter than this, so truncation never fires for
+/// them; it exists so a pathological multi-kilobyte "handle" cannot reflect
+/// verbatim into the response envelope through its own error/outcome record.
+/// A clipped echo is cut on a UTF-8 character boundary and marked with a
+/// trailing `…`.
+pub const MAX_HANDLE_ECHO_BYTES: usize = 128;
+
+/// Upper bound on the aggregate serialized bytes of hydrated `oneup_get`
+/// records in a single response.
+///
+/// [`MAX_GET_HANDLES_PER_CALL`] bounds cardinality, not bytes: 50 handles for
+/// near-2MiB segments (duplicates included) could otherwise approach a
+/// ~100MiB envelope. Aligned with the [`MAX_DAEMON_RESPONSE_BYTES`]
+/// response-framing precedent. Handles are hydrated in input order against
+/// this budget; the first record is always admitted (so any single segment
+/// stays fetchable in a batch of one), and once a further record would exceed
+/// the budget it and every remaining handle receive a structured over-budget
+/// outcome — preserving the per-handle independent-outcome contract — that
+/// directs the caller to re-request those handles in a smaller batch.
+pub const MAX_GET_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Maximum size of a framed daemon request payload in bytes.
 pub const MAX_DAEMON_REQUEST_BYTES: usize = 16 * 1024;
 

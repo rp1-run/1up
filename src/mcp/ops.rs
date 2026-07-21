@@ -28,6 +28,7 @@ use crate::shared::config::{self, project_db_path, project_dot_dir};
 use crate::shared::constants::{
     DB_LOCK_RETRY_ATTEMPTS, DB_LOCK_RETRY_DELAY_MS, FILE_COUNT_THRESHOLD,
     FILE_COUNT_THRESHOLD_ENV_VAR, MAX_CONTEXT_EXPANSION_LINES, MAX_GET_HANDLES_PER_CALL,
+    MAX_GET_REQUEST_HANDLE_BYTES, MAX_GET_RESPONSE_BYTES, MAX_HANDLE_ECHO_BYTES,
     MAX_SYMBOLS_PER_LIST, NO_INDEXED_EMBEDDINGS_REASON, PROJECT_STATE_DIR_MODE,
     SCOPE_TRUNCATION_REASON, SECURE_STATE_FILE_MODE, STALE_REBUILD_REASON,
     STATUS_READ_RETRY_ATTEMPTS, STATUS_READ_RETRY_DELAY_MS, SYMBOL_LIST_TRUNCATION_REASON,
@@ -1606,12 +1607,23 @@ async fn run_search_once(
     })
 }
 
-/// Pure gate rejecting an over-cap `oneup_get` batch before any index open or
-/// hydration work is attempted. Deterministic and unit-testable in isolation.
-fn check_get_handles_cap(handle_count: usize) -> Result<(), String> {
+/// Pure gate rejecting an over-cap or over-budget `oneup_get` batch before any
+/// index open or hydration work is attempted: at most
+/// [`MAX_GET_HANDLES_PER_CALL`] handles and at most
+/// [`MAX_GET_REQUEST_HANDLE_BYTES`] aggregate handle bytes (sum of the supplied
+/// handle string lengths) per call. Deterministic and unit-testable in
+/// isolation.
+pub(crate) fn check_get_handles_cap(handles: &[String]) -> Result<(), String> {
+    let handle_count = handles.len();
     if handle_count > MAX_GET_HANDLES_PER_CALL {
         return Err(format!(
             "oneup_get accepts at most {MAX_GET_HANDLES_PER_CALL} handles per call; received {handle_count}. Split the batch into calls of {MAX_GET_HANDLES_PER_CALL} handles or fewer."
+        ));
+    }
+    let total_bytes: usize = handles.iter().map(String::len).sum();
+    if total_bytes > MAX_GET_REQUEST_HANDLE_BYTES {
+        return Err(format!(
+            "oneup_get accepts at most {MAX_GET_REQUEST_HANDLE_BYTES} aggregate handle bytes per call; received {total_bytes} bytes across {handle_count} handle(s). Handles are short opaque ids returned by oneup_search or oneup_symbol; re-issue the call with valid handles."
         ));
     }
     Ok(())
@@ -1623,7 +1635,7 @@ pub async fn get_handles(
     handles: &[String],
     verbosity: Option<&str>,
 ) -> anyhow::Result<ReadPayload> {
-    if let Err(message) = check_get_handles_cap(handles.len()) {
+    if let Err(message) = check_get_handles_cap(handles) {
         bail!(message);
     }
     retry_on_db_lock(|| async {
@@ -1670,10 +1682,7 @@ async fn get_handles_once(
             );
             match memory.lookup(&key, current_identity) {
                 Some(record) => {
-                    let source = ReadSource::Handle {
-                        raw: raw_handle.clone(),
-                        normalized: normalized.clone(),
-                    };
+                    let source = handle_read_source(raw_handle, normalized);
                     prejudged.push(Some(read_rejected_handle(
                         source,
                         record.outcome,
@@ -2623,6 +2632,14 @@ async fn open_current_index(state_root: &Path) -> anyhow::Result<CurrentIndex> {
 /// lookup. Each handle is resolved independently, so the per-handle
 /// Found/NotFound/Ambiguous outcome and the empty-handle rejection are identical
 /// to resolving handles one at a time.
+///
+/// Hydration is additionally metered against [`MAX_GET_RESPONSE_BYTES`] in
+/// input order: the first record is always admitted (any single segment stays
+/// fetchable in a batch of one); once a further record would push the
+/// aggregate serialized size past the budget, it and every remaining handle
+/// receive the structured over-budget outcome instead — no further database
+/// work is done for them — so a batch of near-maximum segments cannot inflate
+/// the response envelope past the budget.
 async fn resolve_handle_records(
     conn: &Connection,
     context_id: &str,
@@ -2646,22 +2663,25 @@ async fn resolve_handle_records(
     let segments_by_id = get_segments_by_ids_for_context(conn, context_id, &exact_ids).await?;
 
     let mut records = Vec::with_capacity(handles.len());
+    // Aggregate response budget: serialized bytes admitted so far and whether
+    // a record has already been refused. Once tripped, every remaining handle
+    // short-circuits to the over-budget outcome without further database work.
+    let mut used_response_bytes: usize = 0;
+    let mut response_budget_exhausted = false;
     for (raw_handle, normalized) in handles.iter().zip(normalized) {
-        let source = ReadSource::Handle {
-            raw: raw_handle.clone(),
-            normalized: normalized.clone(),
-        };
+        let source = handle_read_source(raw_handle, &normalized);
 
-        if normalized.is_empty() {
-            records.push(read_message(
-                ReadStatus::NotFound,
-                source,
-                "empty segment handle",
-            ));
+        if response_budget_exhausted {
+            records.push(read_over_budget(source));
+            continue;
+        }
+
+        let record = if normalized.is_empty() {
+            read_message(ReadStatus::NotFound, source, "empty segment handle")
         } else if let Some(segment) = segments_by_id.get(&normalized) {
-            records.push(read_segment(source, segment.clone(), verbosity));
+            read_segment(source, segment.clone(), verbosity)
         } else {
-            let record = match resolve_handle_via_prefix(
+            match resolve_handle_via_prefix(
                 conn,
                 context_id,
                 source.clone(),
@@ -2672,7 +2692,20 @@ async fn resolve_handle_records(
             {
                 Ok(record) => record,
                 Err(err) => isolate_residual_resolution_error(source, err)?,
-            };
+            }
+        };
+
+        // The first record is always admitted so any single segment stays
+        // fetchable in a batch of one; a later record that would push the
+        // aggregate past the budget trips it for itself and every handle after.
+        let record_bytes = serialized_record_bytes(&record);
+        if !records.is_empty()
+            && used_response_bytes.saturating_add(record_bytes) > MAX_GET_RESPONSE_BYTES
+        {
+            response_budget_exhausted = true;
+            records.push(read_over_budget(record.source.clone()));
+        } else {
+            used_response_bytes = used_response_bytes.saturating_add(record_bytes);
             records.push(record);
         }
     }
@@ -2797,7 +2830,7 @@ async fn attempt_handle_recovery(
                     source,
                     segment,
                     verbosity,
-                    normalized.to_string(),
+                    truncate_handle_echo(normalized),
                 )),
                 // The candidate id vanished between the id fetch and the
                 // re-fetch (e.g. a concurrent rebuild); stay truthful.
@@ -3148,6 +3181,29 @@ fn read_rejected_handle(
     }
 }
 
+/// `Rejected` record for a handle refused by the aggregate response budget
+/// ([`MAX_GET_RESPONSE_BYTES`]). Emitted for the first record that would push
+/// the serialized batch past the budget and for every handle after it, keeping
+/// the per-handle independent-outcome contract while directing the caller to
+/// re-request exactly these handles in a smaller batch. Constant-sized: the
+/// handle echo carried in `source` is already bounded.
+fn read_over_budget(source: ReadSource) -> ReadRecord {
+    read_message(
+        ReadStatus::Rejected,
+        source,
+        format!(
+            "aggregate response budget of {MAX_GET_RESPONSE_BYTES} bytes was reached before this handle's content could be included; re-request this handle in a smaller oneup_get batch"
+        ),
+    )
+}
+
+/// Serialized size of one record as it will appear in `structuredContent`,
+/// which is what the response budget meters. A record that fails to serialize
+/// counts as unbounded, failing closed against the budget.
+fn serialized_record_bytes(record: &ReadRecord) -> usize {
+    serde_json::to_vec(record).map_or(usize::MAX, |bytes| bytes.len())
+}
+
 fn read_message(status: ReadStatus, source: ReadSource, message: impl Into<String>) -> ReadRecord {
     ReadRecord {
         status,
@@ -3397,6 +3453,32 @@ fn aggregate_read_status(records: &[ReadRecord]) -> OperationStatus {
 
 fn normalize_handle(raw: &str) -> String {
     raw.strip_prefix(':').unwrap_or(raw).to_string()
+}
+
+/// Response-bound echo of a supplied handle, clipped to
+/// [`MAX_HANDLE_ECHO_BYTES`] on a UTF-8 character boundary with a trailing `…`
+/// marker. Real handles are far shorter than the bound, so this is a no-op for
+/// them; it exists so a pathological multi-kilobyte "handle" cannot reflect
+/// verbatim into the response through its own error/outcome record. Lookups
+/// always use the unclipped string — only the echoed copy is bounded.
+fn truncate_handle_echo(handle: &str) -> String {
+    if handle.len() <= MAX_HANDLE_ECHO_BYTES {
+        return handle.to_string();
+    }
+    let mut end = MAX_HANDLE_ECHO_BYTES;
+    while end > 0 && !handle.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &handle[..end])
+}
+
+/// Single constructor for the `source` echo of a handle-addressed record, so
+/// every echo site bounds both the raw and normalized forms the same way.
+fn handle_read_source(raw: &str, normalized: &str) -> ReadSource {
+    ReadSource::Handle {
+        raw: truncate_handle_echo(raw),
+        normalized: truncate_handle_echo(normalized),
+    }
 }
 
 fn partition_symbol_results(results: Vec<SymbolResult>) -> (Vec<SymbolResult>, Vec<SymbolResult>) {
@@ -5784,6 +5866,216 @@ mod tests {
         assert!(
             !message.contains("no current index found"),
             "cap gate must run before index open, not surface an index-open error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handles_request_bytes_over_budget_rejects_before_any_index_open() {
+        // A single handle whose byte length exceeds the aggregate request
+        // budget must be rejected before `open_current_index` runs, even
+        // though it passes the count cap. Deliberately no index at `root`:
+        // if the gate ran after opening the index this would surface the
+        // "no current index found" error instead.
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+
+        let context = WorktreeContext {
+            context_id: "ctx-bytes".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+
+        let over_budget_bytes = MAX_GET_REQUEST_HANDLE_BYTES + 1;
+        let handles = vec!["z".repeat(over_budget_bytes)];
+
+        let err = get_handles(&root, &context, &handles, None)
+            .await
+            .expect_err("over-budget aggregate handle bytes must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains(&MAX_GET_REQUEST_HANDLE_BYTES.to_string()),
+            "error must name the byte budget: {message}"
+        );
+        assert!(
+            message.contains(&over_budget_bytes.to_string()),
+            "error must name the received byte size: {message}"
+        );
+        assert!(
+            !message.contains(&"z".repeat(64)),
+            "the oversized handle must not be echoed into the error: {message}"
+        );
+        assert!(
+            !message.contains("no current index found"),
+            "byte gate must run before index open, not surface an index-open error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_invalid_handle_echo_is_truncated_in_outcomes() {
+        // A pathological multi-kilobyte handle passes the per-call gates (one
+        // handle, under the byte budget) but must never reflect verbatim into
+        // the response: the raw/normalized source echo and the recovered_from
+        // disclosure are all clipped to the bounded prefix with a `…` marker.
+        let db = Db::open_memory().await.unwrap();
+        let conn = db.connect().unwrap();
+        schema::initialize(&conn).await.unwrap();
+
+        let ctx = "ctx-echo";
+        segments::upsert_segment_for_context(
+            &conn,
+            ctx,
+            &test_segment("aaaa1111bbbb2222", "src/a.rs"),
+        )
+        .await
+        .unwrap();
+
+        let junk = "z".repeat(4 * 1024);
+        let invalid = format!(":{junk}");
+        let recoverable = format!("aaaa1111bbbb2222{junk}");
+        let echo_bound = MAX_HANDLE_ECHO_BYTES + '…'.len_utf8();
+
+        let records = resolve_handle_records(&conn, ctx, &[invalid, recoverable], None)
+            .await
+            .unwrap();
+
+        assert_eq!(records[0].status, ReadStatus::NotFound);
+        let ReadSource::Handle { raw, normalized } = &records[0].source else {
+            panic!("handle-addressed record must carry a handle source");
+        };
+        assert!(
+            raw.len() <= echo_bound && raw.ends_with('…'),
+            "raw echo must be clipped and marked, got {} bytes",
+            raw.len()
+        );
+        assert!(
+            normalized.len() <= echo_bound && normalized.ends_with('…'),
+            "normalized echo must be clipped and marked, got {} bytes",
+            normalized.len()
+        );
+
+        // The unique-prefix recovery path still resolves the segment, but its
+        // recovered_from disclosure (the supplied handle) is bounded too.
+        assert_eq!(records[1].status, ReadStatus::Found);
+        assert_eq!(
+            records[1].segment.as_ref().unwrap().handle,
+            "aaaa1111bbbb2222"
+        );
+        let recovered_from = records[1]
+            .recovered_from
+            .as_deref()
+            .expect("recovery discloses the supplied handle");
+        assert!(
+            recovered_from.len() <= echo_bound && recovered_from.ends_with('…'),
+            "recovered_from echo must be clipped and marked, got {} bytes",
+            recovered_from.len()
+        );
+
+        // Belt-and-braces: no serialized outcome carries the junk verbatim.
+        let json = serde_json::to_string(&records).unwrap();
+        assert!(
+            !json.contains(&"z".repeat(MAX_HANDLE_ECHO_BYTES + 8)),
+            "no echo site may reflect the oversized handle past the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handles_response_budget_bounds_duplicate_heavy_batch() {
+        // Regression for the duplicate-amplification gap: the same large
+        // segment requested repeatedly hydrates independently, so without a
+        // byte budget the envelope scales with the handle count. Leading
+        // handles hydrate in input order until the budget is reached; every
+        // later handle gets the structured over-budget outcome and the
+        // envelope stays under MAX_GET_RESPONSE_BYTES.
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        // Canonicalize: secure-fs rejects symlinked path components (macOS
+        // tempdir() lives under `/var -> /private/var`).
+        let root = temp_dir.path().canonicalize().unwrap();
+        let big_id = "beefbeefbeefbeef";
+        {
+            let db = Db::open_rw(&project_db_path(&root)).await.unwrap();
+            let conn = db.connect().unwrap();
+            schema::initialize(&conn).await.unwrap();
+            let mut segment = test_segment(big_id, "src/big.rs");
+            segment.content = "x".repeat(900 * 1024);
+            segments::upsert_segment_for_context(&conn, "ctx-budget", &segment)
+                .await
+                .unwrap();
+        }
+
+        let context = WorktreeContext {
+            context_id: "ctx-budget".to_string(),
+            state_root: root.clone(),
+            source_root: root.clone(),
+            main_worktree_root: root.clone(),
+            worktree_role: WorktreeRole::Main,
+            git_dir: None,
+            common_git_dir: None,
+            branch_name: None,
+            branch_ref: None,
+            head_oid: None,
+            branch_status: BranchStatus::Unknown,
+        };
+
+        let handles = vec![big_id.to_string(); 4];
+        let payload = get_handles(&root, &context, &handles, None)
+            .await
+            .expect("an in-budget prefix of the batch must still hydrate");
+
+        assert_eq!(
+            payload.records.len(),
+            4,
+            "every handle keeps its independent, ordered outcome"
+        );
+        let statuses: Vec<ReadStatus> =
+            payload.records.iter().map(|record| record.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ReadStatus::Found,
+                ReadStatus::Found,
+                ReadStatus::Rejected,
+                ReadStatus::Rejected,
+            ],
+            "leading handles hydrate; handles past the budget are refused"
+        );
+        assert_eq!(
+            payload.records[0].segment.as_ref().unwrap().content.len(),
+            900 * 1024,
+            "admitted records carry their full content"
+        );
+        let message = payload.records[2]
+            .message
+            .as_deref()
+            .expect("over-budget outcome must explain itself");
+        assert!(
+            message.contains(&MAX_GET_RESPONSE_BYTES.to_string()),
+            "over-budget outcome must name the budget: {message}"
+        );
+        assert!(
+            message.contains("smaller oneup_get batch"),
+            "over-budget outcome must direct the caller to a smaller batch: {message}"
+        );
+        assert_eq!(
+            aggregate_read_status(&payload.records),
+            OperationStatus::Partial,
+            "a mixed hydrated/over-budget batch reports partial status"
+        );
+
+        let envelope = serde_json::to_vec(&payload).unwrap();
+        assert!(
+            envelope.len() <= MAX_GET_RESPONSE_BYTES,
+            "the serialized batch must stay within the response budget, got {} bytes",
+            envelope.len()
         );
     }
 

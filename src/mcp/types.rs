@@ -89,7 +89,7 @@ pub struct SearchInput {
 pub struct GetInput {
     #[serde(default)]
     #[schemars(
-        description = "Durable result handles returned by oneup_search or oneup_symbol. Capped at 50 handles per call; split a larger batch across multiple calls."
+        description = "Durable result handles returned by oneup_search or oneup_symbol. Capped at 50 handles and 16KiB of aggregate handle bytes per call; split a larger batch across multiple calls. Hydrated content is metered against a 2MiB response budget in input order; handles past the budget return an over-budget outcome and should be re-requested in a smaller batch."
     )]
     pub handles: Vec<String>,
     pub path: Option<String>,
