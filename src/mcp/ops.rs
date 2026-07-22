@@ -4390,8 +4390,8 @@ fn count_files_per_directory_uncached(
 /// `pub(crate)` so the daemon gate parity test
 /// (`daemon::worker::tests::daemon_gate_count_matches_mcp_vcs_aware_count`) can
 /// assert the two gates never disagree on the same repo. Only reachable from
-/// `#[cfg(test)]` code today, hence the lint allow.
-#[allow(dead_code)]
+/// `#[cfg(test)]` code today, hence the `#[cfg(test)]` gate.
+#[cfg(test)]
 pub(crate) fn count_total_tracked_files(source_root: &Path) -> Result<usize, OneupError> {
     let walker = build_vcs_aware_walker(source_root).build();
 
@@ -4955,8 +4955,6 @@ mod tests {
             referenced_symbols: names("ref", referenced),
             called_symbols: names("call", called),
             file_hash: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
         }
     }
 

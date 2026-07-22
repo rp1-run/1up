@@ -5,7 +5,6 @@
 //! SQL aggregates over the existing index tables. Pure read path: no schema
 //! changes, no embedding runtime, no persisted artifacts (the no-vector-access
 //! guarantee is structural; this module never touches `segment_vectors`).
-#![allow(dead_code)] // The MCP surface task wires `oneup_overview` through this engine.
 
 use std::collections::BTreeMap;
 
@@ -13,6 +12,7 @@ use libsql::Connection;
 
 use crate::search::impact::is_low_signal_path;
 use crate::shared::errors::OneupError;
+#[cfg(test)]
 use crate::shared::symbols::{
     EDGE_IDENTITY_BARE_IDENTIFIER, EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_MACRO_LIKE,
     EDGE_IDENTITY_QUALIFIED_PATH,
@@ -71,10 +71,12 @@ pub const TYPE_DEFINITION_KINDS: [&str; 5] = ["struct", "enum", "trait", "class"
 /// downscoped qualifying definitions to type definitions only).
 /// Must stay aligned
 /// with `queries::OVERVIEW_QUALIFYING_TYPE_KINDS_SQL`.
+#[cfg(test)]
 pub const QUALIFYING_DEFINITION_KINDS: [&str; 5] = TYPE_DEFINITION_KINDS;
 
 /// Roles a segment must carry for its symbol rows to qualify as definitions.
 /// Must stay aligned with `queries::OVERVIEW_QUALIFYING_ROLES_SQL`.
+#[cfg(test)]
 pub const QUALIFYING_DEFINITION_ROLES: [&str; 3] =
     ["DEFINITION", "IMPLEMENTATION", "ORCHESTRATION"];
 
@@ -82,6 +84,7 @@ pub const QUALIFYING_DEFINITION_ROLES: [&str; 3] =
 /// (receiver/member edges resolve identity only through per-pair
 /// owner alignment, which a bounded aggregate cannot compute). Must stay
 /// aligned with `queries::OVERVIEW_IDENTITY_BEARING_EDGE_KINDS_SQL`.
+#[cfg(test)]
 pub const IDENTITY_BEARING_EDGE_KINDS: [&str; 4] = [
     EDGE_IDENTITY_BARE_IDENTIFIER,
     EDGE_IDENTITY_QUALIFIED_PATH,

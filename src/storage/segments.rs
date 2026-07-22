@@ -15,7 +15,6 @@ use crate::storage::relations::{self, RelationInsert};
 
 /// A stored segment row read from the database.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct StoredSegment {
     pub id: String,
     pub file_path: String,
@@ -30,14 +29,12 @@ pub struct StoredSegment {
     pub defined_symbols: String,
     pub referenced_symbols: String,
     pub called_symbols: String,
+    #[cfg(test)]
     pub file_hash: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 impl StoredSegment {
     /// Parse the role string back into a SegmentRole enum.
-    #[allow(dead_code)]
     pub fn parsed_role(&self) -> SegmentRole {
         match self.role.as_str() {
             "DEFINITION" => SegmentRole::Definition,
@@ -83,7 +80,6 @@ pub struct SegmentInsert {
     // until the pool-aware write path consumes it. Remove this attribute
     // when the pool-aware write path wires `content_key` into the
     // `segment_vectors` write.
-    #[allow(dead_code)]
     pub content_key: Option<String>,
     /// Serialized embedding vector for this segment, present only when the
     /// content is *new* under the current model (a pool miss this run) and must
@@ -134,7 +130,6 @@ pub struct IndexedFileMeta {
 
 /// Parameters for replacing one file's indexed contents inside a batch transaction.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub struct FileSegmentBatch<'a> {
     pub file_path: &'a str,
     pub segments: &'a [SegmentInsert],
@@ -148,13 +143,13 @@ struct SegmentSymbolInsert {
 }
 
 /// Insert or replace a segment in the database.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
     upsert_segment_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, seg).await
 }
 
 /// Insert or replace a segment inside one index context.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 pub async fn upsert_segment_for_context(
     conn: &Connection,
     context_id: &str,
@@ -173,6 +168,7 @@ pub async fn upsert_segment_for_context(
     Ok(())
 }
 
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 async fn upsert_segment_record_for_context(
     conn: &Connection,
     context_id: &str,
@@ -221,6 +217,7 @@ async fn upsert_segment_record_for_context(
 /// preceding segment delete (unlike the replace path, where the
 /// `segments_vector_ad` trigger does the decrement). It is idempotent for the
 /// no-op case and safe to re-run.
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 async fn write_segment_vector_reference(
     conn: &Connection,
     seg: &SegmentInsert,
@@ -316,7 +313,7 @@ pub async fn existing_embedding_pool_keys(
 }
 
 /// Query all segments for a given file path, ordered by line_start.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_segments_by_file(
     conn: &Connection,
     file_path: &str,
@@ -338,7 +335,6 @@ pub async fn get_segments_by_file(
 }
 
 /// Query all segments for a given file path inside one index context, ordered by line_start.
-#[allow(dead_code)]
 pub async fn get_segments_by_file_for_context(
     conn: &Connection,
     context_id: &str,
@@ -365,7 +361,6 @@ pub async fn get_segments_by_file_for_context(
 }
 
 /// Get a single segment by its ID.
-#[allow(dead_code)]
 pub async fn get_segment_by_id(
     conn: &Connection,
     id: &str,
@@ -386,7 +381,6 @@ pub async fn get_segment_by_id(
 }
 
 /// Get a single segment by its ID inside one index context.
-#[allow(dead_code)]
 pub async fn get_segment_by_id_for_context(
     conn: &Connection,
     context_id: &str,
@@ -444,7 +438,6 @@ fn escape_like_prefix(prefix: &str) -> String {
 
 /// Resolve a segment handle by prefix. A full-length id resolves to exactly one row
 /// via the same `LIKE ?||'%'` path that also handles the 12-char display handle.
-#[allow(dead_code)]
 pub async fn get_segment_by_prefix(
     conn: &Connection,
     prefix: &str,
@@ -483,7 +476,6 @@ pub async fn get_segment_by_prefix(
 }
 
 /// Resolve a segment handle by prefix inside one index context.
-#[allow(dead_code)]
 pub async fn get_segment_by_prefix_for_context(
     conn: &Connection,
     context_id: &str,
@@ -565,7 +557,7 @@ pub async fn get_segment_ids_by_prefix_for_context(
 }
 
 /// Delete all segments for a given file path.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn delete_segments_by_file(
     conn: &Connection,
     file_path: &str,
@@ -574,7 +566,7 @@ pub async fn delete_segments_by_file(
 }
 
 /// Delete all segments for a given file path inside one index context.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn delete_segments_by_file_for_context(
     conn: &Connection,
     context_id: &str,
@@ -610,7 +602,7 @@ async fn delete_segments_by_file_only_for_context(
 
 /// Get the stored file hash for a given file path (from the first segment found).
 /// Returns None if no segments exist for this file.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_file_hash(
     conn: &Connection,
     file_path: &str,
@@ -619,7 +611,6 @@ pub async fn get_file_hash(
 }
 
 /// Get the stored file hash for a given file path in one index context.
-#[allow(dead_code)]
 pub async fn get_file_hash_for_context(
     conn: &Connection,
     context_id: &str,
@@ -650,7 +641,7 @@ pub async fn get_file_hash_for_context(
 }
 
 /// Replace all stored segments for a single file in one transaction.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn replace_file_segments_tx(
     conn: &Connection,
     file_path: &str,
@@ -660,7 +651,6 @@ pub async fn replace_file_segments_tx(
 }
 
 /// Replace all stored segments for a single file in one index context.
-#[allow(dead_code)]
 pub async fn replace_file_segments_for_context_tx(
     conn: &Connection,
     context_id: &str,
@@ -672,7 +662,7 @@ pub async fn replace_file_segments_for_context_tx(
 }
 
 /// Replace all stored segments for a single file in one transaction, updating the manifest.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn replace_file_segments_tx_with_meta(
     conn: &Connection,
     file_path: &str,
@@ -721,7 +711,7 @@ pub async fn replace_file_segments_for_context_tx_with_meta(
 }
 
 /// Replace stored segments for multiple files in one transaction.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn replace_file_batch_tx(
     conn: &Connection,
     batches: &[FileSegmentBatch<'_>],
@@ -730,7 +720,6 @@ pub async fn replace_file_batch_tx(
 }
 
 /// Replace stored segments for multiple files in one index context and one transaction.
-#[allow(dead_code)]
 pub async fn replace_file_batch_for_context_tx(
     conn: &Connection,
     context_id: &str,
@@ -762,13 +751,12 @@ pub async fn replace_file_batch_for_context_tx(
 }
 
 /// Get all distinct file paths stored in the segments table.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_all_file_paths(conn: &Connection) -> Result<Vec<String>, OneupError> {
     get_all_file_paths_for_context(conn, DEFAULT_INDEX_CONTEXT_ID).await
 }
 
 /// Get all distinct file paths stored in the segments table for one index context.
-#[allow(dead_code)]
 pub async fn get_all_file_paths_for_context(
     conn: &Connection,
     context_id: &str,
@@ -892,7 +880,7 @@ pub async fn get_file_paths_by_language_for_context(
 }
 
 /// Set a key-value pair in the meta table.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), OneupError> {
     conn.execute(queries::UPSERT_META, [key, value])
         .await
@@ -901,7 +889,7 @@ pub async fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), O
 }
 
 /// Get a value from the meta table by key.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, OneupError> {
     let mut rows = conn
         .query(queries::SELECT_META, [key])
@@ -924,7 +912,7 @@ pub async fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, On
 }
 
 /// Delete a key from the meta table.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn delete_meta(conn: &Connection, key: &str) -> Result<(), OneupError> {
     conn.execute(queries::DELETE_META, [key])
         .await
@@ -1702,7 +1690,6 @@ pub async fn get_qualifying_type_definitions_for_context(
     Ok(results)
 }
 
-#[allow(dead_code)]
 fn validate_replace_segments(
     file_path: &str,
     segments: &[SegmentInsert],
@@ -1819,6 +1806,7 @@ fn validate_context_id(context_id: &str) -> Result<(), OneupError> {
     Ok(())
 }
 
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 async fn replace_segment_symbols_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1849,6 +1837,7 @@ async fn replace_segment_symbols_for_context(
     Ok(())
 }
 
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 async fn replace_segment_relations_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1861,6 +1850,7 @@ async fn replace_segment_relations_for_context(
     batch_insert_relations_for_context(conn, context_id, relations).await
 }
 
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 fn validate_relation_source_ids(
     source_segment_id: &str,
     relations: &[RelationInsert],
@@ -1878,6 +1868,7 @@ fn validate_relation_source_ids(
     Ok(())
 }
 
+#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
 async fn delete_segment_relations_by_context_and_source_segment_id(
     conn: &Connection,
     context_id: &str,
@@ -1892,7 +1883,6 @@ async fn delete_segment_relations_by_context_and_source_segment_id(
     .map_err(Into::into)
 }
 
-#[allow(dead_code)]
 fn validate_replace_batches(batches: &[FileSegmentBatch<'_>]) -> Result<(), OneupError> {
     let mut seen_paths = HashSet::new();
 
@@ -1909,22 +1899,6 @@ fn validate_replace_batches(batches: &[FileSegmentBatch<'_>]) -> Result<(), Oneu
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-async fn replace_file_segments_in_transaction(
-    conn: &Connection,
-    file_path: &str,
-    segments: &[SegmentInsert],
-) -> Result<(), OneupError> {
-    replace_file_segments_in_transaction_with_meta(
-        conn,
-        DEFAULT_INDEX_CONTEXT_ID,
-        file_path,
-        segments,
-        None,
-    )
-    .await
 }
 
 async fn replace_file_segments_in_transaction_with_meta(
@@ -2200,14 +2174,6 @@ async fn batch_increment_pool_ref_counts(
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn batch_insert_symbols(
-    conn: &Connection,
-    symbols: &[(String, SegmentSymbolInsert)],
-) -> Result<(), OneupError> {
-    batch_insert_symbols_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, symbols).await
-}
-
 async fn batch_insert_symbols_for_context(
     conn: &Connection,
     context_id: &str,
@@ -2355,31 +2321,23 @@ pub fn row_to_stored_segment(row: &libsql::Row) -> Result<StoredSegment, OneupEr
         called_symbols: row
             .get(12)
             .map_err(|e| StorageError::Query(format!("read called_symbols failed: {e}")))?,
+        #[cfg(test)]
         file_hash: row
             .get(13)
             .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
-        created_at: row
-            .get(14)
-            .map_err(|e| StorageError::Query(format!("read created_at failed: {e}")))?,
-        updated_at: row
-            .get(15)
-            .map_err(|e| StorageError::Query(format!("read updated_at failed: {e}")))?,
     })
 }
 
 /// A row from the `indexed_files` manifest table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IndexedFileEntry {
-    pub file_path: String,
-    pub extension: String,
     pub file_hash: String,
     pub file_size: i64,
     pub modified_ns: i64,
 }
 
 /// Load the full indexed-files manifest keyed by file path.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_all_indexed_files(
     conn: &Connection,
 ) -> Result<HashMap<String, IndexedFileEntry>, OneupError> {
@@ -2387,7 +2345,6 @@ pub async fn get_all_indexed_files(
 }
 
 /// Load one context's indexed-files manifest keyed by file path.
-#[allow(dead_code)]
 pub async fn get_all_indexed_files_for_context(
     conn: &Connection,
     context_id: &str,
@@ -2408,12 +2365,8 @@ pub async fn get_all_indexed_files_for_context(
             .get(0)
             .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
         entries.insert(
-            file_path.clone(),
+            file_path,
             IndexedFileEntry {
-                file_path,
-                extension: row
-                    .get(1)
-                    .map_err(|e| StorageError::Query(format!("read extension failed: {e}")))?,
                 file_hash: row
                     .get(2)
                     .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
@@ -2430,17 +2383,7 @@ pub async fn get_all_indexed_files_for_context(
     Ok(entries)
 }
 
-/// Load a single indexed-file entry by path.
-#[allow(dead_code)]
-pub async fn get_indexed_file(
-    conn: &Connection,
-    file_path: &str,
-) -> Result<Option<IndexedFileEntry>, OneupError> {
-    get_indexed_file_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
-}
-
 /// Load a single indexed-file entry by context and path.
-#[allow(dead_code)]
 pub async fn get_indexed_file_for_context(
     conn: &Connection,
     context_id: &str,
@@ -2461,12 +2404,6 @@ pub async fn get_indexed_file_for_context(
         .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
     {
         Some(row) => Ok(Some(IndexedFileEntry {
-            file_path: row
-                .get(0)
-                .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?,
-            extension: row
-                .get(1)
-                .map_err(|e| StorageError::Query(format!("read extension failed: {e}")))?,
             file_hash: row
                 .get(2)
                 .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?,
@@ -2481,30 +2418,7 @@ pub async fn get_indexed_file_for_context(
     }
 }
 
-/// Write or update an indexed-file manifest entry.
-#[allow(dead_code)]
-pub async fn upsert_indexed_file(
-    conn: &Connection,
-    file_path: &str,
-    extension: &str,
-    file_hash: &str,
-    file_size: i64,
-    modified_ns: i64,
-) -> Result<(), OneupError> {
-    upsert_indexed_file_for_context(
-        conn,
-        DEFAULT_INDEX_CONTEXT_ID,
-        file_path,
-        extension,
-        file_hash,
-        file_size,
-        modified_ns,
-    )
-    .await
-}
-
 /// Write or update an indexed-file manifest entry for one context.
-#[allow(dead_code)]
 pub async fn upsert_indexed_file_for_context(
     conn: &Connection,
     context_id: &str,
@@ -2531,14 +2445,7 @@ pub async fn upsert_indexed_file_for_context(
     Ok(())
 }
 
-/// Remove an indexed-file manifest entry.
-#[allow(dead_code)]
-pub async fn delete_indexed_file(conn: &Connection, file_path: &str) -> Result<(), OneupError> {
-    delete_indexed_file_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, file_path).await
-}
-
 /// Remove one context's indexed-file manifest entry.
-#[allow(dead_code)]
 pub async fn delete_indexed_file_for_context(
     conn: &Connection,
     context_id: &str,

@@ -22,18 +22,6 @@ pub fn probe_daemon() -> Result<DaemonProbeState, OneupError> {
     Ok(DaemonProbeState::NotRunning)
 }
 
-pub fn write_pid_file() -> Result<(), OneupError> {
-    Err(unsupported_daemon_error())
-}
-
-pub fn read_pid_file() -> Result<Option<u32>, OneupError> {
-    Ok(None)
-}
-
-pub fn remove_pid_file() -> Result<(), OneupError> {
-    Ok(())
-}
-
 pub fn is_process_alive(_pid: u32) -> bool {
     false
 }
@@ -72,7 +60,6 @@ pub fn drain_daemon(_pid: u32, _timeout: Duration) -> Result<(), OneupError> {
     Err(unsupported_daemon_error())
 }
 
-#[allow(dead_code)]
 pub fn drain_and_restart_daemon(
     _pid: u32,
     _project_id: &str,

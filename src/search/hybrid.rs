@@ -31,7 +31,7 @@ pub struct HybridSearchEngine<'a> {
 }
 
 impl<'a> HybridSearchEngine<'a> {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
     pub fn new(conn: &'a Connection, embedder: Option<&'a mut Embedder>) -> Self {
         Self::new_scoped(conn, embedder, SearchScope::default_context())
     }
@@ -772,8 +772,6 @@ mod tests {
             referenced_symbols: "[]".to_string(),
             called_symbols: "[]".to_string(),
             file_hash: "hash".to_string(),
-            created_at: "2026-04-13T00:00:00Z".to_string(),
-            updated_at: "2026-04-13T00:00:00Z".to_string(),
         });
 
         assert_eq!(result.segment_id, "seg-123");
@@ -801,8 +799,6 @@ mod tests {
             referenced_symbols: "[]".to_string(),
             called_symbols: "[\"helper\"]".to_string(),
             file_hash: "hash".to_string(),
-            created_at: "2026-04-13T00:00:00Z".to_string(),
-            updated_at: "2026-04-13T00:00:00Z".to_string(),
         };
         // The candidate carries the same row's fields, transformed exactly as
         // `row_to_candidate_row` / the symbol stage produce them.
@@ -857,8 +853,6 @@ mod tests {
             referenced_symbols: "[]".to_string(),
             called_symbols: "[]".to_string(),
             file_hash: "hash".to_string(),
-            created_at: "2026-04-13T00:00:00Z".to_string(),
-            updated_at: "2026-04-13T00:00:00Z".to_string(),
         };
         let candidate = CandidateRow {
             segment_id: segment.id.clone(),

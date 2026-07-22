@@ -537,8 +537,6 @@ mod tests {
             referenced_symbols: "[]".to_string(),
             called_symbols: "[]".to_string(),
             file_hash: "h".to_string(),
-            created_at: "t".to_string(),
-            updated_at: "t".to_string(),
         }
     }
 

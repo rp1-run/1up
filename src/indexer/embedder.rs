@@ -551,7 +551,7 @@ pub struct Embedder {
 /// Returns `false` if neither an active verified artifact nor a hash-validated
 /// legacy flat-file cache is available. Read-only: unlike the prepare paths,
 /// this never activates or repairs persisted state.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn is_model_available() -> bool {
     let model_root = match model_dir() {
         Ok(d) => d,
@@ -670,26 +670,18 @@ impl Embedder {
     /// Creates a new embedder, auto-downloading the model if it is not already present.
     ///
     /// The ONNX session is initialized once; reuse this instance across calls.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn new() -> Result<Self, OneupError> {
         Self::with_options(EMBEDDING_BATCH_SIZE, 1).await
     }
 
     /// Creates a new embedder with a custom ONNX intra-op thread count.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn new_with_threads(intra_threads: usize) -> Result<Self, OneupError> {
         Self::with_options(EMBEDDING_BATCH_SIZE, intra_threads).await
     }
 
-    /// Creates a new embedder with a custom batch size.
-    ///
-    /// If the model is not present, attempts auto-download. On download failure,
-    /// a marker file is written to prevent repeated download attempts.
-    #[allow(dead_code)]
-    pub async fn with_batch_size(batch_size: usize) -> Result<Self, OneupError> {
-        Self::with_options(batch_size, 1).await
-    }
-
+    #[cfg(test)]
     async fn with_options(batch_size: usize, intra_threads: usize) -> Result<Self, OneupError> {
         let model_root = ensure_secure_model_root()?;
 
@@ -723,7 +715,7 @@ impl Embedder {
 
     /// Creates an embedder from pre-existing model files at a custom path and
     /// thread count, resolving the variant from the environment.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn from_dir_with_threads(dir: &Path, intra_threads: usize) -> Result<Self, OneupError> {
         let variant = resolve_model_variant()?;
         Self::from_dir_with_variant(dir, variant, intra_threads, EMBEDDING_BATCH_SIZE)
@@ -853,12 +845,6 @@ impl Embedder {
     /// content-addressed embedding key and `meta.embedding_model`.
     pub fn model_id(&self) -> String {
         self.variant.model_id()
-    }
-
-    /// Which ONNX variant this embedder loaded (INT8 default vs FP32 fallback).
-    #[allow(dead_code)]
-    pub fn variant(&self) -> ModelVariant {
-        self.variant
     }
 
     /// Embeds a single text, returning a 384-dimensional unit vector.
@@ -1101,6 +1087,7 @@ fn manifest_path(model_root: &Path, artifact_id: &str) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn has_active_verified_artifact(model_root: &Path) -> bool {
     matches!(
         try_load_active_artifact_dir(model_root),
@@ -1202,6 +1189,7 @@ fn peek_model_state(model_root: &Path) -> Result<ModelResolution, OneupError> {
     }
 }
 
+#[cfg(test)]
 fn resolve_model_dir_without_download(model_root: &Path) -> Result<Option<PathBuf>, OneupError> {
     Ok(match resolve_model_state(model_root)? {
         ModelResolution::Active(dir) => Some(dir),

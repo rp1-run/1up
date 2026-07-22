@@ -49,7 +49,6 @@ pub enum StorageError {
     Query(String),
 
     #[error("transaction failed: {0}")]
-    #[allow(dead_code)]
     Transaction(String),
 }
 
@@ -58,15 +57,7 @@ pub enum IndexingError {
     #[error("scan failed: {0}")]
     Scan(String),
 
-    #[error("file read failed: {path}: {source}")]
-    #[allow(dead_code)]
-    FileRead {
-        path: String,
-        source: std::io::Error,
-    },
-
     #[error("pipeline failed: {0}")]
-    #[allow(dead_code)]
     Pipeline(String),
 
     /// A cooperatively-cancelled indexing pass. Distinct from success and from a
@@ -118,15 +109,10 @@ pub enum ParserError {
 #[derive(Error, Debug)]
 pub enum DaemonError {
     #[error("daemon already running (pid: {0})")]
-    #[allow(dead_code)]
     AlreadyRunning(u32),
 
     #[error("daemon startup already in progress")]
     StartupInProgress,
-
-    #[error("daemon not running")]
-    #[allow(dead_code)]
-    NotRunning,
 
     #[error("pid file error: {0}")]
     PidFileError(String),
@@ -163,11 +149,9 @@ pub enum ConfigError {
     XdgDirNotFound(String),
 
     #[error("config read failed: {0}")]
-    #[allow(dead_code)]
     ReadFailed(String),
 }
 
-#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum FilesystemError {
     #[error("invalid filesystem path: {0}")]
@@ -199,11 +183,9 @@ pub enum ProjectError {
     NotInitialized,
 
     #[error("project already initialized at {0}")]
-    #[allow(dead_code)]
     AlreadyInitialized(String),
 
     #[error("project ID read failed: {0}")]
-    #[allow(dead_code)]
     ReadFailed(String),
 
     #[error("project ID write failed: {0}")]
@@ -221,16 +203,8 @@ pub enum UpdateError {
     #[error("manifest parse failed: {0}")]
     ParseFailed(String),
 
-    #[error("update cache error: {0}")]
-    #[allow(dead_code)]
-    CacheError(String),
-
     #[error("self-update failed: {0}")]
     SelfUpdateFailed(String),
-
-    #[error("daemon stop required for update but failed: {0}")]
-    #[allow(dead_code)]
-    DaemonStopFailed(String),
 
     #[error("no artifact available for platform: {0}")]
     NoArtifactForPlatform(String),
@@ -277,6 +251,3 @@ impl UpdateError {
         )
     }
 }
-
-#[allow(dead_code)]
-pub type Result<T> = std::result::Result<T, OneupError>;

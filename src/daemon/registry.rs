@@ -49,21 +49,18 @@ impl ProjectEntry {
         self.source_root.as_deref().unwrap_or(&self.project_root)
     }
 
-    #[allow(dead_code)]
     pub fn context_id(&self) -> String {
         self.context_id
             .clone()
             .unwrap_or_else(|| legacy_context_id(&self.project_root, self.source_root()))
     }
 
-    #[allow(dead_code)]
     pub fn main_worktree_root(&self) -> &Path {
         self.main_worktree_root
             .as_deref()
             .unwrap_or(&self.project_root)
     }
 
-    #[allow(dead_code)]
     pub fn worktree_role(&self) -> WorktreeRole {
         self.worktree_role.unwrap_or(WorktreeRole::Main)
     }
@@ -84,7 +81,7 @@ impl Registry {
         Self::load_from_path_with_repair(&config::projects_registry_path()?, &xdg_root)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn save(&self) -> Result<(), OneupError> {
         let xdg_root = ensure_secure_xdg_root()?;
         self.save_to_path(&config::projects_registry_path()?, &xdg_root)
@@ -172,27 +169,6 @@ impl Registry {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn register(
-        &mut self,
-        project_id: &str,
-        project_root: &Path,
-        indexing: Option<IndexingConfig>,
-    ) -> Result<(), OneupError> {
-        self.register_with_source(project_id, project_root, project_root, indexing)
-    }
-
-    pub fn register_with_source(
-        &mut self,
-        project_id: &str,
-        project_root: &Path,
-        source_root: &Path,
-        indexing: Option<IndexingConfig>,
-    ) -> Result<(), OneupError> {
-        let context = registration_context(project_root, source_root);
-        self.register_with_context(project_id, &context, indexing)
-    }
-
     pub fn register_with_context(
         &mut self,
         project_id: &str,
@@ -207,12 +183,6 @@ impl Registry {
             &config::projects_registry_path()?,
             &xdg_root,
         )
-    }
-
-    #[allow(dead_code)]
-    pub fn deregister(&mut self, project_root: &Path) -> Result<bool, OneupError> {
-        let xdg_root = ensure_secure_xdg_root()?;
-        self.deregister_at_path(project_root, &config::projects_registry_path()?, &xdg_root)
     }
 
     pub fn deregister_context(&mut self, context: &WorktreeContext) -> Result<bool, OneupError> {
@@ -287,7 +257,7 @@ impl Registry {
             .and_then(|project| project.indexing.as_ref())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn project_roots(&self) -> Vec<PathBuf> {
         self.projects
             .iter()
@@ -295,7 +265,7 @@ impl Registry {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn register_at_path(
         &mut self,
         project_id: &str,
@@ -323,23 +293,6 @@ impl Registry {
         latest.save_to_path(path, approved_root)?;
         *self = latest;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn deregister_at_path(
-        &mut self,
-        project_root: &Path,
-        path: &Path,
-        approved_root: &Path,
-    ) -> Result<bool, OneupError> {
-        let _lock = acquire_registry_lock(approved_root)?;
-        let mut latest = Self::load_from_path(path, approved_root)?;
-        let removed = latest.remove_project(project_root);
-        if removed {
-            latest.save_to_path(path, approved_root)?;
-        }
-        *self = latest;
-        Ok(removed)
     }
 
     fn deregister_context_at_path(
@@ -436,14 +389,6 @@ impl Registry {
             registered_at: chrono::Utc::now().to_rfc3339(),
             indexing,
         });
-    }
-
-    #[allow(dead_code)]
-    fn remove_project(&mut self, project_root: &Path) -> bool {
-        let canonical = canonical_project_root(project_root);
-        let before = self.projects.len();
-        self.projects.retain(|p| p.project_root != canonical);
-        self.projects.len() < before
     }
 
     fn remove_context(&mut self, context: &WorktreeContext) -> bool {
