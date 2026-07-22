@@ -2,18 +2,18 @@
   "strategy": "parallel-map-reduce",
   "repo_type": "single-project",
   "monorepo_projects": [],
-  "generated_at": "2026-07-12T10:00:00Z",
-  "git_commit": "8bfa534214b3d732fa91a403ca033fbb25b29364",
-  "files_analyzed": 43,
+  "generated_at": "2026-07-21T13:30:00Z",
+  "git_commit": "04e6663670a79c4ad73405c49ef09542d6a237a5",
+  "files_analyzed": 109,
   "languages": ["Rust", "TypeScript", "Markdown", "Shell"],
   "metrics": {
-    "mode": "INCREMENTAL",
-    "prior_commit": "4411845591b9e493b55d1ccfdc1354d9143c5983",
-    "changed_files": 43,
+    "mode": "FULL",
+    "prior_commit": "8bfa534214b3d732fa91a403ca033fbb25b29364",
+    "changed_files": 109,
     "analyzers": 5,
     "analyzer_failures": 0,
     "kb_files_written": 6,
-    "schema_version_documented": 19,
-    "release_documented": "v0.1.14"
+    "schema_version_documented": 20,
+    "release_documented": "v0.1.17"
   }
 }
