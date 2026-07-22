@@ -1646,7 +1646,10 @@ pub async fn run(
     run_with_config(conn, project_root, embedder, &IndexingConfig::auto()).await
 }
 
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config(
     conn: &Connection,
     project_root: &Path,
@@ -1656,7 +1659,10 @@ pub async fn run_with_config(
     run_with_config_with_progress_ui(conn, project_root, embedder, config, true).await
 }
 
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config_with_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1679,7 +1685,10 @@ pub async fn run_with_config_and_progress(
     run_with_config_and_progress_ui(conn, project_root, embedder, config, progress_tx, true).await
 }
 
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config_and_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1711,7 +1720,10 @@ pub async fn run_with_scope(
     run_with_scope_and_progress_ui(conn, project_root, embedder, scope, config, None, true).await
 }
 
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_scope_and_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1735,7 +1747,10 @@ pub async fn run_with_scope_and_progress_ui(
     .await
 }
 
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_scope_and_setup(
     conn: &Connection,
@@ -1769,7 +1784,10 @@ pub async fn run_with_scope_and_setup(
 /// and progress (the default for daemon callers where they are the
 /// same). CLI callers running from a git worktree pass the main
 /// repo root here so that progress is written beside the index.
-#[allow(dead_code, reason = "transitively required by bench-protected pipeline::run")]
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_scope_setup_and_progress_root(
     conn: &Connection,

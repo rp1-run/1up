@@ -143,13 +143,19 @@ struct SegmentSymbolInsert {
 }
 
 /// Insert or replace a segment in the database.
-#[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs"
+)]
 pub async fn upsert_segment(conn: &Connection, seg: &SegmentInsert) -> Result<(), OneupError> {
     upsert_segment_for_context(conn, DEFAULT_INDEX_CONTEXT_ID, seg).await
 }
 
 /// Insert or replace a segment inside one index context.
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub async fn upsert_segment_for_context(
     conn: &Connection,
     context_id: &str,
@@ -168,7 +174,10 @@ pub async fn upsert_segment_for_context(
     Ok(())
 }
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 async fn upsert_segment_record_for_context(
     conn: &Connection,
     context_id: &str,
@@ -217,7 +226,10 @@ async fn upsert_segment_record_for_context(
 /// preceding segment delete (unlike the replace path, where the
 /// `segments_vector_ad` trigger does the decrement). It is idempotent for the
 /// no-op case and safe to re-run.
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 async fn write_segment_vector_reference(
     conn: &Connection,
     seg: &SegmentInsert,
@@ -1806,7 +1818,10 @@ fn validate_context_id(context_id: &str) -> Result<(), OneupError> {
     Ok(())
 }
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 async fn replace_segment_symbols_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1837,7 +1852,10 @@ async fn replace_segment_symbols_for_context(
     Ok(())
 }
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 async fn replace_segment_relations_for_context(
     conn: &Connection,
     context_id: &str,
@@ -1850,7 +1868,10 @@ async fn replace_segment_relations_for_context(
     batch_insert_relations_for_context(conn, context_id, relations).await
 }
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 fn validate_relation_source_ids(
     source_segment_id: &str,
     relations: &[RelationInsert],
@@ -1868,7 +1889,10 @@ fn validate_relation_source_ids(
     Ok(())
 }
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 async fn delete_segment_relations_by_context_and_source_segment_id(
     conn: &Connection,
     context_id: &str,

@@ -11,12 +11,12 @@ use nix::unistd::Pid;
 use tracing::{debug, info, warn};
 
 use crate::shared::config;
+#[cfg(test)]
+use crate::shared::constants::XDG_STATE_DIR_MODE;
 use crate::shared::constants::{
     DAEMON_DRAIN_POLL_INTERVAL_MS, DAEMON_DRAIN_TIMEOUT_MS, REBUILD_LOCK_CONTENTION_TIMEOUT_MS,
     REBUILD_LOCK_RETRY_INTERVAL_MS, SECURE_STATE_FILE_MODE,
 };
-#[cfg(test)]
-use crate::shared::constants::XDG_STATE_DIR_MODE;
 use crate::shared::errors::{DaemonError, OneupError};
 #[cfg(test)]
 use crate::shared::fs::atomic_replace;

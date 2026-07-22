@@ -31,7 +31,10 @@ pub struct HybridSearchEngine<'a> {
 }
 
 impl<'a> HybridSearchEngine<'a> {
-    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub fn new(conn: &'a Connection, embedder: Option<&'a mut Embedder>) -> Self {
         Self::new_scoped(conn, embedder, SearchScope::default_context())
     }

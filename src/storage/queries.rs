@@ -323,7 +323,10 @@ REPLACE. REPLACE resolves conflicts by deleting the existing row, which fires
 the segment's vector row) and skips the FTS delete trigger under the default
 OFF (leaving stale external-content FTS entries). DO UPDATE keeps the rowid
 stable and routes through `segments_au`, which is correct in both modes. */
-#[allow(dead_code, reason = "executed by the bench-facing upsert_segment path via the lib target")]
+#[allow(
+    dead_code,
+    reason = "executed by the bench-facing upsert_segment path via the lib target"
+)]
 pub const UPSERT_SEGMENT: &str = "
 INSERT INTO segments (
     id, context_id, file_path, language, block_type, content,
@@ -365,7 +368,10 @@ pub const SELECT_EMBEDDING_POOL_KEYS_PREFIX: &str =
 /// two writers inserting the same new content collapse to one row.
 /// `ref_count` is reconciled separately (incremented on the `segment_vectors`
 /// write, decremented by the `segments_vector_ad` AFTER DELETE trigger).
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const UPSERT_EMBEDDING_POOL: &str = "
 INSERT INTO embedding_pool (content_key, embedding_vec, ref_count)
 VALUES (?1, vector8(?2), 0)
@@ -374,7 +380,10 @@ ON CONFLICT(content_key) DO NOTHING";
 /// Add `?2` references to a pool row. Called once per distinct `content_key`
 /// written into `segment_vectors`, with `?2` set to the number of new
 /// referencing rows so `ref_count` stays equal to the referencing-row count.
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const INCREMENT_EMBEDDING_POOL_REF_COUNT: &str =
     "UPDATE embedding_pool SET ref_count = ref_count + ?2 WHERE content_key = ?1";
 
@@ -398,7 +407,10 @@ UPDATE embedding_pool
 /// by the test-only single-segment write path when it removes a segment's
 /// vector directly (the batch/replace path decrements via the
 /// `segments_vector_ad` AFTER DELETE trigger instead).
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const DECREMENT_EMBEDDING_POOL_REF_COUNT_FOR_SEGMENT: &str = "
 UPDATE embedding_pool
    SET ref_count = ref_count - 1
@@ -417,7 +429,10 @@ UPDATE embedding_pool
 pub const DELETE_ORPHANED_EMBEDDING_POOL_ROWS: &str =
     "DELETE FROM embedding_pool WHERE ref_count <= 0";
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const UPSERT_SEGMENT_VECTOR: &str = "
 INSERT INTO segment_vectors (
     segment_id, content_key
@@ -427,10 +442,16 @@ INSERT INTO segment_vectors (
 ON CONFLICT(segment_id) DO UPDATE SET
     content_key = excluded.content_key";
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const DELETE_SEGMENT_VECTOR: &str = "DELETE FROM segment_vectors WHERE segment_id = ?1";
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const INSERT_SEGMENT_SYMBOL: &str = "
 INSERT OR REPLACE INTO segment_symbols (
     context_id, segment_id, symbol, canonical_symbol, reference_kind, created_at
@@ -438,11 +459,17 @@ INSERT OR REPLACE INTO segment_symbols (
     ?1, ?2, ?3, ?4, ?5, datetime('now')
 )";
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const DELETE_SEGMENT_SYMBOLS_BY_CONTEXT_AND_SEGMENT_ID: &str =
     "DELETE FROM segment_symbols WHERE context_id = ?1 AND segment_id = ?2";
 
-#[allow(dead_code, reason = "transitively required by the bench-facing upsert_segment path")]
+#[allow(
+    dead_code,
+    reason = "transitively required by the bench-facing upsert_segment path"
+)]
 pub const DELETE_SEGMENT_RELATIONS_BY_CONTEXT_AND_SOURCE_SEGMENT_ID: &str =
     "DELETE FROM segment_relations WHERE context_id = ?1 AND source_segment_id = ?2";
 

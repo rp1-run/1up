@@ -220,7 +220,10 @@ struct FinalizedImpactResults {
 }
 
 impl<'a> ImpactHorizonEngine<'a> {
-    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub fn new(conn: &'a Connection) -> Self {
         Self::new_scoped(conn, SearchScope::default_context())
     }

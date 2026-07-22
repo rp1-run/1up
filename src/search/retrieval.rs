@@ -64,38 +64,56 @@ impl CandidateRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs"
+)]
 pub enum RetrievalMode {
     SqlVectorV2,
     FtsOnly,
 }
 
-#[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs"
+)]
 pub struct RetrievedCandidates {
     pub vector_results: Vec<CandidateRow>,
     pub fts_results: Vec<CandidateRow>,
 }
 
-#[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs"
+)]
 pub enum RetrievalBackend<'a> {
     SqlVectorV2(SqlVectorV2<'a>),
     FtsOnly(FtsOnly<'a>),
 }
 
-#[allow(dead_code, reason = "constructed on the bench-kept RetrievalBackend::select_scoped path (benches/search_bench.rs)")]
+#[allow(
+    dead_code,
+    reason = "constructed on the bench-kept RetrievalBackend::select_scoped path (benches/search_bench.rs)"
+)]
 pub struct SqlVectorV2<'a> {
     conn: &'a Connection,
     scope: SearchScope,
 }
 
-#[allow(dead_code, reason = "constructed on the bench-kept RetrievalBackend::select_scoped path (benches/search_bench.rs)")]
+#[allow(
+    dead_code,
+    reason = "constructed on the bench-kept RetrievalBackend::select_scoped path (benches/search_bench.rs)"
+)]
 pub struct FtsOnly<'a> {
     conn: &'a Connection,
     scope: SearchScope,
 }
 
 impl<'a> RetrievalBackend<'a> {
-    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub async fn select(
         conn: &'a Connection,
         query_embedding: Option<&[f32]>,
@@ -103,7 +121,10 @@ impl<'a> RetrievalBackend<'a> {
         Self::select_scoped(conn, query_embedding, SearchScope::default_context()).await
     }
 
-    #[allow(dead_code, reason = "sole caller is the bench-kept RetrievalBackend::select (benches/search_bench.rs)")]
+    #[allow(
+        dead_code,
+        reason = "sole caller is the bench-kept RetrievalBackend::select (benches/search_bench.rs)"
+    )]
     pub async fn select_scoped(
         conn: &'a Connection,
         query_embedding: Option<&[f32]>,
@@ -116,7 +137,10 @@ impl<'a> RetrievalBackend<'a> {
         }
     }
 
-    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub fn mode(&self) -> RetrievalMode {
         match self {
             Self::SqlVectorV2(_) => RetrievalMode::SqlVectorV2,
@@ -124,7 +148,10 @@ impl<'a> RetrievalBackend<'a> {
         }
     }
 
-    #[allow(dead_code, reason = "consumed via the lib target by benches/search_bench.rs")]
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub async fn search(
         &self,
         query: &str,
@@ -149,7 +176,10 @@ impl<'a> RetrievalBackend<'a> {
 }
 
 impl<'a> SqlVectorV2<'a> {
-    #[allow(dead_code, reason = "dispatched from the bench-kept RetrievalBackend::search (benches/search_bench.rs)")]
+    #[allow(
+        dead_code,
+        reason = "dispatched from the bench-kept RetrievalBackend::search (benches/search_bench.rs)"
+    )]
     async fn search(
         &self,
         query: &str,
@@ -168,7 +198,10 @@ impl<'a> SqlVectorV2<'a> {
 }
 
 impl<'a> FtsOnly<'a> {
-    #[allow(dead_code, reason = "dispatched from the bench-kept RetrievalBackend::search (benches/search_bench.rs)")]
+    #[allow(
+        dead_code,
+        reason = "dispatched from the bench-kept RetrievalBackend::search (benches/search_bench.rs)"
+    )]
     async fn search(&self, query: &str) -> Result<RetrievedCandidates, OneupError> {
         Ok(RetrievedCandidates {
             vector_results: Vec::new(),
@@ -221,7 +254,10 @@ fn warn_once_above_exact_scan_threshold(vector_count: usize) {
     }
 }
 
-#[allow(dead_code, reason = "called by the bench-kept SqlVectorV2::search (benches/search_bench.rs)")]
+#[allow(
+    dead_code,
+    reason = "called by the bench-kept SqlVectorV2::search (benches/search_bench.rs)"
+)]
 pub(crate) async fn fetch_vector_candidates(
     conn: &Connection,
     scope: &SearchScope,
