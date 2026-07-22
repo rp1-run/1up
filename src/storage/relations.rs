@@ -1,10 +1,10 @@
-#![allow(dead_code)]
-
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fmt::Write;
 
 use libsql::Connection;
 
+#[cfg(test)]
 use crate::shared::constants::DEFAULT_INDEX_CONTEXT_ID;
 use crate::shared::errors::{OneupError, StorageError};
 use crate::shared::symbols::{
@@ -141,6 +141,7 @@ fn relation_target_descriptor(raw_target_symbol: &str) -> Option<RelationTargetD
     })
 }
 
+#[cfg(test)]
 pub async fn get_outbound_relations(
     conn: &Connection,
     source_segment_id: &str,
@@ -200,6 +201,7 @@ pub async fn get_outbound_relations_for_context(
     Ok(results)
 }
 
+#[cfg(test)]
 pub async fn get_inbound_relations(
     conn: &Connection,
     canonical_target_symbol: &str,
@@ -216,6 +218,7 @@ pub async fn get_inbound_relations(
     .await
 }
 
+#[cfg(test)]
 pub async fn get_inbound_relations_for_context(
     conn: &Connection,
     context_id: &str,
@@ -261,7 +264,7 @@ pub async fn get_inbound_relations_for_context(
     Ok(results)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn get_inbound_relations_by_lookup_symbol(
     conn: &Connection,
     lookup_canonical_symbol: &str,
@@ -433,6 +436,7 @@ pub async fn get_module_dependency_pairs_for_context(
     Ok(results)
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_relations(
     conn: &Connection,
     relations: &[RelationInsert],
@@ -487,26 +491,6 @@ pub(crate) async fn insert_relations(
     Ok(())
 }
 
-pub(crate) async fn replace_segment_relations(
-    conn: &Connection,
-    source_segment_id: &str,
-    relations: &[RelationInsert],
-) -> Result<(), OneupError> {
-    validate_relation_source_ids(source_segment_id, relations)?;
-    delete_segment_relations_by_source_segment_id(conn, source_segment_id).await?;
-    insert_relations(conn, relations).await
-}
-
-pub(crate) async fn delete_relations_by_file(
-    conn: &Connection,
-    file_path: &str,
-) -> Result<u64, OneupError> {
-    conn.execute(queries::DELETE_SEGMENT_RELATIONS_BY_FILE, [file_path])
-        .await
-        .map_err(|e| StorageError::Query(format!("delete segment relations by file failed: {e}")))
-        .map_err(Into::into)
-}
-
 fn relation_limit(limit: usize) -> Result<Option<i64>, OneupError> {
     if limit == 0 {
         return Ok(None);
@@ -515,36 +499,6 @@ fn relation_limit(limit: usize) -> Result<Option<i64>, OneupError> {
     i64::try_from(limit).map(Some).map_err(|_| {
         StorageError::Query(format!("relation limit {limit} exceeds i64 range")).into()
     })
-}
-
-fn validate_relation_source_ids(
-    source_segment_id: &str,
-    relations: &[RelationInsert],
-) -> Result<(), OneupError> {
-    for relation in relations {
-        if relation.source_segment_id != source_segment_id {
-            return Err(StorageError::Transaction(format!(
-                "relation replace for '{source_segment_id}' received row for '{}'",
-                relation.source_segment_id
-            ))
-            .into());
-        }
-    }
-
-    Ok(())
-}
-
-async fn delete_segment_relations_by_source_segment_id(
-    conn: &Connection,
-    source_segment_id: &str,
-) -> Result<u64, OneupError> {
-    conn.execute(
-        queries::DELETE_SEGMENT_RELATIONS_BY_SOURCE_SEGMENT_ID,
-        [source_segment_id],
-    )
-    .await
-    .map_err(|e| StorageError::Query(format!("delete segment relations failed: {e}")))
-    .map_err(Into::into)
 }
 
 fn row_to_stored_relation(row: &libsql::Row) -> Result<StoredRelation, OneupError> {

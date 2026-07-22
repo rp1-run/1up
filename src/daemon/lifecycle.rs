@@ -11,13 +11,17 @@ use nix::unistd::Pid;
 use tracing::{debug, info, warn};
 
 use crate::shared::config;
+#[cfg(test)]
+use crate::shared::constants::XDG_STATE_DIR_MODE;
 use crate::shared::constants::{
     DAEMON_DRAIN_POLL_INTERVAL_MS, DAEMON_DRAIN_TIMEOUT_MS, REBUILD_LOCK_CONTENTION_TIMEOUT_MS,
-    REBUILD_LOCK_RETRY_INTERVAL_MS, SECURE_STATE_FILE_MODE, XDG_STATE_DIR_MODE,
+    REBUILD_LOCK_RETRY_INTERVAL_MS, SECURE_STATE_FILE_MODE,
 };
 use crate::shared::errors::{DaemonError, OneupError};
+#[cfg(test)]
+use crate::shared::fs::atomic_replace;
 use crate::shared::fs::{
-    atomic_replace, ensure_secure_project_root, ensure_secure_xdg_root, remove_regular_file,
+    ensure_secure_project_root, ensure_secure_xdg_root, remove_regular_file,
     validate_regular_file_path,
 };
 
@@ -164,15 +168,7 @@ fn read_pid_from_path(path: &Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-#[allow(dead_code)]
-pub fn write_pid_file() -> Result<(), OneupError> {
-    let xdg_root = ensure_secure_xdg_root()
-        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
-    let pid = std::process::id();
-    write_pid_file_at(&config::pid_file_path()?, &xdg_root, pid)
-}
-
-#[allow(dead_code)]
+#[cfg(test)]
 fn write_pid_file_at(path: &Path, approved_root: &Path, pid: u32) -> Result<(), OneupError> {
     let pid_text = pid.to_string();
     atomic_replace(
@@ -188,14 +184,7 @@ fn write_pid_file_at(path: &Path, approved_root: &Path, pid: u32) -> Result<(), 
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn read_pid_file() -> Result<Option<u32>, OneupError> {
-    let xdg_root = ensure_secure_xdg_root()
-        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
-    read_pid_file_at(&config::pid_file_path()?, &xdg_root)
-}
-
-#[allow(dead_code)]
+#[cfg(test)]
 fn read_pid_file_at(path: &Path, approved_root: &Path) -> Result<Option<u32>, OneupError> {
     let path = validate_regular_file_path(path, approved_root)
         .map_err(|err| DaemonError::PidFileError(format!("failed to validate pid file: {err}")))?;
@@ -212,13 +201,6 @@ fn read_pid_file_at(path: &Path, approved_root: &Path) -> Result<Option<u32>, On
         .map_err(|e| DaemonError::PidFileError(format!("invalid pid in file: {e}")))?;
 
     Ok(Some(pid))
-}
-
-#[allow(dead_code)]
-pub fn remove_pid_file() -> Result<(), OneupError> {
-    let xdg_root = ensure_secure_xdg_root()
-        .map_err(|err| DaemonError::PidFileError(format!("failed to prepare pid root: {err}")))?;
-    remove_pid_file_at(&config::pid_file_path()?, &xdg_root)
 }
 
 fn remove_pid_file_at(path: &Path, approved_root: &Path) -> Result<(), OneupError> {

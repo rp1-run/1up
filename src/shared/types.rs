@@ -28,7 +28,6 @@ pub struct ParsedSegment {
     pub line_start: usize,
     pub line_end: usize,
     pub language: String,
-    #[allow(dead_code)]
     pub breadcrumb: Option<String>,
     pub complexity: u32,
     pub role: SegmentRole,
@@ -428,7 +427,6 @@ impl IndexingConfig {
         })
     }
 
-    #[allow(dead_code)]
     pub fn auto() -> Self {
         Self::from_sources(None, None, None).expect("automatic indexing defaults are valid")
     }
@@ -628,12 +626,10 @@ pub struct IndexStageTimings {
 ///
 /// Repo-relative paths, no escapes, validation on construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ScopeRoots {
     roots: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl ScopeRoots {
     /// Creates a new ScopeRoots from a list of repo-relative paths.
     ///
@@ -653,6 +649,7 @@ impl ScopeRoots {
     /// Returns `true` if this scope has any roots, `false` if empty.
     ///
     /// Used to determine if a scope has been set.
+    #[cfg(test)]
     pub fn is_scoped(&self) -> bool {
         !self.roots.is_empty()
     }
@@ -660,32 +657,6 @@ impl ScopeRoots {
     /// Returns the list of scope roots.
     pub fn roots(&self) -> &[String] {
         &self.roots
-    }
-
-    /// Checks if a given file path is contained within any scope root.
-    ///
-    /// A path is considered contained if it starts with one of the scope roots
-    /// (with proper path separator handling). For example, `services/auth/main.rs`
-    /// is contained by scope root `services/auth` or `services`.
-    ///
-    /// Empty scope (no roots) always returns `false` for containment.
-    pub fn contains_path(&self, path: &str) -> bool {
-        if !self.is_scoped() {
-            return false;
-        }
-
-        let path = path.trim_end_matches('/');
-
-        for root in &self.roots {
-            if path == root {
-                return true;
-            }
-            if path.starts_with(&format!("{}/", root)) {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Validates and canonicalizes a single path.
@@ -1245,47 +1216,6 @@ mod tests {
         let roots = ScopeRoots::new(vec![]).expect("empty list is valid");
         assert!(!roots.is_scoped());
         assert_eq!(roots.roots(), &[] as &[String]);
-    }
-
-    #[test]
-    fn scope_roots_contains_path_checks_membership() {
-        let roots = ScopeRoots::new(vec!["services/auth".to_string(), "libs".to_string()])
-            .expect("valid paths");
-
-        // Exact root match
-        assert!(roots.contains_path("services/auth"));
-        assert!(roots.contains_path("libs"));
-
-        // Paths under root
-        assert!(roots.contains_path("services/auth/main.rs"));
-        assert!(roots.contains_path("services/auth/handlers/mod.rs"));
-        assert!(roots.contains_path("libs/utils.rs"));
-        assert!(roots.contains_path("libs/core/types.rs"));
-
-        // Paths outside scope
-        assert!(!roots.contains_path("services/web"));
-        assert!(!roots.contains_path("services"));
-        assert!(!roots.contains_path("tools/deploy.sh"));
-        assert!(!roots.contains_path(""));
-    }
-
-    #[test]
-    fn scope_roots_contains_path_handles_trailing_slashes() {
-        let roots = ScopeRoots::new(vec!["services".to_string()]).expect("valid path");
-
-        // Should work with or without trailing slash
-        assert!(roots.contains_path("services/"));
-        assert!(roots.contains_path("services"));
-        assert!(roots.contains_path("services/auth/"));
-        assert!(roots.contains_path("services/auth"));
-    }
-
-    #[test]
-    fn scope_roots_contains_path_false_for_empty_scope() {
-        let roots = ScopeRoots::new(vec![]).expect("empty list");
-
-        assert!(!roots.contains_path("services/auth"));
-        assert!(!roots.contains_path("any/path"));
     }
 
     #[test]

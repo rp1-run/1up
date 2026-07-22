@@ -87,7 +87,6 @@ impl ContextEngine {
     /// scope, with `clipped = true` and the full scope range surfaced so callers
     /// can build a recoverable truncation note. Files with no enclosing scope fall
     /// back to a bounded line window (`clipped = false`).
-    #[allow(dead_code)]
     pub fn retrieve_scope_window(
         file_path: &Path,
         target_line: usize,
@@ -178,7 +177,6 @@ impl ContextEngine {
 /// scope range, and enough metadata for the MCP layer to render a load-bearing
 /// truncation note with a recovery call. `clipped` is `true` only when the
 /// returned window is a strict subset of the enclosing scope.
-#[allow(dead_code)]
 pub struct ScopeWindow {
     pub content: String,
     pub line_start: usize,
@@ -191,7 +189,6 @@ pub struct ScopeWindow {
 }
 
 /// Pure line-geometry result of [`bound_scope_window`].
-#[allow(dead_code)]
 struct WindowBounds {
     line_start: usize,
     line_end: usize,
@@ -207,7 +204,6 @@ struct WindowBounds {
 /// to `ceiling`) intersected with the scope; `clipped` is `true` iff the window
 /// is a strict subset of the scope. `target_line` is assumed to lie within
 /// `scope_range`.
-#[allow(dead_code)]
 fn bound_scope_window(
     scope_range: (usize, usize),
     target_line: usize,

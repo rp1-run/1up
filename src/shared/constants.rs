@@ -229,7 +229,6 @@ pub const CONTEXT_FALLBACK_LINES: usize = 50;
 ///
 /// Consumed by the `src/mcp` record-construction and envelope layers;
 /// provisioned here per the shared-literals + pre-provisioned-API convention.
-#[allow(dead_code)]
 pub const MAX_SYMBOLS_PER_LIST: usize = 20;
 
 /// Hard ceiling (lines each side of the target) on `oneup_context` enclosing-scope
@@ -243,7 +242,6 @@ pub const MAX_SYMBOLS_PER_LIST: usize = 20;
 /// reachable in bounded iterations.
 ///
 /// Consumed by `src/search/context.rs` windowing and `src/mcp`.
-#[allow(dead_code)]
 pub const MAX_CONTEXT_EXPANSION_LINES: usize = 500;
 
 /// Maximum number of truncation-recovery actions prepended to a read envelope's
@@ -256,7 +254,6 @@ pub const MAX_CONTEXT_EXPANSION_LINES: usize = 500;
 /// slot.
 ///
 /// Consumed by `read_next_actions` in `src/mcp/tools.rs`.
-#[allow(dead_code)]
 pub const MAX_RECOVERY_ACTIONS: usize = 3;
 
 /// Line span at or under which an `oneup_context` enclosing scope is returned
@@ -268,7 +265,6 @@ pub const MAX_RECOVERY_ACTIONS: usize = 3;
 /// case. Only scopes larger than this are windowed.
 ///
 /// Consumed by `src/search/context.rs` windowing.
-#[allow(dead_code)]
 pub const MAX_WHOLE_SCOPE_LINES: usize = 2 * CONTEXT_FALLBACK_LINES + 1;
 
 /// Single-source reason string stamped on a `TruncationNote` when an
@@ -277,14 +273,12 @@ pub const MAX_WHOLE_SCOPE_LINES: usize = 2 * CONTEXT_FALLBACK_LINES + 1;
 /// structured note in sync from one definition (Output Contracts pattern).
 ///
 /// Consumed by `src/mcp` record construction and summary rendering.
-#[allow(dead_code)]
 pub const SCOPE_TRUNCATION_REASON: &str = "enclosing scope windowed";
 
 /// Single-source reason string stamped on a `TruncationNote` when a hydrated
 /// record's symbol list was capped at [`MAX_SYMBOLS_PER_LIST`].
 ///
 /// Consumed by `src/mcp` record construction and summary rendering.
-#[allow(dead_code)]
 pub const SYMBOL_LIST_TRUNCATION_REASON: &str = "symbol list capped";
 
 /// Sliding window size (lines) for text chunker.
@@ -353,7 +347,10 @@ pub const DAEMON_DRAIN_POLL_INTERVAL_MS: u64 = 100;
 /// trigger point without re-deriving the rationale recorded here. Provisioned
 /// (unused until that owner decision) per the codebase's pre-provisioned-API
 /// convention.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "pre-provisioned API awaiting an owner decision; wiring trigger point documented at src/cli/search.rs"
+)]
 pub const DAEMON_AUTO_RESTART_GATING_ENABLED: bool = false;
 
 /// Bounded wait for the single-writer rebuild lock before a synchronous
@@ -503,19 +500,15 @@ pub const STAGING_WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
 pub const STAGING_DB_CACHE_SIZE_KIB: i32 = -131_072;
 
 /// Owner-only permissions for the XDG-managed state directory.
-#[allow(dead_code)]
 pub const XDG_STATE_DIR_MODE: u32 = 0o700;
 
 /// Owner-only permissions for the project-local `.1up` directory.
-#[allow(dead_code)]
 pub const PROJECT_STATE_DIR_MODE: u32 = 0o700;
 
 /// Owner-only permissions for security-sensitive state files.
-#[allow(dead_code)]
 pub const SECURE_STATE_FILE_MODE: u32 = 0o600;
 
 /// Owner-only permissions for daemon socket files after bind.
-#[allow(dead_code)]
 pub const SECURE_SOCKET_MODE: u32 = 0o600;
 
 /// Upper bound for auto-selected embedding (ONNX intra-op) threads.
@@ -661,6 +654,10 @@ pub const TEST_GATE_WALK_ENTRY_DELAY_ENV_VAR: &str = "ONEUP_TEST_GATE_WALK_ENTRY
 pub const SCHEMA_VERSION: u32 = 20;
 
 /// Context id used by legacy indexing paths until callers pass an explicit worktree context.
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs through SearchScope::default_context and IndexRunContext::legacy"
+)]
 pub const DEFAULT_INDEX_CONTEXT_ID: &str = "default";
 
 /// FP32 ONNX model filename (the always-present baseline / fallback artifact).

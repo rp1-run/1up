@@ -6,7 +6,6 @@ pub const EDGE_IDENTITY_CONSTRUCTOR_LIKE: &str = "constructor_like";
 pub const EDGE_IDENTITY_MACRO_LIKE: &str = "macro_like";
 pub const EDGE_IDENTITY_DOC_MENTION: &str = "doc_mention";
 
-#[allow(dead_code)]
 const LOW_INFORMATION_OWNER_COMPONENTS: &[&str] = &[
     "crate", "self", "super", "this", "src", "lib", "mod", "index", "main", "tests", "test",
     "spec", "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "cpp", "cc", "cxx", "h",
@@ -21,7 +20,6 @@ pub fn normalize_symbolish(value: &str) -> String {
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn split_symbol_components(value: &str) -> Vec<String> {
     value
         .split(is_symbol_component_separator)
@@ -30,7 +28,6 @@ pub fn split_symbol_components(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn clean_owner_components(components: &[String]) -> Vec<String> {
     let mut cleaned = components
         .iter()
@@ -43,47 +40,8 @@ pub fn clean_owner_components(components: &[String]) -> Vec<String> {
     cleaned
 }
 
-#[allow(dead_code)]
-pub fn owner_fingerprint(value: &str) -> String {
-    owner_fingerprint_from_components(&split_symbol_components(value))
-}
-
-#[allow(dead_code)]
 pub fn owner_fingerprint_from_components(components: &[String]) -> String {
     owner_components(components).join("/")
-}
-
-#[allow(dead_code)]
-pub fn owner_components_share_suffix(left: &[String], right: &[String]) -> bool {
-    let left = owner_components(left);
-    let right = owner_components(right);
-    let shared_len = left
-        .iter()
-        .rev()
-        .zip(right.iter().rev())
-        .take_while(|(lhs, rhs)| lhs == rhs)
-        .count();
-    shared_len > 0
-}
-
-#[allow(dead_code)]
-pub fn owner_components_share_subsequence(left: &[String], right: &[String]) -> bool {
-    let left = owner_components(left);
-    let right = owner_components(right);
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-
-    let (needle, haystack) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-
-    let mut haystack_iter = haystack.iter();
-    needle
-        .iter()
-        .all(|needle_component| haystack_iter.any(|candidate| candidate == needle_component))
 }
 
 pub fn normalize_edge_identity_kind(value: &str) -> String {
@@ -130,7 +88,6 @@ fn owner_components(components: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         clean_owner_components, normalize_edge_identity_kind, normalize_symbolish,
-        owner_components_share_subsequence, owner_components_share_suffix, owner_fingerprint,
         owner_fingerprint_from_components, split_symbol_components, EDGE_IDENTITY_BARE_IDENTIFIER,
         EDGE_IDENTITY_CONSTRUCTOR_LIKE, EDGE_IDENTITY_DOC_MENTION, EDGE_IDENTITY_MACRO_LIKE,
         EDGE_IDENTITY_MEMBER_ACCESS, EDGE_IDENTITY_METHOD_RECEIVER, EDGE_IDENTITY_QUALIFIED_PATH,
@@ -152,23 +109,9 @@ mod tests {
             vec!["auth", "config", "loadconfig"]
         );
         assert_eq!(
-            owner_fingerprint("crate::auth::config::load_config"),
-            "auth/config"
-        );
-        assert_eq!(
             owner_fingerprint_from_components(&split_symbol_components("src/search/impact.rs")),
             "search"
         );
-    }
-
-    #[test]
-    fn compares_owner_components_by_suffix_and_subsequence() {
-        let qualified = split_symbol_components("crate::auth::config::load_config");
-        let file_path = split_symbol_components("src/internal/auth/config/loader.rs");
-        let subsequence = split_symbol_components("repo/auth/runtime/config/loader.rs");
-
-        assert!(owner_components_share_suffix(&qualified, &file_path));
-        assert!(owner_components_share_subsequence(&qualified, &subsequence));
     }
 
     #[test]

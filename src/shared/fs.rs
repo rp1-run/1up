@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[cfg(any(unix, test))]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
@@ -641,13 +639,6 @@ fn is_socket_type(file_type: &fs::FileType) -> bool {
     }
 }
 
-#[cfg(unix)]
-fn mode_bits(path: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::metadata(path).unwrap().permissions().mode() & 0o777
-}
-
 fn io_error(path: &Path, source: std::io::Error) -> OneupError {
     FilesystemError::Io {
         path: path.display().to_string(),
@@ -703,6 +694,13 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+
+    #[cfg(unix)]
+    fn mode_bits(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn probe_source_presence_reports_present_for_an_existing_path() {

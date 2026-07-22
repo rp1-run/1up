@@ -9,6 +9,10 @@ pub struct SearchScope {
 }
 
 impl SearchScope {
+    #[allow(
+        dead_code,
+        reason = "called by the bench-kept SearchScope::default_context (benches/search_bench.rs)"
+    )]
     pub fn new(context_id: impl Into<String>, branch_status: BranchStatus) -> Self {
         Self {
             context_id: context_id.into(),
@@ -17,6 +21,10 @@ impl SearchScope {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "called from bench-kept engine constructors consumed via the lib target by benches/search_bench.rs"
+    )]
     pub fn default_context() -> Self {
         Self::new(DEFAULT_INDEX_CONTEXT_ID, BranchStatus::Unknown)
     }

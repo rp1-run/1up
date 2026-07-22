@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use libsql::Connection;
@@ -159,7 +157,6 @@ pub struct ImpactResultEnvelope {
     pub refusal: Option<ImpactRefusal>,
 }
 
-#[allow(dead_code)]
 pub struct ImpactHorizonEngine<'a> {
     conn: &'a Connection,
     scope: SearchScope,
@@ -223,6 +220,10 @@ struct FinalizedImpactResults {
 }
 
 impl<'a> ImpactHorizonEngine<'a> {
+    #[allow(
+        dead_code,
+        reason = "consumed via the lib target by benches/search_bench.rs"
+    )]
     pub fn new(conn: &'a Connection) -> Self {
         Self::new_scoped(conn, SearchScope::default_context())
     }

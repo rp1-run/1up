@@ -204,6 +204,10 @@ struct IndexRunContext {
 }
 
 impl IndexRunContext {
+    #[allow(
+        dead_code,
+        reason = "consumed by run_with_scope_setup_and_progress_root on the bench-protected pipeline::run chain"
+    )]
     fn legacy(project_root: &Path) -> Self {
         Self {
             context_id: DEFAULT_INDEX_CONTEXT_ID.to_string(),
@@ -447,35 +451,6 @@ fn relative_path_for(project_root: &Path, path: &Path) -> String {
         .unwrap_or(&canonical)
         .to_string_lossy()
         .to_string()
-}
-
-#[allow(dead_code)]
-fn build_scanned_work_items(
-    project_root: &Path,
-    scanned: Vec<scanner::ScannedFile>,
-    stored_hashes: &HashMap<String, String>,
-) -> Vec<ScannedWorkItem> {
-    let project_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-
-    scanned
-        .into_iter()
-        .enumerate()
-        .map(|(sequence_id, scanned_file)| {
-            let relative_path = relative_path_for(&project_root, &scanned_file.path);
-            let stored_hash = stored_hashes.get(&relative_path).cloned();
-            ScannedWorkItem {
-                sequence_id,
-                relative_path,
-                path: scanned_file.path,
-                extension: scanned_file.extension,
-                stored_hash,
-                file_size: scanned_file.file_size,
-                modified_ns: scanned_file.modified_ns,
-            }
-        })
-        .collect()
 }
 
 struct RunInputs {
@@ -1659,7 +1634,10 @@ impl Default for PipelineStats {
 /// Scans for source files, computes SHA-256 hashes for incremental detection,
 /// parses/chunks files, generates embeddings, and stores segments in the database.
 /// Deleted files have their segments removed.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "consumed via the lib target by benches/search_bench.rs:176"
+)]
 pub async fn run(
     conn: &Connection,
     project_root: &Path,
@@ -1668,6 +1646,10 @@ pub async fn run(
     run_with_config(conn, project_root, embedder, &IndexingConfig::auto()).await
 }
 
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config(
     conn: &Connection,
     project_root: &Path,
@@ -1677,6 +1659,10 @@ pub async fn run_with_config(
     run_with_config_with_progress_ui(conn, project_root, embedder, config, true).await
 }
 
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config_with_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1688,7 +1674,7 @@ pub async fn run_with_config_with_progress_ui(
         .await
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn run_with_config_and_progress(
     conn: &Connection,
     project_root: &Path,
@@ -1699,6 +1685,10 @@ pub async fn run_with_config_and_progress(
     run_with_config_and_progress_ui(conn, project_root, embedder, config, progress_tx, true).await
 }
 
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_config_and_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1719,7 +1709,7 @@ pub async fn run_with_config_and_progress_ui(
     .await
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn run_with_scope(
     conn: &Connection,
     project_root: &Path,
@@ -1730,27 +1720,10 @@ pub async fn run_with_scope(
     run_with_scope_and_progress_ui(conn, project_root, embedder, scope, config, None, true).await
 }
 
-#[allow(dead_code)]
-pub async fn run_with_scope_and_progress(
-    conn: &Connection,
-    project_root: &Path,
-    embedder: Option<&mut Embedder>,
-    scope: &RunScope,
-    config: &IndexingConfig,
-    progress_tx: Option<ProgressSender>,
-) -> Result<PipelineStats, OneupError> {
-    run_with_scope_and_progress_ui(
-        conn,
-        project_root,
-        embedder,
-        scope,
-        config,
-        progress_tx,
-        true,
-    )
-    .await
-}
-
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 pub async fn run_with_scope_and_progress_ui(
     conn: &Connection,
     project_root: &Path,
@@ -1774,6 +1747,10 @@ pub async fn run_with_scope_and_progress_ui(
     .await
 }
 
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_scope_and_setup(
     conn: &Connection,
@@ -1807,6 +1784,10 @@ pub async fn run_with_scope_and_setup(
 /// and progress (the default for daemon callers where they are the
 /// same). CLI callers running from a git worktree pass the main
 /// repo root here so that progress is written beside the index.
+#[allow(
+    dead_code,
+    reason = "transitively required by bench-protected pipeline::run"
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_scope_setup_and_progress_root(
     conn: &Connection,

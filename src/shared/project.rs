@@ -41,7 +41,7 @@ pub fn read_project_id(project_root: &Path) -> Result<String, OneupError> {
 
 /// Writes a new project ID to the .1up/project_id file, creating the directory if needed.
 /// Returns the generated project ID.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn write_project_id(project_root: &Path) -> Result<String, OneupError> {
     let dot_dir = ensure_secure_project_root(project_root)
         .map_err(|err| ProjectError::WriteFailed(err.to_string()))?;
@@ -59,7 +59,6 @@ pub fn write_project_id(project_root: &Path) -> Result<String, OneupError> {
     Ok(id)
 }
 
-#[allow(dead_code)]
 pub fn ensure_project_id(project_root: &Path) -> Result<(String, bool), OneupError> {
     let outcome = match read_project_id(project_root) {
         Ok(project_id) => (project_id, false),
@@ -136,7 +135,6 @@ pub fn canonical_project_root(project_root: &Path) -> PathBuf {
         .unwrap_or_else(|_| project_root.to_path_buf())
 }
 
-#[allow(dead_code)]
 fn create_project_id_if_absent(dot_dir: &Path) -> Result<String, OneupError> {
     let id = Uuid::new_v4().to_string();
     let path = validate_regular_file_path(&dot_dir.join("project_id"), dot_dir)
@@ -185,12 +183,10 @@ fn create_project_id_if_absent(dot_dir: &Path) -> Result<String, OneupError> {
     Ok(id)
 }
 
-#[allow(dead_code)]
 fn is_not_initialized(err: &OneupError) -> bool {
     matches!(err, OneupError::Project(ProjectError::NotInitialized))
 }
 
-#[allow(dead_code)]
 fn is_already_initialized(err: &OneupError) -> bool {
     matches!(
         err,
@@ -198,12 +194,10 @@ fn is_already_initialized(err: &OneupError) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn project_write_io_error(path: &Path, source: std::io::Error) -> OneupError {
     ProjectError::WriteFailed(format!("{}: {source}", path.display())).into()
 }
 
-#[allow(dead_code)]
 fn set_project_id_mode(path: &Path) -> Result<(), OneupError> {
     #[cfg(unix)]
     {
@@ -221,7 +215,6 @@ fn set_project_id_mode(path: &Path) -> Result<(), OneupError> {
     }
 }
 
-#[allow(dead_code)]
 fn sync_project_state_dir(path: &Path) -> Result<(), OneupError> {
     #[cfg(unix)]
     {
