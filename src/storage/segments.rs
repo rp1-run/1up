@@ -564,32 +564,6 @@ pub async fn get_segment_ids_by_prefix_for_context(
     Ok(ids)
 }
 
-/// Get the stored file hash for every indexed file path.
-#[allow(dead_code)]
-pub async fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>, OneupError> {
-    let mut rows = conn
-        .query(queries::SELECT_ALL_FILE_HASHES, ())
-        .await
-        .map_err(|e| StorageError::Query(format!("query all file hashes failed: {e}")))?;
-
-    let mut hashes = HashMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
-    {
-        let file_path: String = row
-            .get(0)
-            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
-        let file_hash: String = row
-            .get(1)
-            .map_err(|e| StorageError::Query(format!("read file_hash failed: {e}")))?;
-        hashes.insert(file_path, file_hash);
-    }
-
-    Ok(hashes)
-}
-
 /// Delete all segments for a given file path.
 #[allow(dead_code)]
 pub async fn delete_segments_by_file(
@@ -816,47 +790,6 @@ pub async fn get_all_file_paths_for_context(
             .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
         paths.push(path);
     }
-    Ok(paths)
-}
-
-/// Get distinct test-like file paths, optionally constrained to a scope prefix.
-#[allow(dead_code)]
-pub async fn get_test_file_paths(
-    conn: &Connection,
-    scope: Option<&str>,
-    limit: usize,
-) -> Result<Vec<String>, OneupError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = match scope {
-        Some(scope) => {
-            conn.query(
-                queries::SELECT_SCOPED_TEST_FILE_PATHS_LIMITED,
-                libsql::params![scope, format!("{scope}/%"), limit as i64],
-            )
-            .await
-            .map_err(|e| StorageError::Query(format!("query scoped test file paths failed: {e}")))?
-        }
-        None => conn
-            .query(queries::SELECT_TEST_FILE_PATHS_LIMITED, [limit as i64])
-            .await
-            .map_err(|e| StorageError::Query(format!("query test file paths failed: {e}")))?,
-    };
-
-    let mut paths = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| StorageError::Query(format!("row iteration failed: {e}")))?
-    {
-        let path: String = row
-            .get(0)
-            .map_err(|e| StorageError::Query(format!("read file_path failed: {e}")))?;
-        paths.push(path);
-    }
-
     Ok(paths)
 }
 
@@ -3182,27 +3115,6 @@ mod tests {
                 .unwrap(),
             Vec::<String>::new()
         );
-    }
-
-    #[tokio::test]
-    async fn all_file_hashes_are_preloaded_once_per_file() {
-        let (_db, conn) = setup().await;
-
-        upsert_segment(&conn, &test_segment("s1", "src/a.rs", "hash-a"))
-            .await
-            .unwrap();
-        upsert_segment(&conn, &test_segment("s2", "src/a.rs", "hash-a"))
-            .await
-            .unwrap();
-        upsert_segment(&conn, &test_segment("s3", "src/b.rs", "hash-b"))
-            .await
-            .unwrap();
-
-        let hashes = get_all_file_hashes(&conn).await.unwrap();
-
-        assert_eq!(hashes.len(), 2);
-        assert_eq!(hashes.get("src/a.rs"), Some(&"hash-a".to_string()));
-        assert_eq!(hashes.get("src/b.rs"), Some(&"hash-b".to_string()));
     }
 
     #[tokio::test]

@@ -674,22 +674,6 @@ ORDER BY
   raw_target_symbol
 LIMIT ?3";
 
-#[allow(dead_code)]
-pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND: &str = "
-SELECT
-    source_segment_id,
-    relation_kind,
-    raw_target_symbol,
-    canonical_target_symbol,
-    lookup_canonical_symbol,
-    qualifier_fingerprint,
-    edge_identity_kind
-FROM segment_relations
-WHERE lookup_canonical_symbol = ?1
-  AND relation_kind = ?2
-ORDER BY source_segment_id, edge_identity_kind, raw_target_symbol
-LIMIT ?3";
-
 pub const SELECT_INBOUND_RELATIONS_BY_LOOKUP_SYMBOL_AND_KIND_FOR_CONTEXT: &str = "
 SELECT
     source_segment_id,
@@ -757,24 +741,6 @@ FROM segments
 WHERE context_id = ?1
 ORDER BY file_path";
 
-#[allow(dead_code)]
-pub const SELECT_TEST_FILE_PATHS_LIMITED: &str = "
-SELECT DISTINCT file_path
-FROM segments
-WHERE lower(file_path) LIKE 'tests/%'
-   OR lower(file_path) LIKE '%/tests/%'
-   OR lower(file_path) LIKE '%/test/%'
-   OR lower(file_path) LIKE '%/spec/%'
-   OR lower(file_path) LIKE '%/__tests__/%'
-   OR lower(file_path) LIKE '%_test.rs'
-   OR lower(file_path) LIKE '%_spec.rs'
-   OR lower(file_path) LIKE '%.test.ts'
-   OR lower(file_path) LIKE '%.spec.ts'
-   OR lower(file_path) LIKE '%.test.js'
-   OR lower(file_path) LIKE '%.spec.js'
-ORDER BY file_path
-LIMIT ?1";
-
 pub const SELECT_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT: &str = "
 SELECT DISTINCT file_path
 FROM segments
@@ -794,27 +760,6 @@ WHERE context_id = ?1
   )
 ORDER BY file_path
 LIMIT ?2";
-
-#[allow(dead_code)]
-pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED: &str = "
-SELECT DISTINCT file_path
-FROM segments
-WHERE (file_path = ?1 OR file_path LIKE ?2)
-  AND (
-       lower(file_path) LIKE 'tests/%'
-    OR lower(file_path) LIKE '%/tests/%'
-    OR lower(file_path) LIKE '%/test/%'
-    OR lower(file_path) LIKE '%/spec/%'
-    OR lower(file_path) LIKE '%/__tests__/%'
-    OR lower(file_path) LIKE '%_test.rs'
-    OR lower(file_path) LIKE '%_spec.rs'
-    OR lower(file_path) LIKE '%.test.ts'
-    OR lower(file_path) LIKE '%.spec.ts'
-    OR lower(file_path) LIKE '%.test.js'
-    OR lower(file_path) LIKE '%.spec.js'
-  )
-ORDER BY file_path
-LIMIT ?3";
 
 pub const SELECT_SCOPED_TEST_FILE_PATHS_LIMITED_FOR_CONTEXT: &str = "
 SELECT DISTINCT file_path
@@ -836,13 +781,6 @@ WHERE context_id = ?1
   )
 ORDER BY file_path
 LIMIT ?4";
-
-#[allow(dead_code)]
-pub const SELECT_ALL_FILE_HASHES: &str = "
-SELECT file_path, MAX(file_hash) AS file_hash
-FROM segments
-GROUP BY file_path
-ORDER BY file_path";
 
 #[allow(dead_code)]
 pub const SELECT_SEGMENT_BY_ID: &str = "
@@ -1072,19 +1010,6 @@ WHERE context_id = ?1
   AND canonical_symbol LIKE ?3 || '%'
 ORDER BY LENGTH(canonical_symbol), canonical_symbol
 LIMIT ?4";
-
-#[allow(dead_code)]
-pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS: &str = "
-SELECT DISTINCT canonical_symbol
-FROM segment_symbols
-WHERE reference_kind = ?1
-  AND canonical_symbol LIKE '%' || ?2 || '%'
-ORDER BY
-  CASE WHEN canonical_symbol LIKE ?2 || '%' THEN 0 ELSE 1 END,
-  ABS(LENGTH(canonical_symbol) - LENGTH(?2)),
-  LENGTH(canonical_symbol),
-  canonical_symbol
-LIMIT ?3";
 
 pub const SELECT_DISTINCT_SYMBOL_CANONICALS_BY_CONTAINS_FOR_CONTEXT: &str = "
 SELECT DISTINCT canonical_symbol

@@ -275,18 +275,6 @@ impl Registry {
             .any(|entry| entry_matches_context(entry, &canonical, &canonical_source, context))
     }
 
-    #[allow(dead_code)]
-    pub fn indexing_config_for(&self, project_root: &Path) -> Option<&IndexingConfig> {
-        let canonical = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-
-        self.projects
-            .iter()
-            .find(|project| project.project_root == canonical)
-            .and_then(|project| project.indexing.as_ref())
-    }
-
     pub fn indexing_config_for_context(
         &self,
         context: &WorktreeContext,
