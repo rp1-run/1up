@@ -15,6 +15,41 @@ This project follows an install-first public release posture:
 * Document MCP as the supported agent integration path using command `1up`, args `["mcp", "--path", "<repo>"]`, and canonical `oneup_*` tools.
 * Keep the CLI documented for human/manual workflows while treating older agent skills, reminder fences, and `hello-agent` references below as historical pre-MCP release notes.
 
+## [0.2.0](https://github.com/rp1-run/1up/compare/v0.1.17...v0.2.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **search:** drop DiskANN + post-audit cleanup (schema v20) ([#137](https://github.com/rp1-run/1up/issues/137))
+
+### Bug Fixes
+
+* **cli,daemon:** disclose reclaimable stale-branch contexts and auto-prune deleted-branch snapshots ([#130](https://github.com/rp1-run/1up/issues/130)) ([4fbb2ad](https://github.com/rp1-run/1up/commit/4fbb2ad18cd80176ec315b57077d8648f3aba62e))
+* **cli:** reap stale per-project lock files at startup ([#123](https://github.com/rp1-run/1up/issues/123)) ([b2a2a97](https://github.com/rp1-run/1up/commit/b2a2a97b0a6d286b18e42ac23311e718c3f04bfa))
+* **daemon:** abort project pass when the gate walk is cancelled by SIGTERM ([#128](https://github.com/rp1-run/1up/issues/128)) ([0b313b4](https://github.com/rp1-run/1up/commit/0b313b4dade4b13c8c8ddd94ffecbfa27fd298bb))
+* **daemon:** align the first-index gate with the MCP gate and cache the gated file count ([#142](https://github.com/rp1-run/1up/issues/142)) ([bfc181b](https://github.com/rp1-run/1up/commit/bfc181b2b1ba3d315741485a7ccdf2f0319036ac))
+* **daemon:** de-register projects whose root and index.db are definitively gone ([#125](https://github.com/rp1-run/1up/issues/125)) ([5a32220](https://github.com/rp1-run/1up/commit/5a3222071932942ff5d97cf5d8a3468d793cb1ac))
+* **daemon:** discriminate daemon builds with a git-stamped build identity ([#127](https://github.com/rp1-run/1up/issues/127)) ([5162b5d](https://github.com/rp1-run/1up/commit/5162b5d959d23bfeeae590e512aca5f55d7c0bb0))
+* **daemon:** idempotent registry registration keyed by project identity, dedup on load ([#124](https://github.com/rp1-run/1up/issues/124)) ([ff79b3a](https://github.com/rp1-run/1up/commit/ff79b3ab7863298a5d2323345355333464fda63f))
+* **daemon:** never prune index rows on indeterminate source-existence probes ([#120](https://github.com/rp1-run/1up/issues/120)) ([41f9ee4](https://github.com/rp1-run/1up/commit/41f9ee4b018747052546f8e94778accaa75974be))
+* **daemon:** release rebuild.lock when SIGHUP reload drops a project ([#126](https://github.com/rp1-run/1up/issues/126)) ([970d9c8](https://github.com/rp1-run/1up/commit/970d9c88a597b9a1feb918b89466dfd9079873cf))
+* default to exact vector scan for all corpus sizes; demote pathological DiskANN path to opt-in ([#132](https://github.com/rp1-run/1up/issues/132)) ([9baa4f5](https://github.com/rp1-run/1up/commit/9baa4f5cfc9a87308fc3a846341c9bd197150f25))
+* hard-fail unverified installs and cap oneup_get handle batches ([#143](https://github.com/rp1-run/1up/issues/143)) ([04e6663](https://github.com/rp1-run/1up/commit/04e6663670a79c4ad73405c49ef09542d6a237a5))
+* harden timing-flake family — atomic status writes, three-state reads, deadline polling, single env mutex ([#131](https://github.com/rp1-run/1up/issues/131)) ([f32748b](https://github.com/rp1-run/1up/commit/f32748b192f905ec6c50f85039e6f9ae2c95bdb1))
+* **mcp:** coherent ranked next_actions in the monorepo facts envelope ([#119](https://github.com/rp1-run/1up/issues/119)) ([6d90dea](https://github.com/rp1-run/1up/commit/6d90dea989dad717d8a0eef9b0287590a19302d1))
+* **mcp:** record requested index scope before spawning the rebuild task ([#135](https://github.com/rp1-run/1up/issues/135)) ([abb635b](https://github.com/rp1-run/1up/commit/abb635b4cff436d4f9c44ffbe7f4d10c4ee3bd79))
+* **mcp:** surface the gate-refusal scope proposal on the daemon-alive path ([#129](https://github.com/rp1-run/1up/issues/129)) ([e83a1ad](https://github.com/rp1-run/1up/commit/e83a1ad55406cd62d0e0407baba313a282bed210))
+* **mcp:** wire the persistent directory-density cache into cold-path lookups ([#122](https://github.com/rp1-run/1up/issues/122)) ([ebe859c](https://github.com/rp1-run/1up/commit/ebe859c2c453372991cadba9261408f7f413ac44))
+* **project:** contain commondir-derived state roots to the project tree ([#141](https://github.com/rp1-run/1up/issues/141)) ([e8ea203](https://github.com/rp1-run/1up/commit/e8ea20354d843fdcc99aacf17a378caa2603f13a))
+* **release-smoke:** refuse symlinked ancestors in fixture writes ([#136](https://github.com/rp1-run/1up/issues/136)) ([503a653](https://github.com/rp1-run/1up/commit/503a65340e62cf236f02ce338a54b59c96de0677))
+* **storage:** give schema init tolerance its own multi-second wait budget ([#121](https://github.com/rp1-run/1up/issues/121)) ([dc36649](https://github.com/rp1-run/1up/commit/dc366496badd28d48f2de47d2498d58d7dcf7d92))
+* Windows evidence smoke — dump search payload on failure, normalize paths, re-key known-issue gate to [#110](https://github.com/rp1-run/1up/issues/110) ([#133](https://github.com/rp1-run/1up/issues/133)) ([b88cf43](https://github.com/rp1-run/1up/commit/b88cf43f89cb9a89674aea845839ebaa8f398c9c))
+
+
+### Code Refactoring
+
+* **search:** drop DiskANN + post-audit cleanup (schema v20) ([#137](https://github.com/rp1-run/1up/issues/137)) ([33ce947](https://github.com/rp1-run/1up/commit/33ce947c5b2bafc45f258324dd8bd21903704f6b))
+
 ## [0.1.17](https://github.com/rp1-run/1up/compare/v0.1.16...v0.1.17) (2026-07-16)
 
 
